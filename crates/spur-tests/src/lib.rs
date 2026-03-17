@@ -31,6 +31,7 @@
 pub mod harness;
 
 // Unit / component tests (no running daemons needed)
+pub mod t01_run;
 pub mod t05_queue;
 pub mod t06_cancel;
 pub mod t07_sched;

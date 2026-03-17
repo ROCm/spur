@@ -7,6 +7,7 @@ pub mod hostlist;
 pub mod job;
 pub mod node;
 pub mod partition;
+pub mod step;
 pub mod qos;
 pub mod resource;
 pub mod wal;
