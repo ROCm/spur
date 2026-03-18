@@ -100,19 +100,15 @@ fn is_node_not_ready(node: &K8sNode) -> bool {
         .as_ref()
         .and_then(|s| s.taints.as_ref())
         .map_or(false, |taints| {
-            taints.iter().any(|t| {
-                t.key == "node.kubernetes.io/not-ready"
-                    && t.effect == "NoSchedule"
-            })
+            taints
+                .iter()
+                .any(|t| t.key == "node.kubernetes.io/not-ready" && t.effect == "NoSchedule")
         })
 }
 
 /// Extract CPU, memory, and GPU resources from a K8s Node's allocatable.
 fn extract_resources(node: &K8sNode) -> ResourceSet {
-    let allocatable = node
-        .status
-        .as_ref()
-        .and_then(|s| s.allocatable.as_ref());
+    let allocatable = node.status.as_ref().and_then(|s| s.allocatable.as_ref());
 
     let cpus = allocatable
         .and_then(|a| a.get("cpu"))
@@ -159,7 +155,7 @@ fn extract_resources(node: &K8sNode) -> ResourceSet {
     let link_type: i32 = labels
         .and_then(|l| l.get("spur.ai/gpu-link"))
         .map(|v| match v.as_str() {
-            "xgmi" | "XGMI" => 1,    // GPU_LINK_XGMI
+            "xgmi" | "XGMI" => 1,     // GPU_LINK_XGMI
             "nvlink" | "NVLink" => 2, // GPU_LINK_NVLINK
             _ => 0,                   // GPU_LINK_PCIE
         })
@@ -196,11 +192,9 @@ async fn connect_controller(addr: &str) -> anyhow::Result<SlurmControllerClient<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
-    use k8s_openapi::api::core::v1::{
-        NodeSpec, NodeStatus, Taint,
-    };
+    use k8s_openapi::api::core::v1::{NodeSpec, NodeStatus, Taint};
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+    use std::collections::BTreeMap;
 
     fn make_node(
         name: &str,
@@ -248,12 +242,7 @@ mod tests {
 
     #[test]
     fn test_is_node_not_ready_without_taint() {
-        let node = make_node(
-            "node-1",
-            BTreeMap::new(),
-            BTreeMap::new(),
-            vec![],
-        );
+        let node = make_node("node-1", BTreeMap::new(), BTreeMap::new(), vec![]);
         assert!(!is_node_not_ready(&node));
     }
 

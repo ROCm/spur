@@ -63,9 +63,7 @@ pub enum NodeSource {
     /// Traditional bare-metal node running spurd.
     BareMetal,
     /// Kubernetes node managed by the spur-k8s operator.
-    Kubernetes {
-        namespace: String,
-    },
+    Kubernetes { namespace: String },
 }
 
 impl Default for NodeSource {

@@ -135,9 +135,15 @@ pub async fn run(cluster: Arc<ClusterManager>) {
                 let target_node = node_name.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        dispatch_to_agent(&agent_addr, job_id, &spec, &peer_addrs, task_offset, &target_node)
-                            .await
+                    if let Err(e) = dispatch_to_agent(
+                        &agent_addr,
+                        job_id,
+                        &spec,
+                        &peer_addrs,
+                        task_offset,
+                        &target_node,
+                    )
+                    .await
                     {
                         error!(
                             job_id,

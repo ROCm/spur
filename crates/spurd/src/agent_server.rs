@@ -163,7 +163,9 @@ impl SlurmAgent for AgentService {
         if peer_nodes.len() > 1 {
             // MASTER_ADDR: first peer node's address (strip port)
             if let Some(first_peer) = peer_nodes.first() {
-                let master_addr = first_peer.rsplit(':').nth(1)
+                let master_addr = first_peer
+                    .rsplit(':')
+                    .nth(1)
                     .or_else(|| first_peer.split(':').next())
                     .unwrap_or(first_peer);
                 env.insert("MASTER_ADDR".into(), master_addr.to_string());

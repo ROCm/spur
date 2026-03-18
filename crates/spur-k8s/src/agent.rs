@@ -76,13 +76,10 @@ impl SlurmAgent for VirtualAgent {
             if gpu_count > 0 {
                 let gpu_str = gpu_count.to_string();
                 // Determine GPU vendor from allocated GPU type
-                let gpu_resource_key = gpu_vendor_resource_key(
-                    alloc.gpus.first().map(|g| g.gpu_type.as_str()),
-                );
-                resource_limits
-                    .insert(gpu_resource_key.to_string(), Quantity(gpu_str.clone()));
-                resource_requests
-                    .insert(gpu_resource_key.to_string(), Quantity(gpu_str));
+                let gpu_resource_key =
+                    gpu_vendor_resource_key(alloc.gpus.first().map(|g| g.gpu_type.as_str()));
+                resource_limits.insert(gpu_resource_key.to_string(), Quantity(gpu_str.clone()));
+                resource_requests.insert(gpu_resource_key.to_string(), Quantity(gpu_str));
             }
         }
 
@@ -487,7 +484,13 @@ fn parse_mounts(mounts: &[String]) -> (Vec<Volume>, Vec<VolumeMount>) {
 fn sanitize_k8s_name(s: &str) -> String {
     s.to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .trim_matches('-')
         .to_string()
@@ -661,10 +664,7 @@ mod tests {
 
     #[test]
     fn test_parse_mounts_pvc_naming() {
-        let mounts = vec![
-            "pvc:a:/x".to_string(),
-            "pvc:b:/y".to_string(),
-        ];
+        let mounts = vec!["pvc:a:/x".to_string(), "pvc:b:/y".to_string()];
         let (vols, _) = parse_mounts(&mounts);
         assert_eq!(vols[0].name, "pvc-0");
         assert_eq!(vols[1].name, "pvc-1");

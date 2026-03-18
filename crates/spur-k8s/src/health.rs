@@ -49,11 +49,7 @@ async fn healthz() -> impl IntoResponse {
 /// Readiness probe — checks K8s API and spurctld reachability.
 async fn readyz(State(state): State<Arc<HealthState>>) -> impl IntoResponse {
     // Check K8s API
-    let k8s_ok = state
-        .k8s_client
-        .apiserver_version()
-        .await
-        .is_ok();
+    let k8s_ok = state.k8s_client.apiserver_version().await.is_ok();
 
     // Check spurctld reachability
     let url = if state.controller_addr.starts_with("http") {

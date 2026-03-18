@@ -203,22 +203,14 @@ async fn handle_deletion(
     Ok(Action::await_change())
 }
 
-fn error_policy(
-    _job: Arc<SpurJob>,
-    error: &ReconcileError,
-    _ctx: Arc<JobControllerCtx>,
-) -> Action {
+fn error_policy(_job: Arc<SpurJob>, error: &ReconcileError, _ctx: Arc<JobControllerCtx>) -> Action {
     error!(error = %error, "SpurJob reconciler error");
     // Exponential backoff capped at MAX_BACKOFF_SECS
     Action::requeue(Duration::from_secs(MAX_BACKOFF_SECS))
 }
 
 /// Start the SpurJob controller and Pod watcher.
-pub async fn run(
-    client: Client,
-    controller_addr: String,
-    namespace: String,
-) -> anyhow::Result<()> {
+pub async fn run(client: Client, controller_addr: String, namespace: String) -> anyhow::Result<()> {
     let url = if controller_addr.starts_with("http") {
         controller_addr
     } else {
@@ -419,7 +411,11 @@ fn extract_failure_details(pod: &Pod) -> (i32, i32, String) {
                     let message = terminated.message.clone().unwrap_or_default();
 
                     if reason == "OOMKilled" {
-                        return (4, exit_code, "OOMKilled: container exceeded memory limit".into());
+                        return (
+                            4,
+                            exit_code,
+                            "OOMKilled: container exceeded memory limit".into(),
+                        );
                     }
 
                     let msg = if !message.is_empty() {
@@ -505,10 +501,7 @@ async fn cleanup_orphan_pods(client: Client, namespace: String) {
 async fn patch_status(api: &Api<SpurJob>, name: &str, status: &SpurJobStatus) {
     let patch = serde_json::json!({ "status": status });
     let pp = PatchParams::apply("spur-k8s-operator");
-    if let Err(e) = api
-        .patch_status(name, &pp, &Patch::Merge(&patch))
-        .await
-    {
+    if let Err(e) = api.patch_status(name, &pp, &Patch::Merge(&patch)).await {
         error!(spurjob = %name, error = %e, "failed to patch SpurJob status");
     }
 }
@@ -684,7 +677,7 @@ mod tests {
 
     // --- has_finalizer ---
 
-    use crate::crd::{SpurJobSpec, GpuRequirement};
+    use crate::crd::{GpuRequirement, SpurJobSpec};
 
     fn test_spec() -> SpurJobSpec {
         SpurJobSpec {

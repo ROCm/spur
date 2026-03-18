@@ -165,10 +165,7 @@ pub fn to_core_job_spec(spec: &SpurJobSpec, user: &str) -> spur_core::job::JobSp
         .as_deref()
         .and_then(parse_k8s_memory_to_mb);
 
-    let time_limit = spec
-        .time_limit
-        .as_deref()
-        .and_then(parse_duration_string);
+    let time_limit = spec.time_limit.as_deref().and_then(parse_duration_string);
 
     // Combine container_mounts from CRD volumes field
     let container_mounts = spec.volumes.clone();
@@ -619,7 +616,10 @@ mod tests {
         assert_eq!(parsed.num_nodes, 2);
         assert!(parsed.host_network);
         assert_eq!(parsed.tolerations.len(), 1);
-        assert_eq!(parsed.tolerations[0].key.as_deref(), Some("spur.ai/gpu-node"));
+        assert_eq!(
+            parsed.tolerations[0].key.as_deref(),
+            Some("spur.ai/gpu-node")
+        );
         assert_eq!(parsed.tolerations[0].operator, "Exists");
         assert_eq!(parsed.node_selector.get("zone").unwrap(), "us-east");
         assert_eq!(parsed.priority_class.as_deref(), Some("high-priority"));
@@ -654,7 +654,10 @@ mod tests {
             .into(),
             partition: Some("mi300x".into()),
             account: None,
-            volumes: vec!["/data:/data:ro".into(), "pvc:checkpoints:/checkpoints".into()],
+            volumes: vec![
+                "/data:/data:ro".into(),
+                "pvc:checkpoints:/checkpoints".into(),
+            ],
             host_network: false,
             tolerations: vec![TolerationSpec {
                 key: Some("spur.ai/gpu-node".into()),

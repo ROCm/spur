@@ -74,7 +74,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    info!(version = env!("CARGO_PKG_VERSION"), "spur-k8s-operator starting");
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "spur-k8s-operator starting"
+    );
 
     let client = Client::try_default().await?;
 
