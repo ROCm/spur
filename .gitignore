@@ -21,6 +21,7 @@ Thumbs.db
 # WireGuard configs (contain private keys)
 *.conf
 !/proto/**
+!/deploy/**/*.conf
 
 # Test artifacts
 /tmp/

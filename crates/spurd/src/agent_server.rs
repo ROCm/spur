@@ -81,16 +81,27 @@ async fn report_completion(controller_addr: &str, job_id: u32, exit_code: i32) {
         JobState::JobFailed as i32
     };
 
-    match SlurmControllerClient::connect(controller_addr.to_string()).await {
+    let url = if controller_addr.starts_with("http") {
+        controller_addr.to_string()
+    } else {
+        format!("http://{}", controller_addr)
+    };
+
+    match SlurmControllerClient::connect(url).await {
         Ok(mut client) => {
-            // Use UpdateJob to report completion (or CancelJob with signal=0 as completion marker)
-            // For now, we'll report via a GetJob call — the controller will handle
-            // state transitions internally. A proper completion RPC is needed.
-            // TODO: Add a CompleteJob RPC
-            info!(job_id, exit_code, "reported completion to controller");
+            let req = ReportJobStatusRequest {
+                job_id,
+                state,
+                exit_code,
+                message: format!("exit_code={}", exit_code),
+            };
+            match client.report_job_status(req).await {
+                Ok(_) => info!(job_id, exit_code, "reported completion to controller"),
+                Err(e) => warn!(job_id, error = %e, "ReportJobStatus RPC failed"),
+            }
         }
         Err(e) => {
-            warn!(job_id, error = %e, "failed to report completion");
+            warn!(job_id, error = %e, "failed to connect to controller for completion report");
         }
     }
 }
@@ -143,6 +154,32 @@ impl SlurmAgent for AgentService {
         env.insert("SPUR_NUM_NODES".into(), peer_nodes.len().to_string());
         if !peer_nodes.is_empty() {
             env.insert("SPUR_PEER_NODES".into(), peer_nodes.join(","));
+        }
+        if !req.target_node.is_empty() {
+            env.insert("SPUR_TARGET_NODE".into(), req.target_node.clone());
+        }
+
+        // PyTorch/NCCL/RCCL distributed training env vars
+        if peer_nodes.len() > 1 {
+            // MASTER_ADDR: first peer node's address (strip port)
+            if let Some(first_peer) = peer_nodes.first() {
+                let master_addr = first_peer.rsplit(':').nth(1)
+                    .or_else(|| first_peer.split(':').next())
+                    .unwrap_or(first_peer);
+                env.insert("MASTER_ADDR".into(), master_addr.to_string());
+            }
+            env.insert("MASTER_PORT".into(), "29500".to_string());
+            env.insert("WORLD_SIZE".into(), peer_nodes.len().to_string());
+
+            // RANK = node index within peer list (match by task_offset)
+            let tasks_per_node = if spec.tasks_per_node > 0 {
+                spec.tasks_per_node
+            } else {
+                (spec.num_tasks / spec.num_nodes.max(1)).max(1)
+            };
+            let node_rank = task_offset / tasks_per_node;
+            env.insert("RANK".into(), node_rank.to_string());
+            env.insert("SPUR_NODE_RANK".into(), node_rank.to_string());
         }
 
         // If container image is specified, wrap the job in a container

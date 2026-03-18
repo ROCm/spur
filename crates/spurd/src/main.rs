@@ -34,6 +34,11 @@ struct Args {
     #[arg(short = 'N', long)]
     hostname: Option<String>,
 
+    /// Advertised IP address for the controller to reach this agent.
+    /// If not set, auto-detected from WireGuard interface or hostname resolution.
+    #[arg(long, env = "SPUR_NODE_ADDRESS")]
+    address: Option<String>,
+
     /// Foreground mode
     #[arg(short = 'D', long)]
     foreground: bool,
@@ -76,9 +81,19 @@ async fn main() -> anyhow::Result<()> {
         "spurd starting"
     );
 
-    // Detect node address (WireGuard > hostname)
-    let wg_interface = std::env::var("SPUR_WG_INTERFACE").unwrap_or_else(|_| "spur0".into());
-    let node_address = spur_net::detect_node_address(&hostname, listen_port, &wg_interface);
+    // Detect node address (explicit --address > WireGuard > hostname)
+    let node_address = if let Some(ref addr) = args.address {
+        info!(ip = %addr, "using explicit node address");
+        spur_net::address::NodeAddress {
+            ip: addr.clone(),
+            hostname: hostname.clone(),
+            port: listen_port,
+            source: spur_net::address::AddressSource::Static,
+        }
+    } else {
+        let wg_interface = std::env::var("SPUR_WG_INTERFACE").unwrap_or_else(|_| "spur0".into());
+        spur_net::detect_node_address(&hostname, listen_port, &wg_interface)
+    };
     info!(
         ip = %node_address.ip,
         port = node_address.port,

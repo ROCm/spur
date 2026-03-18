@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spur-config
+  namespace: spur
+data:
+  spur.conf: |
+    [cluster]
+    name = "spur-k8s"
+
+    [scheduler]
+    interval_secs = 2
+    max_jobs_per_cycle = 100
+    plugin = "backfill"
+
+    [accounting]
+    enabled = true
+    address = "spurdbd.spur.svc.cluster.local:6819"
+
+    [partitions.default]
+    state = "UP"
+    default = true
+    max_time = "7d"
+    default_time = "1h"

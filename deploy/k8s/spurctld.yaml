@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: spurctld
+  namespace: spur
+spec:
+  selector:
+    app: spurctld
+  ports:
+    - name: grpc
+      port: 6817
+      targetPort: 6817
+  clusterIP: None  # headless for StatefulSet
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: spurctld
+  namespace: spur
+spec:
+  serviceName: spurctld
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spurctld
+  template:
+    metadata:
+      labels:
+        app: spurctld
+    spec:
+      serviceAccountName: spur-operator
+      containers:
+        - name: spurctld
+          image: spur:latest
+          command: [spurctld]
+          args:
+            - --listen=[::]:6817
+            - --config=/etc/spur/spur.conf
+          ports:
+            - containerPort: 6817
+              name: grpc
+          volumeMounts:
+            - name: config
+              mountPath: /etc/spur
+            - name: spool
+              mountPath: /var/spool/spur
+          readinessProbe:
+            tcpSocket:
+              port: 6817
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 6817
+            initialDelaySeconds: 15
+            periodSeconds: 20
+      volumes:
+        - name: config
+          configMap:
+            name: spur-config
+  volumeClaimTemplates:
+    - metadata:
+        name: spool
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 10Gi

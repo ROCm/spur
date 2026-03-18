@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: spurd
+  namespace: spur
+spec:
+  selector:
+    matchLabels:
+      app: spurd
+  template:
+    metadata:
+      labels:
+        app: spurd
+    spec:
+      serviceAccountName: spur-operator
+      nodeSelector:
+        spur.ai/compute: "true"
+      tolerations:
+        - key: spur.ai/gpu-node
+          operator: Exists
+          effect: NoSchedule
+      hostPID: true
+      containers:
+        - name: spurd
+          image: spur:latest
+          command: [spurd]
+          args:
+            - --controller=spurctld.spur.svc.cluster.local:6817
+            - --listen=[::]:6816
+          ports:
+            - containerPort: 6816
+              name: grpc
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: spool
+              mountPath: /var/spool/spur
+            - name: dev
+              mountPath: /dev
+            - name: sys
+              mountPath: /sys
+              readOnly: true
+            # ROCm: /dev/kfd is the KFD (Kernel Fusion Driver) device
+            - name: dev-kfd
+              mountPath: /dev/kfd
+            # ROCm: /dev/dri contains GPU render nodes (renderD128, etc.)
+            - name: dev-dri
+              mountPath: /dev/dri
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # ROCm runtime defaults
+            - name: GPU_ENABLE_PAL
+              value: "0"
+            - name: HSA_ENABLE_SDMA
+              value: "1"
+          readinessProbe:
+            tcpSocket:
+              port: 6816
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: spool
+          hostPath:
+            path: /var/spool/spur
+            type: DirectoryOrCreate
+        - name: dev
+          hostPath:
+            path: /dev
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: dev-kfd
+          hostPath:
+            path: /dev/kfd
+            type: CharDevice
+        - name: dev-dri
+          hostPath:
+            path: /dev/dri
+            type: Directory
