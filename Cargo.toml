@@ -79,3 +79,7 @@ regex = "1"
 dashmap = "6"
 parking_lot = "0.12"
 bytes = "1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
+flate2 = "1"
+tar = "0.4"

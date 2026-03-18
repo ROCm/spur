@@ -1,6 +1,6 @@
 //! `spur image` subcommands for container image management.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 /// Container image management.
@@ -41,140 +41,19 @@ pub async fn main() -> Result<()> {
 }
 
 async fn cmd_import(image: &str) -> Result<()> {
-    eprintln!("Importing image: {}", image);
+    let image_ref = spur_net::oci::parse_image_ref(image);
+    eprintln!(
+        "Importing {}:{} from {}",
+        image_ref.repository, image_ref.tag, image_ref.registry
+    );
 
-    // Use the container module from spurd (shared logic)
-    // For now, call the tools directly since spur-cli doesn't depend on spurd
-    let image_dir = "/var/spool/spur/images";
-    std::fs::create_dir_all(image_dir)?;
+    let image_dir = std::path::Path::new("/var/spool/spur/images");
+    let path = spur_net::pull_image(image, image_dir).await?;
 
-    let name = image
-        .replace("docker://", "")
-        .replace('/', "+")
-        .replace(':', "+");
-    let output_path = format!("{}/{}.sqsh", image_dir, name);
-
-    if std::path::Path::new(&output_path).exists() {
-        eprintln!("Image already imported: {}", output_path);
-        return Ok(());
-    }
-
-    // Try enroot first
-    let enroot_status = tokio::process::Command::new("enroot")
-        .args(["import", "--output", &output_path, image])
-        .status()
-        .await;
-
-    if let Ok(status) = enroot_status {
-        if status.success() {
-            let size = std::fs::metadata(&output_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
-            eprintln!(
-                "Imported: {} ({:.1} MB)",
-                output_path,
-                size as f64 / 1_048_576.0
-            );
-            return Ok(());
-        }
-    }
-
-    // Fallback: skopeo + umoci + mksquashfs
-    // Check for required tools up front with clear error messages
-    fn check_tool(name: &str, install_hint: &str) -> Result<()> {
-        let found = std::process::Command::new("which")
-            .arg(name)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !found {
-            anyhow::bail!(
-                "{} not found. {}\n\nAlternatively, install enroot for native Docker import:\n  \
-                 https://github.com/NVIDIA/enroot",
-                name,
-                install_hint
-            );
-        }
-        Ok(())
-    }
-
-    check_tool(
-        "skopeo",
-        "Install with:\n  sudo apt install skopeo    # Debian/Ubuntu\n  sudo dnf install skopeo    # Fedora/RHEL",
-    )?;
-    check_tool(
-        "umoci",
-        "Install with:\n  sudo apt install umoci     # Debian/Ubuntu\n  go install github.com/opencontainers/umoci/cmd/umoci@latest",
-    )?;
-    check_tool(
-        "mksquashfs",
-        "Install with:\n  sudo apt install squashfs-tools    # Debian/Ubuntu\n  sudo dnf install squashfs-tools    # Fedora/RHEL",
-    )?;
-
-    let tmp_dir = format!("/var/spool/spur/containers/import_{}", name);
-    let oci_dir = format!("{}/oci", tmp_dir);
-    let rootfs_dir = format!("{}/rootfs", tmp_dir);
-    std::fs::create_dir_all(&oci_dir)?;
-    std::fs::create_dir_all(&rootfs_dir)?;
-
-    let skopeo_src = if image.starts_with("docker://") {
-        image.to_string()
-    } else {
-        format!("docker://{}", image)
-    };
-
-    eprintln!("Downloading with skopeo...");
-    let output = tokio::process::Command::new("skopeo")
-        .args(["copy", &skopeo_src, &format!("oci:{}", oci_dir)])
-        .output()
-        .await
-        .context("failed to run skopeo")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        anyhow::bail!("skopeo copy failed for '{}': {}", image, stderr.trim());
-    }
-
-    eprintln!("Extracting layers with umoci...");
-    let output = tokio::process::Command::new("umoci")
-        .args([
-            "unpack",
-            "--image",
-            &format!("{}:latest", oci_dir),
-            &rootfs_dir,
-        ])
-        .output()
-        .await
-        .context("failed to run umoci")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        anyhow::bail!("umoci unpack failed: {}", stderr.trim());
-    }
-
-    eprintln!("Creating squashfs...");
-    let rootfs_content = format!("{}/rootfs", rootfs_dir);
-    let output = tokio::process::Command::new("mksquashfs")
-        .args([&rootfs_content, &output_path, "-noappend", "-comp", "zstd"])
-        .output()
-        .await
-        .context("failed to run mksquashfs")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        anyhow::bail!("mksquashfs failed: {}", stderr.trim());
-    }
-
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-
-    let size = std::fs::metadata(&output_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     eprintln!(
         "Imported: {} ({:.1} MB)",
-        output_path,
+        path.display(),
         size as f64 / 1_048_576.0
     );
 
@@ -223,10 +102,7 @@ fn cmd_list() -> Result<()> {
 }
 
 fn cmd_remove(name: &str) -> Result<()> {
-    let sanitized = name
-        .replace("docker://", "")
-        .replace('/', "+")
-        .replace(':', "+");
+    let sanitized = spur_net::oci::sanitize_name(name);
     let path = format!("/var/spool/spur/images/{}.sqsh", sanitized);
 
     if !std::path::Path::new(&path).exists() {

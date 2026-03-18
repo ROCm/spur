@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{bail, Context};
-use tokio::process::Command;
 use tracing::{debug, info, warn};
 
 /// Where squashfs images and container rootfs are stored.
@@ -385,133 +384,12 @@ pub fn cleanup_rootfs(job_id: u32) {
 
 /// Import a Docker/OCI image to squashfs format.
 ///
-/// Uses skopeo + mksquashfs, or falls back to enroot if available.
+/// Uses spur-net's native OCI puller — downloads directly from registries
+/// via the Docker Registry HTTP API v2. No dependency on Docker, skopeo,
+/// umoci, or enroot. Only needs mksquashfs (squashfs-tools).
 pub async fn import_image(uri: &str) -> anyhow::Result<PathBuf> {
-    std::fs::create_dir_all(IMAGE_DIR)?;
-
-    let name = sanitize_name(uri);
-    let output_path = PathBuf::from(IMAGE_DIR).join(format!("{}.sqsh", name));
-
-    if output_path.exists() {
-        info!(image = %uri, path = %output_path.display(), "image already imported");
-        return Ok(output_path);
-    }
-
-    // Try enroot first (handles docker:// URIs natively)
-    if which("enroot") {
-        info!(image = %uri, "importing with enroot");
-        let status = Command::new("enroot")
-            .args(["import", "--output", output_path.to_str().unwrap(), uri])
-            .status()
-            .await
-            .context("failed to run enroot import")?;
-        if status.success() {
-            return Ok(output_path);
-        }
-        warn!("enroot import failed, trying manual method");
-    }
-
-    // Manual: skopeo copy → OCI dir → mksquashfs
-    let tmp_dir = PathBuf::from(CONTAINER_DIR).join(format!("import_{}", name));
-    let oci_dir = tmp_dir.join("oci");
-    let rootfs_dir = tmp_dir.join("rootfs");
-    std::fs::create_dir_all(&oci_dir)?;
-    std::fs::create_dir_all(&rootfs_dir)?;
-
-    // Normalize URI for skopeo
-    let skopeo_src = if uri.starts_with("docker://") {
-        uri.to_string()
-    } else {
-        format!("docker://{}", uri)
-    };
-
-    // Check that required tools are installed before starting
-    if !which("skopeo") {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        bail!(
-            "skopeo not found. Install it to import OCI images:\n  \
-             sudo apt install skopeo    # Debian/Ubuntu\n  \
-             sudo dnf install skopeo    # Fedora/RHEL\n\
-             \nAlternatively, install enroot for native Docker import support."
-        );
-    }
-    if !which("umoci") {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        bail!(
-            "umoci not found. Install it to extract OCI images:\n  \
-             sudo apt install umoci     # Debian/Ubuntu\n  \
-             go install github.com/opencontainers/umoci/cmd/umoci@latest\n\
-             \nAlternatively, install enroot for native Docker import support."
-        );
-    }
-    if !which("mksquashfs") {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        bail!(
-            "mksquashfs not found. Install squashfs-tools:\n  \
-             sudo apt install squashfs-tools    # Debian/Ubuntu\n  \
-             sudo dnf install squashfs-tools    # Fedora/RHEL"
-        );
-    }
-
-    info!(image = %uri, "downloading image with skopeo");
-    let output = Command::new("skopeo")
-        .args(["copy", &skopeo_src, &format!("oci:{}", oci_dir.display())])
-        .output()
-        .await
-        .context("failed to run skopeo")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        bail!("skopeo copy failed for '{}': {}", uri, stderr.trim());
-    }
-
-    // Extract OCI layers to rootfs using umoci
-    info!("extracting OCI layers with umoci");
-    let output = Command::new("umoci")
-        .args([
-            "unpack",
-            "--image",
-            &format!("{}:latest", oci_dir.display()),
-            rootfs_dir.to_str().unwrap(),
-        ])
-        .output()
-        .await
-        .context("failed to run umoci")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        bail!("umoci unpack failed: {}", stderr.trim());
-    }
-
-    // Pack rootfs into squashfs
-    let rootfs_content = rootfs_dir.join("rootfs");
-    info!("creating squashfs image");
-    let output = Command::new("mksquashfs")
-        .args([
-            rootfs_content.to_str().unwrap(),
-            output_path.to_str().unwrap(),
-            "-noappend",
-            "-comp",
-            "zstd",
-        ])
-        .output()
-        .await
-        .context("failed to run mksquashfs")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        bail!("mksquashfs failed: {}", stderr.trim());
-    }
-
-    // Cleanup temp dir
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-
-    info!(
-        image = %uri,
-        path = %output_path.display(),
-        "image imported successfully"
-    );
-    Ok(output_path)
+    let image_dir = Path::new(IMAGE_DIR);
+    spur_net::pull_image(uri, image_dir).await
 }
 
 /// List imported images.
