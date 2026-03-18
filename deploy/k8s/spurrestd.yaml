@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: spurrestd
+  namespace: spur
+spec:
+  selector:
+    app: spurrestd
+  ports:
+    - name: http
+      port: 6820
+      targetPort: 6820
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spurrestd
+  namespace: spur
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: spurrestd
+  template:
+    metadata:
+      labels:
+        app: spurrestd
+    spec:
+      serviceAccountName: spur-operator
+      containers:
+        - name: spurrestd
+          image: spur:latest
+          command: [spurrestd]
+          args:
+            - --listen=[::]:6820
+            - --controller=spurctld.spur.svc.cluster.local:6817
+          ports:
+            - containerPort: 6820
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /api/v1/ping
+              port: 6820
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/v1/ping
+              port: 6820
+            initialDelaySeconds: 15
+            periodSeconds: 20

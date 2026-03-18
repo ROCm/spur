@@ -56,6 +56,22 @@ impl std::fmt::Display for NodeState {
     }
 }
 
+/// Where a node originates from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum NodeSource {
+    /// Traditional bare-metal node running spurd.
+    BareMetal,
+    /// Kubernetes node managed by the spur-k8s operator.
+    Kubernetes { namespace: String },
+}
+
+impl Default for NodeSource {
+    fn default() -> Self {
+        Self::BareMetal
+    }
+}
+
 /// A compute node in the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
@@ -63,6 +79,9 @@ pub struct Node {
     pub state: NodeState,
     pub state_reason: Option<String>,
     pub partitions: Vec<String>,
+    /// Where this node comes from (bare-metal or K8s).
+    #[serde(default)]
+    pub source: NodeSource,
 
     pub total_resources: ResourceSet,
     pub alloc_resources: ResourceSet,
@@ -94,6 +113,7 @@ impl Node {
             state: NodeState::Unknown,
             state_reason: None,
             partitions: Vec::new(),
+            source: NodeSource::default(),
             total_resources: resources,
             alloc_resources: ResourceSet::default(),
             arch: String::new(),

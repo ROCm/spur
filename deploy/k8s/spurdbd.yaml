@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: spurdbd
+  namespace: spur
+spec:
+  selector:
+    app: spurdbd
+  ports:
+    - name: grpc
+      port: 6819
+      targetPort: 6819
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spurdbd
+  namespace: spur
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spurdbd
+  template:
+    metadata:
+      labels:
+        app: spurdbd
+    spec:
+      serviceAccountName: spur-operator
+      containers:
+        - name: spurdbd
+          image: spur:latest
+          command: [spurdbd]
+          args:
+            - --listen=[::]:6819
+            - --database-url=postgresql://spur:spur@localhost:5432/spur
+          ports:
+            - containerPort: 6819
+              name: grpc
+          readinessProbe:
+            tcpSocket:
+              port: 6819
+            initialDelaySeconds: 10
+            periodSeconds: 10
+        # Dev-mode postgres sidecar. For production, use an external database.
+        - name: postgres
+          image: postgres:16
+          env:
+            - name: POSTGRES_USER
+              value: spur
+            - name: POSTGRES_PASSWORD
+              value: spur
+            - name: POSTGRES_DB
+              value: spur
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: pgdata
+          emptyDir: {}

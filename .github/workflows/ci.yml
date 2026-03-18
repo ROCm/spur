@@ -73,3 +73,58 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --exclude spur-ffi --all-targets -- -W clippy::all
+
+  cluster:
+    name: Cluster Tests (2x MI300X)
+    runs-on: [self-hosted, mi300x]
+    needs: [build-and-test, fmt, clippy]
+    # Only one cluster run at a time; cancel older runs on the same ref.
+    concurrency:
+      group: cluster-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build release binaries
+        run: |
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          cargo build --release -j 4
+
+      - name: Stop any running cluster
+        run: |
+          ssh mi300-2 '~/spur/etc/stop-agent.sh' 2>/dev/null || true
+          ~/spur/etc/stop-all.sh 2>/dev/null || true
+          sleep 2
+
+      - name: Deploy fresh binaries
+        run: |
+          cp target/release/spur target/release/spurctld target/release/spurd \
+             target/release/spurdbd target/release/spurrestd ~/spur/bin/
+          rsync -a --checksum \
+            target/release/spur \
+            target/release/spurd \
+            mi300-2:~/spur/bin/
+
+      - name: Start cluster
+        run: |
+          ~/spur/etc/start-controller.sh
+          ssh mi300-2 '~/spur/etc/start-agent.sh'
+          sleep 5
+
+      - name: Verify both nodes idle
+        run: |
+          ~/spur/bin/sinfo
+          if ! ~/spur/bin/sinfo | grep -qE "2\s+idle"; then
+            echo "ERROR: Expected 2 idle nodes, got:"
+            ~/spur/bin/sinfo
+            exit 1
+          fi
+
+      - name: Run integration tests
+        run: bash deploy/bare-metal/cluster_test.sh
+
+      - name: Stop cluster
+        if: always()
+        run: |
+          ssh mi300-2 '~/spur/etc/stop-agent.sh' || true
+          ~/spur/etc/stop-all.sh || true

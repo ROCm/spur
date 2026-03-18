@@ -221,6 +221,9 @@ service SlurmController {
   // Agent registration
   rpc RegisterAgent(RegisterAgentRequest) returns (RegisterAgentResponse);
   rpc Heartbeat(stream HeartbeatRequest) returns (stream HeartbeatResponse);
+
+  // K8s operator callback: report job completion from Pod watcher
+  rpc ReportJobStatus(ReportJobStatusRequest) returns (google.protobuf.Empty);
 }
 
 // -- Agent service (slurmd) --
@@ -361,6 +364,7 @@ message LaunchJobRequest {
   ResourceSet allocated = 3;
   repeated string peer_nodes = 4;  // All nodes in this job's allocation
   uint32 task_offset = 5;          // This node's starting task index
+  string target_node = 6;          // Which K8s/Spur node this dispatch targets
 }
 
 message LaunchJobResponse {
@@ -431,4 +435,13 @@ message GetUsageResponse {
   map<string, double> cpu_hours = 1;    // per account
   map<string, double> gpu_hours = 2;
   map<string, uint64> job_count = 3;
+}
+
+// -- K8s Operator --
+
+message ReportJobStatusRequest {
+  uint32 job_id = 1;
+  JobState state = 2;
+  int32 exit_code = 3;
+  string message = 4;  // Pod status message or error
 }

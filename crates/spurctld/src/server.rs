@@ -225,6 +225,7 @@ impl SlurmController for ControllerService {
             agent_port,
             req.wg_pubkey,
             req.version,
+            spur_core::node::NodeSource::BareMetal,
         );
 
         Ok(Response::new(RegisterAgentResponse {
@@ -235,6 +236,23 @@ impl SlurmController for ControllerService {
 
     type HeartbeatStream =
         tokio_stream::wrappers::ReceiverStream<Result<HeartbeatResponse, Status>>;
+
+    async fn report_job_status(
+        &self,
+        request: Request<ReportJobStatusRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        let state = proto_to_job_state(req.state)
+            .ok_or_else(|| Status::invalid_argument("invalid job state"))?;
+
+        if state.is_terminal() {
+            let exit_code = req.exit_code;
+            self.cluster
+                .complete_job(req.job_id, exit_code, state)
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
+        Ok(Response::new(()))
+    }
 
     async fn heartbeat(
         &self,

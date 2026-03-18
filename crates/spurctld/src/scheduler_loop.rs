@@ -132,11 +132,18 @@ pub async fn run(cluster: Arc<ClusterManager>) {
                 let spec = spec.clone();
                 let peer_addrs = peer_addrs.clone();
                 let task_offset = node_idx as u32 * tasks_per_node;
+                let target_node = node_name.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        dispatch_to_agent(&agent_addr, job_id, &spec, &peer_addrs, task_offset)
-                            .await
+                    if let Err(e) = dispatch_to_agent(
+                        &agent_addr,
+                        job_id,
+                        &spec,
+                        &peer_addrs,
+                        task_offset,
+                        &target_node,
+                    )
+                    .await
                     {
                         error!(
                             job_id,
@@ -194,6 +201,7 @@ async fn dispatch_to_agent(
     spec: &spur_core::job::JobSpec,
     peer_nodes: &[String],
     task_offset: u32,
+    target_node: &str,
 ) -> anyhow::Result<()> {
     let mut client = SlurmAgentClient::connect(agent_addr.to_string()).await?;
 
@@ -252,6 +260,7 @@ async fn dispatch_to_agent(
             allocated: None,
             peer_nodes: peer_nodes.to_vec(),
             task_offset,
+            target_node: target_node.to_string(),
         })
         .await?;
 

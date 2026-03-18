@@ -48,6 +48,9 @@ pub struct SlurmConfig {
 
     #[serde(default)]
     pub logging: LoggingConfig,
+
+    #[serde(default)]
+    pub kubernetes: KubernetesConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,6 +300,42 @@ impl Default for LoggingConfig {
             level: "info".into(),
             format: "text".into(),
             file: None,
+        }
+    }
+}
+
+/// Kubernetes integration configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KubernetesConfig {
+    /// Enable K8s integration.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to kubeconfig file. If empty, uses in-cluster config.
+    #[serde(default)]
+    pub kubeconfig: Option<String>,
+    /// K8s namespace for SpurJob CRDs and Pods.
+    #[serde(default = "default_k8s_namespace")]
+    pub namespace: String,
+    /// Label selector for K8s nodes to include in the Spur pool.
+    #[serde(default = "default_k8s_node_selector")]
+    pub node_label_selector: String,
+}
+
+fn default_k8s_namespace() -> String {
+    "spur".into()
+}
+
+fn default_k8s_node_selector() -> String {
+    "spur.ai/managed=true".into()
+}
+
+impl Default for KubernetesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            kubeconfig: None,
+            namespace: "spur".into(),
+            node_label_selector: "spur.ai/managed=true".into(),
         }
     }
 }
