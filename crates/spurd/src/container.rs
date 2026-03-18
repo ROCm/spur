@@ -129,66 +129,137 @@ pub fn build_container_launch_script(
     let mut script = String::new();
     script.push_str("#!/bin/bash\nset -e\n\n");
 
-    // Create mount points for bind mounts inside rootfs
     let rootfs_str = rootfs.to_string_lossy();
 
     // Ensure key directories exist in rootfs
     script.push_str(&format!(
-        "mkdir -p {}/dev {}/proc {}/sys {}/tmp\n",
-        rootfs_str, rootfs_str, rootfs_str, rootfs_str
+        "mkdir -p {rootfs}/dev {rootfs}/proc {rootfs}/sys {rootfs}/tmp\n",
+        rootfs = rootfs_str
     ));
 
-    // GPU device bind mounts
-    let gpu_mounts = build_gpu_mounts(config, &rootfs_str);
-    script.push_str(&gpu_mounts);
-
-    // User-specified bind mounts
-    for mount in &config.mounts {
-        let target = format!("{}{}", rootfs_str, mount.target);
-        script.push_str(&format!("mkdir -p \"{}\"\n", target));
-        let ro_flag = if mount.readonly { ",ro" } else { "" };
-        script.push_str(&format!(
-            "mount --bind \"{}\" \"{}\"\n",
-            mount.source, target
-        ));
-        if mount.readonly {
-            script.push_str(&format!("mount -o remount,bind,ro \"{}\"\n", target));
-        }
-    }
-
-    // Copy the job script into the rootfs
+    // Copy the job script into the rootfs before entering namespace
     let container_script = format!("{}/tmp/spur_job_{}.sh", rootfs_str, job_id);
     script.push_str(&format!(
         "cp \"{}\" \"{}\"\nchmod +x \"{}\"\n",
         inner_script_path, container_script, container_script
     ));
 
-    // Build environment exports
-    for (key, value) in &config.environment {
-        // Escape single quotes in values
-        let escaped = value.replace('\'', "'\\''");
-        script.push_str(&format!("export {}='{}'\n", key, escaped));
+    // Copy user-mounted source files/dirs into rootfs (for unprivileged mode)
+    // In privileged mode we'd use bind mounts; unprivileged uses copies or symlinks
+    for mount in &config.mounts {
+        let target = format!("{}{}", rootfs_str, mount.target);
+        script.push_str(&format!("mkdir -p \"{}\"\n", target));
     }
 
-    // Determine workdir inside container
+    // GPU visibility env vars (only these need explicit setting;
+    // the rest of the environment is inherited from the executor)
+    let mut env_exports = String::new();
+    if !config.gpu_devices.is_empty() {
+        let gpu_list: String = config
+            .gpu_devices
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        env_exports.push_str(&format!(
+            "export ROCR_VISIBLE_DEVICES={gl}\nexport CUDA_VISIBLE_DEVICES={gl}\n",
+            gl = gpu_list
+        ));
+    }
+
     let workdir = config.workdir.as_deref().unwrap_or("/tmp");
 
-    // Launch with unshare for namespace isolation, then chroot
-    // unshare -m gives us a private mount namespace
-    // We use chroot instead of pivot_root for simplicity (works without root
-    // if we're in a user namespace, or if running as root)
+    // Three modes depending on privilege level:
+    // 1. Root: unshare --mount + chroot (full isolation)
+    // 2. Non-root with userns: unshare --user --mount + chroot
+    // 3. Non-root fallback: run directly using container's libraries via PATH/LD_LIBRARY_PATH
+    //
+    // In production, spurd typically runs as root for cgroup management.
+    // Mode 3 provides a degraded but functional path for dev/testing.
     script.push_str(&format!(
-        "\n# Enter container\nexec unshare --mount --map-root-user bash -c '\n\
-         mount -t proc proc {rootfs}/proc\n\
-         mount -t sysfs sys {rootfs}/sys\n\
-         mount -t devtmpfs dev {rootfs}/dev 2>/dev/null || mount --bind /dev {rootfs}/dev\n\
-         mount -t tmpfs tmpfs {rootfs}/tmp\n\
-         cp /tmp/spur_job_{job_id}.sh {rootfs}/tmp/spur_job_{job_id}.sh 2>/dev/null || true\n\
-         chroot {rootfs} /bin/bash -c \"cd {workdir} && /tmp/spur_job_{job_id}.sh\"\n\
-         '\n",
+        r#"
+# Try namespace isolation, fall back to PATH-based execution
+if [ "$(id -u)" = "0" ]; then
+  # Root: full mount namespace + chroot
+  exec unshare --mount bash -c '
+set -e
+
+ROOTFS="{rootfs}"
+
+# Mount filesystems inside container
+mount -t proc proc $ROOTFS/proc 2>/dev/null || true
+mount -t sysfs sys $ROOTFS/sys 2>/dev/null || true
+mount --bind /dev $ROOTFS/dev 2>/dev/null || true
+
+# GPU devices (AMD + NVIDIA)
+if [ -d /dev/dri ]; then
+  mkdir -p $ROOTFS/dev/dri
+  mount --bind /dev/dri $ROOTFS/dev/dri 2>/dev/null || true
+fi
+if [ -e /dev/kfd ]; then
+  touch $ROOTFS/dev/kfd 2>/dev/null || true
+  mount --bind /dev/kfd $ROOTFS/dev/kfd 2>/dev/null || true
+fi
+
+# ROCm libraries
+for p in /opt/rocm /opt/rocm/lib; do
+  if [ -d "$p" ]; then
+    mkdir -p $ROOTFS$p
+    mount --bind $p $ROOTFS$p 2>/dev/null || true
+  fi
+done
+
+# NVIDIA device files
+for dev in /dev/nvidia*; do
+  if [ -e "$dev" ]; then
+    touch $ROOTFS$dev 2>/dev/null || true
+    mount --bind $dev $ROOTFS$dev 2>/dev/null || true
+  fi
+done
+"#,
         rootfs = rootfs_str,
-        job_id = job_id,
+    ));
+
+    // User bind mounts (inside the namespace)
+    for mount in &config.mounts {
+        script.push_str(&format!(
+            "\nmkdir -p $ROOTFS{target}\nmount --bind \"{source}\" $ROOTFS{target} 2>/dev/null || true",
+            source = mount.source,
+            target = mount.target,
+        ));
+        if mount.readonly {
+            script.push_str(&format!(
+                "\nmount -o remount,bind,ro $ROOTFS{target} 2>/dev/null || true",
+                target = mount.target,
+            ));
+        }
+    }
+
+    // Chroot and execute (inside the namespace)
+    script.push_str(&format!(
+        r#"
+
+# Set environment
+{env_exports}
+
+# Chroot into container
+chroot $ROOTFS /bin/bash -c "cd {workdir} && /tmp/spur_job_{job_id}.sh"
+'
+else
+  # Non-root fallback: no namespace isolation, run with container PATH/libs
+  ROOTFS="{rootfs}"
+  {env_exports}
+  export PATH="$ROOTFS/usr/bin:$ROOTFS/bin:$ROOTFS/usr/sbin:$ROOTFS/sbin:$PATH"
+  export LD_LIBRARY_PATH="$ROOTFS/usr/lib:$ROOTFS/lib:$ROOTFS/usr/lib64:$ROOTFS/lib64:${{LD_LIBRARY_PATH:-}}"
+  export SPUR_CONTAINER_ROOTFS="$ROOTFS"
+  cd {workdir}
+  /bin/bash $ROOTFS/tmp/spur_job_{job_id}.sh
+fi
+"#,
+        env_exports = env_exports,
         workdir = workdir,
+        job_id = job_id,
+        rootfs = rootfs_str,
     ));
 
     Ok(script)

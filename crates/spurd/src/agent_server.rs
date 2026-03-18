@@ -179,8 +179,19 @@ impl SlurmAgent for AgentService {
             )
             .map_err(|e| Status::internal(format!("container setup failed: {}", e)))?;
 
-            // Write the inner script to a temp file path
-            let inner_script_path = format!("{}/tmp/spur_job_{}.sh", work_dir, job_id);
+            // Write the user's actual script to a separate file
+            // (the executor will write the *wrapper* as .spur_job_{id}.sh)
+            let inner_script_path = format!("{}/.spur_inner_{}.sh", work_dir, job_id);
+            std::fs::write(&inner_script_path, &script)
+                .map_err(|e| Status::internal(format!("failed to write inner script: {}", e)))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &inner_script_path,
+                    std::fs::Permissions::from_mode(0o755),
+                );
+            }
 
             let wrapper = crate::container::build_container_launch_script(
                 &container_config,
