@@ -14,3 +14,4 @@ reqwest = { workspace = true }
 futures-util = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
+bytes = { workspace = true }

@@ -2529,6 +2529,7 @@ name = "spur-net"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "flate2",
  "futures-util",
  "reqwest",

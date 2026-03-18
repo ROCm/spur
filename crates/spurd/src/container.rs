@@ -81,31 +81,135 @@ pub fn resolve_image(image: &str) -> anyhow::Result<PathBuf> {
     )
 }
 
+/// How the rootfs was set up — determines cleanup strategy.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RootfsMode {
+    /// Extracted via unsquashfs — cleanup by removing the directory.
+    Extracted,
+    /// Mounted via squashfs + overlayfs — cleanup by unmounting.
+    Overlay,
+}
+
 /// Create a container rootfs from a squashfs image.
 ///
-/// Named containers are persistent; unnamed containers use job-specific paths
-/// and are cleaned up after the job.
-pub fn setup_rootfs(image_path: &Path, job_id: u32, name: Option<&str>) -> anyhow::Result<PathBuf> {
-    let rootfs = if let Some(name) = name {
+/// Tries overlayfs mount first (fast, no disk copy) and falls back to
+/// unsquashfs extraction if not root or mount fails.
+///
+/// Named containers always use extraction (they persist across jobs).
+pub fn setup_rootfs(
+    image_path: &Path,
+    job_id: u32,
+    name: Option<&str>,
+) -> anyhow::Result<(PathBuf, RootfsMode)> {
+    let base_dir = if let Some(name) = name {
         PathBuf::from(CONTAINER_DIR).join(sanitize_name(name))
     } else {
         PathBuf::from(CONTAINER_DIR).join(format!("job_{}", job_id))
     };
 
     // If named container already exists, reuse it
-    if rootfs.exists() && name.is_some() {
-        debug!(path = %rootfs.display(), "reusing named container");
-        return Ok(rootfs);
+    if base_dir.exists() && name.is_some() {
+        debug!(path = %base_dir.display(), "reusing named container");
+        return Ok((base_dir, RootfsMode::Extracted));
     }
 
-    std::fs::create_dir_all(&rootfs)
+    // Try overlayfs mount first (unnamed containers only, requires root)
+    if name.is_none() && nix::unistd::geteuid().is_root() {
+        if let Ok(merged) = setup_rootfs_overlay(image_path, &base_dir) {
+            return Ok((merged, RootfsMode::Overlay));
+        }
+        debug!("overlayfs mount failed, falling back to extraction");
+    }
+
+    // Fallback: extract with unsquashfs
+    setup_rootfs_extract(image_path, &base_dir)?;
+    Ok((base_dir, RootfsMode::Extracted))
+}
+
+/// Mount squashfs image read-only, then layer a tmpfs overlay on top.
+///
+/// Layout:
+///   base_dir/lower   — squashfs mounted read-only
+///   base_dir/upper   — tmpfs for writes
+///   base_dir/work    — overlayfs workdir
+///   base_dir/merged  — the merged rootfs (this is what gets chrooted)
+fn setup_rootfs_overlay(image_path: &Path, base_dir: &Path) -> anyhow::Result<PathBuf> {
+    let lower = base_dir.join("lower");
+    let upper = base_dir.join("upper");
+    let work = base_dir.join("work");
+    let merged = base_dir.join("merged");
+
+    for dir in [&lower, &upper, &work, &merged] {
+        std::fs::create_dir_all(dir)?;
+    }
+
+    // Mount squashfs read-only
+    let status = std::process::Command::new("mount")
+        .args([
+            "-t",
+            "squashfs",
+            "-o",
+            "ro,loop",
+            image_path.to_str().unwrap(),
+            lower.to_str().unwrap(),
+        ])
+        .output()?;
+    if !status.status.success() {
+        let _ = std::fs::remove_dir_all(base_dir);
+        bail!("failed to mount squashfs");
+    }
+
+    // Mount tmpfs for upper layer
+    let status = std::process::Command::new("mount")
+        .args(["-t", "tmpfs", "tmpfs", upper.to_str().unwrap()])
+        .output()?;
+    if !status.status.success() {
+        let _ = std::process::Command::new("umount").arg(&lower).output();
+        let _ = std::fs::remove_dir_all(base_dir);
+        bail!("failed to mount tmpfs for overlay upper");
+    }
+
+    // Mount overlayfs
+    let overlay_opts = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        lower.display(),
+        upper.display(),
+        work.display()
+    );
+    let status = std::process::Command::new("mount")
+        .args([
+            "-t",
+            "overlay",
+            "overlay",
+            "-o",
+            &overlay_opts,
+            merged.to_str().unwrap(),
+        ])
+        .output()?;
+    if !status.status.success() {
+        let _ = std::process::Command::new("umount").arg(&upper).output();
+        let _ = std::process::Command::new("umount").arg(&lower).output();
+        let _ = std::fs::remove_dir_all(base_dir);
+        bail!("failed to mount overlayfs");
+    }
+
+    info!(
+        rootfs = %merged.display(),
+        image = %image_path.display(),
+        "container rootfs mounted (overlayfs)"
+    );
+    Ok(merged)
+}
+
+/// Extract squashfs image to a directory (fallback when overlayfs unavailable).
+fn setup_rootfs_extract(image_path: &Path, rootfs: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(rootfs)
         .with_context(|| format!("failed to create container rootfs at {}", rootfs.display()))?;
 
-    // Extract squashfs to rootfs
     let unsquashfs_result = std::process::Command::new("unsquashfs")
         .args([
-            "-f", // force overwrite
-            "-d", // destination
+            "-f",
+            "-d",
             rootfs.to_str().unwrap(),
             image_path.to_str().unwrap(),
         ])
@@ -136,8 +240,8 @@ pub fn setup_rootfs(image_path: &Path, job_id: u32, name: Option<&str>) -> anyho
         }
     }
 
-    info!(rootfs = %rootfs.display(), "container rootfs created");
-    Ok(rootfs)
+    info!(rootfs = %rootfs.display(), "container rootfs created (extracted)");
+    Ok(())
 }
 
 /// Build the wrapper script that launches a job inside a container.
@@ -495,18 +599,34 @@ pub fn parse_mount(spec: &str) -> anyhow::Result<BindMount> {
 }
 
 /// Clean up an unnamed container rootfs.
-pub fn cleanup_rootfs(job_id: u32) {
-    let rootfs = PathBuf::from(CONTAINER_DIR).join(format!("job_{}", job_id));
-    if rootfs.exists() {
-        if let Err(e) = std::fs::remove_dir_all(&rootfs) {
-            warn!(
-                path = %rootfs.display(),
-                error = %e,
-                "failed to clean up container rootfs"
-            );
-        } else {
-            debug!(path = %rootfs.display(), "container rootfs cleaned up");
+///
+/// Handles both overlay (unmount) and extracted (rm -rf) modes.
+pub fn cleanup_rootfs(job_id: u32, mode: &RootfsMode) {
+    let base_dir = PathBuf::from(CONTAINER_DIR).join(format!("job_{}", job_id));
+    if !base_dir.exists() {
+        return;
+    }
+
+    if *mode == RootfsMode::Overlay {
+        // Unmount in reverse order: overlay, upper tmpfs, lower squashfs
+        let merged = base_dir.join("merged");
+        let upper = base_dir.join("upper");
+        let lower = base_dir.join("lower");
+        for mount_point in [&merged, &upper, &lower] {
+            let _ = std::process::Command::new("umount")
+                .arg(mount_point)
+                .output();
         }
+    }
+
+    if let Err(e) = std::fs::remove_dir_all(&base_dir) {
+        warn!(
+            path = %base_dir.display(),
+            error = %e,
+            "failed to clean up container rootfs"
+        );
+    } else {
+        debug!(path = %base_dir.display(), "container rootfs cleaned up");
     }
 }
 
@@ -873,7 +993,8 @@ mod tests {
     #[test]
     fn test_cleanup_rootfs_nonexistent() {
         // Should not panic when cleaning up a rootfs that doesn't exist
-        cleanup_rootfs(999999);
+        cleanup_rootfs(999999, &RootfsMode::Extracted);
+        cleanup_rootfs(999998, &RootfsMode::Overlay);
     }
 
     // --- Which ---

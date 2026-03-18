@@ -243,40 +243,87 @@ async fn pull_and_extract(image_ref: &ImageRef, rootfs_dir: &Path) -> anyhow::Re
 
     info!(layers = manifest.layers.len(), "downloading layers");
 
-    // Download and extract each layer
+    // Layer cache directory
+    let cache_dir = PathBuf::from(
+        std::env::var("SPUR_IMAGE_CACHE")
+            .unwrap_or_else(|_| "/var/spool/spur/images/.layers".into()),
+    );
+    let _ = std::fs::create_dir_all(&cache_dir);
+
+    // Download layers in parallel, then extract sequentially (order matters)
+    let mut layer_data: Vec<(usize, bytes::Bytes)> = Vec::new();
+
+    // Parallel download
+    let mut handles = Vec::new();
     for (i, layer) in manifest.layers.iter().enumerate() {
-        let total_mb = layer.size / 1_048_576;
-        info!(
-            layer = i + 1,
-            total = manifest.layers.len(),
-            digest = %layer.digest,
-            size_mb = total_mb,
-            "downloading layer"
-        );
+        let digest = layer.digest.clone();
+        let size = layer.size;
+        let media_type = layer.media_type.clone();
+        let cache_path = cache_dir.join(digest.replace(':', "_"));
+
+        // Check layer cache
+        if cache_path.exists() {
+            if let Ok(cached) = std::fs::read(&cache_path) {
+                info!(
+                    layer = i + 1,
+                    total = manifest.layers.len(),
+                    digest = %digest,
+                    "layer cached, skipping download"
+                );
+                layer_data.push((i, bytes::Bytes::from(cached)));
+                continue;
+            }
+        }
 
         let blob_url = format!(
             "{}/v2/{}/blobs/{}",
-            registry_url, image_ref.repository, layer.digest
+            registry_url, image_ref.repository, digest
         );
-        let mut req = client.get(&blob_url);
-        if let Some(ref token) = token {
-            req = req.header(AUTHORIZATION, format!("Bearer {}", token));
-        }
+        let client = client.clone();
+        let token = token.clone();
 
-        let resp = req.send().await.context("failed to download layer")?;
-        if !resp.status().is_success() {
-            bail!(
-                "registry returned {} for layer {}",
-                resp.status(),
-                layer.digest
+        let handle = tokio::spawn(async move {
+            info!(
+                layer = i + 1,
+                digest = %digest,
+                size_mb = size / 1_048_576,
+                "downloading layer"
             );
-        }
 
-        let bytes = resp.bytes().await.context("failed to read layer body")?;
+            let mut req = client.get(&blob_url);
+            if let Some(ref token) = token {
+                req = req.header(AUTHORIZATION, format!("Bearer {}", token));
+            }
 
-        // Layers are gzipped tarballs
-        if layer.media_type.contains("gzip") || layer.digest.starts_with("sha256:") {
-            extract_tar_gz(&bytes, rootfs_dir)
+            let resp = req.send().await.context("failed to download layer")?;
+            if !resp.status().is_success() {
+                bail!("registry returned {} for layer {}", resp.status(), digest);
+            }
+
+            let data = resp.bytes().await.context("failed to read layer body")?;
+
+            // Cache the layer
+            let _ = std::fs::write(&cache_path, &data);
+
+            Ok::<(usize, bytes::Bytes), anyhow::Error>((i, data))
+        });
+        handles.push(handle);
+    }
+
+    // Collect parallel downloads
+    for handle in handles {
+        let (idx, data) = handle.await.context("layer download task panicked")??;
+        layer_data.push((idx, data));
+    }
+
+    // Sort by layer index (parallel downloads may complete out of order)
+    layer_data.sort_by_key(|(idx, _)| *idx);
+
+    // Extract layers sequentially (order matters for whiteout files)
+    for (i, (_, data)) in layer_data.iter().enumerate() {
+        let media_type = &manifest.layers[i].media_type;
+        if media_type.contains("gzip") || manifest.layers[i].digest.starts_with("sha256:") {
+            extract_tar_gz(data, rootfs_dir)
                 .with_context(|| format!("failed to extract layer {}", i + 1))?;
         }
     }

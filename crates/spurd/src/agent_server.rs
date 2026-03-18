@@ -17,6 +17,10 @@ use crate::reporter::NodeReporter;
 /// Running job handle for tracking.
 struct TrackedJob {
     child: tokio::process::Child,
+    /// PID of the container init process (for nsenter/exec).
+    pid: Option<u32>,
+    /// How the container rootfs was set up (for cleanup).
+    rootfs_mode: crate::container::RootfsMode,
 }
 
 pub struct AgentService {
@@ -47,7 +51,7 @@ impl AgentService {
                         Ok(Some(status)) => {
                             let exit_code = status.code().unwrap_or(-1);
                             info!(job_id, exit_code, "job finished");
-                            completed.push((*job_id, exit_code));
+                            completed.push((*job_id, exit_code, tracked.rootfs_mode.clone()));
                         }
                         Ok(None) => {} // Still running
                         Err(e) => {
@@ -56,10 +60,10 @@ impl AgentService {
                     }
                 }
 
-                for (job_id, exit_code) in &completed {
+                for (job_id, exit_code, mode) in &completed {
                     jobs.remove(job_id);
                     // Clean up unnamed container rootfs
-                    crate::container::cleanup_rootfs(*job_id);
+                    crate::container::cleanup_rootfs(*job_id, mode);
                     // Report completion to controller
                     report_completion(&controller_addr, *job_id, *exit_code).await;
                 }
@@ -142,7 +146,7 @@ impl SlurmAgent for AgentService {
         }
 
         // If container image is specified, wrap the job in a container
-        let (launch_script, is_container) = if !spec.container_image.is_empty() {
+        let (launch_script, rootfs_mode) = if !spec.container_image.is_empty() {
             info!(job_id, image = %spec.container_image, "launching containerized job");
 
             let mounts: Vec<crate::container::BindMount> = spec
@@ -194,7 +198,7 @@ impl SlurmAgent for AgentService {
             let image_path = crate::container::resolve_image(&spec.container_image)
                 .map_err(|e| Status::failed_precondition(e.to_string()))?;
 
-            let rootfs = crate::container::setup_rootfs(
+            let (rootfs, rootfs_mode) = crate::container::setup_rootfs(
                 &image_path,
                 job_id,
                 container_config.name.as_deref(),
@@ -223,9 +227,9 @@ impl SlurmAgent for AgentService {
             )
             .map_err(|e| Status::internal(format!("container script failed: {}", e)))?;
 
-            (wrapper, true)
+            (wrapper, rootfs_mode)
         } else {
-            (script, false)
+            (script, crate::container::RootfsMode::Extracted)
         };
 
         // Launch the job
@@ -243,11 +247,15 @@ impl SlurmAgent for AgentService {
         .await
         {
             Ok(running_job) => {
+                let child = running_job.into_child();
+                let pid = child.id();
                 let mut jobs = self.running.lock().await;
                 jobs.insert(
                     job_id,
                     TrackedJob {
-                        child: running_job.into_child(),
+                        child,
+                        pid,
+                        rootfs_mode: rootfs_mode.clone(),
                     },
                 );
                 info!(job_id, "job launched successfully");
@@ -290,6 +298,53 @@ impl SlurmAgent for AgentService {
         Ok(Response::new(NodeResourcesResponse {
             total: Some(crate::reporter::resource_to_proto(resources)),
             used: Some(ResourceSet::default()),
+        }))
+    }
+
+    async fn exec_in_job(
+        &self,
+        request: Request<ExecInJobRequest>,
+    ) -> Result<Response<ExecInJobResponse>, Status> {
+        let req = request.into_inner();
+        let jobs = self.running.lock().await;
+
+        let tracked = jobs.get(&req.job_id).ok_or_else(|| {
+            Status::not_found(format!("job {} not running on this node", req.job_id))
+        })?;
+
+        let pid = tracked.pid.ok_or_else(|| {
+            Status::failed_precondition(format!("job {} has no tracked PID", req.job_id))
+        })?;
+
+        if req.command.is_empty() {
+            return Err(Status::invalid_argument("no command specified"));
+        }
+
+        info!(
+            job_id = req.job_id,
+            pid,
+            command = ?req.command,
+            "exec into running job"
+        );
+
+        // Use nsenter to enter the job's mount namespace and run the command
+        let mut cmd = tokio::process::Command::new("nsenter");
+        cmd.args(["--target", &pid.to_string(), "--mount", "--"]);
+        cmd.arg(&req.command[0]);
+        for arg in &req.command[1..] {
+            cmd.arg(arg);
+        }
+
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("nsenter failed: {}", e)))?;
+
+        Ok(Response::new(ExecInJobResponse {
+            success: output.status.success(),
+            exit_code: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         }))
     }
 }

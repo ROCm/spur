@@ -229,6 +229,7 @@ service SlurmAgent {
   rpc LaunchJob(LaunchJobRequest) returns (LaunchJobResponse);
   rpc CancelJob(AgentCancelJobRequest) returns (google.protobuf.Empty);
   rpc GetNodeResources(google.protobuf.Empty) returns (NodeResourcesResponse);
+  rpc ExecInJob(ExecInJobRequest) returns (ExecInJobResponse);
 }
 
 // -- Accounting service (slurmdbd) --
@@ -375,6 +376,18 @@ message AgentCancelJobRequest {
 message NodeResourcesResponse {
   ResourceSet total = 1;
   ResourceSet used = 2;
+}
+
+message ExecInJobRequest {
+  uint32 job_id = 1;
+  repeated string command = 2;  // Command to exec inside the container
+}
+
+message ExecInJobResponse {
+  bool success = 1;
+  int32 exit_code = 2;
+  string stdout = 3;
+  string stderr = 4;
 }
 
 // -- Accounting --
