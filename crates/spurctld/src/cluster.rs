@@ -8,7 +8,7 @@ use tracing::{debug, info, warn};
 
 use spur_core::config::SlurmConfig;
 use spur_core::job::{Job, JobId, JobSpec, JobState, PendingReason};
-use spur_core::node::{Node, NodeState};
+use spur_core::node::{Node, NodeSource, NodeState};
 use spur_core::partition::Partition;
 use spur_core::resource::ResourceSet;
 use spur_core::wal::{WalEntry, WalOperation, WalStore};
@@ -308,9 +308,11 @@ impl ClusterManager {
         port: u16,
         wg_pubkey: String,
         version: String,
+        source: NodeSource,
     ) {
         let mut node = Node::new(name.clone(), resources.clone());
         node.state = NodeState::Idle;
+        node.source = source;
         node.address = Some(address.clone());
         node.port = port;
         if !wg_pubkey.is_empty() {
