@@ -77,7 +77,12 @@ job_state() {
     #   $1=JOBID $2=NAME $3=USER $4=ST $5=TIME $6=NODES $7=NODELIST
     # (PARTITION merges with the gap after JOBID in display but awk sees it as a separate field
     #  only when it has content — check both $4 and $5 for 2-letter state codes)
-    "${SPUR}/squeue" 2>/dev/null | tail -n +2 | awk -v id="${job_id}" '
+    #
+    # Note: avoid tail in the pipeline; when awk exits early (after finding the job),
+    # tail would get SIGPIPE and exit 141, causing set -o pipefail to abort the script
+    # once the queue grows large enough that there are unread lines remaining.
+    "${SPUR}/squeue" 2>/dev/null | awk -v id="${job_id}" '
+        NR == 1 { next }
         $1 == id {
             # Find the 2-char state code (CD, PD, R, F, CA)
             for (i = 2; i <= NF; i++) {
@@ -87,7 +92,7 @@ job_state() {
                 }
             }
         }
-    '
+    ' || true
 }
 
 # Clean old output files
