@@ -122,6 +122,7 @@ impl WalStore for FileWalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spur_core::job::JobSpec;
     use spur_core::wal::WalOperation;
     use tempfile::TempDir;
 
@@ -134,12 +135,15 @@ mod tests {
             1,
             WalOperation::JobSubmit {
                 job_id: 42,
-                name: "test".into(),
-                user: "alice".into(),
-                partition: Some("gpu".into()),
-                num_nodes: 2,
-                num_tasks: 16,
-                cpus_per_task: 1,
+                spec: JobSpec {
+                    name: "test".into(),
+                    user: "alice".into(),
+                    partition: Some("gpu".into()),
+                    num_nodes: 2,
+                    num_tasks: 16,
+                    cpus_per_task: 1,
+                    ..Default::default()
+                },
             },
         );
 
@@ -164,12 +168,11 @@ mod tests {
                         i,
                         WalOperation::JobSubmit {
                             job_id: i as u32,
-                            name: format!("job{}", i),
-                            user: "alice".into(),
-                            partition: None,
-                            num_nodes: 1,
-                            num_tasks: 1,
-                            cpus_per_task: 1,
+                            spec: JobSpec {
+                                name: format!("job{}", i),
+                                user: "alice".into(),
+                                ..Default::default()
+                            },
                         },
                     ))
                     .unwrap();

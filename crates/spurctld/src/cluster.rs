@@ -102,12 +102,7 @@ impl ClusterManager {
         // WAL
         self.append_wal(WalOperation::JobSubmit {
             job_id,
-            name: spec.name.clone(),
-            user: spec.user.clone(),
-            partition: spec.partition.clone(),
-            num_nodes: spec.num_nodes,
-            num_tasks: spec.num_tasks,
-            cpus_per_task: spec.cpus_per_task,
+            spec: spec.clone(),
         });
 
         self.jobs.write().insert(job_id, job);
@@ -140,19 +135,14 @@ impl ClusterManager {
             let mut task_spec = spec.clone();
             task_spec.array_spec = None; // Don't recurse
 
+            self.append_wal(WalOperation::JobSubmit {
+                job_id: task_job_id,
+                spec: task_spec.clone(),
+            });
+
             let mut job = Job::new(task_job_id, task_spec);
             job.array_job_id = Some(array_job_id);
             job.array_task_id = Some(task_id);
-
-            self.append_wal(WalOperation::JobSubmit {
-                job_id: task_job_id,
-                name: spec.name.clone(),
-                user: spec.user.clone(),
-                partition: spec.partition.clone(),
-                num_nodes: spec.num_nodes,
-                num_tasks: spec.num_tasks,
-                cpus_per_task: spec.cpus_per_task,
-            });
 
             jobs.insert(task_job_id, job);
         }
@@ -593,25 +583,8 @@ fn replay_entry(
     next_id: &mut u32,
 ) {
     match &entry.operation {
-        WalOperation::JobSubmit {
-            job_id,
-            name,
-            user,
-            partition,
-            num_nodes,
-            num_tasks,
-            cpus_per_task,
-        } => {
-            let spec = JobSpec {
-                name: name.clone(),
-                user: user.clone(),
-                partition: partition.clone(),
-                num_nodes: *num_nodes,
-                num_tasks: *num_tasks,
-                cpus_per_task: *cpus_per_task,
-                ..Default::default()
-            };
-            jobs.insert(*job_id, Job::new(*job_id, spec));
+        WalOperation::JobSubmit { job_id, spec } => {
+            jobs.insert(*job_id, Job::new(*job_id, spec.clone()));
             *next_id = (*next_id).max(job_id + 1);
         }
         WalOperation::JobStateChange {

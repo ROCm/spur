@@ -58,11 +58,20 @@ impl ResourceSet {
     }
 
     /// Subtract requested resources, returning the remainder.
+    /// GPUs are filtered by device_id — any GPU in `used` with a matching
+    /// device_id is removed from the result.
     pub fn subtract(&self, used: &ResourceSet) -> ResourceSet {
+        let used_gpu_ids: std::collections::HashSet<u32> =
+            used.gpus.iter().map(|g| g.device_id).collect();
         ResourceSet {
             cpus: self.cpus.saturating_sub(used.cpus),
             memory_mb: self.memory_mb.saturating_sub(used.memory_mb),
-            gpus: self.gpus.clone(), // GPU allocation is discrete, handled separately
+            gpus: self
+                .gpus
+                .iter()
+                .filter(|g| !used_gpu_ids.contains(&g.device_id))
+                .cloned()
+                .collect(),
             generic: self
                 .generic
                 .iter()
@@ -73,6 +82,28 @@ impl ResourceSet {
                     )
                 })
                 .collect(),
+        }
+    }
+
+    /// Add resources from another set, accumulating totals.
+    pub fn add(&self, other: &ResourceSet) -> ResourceSet {
+        let mut gpus = self.gpus.clone();
+        let existing_ids: std::collections::HashSet<u32> =
+            gpus.iter().map(|g| g.device_id).collect();
+        for g in &other.gpus {
+            if !existing_ids.contains(&g.device_id) {
+                gpus.push(g.clone());
+            }
+        }
+        let mut generic = self.generic.clone();
+        for (k, v) in &other.generic {
+            *generic.entry(k.clone()).or_insert(0) += v;
+        }
+        ResourceSet {
+            cpus: self.cpus + other.cpus,
+            memory_mb: self.memory_mb + other.memory_mb,
+            gpus,
+            generic,
         }
     }
 

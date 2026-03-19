@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::job::{JobId, JobState};
+use crate::job::{JobId, JobSpec, JobState};
 use crate::node::NodeState;
 use crate::resource::ResourceSet;
 
@@ -19,12 +19,7 @@ pub enum WalOperation {
     // Job operations
     JobSubmit {
         job_id: JobId,
-        name: String,
-        user: String,
-        partition: Option<String>,
-        num_nodes: u32,
-        num_tasks: u32,
-        cpus_per_task: u32,
+        spec: JobSpec,
     },
     JobStateChange {
         job_id: JobId,
