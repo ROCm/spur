@@ -119,6 +119,9 @@ pub async fn launch_job(
     // Set up cgroup for isolation
     let cgroup_path = setup_cgroup(job_id, cpus, memory_mb)?;
 
+    // Ensure work_dir exists on this node (it may only exist on the submitting node)
+    tokio::fs::create_dir_all(work_dir).await.ok();
+
     // Write script to temp file
     let script_path = PathBuf::from(work_dir).join(format!(".spur_job_{}.sh", job_id));
     tokio::fs::write(&script_path, script)

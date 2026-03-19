@@ -139,6 +139,7 @@ pub async fn run(cluster: Arc<ClusterManager>) {
                 let peer_addrs = peer_addrs.clone();
                 let task_offset = node_idx as u32 * tasks_per_node;
                 let target_node = node_name.clone();
+                let cluster_for_dispatch = cluster.clone();
 
                 tokio::spawn(async move {
                     if let Err(e) = dispatch_to_agent(
@@ -155,7 +156,12 @@ pub async fn run(cluster: Arc<ClusterManager>) {
                             job_id,
                             agent = %agent_addr,
                             error = %e,
-                            "failed to dispatch job to agent"
+                            "failed to dispatch job to agent — marking job failed"
+                        );
+                        let _ = cluster_for_dispatch.complete_job(
+                            job_id,
+                            -1,
+                            spur_core::job::JobState::Failed,
                         );
                     }
                 });

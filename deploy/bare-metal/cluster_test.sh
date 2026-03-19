@@ -393,6 +393,7 @@ SCRIPT
 chmod +x /tmp/spur-test-exitfail.sh
 
 JFAIL=$(${SPUR}/sbatch -J test-exitfail -N 1 \
+    -w mi300 \
     -o /tmp/spur-fail-$$.out \
     /tmp/spur-test-exitfail.sh 2>/dev/null | awk '{print $NF}')
 run_test "failed job: sbatch submitted" test -n "${JFAIL}"
@@ -426,6 +427,7 @@ SCRIPT
 chmod +x /tmp/spur-test-io.sh
 
 JIO=$(${SPUR}/sbatch -J test-custom-io -N 1 \
+    -w mi300 \
     -o "${CUSTOM_OUT}" -e "${CUSTOM_ERR}" \
     /tmp/spur-test-io.sh 2>/dev/null | awk '{print $NF}')
 run_test "custom io: submitted" test -n "${JIO}"
@@ -436,6 +438,7 @@ rm -f "${CUSTOM_OUT}" "${CUSTOM_ERR}"
 
 # %j substitution
 JSUBST=$(${SPUR}/sbatch -J test-subst -N 1 \
+    -w mi300 \
     -o "/tmp/spur-subst-%j.out" \
     /tmp/spur-test-basic.sh 2>/dev/null | awk '{print $NF}')
 run_test "%j substitution: submitted" test -n "${JSUBST}"
@@ -466,6 +469,7 @@ chmod +x /tmp/spur-test-env.sh
 
 JENV=$(MYVAR=hello123 MULTIVAR=world456 \
     ${SPUR}/sbatch -J test-env -N 1 \
+    -w mi300 \
     -o /tmp/spur-env-$$.out \
     --export=MYVAR,MULTIVAR \
     /tmp/spur-test-env.sh 2>/dev/null | awk '{print $NF}')
@@ -649,8 +653,8 @@ fi
 
 TOTAL=$((TOTAL + 1))
 echo -n "TEST ${TOTAL}: dist env: MASTER_ADDR non-empty on both nodes ... "
-LOCAL_MA=$(echo "${LOCAL_DIST}" | grep "^MASTER_ADDR=" | grep -v "MASTER_ADDR=$" | wc -l)
-REMOTE_MA=$(echo "${REMOTE_DIST}" | grep "^MASTER_ADDR=" | grep -v "MASTER_ADDR=$" | wc -l)
+LOCAL_MA=$(echo "${LOCAL_DIST}" | grep "^MASTER_ADDR=" | grep -v "MASTER_ADDR=$" | wc -l || true)
+REMOTE_MA=$(echo "${REMOTE_DIST}" | grep "^MASTER_ADDR=" | grep -v "MASTER_ADDR=$" | wc -l || true)
 if [ "${LOCAL_MA}" -ge 1 ] && [ "${REMOTE_MA}" -ge 1 ]; then
     echo "PASS"; PASS=$((PASS + 1))
 else
