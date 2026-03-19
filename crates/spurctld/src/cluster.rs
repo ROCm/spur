@@ -586,8 +586,12 @@ impl ClusterManager {
                 .map(|p| p.priority_tier)
                 .unwrap_or(1);
             // fair_share = 1.0 (neutral) until spurdbd integration
-            job.priority =
-                spur_sched::priority::effective_priority(job.priority, 1.0, age_minutes, partition_tier);
+            job.priority = spur_sched::priority::effective_priority(
+                job.priority,
+                1.0,
+                age_minutes,
+                partition_tier,
+            );
         }
 
         pending.sort_by(|a, b| b.priority.cmp(&a.priority));

@@ -8,6 +8,8 @@ use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
+use tokio_stream::wrappers::ReceiverStream;
+
 use spur_proto::proto::slurm_agent_server::{SlurmAgent, SlurmAgentServer};
 use spur_proto::proto::*;
 
@@ -61,7 +63,12 @@ impl AgentService {
             loop {
                 interval.tick().await;
                 let mut jobs = running.lock().await;
-                let mut completed: Vec<(u32, i32, crate::container::RootfsMode, Option<AllocationResult>)> = Vec::new();
+                let mut completed: Vec<(
+                    u32,
+                    i32,
+                    crate::container::RootfsMode,
+                    Option<AllocationResult>,
+                )> = Vec::new();
 
                 for (job_id, tracked) in jobs.iter_mut() {
                     match tracked.child.try_wait() {
@@ -166,6 +173,8 @@ async fn report_completion(controller_addr: &str, job_id: u32, exit_code: i32) {
 
 #[tonic::async_trait]
 impl SlurmAgent for AgentService {
+    type StreamJobOutputStream = ReceiverStream<Result<StreamJobOutputChunk, Status>>;
+
     async fn launch_job(
         &self,
         request: Request<LaunchJobRequest>,
@@ -493,6 +502,97 @@ impl SlurmAgent for AgentService {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         }))
+    }
+
+    async fn stream_job_output(
+        &self,
+        request: Request<StreamJobOutputRequest>,
+    ) -> Result<Response<Self::StreamJobOutputStream>, Status> {
+        let req = request.into_inner();
+        let job_id = req.job_id;
+
+        // Look up the output file path from the tracked job
+        let file_path = {
+            let jobs = self.running.lock().await;
+            match jobs.get(&job_id) {
+                Some(tracked) => {
+                    if req.stream == "stderr" {
+                        tracked.stderr_path.clone()
+                    } else {
+                        tracked.stdout_path.clone()
+                    }
+                }
+                None => {
+                    return Err(Status::not_found(format!(
+                        "job {} not running on this node",
+                        job_id
+                    )));
+                }
+            }
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let running = self.running.clone();
+
+        tokio::spawn(async move {
+            // Wait for the output file to appear
+            let mut waited = 0;
+            while !std::path::Path::new(&file_path).exists() && waited < 30 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                waited += 1;
+            }
+
+            let mut offset = 0u64;
+            loop {
+                // Read new data from the file
+                match tokio::fs::read(&file_path).await {
+                    Ok(data) => {
+                        if data.len() as u64 > offset {
+                            let new_data = data[offset as usize..].to_vec();
+                            offset = data.len() as u64;
+                            if tx
+                                .send(Ok(StreamJobOutputChunk {
+                                    data: new_data,
+                                    eof: false,
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                break; // Client disconnected
+                            }
+                        }
+                    }
+                    Err(_) => {} // File not ready yet
+                }
+
+                // Check if job is still running
+                let still_running = running.lock().await.contains_key(&job_id);
+                if !still_running {
+                    // Final read to get any remaining output
+                    if let Ok(data) = tokio::fs::read(&file_path).await {
+                        if data.len() as u64 > offset {
+                            let _ = tx
+                                .send(Ok(StreamJobOutputChunk {
+                                    data: data[offset as usize..].to_vec(),
+                                    eof: false,
+                                }))
+                                .await;
+                        }
+                    }
+                    let _ = tx
+                        .send(Ok(StreamJobOutputChunk {
+                            data: Vec::new(),
+                            eof: true,
+                        }))
+                        .await;
+                    break;
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 

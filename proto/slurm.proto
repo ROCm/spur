@@ -233,6 +233,7 @@ service SlurmAgent {
   rpc CancelJob(AgentCancelJobRequest) returns (google.protobuf.Empty);
   rpc GetNodeResources(google.protobuf.Empty) returns (NodeResourcesResponse);
   rpc ExecInJob(ExecInJobRequest) returns (ExecInJobResponse);
+  rpc StreamJobOutput(StreamJobOutputRequest) returns (stream StreamJobOutputChunk);
 }
 
 // -- Accounting service (slurmdbd) --
@@ -392,6 +393,16 @@ message ExecInJobResponse {
   int32 exit_code = 2;
   string stdout = 3;
   string stderr = 4;
+}
+
+message StreamJobOutputRequest {
+  uint32 job_id = 1;
+  string stream = 2;  // "stdout" or "stderr"
+}
+
+message StreamJobOutputChunk {
+  bytes data = 1;
+  bool eof = 2;
 }
 
 // -- Accounting --

@@ -1,8 +1,12 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
-use spur_proto::proto::{GetJobRequest, JobSpec, SubmitJobRequest};
+use spur_proto::proto::{
+    GetJobRequest, GetNodeRequest, JobSpec, StreamJobOutputRequest, SubmitJobRequest,
+};
 use std::collections::HashMap;
+use std::io::Write;
 
 /// Run a parallel job (interactive or allocation-based).
 #[derive(Parser, Debug)]
@@ -198,66 +202,189 @@ pub async fn main() -> Result<()> {
     let job_id = response.into_inner().job_id;
     eprintln!("srun: job {} submitted, waiting for completion...", job_id);
 
-    // Poll for completion
+    // Wait for the job to start running
     let mut poll_interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
-    let mut was_running = false;
+    #[allow(unused_assignments)]
+    let mut nodelist = String::new();
 
     loop {
         poll_interval.tick().await;
 
-        let resp = client.get_job(GetJobRequest { job_id }).await;
-
-        match resp {
+        match client.get_job(GetJobRequest { job_id }).await {
             Ok(resp) => {
                 let job = resp.into_inner();
-                let state = job.state;
-
-                if !was_running && state == 1 {
-                    // Just started running
-                    was_running = true;
-                    if !job.nodelist.is_empty() {
-                        eprintln!("srun: job {} running on {}", job_id, job.nodelist);
+                match job.state {
+                    1 => {
+                        // RUNNING
+                        nodelist = job.nodelist.clone();
+                        if !nodelist.is_empty() {
+                            eprintln!("srun: job {} running on {}", job_id, nodelist);
+                        }
+                        break;
                     }
-                }
-
-                // Check terminal states
-                match state {
-                    3 => {
-                        // COMPLETED
-                        // Try to read output
-                        print_job_output(&work_dir, job_id).await;
-                        std::process::exit(job.exit_code);
+                    3 | 4 | 5 | 6 | 7 => {
+                        // Already terminal
+                        handle_terminal_state(job.state, job_id, job.exit_code, &work_dir).await;
                     }
-                    4 => {
-                        // FAILED
-                        print_job_output(&work_dir, job_id).await;
-                        eprintln!(
-                            "srun: job {} failed with exit code {}",
-                            job_id, job.exit_code
-                        );
-                        std::process::exit(job.exit_code.max(1));
-                    }
-                    5 => {
-                        // CANCELLED
-                        eprintln!("srun: job {} cancelled", job_id);
-                        std::process::exit(1);
-                    }
-                    6 => {
-                        // TIMEOUT
-                        eprintln!("srun: job {} timed out", job_id);
-                        std::process::exit(1);
-                    }
-                    7 => {
-                        // NODE_FAIL
-                        eprintln!("srun: job {} failed (node failure)", job_id);
-                        std::process::exit(1);
-                    }
-                    _ => {} // Still pending or running
+                    _ => {} // Still pending
                 }
             }
             Err(e) => {
                 eprintln!("srun: warning: failed to get job status: {}", e.message());
             }
+        }
+    }
+
+    // Try streaming output from the agent
+    let streamed = try_stream_output(&mut client, &nodelist, job_id).await;
+
+    if !streamed {
+        // Fallback: poll for completion and read output file
+        poll_for_completion(&mut client, job_id, &work_dir).await;
+    }
+
+    Ok(())
+}
+
+/// Try to stream live output from the agent. Returns true if streaming succeeded.
+async fn try_stream_output(
+    controller: &mut SlurmControllerClient<tonic::transport::Channel>,
+    nodelist: &str,
+    job_id: u32,
+) -> bool {
+    // Get the first node's agent address
+    let first_node = nodelist.split(',').next().unwrap_or(nodelist).trim();
+    if first_node.is_empty() {
+        return false;
+    }
+
+    // Verify the node exists, then try connecting to the agent on the standard port.
+    if controller
+        .get_node(GetNodeRequest {
+            name: first_node.to_string(),
+        })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    let agent_addr = format!("http://{}:6818", first_node);
+
+    let mut agent = match SlurmAgentClient::connect(agent_addr).await {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    let stream_result = agent
+        .stream_job_output(StreamJobOutputRequest {
+            job_id,
+            stream: "stdout".into(),
+        })
+        .await;
+
+    let mut stream = match stream_result {
+        Ok(resp) => resp.into_inner(),
+        Err(e) => {
+            if e.code() == tonic::Code::Unimplemented {
+                // Old agent without streaming support
+                return false;
+            }
+            return false;
+        }
+    };
+
+    // Stream chunks to stdout
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    loop {
+        match stream.message().await {
+            Ok(Some(chunk)) => {
+                if chunk.eof {
+                    break;
+                }
+                let _ = handle.write_all(&chunk.data);
+                let _ = handle.flush();
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    drop(handle);
+
+    // Wait for terminal state and get exit code
+    let mut poll_interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+    loop {
+        poll_interval.tick().await;
+        match controller.get_job(GetJobRequest { job_id }).await {
+            Ok(resp) => {
+                let job = resp.into_inner();
+                if job.state >= 3 {
+                    // Terminal
+                    let code = if job.state == 3 {
+                        job.exit_code
+                    } else {
+                        job.exit_code.max(1)
+                    };
+                    std::process::exit(code);
+                }
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+/// Poll-based fallback for agents that don't support streaming.
+async fn poll_for_completion(
+    client: &mut SlurmControllerClient<tonic::transport::Channel>,
+    job_id: u32,
+    work_dir: &str,
+) {
+    let mut poll_interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+    loop {
+        poll_interval.tick().await;
+        match client.get_job(GetJobRequest { job_id }).await {
+            Ok(resp) => {
+                let job = resp.into_inner();
+                if job.state >= 3 {
+                    handle_terminal_state(job.state, job_id, job.exit_code, work_dir).await;
+                }
+            }
+            Err(e) => {
+                eprintln!("srun: warning: failed to get job status: {}", e.message());
+            }
+        }
+    }
+}
+
+async fn handle_terminal_state(state: i32, job_id: u32, exit_code: i32, work_dir: &str) -> ! {
+    match state {
+        3 => {
+            // COMPLETED
+            print_job_output(work_dir, job_id).await;
+            std::process::exit(exit_code);
+        }
+        4 => {
+            // FAILED
+            print_job_output(work_dir, job_id).await;
+            eprintln!("srun: job {} failed with exit code {}", job_id, exit_code);
+            std::process::exit(exit_code.max(1));
+        }
+        5 => {
+            eprintln!("srun: job {} cancelled", job_id);
+            std::process::exit(1);
+        }
+        6 => {
+            eprintln!("srun: job {} timed out", job_id);
+            std::process::exit(1);
+        }
+        7 => {
+            eprintln!("srun: job {} failed (node failure)", job_id);
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("srun: job {} ended with state {}", job_id, state);
+            std::process::exit(1);
         }
     }
 }

@@ -28,6 +28,9 @@ impl VirtualAgent {
 
 #[tonic::async_trait]
 impl SlurmAgent for VirtualAgent {
+    type StreamJobOutputStream =
+        tokio_stream::wrappers::ReceiverStream<Result<StreamJobOutputChunk, Status>>;
+
     async fn launch_job(
         &self,
         request: Request<LaunchJobRequest>,
@@ -377,6 +380,15 @@ impl SlurmAgent for VirtualAgent {
             "exec into K8s pod {} not yet implemented",
             pod_name
         )))
+    }
+
+    async fn stream_job_output(
+        &self,
+        _request: Request<StreamJobOutputRequest>,
+    ) -> Result<Response<Self::StreamJobOutputStream>, Status> {
+        Err(Status::unimplemented(
+            "output streaming not supported for K8s agent",
+        ))
     }
 }
 
