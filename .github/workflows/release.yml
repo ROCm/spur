@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build release binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protobuf compiler
+        run: sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Package binaries
+        run: |
+          VERSION="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          DIST="spur-${VERSION}-linux-amd64"
+          mkdir -p "${DIST}/bin"
+          for bin in spur spurctld spurd spurdbd spurrestd; do
+            cp "target/release/${bin}" "${DIST}/bin/"
+          done
+
+          # Create Slurm-compat symlinks
+          cd "${DIST}/bin"
+          for cmd in sbatch srun squeue scancel sinfo sacct scontrol; do
+            ln -s spur "${cmd}"
+          done
+          cd ../..
+
+          # Include config + deploy examples
+          mkdir -p "${DIST}/etc"
+          cp deploy/bare-metal/spur.conf "${DIST}/etc/spur.conf.example"
+
+          tar czf "${DIST}.tar.gz" "${DIST}"
+          sha256sum "${DIST}.tar.gz" > "${DIST}.tar.gz.sha256"
+          echo "DIST=${DIST}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spur-linux-amd64
+          path: |
+            spur-*.tar.gz
+            spur-*.tar.gz.sha256
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: spur-linux-amd64
+
+      - name: Determine tag
+        id: tag
+        run: echo "tag=${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}" >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          gh release create "${TAG}" \
+            --title "Spur ${TAG}" \
+            --generate-notes \
+            spur-*.tar.gz spur-*.tar.gz.sha256
