@@ -532,7 +532,7 @@ mod tests {
         assert_eq!(parse_time_seconds("60"), Some(3600));
         // "H:MM" → exact seconds
         assert_eq!(parse_time_seconds("1:30"), Some(5400)); // 1h30m
-        // "H:MM:SS" → exact seconds (the key case)
+                                                            // "H:MM:SS" → exact seconds (the key case)
         assert_eq!(parse_time_seconds("0:00:10"), Some(10));
         assert_eq!(parse_time_seconds("0:01:30"), Some(90));
         assert_eq!(parse_time_seconds("1:00:00"), Some(3600));

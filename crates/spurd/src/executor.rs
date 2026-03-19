@@ -125,7 +125,10 @@ pub async fn launch_job(
     let effective_work_dir: String = if tokio::fs::create_dir_all(work_dir).await.is_ok() {
         work_dir.to_string()
     } else {
-        warn!(job_id, work_dir, "work_dir unavailable on this node, using /tmp");
+        warn!(
+            job_id,
+            work_dir, "work_dir unavailable on this node, using /tmp"
+        );
         "/tmp".to_string()
     };
     let work_dir = effective_work_dir.as_str();
