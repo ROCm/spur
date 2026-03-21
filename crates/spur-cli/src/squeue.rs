@@ -55,7 +55,11 @@ pub struct SqueueArgs {
 }
 
 pub async fn main() -> Result<()> {
-    let args = SqueueArgs::try_parse_from(std::env::args())?;
+    main_with_args(std::env::args().collect()).await
+}
+
+pub async fn main_with_args(args: Vec<String>) -> Result<()> {
+    let args = SqueueArgs::try_parse_from(&args)?;
 
     // Determine format
     let fmt = if let Some(ref f) = args.format {

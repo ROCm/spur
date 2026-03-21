@@ -282,9 +282,12 @@ fn parse_memory_mb(s: &str) -> Result<u64> {
 }
 
 pub async fn main() -> Result<()> {
+    main_with_args(std::env::args().collect()).await
+}
+
+pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
     // Build argv: merge #SBATCH directives (from script) with CLI args.
     // CLI args take precedence (they come after in the merged argv).
-    let cli_args: Vec<String> = std::env::args().collect();
 
     // If script is provided, parse directives from it
     let script_content = if let Some(script_path) = cli_args.last() {

@@ -85,7 +85,11 @@ pub enum NetCommand {
 }
 
 pub async fn main() -> Result<()> {
-    let args = NetArgs::parse();
+    main_with_args(std::env::args().collect()).await
+}
+
+pub async fn main_with_args(args: Vec<String>) -> Result<()> {
+    let args = NetArgs::try_parse_from(&args)?;
 
     match args.command {
         NetCommand::Init {
