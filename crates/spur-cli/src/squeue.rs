@@ -55,7 +55,11 @@ pub struct SqueueArgs {
 }
 
 pub async fn main() -> Result<()> {
-    let args = SqueueArgs::try_parse_from(std::env::args())?;
+    main_with_args(std::env::args().collect()).await
+}
+
+pub async fn main_with_args(args: Vec<String>) -> Result<()> {
+    let args = SqueueArgs::try_parse_from(&args)?;
 
     // Determine format
     let fmt = if let Some(ref f) = args.format {
@@ -68,7 +72,7 @@ pub async fn main() -> Result<()> {
 
     let fields = format_engine::parse_format(&fmt, &format_engine::squeue_header);
 
-    // Parse state filter
+    // Parse state filter — default to Pending+Running when no filter specified (Slurm default)
     let states = args
         .states
         .as_ref()
@@ -77,7 +81,12 @@ pub async fn main() -> Result<()> {
                 .filter_map(|st| parse_state_filter(st.trim()))
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            vec![
+                spur_proto::proto::JobState::JobPending,
+                spur_proto::proto::JobState::JobRunning,
+            ]
+        });
 
     // Parse job ID filter
     let job_ids = args

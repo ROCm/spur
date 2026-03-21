@@ -44,6 +44,13 @@ pub fn parse_format(fmt: &str, header_map: &dyn Fn(char) -> &'static str) -> Vec
         let mut truncate = false;
         let mut width: i32 = 0;
         let mut has_width = false;
+        let mut hash_flag = false;
+
+        // Leading # = variable-width, left-aligned (no padding/truncation)
+        if chars.peek() == Some(&'#') {
+            hash_flag = true;
+            chars.next();
+        }
 
         // Leading dot = truncate mode
         if chars.peek() == Some(&'.') {
@@ -52,9 +59,13 @@ pub fn parse_format(fmt: &str, header_map: &dyn Fn(char) -> &'static str) -> Vec
         }
 
         // Width (possibly negative for left-align)
-        let negative = chars.peek() == Some(&'-');
+        let mut negative = chars.peek() == Some(&'-');
         if negative {
             chars.next();
+        }
+
+        if hash_flag {
+            negative = true; // # implies left-align
         }
 
         while let Some(&d) = chars.peek() {
@@ -78,7 +89,7 @@ pub fn parse_format(fmt: &str, header_map: &dyn Fn(char) -> &'static str) -> Vec
         };
 
         let abs_width = width.unsigned_abs() as usize;
-        let right_align = width >= 0;
+        let right_align = if hash_flag { false } else { width >= 0 };
         let header = header_map(spec).to_string();
 
         fields.push(FormatField {
@@ -202,7 +213,6 @@ pub fn sinfo_header(spec: char) -> &'static str {
         'n' => "HOSTNAMES",
         'O' => "CPU_LOAD",
         'e' => "FREE_MEM",
-        '#' => "", // Special: partition name with * for default
         _ => "?",
     }
 }

@@ -228,6 +228,7 @@ impl ClusterManager {
             .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
 
         let old_state = job.state;
+        let exclusive = job.spec.exclusive;
         job.transition(JobState::Running)?;
         job.start_time = Some(Utc::now());
         job.allocated_nodes = node_names.clone();
@@ -265,7 +266,12 @@ impl ClusterManager {
         let mut nodes = self.nodes.write();
         for name in &node_names {
             if let Some(node) = nodes.get_mut(name) {
-                node.alloc_resources = node.alloc_resources.add(&per_node);
+                if exclusive {
+                    // Exclusive: claim entire node so no other jobs can co-schedule
+                    node.alloc_resources = node.total_resources.clone();
+                } else {
+                    node.alloc_resources = node.alloc_resources.add(&per_node);
+                }
                 node.update_state_from_alloc();
             }
         }
@@ -331,8 +337,55 @@ impl ClusterManager {
         }
 
         debug!(job_id, exit_code, "job completed");
+
+        // Check for requeue: if the job has --requeue and hit a retriable state,
+        // reset it to Pending so the scheduler picks it up again.
+        let should_requeue = matches!(
+            state,
+            JobState::Timeout | JobState::Preempted | JobState::NodeFail
+        );
+        if should_requeue {
+            self.maybe_requeue(job_id);
+        }
+
         self.maybe_snapshot();
         Ok(())
+    }
+
+    /// Requeue a job if spec.requeue is set and attempt limit not exceeded.
+    fn maybe_requeue(&self, job_id: JobId) {
+        const MAX_REQUEUE: u32 = 3;
+        let mut jobs = self.jobs.write();
+        let Some(job) = jobs.get_mut(&job_id) else {
+            return;
+        };
+        if !job.spec.requeue || job.requeue_count >= MAX_REQUEUE {
+            return;
+        }
+
+        let old_state = job.state;
+        if job.transition(JobState::Pending).is_err() {
+            return;
+        }
+        job.requeue_count += 1;
+        job.start_time = None;
+        job.exit_code = None;
+        job.allocated_nodes.clear();
+        job.allocated_resources = None;
+        job.pending_reason = PendingReason::Priority;
+
+        self.append_wal(WalOperation::JobStateChange {
+            job_id,
+            old_state,
+            new_state: JobState::Pending,
+        });
+
+        info!(
+            job_id,
+            requeue_count = job.requeue_count,
+            from = %old_state,
+            "job requeued"
+        );
     }
 
     /// Register a node agent.

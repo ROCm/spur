@@ -56,7 +56,11 @@ pub struct ScancelArgs {
 }
 
 pub async fn main() -> Result<()> {
-    let args = ScancelArgs::try_parse_from(std::env::args())?;
+    main_with_args(std::env::args().collect()).await
+}
+
+pub async fn main_with_args(args: Vec<String>) -> Result<()> {
+    let args = ScancelArgs::try_parse_from(&args)?;
 
     if args.job_ids.is_empty() && args.user.is_none() && args.name.is_none() {
         bail!("scancel: no job IDs or filters specified");

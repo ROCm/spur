@@ -43,30 +43,55 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
+    // Map command name to the canonical binary name used by the subcommand parser.
+    // This is needed because each subcommand calls try_parse_from(std::env::args())
+    // and expects argv[0] to be its own name (e.g., "squeue"), not "spur".
+    // We rewrite argv so the subcommand sees ["squeue", ...remaining args...].
+    let canonical = match args[1].as_str() {
+        "submit" => Some("sbatch"),
+        "run" => Some("srun"),
+        "queue" | "jobs" => Some("squeue"),
+        "cancel" | "kill" => Some("scancel"),
+        "nodes" | "info" => Some("sinfo"),
+        "history" | "acct" => Some("sacct"),
+        "accounts" | "acctmgr" => Some("sacctmgr"),
+        "show" | "control" | "ctl" => Some("scontrol"),
+        "sbatch" | "srun" | "squeue" | "scancel" | "sinfo" | "sacct" | "sacctmgr" | "scontrol" => {
+            Some(args[1].as_str())
+        }
+        "net" | "image" | "exec" => Some(args[1].as_str()),
+        _ => None,
+    };
+
+    if let Some(cmd) = canonical {
+        // Rewrite argv: replace ["spur", "cmd", ...rest] with ["cmd", ...rest]
+        let rewritten: Vec<String> = std::iter::once(cmd.to_string())
+            .chain(args[2..].iter().cloned())
+            .collect();
+        // Temporarily override process args for the subcommand parser
+        std::env::set_var("SPUR_ARGV0_OVERRIDE", "1");
+        let result = match cmd {
+            "sbatch" | "submit" => runtime.block_on(sbatch::main_with_args(rewritten)),
+            "srun" | "run" => runtime.block_on(srun::main_with_args(rewritten)),
+            "squeue" | "queue" | "jobs" => runtime.block_on(squeue::main_with_args(rewritten)),
+            "scancel" | "cancel" | "kill" => runtime.block_on(scancel::main_with_args(rewritten)),
+            "sinfo" | "nodes" | "info" => runtime.block_on(sinfo::main_with_args(rewritten)),
+            "sacct" | "history" | "acct" => runtime.block_on(sacct::main_with_args(rewritten)),
+            "sacctmgr" | "accounts" | "acctmgr" => {
+                runtime.block_on(sacctmgr::main_with_args(rewritten))
+            }
+            "scontrol" | "show" | "control" | "ctl" => {
+                runtime.block_on(scontrol::main_with_args(rewritten))
+            }
+            "net" => runtime.block_on(net::main_with_args(rewritten)),
+            "image" => runtime.block_on(image::main_with_args(rewritten)),
+            "exec" => runtime.block_on(exec::main_with_args(rewritten)),
+            _ => unreachable!(),
+        };
+        return result;
+    }
+
     match args[1].as_str() {
-        // Native spur commands
-        "net" => runtime.block_on(net::main()),
-        "image" => runtime.block_on(image::main()),
-        "exec" => runtime.block_on(exec::main()),
-        "submit" => runtime.block_on(sbatch::main()),
-        "run" => runtime.block_on(srun::main()),
-        "queue" | "jobs" => runtime.block_on(squeue::main()),
-        "cancel" | "kill" => runtime.block_on(scancel::main()),
-        "nodes" | "info" => runtime.block_on(sinfo::main()),
-        "history" | "acct" => runtime.block_on(sacct::main()),
-        "accounts" | "acctmgr" => runtime.block_on(sacctmgr::main()),
-        "show" | "control" | "ctl" => runtime.block_on(scontrol::main()),
-
-        // Slurm-compatible subcommands (for migration)
-        "sbatch" => runtime.block_on(sbatch::main()),
-        "srun" => runtime.block_on(srun::main()),
-        "squeue" => runtime.block_on(squeue::main()),
-        "scancel" => runtime.block_on(scancel::main()),
-        "sinfo" => runtime.block_on(sinfo::main()),
-        "sacct" => runtime.block_on(sacct::main()),
-        "sacctmgr" => runtime.block_on(sacctmgr::main()),
-        "scontrol" => runtime.block_on(scontrol::main()),
-
         "version" | "--version" | "-V" => {
             println!("spur {}", env!("CARGO_PKG_VERSION"));
             Ok(())
