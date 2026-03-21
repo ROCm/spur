@@ -107,12 +107,11 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     } else {
         // One line per partition (summarized)
         for part in &partitions {
-            // Count nodes by state for this partition
+            // Collect nodes belonging to this partition
             let part_nodes: Vec<_> = nodes.iter().filter(|n| n.partition == part.name).collect();
-            let total = part_nodes.len();
 
             let row = format_engine::format_row(&fields, &|spec| {
-                resolve_partition_field(part, &part_nodes, total, spec)
+                resolve_partition_field(part, &part_nodes, spec)
             });
             println!("{}", row);
         }
@@ -123,12 +122,12 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
 fn resolve_node_field(
     node: &spur_proto::proto::NodeInfo,
-    partitions: &[spur_proto::proto::PartitionInfo],
+    _partitions: &[spur_proto::proto::PartitionInfo],
     spec: char,
 ) -> String {
     match spec {
         'N' | 'n' => node.name.clone(),
-        'P' | 'R' | '#' => node.partition.clone(),
+        'P' | 'R' => node.partition.clone(),
         't' | 'T' => node_state_str(node.state),
         'c' => {
             if let Some(ref r) = node.total_resources {
@@ -177,18 +176,10 @@ fn resolve_node_field(
 fn resolve_partition_field(
     part: &spur_proto::proto::PartitionInfo,
     nodes: &[&spur_proto::proto::NodeInfo],
-    total_nodes: usize,
     spec: char,
 ) -> String {
     match spec {
         'P' | 'R' => {
-            if part.is_default {
-                format!("{}*", part.name)
-            } else {
-                part.name.clone()
-            }
-        }
-        '#' => {
             if part.is_default {
                 format!("{}*", part.name)
             } else {
@@ -203,11 +194,12 @@ fn resolve_partition_field(
                 "infinite".into()
             }
         }
-        'D' => total_nodes.to_string(),
+        'D' => part.total_nodes.to_string(),
         't' | 'T' => {
             // Summarize node states
             if nodes.is_empty() {
-                "n/a".into()
+                // No node details available; default to idle
+                "idle".into()
             } else {
                 // Show most common state
                 let mut counts = std::collections::HashMap::new();
