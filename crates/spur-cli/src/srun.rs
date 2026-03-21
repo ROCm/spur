@@ -3,7 +3,8 @@ use clap::Parser;
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
-    GetJobRequest, GetNodeRequest, JobSpec, StreamJobOutputRequest, SubmitJobRequest,
+    CancelJobRequest, GetJobRequest, GetNodeRequest, JobSpec, StreamJobOutputRequest,
+    SubmitJobRequest,
 };
 use std::collections::HashMap;
 use std::io::Write;
@@ -204,7 +205,26 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .context("job submission failed")?;
 
     let job_id = response.into_inner().job_id;
+    let user = whoami::username().unwrap_or_else(|_| "unknown".into());
     eprintln!("srun: job {} submitted, waiting for completion...", job_id);
+
+    // Set up Ctrl+C handler to cancel the job on interrupt
+    let cancel_client = client.clone();
+    let cancel_user = user.clone();
+    tokio::spawn(async move {
+        let mut cancel_client = cancel_client;
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("\nsrun: cancelling job {}...", job_id);
+            let _ = cancel_client
+                .cancel_job(CancelJobRequest {
+                    job_id,
+                    signal: 2, // SIGINT
+                    user: cancel_user,
+                })
+                .await;
+            std::process::exit(130); // Standard SIGINT exit code
+        }
+    });
 
     // Wait for the job to start running
     let mut poll_interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
