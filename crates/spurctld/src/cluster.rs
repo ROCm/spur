@@ -172,11 +172,7 @@ impl ClusterManager {
 
         // Check partition state
         if part.state != spur_core::partition::PartitionState::Up {
-            anyhow::bail!(
-                "partition '{}' is {}",
-                partition_name,
-                part.state.display()
-            );
+            anyhow::bail!("partition '{}' is {}", partition_name, part.state.display());
         }
 
         // Check allow_accounts (if non-empty, user's account must be in the list)

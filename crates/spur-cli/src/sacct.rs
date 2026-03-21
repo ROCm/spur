@@ -268,11 +268,17 @@ fn parse_time_arg(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 
     // Relative: "now-Ndays", "now-Nhours"
     if let Some(rest) = s.strip_prefix("now-") {
-        if let Some(days) = rest.strip_suffix("days").or_else(|| rest.strip_suffix("day")) {
+        if let Some(days) = rest
+            .strip_suffix("days")
+            .or_else(|| rest.strip_suffix("day"))
+        {
             let n: i64 = days.trim().parse().ok()?;
             return Some(Utc::now() - chrono::Duration::days(n));
         }
-        if let Some(hours) = rest.strip_suffix("hours").or_else(|| rest.strip_suffix("hour")) {
+        if let Some(hours) = rest
+            .strip_suffix("hours")
+            .or_else(|| rest.strip_suffix("hour"))
+        {
             let n: i64 = hours.trim().parse().ok()?;
             return Some(Utc::now() - chrono::Duration::hours(n));
         }
@@ -285,9 +291,7 @@ fn parse_time_arg(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 
     // Date only: "2024-01-01"
     if let Ok(nd) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        return nd
-            .and_hms_opt(0, 0, 0)
-            .map(|ndt| ndt.and_utc());
+        return nd.and_hms_opt(0, 0, 0).map(|ndt| ndt.and_utc());
     }
 
     None
