@@ -124,12 +124,23 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .await
         .context("failed to connect to spurdbd")?;
 
+    let start_after = args
+        .starttime
+        .as_deref()
+        .and_then(parse_time_arg)
+        .map(datetime_to_proto);
+    let start_before = args
+        .endtime
+        .as_deref()
+        .and_then(parse_time_arg)
+        .map(datetime_to_proto);
+
     let response = client
         .get_job_history(GetJobHistoryRequest {
             user: args.user.unwrap_or_default(),
             account: args.account.unwrap_or_default(),
-            start_after: None, // TODO: parse starttime
-            start_before: None,
+            start_after,
+            start_before,
             states,
             limit: args.limit,
         })
@@ -246,5 +257,49 @@ fn format_timestamp(ts: Option<&prost_types::Timestamp>) -> String {
             dt.format("%Y-%m-%dT%H:%M:%S").to_string()
         }
         _ => "Unknown".into(),
+    }
+}
+
+/// Parse a time argument string into a DateTime.
+/// Supports: "2024-01-01", "2024-01-01T00:00:00", "now-7days", "now-24hours".
+fn parse_time_arg(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::{NaiveDate, NaiveDateTime, Utc};
+    let s = s.trim();
+
+    // Relative: "now-Ndays", "now-Nhours"
+    if let Some(rest) = s.strip_prefix("now-") {
+        if let Some(days) = rest
+            .strip_suffix("days")
+            .or_else(|| rest.strip_suffix("day"))
+        {
+            let n: i64 = days.trim().parse().ok()?;
+            return Some(Utc::now() - chrono::Duration::days(n));
+        }
+        if let Some(hours) = rest
+            .strip_suffix("hours")
+            .or_else(|| rest.strip_suffix("hour"))
+        {
+            let n: i64 = hours.trim().parse().ok()?;
+            return Some(Utc::now() - chrono::Duration::hours(n));
+        }
+    }
+
+    // ISO datetime: "2024-01-01T00:00:00"
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        return Some(ndt.and_utc());
+    }
+
+    // Date only: "2024-01-01"
+    if let Ok(nd) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return nd.and_hms_opt(0, 0, 0).map(|ndt| ndt.and_utc());
+    }
+
+    None
+}
+
+fn datetime_to_proto(dt: chrono::DateTime<chrono::Utc>) -> prost_types::Timestamp {
+    prost_types::Timestamp {
+        seconds: dt.timestamp(),
+        nanos: dt.timestamp_subsec_nanos() as i32,
     }
 }
