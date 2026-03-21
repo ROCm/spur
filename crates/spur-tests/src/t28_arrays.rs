@@ -120,4 +120,52 @@ mod tests {
         assert_eq!(task1.state, JobState::Running);
         assert_eq!(task2.state, JobState::Pending);
     }
+
+    // ── T28.7: Array max concurrent parsing ────────────────────
+
+    #[test]
+    fn t28_7_array_max_concurrent_set() {
+        use spur_core::array::parse_array_spec;
+
+        // Parse array spec "0-9%3", verify max_concurrent = 3
+        let spec = parse_array_spec("0-9%3").unwrap();
+        assert_eq!(spec.max_concurrent, 3);
+        assert_eq!(spec.task_ids.len(), 10);
+        assert_eq!(spec.task_ids, (0..=9).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn t28_8_array_max_concurrent_zero_means_unlimited() {
+        use spur_core::array::parse_array_spec;
+
+        // Without %N, max_concurrent should be 0 (unlimited)
+        let spec = parse_array_spec("0-9").unwrap();
+        assert_eq!(spec.max_concurrent, 0);
+    }
+
+    #[test]
+    fn t28_9_array_max_concurrent_with_step() {
+        use spur_core::array::parse_array_spec;
+
+        // Combine step and concurrent limit: "0-20:5%2"
+        let spec = parse_array_spec("0-20:5%2").unwrap();
+        assert_eq!(spec.task_ids, vec![0, 5, 10, 15, 20]);
+        assert_eq!(spec.max_concurrent, 2);
+    }
+
+    #[test]
+    fn t28_10_array_max_concurrent_stored_on_job() {
+        // Verify array_max_concurrent field on Job struct
+        let mut job = Job::new(
+            300,
+            JobSpec {
+                name: "array_conc".into(),
+                user: "test".into(),
+                array_spec: Some("0-99%5".into()),
+                ..Default::default()
+            },
+        );
+        job.array_max_concurrent = Some(5);
+        assert_eq!(job.array_max_concurrent, Some(5));
+    }
 }

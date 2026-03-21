@@ -287,4 +287,129 @@ mod tests {
         let sched = BackfillScheduler::new(100);
         assert_eq!(sched.name(), "backfill");
     }
+
+    // ── T07.13: Exclusive mode blocks co-scheduling ────────────
+
+    #[test]
+    fn t07_13_exclusive_blocks_coscheduling() {
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2, 64, 256_000);
+        // Simulate node001 already having an allocation (partially used)
+        nodes[0].alloc_resources.cpus = 32;
+        nodes[0].state = NodeState::Mixed;
+
+        let partitions = vec![make_partition("default", 2)];
+
+        // Exclusive job requires an idle node — node001 has allocs, so only node002 works
+        let mut job = make_job_with_resources("excl", 1, 1, 1, Some(60));
+        job.spec.exclusive = true;
+
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
+        let assignments = sched.schedule(&[job], &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes[0], "node002");
+    }
+
+    #[test]
+    fn t07_14_exclusive_no_idle_nodes() {
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2, 64, 256_000);
+        // Both nodes have allocations
+        nodes[0].alloc_resources.cpus = 16;
+        nodes[0].state = NodeState::Mixed;
+        nodes[1].alloc_resources.cpus = 8;
+        nodes[1].state = NodeState::Mixed;
+
+        let partitions = vec![make_partition("default", 2)];
+
+        let mut job = make_job_with_resources("excl", 1, 1, 1, Some(60));
+        job.spec.exclusive = true;
+
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
+        let assignments = sched.schedule(&[job], &cluster);
+        // No idle nodes available, so exclusive job cannot be scheduled
+        assert_eq!(assignments.len(), 0);
+    }
+
+    #[test]
+    fn t07_15_non_exclusive_allows_mixed() {
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2, 64, 256_000);
+        // node001 partially allocated
+        nodes[0].alloc_resources.cpus = 32;
+        nodes[0].state = NodeState::Mixed;
+
+        let partitions = vec![make_partition("default", 2)];
+
+        // Non-exclusive job should schedule on mixed node
+        let job = make_job_with_resources("normal", 1, 1, 1, Some(60));
+
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
+        let assignments = sched.schedule(&[job], &cluster);
+        assert_eq!(assignments.len(), 1);
+    }
+
+    // ── T07.16: Constraint filtering ──────────────────────────
+
+    #[test]
+    fn t07_16_constraint_filters_nodes() {
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(3, 64, 256_000);
+        nodes[0].features = vec!["gpu".into(), "nvme".into()];
+        nodes[1].features = vec!["nvme".into()];
+        nodes[2].features = vec!["gpu".into(), "nvme".into()];
+
+        let partitions = vec![make_partition("default", 3)];
+
+        let mut job = make_job_with_resources("constrained", 1, 1, 1, Some(60));
+        job.spec.constraint = Some("gpu".into());
+
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
+        let assignments = sched.schedule(&[job], &cluster);
+        assert_eq!(assignments.len(), 1);
+        // Should be assigned to node001 or node003 (both have "gpu")
+        let name = &assignments[0].nodes[0];
+        assert!(
+            name == "node001" || name == "node003",
+            "expected node with 'gpu' feature, got {}",
+            name
+        );
+    }
+
+    #[test]
+    fn t07_17_constraint_no_match() {
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2, 64, 256_000);
+        nodes[0].features = vec!["cpu_only".into()];
+        nodes[1].features = vec!["cpu_only".into()];
+
+        let partitions = vec![make_partition("default", 2)];
+
+        let mut job = make_job_with_resources("need-gpu", 1, 1, 1, Some(60));
+        job.spec.constraint = Some("gpu".into());
+
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
+        let assignments = sched.schedule(&[job], &cluster);
+        assert_eq!(assignments.len(), 0, "no node has 'gpu' feature");
+    }
 }

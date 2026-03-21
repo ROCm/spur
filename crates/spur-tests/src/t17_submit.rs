@@ -146,4 +146,108 @@ mod tests {
         assert_eq!(job.spec.dependency.len(), 2);
         assert_eq!(job.spec.dependency[0], "afterok:100");
     }
+
+    // ── T17.11–14: Partition configuration validation ──────────
+
+    #[test]
+    fn t17_11_partition_max_nodes_field() {
+        use spur_core::partition::Partition;
+
+        // Partition with max_nodes=2 should store the limit
+        let part = Partition {
+            name: "small".into(),
+            max_nodes: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(part.max_nodes, Some(2));
+    }
+
+    #[test]
+    fn t17_12_partition_allow_accounts_field() {
+        use spur_core::partition::Partition;
+
+        // Partition with allow_accounts restriction
+        let part = Partition {
+            name: "research".into(),
+            allow_accounts: vec!["research".into(), "faculty".into()],
+            ..Default::default()
+        };
+        assert!(part.allow_accounts.contains(&"research".into()));
+        assert!(!part.allow_accounts.contains(&"other".into()));
+    }
+
+    #[test]
+    fn t17_13_partition_deny_accounts_field() {
+        use spur_core::partition::Partition;
+
+        let part = Partition {
+            name: "restricted".into(),
+            deny_accounts: vec!["student".into()],
+            ..Default::default()
+        };
+        assert!(part.deny_accounts.contains(&"student".into()));
+    }
+
+    #[test]
+    fn t17_14_partition_preempt_modes() {
+        use spur_core::partition::{Partition, PreemptMode};
+
+        let part_off = Partition {
+            name: "nopreempt".into(),
+            preempt_mode: PreemptMode::Off,
+            ..Default::default()
+        };
+        assert_eq!(part_off.preempt_mode, PreemptMode::Off);
+
+        let part_requeue = Partition {
+            name: "requeue".into(),
+            preempt_mode: PreemptMode::Requeue,
+            ..Default::default()
+        };
+        assert_eq!(part_requeue.preempt_mode, PreemptMode::Requeue);
+    }
+
+    #[test]
+    fn t17_15_partition_max_time() {
+        use spur_core::partition::Partition;
+
+        let part = Partition {
+            name: "short".into(),
+            max_time_minutes: Some(60),
+            default_time_minutes: Some(30),
+            ..Default::default()
+        };
+        assert_eq!(part.max_time_minutes, Some(60));
+        assert_eq!(part.default_time_minutes, Some(30));
+    }
+
+    #[test]
+    fn t17_16_job_requeue_flag() {
+        // Verify the requeue flag is stored on the job spec
+        let job = spur_core::job::Job::new(
+            1,
+            spur_core::job::JobSpec {
+                name: "requeueable".into(),
+                user: "alice".into(),
+                requeue: true,
+                ..Default::default()
+            },
+        );
+        assert!(job.spec.requeue);
+    }
+
+    #[test]
+    fn t17_17_job_exclusive_flag() {
+        // Verify the exclusive flag is stored on the job spec
+        let job = spur_core::job::Job::new(
+            1,
+            spur_core::job::JobSpec {
+                name: "exclusive".into(),
+                user: "alice".into(),
+                exclusive: true,
+                ..Default::default()
+            },
+        );
+        assert!(job.spec.exclusive);
+    }
 }

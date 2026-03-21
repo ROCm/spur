@@ -478,6 +478,83 @@ mod tests {
     }
 
     #[test]
+    fn test_constraint_matches_features() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(4);
+        // Give nodes different features
+        nodes[0].features = vec!["mi300x".into(), "nvlink".into()];
+        nodes[1].features = vec!["mi300x".into(), "nvlink".into()];
+        nodes[2].features = vec!["h100".into()];
+        nodes[3].features = vec!["h100".into()];
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        // Job requiring mi300x should only match nodes 0,1
+        let mut job = make_job(1, 1, 32);
+        job.spec.constraint = Some("mi300x".into());
+
+        let pending = vec![job];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        // Should be on node001 or node002 (mi300x nodes)
+        assert!(assignments[0].nodes[0] == "node001" || assignments[0].nodes[0] == "node002");
+    }
+
+    #[test]
+    fn test_constraint_no_match() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2);
+        nodes[0].features = vec!["h100".into()];
+        nodes[1].features = vec!["h100".into()];
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let mut job = make_job(1, 1, 32);
+        job.spec.constraint = Some("mi300x".into());
+
+        let pending = vec![job];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 0); // No nodes with mi300x
+    }
+
+    #[test]
+    fn test_constraint_multi_feature() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(3);
+        nodes[0].features = vec!["mi300x".into(), "nvlink".into()];
+        nodes[1].features = vec!["mi300x".into()]; // missing nvlink
+        nodes[2].features = vec!["h100".into()];
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let mut job = make_job(1, 1, 32);
+        job.spec.constraint = Some("mi300x,nvlink".into());
+
+        let pending = vec![job];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes[0], "node001"); // Only node with both features
+    }
+
+    #[test]
     fn test_exclude_too_many_leaves_unschedulable() {
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(2); // node001, node002

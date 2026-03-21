@@ -358,4 +358,161 @@ mod tests {
         assert_eq!(job.state, JobState::Pending);
         assert_eq!(job.pending_reason, PendingReason::Held);
     }
+
+    // ── T50.33–37: Requeue state transitions ───────────────────
+
+    #[test]
+    fn t50_33_requeue_from_timeout() {
+        reset_job_ids();
+        let mut job = make_job("requeue-timeout");
+        assert_transition_ok(&mut job, JobState::Running);
+        assert_transition_ok(&mut job, JobState::Timeout);
+        assert!(job.end_time.is_some(), "end_time should be set on Timeout");
+        // Requeue: Timeout → Pending should succeed
+        assert_transition_ok(&mut job, JobState::Pending);
+        assert_job_state(&job, JobState::Pending);
+        assert!(
+            job.end_time.is_none(),
+            "end_time should be cleared on requeue"
+        );
+    }
+
+    #[test]
+    fn t50_34_requeue_from_preempted() {
+        reset_job_ids();
+        let mut job = make_job("requeue-preempted");
+        assert_transition_ok(&mut job, JobState::Running);
+        assert_transition_ok(&mut job, JobState::Preempted);
+        // Preempted → Pending should succeed
+        assert_transition_ok(&mut job, JobState::Pending);
+        assert_job_state(&job, JobState::Pending);
+        assert!(
+            job.end_time.is_none(),
+            "end_time should be cleared on requeue"
+        );
+    }
+
+    #[test]
+    fn t50_35_requeue_from_node_fail() {
+        reset_job_ids();
+        let mut job = make_job("requeue-nodefail");
+        assert_transition_ok(&mut job, JobState::Running);
+        assert_transition_ok(&mut job, JobState::NodeFail);
+        // NodeFail → Pending should succeed
+        assert_transition_ok(&mut job, JobState::Pending);
+        assert_job_state(&job, JobState::Pending);
+    }
+
+    #[test]
+    fn t50_36_requeue_from_failed() {
+        reset_job_ids();
+        let mut job = make_job("requeue-failed");
+        assert_transition_ok(&mut job, JobState::Running);
+        assert_transition_ok(&mut job, JobState::Failed);
+        // Failed → Pending should succeed
+        assert_transition_ok(&mut job, JobState::Pending);
+        assert_job_state(&job, JobState::Pending);
+    }
+
+    #[test]
+    fn t50_37_requeue_from_completed_fails() {
+        reset_job_ids();
+        let mut job = make_job("requeue-completed");
+        assert_transition_ok(&mut job, JobState::Running);
+        assert_transition_ok(&mut job, JobState::Completed);
+        // Completed → Pending should fail (Completed is not retriable)
+        assert_transition_err(&mut job, JobState::Pending);
+        assert_job_state(&job, JobState::Completed);
+    }
+
+    // ── T50.38–40: Drain / Draining node behavior ──────────────
+
+    #[test]
+    fn t50_38_drain_preserves_state() {
+        let mut node = Node::new(
+            "n1".into(),
+            ResourceSet {
+                cpus: 64,
+                memory_mb: 256_000,
+                ..Default::default()
+            },
+        );
+        node.state = NodeState::Drain;
+        // update_state_from_alloc should not override Drain
+        node.update_state_from_alloc();
+        assert_eq!(node.state, NodeState::Drain);
+    }
+
+    #[test]
+    fn t50_39_draining_not_schedulable() {
+        let mut node = Node::new(
+            "n1".into(),
+            ResourceSet {
+                cpus: 64,
+                memory_mb: 256_000,
+                ..Default::default()
+            },
+        );
+        node.state = NodeState::Draining;
+        assert!(
+            !node.is_schedulable(),
+            "Draining node should not be schedulable"
+        );
+    }
+
+    #[test]
+    fn t50_40_draining_preserves_state() {
+        let mut node = Node::new(
+            "n1".into(),
+            ResourceSet {
+                cpus: 64,
+                memory_mb: 256_000,
+                ..Default::default()
+            },
+        );
+        node.state = NodeState::Draining;
+        node.alloc_resources.cpus = 32;
+        // update_state_from_alloc should not override Draining
+        node.update_state_from_alloc();
+        assert_eq!(node.state, NodeState::Draining);
+    }
+
+    #[test]
+    fn t50_41_error_preserves_state() {
+        let mut node = Node::new(
+            "n1".into(),
+            ResourceSet {
+                cpus: 64,
+                memory_mb: 256_000,
+                ..Default::default()
+            },
+        );
+        node.state = NodeState::Error;
+        node.update_state_from_alloc();
+        assert_eq!(node.state, NodeState::Error);
+    }
+
+    // ── T50.42–43: Requeue does not reset from Cancelled ───────
+
+    #[test]
+    fn t50_42_requeue_from_cancelled_fails() {
+        reset_job_ids();
+        let mut job = make_job("requeue-cancelled");
+        assert_transition_ok(&mut job, JobState::Cancelled);
+        // Cancelled → Pending should fail
+        assert_transition_err(&mut job, JobState::Pending);
+    }
+
+    #[test]
+    fn t50_43_node_available_states() {
+        // Comprehensive check: only Idle and Mixed are available
+        assert!(NodeState::Idle.is_available());
+        assert!(NodeState::Mixed.is_available());
+        assert!(!NodeState::Down.is_available());
+        assert!(!NodeState::Drain.is_available());
+        assert!(!NodeState::Draining.is_available());
+        assert!(!NodeState::Allocated.is_available());
+        assert!(!NodeState::Error.is_available());
+        assert!(!NodeState::Unknown.is_available());
+    }
 }
