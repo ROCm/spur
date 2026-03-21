@@ -435,12 +435,43 @@ impl SlurmAgent for AgentService {
         request: Request<AgentCancelJobRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
-        let mut jobs = self.running.lock().await;
+        let job_id = req.job_id;
+        let signal = req.signal;
 
-        if let Some(tracked) = jobs.get_mut(&req.job_id) {
-            info!(job_id = req.job_id, "cancelling job");
-            let _ = tracked.child.kill().await;
-            jobs.remove(&req.job_id);
+        let pid = {
+            let jobs = self.running.lock().await;
+            jobs.get(&job_id).and_then(|t| t.pid)
+        };
+
+        let Some(pid) = pid else {
+            return Ok(Response::new(()));
+        };
+
+        if signal > 0 {
+            // Send the specific signal requested (e.g., SIGTERM=15, SIGUSR1=10)
+            info!(job_id, signal, "sending signal to job");
+            let sig = nix::sys::signal::Signal::try_from(signal)
+                .unwrap_or(nix::sys::signal::Signal::SIGTERM);
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), sig);
+        } else {
+            // Default: graceful shutdown — SIGTERM, wait 5s, then SIGKILL
+            info!(job_id, "graceful cancel: SIGTERM → 5s grace → SIGKILL");
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+
+            let running = self.running.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                let mut jobs = running.lock().await;
+                if let Some(tracked) = jobs.get_mut(&job_id) {
+                    // Still running after grace period — force kill
+                    info!(job_id, "grace period expired, sending SIGKILL");
+                    let _ = tracked.child.kill().await;
+                    jobs.remove(&job_id);
+                }
+            });
         }
 
         Ok(Response::new(()))
