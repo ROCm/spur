@@ -238,11 +238,16 @@ pub async fn launch_job(
 fn setup_cgroup(job_id: JobId, cpus: u32, memory_mb: u64) -> anyhow::Result<Option<PathBuf>> {
     let cgroup_path = PathBuf::from(CGROUP_ROOT).join(format!("job_{}", job_id));
 
-    // Try to create cgroup (may fail without root)
-    if std::fs::create_dir_all(&cgroup_path).is_err() {
-        debug!(
+    // Try to create cgroup — when running as root, failure is fatal.
+    // Non-root is expected to fail (development/test environments).
+    if let Err(e) = std::fs::create_dir_all(&cgroup_path) {
+        if nix::unistd::geteuid().is_root() {
+            anyhow::bail!("cgroup creation failed as root: {}", e);
+        }
+        warn!(
             job_id,
-            "cgroup creation failed (not root?), running without isolation"
+            error = %e,
+            "cgroup creation failed (not root), running without isolation"
         );
         return Ok(None);
     }
@@ -252,14 +257,14 @@ fn setup_cgroup(job_id: JobId, cpus: u32, memory_mb: u64) -> anyhow::Result<Opti
     let quota = cpus as u64 * 100_000;
     let cpu_max = format!("{} 100000", quota);
     if let Err(e) = std::fs::write(cgroup_path.join("cpu.max"), &cpu_max) {
-        debug!(error = %e, "failed to set cpu.max");
+        warn!(job_id, error = %e, "failed to set cpu.max");
     }
 
     // Set memory limit
     if memory_mb > 0 {
         let memory_bytes = memory_mb * 1024 * 1024;
         if let Err(e) = std::fs::write(cgroup_path.join("memory.max"), memory_bytes.to_string()) {
-            debug!(error = %e, "failed to set memory.max");
+            warn!(job_id, error = %e, "failed to set memory.max");
         }
     }
 
@@ -274,15 +279,18 @@ fn setup_cgroup(job_id: JobId, cpus: u32, memory_mb: u64) -> anyhow::Result<Opti
     Ok(Some(cgroup_path))
 }
 
-/// Move a process into a cgroup.
-fn move_to_cgroup(cgroup_path: &Path, pid: u32) {
+/// Move a process into a cgroup. Returns true if successful.
+fn move_to_cgroup(cgroup_path: &Path, pid: u32) -> bool {
     let procs_file = cgroup_path.join("cgroup.procs");
     if let Err(e) = std::fs::write(&procs_file, pid.to_string()) {
-        debug!(
+        warn!(
             pid,
             error = %e,
-            "failed to move process to cgroup"
+            "failed to move process to cgroup — job runs without isolation"
         );
+        false
+    } else {
+        true
     }
 }
 
