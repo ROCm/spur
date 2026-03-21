@@ -244,6 +244,10 @@ pub struct Job {
 
     pub exit_code: Option<i32>,
 
+    /// Number of times this job has been requeued.
+    #[serde(default)]
+    pub requeue_count: u32,
+
     // Array support
     pub array_job_id: Option<JobId>,
     pub array_task_id: Option<u32>,
@@ -274,6 +278,7 @@ impl Job {
             allocated_nodes: Vec::new(),
             allocated_resources: None,
             exit_code: None,
+            requeue_count: 0,
             array_job_id: None,
             array_task_id: None,
         }
@@ -338,6 +343,11 @@ impl Job {
             (JobState::Completing, JobState::Failed) => true,
             (JobState::Suspended, JobState::Running) => true,
             (JobState::Suspended, JobState::Cancelled) => true,
+            // Requeue transitions: terminal → Pending (for --requeue jobs)
+            (JobState::Timeout, JobState::Pending) => true,
+            (JobState::Preempted, JobState::Pending) => true,
+            (JobState::NodeFail, JobState::Pending) => true,
+            (JobState::Failed, JobState::Pending) => true,
             _ => false,
         };
 
@@ -345,6 +355,10 @@ impl Job {
             self.state = to;
             if to.is_terminal() && self.end_time.is_none() {
                 self.end_time = Some(Utc::now());
+            }
+            // Requeue: clear end_time when going back to Pending
+            if to == JobState::Pending {
+                self.end_time = None;
             }
             Ok(())
         } else {

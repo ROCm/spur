@@ -331,8 +331,52 @@ impl ClusterManager {
         }
 
         debug!(job_id, exit_code, "job completed");
+
+        // Check for requeue: if the job has --requeue and hit a retriable state,
+        // reset it to Pending so the scheduler picks it up again.
+        let should_requeue = matches!(state, JobState::Timeout | JobState::Preempted | JobState::NodeFail);
+        if should_requeue {
+            self.maybe_requeue(job_id);
+        }
+
         self.maybe_snapshot();
         Ok(())
+    }
+
+    /// Requeue a job if spec.requeue is set and attempt limit not exceeded.
+    fn maybe_requeue(&self, job_id: JobId) {
+        const MAX_REQUEUE: u32 = 3;
+        let mut jobs = self.jobs.write();
+        let Some(job) = jobs.get_mut(&job_id) else {
+            return;
+        };
+        if !job.spec.requeue || job.requeue_count >= MAX_REQUEUE {
+            return;
+        }
+
+        let old_state = job.state;
+        if job.transition(JobState::Pending).is_err() {
+            return;
+        }
+        job.requeue_count += 1;
+        job.start_time = None;
+        job.exit_code = None;
+        job.allocated_nodes.clear();
+        job.allocated_resources = None;
+        job.pending_reason = PendingReason::Priority;
+
+        self.append_wal(WalOperation::JobStateChange {
+            job_id,
+            old_state,
+            new_state: JobState::Pending,
+        });
+
+        info!(
+            job_id,
+            requeue_count = job.requeue_count,
+            from = %old_state,
+            "job requeued"
+        );
     }
 
     /// Register a node agent.
