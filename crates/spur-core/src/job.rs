@@ -157,6 +157,10 @@ pub struct JobSpec {
     /// Node feature constraint (comma-separated, all must match).
     pub constraint: Option<String>,
 
+    // MPI
+    pub mpi: Option<String>,
+    pub distribution: Option<String>,
+
     // Array
     pub array_spec: Option<String>,
 
@@ -213,6 +217,8 @@ impl Default for JobSpec {
             nodelist: None,
             exclude: None,
             constraint: None,
+            mpi: None,
+            distribution: None,
             array_spec: None,
             requeue: false,
             exclusive: false,

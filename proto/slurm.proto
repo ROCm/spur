@@ -101,6 +101,10 @@ message JobSpec {
   // Array
   string array_spec = 50;  // "0-99%10"
 
+  // MPI
+  string mpi = 51;            // MPI type: "none", "pmix", "pmi2"
+  string distribution = 52;   // Task distribution: "block", "cyclic", "plane"
+
   // Misc
   bool requeue = 60;
   bool exclusive = 61;

@@ -449,6 +449,16 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         } else {
             Some(spec.constraint.clone())
         },
+        mpi: if spec.mpi.is_empty() {
+            None
+        } else {
+            Some(spec.mpi)
+        },
+        distribution: if spec.distribution.is_empty() {
+            None
+        } else {
+            Some(spec.distribution)
+        },
         array_spec: if spec.array_spec.is_empty() {
             None
         } else {

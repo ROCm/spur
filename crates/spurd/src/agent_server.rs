@@ -288,6 +288,27 @@ impl SlurmAgent for AgentService {
             env.insert("SPUR_TARGET_NODE".into(), req.target_node.clone());
         }
 
+        // Compute tasks_per_node for both single- and multi-node jobs
+        let tasks_per_node = if spec.tasks_per_node > 0 {
+            spec.tasks_per_node
+        } else {
+            (spec.num_tasks / spec.num_nodes.max(1)).max(1)
+        };
+        let node_rank = task_offset / tasks_per_node.max(1);
+
+        // LOCAL_RANK / LOCAL_WORLD_SIZE — always set, even for single-node jobs
+        env.insert("LOCAL_RANK".into(), "0".to_string()); // Single process per node (multi-task wrapper overrides per-process)
+        env.insert("LOCAL_WORLD_SIZE".into(), tasks_per_node.to_string());
+        env.insert("NPROC_PER_NODE".into(), tasks_per_node.to_string());
+        env.insert("NODE_RANK".into(), node_rank.to_string());
+
+        // PMI env vars for MPI runtimes
+        env.insert("PMI_SIZE".into(), spec.num_tasks.to_string());
+        env.insert("PMI_UNIVERSE_SIZE".into(), spec.num_tasks.to_string());
+        env.insert("PMI_APPNUM".into(), "0".to_string());
+        // PMI_RANK is set per-task in the multi-task wrapper; default to task_offset for single-task
+        env.insert("PMI_RANK".into(), task_offset.to_string());
+
         // PyTorch/NCCL/RCCL distributed training env vars
         if peer_nodes.len() > 1 {
             // MASTER_ADDR: first peer node's address (strip port)
@@ -302,13 +323,7 @@ impl SlurmAgent for AgentService {
             env.insert("MASTER_PORT".into(), "29500".to_string());
             env.insert("WORLD_SIZE".into(), peer_nodes.len().to_string());
 
-            // RANK = node index within peer list (match by task_offset)
-            let tasks_per_node = if spec.tasks_per_node > 0 {
-                spec.tasks_per_node
-            } else {
-                (spec.num_tasks / spec.num_nodes.max(1)).max(1)
-            };
-            let node_rank = task_offset / tasks_per_node;
+            // RANK = node index within peer list
             env.insert("RANK".into(), node_rank.to_string());
             env.insert("SPUR_NODE_RANK".into(), node_rank.to_string());
         }
@@ -398,6 +413,62 @@ impl SlurmAgent for AgentService {
             (wrapper, rootfs_mode)
         } else {
             (script, crate::container::RootfsMode::Extracted)
+        };
+
+        // Multi-task per-node: wrap the user script so it forks N processes,
+        // each with a distinct LOCAL_RANK. The wrapper backgrounds N copies and
+        // waits for all to finish, so TrackedJob only tracks a single PID (the
+        // wrapper shell). GPU devices are partitioned across tasks via
+        // ROCR_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES overrides in each fork.
+        let launch_script = if tasks_per_node > 1 {
+            // Write the user script to disk first so the wrapper can reference it
+            let user_script_path = format!("{}/.spur_user_{}.sh", work_dir, job_id);
+            std::fs::write(&user_script_path, &launch_script)
+                .map_err(|e| Status::internal(format!("failed to write user script: {}", e)))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &user_script_path,
+                    std::fs::Permissions::from_mode(0o755),
+                );
+            }
+
+            // Build the wrapper that launches N tasks with GPU partitioning
+            let mut wrapper = String::from("#!/bin/bash\n");
+            wrapper.push_str(&format!(
+                "SPUR_NTASKS={}\nSPUR_TASK_OFFSET=${{SPUR_TASK_OFFSET:-0}}\n",
+                tasks_per_node
+            ));
+            wrapper.push_str("for LOCAL_RANK in $(seq 0 $((SPUR_NTASKS - 1))); do\n");
+            wrapper.push_str("  export LOCAL_RANK\n");
+            wrapper.push_str("  export SPUR_LOCALID=$LOCAL_RANK\n");
+            wrapper.push_str("  export SPUR_PROCID=$((SPUR_TASK_OFFSET + LOCAL_RANK))\n");
+            wrapper.push_str("  export PMI_RANK=$SPUR_PROCID\n");
+
+            // Partition GPUs across tasks if GPUs are allocated
+            wrapper.push_str("  if [ -n \"$SPUR_JOB_GPUS\" ]; then\n");
+            wrapper.push_str("    IFS=',' read -ra _ALL_GPUS <<< \"$SPUR_JOB_GPUS\"\n");
+            wrapper.push_str("    _GPUS_PER_TASK=$(( ${#_ALL_GPUS[@]} / SPUR_NTASKS ))\n");
+            wrapper.push_str("    if [ $_GPUS_PER_TASK -gt 0 ]; then\n");
+            wrapper.push_str("      _START=$((LOCAL_RANK * _GPUS_PER_TASK))\n");
+            wrapper.push_str(
+                "      _TASK_GPUS=$(echo \"${_ALL_GPUS[@]:$_START:$_GPUS_PER_TASK}\" | tr ' ' ',')\n",
+            );
+            wrapper.push_str("      export ROCR_VISIBLE_DEVICES=$_TASK_GPUS\n");
+            wrapper.push_str("      export CUDA_VISIBLE_DEVICES=$_TASK_GPUS\n");
+            wrapper.push_str("      export GPU_DEVICE_ORDINAL=$_TASK_GPUS\n");
+            wrapper.push_str("    fi\n");
+            wrapper.push_str("  fi\n");
+
+            wrapper.push_str(&format!(
+                "  bash \"{}\" &\n",
+                user_script_path.replace('"', "\\\"")
+            ));
+            wrapper.push_str("done\nwait\n");
+            wrapper
+        } else {
+            launch_script
         };
 
         // Allocate GPU devices from the node's pool
