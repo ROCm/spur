@@ -288,6 +288,20 @@ impl SlurmAgent for AgentService {
             env.insert("SPUR_TARGET_NODE".into(), req.target_node.clone());
         }
 
+        // Compute tasks_per_node for both single- and multi-node jobs
+        let tasks_per_node = if spec.tasks_per_node > 0 {
+            spec.tasks_per_node
+        } else {
+            (spec.num_tasks / spec.num_nodes.max(1)).max(1)
+        };
+        let node_rank = task_offset / tasks_per_node.max(1);
+
+        // LOCAL_RANK / LOCAL_WORLD_SIZE — always set, even for single-node jobs
+        env.insert("LOCAL_RANK".into(), "0".to_string()); // Single process per node (multi-task wrapper overrides per-process)
+        env.insert("LOCAL_WORLD_SIZE".into(), tasks_per_node.to_string());
+        env.insert("NPROC_PER_NODE".into(), tasks_per_node.to_string());
+        env.insert("NODE_RANK".into(), node_rank.to_string());
+
         // PyTorch/NCCL/RCCL distributed training env vars
         if peer_nodes.len() > 1 {
             // MASTER_ADDR: first peer node's address (strip port)
@@ -302,13 +316,7 @@ impl SlurmAgent for AgentService {
             env.insert("MASTER_PORT".into(), "29500".to_string());
             env.insert("WORLD_SIZE".into(), peer_nodes.len().to_string());
 
-            // RANK = node index within peer list (match by task_offset)
-            let tasks_per_node = if spec.tasks_per_node > 0 {
-                spec.tasks_per_node
-            } else {
-                (spec.num_tasks / spec.num_nodes.max(1)).max(1)
-            };
-            let node_rank = task_offset / tasks_per_node;
+            // RANK = node index within peer list
             env.insert("RANK".into(), node_rank.to_string());
             env.insert("SPUR_NODE_RANK".into(), node_rank.to_string());
         }
