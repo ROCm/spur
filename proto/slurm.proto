@@ -227,6 +227,9 @@ service SlurmController {
   // Partition management
   rpc GetPartitions(GetPartitionsRequest) returns (GetPartitionsResponse);
 
+  // Job steps
+  rpc GetJobSteps(GetJobStepsRequest) returns (GetJobStepsResponse);
+
   // Health
   rpc Ping(google.protobuf.Empty) returns (PingResponse);
 
@@ -579,6 +582,26 @@ message QosInfo {
   uint32 max_jobs_per_user = 6;
   uint32 max_wall_minutes = 7;
   string max_tres_per_job = 8;
+}
+
+// ============================================================
+// Job Steps
+// ============================================================
+
+message JobStepInfo {
+  uint32 job_id = 1;
+  uint32 step_id = 2;
+  string name = 3;
+  string state = 4;
+  uint32 num_tasks = 5;
+}
+
+message GetJobStepsRequest {
+  uint32 job_id = 1;
+}
+
+message GetJobStepsResponse {
+  repeated JobStepInfo steps = 1;
 }
 
 // ============================================================

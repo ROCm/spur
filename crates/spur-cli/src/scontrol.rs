@@ -311,6 +311,36 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 println!();
             }
         }
+        "step" | "steps" => {
+            let job_id: u32 = name
+                .ok_or_else(|| anyhow::anyhow!("scontrol show steps: job_id required"))?
+                .parse()
+                .context("invalid job_id")?;
+
+            let resp = client
+                .get_job_steps(spur_proto::proto::GetJobStepsRequest { job_id })
+                .await
+                .context("failed to get job steps")?;
+
+            let steps = resp.into_inner().steps;
+            if steps.is_empty() {
+                println!("No steps found for job {}", job_id);
+            } else {
+                for step in steps {
+                    let step_name = if step.step_id == 0xFFFF_FFFE {
+                        "batch".to_string()
+                    } else if step.step_id == 0xFFFF_FFFD {
+                        "extern".to_string()
+                    } else {
+                        step.step_id.to_string()
+                    };
+                    println!(
+                        "StepId={}.{} StepName={} State={} NumTasks={}",
+                        step.job_id, step_name, step.name, step.state, step.num_tasks
+                    );
+                }
+            }
+        }
         "config" => {
             println!("ClusterName=spur");
             println!("SlurmctldAddr={}", controller);

@@ -11,6 +11,7 @@ use spur_core::config::SlurmConfig;
 use spur_core::job::{Job, JobId, JobSpec, JobState, PendingReason};
 use spur_core::node::{Node, NodeSource, NodeState};
 use spur_core::partition::Partition;
+use spur_core::step::{JobStep, StepState, STEP_BATCH};
 use spur_core::qos::{check_qos_limits, QosCheckResult};
 use spur_core::reservation::Reservation;
 use spur_core::resource::ResourceSet;
@@ -28,6 +29,7 @@ pub struct ClusterManager {
     partitions: RwLock<Vec<Partition>>,
     next_job_id: AtomicU32,
     reservations: RwLock<Vec<Reservation>>,
+    steps: RwLock<HashMap<(JobId, u32), JobStep>>,
     wal: RwLock<FileWalStore>,
     snapshot: RwLock<Option<SnapshotStore>>,
     wal_since_snapshot: AtomicU32,
@@ -87,6 +89,7 @@ impl ClusterManager {
             nodes: RwLock::new(nodes),
             partitions: RwLock::new(partitions),
             reservations: RwLock::new(Vec::new()),
+            steps: RwLock::new(HashMap::new()),
             next_job_id: AtomicU32::new(next_id),
             wal: RwLock::new(wal),
             snapshot: RwLock::new(snapshot),
@@ -380,6 +383,23 @@ impl ClusterManager {
 
         debug!(job_id, "job started");
 
+        // Create the batch step for this job
+        let batch_step = JobStep {
+            job_id,
+            step_id: STEP_BATCH,
+            name: "batch".into(),
+            state: StepState::Running,
+            num_tasks: 1,
+            cpus_per_task: per_node.cpus,
+            resources: per_node.clone(),
+            nodes: node_names.clone(),
+            distribution: spur_core::step::TaskDistribution::Block,
+            start_time: Some(Utc::now()),
+            end_time: None,
+            exit_code: None,
+        };
+        self.create_step(job_id, STEP_BATCH, batch_step);
+
         // Send BEGIN notification if configured
         if spec_for_notify
             .mail_type
@@ -418,6 +438,22 @@ impl ClusterManager {
             exit_code,
             state,
         });
+
+        // Complete all steps for this job
+        {
+            let mut steps = self.steps.write();
+            for step in steps.values_mut() {
+                if step.job_id == job_id && !step.state.is_terminal() {
+                    step.state = if exit_code == 0 {
+                        StepState::Completed
+                    } else {
+                        StepState::Failed
+                    };
+                    step.exit_code = Some(exit_code);
+                    step.end_time = Some(Utc::now());
+                }
+            }
+        }
 
         // Subtract per-node resources instead of blanket-zeroing
         let mut nodes = self.nodes.write();
@@ -773,6 +809,36 @@ impl ClusterManager {
                 }
             }
         }
+    }
+
+    /// Create a job step.
+    pub fn create_step(&self, job_id: JobId, step_id: u32, step: JobStep) {
+        self.steps.write().insert((job_id, step_id), step);
+        debug!(job_id, step_id, "step created");
+    }
+
+    /// Complete a job step.
+    pub fn complete_step(&self, job_id: JobId, step_id: u32, exit_code: i32) {
+        if let Some(step) = self.steps.write().get_mut(&(job_id, step_id)) {
+            step.state = if exit_code == 0 {
+                StepState::Completed
+            } else {
+                StepState::Failed
+            };
+            step.exit_code = Some(exit_code);
+            step.end_time = Some(Utc::now());
+            debug!(job_id, step_id, exit_code, "step completed");
+        }
+    }
+
+    /// Get all steps for a job.
+    pub fn get_steps(&self, job_id: JobId) -> Vec<JobStep> {
+        self.steps
+            .read()
+            .iter()
+            .filter(|((jid, _), _)| *jid == job_id)
+            .map(|(_, step)| step.clone())
+            .collect()
     }
 
     /// Get pending jobs sorted by priority, filtering out held and dependency-blocked jobs.
