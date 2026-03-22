@@ -242,4 +242,34 @@ mod tests {
         assert_eq!(QosPreemptMode::from_str("off"), QosPreemptMode::Off);
         assert_eq!(QosPreemptMode::from_str("unknown"), QosPreemptMode::Off);
     }
+
+    #[test]
+    fn test_tres_record_set_get() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Cpu, 64);
+        tres.set(TresType::Memory, 256_000);
+        assert_eq!(tres.get(TresType::Cpu), 64);
+        assert_eq!(tres.get(TresType::Memory), 256_000);
+        assert_eq!(tres.get(TresType::Gpu), 0); // default
+    }
+
+    #[test]
+    fn test_qos_limits_default() {
+        let limits = QosLimits::default();
+        assert!(limits.max_jobs_per_user.is_none());
+        assert!(limits.max_wall_minutes.is_none());
+    }
+
+    #[test]
+    fn test_qos_default() {
+        let qos = Qos::default();
+        assert_eq!(qos.priority, 0);
+        assert_eq!(qos.usage_factor, 1.0);
+    }
+
+    #[test]
+    fn test_account_limits_default() {
+        let limits = AccountLimits::default();
+        assert!(limits.max_running_jobs.is_none());
+    }
 }

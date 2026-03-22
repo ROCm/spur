@@ -226,4 +226,48 @@ mod tests {
         };
         assert_eq!(qos_adjusted_priority(1000, &qos), 1);
     }
+
+    // ── T21.17: TRES record accumulation ─────────────────────────
+
+    #[test]
+    fn t21_17_tres_record_arithmetic() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Cpu, 10);
+        let total = tres.get(TresType::Cpu);
+        assert_eq!(total, 10);
+
+        // Accumulate via add
+        let mut other = TresRecord::new();
+        other.set(TresType::Cpu, 5);
+        other.set(TresType::Gpu, 2);
+        tres.add(&other);
+        assert_eq!(tres.get(TresType::Cpu), 15);
+        assert_eq!(tres.get(TresType::Gpu), 2);
+    }
+
+    // ── T21.18: Account limits default ───────────────────────────
+
+    #[test]
+    fn t21_18_account_limits_all_none() {
+        let limits = AccountLimits::default();
+        assert!(limits.max_running_jobs.is_none());
+        assert!(limits.max_submit_jobs.is_none());
+        assert!(limits.max_tres_per_job.is_none());
+        assert!(limits.grp_tres.is_none());
+        assert!(limits.max_wall_minutes.is_none());
+    }
+
+    // ── T21.19: QOS limits default ───────────────────────────────
+
+    #[test]
+    fn t21_19_qos_limits_all_none() {
+        let limits = QosLimits::default();
+        assert!(limits.max_jobs_per_user.is_none());
+        assert!(limits.max_submit_jobs_per_user.is_none());
+        assert!(limits.max_tres_per_job.is_none());
+        assert!(limits.max_tres_per_user.is_none());
+        assert!(limits.grp_tres.is_none());
+        assert!(limits.max_wall_minutes.is_none());
+        assert!(limits.grp_wall_minutes.is_none());
+    }
 }

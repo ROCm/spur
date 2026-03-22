@@ -26,7 +26,8 @@
 //! | 54    | REST API      | —            | t54_rest |
 //! | 55    | CLI format    | —            | t55_format |
 //! | 56    | FFI           | —            | t56_ffi |
-//! | 57    | SPANK         | —            | t57_spank |
+//! | 57    | auth          | —            | t57_auth |
+//! | 58    | SPANK         | —            | t58_spank |
 
 pub mod harness;
 
@@ -48,3 +49,4 @@ pub mod t53_state;
 pub mod t55_format;
 pub mod t56_deps;
 pub mod t57_auth;
+pub mod t58_spank;

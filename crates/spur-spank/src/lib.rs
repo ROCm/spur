@@ -28,7 +28,7 @@ pub enum SpankHook {
 
 impl SpankHook {
     /// C symbol name for this hook.
-    fn symbol_name(&self) -> &'static str {
+    pub fn symbol_name(&self) -> &'static str {
         match self {
             Self::Init => "slurm_spank_init",
             Self::InitPost => "slurm_spank_init_post_opt",
@@ -251,6 +251,7 @@ pub struct PlugstackEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn test_spank_host_new() {
@@ -262,5 +263,101 @@ mod tests {
     fn test_hook_symbol_names() {
         assert_eq!(SpankHook::Init.symbol_name(), "slurm_spank_init");
         assert_eq!(SpankHook::TaskExit.symbol_name(), "slurm_spank_task_exit");
+    }
+
+    #[test]
+    fn test_spank_hook_all_symbol_names() {
+        // Verify all hook symbol names match Slurm convention
+        assert_eq!(SpankHook::Init.symbol_name(), "slurm_spank_init");
+        assert_eq!(
+            SpankHook::InitPost.symbol_name(),
+            "slurm_spank_init_post_opt"
+        );
+        assert_eq!(
+            SpankHook::LocalUserInit.symbol_name(),
+            "slurm_spank_local_user_init"
+        );
+        assert_eq!(SpankHook::UserInit.symbol_name(), "slurm_spank_user_init");
+        assert_eq!(SpankHook::TaskInit.symbol_name(), "slurm_spank_task_init");
+        assert_eq!(
+            SpankHook::TaskInitPrivileged.symbol_name(),
+            "slurm_spank_task_init_privileged"
+        );
+        assert_eq!(
+            SpankHook::TaskPost.symbol_name(),
+            "slurm_spank_task_post_fork"
+        );
+        assert_eq!(SpankHook::TaskExit.symbol_name(), "slurm_spank_task_exit");
+        assert_eq!(SpankHook::JobEpilog.symbol_name(), "slurm_spank_job_epilog");
+        assert_eq!(
+            SpankHook::SlurmctldExit.symbol_name(),
+            "slurm_spank_slurmd_exit"
+        );
+        assert_eq!(SpankHook::Exit.symbol_name(), "slurm_spank_exit");
+    }
+
+    #[test]
+    fn test_spank_host_empty_invoke() {
+        let host = SpankHost::new();
+        // Invoking hooks on empty host should succeed (no plugins to fail)
+        assert!(host.invoke_hook(SpankHook::Init).is_ok());
+        assert!(host.invoke_hook(SpankHook::TaskExit).is_ok());
+        assert!(host.invoke_hook(SpankHook::JobEpilog).is_ok());
+    }
+
+    #[test]
+    fn test_plugstack_parse_missing_file() {
+        let result = parse_plugstack(Path::new("/nonexistent/plugstack.conf"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_plugstack_parse_valid() {
+        let dir = std::env::temp_dir().join("spur_spank_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let conf_path = dir.join("plugstack.conf");
+        let mut f = std::fs::File::create(&conf_path).unwrap();
+        writeln!(f, "# comment line").unwrap();
+        writeln!(f, "required /usr/lib/spank/plugin1.so arg1 arg2").unwrap();
+        writeln!(f, "optional /usr/lib/spank/plugin2.so").unwrap();
+        writeln!(f, "").unwrap();
+        drop(f);
+
+        let entries = parse_plugstack(&conf_path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].required);
+        assert_eq!(entries[0].path, PathBuf::from("/usr/lib/spank/plugin1.so"));
+        assert_eq!(entries[0].args, vec!["arg1", "arg2"]);
+        assert!(!entries[1].required);
+        assert_eq!(entries[1].path, PathBuf::from("/usr/lib/spank/plugin2.so"));
+        assert!(entries[1].args.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_spank_context_default() {
+        let ctx = SpankContext::default();
+        assert_eq!(ctx.job_id, 0);
+        assert_eq!(ctx.uid, 0);
+        assert_eq!(ctx.task_pid, 0);
+    }
+
+    #[test]
+    fn test_spank_host_set_context() {
+        let mut host = SpankHost::new();
+        host.set_context(SpankContext {
+            job_id: 42,
+            uid: 1000,
+            gid: 1000,
+            step_id: 0,
+            num_nodes: 1,
+            node_id: 0,
+            local_task_count: 1,
+            total_task_count: 1,
+            task_pid: 12345,
+        });
+        // Context is set without panicking
+        assert_eq!(host.plugin_count(), 0);
     }
 }
