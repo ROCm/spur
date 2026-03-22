@@ -968,6 +968,32 @@ impl ClusterManager {
                 }
             });
         }
+
+        // SMTP email notification via sendmail-compatible command
+        if let Some(ref smtp_cmd) = self.config.notifications.smtp_command {
+            let from = self.config.notifications.from_address.as_deref().unwrap_or("spur@localhost");
+            let user = spec.user.clone();
+            let mail_user = spec.mail_user.clone();
+            let to = mail_user.as_deref().unwrap_or(&user).to_string();
+            let subject = format!("Spur Job {}: {}", job_id, event);
+            let body = format!("Job ID: {}\nEvent: {}\nUser: {}\n", job_id, event, user);
+            let email = format!("From: {}\nTo: {}\nSubject: {}\n\n{}", from, to, subject, body);
+
+            let smtp_cmd = smtp_cmd.clone();
+            tokio::spawn(async move {
+                let mut child = tokio::process::Command::new("sh")
+                    .args(["-c", &smtp_cmd])
+                    .stdin(std::process::Stdio::piped())
+                    .spawn();
+                if let Ok(ref mut child) = child {
+                    if let Some(ref mut stdin) = child.stdin.take() {
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stdin.write_all(email.as_bytes()).await;
+                    }
+                    let _ = child.wait().await;
+                }
+            });
+        }
     }
 
     fn append_wal(&self, op: WalOperation) {
