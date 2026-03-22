@@ -104,6 +104,14 @@ pub struct SbatchArgs {
     #[arg(short = 'a', long)]
     pub array: Option<String>,
 
+    /// Task distribution (block, cyclic, plane, arbitrary)
+    #[arg(short = 'm', long)]
+    pub distribution: Option<String>,
+
+    /// MPI type (none, pmix, pmi2)
+    #[arg(long, default_value = "none")]
+    pub mpi: String,
+
     /// Allow requeue
     #[arg(long)]
     pub requeue: bool,
@@ -430,6 +438,8 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         nodelist: args.nodelist.unwrap_or_default(),
         exclude: args.exclude.unwrap_or_default(),
         constraint: args.constraint.unwrap_or_default(),
+        mpi: args.mpi,
+        distribution: args.distribution.unwrap_or_default(),
         array_spec: args.array.unwrap_or_default(),
         requeue: args.requeue,
         exclusive: args.exclusive,

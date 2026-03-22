@@ -73,6 +73,10 @@ pub struct SrunArgs {
     #[arg(short = 'C', long)]
     pub constraint: Option<String>,
 
+    /// MPI type (none, pmix, pmi2)
+    #[arg(long, default_value = "none")]
+    pub mpi: String,
+
     /// Job step label output
     #[arg(short = 'l', long)]
     pub label: bool,
@@ -194,6 +198,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         environment,
         time_limit,
         constraint: args.constraint.unwrap_or_default(),
+        mpi: args.mpi,
         container_image: args.container_image.unwrap_or_default(),
         container_mounts: args.container_mounts,
         container_workdir: args.container_workdir.unwrap_or_default(),

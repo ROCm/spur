@@ -302,6 +302,13 @@ impl SlurmAgent for AgentService {
         env.insert("NPROC_PER_NODE".into(), tasks_per_node.to_string());
         env.insert("NODE_RANK".into(), node_rank.to_string());
 
+        // PMI env vars for MPI runtimes
+        env.insert("PMI_SIZE".into(), spec.num_tasks.to_string());
+        env.insert("PMI_UNIVERSE_SIZE".into(), spec.num_tasks.to_string());
+        env.insert("PMI_APPNUM".into(), "0".to_string());
+        // PMI_RANK is set per-task in the multi-task wrapper; default to task_offset for single-task
+        env.insert("PMI_RANK".into(), task_offset.to_string());
+
         // PyTorch/NCCL/RCCL distributed training env vars
         if peer_nodes.len() > 1 {
             // MASTER_ADDR: first peer node's address (strip port)

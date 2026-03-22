@@ -282,6 +282,8 @@ async fn dispatch_to_agent(
         nodelist: spec.nodelist.clone().unwrap_or_default(),
         exclude: spec.exclude.clone().unwrap_or_default(),
         constraint: spec.constraint.clone().unwrap_or_default(),
+        mpi: spec.mpi.clone().unwrap_or_default(),
+        distribution: spec.distribution.clone().unwrap_or_default(),
         array_spec: spec.array_spec.clone().unwrap_or_default(),
         requeue: spec.requeue,
         exclusive: spec.exclusive,
