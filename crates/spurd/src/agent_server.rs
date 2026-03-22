@@ -18,6 +18,7 @@ use spur_sched::cons_tres::{AllocationResult, NodeAllocation};
 use spur_spank::{SpankHook, SpankHost};
 
 use crate::executor;
+use crate::pmi::PmiServer;
 use crate::reporter::NodeReporter;
 
 /// Running job handle for tracking.
@@ -40,6 +41,7 @@ pub struct AgentService {
     running: Arc<Mutex<HashMap<u32, TrackedJob>>>,
     allocation: Arc<Mutex<NodeAllocation>>,
     spank: Arc<Option<SpankHost>>,
+    pmi_servers: Arc<Mutex<HashMap<u32, Arc<PmiServer>>>>,
 }
 
 impl AgentService {
@@ -100,6 +102,7 @@ impl AgentService {
             running: Arc::new(Mutex::new(HashMap::new())),
             allocation: Arc::new(Mutex::new(allocation)),
             spank: Arc::new(spank),
+            pmi_servers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -108,6 +111,7 @@ impl AgentService {
         let running = self.running.clone();
         let allocation = self.allocation.clone();
         let spank = self.spank.clone();
+        let pmi_servers = self.pmi_servers.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
             loop {
@@ -145,6 +149,10 @@ impl AgentService {
                     // Release GPU/CPU allocation
                     if let Some(alloc) = alloc {
                         allocation.lock().await.release(alloc);
+                    }
+                    // Cleanup PMI server if one was started for this job
+                    if let Some(pmi) = pmi_servers.lock().await.remove(job_id) {
+                        pmi.cleanup();
                     }
                 }
 
@@ -414,6 +422,19 @@ impl SlurmAgent for AgentService {
         } else {
             (script, crate::container::RootfsMode::Extracted)
         };
+
+        // PMI-1 server: if MPI mode is "pmi1" and multiple tasks, start a
+        // Unix socket KVS server so MPI ranks can bootstrap via PMI.
+        if spec.mpi == "pmi1" && tasks_per_node > 1 {
+            let socket_path = format!("/tmp/spur-pmi-{}.sock", job_id);
+            let pmi = Arc::new(PmiServer::new(&socket_path, spec.num_tasks));
+            let pmi_run = pmi.clone();
+            tokio::spawn(async move {
+                pmi_run.run().await;
+            });
+            env.insert("PMI_PORT".into(), socket_path.clone());
+            self.pmi_servers.lock().await.insert(job_id, pmi);
+        }
 
         // Multi-task per-node: wrap the user script so it forks N processes,
         // each with a distinct LOCAL_RANK. The wrapper backgrounds N copies and
