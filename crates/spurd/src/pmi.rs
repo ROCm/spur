@@ -50,14 +50,9 @@ impl PmiServer {
                 let mut lines = BufReader::new(reader).lines();
 
                 while let Ok(Some(line)) = lines.next_line().await {
-                    let response = handle_pmi_command(
-                        &line,
-                        &kvs,
-                        num_ranks,
-                        &barrier_count,
-                        &barrier_notify,
-                    )
-                    .await;
+                    let response =
+                        handle_pmi_command(&line, &kvs, num_ranks, &barrier_count, &barrier_notify)
+                            .await;
                     if writer.write_all(response.as_bytes()).await.is_err() {
                         break;
                     }
@@ -120,8 +115,7 @@ async fn handle_pmi_command(
             }
         }
         Some("barrier_in") => {
-            let count =
-                barrier_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let count = barrier_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             if count >= num_ranks {
                 barrier_count.store(0, std::sync::atomic::Ordering::SeqCst);
                 barrier_notify.notify_waiters();
@@ -183,13 +177,7 @@ mod tests {
         let bc = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let bn = Arc::new(Notify::new());
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let resp = rt.block_on(handle_pmi_command(
-            "cmd=get_appnum",
-            &kvs,
-            4,
-            &bc,
-            &bn,
-        ));
+        let resp = rt.block_on(handle_pmi_command("cmd=get_appnum", &kvs, 4, &bc, &bn));
         assert!(resp.contains("appnum=0"));
     }
 }

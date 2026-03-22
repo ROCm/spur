@@ -221,48 +221,66 @@ pub extern "C" fn spur_spank_get_item(
     match item {
         0 => {
             // SPANK_JOB_ID
-            unsafe { *(val as *mut u32) = handle.context.job_id; }
+            unsafe {
+                *(val as *mut u32) = handle.context.job_id;
+            }
             0
         }
         1 => {
             // SPANK_JOB_UID
-            unsafe { *(val as *mut u32) = handle.context.uid; }
+            unsafe {
+                *(val as *mut u32) = handle.context.uid;
+            }
             0
         }
         2 => {
             // SPANK_JOB_GID
-            unsafe { *(val as *mut u32) = handle.context.gid; }
+            unsafe {
+                *(val as *mut u32) = handle.context.gid;
+            }
             0
         }
         3 => {
             // SPANK_JOB_STEPID
-            unsafe { *(val as *mut u32) = handle.context.step_id; }
+            unsafe {
+                *(val as *mut u32) = handle.context.step_id;
+            }
             0
         }
         4 => {
             // SPANK_JOB_NNODES
-            unsafe { *(val as *mut u32) = handle.context.num_nodes; }
+            unsafe {
+                *(val as *mut u32) = handle.context.num_nodes;
+            }
             0
         }
         5 => {
             // SPANK_JOB_NODEID
-            unsafe { *(val as *mut u32) = handle.context.node_id; }
+            unsafe {
+                *(val as *mut u32) = handle.context.node_id;
+            }
             0
         }
         6 => {
             // SPANK_JOB_LOCAL_TASK_COUNT
-            unsafe { *(val as *mut u32) = handle.context.local_task_count; }
+            unsafe {
+                *(val as *mut u32) = handle.context.local_task_count;
+            }
             0
         }
         7 => {
             // SPANK_JOB_TOTAL_TASK_COUNT
-            unsafe { *(val as *mut u32) = handle.context.total_task_count; }
+            unsafe {
+                *(val as *mut u32) = handle.context.total_task_count;
+            }
             0
         }
         // 8 = SPANK_JOB_ARGV — not yet implemented (requires pointer-to-array)
         9 => {
             // SPANK_TASK_PID
-            unsafe { *(val as *mut u32) = handle.context.task_pid; }
+            unsafe {
+                *(val as *mut u32) = handle.context.task_pid;
+            }
             0
         }
         _ => -1,

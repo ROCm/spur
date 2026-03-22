@@ -83,7 +83,10 @@ impl BackfillScheduler {
                 // Check partition membership (comma-separated OR matching)
                 if let Some(pname) = partition_name {
                     let requested: Vec<&str> = pname.split(',').map(str::trim).collect();
-                    if !requested.iter().any(|rp| node.partitions.iter().any(|np| np == rp)) {
+                    if !requested
+                        .iter()
+                        .any(|rp| node.partitions.iter().any(|np| np == rp))
+                    {
                         return false;
                     }
                 }
@@ -645,7 +648,11 @@ mod tests {
         };
 
         let assignments = sched.schedule(&pending, &cluster);
-        assert_eq!(assignments.len(), 1, "job should schedule on either partition");
+        assert_eq!(
+            assignments.len(),
+            1,
+            "job should schedule on either partition"
+        );
     }
 
     #[test]

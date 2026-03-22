@@ -11,10 +11,10 @@ use spur_core::config::SlurmConfig;
 use spur_core::job::{Job, JobId, JobSpec, JobState, PendingReason};
 use spur_core::node::{Node, NodeSource, NodeState};
 use spur_core::partition::Partition;
-use spur_core::step::{JobStep, StepState, STEP_BATCH};
 use spur_core::qos::{check_qos_limits, QosCheckResult};
 use spur_core::reservation::Reservation;
 use spur_core::resource::ResourceSet;
+use spur_core::step::{JobStep, StepState, STEP_BATCH};
 use spur_core::wal::{WalEntry, WalOperation, WalStore};
 use spur_state::snapshot::SnapshotStore;
 use spur_state::wal_store::FileWalStore;
@@ -1058,13 +1058,21 @@ impl ClusterManager {
 
         // SMTP email notification via sendmail-compatible command
         if let Some(ref smtp_cmd) = self.config.notifications.smtp_command {
-            let from = self.config.notifications.from_address.as_deref().unwrap_or("spur@localhost");
+            let from = self
+                .config
+                .notifications
+                .from_address
+                .as_deref()
+                .unwrap_or("spur@localhost");
             let user = spec.user.clone();
             let mail_user = spec.mail_user.clone();
             let to = mail_user.as_deref().unwrap_or(&user).to_string();
             let subject = format!("Spur Job {}: {}", job_id, event);
             let body = format!("Job ID: {}\nEvent: {}\nUser: {}\n", job_id, event, user);
-            let email = format!("From: {}\nTo: {}\nSubject: {}\n\n{}", from, to, subject, body);
+            let email = format!(
+                "From: {}\nTo: {}\nSubject: {}\n\n{}",
+                from, to, subject, body
+            );
 
             let smtp_cmd = smtp_cmd.clone();
             tokio::spawn(async move {
