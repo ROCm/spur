@@ -299,8 +299,8 @@ async fn dispatch_to_agent(
         container_entrypoint: spec.container_entrypoint.clone().unwrap_or_default(),
         container_remap_root: spec.container_remap_root,
         licenses: Vec::new(),
-        mail_type: Vec::new(),
-        mail_user: String::new(),
+        mail_type: spec.mail_type.clone(),
+        mail_user: spec.mail_user.clone().unwrap_or_default(),
     };
 
     let response = client

@@ -116,5 +116,6 @@ fn default_config() -> spur_core::config::SlurmConfig {
         network: Default::default(),
         logging: Default::default(),
         kubernetes: Default::default(),
+        notifications: Default::default(),
     }
 }

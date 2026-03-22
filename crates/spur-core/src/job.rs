@@ -165,6 +165,8 @@ pub struct JobSpec {
     pub exclusive: bool,
     pub hold: bool,
     pub interactive: bool,
+    pub mail_type: Vec<String>,
+    pub mail_user: Option<String>,
     pub comment: Option<String>,
     pub wckey: Option<String>,
 
@@ -216,6 +218,8 @@ impl Default for JobSpec {
             exclusive: false,
             hold: false,
             interactive: false,
+            mail_type: Vec::new(),
+            mail_user: None,
             comment: None,
             wckey: None,
             container_image: None,

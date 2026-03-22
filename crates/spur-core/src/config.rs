@@ -51,6 +51,9 @@ pub struct SlurmConfig {
 
     #[serde(default)]
     pub kubernetes: KubernetesConfig,
+
+    #[serde(default)]
+    pub notifications: NotificationConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -338,6 +341,13 @@ impl Default for KubernetesConfig {
             node_label_selector: "spur.ai/managed=true".into(),
         }
     }
+}
+
+/// Notification configuration for job event webhooks.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NotificationConfig {
+    /// Webhook URL to POST job event notifications to.
+    pub webhook_url: Option<String>,
 }
 
 impl SlurmConfig {

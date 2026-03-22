@@ -306,6 +306,7 @@ impl ClusterManager {
 
         let old_state = job.state;
         let exclusive = job.spec.exclusive;
+        let spec_for_notify = job.spec.clone();
         job.transition(JobState::Running)?;
         job.start_time = Some(Utc::now());
         job.allocated_nodes = node_names.clone();
@@ -354,6 +355,12 @@ impl ClusterManager {
         }
 
         debug!(job_id, "job started");
+
+        // Send BEGIN notification if configured
+        if spec_for_notify.mail_type.iter().any(|t| t == "BEGIN" || t == "ALL") {
+            self.send_notification(job_id, "BEGIN", &spec_for_notify);
+        }
+
         Ok(())
     }
 
@@ -372,9 +379,10 @@ impl ClusterManager {
         job.transition(state)?;
         job.exit_code = Some(exit_code);
 
-        // Capture allocation info before dropping jobs lock
+        // Capture allocation info and spec before dropping jobs lock
         let freed_nodes = job.allocated_nodes.clone();
         let allocated_resources = job.allocated_resources.clone();
+        let spec_for_notify = job.spec.clone();
         drop(jobs);
 
         self.append_wal(WalOperation::JobComplete {
@@ -430,6 +438,29 @@ impl ClusterManager {
         }
 
         debug!(job_id, exit_code, "job completed");
+
+        // Send completion notifications
+        let is_success = state == JobState::Completed;
+        let is_failure = matches!(
+            state,
+            JobState::Failed | JobState::Timeout | JobState::NodeFail
+        );
+        if is_success
+            && spec_for_notify
+                .mail_type
+                .iter()
+                .any(|t| t == "END" || t == "ALL")
+        {
+            self.send_notification(job_id, "END", &spec_for_notify);
+        }
+        if is_failure
+            && spec_for_notify
+                .mail_type
+                .iter()
+                .any(|t| t == "FAIL" || t == "ALL")
+        {
+            self.send_notification(job_id, "FAIL", &spec_for_notify);
+        }
 
         // Check for requeue: if the job has --requeue and hit a retriable state,
         // reset it to Pending so the scheduler picks it up again.
@@ -849,6 +880,61 @@ impl ClusterManager {
             .collect()
     }
 
+    /// Send a job event notification via webhook (if configured).
+    ///
+    /// Uses `curl` as a subprocess to avoid pulling in an HTTP client dependency.
+    fn send_notification(&self, job_id: JobId, event: &str, spec: &JobSpec) {
+        let webhook_url = self.config.notifications.webhook_url.clone();
+        if let Some(url) = webhook_url {
+            let event = event.to_string();
+            let user = spec.user.clone();
+            let mail_user = spec.mail_user.clone();
+            let job_name = spec.name.clone();
+            tokio::spawn(async move {
+                let payload = serde_json::json!({
+                    "job_id": job_id,
+                    "event": event,
+                    "job_name": job_name,
+                    "user": user,
+                    "mail_user": mail_user,
+                });
+                let payload_str = payload.to_string();
+                match tokio::process::Command::new("curl")
+                    .args([
+                        "-s",
+                        "-X",
+                        "POST",
+                        "-H",
+                        "Content-Type: application/json",
+                        "-d",
+                        &payload_str,
+                        &url,
+                    ])
+                    .output()
+                    .await
+                {
+                    Ok(output) => {
+                        if !output.status.success() {
+                            tracing::warn!(
+                                job_id,
+                                %event,
+                                "notification webhook returned non-zero exit"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            job_id,
+                            %event,
+                            error = %e,
+                            "failed to send notification webhook"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
     fn append_wal(&self, op: WalOperation) {
         let mut wal = self.wal.write();
         let seq = wal.latest_sequence() + 1;
@@ -881,6 +967,44 @@ impl ClusterManager {
                 Err(e) => warn!(error = %e, "failed to take snapshot"),
             }
         }
+    }
+
+    /// Send a job event notification (best-effort webhook POST).
+    fn send_notification(&self, job_id: JobId, event: &str, spec: &JobSpec) {
+        let webhook_url = match &self.config.notifications.webhook_url {
+            Some(url) if !url.is_empty() => url.clone(),
+            _ => return, // No webhook configured
+        };
+
+        let mail_user = spec.mail_user.clone().unwrap_or_default();
+        info!(
+            job_id,
+            event,
+            mail_user = %mail_user,
+            "sending job notification"
+        );
+
+        // Fire-and-forget: don't block the caller on HTTP
+        let event = event.to_string();
+        let job_name = spec.name.clone();
+        tokio::spawn(async move {
+            let body = serde_json::json!({
+                "job_id": job_id,
+                "event": event,
+                "job_name": job_name,
+                "mail_user": mail_user,
+            });
+            let client = reqwest::Client::new();
+            if let Err(e) = client
+                .post(&webhook_url)
+                .json(&body)
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await
+            {
+                warn!(job_id, event = %event, error = %e, "notification webhook failed");
+            }
+        });
     }
 }
 

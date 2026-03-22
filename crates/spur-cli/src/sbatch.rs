@@ -120,6 +120,14 @@ pub struct SbatchArgs {
     #[arg(long)]
     pub comment: Option<String>,
 
+    /// Mail notification type (comma-separated: BEGIN,END,FAIL,ALL)
+    #[arg(long)]
+    pub mail_type: Option<String>,
+
+    /// Mail notification user/address
+    #[arg(long)]
+    pub mail_user: Option<String>,
+
     /// Export environment variables
     #[arg(long, default_value = "ALL")]
     pub export: String,
@@ -445,8 +453,11 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         container_entrypoint: args.container_entrypoint.unwrap_or_default(),
         container_remap_root: args.container_remap_root,
         licenses: args.licenses,
-        mail_type: Vec::new(),
-        mail_user: String::new(),
+        mail_type: args
+            .mail_type
+            .map(|s| s.split(',').map(|t| t.trim().to_uppercase()).collect())
+            .unwrap_or_default(),
+        mail_user: args.mail_user.unwrap_or_default(),
         interactive: false,
     };
 

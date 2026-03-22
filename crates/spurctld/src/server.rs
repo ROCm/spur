@@ -393,6 +393,12 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         exclusive: spec.exclusive,
         hold: spec.hold,
         interactive: spec.interactive,
+        mail_type: spec.mail_type,
+        mail_user: if spec.mail_user.is_empty() {
+            None
+        } else {
+            Some(spec.mail_user)
+        },
         comment: if spec.comment.is_empty() {
             None
         } else {

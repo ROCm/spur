@@ -4,6 +4,7 @@ mod image;
 mod net;
 mod sacct;
 mod sacctmgr;
+mod salloc;
 mod sbatch;
 mod scancel;
 mod scontrol;
@@ -25,6 +26,7 @@ fn main() -> anyhow::Result<()> {
 
     // Slurm-compatible symlink dispatch (backward compat)
     match bin_name {
+        "salloc" => return runtime.block_on(salloc::main()),
         "sbatch" => return runtime.block_on(sbatch::main()),
         "srun" => return runtime.block_on(srun::main()),
         "squeue" => return runtime.block_on(squeue::main()),
@@ -50,6 +52,7 @@ fn main() -> anyhow::Result<()> {
     let canonical = match args[1].as_str() {
         "submit" => Some("sbatch"),
         "run" => Some("srun"),
+        "salloc" | "alloc" => Some("salloc"),
         "queue" | "jobs" => Some("squeue"),
         "cancel" | "kill" => Some("scancel"),
         "nodes" | "info" => Some("sinfo"),
@@ -73,6 +76,7 @@ fn main() -> anyhow::Result<()> {
         let result = match cmd {
             "sbatch" | "submit" => runtime.block_on(sbatch::main_with_args(rewritten)),
             "srun" | "run" => runtime.block_on(srun::main_with_args(rewritten)),
+            "salloc" | "alloc" => runtime.block_on(salloc::main_with_args(rewritten)),
             "squeue" | "queue" | "jobs" => runtime.block_on(squeue::main_with_args(rewritten)),
             "scancel" | "cancel" | "kill" => runtime.block_on(scancel::main_with_args(rewritten)),
             "sinfo" | "nodes" | "info" => runtime.block_on(sinfo::main_with_args(rewritten)),
@@ -120,6 +124,7 @@ fn print_usage() {
     eprintln!("  exec        Execute a command inside a running container job");
     eprintln!("  submit      Submit a batch job script");
     eprintln!("  run         Run a parallel job (interactive)");
+    eprintln!("  alloc       Allocate resources for an interactive session");
     eprintln!("  queue       View the job queue");
     eprintln!("  cancel      Cancel pending or running jobs");
     eprintln!("  nodes       View cluster node information");
@@ -129,5 +134,5 @@ fn print_usage() {
     eprintln!("  version     Show version");
     eprintln!();
     eprintln!("Slurm-compatible aliases (also work as symlinks):");
-    eprintln!("  sbatch srun squeue scancel sinfo sacct sacctmgr scontrol");
+    eprintln!("  salloc sbatch srun squeue scancel sinfo sacct sacctmgr scontrol");
 }
