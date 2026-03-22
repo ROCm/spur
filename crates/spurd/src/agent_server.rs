@@ -443,21 +443,15 @@ impl SlurmAgent for AgentService {
             wrapper.push_str("for LOCAL_RANK in $(seq 0 $((SPUR_NTASKS - 1))); do\n");
             wrapper.push_str("  export LOCAL_RANK\n");
             wrapper.push_str("  export SPUR_LOCALID=$LOCAL_RANK\n");
-            wrapper.push_str(
-                "  export SPUR_PROCID=$((SPUR_TASK_OFFSET + LOCAL_RANK))\n",
-            );
+            wrapper.push_str("  export SPUR_PROCID=$((SPUR_TASK_OFFSET + LOCAL_RANK))\n");
             wrapper.push_str("  export PMI_RANK=$SPUR_PROCID\n");
 
             // Partition GPUs across tasks if GPUs are allocated
             wrapper.push_str("  if [ -n \"$SPUR_JOB_GPUS\" ]; then\n");
             wrapper.push_str("    IFS=',' read -ra _ALL_GPUS <<< \"$SPUR_JOB_GPUS\"\n");
-            wrapper.push_str(
-                "    _GPUS_PER_TASK=$(( ${#_ALL_GPUS[@]} / SPUR_NTASKS ))\n",
-            );
+            wrapper.push_str("    _GPUS_PER_TASK=$(( ${#_ALL_GPUS[@]} / SPUR_NTASKS ))\n");
             wrapper.push_str("    if [ $_GPUS_PER_TASK -gt 0 ]; then\n");
-            wrapper.push_str(
-                "      _START=$((LOCAL_RANK * _GPUS_PER_TASK))\n",
-            );
+            wrapper.push_str("      _START=$((LOCAL_RANK * _GPUS_PER_TASK))\n");
             wrapper.push_str(
                 "      _TASK_GPUS=$(echo \"${_ALL_GPUS[@]:$_START:$_GPUS_PER_TASK}\" | tr ' ' ',')\n",
             );
