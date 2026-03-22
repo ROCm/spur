@@ -570,4 +570,67 @@ mod tests {
         assert_eq!(spec.mpi.as_deref(), Some("pmix"));
         assert_eq!(spec.distribution.as_deref(), Some("cyclic"));
     }
+
+    // ── T50.50–52: Heterogeneous job fields ────────────────────
+
+    #[test]
+    fn t50_50_het_job_fields_default_none() {
+        reset_job_ids();
+        let job = make_job("het-test");
+        assert!(job.het_job_id.is_none());
+        assert!(job.het_group.is_none());
+    }
+
+    #[test]
+    fn t50_51_het_job_fields_set() {
+        reset_job_ids();
+        let mut job = make_job("het-test");
+        job.het_job_id = Some(100);
+        job.het_group = Some(1);
+        assert_eq!(job.het_job_id, Some(100));
+        assert_eq!(job.het_group, Some(1));
+    }
+
+    #[test]
+    fn t50_52_het_group_spec_field() {
+        let spec = spur_core::job::JobSpec {
+            het_group: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(spec.het_group, Some(0));
+    }
+
+    // ── T50.53–55: Step constants and state transitions ────────
+
+    #[test]
+    fn t50_53_step_batch_constant() {
+        assert_eq!(spur_core::step::STEP_BATCH, 0xFFFF_FFFE);
+        assert_eq!(spur_core::step::STEP_EXTERN, 0xFFFF_FFFD);
+        assert_eq!(spur_core::step::STEP_INTERACTIVE, 0xFFFF_FFFC);
+    }
+
+    #[test]
+    fn t50_54_step_state_running_not_terminal() {
+        use spur_core::step::StepState;
+        assert!(!StepState::Running.is_terminal());
+        assert!(!StepState::Pending.is_terminal());
+    }
+
+    #[test]
+    fn t50_55_step_state_terminal_states() {
+        use spur_core::step::StepState;
+        assert!(StepState::Completed.is_terminal());
+        assert!(StepState::Failed.is_terminal());
+        assert!(StepState::Cancelled.is_terminal());
+    }
+
+    #[test]
+    fn t50_56_step_state_display() {
+        use spur_core::step::StepState;
+        assert_eq!(StepState::Running.display(), "RUNNING");
+        assert_eq!(StepState::Completed.display(), "COMPLETED");
+        assert_eq!(StepState::Failed.display(), "FAILED");
+        assert_eq!(StepState::Pending.display(), "PENDING");
+        assert_eq!(StepState::Cancelled.display(), "CANCELLED");
+    }
 }
