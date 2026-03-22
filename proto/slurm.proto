@@ -92,6 +92,11 @@ message JobSpec {
   string nodelist = 44;             // "node[001-010]"
   string exclude = 45;
   string constraint = 46;       // "mi300x,nvlink" - required node features
+  repeated string licenses = 47;  // "fluent:5", "matlab:1"
+
+  // Notifications
+  repeated string mail_type = 48;  // "BEGIN", "END", "FAIL", "ALL"
+  string mail_user = 49;
 
   // Array
   string array_spec = 50;  // "0-99%10"
@@ -102,6 +107,7 @@ message JobSpec {
   bool hold = 62;
   string comment = 63;
   string wckey = 64;
+  bool interactive = 65;  // salloc interactive allocation
 
   // Container
   string container_image = 70;     // OCI image ref or squashfs path

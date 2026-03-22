@@ -286,6 +286,7 @@ async fn dispatch_to_agent(
         requeue: spec.requeue,
         exclusive: spec.exclusive,
         hold: spec.hold,
+        interactive: spec.interactive,
         comment: spec.comment.clone().unwrap_or_default(),
         wckey: spec.wckey.clone().unwrap_or_default(),
         container_image: spec.container_image.clone().unwrap_or_default(),
@@ -297,6 +298,9 @@ async fn dispatch_to_agent(
         container_env: spec.container_env.clone(),
         container_entrypoint: spec.container_entrypoint.clone().unwrap_or_default(),
         container_remap_root: spec.container_remap_root,
+        licenses: Vec::new(),
+        mail_type: Vec::new(),
+        mail_user: String::new(),
     };
 
     let response = client

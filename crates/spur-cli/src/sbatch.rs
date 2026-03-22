@@ -48,6 +48,10 @@ pub struct SbatchArgs {
     #[arg(long)]
     pub gres: Vec<String>,
 
+    /// Licenses (e.g., "fluent:5", "matlab:1")
+    #[arg(short = 'L', long)]
+    pub licenses: Vec<String>,
+
     /// GPUs (shorthand, e.g., "4" or "mi300x:4")
     #[arg(short = 'G', long)]
     pub gpus: Option<String>,
@@ -347,6 +351,10 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
     if let Some(gpn) = &args.gpus_per_node {
         gres.push(format!("gpu:{}", gpn));
     }
+    // Append licenses as GRES entries (license:<name>:<count>)
+    for lic in &args.licenses {
+        gres.push(format!("license:{}", lic));
+    }
 
     // Parse time limit — use parse_time_seconds so that short values like
     // "0:00:10" (10 seconds) are stored with full second precision instead of
@@ -436,6 +444,10 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
             .collect(),
         container_entrypoint: args.container_entrypoint.unwrap_or_default(),
         container_remap_root: args.container_remap_root,
+        licenses: args.licenses,
+        mail_type: Vec::new(),
+        mail_user: String::new(),
+        interactive: false,
     };
 
     // Submit to controller

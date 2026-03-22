@@ -49,6 +49,10 @@ pub struct SrunArgs {
     #[arg(long)]
     pub gres: Vec<String>,
 
+    /// Licenses (e.g., "fluent:5", "matlab:1")
+    #[arg(short = 'L', long)]
+    pub licenses: Vec<String>,
+
     /// GPUs
     #[arg(short = 'G', long)]
     pub gpus: Option<String>,
@@ -137,6 +141,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let mut gres = args.gres;
     if let Some(gpus) = &args.gpus {
         gres.push(format!("gpu:{}", gpus));
+    }
+    // Append licenses as GRES entries (license:<name>:<count>)
+    for lic in &args.licenses {
+        gres.push(format!("license:{}", lic));
     }
 
     let time_limit = args

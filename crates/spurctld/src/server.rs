@@ -287,6 +287,12 @@ pub async fn serve(addr: SocketAddr, cluster: Arc<ClusterManager>) -> anyhow::Re
 // ---- Proto conversion helpers ----
 
 fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
+    // Merge licenses into gres as "license:<entry>"
+    let mut gres = spec.gres;
+    for lic in &spec.licenses {
+        gres.push(format!("license:{}", lic));
+    }
+
     Ok(spur_core::job::JobSpec {
         name: spec.name,
         partition: if spec.partition.is_empty() {
@@ -320,7 +326,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         } else {
             None
         },
-        gres: spec.gres,
+        gres,
         script: if spec.script.is_empty() {
             None
         } else {
@@ -386,6 +392,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         requeue: spec.requeue,
         exclusive: spec.exclusive,
         hold: spec.hold,
+        interactive: spec.interactive,
         comment: if spec.comment.is_empty() {
             None
         } else {

@@ -164,6 +164,7 @@ pub struct JobSpec {
     pub requeue: bool,
     pub exclusive: bool,
     pub hold: bool,
+    pub interactive: bool,
     pub comment: Option<String>,
     pub wckey: Option<String>,
 
@@ -214,6 +215,7 @@ impl Default for JobSpec {
             requeue: false,
             exclusive: false,
             hold: false,
+            interactive: false,
             comment: None,
             wckey: None,
             container_image: None,
