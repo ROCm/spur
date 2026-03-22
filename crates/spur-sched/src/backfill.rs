@@ -78,9 +78,10 @@ impl BackfillScheduler {
                 if exclude.contains(&node.name.as_str()) {
                     return false;
                 }
-                // Check partition membership
+                // Check partition membership (comma-separated OR matching)
                 if let Some(pname) = partition_name {
-                    if !node.partitions.contains(&pname.to_string()) {
+                    let requested: Vec<&str> = pname.split(',').map(str::trim).collect();
+                    if !requested.iter().any(|rp| node.partitions.iter().any(|np| np == rp)) {
                         return false;
                     }
                 }
