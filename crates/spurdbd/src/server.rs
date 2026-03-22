@@ -6,6 +6,8 @@ use tonic::{Request, Response, Status};
 
 use spur_proto::proto::slurm_accounting_server::{SlurmAccounting, SlurmAccountingServer};
 use spur_proto::proto::*;
+#[allow(unused_imports)]
+use tracing::info;
 
 use crate::db;
 
@@ -221,6 +223,199 @@ impl SlurmAccounting for AccountingService {
             gpu_hours,
             job_count,
         }))
+    }
+
+    // ============================================================
+    // Account management
+    // ============================================================
+
+    async fn create_account(
+        &self,
+        request: Request<CreateAccountRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        let parent = if req.parent_account.is_empty() {
+            None
+        } else {
+            Some(req.parent_account.as_str())
+        };
+        let max_running = if req.max_running_jobs == 0 {
+            None
+        } else {
+            Some(req.max_running_jobs as i32)
+        };
+        db::upsert_account(
+            &self.pool,
+            &req.name,
+            &req.description,
+            &req.organization,
+            parent,
+            req.fairshare_weight as i32,
+            max_running,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(()))
+    }
+
+    async fn delete_account(
+        &self,
+        request: Request<DeleteAccountRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        db::delete_account(&self.pool, &req.name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(()))
+    }
+
+    async fn list_accounts(
+        &self,
+        _request: Request<ListAccountsRequest>,
+    ) -> Result<Response<ListAccountsResponse>, Status> {
+        let records = db::list_accounts(&self.pool)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let accounts = records
+            .into_iter()
+            .map(|r| AccountInfo {
+                name: r.name,
+                description: r.description,
+                organization: r.organization,
+                parent_account: r.parent.unwrap_or_default(),
+                fairshare_weight: r.fairshare_weight as f64,
+                max_running_jobs: r.max_running_jobs.unwrap_or(0) as u32,
+            })
+            .collect();
+
+        Ok(Response::new(ListAccountsResponse { accounts }))
+    }
+
+    // ============================================================
+    // User management
+    // ============================================================
+
+    async fn add_user(&self, request: Request<AddUserRequest>) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        db::add_user(
+            &self.pool,
+            &req.user,
+            &req.account,
+            &req.admin_level,
+            req.is_default,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(()))
+    }
+
+    async fn remove_user(
+        &self,
+        request: Request<RemoveUserRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        db::remove_user(&self.pool, &req.user, &req.account)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(()))
+    }
+
+    async fn list_users(
+        &self,
+        request: Request<ListUsersRequest>,
+    ) -> Result<Response<ListUsersResponse>, Status> {
+        let req = request.into_inner();
+        let account = if req.account.is_empty() {
+            None
+        } else {
+            Some(req.account.as_str())
+        };
+        let records = db::list_users(&self.pool, account)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let users = records
+            .into_iter()
+            .map(|r| UserInfo {
+                name: r.name,
+                account: r.account,
+                admin_level: r.admin_level,
+                default_account: r.default_account.unwrap_or_default(),
+            })
+            .collect();
+
+        Ok(Response::new(ListUsersResponse { users }))
+    }
+
+    // ============================================================
+    // QOS management
+    // ============================================================
+
+    async fn create_qos(&self, request: Request<CreateQosRequest>) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        let max_jobs = if req.max_jobs_per_user == 0 {
+            None
+        } else {
+            Some(req.max_jobs_per_user as i32)
+        };
+        let max_wall = if req.max_wall_minutes == 0 {
+            None
+        } else {
+            Some(req.max_wall_minutes as i32)
+        };
+        let max_tres = if req.max_tres_per_job.is_empty() {
+            None
+        } else {
+            Some(req.max_tres_per_job.as_str())
+        };
+        db::upsert_qos(
+            &self.pool,
+            &req.name,
+            &req.description,
+            req.priority,
+            &req.preempt_mode,
+            req.usage_factor,
+            max_jobs,
+            max_wall,
+            max_tres,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(()))
+    }
+
+    async fn delete_qos(&self, request: Request<DeleteQosRequest>) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        db::delete_qos(&self.pool, &req.name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(()))
+    }
+
+    async fn list_qos(
+        &self,
+        _request: Request<ListQosRequest>,
+    ) -> Result<Response<ListQosResponse>, Status> {
+        let records = db::list_qos(&self.pool)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let qos_list = records
+            .into_iter()
+            .map(|r| QosInfo {
+                name: r.name,
+                description: r.description,
+                priority: r.priority,
+                preempt_mode: r.preempt_mode,
+                usage_factor: r.usage_factor,
+                max_jobs_per_user: r.max_jobs_per_user.unwrap_or(0) as u32,
+                max_wall_minutes: r.max_wall_min.unwrap_or(0) as u32,
+                max_tres_per_job: r.max_tres_per_job.unwrap_or_default(),
+            })
+            .collect();
+
+        Ok(Response::new(ListQosResponse { qos_list }))
     }
 }
 

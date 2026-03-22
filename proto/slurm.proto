@@ -244,6 +244,21 @@ service SlurmAccounting {
   rpc RecordJobEnd(RecordJobEndRequest) returns (google.protobuf.Empty);
   rpc GetJobHistory(GetJobHistoryRequest) returns (GetJobHistoryResponse);
   rpc GetUsage(GetUsageRequest) returns (GetUsageResponse);
+
+  // Account management (sacctmgr)
+  rpc CreateAccount(CreateAccountRequest) returns (google.protobuf.Empty);
+  rpc DeleteAccount(DeleteAccountRequest) returns (google.protobuf.Empty);
+  rpc ListAccounts(ListAccountsRequest) returns (ListAccountsResponse);
+
+  // User management (sacctmgr)
+  rpc AddUser(AddUserRequest) returns (google.protobuf.Empty);
+  rpc RemoveUser(RemoveUserRequest) returns (google.protobuf.Empty);
+  rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+
+  // QOS management (sacctmgr)
+  rpc CreateQos(CreateQosRequest) returns (google.protobuf.Empty);
+  rpc DeleteQos(DeleteQosRequest) returns (google.protobuf.Empty);
+  rpc ListQos(ListQosRequest) returns (ListQosResponse);
 }
 
 // ============================================================
@@ -457,4 +472,95 @@ message ReportJobStatusRequest {
   JobState state = 2;
   int32 exit_code = 3;
   string message = 4;  // Pod status message or error
+}
+
+// ============================================================
+// Account/User/QOS Management (sacctmgr)
+// ============================================================
+
+message CreateAccountRequest {
+  string name = 1;
+  string description = 2;
+  string organization = 3;
+  string parent_account = 4;
+  double fairshare_weight = 5;
+  uint32 max_running_jobs = 6;
+}
+
+message DeleteAccountRequest {
+  string name = 1;
+}
+
+message ListAccountsRequest { }
+
+message ListAccountsResponse {
+  repeated AccountInfo accounts = 1;
+}
+
+message AccountInfo {
+  string name = 1;
+  string description = 2;
+  string organization = 3;
+  string parent_account = 4;
+  double fairshare_weight = 5;
+  uint32 max_running_jobs = 6;
+}
+
+message AddUserRequest {
+  string user = 1;
+  string account = 2;
+  string admin_level = 3;
+  bool is_default = 4;
+}
+
+message RemoveUserRequest {
+  string user = 1;
+  string account = 2;
+}
+
+message ListUsersRequest {
+  string account = 1;
+}
+
+message ListUsersResponse {
+  repeated UserInfo users = 1;
+}
+
+message UserInfo {
+  string name = 1;
+  string account = 2;
+  string admin_level = 3;
+  string default_account = 4;
+}
+
+message CreateQosRequest {
+  string name = 1;
+  string description = 2;
+  int32 priority = 3;
+  string preempt_mode = 4;
+  double usage_factor = 5;
+  uint32 max_jobs_per_user = 6;
+  uint32 max_wall_minutes = 7;
+  string max_tres_per_job = 8;
+}
+
+message DeleteQosRequest {
+  string name = 1;
+}
+
+message ListQosRequest { }
+
+message ListQosResponse {
+  repeated QosInfo qos_list = 1;
+}
+
+message QosInfo {
+  string name = 1;
+  string description = 2;
+  int32 priority = 3;
+  string preempt_mode = 4;
+  double usage_factor = 5;
+  uint32 max_jobs_per_user = 6;
+  uint32 max_wall_minutes = 7;
+  string max_tres_per_job = 8;
 }
