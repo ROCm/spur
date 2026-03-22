@@ -11,6 +11,7 @@ use tracing::{debug, error, info, warn};
 
 use spur_core::job::JobId;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
+use spur_spank::SpankHost;
 
 use crate::reporter::NodeReporter;
 
@@ -107,6 +108,7 @@ pub async fn launch_job(
     memory_mb: u64,
     gpu_devices: &[u32],
     cpu_ids: &[u32],
+    spank: Option<&SpankHost>,
 ) -> anyhow::Result<RunningJob> {
     info!(job_id, work_dir, "launching job");
 
@@ -114,6 +116,16 @@ pub async fn launch_job(
     if let Ok(prolog) = std::env::var("SPUR_PROLOG") {
         if !prolog.is_empty() {
             run_hook(&prolog, job_id, work_dir, "prolog").await?;
+        }
+    }
+
+    // Invoke SPANK Init hook (after prolog, before process spawn)
+    if let Some(spank) = spank {
+        if let Err(e) = spank.invoke_hook(spur_spank::SpankHook::Init) {
+            warn!(job_id, error = %e, "SPANK Init hook failed");
+        }
+        if let Err(e) = spank.invoke_hook(spur_spank::SpankHook::TaskInit) {
+            warn!(job_id, error = %e, "SPANK TaskInit hook failed");
         }
     }
 

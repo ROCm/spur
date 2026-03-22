@@ -15,6 +15,8 @@ use spur_proto::proto::*;
 
 use spur_sched::cons_tres::{AllocationResult, NodeAllocation};
 
+use spur_spank::{SpankHook, SpankHost};
+
 use crate::executor;
 use crate::reporter::NodeReporter;
 
@@ -37,6 +39,7 @@ pub struct AgentService {
     pub reporter: Arc<NodeReporter>,
     running: Arc<Mutex<HashMap<u32, TrackedJob>>>,
     allocation: Arc<Mutex<NodeAllocation>>,
+    spank: Arc<Option<SpankHost>>,
 }
 
 impl AgentService {
@@ -47,10 +50,56 @@ impl AgentService {
                 .unwrap_or_else(|_| "unknown".into()),
             &reporter.resources,
         );
+
+        // Load SPANK plugins from plugstack.conf if available
+        let plugstack_path = std::env::var("SPUR_PLUGSTACK")
+            .unwrap_or_else(|_| "/etc/spur/plugstack.conf".to_string());
+        let spank = if std::path::Path::new(&plugstack_path).exists() {
+            match spur_spank::parse_plugstack(std::path::Path::new(&plugstack_path)) {
+                Ok(entries) => {
+                    let mut host = SpankHost::new();
+                    for entry in &entries {
+                        if let Err(e) = host.load_plugin(&entry.path) {
+                            if entry.required {
+                                warn!(
+                                    plugin = %entry.path.display(),
+                                    error = %e,
+                                    "required SPANK plugin failed to load"
+                                );
+                            } else {
+                                info!(
+                                    plugin = %entry.path.display(),
+                                    error = %e,
+                                    "optional SPANK plugin failed to load, skipping"
+                                );
+                            }
+                        }
+                    }
+                    if host.plugin_count() > 0 {
+                        info!(count = host.plugin_count(), "SPANK plugins loaded");
+                        Some(host)
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        path = %plugstack_path,
+                        error = %e,
+                        "failed to parse plugstack.conf"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             reporter,
             running: Arc::new(Mutex::new(HashMap::new())),
             allocation: Arc::new(Mutex::new(allocation)),
+            spank: Arc::new(spank),
         }
     }
 
@@ -58,6 +107,7 @@ impl AgentService {
     pub fn start_monitor(&self, controller_addr: String) {
         let running = self.running.clone();
         let allocation = self.allocation.clone();
+        let spank = self.spank.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
             loop {
@@ -102,6 +152,18 @@ impl AgentService {
                 // report_completion blocks new job launches and can lose
                 // completions if the RPC times out.
                 drop(jobs);
+
+                // Invoke SPANK TaskExit and JobEpilog hooks for completed jobs
+                if let Some(ref spank_host) = *spank {
+                    for (job_id, _exit_code, _mode, _alloc) in &completed {
+                        if let Err(e) = spank_host.invoke_hook(SpankHook::TaskExit) {
+                            warn!(job_id, error = %e, "SPANK TaskExit hook failed");
+                        }
+                        if let Err(e) = spank_host.invoke_hook(SpankHook::JobEpilog) {
+                            warn!(job_id, error = %e, "SPANK JobEpilog hook failed");
+                        }
+                    }
+                }
 
                 for (job_id, exit_code, _mode, _alloc) in &completed {
                     report_completion(&controller_addr, *job_id, *exit_code).await;
@@ -398,6 +460,7 @@ impl SlurmAgent for AgentService {
             spec.memory_per_node_mb,
             &gpu_devices,
             &cpu_ids,
+            (*self.spank).as_ref(),
         )
         .await
         {

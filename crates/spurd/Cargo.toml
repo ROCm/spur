@@ -12,6 +12,7 @@ spur-proto = { path = "../spur-proto" }
 spur-core = { path = "../spur-core" }
 spur-net = { path = "../spur-net" }
 spur-sched = { path = "../spur-sched" }
+spur-spank = { path = "../spur-spank" }
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost-types = { workspace = true }
