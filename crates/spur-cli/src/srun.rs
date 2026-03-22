@@ -168,6 +168,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     if let Some(ref gpu_bind) = args.gpu_bind {
         environment.insert("SPUR_GPU_BIND".into(), gpu_bind.clone());
     }
+    if args.label {
+        environment.insert("SPUR_LABEL".into(), "1".into());
+    }
 
     let memory_mb = args
         .mem

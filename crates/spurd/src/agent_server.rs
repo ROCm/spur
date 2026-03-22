@@ -461,10 +461,17 @@ impl SlurmAgent for AgentService {
             wrapper.push_str("    fi\n");
             wrapper.push_str("  fi\n");
 
+            wrapper.push_str("  if [ \"$SPUR_LABEL\" = \"1\" ]; then\n");
             wrapper.push_str(&format!(
-                "  bash \"{}\" &\n",
+                "    bash \"{}\" 2>&1 | sed \"s/^/[$SPUR_PROCID] /\" &\n",
                 user_script_path.replace('"', "\\\"")
             ));
+            wrapper.push_str("  else\n");
+            wrapper.push_str(&format!(
+                "    bash \"{}\" &\n",
+                user_script_path.replace('"', "\\\"")
+            ));
+            wrapper.push_str("  fi\n");
             wrapper.push_str("done\nwait\n");
             wrapper
         } else {
