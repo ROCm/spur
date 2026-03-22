@@ -105,7 +105,28 @@ impl ClusterManager {
         }
 
         let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
-        let job = Job::new(job_id, spec.clone());
+        let mut job = Job::new(job_id, spec.clone());
+
+        // Heterogeneous job linking: if het_group > 0, find the first component
+        // (het_group == 0) submitted by the same user with the same name and
+        // link this component to it via het_job_id.
+        if let Some(het_group) = spec.het_group {
+            job.het_group = Some(het_group);
+            if het_group > 0 {
+                // Find the first component (het_group 0) as the anchor
+                let jobs = self.jobs.read();
+                let anchor = jobs.values().find(|j| {
+                    j.het_group == Some(0)
+                        && j.spec.user == spec.user
+                        && j.spec.name == spec.name
+                        && j.state == JobState::Pending
+                });
+                if let Some(anchor_job) = anchor {
+                    job.het_job_id = Some(anchor_job.job_id);
+                }
+                drop(jobs);
+            }
+        }
 
         // WAL
         self.append_wal(WalOperation::JobSubmit {

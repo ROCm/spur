@@ -459,6 +459,11 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         } else {
             Some(spec.distribution)
         },
+        het_group: if spec.het_group > 0 {
+            Some(spec.het_group)
+        } else {
+            None
+        },
         array_spec: if spec.array_spec.is_empty() {
             None
         } else {

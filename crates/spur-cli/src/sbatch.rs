@@ -108,6 +108,10 @@ pub struct SbatchArgs {
     #[arg(short = 'm', long)]
     pub distribution: Option<String>,
 
+    /// Heterogeneous job component index (0 = first component)
+    #[arg(long)]
+    pub het_group: Option<u32>,
+
     /// MPI type (none, pmix, pmi2)
     #[arg(long, default_value = "none")]
     pub mpi: String,
@@ -440,6 +444,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         constraint: args.constraint.unwrap_or_default(),
         mpi: args.mpi,
         distribution: args.distribution.unwrap_or_default(),
+        het_group: args.het_group.unwrap_or(0),
         array_spec: args.array.unwrap_or_default(),
         requeue: args.requeue,
         exclusive: args.exclusive,

@@ -1,7 +1,9 @@
+use std::collections::HashMap;
+
 use chrono::{Duration, Utc};
 use tracing::debug;
 
-use spur_core::job::Job;
+use spur_core::job::{Job, JobId};
 use spur_core::node::Node;
 use spur_core::resource::ResourceSet;
 
@@ -142,6 +144,38 @@ impl Scheduler for BackfillScheduler {
             }
         }
 
+        // Identify het job groups: collect sets of jobs linked by het_job_id.
+        // For each group, ALL components must be schedulable or NONE are scheduled.
+        let mut het_groups: HashMap<JobId, Vec<usize>> = HashMap::new();
+        for (idx, job) in pending.iter().enumerate() {
+            if let Some(het_id) = job.het_job_id {
+                het_groups.entry(het_id).or_default().push(idx);
+            } else if job.het_group == Some(0) {
+                // The anchor component (group 0) uses its own job_id as the key
+                het_groups.entry(job.job_id).or_default().push(idx);
+            }
+        }
+
+        // Build a set of job indices to skip (part of a het group that can't fully schedule)
+        let mut skip_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        // Pre-check het groups: if any component can't find suitable nodes, skip all
+        for (_het_id, indices) in &het_groups {
+            if indices.len() <= 1 {
+                continue; // Single-component "het" job, treat normally
+            }
+            let all_have_nodes = indices.iter().all(|&idx| {
+                let job = &pending[idx];
+                let suitable = self.find_suitable_nodes(job, cluster.nodes, cluster.partitions);
+                suitable.len() >= job.spec.num_nodes as usize
+            });
+            if !all_have_nodes {
+                for &idx in indices {
+                    skip_indices.insert(idx);
+                }
+            }
+        }
+
         let mut assignments = Vec::new();
         let limit = pending.len().min(self.max_jobs);
 
@@ -149,6 +183,10 @@ impl Scheduler for BackfillScheduler {
         let mut shadows: Vec<(usize, chrono::DateTime<Utc>)> = Vec::new(); // (job_idx, earliest_start)
 
         for (job_idx, job) in pending.iter().enumerate().take(limit) {
+            // Skip jobs that are part of an unschedulable het group
+            if skip_indices.contains(&job_idx) {
+                continue;
+            }
             let suitable = self.find_suitable_nodes(job, cluster.nodes, cluster.partitions);
             if suitable.is_empty() {
                 continue;

@@ -600,6 +600,7 @@ fn core_job_spec_to_proto(spec: &spur_core::job::JobSpec) -> spur_proto::proto::
         constraint: spec.constraint.clone().unwrap_or_default(),
         mpi: spec.mpi.clone().unwrap_or_default(),
         distribution: spec.distribution.clone().unwrap_or_default(),
+        het_group: spec.het_group.unwrap_or(0),
         array_spec: spec.array_spec.clone().unwrap_or_default(),
         requeue: spec.requeue,
         exclusive: spec.exclusive,

@@ -104,6 +104,7 @@ message JobSpec {
   // MPI
   string mpi = 51;            // MPI type: "none", "pmix", "pmi2"
   string distribution = 52;   // Task distribution: "block", "cyclic", "plane"
+  uint32 het_group = 53;      // Heterogeneous job component index
 
   // Misc
   bool requeue = 60;
