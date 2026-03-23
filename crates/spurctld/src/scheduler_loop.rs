@@ -309,6 +309,16 @@ async fn dispatch_to_agent(
         licenses: Vec::new(),
         mail_type: spec.mail_type.clone(),
         mail_user: spec.mail_user.clone().unwrap_or_default(),
+        begin_time: spec.begin_time.map(|dt| prost_types::Timestamp {
+            seconds: dt.timestamp(),
+            nanos: dt.timestamp_subsec_nanos() as i32,
+        }),
+        deadline: spec.deadline.map(|dt| prost_types::Timestamp {
+            seconds: dt.timestamp(),
+            nanos: dt.timestamp_subsec_nanos() as i32,
+        }),
+        spread_job: spec.spread_job,
+        open_mode: spec.open_mode.clone().unwrap_or_default(),
     };
 
     let response = client
@@ -379,6 +389,26 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>) {
         interval.tick().await;
 
         let now = Utc::now();
+
+        // Deadline enforcement: cancel pending jobs whose deadline has passed
+        {
+            let pending =
+                cluster.get_jobs(&[spur_core::job::JobState::Pending], None, None, None, &[]);
+            for job in &pending {
+                if let Some(deadline) = job.spec.deadline {
+                    if now > deadline {
+                        info!(
+                            job_id = job.job_id,
+                            "job deadline passed while still pending — cancelling"
+                        );
+                        if let Err(e) = cluster.cancel_job(job.job_id, "system") {
+                            warn!(job_id = job.job_id, error = %e, "failed to cancel deadline-expired job");
+                        }
+                    }
+                }
+            }
+        }
+
         let running = cluster.get_jobs(&[spur_core::job::JobState::Running], None, None, None, &[]);
 
         for job in &running {

@@ -699,4 +699,62 @@ mod tests {
         assert_eq!(NodeState::Suspended.display(), "suspended");
         assert_eq!(NodeState::Suspended.short(), "susp");
     }
+
+    // ── T50.63–70: Begin time, deadline, spread_job, open_mode fields ──
+
+    #[test]
+    fn t50_63_begin_time_field() {
+        let spec = JobSpec {
+            begin_time: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            ..Default::default()
+        };
+        assert!(spec.begin_time.is_some());
+    }
+
+    #[test]
+    fn t50_64_deadline_field() {
+        let spec = JobSpec {
+            deadline: Some(chrono::Utc::now() + chrono::Duration::hours(24)),
+            ..Default::default()
+        };
+        assert!(spec.deadline.is_some());
+    }
+
+    #[test]
+    fn t50_65_spread_job_flag() {
+        let spec = JobSpec {
+            spread_job: true,
+            ..Default::default()
+        };
+        assert!(spec.spread_job);
+    }
+
+    #[test]
+    fn t50_66_spread_job_default_false() {
+        assert!(!JobSpec::default().spread_job);
+    }
+
+    #[test]
+    fn t50_67_open_mode_append() {
+        let spec = JobSpec {
+            open_mode: Some("append".into()),
+            ..Default::default()
+        };
+        assert_eq!(spec.open_mode.as_deref(), Some("append"));
+    }
+
+    #[test]
+    fn t50_68_open_mode_default_none() {
+        assert!(JobSpec::default().open_mode.is_none());
+    }
+
+    #[test]
+    fn t50_69_begin_time_default_none() {
+        assert!(JobSpec::default().begin_time.is_none());
+    }
+
+    #[test]
+    fn t50_70_deadline_default_none() {
+        assert!(JobSpec::default().deadline.is_none());
+    }
 }

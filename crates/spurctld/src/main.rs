@@ -119,5 +119,6 @@ fn default_config() -> spur_core::config::SlurmConfig {
         notifications: Default::default(),
         power: Default::default(),
         federation: Default::default(),
+        licenses: std::collections::HashMap::new(),
     }
 }

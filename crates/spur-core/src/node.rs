@@ -111,6 +111,13 @@ pub struct Node {
     pub wg_pubkey: Option<String>,
     /// Agent version.
     pub version: Option<String>,
+    /// Scheduling weight. Higher weight = preferred for scheduling.
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+}
+
+fn default_weight() -> u32 {
+    1
 }
 
 impl Node {
@@ -136,6 +143,7 @@ impl Node {
             port: 6818,
             wg_pubkey: None,
             version: None,
+            weight: 1,
         }
     }
 

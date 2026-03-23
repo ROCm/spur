@@ -90,6 +90,9 @@ pub enum PendingReason {
     Held,
     QoSMaxJobsPerUser,
     ReqNodeNotAvail,
+    BeginTime,
+    DeadlineReached,
+    Licenses,
 }
 
 impl PendingReason {
@@ -106,6 +109,9 @@ impl PendingReason {
             Self::Held => "JobHeldUser",
             Self::QoSMaxJobsPerUser => "QOSMaxJobsPerUserLimit",
             Self::ReqNodeNotAvail => "ReqNodeNotAvail",
+            Self::BeginTime => "BeginTime",
+            Self::DeadlineReached => "DeadlineReached",
+            Self::Licenses => "Licenses",
         }
     }
 }
@@ -190,6 +196,20 @@ pub struct JobSpec {
 
     // Burst buffer
     pub burst_buffer: Option<String>,
+
+    // Deferred scheduling
+    /// Earliest time the job is eligible to start.
+    pub begin_time: Option<DateTime<Utc>>,
+    /// If still pending after this time, cancel the job.
+    pub deadline: Option<DateTime<Utc>>,
+
+    // Scheduling strategy
+    /// Spread job across least-loaded nodes.
+    pub spread_job: bool,
+
+    // Output mode
+    /// How to open stdout/stderr files: "truncate" (default) or "append".
+    pub open_mode: Option<String>,
 }
 
 impl Default for JobSpec {
@@ -245,6 +265,10 @@ impl Default for JobSpec {
             container_entrypoint: None,
             container_remap_root: false,
             burst_buffer: None,
+            begin_time: None,
+            deadline: None,
+            spread_job: false,
+            open_mode: None,
         }
     }
 }

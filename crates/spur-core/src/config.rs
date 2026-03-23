@@ -60,6 +60,10 @@ pub struct SlurmConfig {
 
     #[serde(default)]
     pub federation: FederationConfig,
+
+    /// Cluster-wide license pool, e.g., {"fluent": 20, "comsol": 5}.
+    #[serde(default)]
+    pub licenses: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +253,9 @@ pub struct NodeConfig {
     pub features: Vec<String>,
     /// Override address (if different from hostname).
     pub address: Option<String>,
+    /// Scheduling weight. Higher weight = preferred for scheduling.
+    #[serde(default = "default_one")]
+    pub weight: u32,
 }
 
 /// Network / WireGuard mesh configuration.

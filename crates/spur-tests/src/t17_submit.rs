@@ -260,4 +260,14 @@ mod tests {
         let parsed = spur_core::resource::parse_gres(gres);
         assert_eq!(parsed, Some(("license".into(), Some("fluent".into()), 5)));
     }
+
+    // ── T17.19: License GRES tracking ────────────────────────────
+
+    #[test]
+    fn t17_19_license_gres_tracking() {
+        // Verify license requirements can be extracted from GRES
+        let gres = "license:fluent:5";
+        let parsed = spur_core::resource::parse_gres(gres);
+        assert_eq!(parsed, Some(("license".into(), Some("fluent".into()), 5)));
+    }
 }

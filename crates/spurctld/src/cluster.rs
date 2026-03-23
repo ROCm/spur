@@ -33,6 +33,8 @@ pub struct ClusterManager {
     wal: RwLock<FileWalStore>,
     snapshot: RwLock<Option<SnapshotStore>>,
     wal_since_snapshot: AtomicU32,
+    /// Cluster-wide license pool: available licenses (decremented when jobs start).
+    license_pool: RwLock<HashMap<String, u64>>,
 }
 
 impl ClusterManager {
@@ -83,6 +85,8 @@ impl ClusterManager {
             "cluster state recovered"
         );
 
+        let license_pool = config.licenses.clone();
+
         Ok(Self {
             config,
             jobs: RwLock::new(jobs),
@@ -94,6 +98,7 @@ impl ClusterManager {
             wal: RwLock::new(wal),
             snapshot: RwLock::new(snapshot),
             wal_since_snapshot: AtomicU32::new(0),
+            license_pool: RwLock::new(license_pool),
         })
     }
 
@@ -353,6 +358,17 @@ impl ClusterManager {
                 .collect(),
         };
 
+        // Subtract licenses from cluster pool
+        let lic_req = extract_license_requirements(&spec_for_notify);
+        if !lic_req.is_empty() {
+            let mut pool = self.license_pool.write();
+            for (lic, count) in &lic_req {
+                if let Some(avail) = pool.get_mut(lic) {
+                    *avail = avail.saturating_sub(*count);
+                }
+            }
+        }
+
         // Drop jobs lock before acquiring nodes lock (lock ordering: jobs → nodes)
         drop(jobs);
 
@@ -432,6 +448,15 @@ impl ClusterManager {
         let allocated_resources = job.allocated_resources.clone();
         let spec_for_notify = job.spec.clone();
         drop(jobs);
+
+        // Return licenses to cluster pool
+        let lic_req = extract_license_requirements(&spec_for_notify);
+        if !lic_req.is_empty() {
+            let mut pool = self.license_pool.write();
+            for (lic, count) in &lic_req {
+                *pool.entry(lic.clone()).or_insert(0) += count;
+            }
+        }
 
         self.append_wal(WalOperation::JobComplete {
             job_id,
@@ -609,11 +634,12 @@ impl ClusterManager {
             }
         }
 
-        // Copy features from node config
+        // Copy features and weight from node config
         for nc in &self.config.nodes {
             if let Ok(hosts) = spur_core::hostlist::expand(&nc.names) {
                 if hosts.contains(&name) {
                     node.features = nc.features.clone();
+                    node.weight = nc.weight;
                     break;
                 }
             }
@@ -876,6 +902,19 @@ impl ClusterManager {
             }
         });
 
+        // Filter out jobs whose begin_time is in the future (not yet eligible)
+        {
+            let now = Utc::now();
+            pending.retain(|job| {
+                if let Some(begin) = job.spec.begin_time {
+                    if now < begin {
+                        return false; // Not yet eligible
+                    }
+                }
+                true
+            });
+        }
+
         // Enforce array max_concurrent: suppress tasks if too many siblings already running
         let running_array_counts: std::collections::HashMap<JobId, u32> = {
             let mut counts = std::collections::HashMap::new();
@@ -938,6 +977,21 @@ impl ClusterManager {
                 QosCheckResult::Blocked(_reason) => false,
             }
         });
+
+        // License enforcement: check cluster-wide license pool
+        {
+            let pool = self.license_pool.read();
+            pending.retain(|job| {
+                let lic_req = extract_license_requirements(&job.spec);
+                for (lic, count) in &lic_req {
+                    let available = pool.get(lic).copied().unwrap_or(0);
+                    if available < *count {
+                        return false; // Not enough licenses
+                    }
+                }
+                true
+            });
+        }
 
         // Recompute effective priority with age + partition tier
         let now = Utc::now();
@@ -1124,6 +1178,21 @@ impl ClusterManager {
             }
         }
     }
+}
+
+/// Extract license requirements from a job's GRES list.
+/// License GRES entries are formatted as "license:<name>:<count>" or "license:<name>".
+fn extract_license_requirements(spec: &JobSpec) -> HashMap<String, u64> {
+    let mut licenses = HashMap::new();
+    for gres in &spec.gres {
+        if let Some((name, ltype, count)) = spur_core::resource::parse_gres(gres) {
+            if name == "license" {
+                let lic_name = ltype.unwrap_or_else(|| "unknown".to_string());
+                *licenses.entry(lic_name).or_insert(0) += count as u64;
+            }
+        }
+    }
+    licenses
 }
 
 /// Replay a single WAL entry into state.

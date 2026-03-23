@@ -621,6 +621,16 @@ fn core_job_spec_to_proto(spec: &spur_core::job::JobSpec) -> spur_proto::proto::
         mail_type: Vec::new(),
         mail_user: String::new(),
         interactive: false,
+        begin_time: spec.begin_time.map(|dt| prost_types::Timestamp {
+            seconds: dt.timestamp(),
+            nanos: dt.timestamp_subsec_nanos() as i32,
+        }),
+        deadline: spec.deadline.map(|dt| prost_types::Timestamp {
+            seconds: dt.timestamp(),
+            nanos: dt.timestamp_subsec_nanos() as i32,
+        }),
+        spread_job: spec.spread_job,
+        open_mode: spec.open_mode.clone().unwrap_or_default(),
     }
 }
 

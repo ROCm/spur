@@ -574,6 +574,11 @@ impl SlurmAgent for AgentService {
         };
 
         // Launch the job
+        let open_mode = if spec.open_mode.is_empty() {
+            None
+        } else {
+            Some(spec.open_mode.as_str())
+        };
         match executor::launch_job(
             job_id,
             &launch_script,
@@ -586,6 +591,7 @@ impl SlurmAgent for AgentService {
             &gpu_devices,
             &cpu_ids,
             (*self.spank).as_ref(),
+            open_mode,
         )
         .await
         {

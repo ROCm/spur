@@ -208,7 +208,32 @@ impl Scheduler for BackfillScheduler {
                 })
                 .collect();
 
-            node_starts.sort_by_key(|(_, t)| *t);
+            // For --spread-job, sort by least-loaded (ascending alloc) so we
+            // prefer nodes with the most available resources. For normal jobs,
+            // sort by earliest start time. For weighted nodes, prefer higher
+            // weight (descending).
+            if job.spec.spread_job {
+                node_starts.sort_by(|(a_ni, a_t), (b_ni, b_t)| {
+                    // Primary: earliest start time
+                    a_t.cmp(b_t)
+                        // Secondary: least allocated CPUs (ascending = most free)
+                        .then_with(|| {
+                            cluster.nodes[*a_ni]
+                                .alloc_resources
+                                .cpus
+                                .cmp(&cluster.nodes[*b_ni].alloc_resources.cpus)
+                        })
+                });
+            } else {
+                // Default: sort by time, then prefer higher-weight nodes
+                node_starts.sort_by(|(a_ni, a_t), (b_ni, b_t)| {
+                    a_t.cmp(b_t).then_with(|| {
+                        cluster.nodes[*b_ni]
+                            .weight
+                            .cmp(&cluster.nodes[*a_ni].weight)
+                    })
+                });
+            }
 
             if node_starts.len() < needed_nodes {
                 continue;
@@ -761,5 +786,67 @@ mod tests {
             0,
             "neither het component should schedule if one can't"
         );
+    }
+
+    #[test]
+    fn test_spread_job_prefers_least_loaded() {
+        // Create nodes with different allocation levels
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(3);
+        // node001 heavily loaded, node002 medium, node003 empty
+        nodes[0].alloc_resources = ResourceSet {
+            cpus: 60,
+            ..Default::default()
+        };
+        nodes[0].state = NodeState::Mixed;
+        nodes[1].alloc_resources = ResourceSet {
+            cpus: 30,
+            ..Default::default()
+        };
+        nodes[1].state = NodeState::Mixed;
+        // node003 is idle (default)
+
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let mut job = make_job(1, 1, 1);
+        job.spec.spread_job = true;
+
+        let pending = vec![job];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        // Should prefer least-loaded node (node003)
+        assert_eq!(assignments[0].nodes[0], "node003");
+    }
+
+    #[test]
+    fn test_node_weight_prefers_higher() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(3);
+        nodes[0].weight = 1;
+        nodes[1].weight = 10; // Highest weight
+        nodes[2].weight = 5;
+
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let job = make_job(1, 1, 1);
+
+        let pending = vec![job];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+        };
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        // Should prefer highest-weight node (node002)
+        assert_eq!(assignments[0].nodes[0], "node002");
     }
 }

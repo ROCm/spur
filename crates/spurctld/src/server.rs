@@ -595,6 +595,20 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         } else {
             Some(spec.burst_buffer)
         },
+        begin_time: spec.begin_time.map(|ts| {
+            chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32)
+                .unwrap_or_else(chrono::Utc::now)
+        }),
+        deadline: spec.deadline.map(|ts| {
+            chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32)
+                .unwrap_or_else(chrono::Utc::now)
+        }),
+        spread_job: spec.spread_job,
+        open_mode: if spec.open_mode.is_empty() {
+            None
+        } else {
+            Some(spec.open_mode)
+        },
     })
 }
 

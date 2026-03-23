@@ -8,9 +8,14 @@ mod salloc;
 mod sbatch;
 mod scancel;
 mod scontrol;
+mod sdiag;
 mod sinfo;
+mod sprio;
 mod squeue;
+mod sreport;
 mod srun;
+mod sshare;
+mod sstat;
 
 use std::path::Path;
 
@@ -35,6 +40,11 @@ fn main() -> anyhow::Result<()> {
         "sacct" => return runtime.block_on(sacct::main()),
         "sacctmgr" => return runtime.block_on(sacctmgr::main()),
         "scontrol" => return runtime.block_on(scontrol::main()),
+        "sprio" => return runtime.block_on(sprio::main()),
+        "sshare" => return runtime.block_on(sshare::main()),
+        "sstat" => return runtime.block_on(sstat::main()),
+        "sdiag" => return runtime.block_on(sdiag::main()),
+        "sreport" => return runtime.block_on(sreport::main()),
         _ => {}
     }
 
@@ -59,9 +69,13 @@ fn main() -> anyhow::Result<()> {
         "history" | "acct" => Some("sacct"),
         "accounts" | "acctmgr" => Some("sacctmgr"),
         "show" | "control" | "ctl" => Some("scontrol"),
-        "sbatch" | "srun" | "squeue" | "scancel" | "sinfo" | "sacct" | "sacctmgr" | "scontrol" => {
-            Some(args[1].as_str())
-        }
+        "priority" | "prio" => Some("sprio"),
+        "share" | "fairshare" => Some("sshare"),
+        "stat" | "jobstat" => Some("sstat"),
+        "diag" | "diagnostics" => Some("sdiag"),
+        "report" | "usage" => Some("sreport"),
+        "sbatch" | "srun" | "squeue" | "scancel" | "sinfo" | "sacct" | "sacctmgr" | "scontrol"
+        | "sprio" | "sshare" | "sstat" | "sdiag" | "sreport" => Some(args[1].as_str()),
         "net" | "image" | "exec" => Some(args[1].as_str()),
         _ => None,
     };
@@ -87,6 +101,11 @@ fn main() -> anyhow::Result<()> {
             "scontrol" | "show" | "control" | "ctl" => {
                 runtime.block_on(scontrol::main_with_args(rewritten))
             }
+            "sprio" | "priority" | "prio" => runtime.block_on(sprio::main_with_args(rewritten)),
+            "sshare" | "share" | "fairshare" => runtime.block_on(sshare::main_with_args(rewritten)),
+            "sstat" | "stat" | "jobstat" => runtime.block_on(sstat::main_with_args(rewritten)),
+            "sdiag" | "diag" | "diagnostics" => runtime.block_on(sdiag::main_with_args(rewritten)),
+            "sreport" | "report" | "usage" => runtime.block_on(sreport::main_with_args(rewritten)),
             "net" => runtime.block_on(net::main_with_args(rewritten)),
             "image" => runtime.block_on(image::main_with_args(rewritten)),
             "exec" => runtime.block_on(exec::main_with_args(rewritten)),
@@ -131,8 +150,14 @@ fn print_usage() {
     eprintln!("  history     View job accounting history");
     eprintln!("  accounts    Manage accounts, users, and QOS");
     eprintln!("  show        Show detailed job/node/partition info");
+    eprintln!("  priority    View job priority breakdown");
+    eprintln!("  share       Show fair-share information");
+    eprintln!("  stat        Display running job statistics");
+    eprintln!("  diag        Show scheduler diagnostics");
+    eprintln!("  report      Generate usage reports");
     eprintln!("  version     Show version");
     eprintln!();
     eprintln!("Slurm-compatible aliases (also work as symlinks):");
     eprintln!("  salloc sbatch srun squeue scancel sinfo sacct sacctmgr scontrol");
+    eprintln!("  sprio sshare sstat sdiag sreport");
 }

@@ -109,6 +109,7 @@ pub async fn launch_job(
     gpu_devices: &[u32],
     cpu_ids: &[u32],
     spank: Option<&SpankHost>,
+    open_mode: Option<&str>,
 ) -> anyhow::Result<RunningJob> {
     info!(job_id, work_dir, "launching job");
 
@@ -184,12 +185,34 @@ pub async fn launch_job(
         tokio::fs::create_dir_all(parent).await.ok();
     }
 
-    let stdout_file = tokio::fs::File::create(&stdout_resolved)
-        .await
-        .context("failed to create stdout file")?;
-    let stderr_file = tokio::fs::File::create(&stderr_resolved)
-        .await
-        .context("failed to create stderr file")?;
+    let use_append = open_mode
+        .map(|m| m.eq_ignore_ascii_case("append"))
+        .unwrap_or(false);
+
+    let stdout_file = if use_append {
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&stdout_resolved)
+            .await
+            .context("failed to open stdout file in append mode")?
+    } else {
+        tokio::fs::File::create(&stdout_resolved)
+            .await
+            .context("failed to create stdout file")?
+    };
+    let stderr_file = if use_append {
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&stderr_resolved)
+            .await
+            .context("failed to open stderr file in append mode")?
+    } else {
+        tokio::fs::File::create(&stderr_resolved)
+            .await
+            .context("failed to create stderr file")?
+    };
 
     // Build environment
     let mut env = environment.clone();

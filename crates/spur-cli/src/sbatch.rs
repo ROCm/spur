@@ -116,6 +116,22 @@ pub struct SbatchArgs {
     #[arg(long)]
     pub bb: Option<String>,
 
+    /// Earliest start time (ISO 8601, e.g. "2026-03-22T10:00:00Z" or "now+1hour")
+    #[arg(long)]
+    pub begin: Option<String>,
+
+    /// Cancel if still pending after this time (ISO 8601)
+    #[arg(long)]
+    pub deadline: Option<String>,
+
+    /// Spread job across least-loaded nodes
+    #[arg(long)]
+    pub spread_job: bool,
+
+    /// Output file open mode: "truncate" (default) or "append"
+    #[arg(long)]
+    pub open_mode: Option<String>,
+
     /// MPI type (none, pmix, pmi2)
     #[arg(long, default_value = "none")]
     pub mpi: String,
@@ -294,6 +310,53 @@ fn convert_pbs_resource(spec: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Parse a datetime argument. Supports:
+///   - ISO 8601: "2026-03-22T10:00:00Z"
+///   - "now" → current time
+///   - "now+Nhours", "now+Nminutes" → offset from now
+fn parse_datetime_arg(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("now") {
+        return Ok(chrono::Utc::now());
+    }
+    if let Some(rest) = s.strip_prefix("now+").or_else(|| s.strip_prefix("now +")) {
+        let rest = rest.trim();
+        // Try "Nhours", "Nminutes", "Nseconds", "Ndays"
+        if let Some(n) = rest
+            .strip_suffix("hours")
+            .or_else(|| rest.strip_suffix("hour"))
+        {
+            let n: i64 = n.trim().parse().context("invalid offset")?;
+            return Ok(chrono::Utc::now() + chrono::Duration::hours(n));
+        }
+        if let Some(n) = rest
+            .strip_suffix("minutes")
+            .or_else(|| rest.strip_suffix("minute"))
+        {
+            let n: i64 = n.trim().parse().context("invalid offset")?;
+            return Ok(chrono::Utc::now() + chrono::Duration::minutes(n));
+        }
+        if let Some(n) = rest
+            .strip_suffix("seconds")
+            .or_else(|| rest.strip_suffix("second"))
+        {
+            let n: i64 = n.trim().parse().context("invalid offset")?;
+            return Ok(chrono::Utc::now() + chrono::Duration::seconds(n));
+        }
+        if let Some(n) = rest
+            .strip_suffix("days")
+            .or_else(|| rest.strip_suffix("day"))
+        {
+            let n: i64 = n.trim().parse().context("invalid offset")?;
+            return Ok(chrono::Utc::now() + chrono::Duration::days(n));
+        }
+        bail!("unsupported time offset format: {}", rest);
+    }
+    // Try ISO 8601 parse
+    s.parse::<chrono::DateTime<chrono::Utc>>()
+        .context("invalid datetime format (expected ISO 8601 or 'now+Nhours')")
 }
 
 /// Parse memory string (e.g., "4G", "4096M", "4096") into MB.
@@ -479,6 +542,26 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
             .unwrap_or_default(),
         mail_user: args.mail_user.unwrap_or_default(),
         interactive: false,
+        begin_time: args
+            .begin
+            .as_ref()
+            .map(|s| parse_datetime_arg(s))
+            .transpose()?
+            .map(|dt| prost_types::Timestamp {
+                seconds: dt.timestamp(),
+                nanos: dt.timestamp_subsec_nanos() as i32,
+            }),
+        deadline: args
+            .deadline
+            .as_ref()
+            .map(|s| parse_datetime_arg(s))
+            .transpose()?
+            .map(|dt| prost_types::Timestamp {
+                seconds: dt.timestamp(),
+                nanos: dt.timestamp_subsec_nanos() as i32,
+            }),
+        spread_job: args.spread_job,
+        open_mode: args.open_mode.unwrap_or_default(),
     };
 
     // Submit to controller
