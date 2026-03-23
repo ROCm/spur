@@ -347,10 +347,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
             println!("Version={}", env!("CARGO_PKG_VERSION"));
         }
         "federation" => {
-            let resp = client
-                .ping(())
-                .await
-                .context("failed to ping controller")?;
+            let resp = client.ping(()).await.context("failed to ping controller")?;
 
             let inner = resp.into_inner();
             if inner.federation_peers.is_empty() {

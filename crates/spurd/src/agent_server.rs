@@ -332,7 +332,10 @@ impl SlurmAgent for AgentService {
             env.insert("OMPI_COMM_WORLD_SIZE".into(), spec.num_tasks.to_string());
             env.insert("OMPI_COMM_WORLD_RANK".into(), task_offset.to_string());
             env.insert("OMPI_COMM_WORLD_LOCAL_RANK".into(), "0".to_string());
-            env.insert("OMPI_COMM_WORLD_LOCAL_SIZE".into(), tasks_per_node.to_string());
+            env.insert(
+                "OMPI_COMM_WORLD_LOCAL_SIZE".into(),
+                tasks_per_node.to_string(),
+            );
             env.insert("OMPI_COMM_WORLD_NODE_RANK".into(), node_rank.to_string());
         }
 
