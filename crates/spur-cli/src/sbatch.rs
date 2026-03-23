@@ -112,6 +112,10 @@ pub struct SbatchArgs {
     #[arg(long)]
     pub het_group: Option<u32>,
 
+    /// Burst buffer specification ("stage_in:cmd;stage_out:cmd")
+    #[arg(long)]
+    pub bb: Option<String>,
+
     /// MPI type (none, pmix, pmi2)
     #[arg(long, default_value = "none")]
     pub mpi: String,
@@ -467,6 +471,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
             .collect(),
         container_entrypoint: args.container_entrypoint.unwrap_or_default(),
         container_remap_root: args.container_remap_root,
+        burst_buffer: args.bb.unwrap_or_default(),
         licenses: args.licenses,
         mail_type: args
             .mail_type

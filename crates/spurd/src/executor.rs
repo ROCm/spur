@@ -146,6 +146,18 @@ pub async fn launch_job(
     };
     let work_dir = effective_work_dir.as_str();
 
+    // Wrap script with burst buffer stage-in/stage-out if configured
+    let script = if let Ok(bb) = std::env::var("SPUR_BURST_BUFFER") {
+        if !bb.is_empty() {
+            wrap_with_burst_buffer(script, &bb)
+        } else {
+            script.to_string()
+        }
+    } else {
+        script.to_string()
+    };
+    let script = script.as_str();
+
     // Write script to temp file
     let script_path = PathBuf::from(work_dir).join(format!(".spur_job_{}.sh", job_id));
     tokio::fs::write(&script_path, script)
@@ -410,6 +422,55 @@ fn resolve_output_path(pattern: &str, job_id: JobId, work_dir: &str) -> String {
             .to_string_lossy()
             .into()
     }
+}
+
+/// Wrap a job script with burst buffer stage-in (before) and stage-out (after).
+///
+/// The `bb` string contains semicolon-separated directives:
+///   - `stage_in:<cmd>` — run before the job
+///   - `stage_out:<cmd>` — run after the job (best-effort, ignores failures)
+fn wrap_with_burst_buffer(script: &str, bb: &str) -> String {
+    let mut stage_in = Vec::new();
+    let mut stage_out = Vec::new();
+
+    for directive in bb.split(';') {
+        let directive = directive.trim();
+        if let Some(cmd) = directive.strip_prefix("stage_in:") {
+            stage_in.push(cmd.trim().to_string());
+        } else if let Some(cmd) = directive.strip_prefix("stage_out:") {
+            stage_out.push(cmd.trim().to_string());
+        }
+    }
+
+    if stage_in.is_empty() && stage_out.is_empty() {
+        return script.to_string();
+    }
+
+    let mut wrapper = String::from("#!/bin/bash\n");
+
+    // Stage-in commands (fail-fast)
+    for cmd in &stage_in {
+        wrapper.push_str(&format!("# Burst buffer stage-in\n{} || exit 1\n", cmd));
+    }
+
+    // The user script (inline)
+    wrapper.push_str("# User script\n");
+    // Remove shebang from user script if present to avoid nested shebangs
+    let user_body = if script.starts_with("#!") {
+        script.splitn(2, '\n').nth(1).unwrap_or("")
+    } else {
+        script
+    };
+    wrapper.push_str(user_body);
+    wrapper.push_str("\nSPUR_BB_EXIT=$?\n");
+
+    // Stage-out commands (best-effort)
+    for cmd in &stage_out {
+        wrapper.push_str(&format!("# Burst buffer stage-out\n{} || true\n", cmd));
+    }
+
+    wrapper.push_str("exit $SPUR_BB_EXIT\n");
+    wrapper
 }
 
 #[cfg(test)]

@@ -616,6 +616,7 @@ fn core_job_spec_to_proto(spec: &spur_core::job::JobSpec) -> spur_proto::proto::
         container_env: spec.container_env.clone(),
         container_entrypoint: spec.container_entrypoint.clone().unwrap_or_default(),
         container_remap_root: spec.container_remap_root,
+        burst_buffer: spec.burst_buffer.clone().unwrap_or_default(),
         licenses: Vec::new(),
         mail_type: Vec::new(),
         mail_user: String::new(),

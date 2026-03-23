@@ -296,6 +296,11 @@ impl SlurmAgent for AgentService {
             env.insert("SPUR_TARGET_NODE".into(), req.target_node.clone());
         }
 
+        // Burst buffer: pass via env var so executor can wrap the script
+        if !spec.burst_buffer.is_empty() {
+            env.insert("SPUR_BURST_BUFFER".into(), spec.burst_buffer.clone());
+        }
+
         // Compute tasks_per_node for both single- and multi-node jobs
         let tasks_per_node = if spec.tasks_per_node > 0 {
             spec.tasks_per_node
@@ -316,6 +321,20 @@ impl SlurmAgent for AgentService {
         env.insert("PMI_APPNUM".into(), "0".to_string());
         // PMI_RANK is set per-task in the multi-task wrapper; default to task_offset for single-task
         env.insert("PMI_RANK".into(), task_offset.to_string());
+
+        // PMIx environment (for OpenMPI and other PMIx-aware runtimes)
+        if spec.mpi == "pmix" {
+            env.insert("PMIX_SIZE".into(), spec.num_tasks.to_string());
+            env.insert("PMIX_NAMESPACE".into(), format!("spur.{}", job_id));
+            // PMIX_RANK is set per-task in the multi-task wrapper; default to task_offset
+            env.insert("PMIX_RANK".into(), task_offset.to_string());
+            // OpenMPI direct-launch bootstrap vars
+            env.insert("OMPI_COMM_WORLD_SIZE".into(), spec.num_tasks.to_string());
+            env.insert("OMPI_COMM_WORLD_RANK".into(), task_offset.to_string());
+            env.insert("OMPI_COMM_WORLD_LOCAL_RANK".into(), "0".to_string());
+            env.insert("OMPI_COMM_WORLD_LOCAL_SIZE".into(), tasks_per_node.to_string());
+            env.insert("OMPI_COMM_WORLD_NODE_RANK".into(), node_rank.to_string());
+        }
 
         // PyTorch/NCCL/RCCL distributed training env vars
         if peer_nodes.len() > 1 {
@@ -466,6 +485,10 @@ impl SlurmAgent for AgentService {
             wrapper.push_str("  export SPUR_LOCALID=$LOCAL_RANK\n");
             wrapper.push_str("  export SPUR_PROCID=$((SPUR_TASK_OFFSET + LOCAL_RANK))\n");
             wrapper.push_str("  export PMI_RANK=$SPUR_PROCID\n");
+            // PMIx per-task overrides
+            wrapper.push_str("  export PMIX_RANK=$SPUR_PROCID\n");
+            wrapper.push_str("  export OMPI_COMM_WORLD_RANK=$SPUR_PROCID\n");
+            wrapper.push_str("  export OMPI_COMM_WORLD_LOCAL_RANK=$LOCAL_RANK\n");
 
             // Partition GPUs across tasks if GPUs are allocated
             wrapper.push_str("  if [ -n \"$SPUR_JOB_GPUS\" ]; then\n");

@@ -301,6 +301,7 @@ async fn dispatch_to_agent(
         container_env: spec.container_env.clone(),
         container_entrypoint: spec.container_entrypoint.clone().unwrap_or_default(),
         container_remap_root: spec.container_remap_root,
+        burst_buffer: spec.burst_buffer.clone().unwrap_or_default(),
         licenses: Vec::new(),
         mail_type: spec.mail_type.clone(),
         mail_user: spec.mail_user.clone().unwrap_or_default(),
