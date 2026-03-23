@@ -73,6 +73,10 @@ pub struct SrunArgs {
     #[arg(short = 'C', long)]
     pub constraint: Option<String>,
 
+    /// Target a named reservation
+    #[arg(long)]
+    pub reservation: Option<String>,
+
     /// MPI type (none, pmix, pmi2)
     #[arg(long, default_value = "none")]
     pub mpi: String,
@@ -208,6 +212,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         environment,
         time_limit,
         constraint: args.constraint.unwrap_or_default(),
+        reservation: args.reservation.unwrap_or_default(),
         mpi: args.mpi,
         container_image: args.container_image.unwrap_or_default(),
         container_mounts: args.container_mounts,

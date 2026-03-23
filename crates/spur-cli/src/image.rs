@@ -81,8 +81,8 @@ async fn cmd_import(image: &str, arch: &str) -> Result<()> {
         image_ref.repository, image_ref.tag, image_ref.registry, arch
     );
 
-    let image_dir = std::path::Path::new("/var/spool/spur/images");
-    let path = spur_net::pull_image(image, image_dir).await?;
+    let image_dir = resolve_image_dir();
+    let path = spur_net::pull_image(image, &image_dir).await?;
 
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     eprintln!(
@@ -98,16 +98,17 @@ async fn cmd_import(image: &str, arch: &str) -> Result<()> {
 async fn cmd_import_dockerd(image: &str) -> Result<()> {
     eprintln!("Importing from Docker daemon: {}", image);
 
+    let image_dir = resolve_image_dir();
     let name = spur_net::oci::sanitize_name(image);
-    let output_path = format!("/var/spool/spur/images/{}.sqsh", name);
-    if std::path::Path::new(&output_path).exists() {
-        eprintln!("Image already imported: {}", output_path);
+    let output_path = image_dir.join(format!("{}.sqsh", name));
+    if output_path.exists() {
+        eprintln!("Image already imported: {}", output_path.display());
         return Ok(());
     }
 
-    std::fs::create_dir_all("/var/spool/spur/images")?;
-    let tmp_dir = format!("/var/spool/spur/containers/.import_dockerd_{}", name);
-    let rootfs = format!("{}/rootfs", tmp_dir);
+    std::fs::create_dir_all(&image_dir)?;
+    let tmp_dir = std::env::temp_dir().join(format!(".import_dockerd_{}", name));
+    let rootfs = tmp_dir.join("rootfs");
     std::fs::create_dir_all(&rootfs)?;
 
     // docker save → tar, then extract layers
@@ -125,11 +126,14 @@ async fn cmd_import_dockerd(image: &str) -> Result<()> {
         bail!("docker save failed: {}", stderr.trim());
     }
 
+    let rootfs_str = rootfs.to_string_lossy();
+    let output_path_str = output_path.to_string_lossy();
+
     // Extract the docker save tar, then extract each layer
-    extract_docker_save_tar(&output.stdout, &rootfs)?;
+    extract_docker_save_tar(&output.stdout, &rootfs_str)?;
 
     // Pack into squashfs
-    pack_squashfs(&rootfs, &output_path)?;
+    pack_squashfs(&rootfs_str, &output_path_str)?;
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
     let size = std::fs::metadata(&output_path)
@@ -137,7 +141,7 @@ async fn cmd_import_dockerd(image: &str) -> Result<()> {
         .unwrap_or(0);
     eprintln!(
         "Imported: {} ({:.1} MB)",
-        output_path,
+        output_path.display(),
         size as f64 / 1_048_576.0
     );
     Ok(())
@@ -147,16 +151,17 @@ async fn cmd_import_dockerd(image: &str) -> Result<()> {
 async fn cmd_import_podman(image: &str) -> Result<()> {
     eprintln!("Importing from Podman: {}", image);
 
+    let image_dir = resolve_image_dir();
     let name = spur_net::oci::sanitize_name(image);
-    let output_path = format!("/var/spool/spur/images/{}.sqsh", name);
-    if std::path::Path::new(&output_path).exists() {
-        eprintln!("Image already imported: {}", output_path);
+    let output_path = image_dir.join(format!("{}.sqsh", name));
+    if output_path.exists() {
+        eprintln!("Image already imported: {}", output_path.display());
         return Ok(());
     }
 
-    std::fs::create_dir_all("/var/spool/spur/images")?;
-    let tmp_dir = format!("/var/spool/spur/containers/.import_podman_{}", name);
-    let rootfs = format!("{}/rootfs", tmp_dir);
+    std::fs::create_dir_all(&image_dir)?;
+    let tmp_dir = std::env::temp_dir().join(format!(".import_podman_{}", name));
+    let rootfs = tmp_dir.join("rootfs");
     std::fs::create_dir_all(&rootfs)?;
 
     let output = tokio::process::Command::new("podman")
@@ -173,8 +178,11 @@ async fn cmd_import_podman(image: &str) -> Result<()> {
         bail!("podman save failed: {}", stderr.trim());
     }
 
-    extract_docker_save_tar(&output.stdout, &rootfs)?;
-    pack_squashfs(&rootfs, &output_path)?;
+    let rootfs_str = rootfs.to_string_lossy();
+    let output_path_str = output_path.to_string_lossy();
+
+    extract_docker_save_tar(&output.stdout, &rootfs_str)?;
+    pack_squashfs(&rootfs_str, &output_path_str)?;
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
     let size = std::fs::metadata(&output_path)
@@ -182,7 +190,7 @@ async fn cmd_import_podman(image: &str) -> Result<()> {
         .unwrap_or(0);
     eprintln!(
         "Imported: {} ({:.1} MB)",
-        output_path,
+        output_path.display(),
         size as f64 / 1_048_576.0
     );
     Ok(())
@@ -273,7 +281,7 @@ fn pack_squashfs(rootfs: &str, output: &str) -> Result<()> {
 }
 
 fn cmd_list() -> Result<()> {
-    let image_dir = std::path::Path::new("/var/spool/spur/images");
+    let image_dir = resolve_image_dir();
     if !image_dir.exists() {
         eprintln!("No images imported yet.");
         return Ok(());
@@ -315,9 +323,10 @@ fn cmd_list() -> Result<()> {
 
 fn cmd_remove(name: &str) -> Result<()> {
     let sanitized = spur_net::oci::sanitize_name(name);
-    let path = format!("/var/spool/spur/images/{}.sqsh", sanitized);
+    let image_dir = resolve_image_dir();
+    let path = image_dir.join(format!("{}.sqsh", sanitized));
 
-    if !std::path::Path::new(&path).exists() {
+    if !path.exists() {
         bail!("image '{}' not found", name);
     }
 
@@ -338,9 +347,13 @@ fn cmd_export(name: &str, output: Option<&str>) -> Result<()> {
         );
     }
 
-    let output_path = output
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("/var/spool/spur/images/{}.sqsh", sanitized));
+    let image_dir = resolve_image_dir();
+    let output_path = output.map(|s| s.to_string()).unwrap_or_else(|| {
+        image_dir
+            .join(format!("{}.sqsh", sanitized))
+            .to_string_lossy()
+            .into()
+    });
 
     eprintln!("Exporting container '{}' to {}", name, output_path);
     pack_squashfs(&container_dir, &output_path)?;
@@ -354,4 +367,56 @@ fn cmd_export(name: &str, output: Option<&str>) -> Result<()> {
         size as f64 / 1_048_576.0
     );
     Ok(())
+}
+
+/// Resolve the image storage directory.
+///
+/// Priority:
+/// 1. `$SPUR_IMAGE_DIR` environment variable
+/// 2. `/var/spool/spur/images` if writable
+/// 3. `~/.spur/images/` as user-local fallback
+fn resolve_image_dir() -> std::path::PathBuf {
+    // 1. Explicit env var
+    if let Ok(dir) = std::env::var("SPUR_IMAGE_DIR") {
+        if !dir.is_empty() {
+            return std::path::PathBuf::from(dir);
+        }
+    }
+
+    // 2. System-wide default
+    let system_dir = std::path::Path::new("/var/spool/spur/images");
+    if is_dir_writable(system_dir) {
+        return system_dir.to_path_buf();
+    }
+
+    // 3. User-local fallback
+    if let Some(home) = std::env::var_os("HOME") {
+        let user_dir = std::path::PathBuf::from(home).join(".spur/images");
+        eprintln!(
+            "Note: /var/spool/spur/images is not writable, using {}",
+            user_dir.display()
+        );
+        return user_dir;
+    }
+
+    // Last resort: use system dir and let the error propagate at write time
+    system_dir.to_path_buf()
+}
+
+/// Check if a directory exists and is writable, or if it can be created.
+fn is_dir_writable(path: &std::path::Path) -> bool {
+    if path.exists() {
+        // Try creating a temp file to test writability
+        let test_file = path.join(".spur_write_test");
+        if std::fs::write(&test_file, b"").is_ok() {
+            let _ = std::fs::remove_file(&test_file);
+            return true;
+        }
+        false
+    } else {
+        // Check if parent is writable (so we can mkdir)
+        path.parent()
+            .map(|p| p.exists() && is_dir_writable(p))
+            .unwrap_or(false)
+    }
 }

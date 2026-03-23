@@ -237,6 +237,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 1);
@@ -301,6 +302,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 0);
@@ -362,6 +364,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 1);

@@ -1,6 +1,7 @@
 use spur_core::job::{Job, JobId};
 use spur_core::node::Node;
 use spur_core::partition::Partition;
+use spur_core::reservation::Reservation;
 
 /// An assignment of a job to one or more nodes.
 #[derive(Debug, Clone)]
@@ -13,6 +14,7 @@ pub struct Assignment {
 pub struct ClusterState<'a> {
     pub nodes: &'a [Node],
     pub partitions: &'a [Partition],
+    pub reservations: &'a [Reservation],
 }
 
 /// Trait for pluggable scheduler implementations.

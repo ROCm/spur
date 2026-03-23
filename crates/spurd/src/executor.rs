@@ -248,6 +248,10 @@ pub async fn launch_job(
                 .join(","),
         );
     }
+    // Note: when gpu_devices is empty and no GRES was requested, we do NOT
+    // override GPU visibility — legacy jobs that don't specify --gres expect
+    // to see all GPUs. GPU hiding only happens when the allocation explicitly
+    // assigned specific devices (gpu_devices non-empty).
 
     // Launch the process
     let mut cmd = Command::new("/bin/bash");

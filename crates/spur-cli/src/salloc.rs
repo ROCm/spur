@@ -52,6 +52,10 @@ pub struct SallocArgs {
     #[arg(short = 'C', long)]
     pub constraint: Option<String>,
 
+    /// Target a named reservation
+    #[arg(long)]
+    pub reservation: Option<String>,
+
     /// Exclusive node allocation
     #[arg(long)]
     pub exclusive: bool,
@@ -95,6 +99,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let controller = args.controller.clone();
     let exclusive = args.exclusive;
     let constraint = args.constraint;
+    let reservation = args.reservation;
     let partition = args.partition;
     let account = args.account;
     let ntasks = args.ntasks;
@@ -121,6 +126,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         time_limit,
         exclusive,
         constraint: constraint.unwrap_or_default(),
+        reservation: reservation.unwrap_or_default(),
         interactive: true,
         environment: HashMap::new(),
         ..Default::default()

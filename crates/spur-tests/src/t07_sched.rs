@@ -28,6 +28,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
         let assignments = sched.schedule(&pending, &cluster);
 
@@ -51,6 +52,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
         let assignments = sched.schedule(&pending, &cluster);
 
@@ -73,6 +75,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
         let assignments = sched.schedule(&pending, &cluster);
 
@@ -91,6 +94,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
         let assignments = sched.schedule(&pending, &cluster);
 
@@ -112,6 +116,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
         let assignments = sched.schedule(&pending, &cluster);
 
@@ -136,6 +141,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
         let assignments = sched.schedule(&pending, &cluster);
 
@@ -164,6 +170,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
         let assignments = sched.schedule(&[job], &cluster);
 
@@ -308,6 +315,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 1);
@@ -333,6 +341,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
         let assignments = sched.schedule(&[job], &cluster);
         // No idle nodes available, so exclusive job cannot be scheduled
@@ -356,6 +365,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 1);
@@ -380,6 +390,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 1);
@@ -408,6 +419,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 0, "no node has 'gpu' feature");

@@ -197,10 +197,21 @@ fn resolve_partition_field(
         'D' => {
             // part.total_nodes may be 0 (not populated by server),
             // so fall back to the actual node count from the query.
-            if nodes.is_empty() && part.total_nodes > 0 {
+            // If node filtering returned 0 matches (e.g. nodes lack partition
+            // metadata), fall back to counting entries in the partition's
+            // nodelist string, then to part.total_nodes.
+            if !nodes.is_empty() {
+                nodes.len().to_string()
+            } else if !part.nodes.is_empty() {
+                part.nodes
+                    .split(',')
+                    .filter(|s| !s.trim().is_empty())
+                    .count()
+                    .to_string()
+            } else if part.total_nodes > 0 {
                 part.total_nodes.to_string()
             } else {
-                nodes.len().to_string()
+                "0".into()
             }
         }
         't' | 'T' => {

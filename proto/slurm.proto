@@ -249,6 +249,7 @@ service SlurmController {
 
   // Reservation management
   rpc CreateReservation(CreateReservationRequest) returns (google.protobuf.Empty);
+  rpc UpdateReservation(UpdateReservationRequest) returns (google.protobuf.Empty);
   rpc DeleteReservation(DeleteReservationRequest) returns (google.protobuf.Empty);
   rpc ListReservations(ListReservationsRequest) returns (ListReservationsResponse);
 }
@@ -634,6 +635,17 @@ message CreateReservationRequest {
   repeated string nodes = 4;
   repeated string accounts = 5;
   repeated string users = 6;
+}
+
+message UpdateReservationRequest {
+  string name = 1;
+  uint32 duration_minutes = 2;  // 0 = no change
+  repeated string add_nodes = 3;
+  repeated string remove_nodes = 4;
+  repeated string add_users = 5;
+  repeated string remove_users = 6;
+  repeated string add_accounts = 7;
+  repeated string remove_accounts = 8;
 }
 
 message DeleteReservationRequest {

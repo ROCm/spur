@@ -757,4 +757,20 @@ mod tests {
     fn t50_70_deadline_default_none() {
         assert!(JobSpec::default().deadline.is_none());
     }
+
+    // ── T50.71–72: Reservation field on JobSpec ─────────────────
+
+    #[test]
+    fn t50_71_reservation_field_on_jobspec() {
+        let spec = JobSpec {
+            reservation: Some("gpu-reservation".into()),
+            ..Default::default()
+        };
+        assert_eq!(spec.reservation.as_deref(), Some("gpu-reservation"));
+    }
+
+    #[test]
+    fn t50_72_reservation_default_none() {
+        assert!(JobSpec::default().reservation.is_none());
+    }
 }

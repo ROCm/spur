@@ -993,6 +993,30 @@ impl ClusterManager {
             });
         }
 
+        // Reservation validation: reject jobs targeting expired/nonexistent reservations
+        {
+            let reservations = self.get_reservations();
+            let now = Utc::now();
+            pending.retain(|job| {
+                if let Some(ref res_name) = job.spec.reservation {
+                    if res_name.is_empty() {
+                        return true;
+                    }
+                    match reservations.iter().find(|r| r.name == *res_name) {
+                        Some(r) => {
+                            if !r.is_active(now) {
+                                return false; // Reservation not active yet or expired
+                            }
+                            r.allows_user(&job.spec.user, job.spec.account.as_deref())
+                        }
+                        None => false, // Reservation doesn't exist
+                    }
+                } else {
+                    true
+                }
+            });
+        }
+
         // Recompute effective priority with age + partition tier
         let now = Utc::now();
         let partitions = self.partitions.read();
@@ -1036,6 +1060,50 @@ impl ClusterManager {
         }
         info!(name = %res.name, "reservation created");
         reservations.push(res);
+        Ok(())
+    }
+
+    /// Update an existing reservation.
+    pub fn update_reservation(
+        &self,
+        name: &str,
+        duration_minutes: u32,
+        add_nodes: &[String],
+        remove_nodes: &[String],
+        add_users: &[String],
+        remove_users: &[String],
+        add_accounts: &[String],
+        remove_accounts: &[String],
+    ) -> anyhow::Result<()> {
+        let mut reservations = self.reservations.write();
+        let res = reservations
+            .iter_mut()
+            .find(|r| r.name == name)
+            .ok_or_else(|| anyhow::anyhow!("reservation '{}' not found", name))?;
+
+        if duration_minutes > 0 {
+            res.end_time = res.start_time + chrono::Duration::minutes(duration_minutes as i64);
+        }
+        for node in add_nodes {
+            if !res.nodes.contains(node) {
+                res.nodes.push(node.clone());
+            }
+        }
+        res.nodes.retain(|n| !remove_nodes.contains(n));
+        for user in add_users {
+            if !res.users.contains(user) {
+                res.users.push(user.clone());
+            }
+        }
+        res.users.retain(|u| !remove_users.contains(u));
+        for account in add_accounts {
+            if !res.accounts.contains(account) {
+                res.accounts.push(account.clone());
+            }
+        }
+        res.accounts.retain(|a| !remove_accounts.contains(a));
+
+        info!(name, "reservation updated");
         Ok(())
     }
 

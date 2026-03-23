@@ -381,6 +381,26 @@ impl SlurmController for ControllerService {
         Ok(Response::new(()))
     }
 
+    async fn update_reservation(
+        &self,
+        request: Request<UpdateReservationRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        self.cluster
+            .update_reservation(
+                &req.name,
+                req.duration_minutes,
+                &req.add_nodes,
+                &req.remove_nodes,
+                &req.add_users,
+                &req.remove_users,
+                &req.add_accounts,
+                &req.remove_accounts,
+            )
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(()))
+    }
+
     async fn delete_reservation(
         &self,
         request: Request<DeleteReservationRequest>,

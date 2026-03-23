@@ -48,6 +48,7 @@ pub async fn run(cluster: Arc<ClusterManager>) {
 
         let nodes = cluster.get_nodes();
         let partitions = cluster.get_partitions();
+        let reservations = cluster.get_reservations();
 
         if nodes.is_empty() {
             debug!("no nodes registered, skipping scheduling cycle");
@@ -57,6 +58,7 @@ pub async fn run(cluster: Arc<ClusterManager>) {
         let cluster_state = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &reservations,
         };
 
         let assignments = scheduler.schedule(&pending, &cluster_state);

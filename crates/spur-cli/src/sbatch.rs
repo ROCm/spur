@@ -100,6 +100,10 @@ pub struct SbatchArgs {
     #[arg(short = 'C', long)]
     pub constraint: Option<String>,
 
+    /// Target a named reservation
+    #[arg(long)]
+    pub reservation: Option<String>,
+
     /// Job array (e.g., "0-99%10")
     #[arg(short = 'a', long)]
     pub array: Option<String>,
@@ -504,7 +508,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         time_min: None,
         qos: args.qos.unwrap_or_default(),
         priority: 0,
-        reservation: String::new(),
+        reservation: args.reservation.unwrap_or_default(),
         dependency: dependencies,
         nodelist: args.nodelist.unwrap_or_default(),
         exclude: args.exclude.unwrap_or_default(),

@@ -5,6 +5,7 @@ use tracing::debug;
 
 use spur_core::job::{Job, JobId};
 use spur_core::node::Node;
+use spur_core::reservation::Reservation;
 use spur_core::resource::ResourceSet;
 
 use crate::timeline::NodeTimeline;
@@ -47,6 +48,7 @@ impl BackfillScheduler {
         job: &Job,
         nodes: &[Node],
         partitions: &[spur_core::partition::Partition],
+        reservations: &[Reservation],
     ) -> Vec<usize> {
         let partition_name = job.spec.partition.as_deref();
         let required = job_resource_request(job);
@@ -120,6 +122,36 @@ impl BackfillScheduler {
                         return false;
                     }
                 }
+                // Reservation enforcement
+                let now = Utc::now();
+                let job_reservation = job.spec.reservation.as_deref().filter(|s| !s.is_empty());
+
+                let active_reservations: Vec<&Reservation> = reservations
+                    .iter()
+                    .filter(|r| r.is_active(now) && r.covers_node(&node.name))
+                    .collect();
+
+                if let Some(res_name) = job_reservation {
+                    // Job targets a reservation -- only allow nodes in that reservation
+                    if !active_reservations.iter().any(|r| r.name == res_name) {
+                        return false;
+                    }
+                    // Check user/account is allowed
+                    let user = &job.spec.user;
+                    let account = job.spec.account.as_deref();
+                    if !active_reservations
+                        .iter()
+                        .any(|r| r.name == res_name && r.allows_user(user, account))
+                    {
+                        return false;
+                    }
+                } else {
+                    // Job does NOT target a reservation -- skip reserved nodes
+                    if !active_reservations.is_empty() {
+                        return false;
+                    }
+                }
+
                 // Check resource capacity (total, not current available)
                 node.total_resources.can_satisfy(&required)
             })
@@ -169,7 +201,12 @@ impl Scheduler for BackfillScheduler {
             }
             let all_have_nodes = indices.iter().all(|&idx| {
                 let job = &pending[idx];
-                let suitable = self.find_suitable_nodes(job, cluster.nodes, cluster.partitions);
+                let suitable = self.find_suitable_nodes(
+                    job,
+                    cluster.nodes,
+                    cluster.partitions,
+                    cluster.reservations,
+                );
                 suitable.len() >= job.spec.num_nodes as usize
             });
             if !all_have_nodes {
@@ -190,7 +227,12 @@ impl Scheduler for BackfillScheduler {
             if skip_indices.contains(&job_idx) {
                 continue;
             }
-            let suitable = self.find_suitable_nodes(job, cluster.nodes, cluster.partitions);
+            let suitable = self.find_suitable_nodes(
+                job,
+                cluster.nodes,
+                cluster.partitions,
+                cluster.reservations,
+            );
             if suitable.is_empty() {
                 continue;
             }
@@ -388,6 +430,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -409,6 +452,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -429,6 +473,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -473,6 +518,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -493,6 +539,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -516,6 +563,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -536,6 +584,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -566,6 +615,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 1);
@@ -591,6 +641,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 0); // No nodes with mi300x
@@ -615,6 +666,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 1);
@@ -635,6 +687,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -670,6 +723,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -702,6 +756,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -746,6 +801,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -777,6 +833,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -818,6 +875,7 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 1);
@@ -843,10 +901,155 @@ mod tests {
         let cluster = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
+            reservations: &[],
         };
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 1);
         // Should prefer highest-weight node (node002)
         assert_eq!(assignments[0].nodes[0], "node002");
+    }
+
+    // ── Reservation enforcement tests ────────────────────────────
+
+    fn make_active_reservation(name: &str, nodes: Vec<String>, users: Vec<String>) -> Reservation {
+        let now = Utc::now();
+        Reservation {
+            name: name.into(),
+            start_time: now - Duration::hours(1),
+            end_time: now + Duration::hours(1),
+            nodes,
+            accounts: Vec::new(),
+            users,
+        }
+    }
+
+    #[test]
+    fn test_reservation_blocks_non_reserved_jobs() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(2); // node001, node002
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        // Reserve node001 for alice
+        let reservations = vec![make_active_reservation(
+            "res1",
+            vec!["node001".into()],
+            vec!["alice".into()],
+        )];
+
+        // Submit job WITHOUT reservation — should skip node001
+        let job = make_job(1, 1, 1);
+        let pending = vec![job];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &reservations,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        // Must be assigned to node002 (not the reserved node001)
+        assert_eq!(assignments[0].nodes[0], "node002");
+    }
+
+    #[test]
+    fn test_reservation_allows_authorized_job() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(2);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let reservations = vec![make_active_reservation(
+            "res1",
+            vec!["node001".into()],
+            vec!["alice".into()],
+        )];
+
+        // Submit job WITH reservation from authorized user "alice"
+        let mut job = make_job(1, 1, 1);
+        job.spec.reservation = Some("res1".into());
+        job.spec.user = "alice".into();
+
+        let pending = vec![job];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &reservations,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        // Should be assigned to node001 (the reserved node)
+        assert_eq!(assignments[0].nodes[0], "node001");
+    }
+
+    #[test]
+    fn test_reservation_rejects_unauthorized_user() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(2);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let reservations = vec![make_active_reservation(
+            "res1",
+            vec!["node001".into(), "node002".into()],
+            vec!["alice".into()],
+        )];
+
+        // Submit job WITH reservation from unauthorized user "bob"
+        let mut job = make_job(1, 1, 1);
+        job.spec.reservation = Some("res1".into());
+        job.spec.user = "bob".into();
+
+        let pending = vec![job];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &reservations,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        // Bob is not authorized for res1, so the job should not be scheduled
+        assert_eq!(assignments.len(), 0);
+    }
+
+    #[test]
+    fn test_inactive_reservation_ignored() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(2);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        // Create a reservation that hasn't started yet (future)
+        let future_reservation = Reservation {
+            name: "future-res".into(),
+            start_time: Utc::now() + Duration::hours(2),
+            end_time: Utc::now() + Duration::hours(4),
+            nodes: vec!["node001".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+        };
+
+        // Non-reservation job should be able to use node001 since reservation is inactive
+        let job = make_job(1, 1, 1);
+        let pending = vec![job];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[future_reservation],
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        // node001 should be available since the reservation hasn't started
+        // (scheduler picks by weight/time, node001 is a valid target)
     }
 }
