@@ -4,9 +4,17 @@ An AI-native job scheduler written in Rust. Drop-in compatible with Slurm's CLI,
 
 ## Quick Start
 
+### One-Line Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | bash
+```
+
+Downloads the latest release binaries and installs them to `~/.spur/bin`. Add to your PATH with `export PATH="$HOME/.spur/bin:$PATH"`.
+
 **See [docs/quickstart.md](docs/quickstart.md) for the full walkthrough** — single-node setup in 5 minutes, multi-node with WireGuard mesh, GPU job examples, and troubleshooting.
 
-### Build
+### Build from Source
 
 ```bash
 # Prerequisites
