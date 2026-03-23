@@ -14,6 +14,7 @@ use spur_core::partition::Partition;
 use spur_core::qos::{check_qos_limits, QosCheckResult};
 use spur_core::reservation::Reservation;
 use spur_core::resource::ResourceSet;
+use spur_core::step::{JobStep, StepState, STEP_BATCH};
 use spur_core::wal::{WalEntry, WalOperation, WalStore};
 use spur_state::snapshot::SnapshotStore;
 use spur_state::wal_store::FileWalStore;
@@ -28,6 +29,7 @@ pub struct ClusterManager {
     partitions: RwLock<Vec<Partition>>,
     next_job_id: AtomicU32,
     reservations: RwLock<Vec<Reservation>>,
+    steps: RwLock<HashMap<(JobId, u32), JobStep>>,
     wal: RwLock<FileWalStore>,
     snapshot: RwLock<Option<SnapshotStore>>,
     wal_since_snapshot: AtomicU32,
@@ -87,6 +89,7 @@ impl ClusterManager {
             nodes: RwLock::new(nodes),
             partitions: RwLock::new(partitions),
             reservations: RwLock::new(Vec::new()),
+            steps: RwLock::new(HashMap::new()),
             next_job_id: AtomicU32::new(next_id),
             wal: RwLock::new(wal),
             snapshot: RwLock::new(snapshot),
@@ -105,7 +108,28 @@ impl ClusterManager {
         }
 
         let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
-        let job = Job::new(job_id, spec.clone());
+        let mut job = Job::new(job_id, spec.clone());
+
+        // Heterogeneous job linking: if het_group > 0, find the first component
+        // (het_group == 0) submitted by the same user with the same name and
+        // link this component to it via het_job_id.
+        if let Some(het_group) = spec.het_group {
+            job.het_group = Some(het_group);
+            if het_group > 0 {
+                // Find the first component (het_group 0) as the anchor
+                let jobs = self.jobs.read();
+                let anchor = jobs.values().find(|j| {
+                    j.het_group == Some(0)
+                        && j.spec.user == spec.user
+                        && j.spec.name == spec.name
+                        && j.state == JobState::Pending
+                });
+                if let Some(anchor_job) = anchor {
+                    job.het_job_id = Some(anchor_job.job_id);
+                }
+                drop(jobs);
+            }
+        }
 
         // WAL
         self.append_wal(WalOperation::JobSubmit {
@@ -359,6 +383,23 @@ impl ClusterManager {
 
         debug!(job_id, "job started");
 
+        // Create the batch step for this job
+        let batch_step = JobStep {
+            job_id,
+            step_id: STEP_BATCH,
+            name: "batch".into(),
+            state: StepState::Running,
+            num_tasks: 1,
+            cpus_per_task: per_node.cpus,
+            resources: per_node.clone(),
+            nodes: node_names.clone(),
+            distribution: spur_core::step::TaskDistribution::Block,
+            start_time: Some(Utc::now()),
+            end_time: None,
+            exit_code: None,
+        };
+        self.create_step(job_id, STEP_BATCH, batch_step);
+
         // Send BEGIN notification if configured
         if spec_for_notify
             .mail_type
@@ -397,6 +438,22 @@ impl ClusterManager {
             exit_code,
             state,
         });
+
+        // Complete all steps for this job
+        {
+            let mut steps = self.steps.write();
+            for step in steps.values_mut() {
+                if step.job_id == job_id && !step.state.is_terminal() {
+                    step.state = if exit_code == 0 {
+                        StepState::Completed
+                    } else {
+                        StepState::Failed
+                    };
+                    step.exit_code = Some(exit_code);
+                    step.end_time = Some(Utc::now());
+                }
+            }
+        }
 
         // Subtract per-node resources instead of blanket-zeroing
         let mut nodes = self.nodes.write();
@@ -754,6 +811,36 @@ impl ClusterManager {
         }
     }
 
+    /// Create a job step.
+    pub fn create_step(&self, job_id: JobId, step_id: u32, step: JobStep) {
+        self.steps.write().insert((job_id, step_id), step);
+        debug!(job_id, step_id, "step created");
+    }
+
+    /// Complete a job step.
+    pub fn complete_step(&self, job_id: JobId, step_id: u32, exit_code: i32) {
+        if let Some(step) = self.steps.write().get_mut(&(job_id, step_id)) {
+            step.state = if exit_code == 0 {
+                StepState::Completed
+            } else {
+                StepState::Failed
+            };
+            step.exit_code = Some(exit_code);
+            step.end_time = Some(Utc::now());
+            debug!(job_id, step_id, exit_code, "step completed");
+        }
+    }
+
+    /// Get all steps for a job.
+    pub fn get_steps(&self, job_id: JobId) -> Vec<JobStep> {
+        self.steps
+            .read()
+            .iter()
+            .filter(|((jid, _), _)| *jid == job_id)
+            .map(|(_, step)| step.clone())
+            .collect()
+    }
+
     /// Get pending jobs sorted by priority, filtering out held and dependency-blocked jobs.
     /// Recomputes effective priority using age and partition tier before sorting.
     pub fn pending_jobs(&self) -> Vec<Job> {
@@ -965,6 +1052,40 @@ impl ClusterManager {
                             "failed to send notification webhook"
                         );
                     }
+                }
+            });
+        }
+
+        // SMTP email notification via sendmail-compatible command
+        if let Some(ref smtp_cmd) = self.config.notifications.smtp_command {
+            let from = self
+                .config
+                .notifications
+                .from_address
+                .as_deref()
+                .unwrap_or("spur@localhost");
+            let user = spec.user.clone();
+            let mail_user = spec.mail_user.clone();
+            let to = mail_user.as_deref().unwrap_or(&user).to_string();
+            let subject = format!("Spur Job {}: {}", job_id, event);
+            let body = format!("Job ID: {}\nEvent: {}\nUser: {}\n", job_id, event, user);
+            let email = format!(
+                "From: {}\nTo: {}\nSubject: {}\n\n{}",
+                from, to, subject, body
+            );
+
+            let smtp_cmd = smtp_cmd.clone();
+            tokio::spawn(async move {
+                let mut child = tokio::process::Command::new("sh")
+                    .args(["-c", &smtp_cmd])
+                    .stdin(std::process::Stdio::piped())
+                    .spawn();
+                if let Ok(ref mut child) = child {
+                    if let Some(ref mut stdin) = child.stdin.take() {
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stdin.write_all(email.as_bytes()).await;
+                    }
+                    let _ = child.wait().await;
                 }
             });
         }

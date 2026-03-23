@@ -272,6 +272,25 @@ impl SlurmController for ControllerService {
         )))
     }
 
+    async fn get_job_steps(
+        &self,
+        request: Request<GetJobStepsRequest>,
+    ) -> Result<Response<GetJobStepsResponse>, Status> {
+        let job_id = request.into_inner().job_id;
+        let steps = self.cluster.get_steps(job_id);
+        let step_infos: Vec<JobStepInfo> = steps
+            .iter()
+            .map(|s| JobStepInfo {
+                job_id: s.job_id,
+                step_id: s.step_id,
+                name: s.name.clone(),
+                state: s.state.display().to_string(),
+                num_tasks: s.num_tasks,
+            })
+            .collect();
+        Ok(Response::new(GetJobStepsResponse { steps: step_infos }))
+    }
+
     async fn create_reservation(
         &self,
         request: Request<CreateReservationRequest>,
@@ -458,6 +477,11 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
             None
         } else {
             Some(spec.distribution)
+        },
+        het_group: if spec.het_group > 0 {
+            Some(spec.het_group)
+        } else {
+            None
         },
         array_spec: if spec.array_spec.is_empty() {
             None

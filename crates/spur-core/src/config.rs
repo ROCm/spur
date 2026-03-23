@@ -343,11 +343,15 @@ impl Default for KubernetesConfig {
     }
 }
 
-/// Notification configuration for job event webhooks.
+/// Notification configuration for job event webhooks and email.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NotificationConfig {
     /// Webhook URL to POST job event notifications to.
     pub webhook_url: Option<String>,
+    /// SMTP command for sending mail, e.g., "/usr/sbin/sendmail -t".
+    pub smtp_command: Option<String>,
+    /// From address for notification emails, e.g., "spur@cluster.local".
+    pub from_address: Option<String>,
 }
 
 impl SlurmConfig {

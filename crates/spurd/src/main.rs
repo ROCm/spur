@@ -2,6 +2,7 @@ mod agent_server;
 pub mod container;
 mod executor;
 mod gpu;
+pub mod pmi;
 mod reporter;
 
 use std::sync::Arc;

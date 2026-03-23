@@ -161,6 +161,9 @@ pub struct JobSpec {
     pub mpi: Option<String>,
     pub distribution: Option<String>,
 
+    // Heterogeneous jobs
+    pub het_group: Option<u32>,
+
     // Array
     pub array_spec: Option<String>,
 
@@ -219,6 +222,7 @@ impl Default for JobSpec {
             constraint: None,
             mpi: None,
             distribution: None,
+            het_group: None,
             array_spec: None,
             requeue: false,
             exclusive: false,
@@ -269,6 +273,14 @@ pub struct Job {
     /// Max concurrent tasks for this array (0 = unlimited).
     #[serde(default)]
     pub array_max_concurrent: Option<u32>,
+
+    // Heterogeneous job support
+    /// Links het job components to the first component's job ID.
+    #[serde(default)]
+    pub het_job_id: Option<JobId>,
+    /// Component index within a heterogeneous job group (0 = first).
+    #[serde(default)]
+    pub het_group: Option<u32>,
 }
 
 impl Job {
@@ -300,6 +312,8 @@ impl Job {
             array_job_id: None,
             array_task_id: None,
             array_max_concurrent: None,
+            het_job_id: None,
+            het_group: None,
         }
     }
 

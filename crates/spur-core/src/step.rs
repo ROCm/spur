@@ -312,4 +312,79 @@ mod tests {
         assert_eq!(node0_count, 4);
         assert_eq!(node1_count, 4);
     }
+
+    #[test]
+    fn test_step_special_ids() {
+        assert_eq!(STEP_BATCH, 0xFFFF_FFFE);
+        assert_eq!(STEP_EXTERN, 0xFFFF_FFFD);
+        assert_eq!(STEP_INTERACTIVE, 0xFFFF_FFFC);
+        // All special IDs should be distinct
+        assert_ne!(STEP_BATCH, STEP_EXTERN);
+        assert_ne!(STEP_BATCH, STEP_INTERACTIVE);
+        assert_ne!(STEP_EXTERN, STEP_INTERACTIVE);
+    }
+
+    #[test]
+    fn test_step_state_transitions() {
+        use crate::resource::ResourceSet;
+
+        let mut step = JobStep {
+            job_id: 1,
+            step_id: 0,
+            name: "test".into(),
+            state: StepState::Pending,
+            num_tasks: 4,
+            cpus_per_task: 2,
+            resources: ResourceSet::default(),
+            nodes: vec!["node001".into()],
+            distribution: TaskDistribution::Block,
+            start_time: None,
+            end_time: None,
+            exit_code: None,
+        };
+
+        assert!(!step.state.is_terminal());
+        assert_eq!(step.state.display(), "PENDING");
+
+        // Pending -> Running
+        step.state = StepState::Running;
+        step.start_time = Some(chrono::Utc::now());
+        assert!(!step.state.is_terminal());
+        assert_eq!(step.state.display(), "RUNNING");
+
+        // Running -> Completed
+        step.state = StepState::Completed;
+        step.exit_code = Some(0);
+        step.end_time = Some(chrono::Utc::now());
+        assert!(step.state.is_terminal());
+        assert_eq!(step.state.display(), "COMPLETED");
+    }
+
+    #[test]
+    fn test_step_state_failed() {
+        let state = StepState::Failed;
+        assert!(state.is_terminal());
+        assert_eq!(state.display(), "FAILED");
+    }
+
+    #[test]
+    fn test_step_state_cancelled() {
+        let state = StepState::Cancelled;
+        assert!(state.is_terminal());
+        assert_eq!(state.display(), "CANCELLED");
+    }
+
+    #[test]
+    fn test_distribute_zero_tasks() {
+        let m = distribute_tasks(0, 4, TaskDistribution::Block);
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn test_distribute_zero_nodes_uses_one() {
+        // 0 nodes should be treated as 1 (max(1))
+        let m = distribute_tasks(4, 0, TaskDistribution::Block);
+        assert_eq!(m.len(), 4);
+        assert!(m.iter().all(|&n| n == 0));
+    }
 }

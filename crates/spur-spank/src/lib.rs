@@ -76,7 +76,7 @@ pub struct SpankHost {
 }
 
 /// Job context available to SPANK plugins.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct SpankContext {
     pub job_id: u32,
     pub uid: u32,
@@ -139,6 +139,12 @@ impl SpankHost {
     pub fn invoke_hook(&self, hook: SpankHook) -> Result<(), SpankError> {
         let symbol = hook.symbol_name();
 
+        let mut handle = SpankHandle {
+            context: self.context.clone(),
+            env: HashMap::new(),
+        };
+        let handle_ptr = &mut handle as *mut SpankHandle;
+
         for plugin in &self.plugins {
             #[cfg(unix)]
             {
@@ -153,7 +159,7 @@ impl SpankHost {
                 match func {
                     Ok(f) => {
                         debug!(plugin = %plugin.name, hook = symbol, "invoking SPANK hook");
-                        let rc = unsafe { f(std::ptr::null_mut(), 0, std::ptr::null_mut()) };
+                        let rc = unsafe { f(handle_ptr, 0, std::ptr::null_mut()) };
                         if rc != 0 {
                             warn!(
                                 plugin = %plugin.name,
@@ -189,10 +195,115 @@ impl SpankHost {
     }
 }
 
-/// Opaque handle passed to SPANK plugins (placeholder).
+/// Handle passed to SPANK plugin callbacks, providing access to job
+/// context and a per-invocation environment variable map.
 #[repr(C)]
 pub struct SpankHandle {
-    _opaque: [u8; 0],
+    pub context: SpankContext,
+    pub env: HashMap<String, String>,
+}
+
+/// Retrieve a job context item from the SPANK handle.
+///
+/// The `item` parameter corresponds to `SpankItem` variants (0=JobId,
+/// 1=JobUid, etc.).  On success the value is written through `val` and 0
+/// is returned; on error -1 is returned.
+#[no_mangle]
+pub extern "C" fn spur_spank_get_item(
+    handle: *mut SpankHandle,
+    item: c_int,
+    val: *mut *mut std::ffi::c_void,
+) -> c_int {
+    if handle.is_null() || val.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*handle };
+    match item {
+        0 => {
+            // SPANK_JOB_ID
+            unsafe {
+                *(val as *mut u32) = handle.context.job_id;
+            }
+            0
+        }
+        1 => {
+            // SPANK_JOB_UID
+            unsafe {
+                *(val as *mut u32) = handle.context.uid;
+            }
+            0
+        }
+        2 => {
+            // SPANK_JOB_GID
+            unsafe {
+                *(val as *mut u32) = handle.context.gid;
+            }
+            0
+        }
+        3 => {
+            // SPANK_JOB_STEPID
+            unsafe {
+                *(val as *mut u32) = handle.context.step_id;
+            }
+            0
+        }
+        4 => {
+            // SPANK_JOB_NNODES
+            unsafe {
+                *(val as *mut u32) = handle.context.num_nodes;
+            }
+            0
+        }
+        5 => {
+            // SPANK_JOB_NODEID
+            unsafe {
+                *(val as *mut u32) = handle.context.node_id;
+            }
+            0
+        }
+        6 => {
+            // SPANK_JOB_LOCAL_TASK_COUNT
+            unsafe {
+                *(val as *mut u32) = handle.context.local_task_count;
+            }
+            0
+        }
+        7 => {
+            // SPANK_JOB_TOTAL_TASK_COUNT
+            unsafe {
+                *(val as *mut u32) = handle.context.total_task_count;
+            }
+            0
+        }
+        // 8 = SPANK_JOB_ARGV — not yet implemented (requires pointer-to-array)
+        9 => {
+            // SPANK_TASK_PID
+            unsafe {
+                *(val as *mut u32) = handle.context.task_pid;
+            }
+            0
+        }
+        _ => -1,
+    }
+}
+
+/// Set an environment variable in the SPANK handle's per-invocation map.
+///
+/// Returns 0 on success, -1 if any pointer is null.
+#[no_mangle]
+pub extern "C" fn spur_spank_set_var(
+    handle: *mut SpankHandle,
+    key: *const c_char,
+    val: *const c_char,
+) -> c_int {
+    if handle.is_null() || key.is_null() || val.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &mut *handle };
+    let key = unsafe { CStr::from_ptr(key) }.to_string_lossy().to_string();
+    let val = unsafe { CStr::from_ptr(val) }.to_string_lossy().to_string();
+    handle.env.insert(key, val);
+    0
 }
 
 #[derive(Debug, thiserror::Error)]
