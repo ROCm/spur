@@ -53,6 +53,7 @@ enum NodeState {
   NODE_DRAINING = 5;
   NODE_ERROR = 6;
   NODE_UNKNOWN = 7;
+  NODE_SUSPENDED = 8;
 }
 
 message JobSpec {

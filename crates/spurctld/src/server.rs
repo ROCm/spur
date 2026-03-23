@@ -176,11 +176,20 @@ impl SlurmController for ControllerService {
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_else(|_| "unknown".into());
 
+        let federation_peers: Vec<String> = self
+            .cluster
+            .config
+            .federation
+            .clusters
+            .iter()
+            .map(|p| format!("{}@{}", p.name, p.address))
+            .collect();
+
         Ok(Response::new(PingResponse {
             hostname,
             server_time: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
             version: env!("CARGO_PKG_VERSION").into(),
-            federation_peers: Vec::new(),
+            federation_peers,
         }))
     }
 
@@ -615,6 +624,7 @@ fn proto_to_node_state(s: i32) -> Option<spur_core::node::NodeState> {
         5 => Some(spur_core::node::NodeState::Draining),
         6 => Some(spur_core::node::NodeState::Error),
         7 => Some(spur_core::node::NodeState::Unknown),
+        8 => Some(spur_core::node::NodeState::Suspended),
         _ => None,
     }
 }
@@ -796,6 +806,7 @@ fn node_state_to_proto(s: spur_core::node::NodeState) -> spur_proto::proto::Node
         spur_core::node::NodeState::Draining => spur_proto::proto::NodeState::NodeDraining,
         spur_core::node::NodeState::Error => spur_proto::proto::NodeState::NodeError,
         spur_core::node::NodeState::Unknown => spur_proto::proto::NodeState::NodeUnknown,
+        spur_core::node::NodeState::Suspended => spur_proto::proto::NodeState::NodeSuspended,
     }
 }
 

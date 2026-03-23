@@ -14,11 +14,15 @@ use spur_sched::traits::{ClusterState, Scheduler};
 
 use crate::cluster::ClusterManager;
 
-/// Spawn the time-limit enforcement watchdog alongside the scheduler loop.
+/// Spawn the time-limit enforcement watchdog and power manager alongside the scheduler loop.
 pub async fn run(cluster: Arc<ClusterManager>) {
     let enforcer_cluster = cluster.clone();
     tokio::spawn(async move {
         enforce_time_limits(enforcer_cluster).await;
+    });
+    let power_cluster = cluster.clone();
+    tokio::spawn(async move {
+        manage_power(power_cluster).await;
     });
     let interval_secs = cluster.config.scheduler.interval_secs.max(1) as u64;
     let max_jobs = cluster.config.scheduler.max_jobs_per_cycle as usize;
@@ -433,6 +437,90 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>) {
         let running_ids: HashSet<_> = running.iter().map(|j| j.job_id).collect();
         warned_jobs.retain(|id| running_ids.contains(id));
         warn_times.retain(|id, _| running_ids.contains(id));
+    }
+}
+
+/// Power management: suspend idle nodes and resume them when jobs are pending.
+///
+/// Disabled when `power.suspend_timeout_secs` is not set in the config.
+async fn manage_power(cluster: Arc<ClusterManager>) {
+    let suspend_timeout = match cluster.config.power.suspend_timeout_secs {
+        Some(t) => t,
+        None => return, // Power management disabled
+    };
+
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+    info!(suspend_timeout, "power management enabled");
+
+    loop {
+        interval.tick().await;
+        let now = Utc::now();
+        let nodes = cluster.get_nodes();
+
+        // Suspend idle nodes that have been idle longer than the timeout
+        for node in &nodes {
+            if node.state == spur_core::node::NodeState::Idle {
+                if let Some(last_busy) = node.last_busy {
+                    if (now - last_busy).num_seconds() as u64 > suspend_timeout {
+                        info!(node = %node.name, "suspending idle node (power saving)");
+                        let _ = cluster.update_node_state(
+                            &node.name,
+                            spur_core::node::NodeState::Suspended,
+                            Some("Power saving".into()),
+                        );
+                        if let Some(ref cmd) = cluster.config.power.suspend_command {
+                            let cmd = cmd.replace("{node}", &node.name);
+                            let node_name = node.name.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = tokio::process::Command::new("sh")
+                                    .args(["-c", &cmd])
+                                    .status()
+                                    .await
+                                {
+                                    warn!(
+                                        node = %node_name,
+                                        error = %e,
+                                        "suspend command failed"
+                                    );
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Resume suspended nodes if there are pending jobs
+        let pending = cluster.pending_jobs();
+        if !pending.is_empty() {
+            for node in &nodes {
+                if node.state == spur_core::node::NodeState::Suspended {
+                    info!(node = %node.name, "resuming suspended node for pending jobs");
+                    let _ = cluster.update_node_state(
+                        &node.name,
+                        spur_core::node::NodeState::Idle,
+                        None,
+                    );
+                    if let Some(ref cmd) = cluster.config.power.resume_command {
+                        let cmd = cmd.replace("{node}", &node.name);
+                        let node_name = node.name.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = tokio::process::Command::new("sh")
+                                .args(["-c", &cmd])
+                                .status()
+                                .await
+                            {
+                                warn!(
+                                    node = %node_name,
+                                    error = %e,
+                                    "resume command failed"
+                                );
+                            }
+                        });
+                    }
+                }
+            }
+        }
     }
 }
 

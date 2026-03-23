@@ -15,6 +15,7 @@ pub enum NodeState {
     Draining,
     Error,
     Unknown,
+    Suspended,
 }
 
 impl NodeState {
@@ -28,6 +29,7 @@ impl NodeState {
             Self::Draining => "draining",
             Self::Error => "error",
             Self::Unknown => "unknown",
+            Self::Suspended => "suspended",
         }
     }
 
@@ -42,6 +44,7 @@ impl NodeState {
             Self::Draining => "drng",
             Self::Error => "err",
             Self::Unknown => "unk",
+            Self::Suspended => "susp",
         }
     }
 
@@ -152,6 +155,7 @@ impl Node {
             || self.state == NodeState::Drain
             || self.state == NodeState::Draining
             || self.state == NodeState::Error
+            || self.state == NodeState::Suspended
         {
             return; // Don't override admin states
         }

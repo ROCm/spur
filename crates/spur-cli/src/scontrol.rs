@@ -346,9 +346,31 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
             println!("SlurmctldAddr={}", controller);
             println!("Version={}", env!("CARGO_PKG_VERSION"));
         }
+        "federation" => {
+            let resp = client
+                .ping(())
+                .await
+                .context("failed to ping controller")?;
+
+            let inner = resp.into_inner();
+            if inner.federation_peers.is_empty() {
+                println!("No federation peers configured.");
+            } else {
+                println!("FEDERATION PEERS");
+                println!("{:<20} {}", "CLUSTER", "ADDRESS");
+                for peer in &inner.federation_peers {
+                    // Format is "name@address"
+                    if let Some((name, addr)) = peer.split_once('@') {
+                        println!("{:<20} {}", name, addr);
+                    } else {
+                        println!("{:<20} {}", peer, "(unknown)");
+                    }
+                }
+            }
+        }
         other => {
             bail!(
-                "scontrol: unknown entity type '{}'. Use: job, node, partition, reservation, config",
+                "scontrol: unknown entity type '{}'. Use: job, node, partition, reservation, federation, config",
                 other
             );
         }

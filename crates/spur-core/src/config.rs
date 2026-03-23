@@ -54,6 +54,12 @@ pub struct SlurmConfig {
 
     #[serde(default)]
     pub notifications: NotificationConfig,
+
+    #[serde(default)]
+    pub power: PowerConfig,
+
+    #[serde(default)]
+    pub federation: FederationConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,6 +349,17 @@ impl Default for KubernetesConfig {
     }
 }
 
+/// Power management configuration for suspending/resuming idle nodes.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PowerConfig {
+    /// Seconds a node must be idle before it is suspended.
+    pub suspend_timeout_secs: Option<u64>,
+    /// Command to suspend a node (e.g., "systemctl suspend"). {node} is replaced with the node name.
+    pub suspend_command: Option<String>,
+    /// Command to resume a node (e.g., "ipmitool chassis power on"). {node} is replaced with the node name.
+    pub resume_command: Option<String>,
+}
+
 /// Notification configuration for job event webhooks and email.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NotificationConfig {
@@ -352,6 +369,22 @@ pub struct NotificationConfig {
     pub smtp_command: Option<String>,
     /// From address for notification emails, e.g., "spur@cluster.local".
     pub from_address: Option<String>,
+}
+
+/// Federation configuration for multi-cluster job routing.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FederationConfig {
+    /// Peer clusters in the federation.
+    pub clusters: Vec<ClusterPeer>,
+}
+
+/// A peer cluster in a federation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterPeer {
+    /// Name of the peer cluster.
+    pub name: String,
+    /// gRPC address of the peer controller (e.g., "http://peer-ctrl:6817").
+    pub address: String,
 }
 
 impl SlurmConfig {
