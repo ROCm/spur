@@ -180,6 +180,7 @@ impl SlurmController for ControllerService {
             hostname,
             server_time: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
             version: env!("CARGO_PKG_VERSION").into(),
+            federation_peers: Vec::new(),
         }))
     }
 
@@ -289,6 +290,53 @@ impl SlurmController for ControllerService {
             })
             .collect();
         Ok(Response::new(GetJobStepsResponse { steps: step_infos }))
+    }
+
+    async fn create_job_step(
+        &self,
+        request: Request<CreateJobStepRequest>,
+    ) -> Result<Response<CreateJobStepResponse>, Status> {
+        let req = request.into_inner();
+        let job_id = req.job_id;
+
+        // Verify job exists and is Running
+        let job = self
+            .cluster
+            .get_job(job_id)
+            .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
+
+        if job.state != spur_core::job::JobState::Running {
+            return Err(Status::failed_precondition(format!(
+                "job {} is not running (state: {:?})",
+                job_id, job.state
+            )));
+        }
+
+        // Auto-increment step_id from existing step count (skip special IDs)
+        let existing_steps = self.cluster.get_steps(job_id);
+        let step_id = existing_steps
+            .iter()
+            .filter(|s| s.step_id < 0xFFFF_FFF0)
+            .count() as u32;
+
+        let step = spur_core::step::JobStep {
+            job_id,
+            step_id,
+            name: req.command.join(" "),
+            state: spur_core::step::StepState::Running,
+            num_tasks: req.num_tasks.max(1),
+            cpus_per_task: req.cpus_per_task.max(1),
+            resources: spur_core::resource::ResourceSet::default(),
+            nodes: job.allocated_nodes.clone(),
+            distribution: spur_core::step::TaskDistribution::Block,
+            start_time: Some(chrono::Utc::now()),
+            end_time: None,
+            exit_code: None,
+        };
+
+        self.cluster.create_step(job_id, step_id, step);
+
+        Ok(Response::new(CreateJobStepResponse { step_id }))
     }
 
     async fn create_reservation(
@@ -533,6 +581,11 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
             Some(spec.container_entrypoint)
         },
         container_remap_root: spec.container_remap_root,
+        burst_buffer: if spec.burst_buffer.is_empty() {
+            None
+        } else {
+            Some(spec.burst_buffer)
+        },
     })
 }
 

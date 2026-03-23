@@ -3,8 +3,8 @@ use clap::Parser;
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
-    CancelJobRequest, GetJobRequest, GetNodeRequest, JobSpec, StreamJobOutputRequest,
-    SubmitJobRequest,
+    CancelJobRequest, CreateJobStepRequest, GetJobRequest, GetNodeRequest, JobSpec,
+    StreamJobOutputRequest, SubmitJobRequest,
 };
 use std::collections::HashMap;
 use std::io::Write;
@@ -129,6 +129,13 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     if args.command.is_empty() {
         eprintln!("srun: no command specified");
         std::process::exit(1);
+    }
+
+    // Step mode: if running inside an allocation, create a step instead of a new job
+    if let Ok(parent_job_id) = std::env::var("SPUR_JOB_ID") {
+        if let Ok(job_id) = parent_job_id.parse::<u32>() {
+            return run_as_step(&args, job_id).await;
+        }
     }
 
     let name = args.job_name.unwrap_or_else(|| args.command[0].clone());
@@ -440,6 +447,38 @@ async fn print_job_output(work_dir: &str, job_id: u32) {
     if let Ok(content) = tokio::fs::read_to_string(&path).await {
         print!("{}", content);
     }
+}
+
+/// When srun runs inside a sbatch script (SPUR_JOB_ID is set), it creates a
+/// job step and executes the command directly on the allocated node.
+async fn run_as_step(args: &SrunArgs, job_id: u32) -> Result<()> {
+    let mut client = SlurmControllerClient::connect(args.controller.clone())
+        .await
+        .context("failed to connect to spurctld")?;
+
+    // Create a step on the controller for tracking
+    let resp = client
+        .create_job_step(CreateJobStepRequest {
+            job_id,
+            command: args.command.clone(),
+            num_tasks: args.ntasks,
+            cpus_per_task: args.cpus_per_task,
+        })
+        .await
+        .context("failed to create job step")?;
+
+    let step_id = resp.into_inner().step_id;
+    eprintln!("srun: created step {}.{}", job_id, step_id);
+
+    // Execute the command directly — we are already on an allocated node
+    let status = tokio::process::Command::new(&args.command[0])
+        .args(&args.command[1..])
+        .status()
+        .await
+        .context("failed to execute command")?;
+
+    let exit_code = status.code().unwrap_or(-1);
+    std::process::exit(exit_code);
 }
 
 fn parse_memory_mb(s: &str) -> Result<u64> {
