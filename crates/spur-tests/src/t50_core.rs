@@ -633,4 +633,70 @@ mod tests {
         assert_eq!(StepState::Pending.display(), "PENDING");
         assert_eq!(StepState::Cancelled.display(), "CANCELLED");
     }
+
+    // ── T50.57–58: Burst buffer field ─────────────────────────────
+
+    #[test]
+    fn t50_57_burst_buffer_field() {
+        let spec = spur_core::job::JobSpec {
+            burst_buffer: Some("stage_in:cp /data/model.bin /tmp/".into()),
+            ..Default::default()
+        };
+        assert!(spec.burst_buffer.is_some());
+        assert_eq!(
+            spec.burst_buffer.as_deref(),
+            Some("stage_in:cp /data/model.bin /tmp/")
+        );
+    }
+
+    #[test]
+    fn t50_58_burst_buffer_default_none() {
+        let spec = spur_core::job::JobSpec::default();
+        assert!(spec.burst_buffer.is_none());
+    }
+
+    // ── T50.59: Power config default ──────────────────────────────
+
+    #[test]
+    fn t50_59_power_config_default() {
+        let config = spur_core::config::PowerConfig::default();
+        assert!(config.suspend_timeout_secs.is_none());
+        assert!(config.suspend_command.is_none());
+        assert!(config.resume_command.is_none());
+    }
+
+    // ── T50.60: Suspended node not schedulable ────────────────────
+
+    #[test]
+    fn t50_60_suspended_not_schedulable() {
+        let mut node = Node::new("n1".into(), ResourceSet::default());
+        node.state = NodeState::Suspended;
+        assert!(!node.is_schedulable());
+        assert!(!node.state.is_available());
+    }
+
+    // ── T50.61: Suspended state preserved by update_state_from_alloc ──
+
+    #[test]
+    fn t50_61_suspended_preserves_state() {
+        let mut node = Node::new(
+            "n1".into(),
+            ResourceSet {
+                cpus: 64,
+                memory_mb: 256_000,
+                ..Default::default()
+            },
+        );
+        node.state = NodeState::Suspended;
+        node.update_state_from_alloc();
+        assert_eq!(node.state, NodeState::Suspended);
+    }
+
+    // ── T50.62: Suspended display and short ───────────────────────
+
+    #[test]
+    fn t50_62_suspended_display() {
+        assert_eq!(NodeState::Suspended.display(), "suspended");
+        assert_eq!(NodeState::Suspended.short(), "susp");
+    }
 }

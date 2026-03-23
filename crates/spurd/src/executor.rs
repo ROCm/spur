@@ -489,4 +489,45 @@ mod tests {
         );
         assert_eq!(resolve_output_path("", 42, "/tmp"), "/tmp/spur-42.out");
     }
+
+    #[test]
+    fn test_burst_buffer_wrap_stage_in_only() {
+        let script = "#!/bin/bash\necho hello\n";
+        let bb = "stage_in:cp /data/model.bin /tmp/";
+        let wrapped = wrap_with_burst_buffer(script, bb);
+        assert!(wrapped.contains("cp /data/model.bin /tmp/ || exit 1"));
+        assert!(wrapped.contains("echo hello"));
+        assert!(wrapped.contains("exit $SPUR_BB_EXIT"));
+    }
+
+    #[test]
+    fn test_burst_buffer_wrap_stage_out_only() {
+        let script = "#!/bin/bash\necho hello\n";
+        let bb = "stage_out:cp /tmp/results /data/";
+        let wrapped = wrap_with_burst_buffer(script, bb);
+        assert!(wrapped.contains("cp /tmp/results /data/ || true"));
+        assert!(wrapped.contains("echo hello"));
+    }
+
+    #[test]
+    fn test_burst_buffer_wrap_both() {
+        let script = "#!/bin/bash\necho hello\n";
+        let bb = "stage_in:cp /data/in.bin /tmp/;stage_out:cp /tmp/out.bin /data/";
+        let wrapped = wrap_with_burst_buffer(script, bb);
+        assert!(wrapped.contains("cp /data/in.bin /tmp/ || exit 1"));
+        assert!(wrapped.contains("cp /tmp/out.bin /data/ || true"));
+        // Stage-in should come before user script, stage-out after
+        let stage_in_pos = wrapped.find("stage-in").unwrap();
+        let user_pos = wrapped.find("User script").unwrap();
+        let stage_out_pos = wrapped.find("stage-out").unwrap();
+        assert!(stage_in_pos < user_pos);
+        assert!(user_pos < stage_out_pos);
+    }
+
+    #[test]
+    fn test_burst_buffer_empty_passthrough() {
+        let script = "#!/bin/bash\necho hello\n";
+        let wrapped = wrap_with_burst_buffer(script, "");
+        assert_eq!(wrapped, script);
+    }
 }
