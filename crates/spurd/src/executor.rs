@@ -248,10 +248,27 @@ pub async fn launch_job(
                 .join(","),
         );
     }
-    // Note: when gpu_devices is empty and no GRES was requested, we do NOT
-    // override GPU visibility — legacy jobs that don't specify --gres expect
-    // to see all GPUs. GPU hiding only happens when the allocation explicitly
-    // assigned specific devices (gpu_devices non-empty).
+    // When no GPUs are allocated but GRES was explicitly requested (gpu:0 or
+    // other GRES without gpu), hide all GPUs. When no GRES was requested at
+    // all, leave GPU visibility unchanged for backward compatibility.
+    // The caller (agent_server) should set SPUR_GRES_REQUESTED=1 when GRES is specified.
+    if gpu_devices.is_empty()
+        && env
+            .get("SPUR_GRES_REQUESTED")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    {
+        env.insert("ROCR_VISIBLE_DEVICES".into(), String::new());
+        env.insert("CUDA_VISIBLE_DEVICES".into(), String::new());
+    }
+
+    // Environment-based CPU/thread limiting — works even without cgroups.
+    // Well-behaved applications (OpenMP, MKL, PyTorch, etc.) read these.
+    env.insert("OMP_NUM_THREADS".into(), cpus.to_string());
+    env.insert("MKL_NUM_THREADS".into(), cpus.to_string());
+    env.insert("OPENBLAS_NUM_THREADS".into(), cpus.to_string());
+    env.insert("VECLIB_MAXIMUM_THREADS".into(), cpus.to_string());
+    env.insert("NUMEXPR_NUM_THREADS".into(), cpus.to_string());
 
     // Launch the process
     let mut cmd = Command::new("/bin/bash");

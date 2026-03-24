@@ -289,6 +289,10 @@ impl SlurmAgent for AgentService {
         env.insert("SPUR_JOB_ID".into(), job_id.to_string());
         env.insert("SPUR_TASK_OFFSET".into(), task_offset.to_string());
         env.insert("SPUR_NUM_NODES".into(), peer_nodes.len().to_string());
+        // Signal to executor that GRES was explicitly requested (for GPU hiding)
+        if !spec.gres.is_empty() {
+            env.insert("SPUR_GRES_REQUESTED".into(), "1".into());
+        }
         if !peer_nodes.is_empty() {
             env.insert("SPUR_PEER_NODES".into(), peer_nodes.join(","));
         }
