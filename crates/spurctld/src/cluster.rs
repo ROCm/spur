@@ -35,6 +35,8 @@ pub struct ClusterManager {
     wal_since_snapshot: AtomicU32,
     /// Cluster-wide license pool: available licenses (decremented when jobs start).
     license_pool: RwLock<HashMap<String, u64>>,
+    /// Maps agent hostname → config node name (for name normalization).
+    hostname_aliases: RwLock<HashMap<String, String>>,
 }
 
 impl ClusterManager {
@@ -99,6 +101,7 @@ impl ClusterManager {
             snapshot: RwLock::new(snapshot),
             wal_since_snapshot: AtomicU32::new(0),
             license_pool: RwLock::new(license_pool),
+            hostname_aliases: RwLock::new(HashMap::new()),
         })
     }
 
@@ -612,7 +615,58 @@ impl ClusterManager {
         version: String,
         source: NodeSource,
     ) {
-        let mut node = Node::new(name.clone(), resources.clone());
+        // Normalize node name: if the agent's hostname doesn't match any config
+        // entry, check if there's an unmatched config node it could be aliased to.
+        // This handles single-node setups where config says "localhost" but the
+        // agent registers with its real hostname.
+        let effective_name = {
+            let registered_nodes = self.nodes.read();
+            let mut matches_config = false;
+            for nc in &self.config.nodes {
+                if let Ok(hosts) = spur_core::hostlist::expand(&nc.names) {
+                    if hosts.contains(&name) {
+                        matches_config = true;
+                        break;
+                    }
+                }
+            }
+            if !matches_config {
+                // Agent hostname doesn't match config — find an unmatched config node
+                let mut candidate = None;
+                for nc in &self.config.nodes {
+                    if let Ok(hosts) = spur_core::hostlist::expand(&nc.names) {
+                        for host in &hosts {
+                            if !registered_nodes.contains_key(host) {
+                                candidate = Some(host.clone());
+                                break;
+                            }
+                        }
+                        if candidate.is_some() {
+                            break;
+                        }
+                    }
+                }
+                if let Some(config_name) = candidate {
+                    info!(
+                        agent_hostname = %name,
+                        config_name = %config_name,
+                        "node hostname doesn't match config — using config name"
+                    );
+                    // Store the alias so heartbeats from this hostname find the right node
+                    drop(registered_nodes);
+                    self.hostname_aliases
+                        .write()
+                        .insert(name.clone(), config_name.clone());
+                    config_name
+                } else {
+                    name.clone()
+                }
+            } else {
+                name.clone()
+            }
+        };
+
+        let mut node = Node::new(effective_name.clone(), resources.clone());
         node.state = NodeState::Idle;
         node.source = source;
         node.address = Some(address.clone());
@@ -628,7 +682,7 @@ impl ClusterManager {
         let partitions = self.partitions.read();
         for part in partitions.iter() {
             if let Ok(hosts) = spur_core::hostlist::expand(&part.nodes) {
-                if hosts.contains(&name) {
+                if hosts.contains(&effective_name) {
                     node.partitions.push(part.name.clone());
                 }
             }
@@ -637,7 +691,7 @@ impl ClusterManager {
         // Copy features and weight from node config
         for nc in &self.config.nodes {
             if let Ok(hosts) = spur_core::hostlist::expand(&nc.names) {
-                if hosts.contains(&name) {
+                if hosts.contains(&effective_name) {
                     node.features = nc.features.clone();
                     node.weight = nc.weight;
                     break;
@@ -646,19 +700,26 @@ impl ClusterManager {
         }
 
         self.append_wal(WalOperation::NodeRegister {
-            name: name.clone(),
+            name: effective_name.clone(),
             resources,
             address,
         });
 
-        info!(node = %name, partitions = ?node.partitions, "node registered");
-        self.nodes.write().insert(name, node);
+        info!(node = %effective_name, partitions = ?node.partitions, "node registered");
+        self.nodes.write().insert(effective_name, node);
     }
 
     /// Update node heartbeat data.
     pub fn update_heartbeat(&self, name: &str, cpu_load: u32, free_memory_mb: u64) {
+        // Resolve hostname alias (agent may use real hostname, node stored under config name)
+        let effective_name = self
+            .hostname_aliases
+            .read()
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string());
         let mut nodes = self.nodes.write();
-        if let Some(node) = nodes.get_mut(name) {
+        if let Some(node) = nodes.get_mut(&effective_name) {
             node.cpu_load = cpu_load;
             node.free_memory_mb = free_memory_mb;
             node.last_heartbeat = Some(Utc::now());
