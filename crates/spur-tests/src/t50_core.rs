@@ -773,4 +773,30 @@ mod tests {
     fn t50_72_reservation_default_none() {
         assert!(JobSpec::default().reservation.is_none());
     }
+
+    // ── T50.73–74: strigger and scrontab types ────────────────────
+
+    #[test]
+    fn t50_73_strigger_types() {
+        let types = ["node_down", "node_up", "job_end", "job_fail", "time"];
+        assert_eq!(types.len(), 5);
+        // Ensure no duplicates
+        let mut deduped = types.to_vec();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(deduped.len(), 5);
+    }
+
+    #[test]
+    fn t50_74_scrontab_format() {
+        let line = "0 */6 * * * sbatch /path/to/script.sh";
+        let parts: Vec<&str> = line.splitn(6, ' ').collect();
+        assert_eq!(parts.len(), 6);
+        assert_eq!(parts[0], "0"); // minute
+        assert_eq!(parts[1], "*/6"); // hour
+        assert_eq!(parts[2], "*"); // day of month
+        assert_eq!(parts[3], "*"); // month
+        assert_eq!(parts[4], "*"); // day of week
+        assert_eq!(parts[5], "sbatch /path/to/script.sh"); // command
+    }
 }

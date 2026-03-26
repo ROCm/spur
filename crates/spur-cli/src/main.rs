@@ -5,17 +5,21 @@ mod net;
 mod sacct;
 mod sacctmgr;
 mod salloc;
+mod sattach;
 mod sbatch;
 mod scancel;
 mod scontrol;
+mod scrontab;
 mod sdiag;
 mod sinfo;
+mod smd;
 mod sprio;
 mod squeue;
 mod sreport;
 mod srun;
 mod sshare;
 mod sstat;
+mod strigger;
 
 use std::path::Path;
 
@@ -45,6 +49,10 @@ fn main() -> anyhow::Result<()> {
         "sstat" => return runtime.block_on(sstat::main()),
         "sdiag" => return runtime.block_on(sdiag::main()),
         "sreport" => return runtime.block_on(sreport::main()),
+        "strigger" => return runtime.block_on(strigger::main()),
+        "sattach" => return runtime.block_on(sattach::main()),
+        "scrontab" => return runtime.block_on(scrontab::main()),
+        "smd" => return runtime.block_on(smd::main()),
         _ => {}
     }
 
@@ -74,8 +82,13 @@ fn main() -> anyhow::Result<()> {
         "stat" | "jobstat" => Some("sstat"),
         "diag" | "diagnostics" => Some("sdiag"),
         "report" | "usage" => Some("sreport"),
+        "trigger" | "triggers" => Some("strigger"),
+        "attach" => Some("sattach"),
+        "crontab" | "cron" => Some("scrontab"),
+        "health" | "monitor" => Some("smd"),
         "sbatch" | "srun" | "squeue" | "scancel" | "sinfo" | "sacct" | "sacctmgr" | "scontrol"
-        | "sprio" | "sshare" | "sstat" | "sdiag" | "sreport" => Some(args[1].as_str()),
+        | "sprio" | "sshare" | "sstat" | "sdiag" | "sreport" | "strigger" | "sattach"
+        | "scrontab" | "smd" => Some(args[1].as_str()),
         "net" | "image" | "exec" => Some(args[1].as_str()),
         _ => None,
     };
@@ -106,6 +119,14 @@ fn main() -> anyhow::Result<()> {
             "sstat" | "stat" | "jobstat" => runtime.block_on(sstat::main_with_args(rewritten)),
             "sdiag" | "diag" | "diagnostics" => runtime.block_on(sdiag::main_with_args(rewritten)),
             "sreport" | "report" | "usage" => runtime.block_on(sreport::main_with_args(rewritten)),
+            "strigger" | "trigger" | "triggers" => {
+                runtime.block_on(strigger::main_with_args(rewritten))
+            }
+            "sattach" | "attach" => runtime.block_on(sattach::main_with_args(rewritten)),
+            "scrontab" | "crontab" | "cron" => {
+                runtime.block_on(scrontab::main_with_args(rewritten))
+            }
+            "smd" | "health" | "monitor" => runtime.block_on(smd::main_with_args(rewritten)),
             "net" => runtime.block_on(net::main_with_args(rewritten)),
             "image" => runtime.block_on(image::main_with_args(rewritten)),
             "exec" => runtime.block_on(exec::main_with_args(rewritten)),
@@ -155,9 +176,13 @@ fn print_usage() {
     eprintln!("  stat        Display running job statistics");
     eprintln!("  diag        Show scheduler diagnostics");
     eprintln!("  report      Generate usage reports");
+    eprintln!("  trigger     Manage event triggers");
+    eprintln!("  attach      Attach to a running job's I/O");
+    eprintln!("  crontab     Manage recurring cron-style jobs");
+    eprintln!("  health      Node health monitoring");
     eprintln!("  version     Show version");
     eprintln!();
     eprintln!("Slurm-compatible aliases (also work as symlinks):");
     eprintln!("  salloc sbatch srun squeue scancel sinfo sacct sacctmgr scontrol");
-    eprintln!("  sprio sshare sstat sdiag sreport");
+    eprintln!("  sprio sshare sstat sdiag sreport strigger sattach scrontab smd");
 }
