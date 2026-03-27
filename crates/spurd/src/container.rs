@@ -18,8 +18,21 @@ use anyhow::{bail, Context};
 use tracing::{debug, info, warn};
 
 /// Where squashfs images and container rootfs are stored.
-const IMAGE_DIR: &str = "/var/spool/spur/images";
+const DEFAULT_IMAGE_DIR: &str = "/var/spool/spur/images";
 const CONTAINER_DIR: &str = "/var/spool/spur/containers";
+
+/// Return the image directory, honoring `SPUR_IMAGE_DIR` env var.
+///
+/// This must match the CLI's `resolve_image_dir()` logic so that images
+/// imported via `spur image import` are found by the agent at job launch.
+fn image_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("SPUR_IMAGE_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    PathBuf::from(DEFAULT_IMAGE_DIR)
+}
 
 /// A parsed bind mount specification.
 #[derive(Debug)]
@@ -53,7 +66,7 @@ pub struct ContainerConfig {
 ///
 /// Supports:
 /// - Absolute path to squashfs file
-/// - Image name (looked up in IMAGE_DIR)
+/// - Image name (looked up in image_dir())
 /// - docker:// URI (must be pre-imported with `spur image import`)
 pub fn resolve_image(image: &str) -> anyhow::Result<PathBuf> {
     // Absolute path to squashfs
@@ -62,21 +75,23 @@ pub fn resolve_image(image: &str) -> anyhow::Result<PathBuf> {
         return Ok(path.to_path_buf());
     }
 
-    // Check image dir
-    let image_path = PathBuf::from(IMAGE_DIR).join(format!("{}.sqsh", sanitize_name(image)));
+    // Check image dir (respects SPUR_IMAGE_DIR env var)
+    let dir = image_dir();
+    let image_path = dir.join(format!("{}.sqsh", sanitize_name(image)));
     if image_path.exists() {
         return Ok(image_path);
     }
 
     // Try without .sqsh extension
-    let image_path = PathBuf::from(IMAGE_DIR).join(sanitize_name(image));
+    let image_path = dir.join(sanitize_name(image));
     if image_path.exists() {
         return Ok(image_path);
     }
 
     bail!(
-        "container image '{}' not found. Import it first with: spur image import {}",
+        "container image '{}' not found in {}. Import it first with: spur image import {}",
         image,
+        dir.display(),
         image
     )
 }
@@ -636,19 +651,19 @@ pub fn cleanup_rootfs(job_id: u32, mode: &RootfsMode) {
 /// via the Docker Registry HTTP API v2. No dependency on Docker, skopeo,
 /// umoci, or enroot. Only needs mksquashfs (squashfs-tools).
 pub async fn import_image(uri: &str) -> anyhow::Result<PathBuf> {
-    let image_dir = Path::new(IMAGE_DIR);
-    spur_net::pull_image(uri, image_dir).await
+    let dir = image_dir();
+    spur_net::pull_image(uri, &dir).await
 }
 
 /// List imported images.
 pub fn list_images() -> Vec<(String, u64)> {
-    let dir = Path::new(IMAGE_DIR);
+    let dir = image_dir();
     if !dir.exists() {
         return Vec::new();
     }
 
     let mut images = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
+    if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().map_or(false, |ext| ext == "sqsh") {
@@ -667,7 +682,7 @@ pub fn list_images() -> Vec<(String, u64)> {
 
 /// Remove an imported image.
 pub fn remove_image(name: &str) -> anyhow::Result<()> {
-    let path = PathBuf::from(IMAGE_DIR).join(format!("{}.sqsh", sanitize_name(name)));
+    let path = image_dir().join(format!("{}.sqsh", sanitize_name(name)));
     if !path.exists() {
         bail!("image '{}' not found", name);
     }

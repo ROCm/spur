@@ -229,7 +229,17 @@ fn resolve_partition_field(
                 node_state_str(*most_common)
             }
         }
-        'N' => part.nodes.clone(),
+        'N' => {
+            if !nodes.is_empty() {
+                nodes
+                    .iter()
+                    .map(|n| n.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            } else {
+                part.nodes.clone()
+            }
+        }
         'c' => part.total_cpus.to_string(),
         _ => "?".into(),
     }

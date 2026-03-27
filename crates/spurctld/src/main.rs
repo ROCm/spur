@@ -17,9 +17,9 @@ struct Args {
     #[arg(short = 'f', long, default_value = "/etc/spur/spur.conf")]
     config: PathBuf,
 
-    /// gRPC listen address
-    #[arg(long, default_value = "[::]:6817")]
-    listen: String,
+    /// gRPC listen address (overrides config file)
+    #[arg(long)]
+    listen: Option<String>,
 
     /// State directory
     #[arg(long, default_value = "/var/spool/spur")]
@@ -48,20 +48,29 @@ async fn main() -> anyhow::Result<()> {
     info!(version = env!("CARGO_PKG_VERSION"), "spurctld starting");
 
     // Load config if it exists, otherwise use defaults
-    let config = if args.config.exists() {
+    let mut config = if args.config.exists() {
         spur_core::config::SlurmConfig::load(&args.config)?
     } else {
         info!("no config file found, using defaults");
         spur_core::config::SlurmConfig {
             cluster_name: "spur".into(),
             controller: spur_core::config::ControllerConfig {
-                listen_addr: args.listen.clone(),
+                listen_addr: "[::]:6817".into(),
                 state_dir: args.state_dir.to_string_lossy().into(),
                 ..Default::default()
             },
             ..default_config()
         }
     };
+
+    // CLI --listen overrides config file; otherwise use config's listen_addr.
+    let listen_addr = args
+        .listen
+        .clone()
+        .unwrap_or_else(|| config.controller.listen_addr.clone());
+
+    // Keep config in sync so downstream code sees the final address.
+    config.controller.listen_addr = listen_addr.clone();
 
     // Initialize cluster manager
     let cluster = Arc::new(ClusterManager::new(config.clone(), &args.state_dir)?);
@@ -83,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Start gRPC server
-    let addr = args.listen.parse()?;
+    let addr = listen_addr.parse()?;
     info!(%addr, "gRPC server listening");
     server::serve(addr, cluster).await?;
 
