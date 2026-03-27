@@ -2,12 +2,14 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::Utc;
+use prost_types;
 use tracing::{debug, error, info, warn};
 
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
+use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
     AgentCancelJobRequest, JobSpec as ProtoJobSpec, LaunchJobRequest,
-    ResourceSet as ProtoResourceSet,
+    ResourceSet as ProtoResourceSet, SubmitJobRequest,
 };
 use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::traits::{ClusterState, Scheduler};
@@ -73,6 +75,16 @@ pub async fn run(cluster: Arc<ClusterManager>) {
 
             if !unscheduled.is_empty() {
                 try_preempt(&cluster, &unscheduled);
+
+                // Federation: forward still-unschedulable jobs to peer clusters.
+                if !cluster.config.federation.clusters.is_empty() {
+                    let jobs_to_fwd: Vec<spur_core::job::Job> =
+                        unscheduled.iter().map(|j| (*j).clone()).collect();
+                    let fed_cluster = cluster.clone();
+                    tokio::spawn(async move {
+                        forward_to_federation(&fed_cluster, &jobs_to_fwd).await;
+                    });
+                }
             }
         }
 
@@ -241,6 +253,136 @@ fn try_preempt(cluster: &Arc<ClusterManager>, unscheduled: &[&spur_core::job::Jo
                 break; // One preemption per cycle, re-evaluate next cycle
             }
         }
+    }
+}
+
+/// Forward unschedulable jobs to federation peer clusters.
+///
+/// Tries each peer in order; stops forwarding a job as soon as one peer accepts it.
+/// Failed peer connections are logged as warnings and skipped.
+async fn forward_to_federation(cluster: &ClusterManager, jobs: &[spur_core::job::Job]) {
+    let peers = &cluster.config.federation.clusters;
+    for job in jobs {
+        for peer in peers {
+            match SlurmControllerClient::connect(peer.address.clone()).await {
+                Ok(mut client) => {
+                    let req = SubmitJobRequest {
+                        spec: Some(core_spec_to_proto(&job.spec)),
+                    };
+                    match client.submit_job(req).await {
+                        Ok(resp) => {
+                            let remote_id = resp.into_inner().job_id;
+                            info!(
+                                job_id = job.job_id,
+                                peer = %peer.name,
+                                remote_id,
+                                "forwarded unschedulable job to federation peer"
+                            );
+                            break; // accepted by this peer — don't try others
+                        }
+                        Err(e) => {
+                            warn!(
+                                job_id = job.job_id,
+                                peer = %peer.name,
+                                error = %e,
+                                "federation peer rejected job"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        peer = %peer.name,
+                        error = %e,
+                        "could not connect to federation peer"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Convert a core JobSpec to its proto representation for cross-cluster forwarding.
+fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
+    // Split licenses back out of GRES (stored as "license:<entry>")
+    let mut gres = Vec::new();
+    let mut licenses = Vec::new();
+    for g in &s.gres {
+        if let Some(lic) = g.strip_prefix("license:") {
+            licenses.push(lic.to_string());
+        } else {
+            gres.push(g.clone());
+        }
+    }
+
+    ProtoJobSpec {
+        name: s.name.clone(),
+        partition: s.partition.clone().unwrap_or_default(),
+        account: s.account.clone().unwrap_or_default(),
+        user: s.user.clone(),
+        uid: s.uid,
+        gid: s.gid,
+        num_nodes: s.num_nodes,
+        num_tasks: s.num_tasks,
+        tasks_per_node: s.tasks_per_node.unwrap_or(0),
+        cpus_per_task: s.cpus_per_task,
+        memory_per_node_mb: s.memory_per_node_mb.unwrap_or(0),
+        memory_per_cpu_mb: s.memory_per_cpu_mb.unwrap_or(0),
+        gres,
+        licenses,
+        script: s.script.clone().unwrap_or_default(),
+        argv: s.argv.clone(),
+        work_dir: s.work_dir.clone(),
+        stdout_path: s.stdout_path.clone().unwrap_or_default(),
+        stderr_path: s.stderr_path.clone().unwrap_or_default(),
+        environment: s.environment.clone(),
+        time_limit: s.time_limit.map(|d| prost_types::Duration {
+            seconds: d.num_seconds(),
+            nanos: 0,
+        }),
+        time_min: s.time_min.map(|d| prost_types::Duration {
+            seconds: d.num_seconds(),
+            nanos: 0,
+        }),
+        qos: s.qos.clone().unwrap_or_default(),
+        priority: s.priority.unwrap_or(0),
+        reservation: s.reservation.clone().unwrap_or_default(),
+        dependency: s.dependency.clone(),
+        nodelist: s.nodelist.clone().unwrap_or_default(),
+        exclude: s.exclude.clone().unwrap_or_default(),
+        constraint: s.constraint.clone().unwrap_or_default(),
+        mpi: s.mpi.clone().unwrap_or_default(),
+        distribution: s.distribution.clone().unwrap_or_default(),
+        het_group: s.het_group.unwrap_or(0),
+        array_spec: s.array_spec.clone().unwrap_or_default(),
+        requeue: s.requeue,
+        exclusive: s.exclusive,
+        hold: s.hold,
+        interactive: s.interactive,
+        mail_type: s.mail_type.clone(),
+        mail_user: s.mail_user.clone().unwrap_or_default(),
+        comment: s.comment.clone().unwrap_or_default(),
+        wckey: s.wckey.clone().unwrap_or_default(),
+        container_image: s.container_image.clone().unwrap_or_default(),
+        container_mounts: s.container_mounts.clone(),
+        container_workdir: s.container_workdir.clone().unwrap_or_default(),
+        container_name: s.container_name.clone().unwrap_or_default(),
+        container_readonly: s.container_readonly,
+        container_mount_home: s.container_mount_home,
+        container_env: s.container_env.clone(),
+        container_entrypoint: s.container_entrypoint.clone().unwrap_or_default(),
+        container_remap_root: s.container_remap_root,
+        burst_buffer: s.burst_buffer.clone().unwrap_or_default(),
+        begin_time: s.begin_time.map(|dt| prost_types::Timestamp {
+            seconds: dt.timestamp(),
+            nanos: 0,
+        }),
+        deadline: s.deadline.map(|dt| prost_types::Timestamp {
+            seconds: dt.timestamp(),
+            nanos: 0,
+        }),
+        spread_job: s.spread_job,
+        open_mode: s.open_mode.clone().unwrap_or_default(),
     }
 }
 
