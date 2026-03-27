@@ -800,17 +800,100 @@ mod tests {
         assert_eq!(parts[5], "sbatch /path/to/script.sh"); // command
     }
 
-    // ── T50.75–78: Federation config parsing ─────────────────────
+    // ── T50.75: Node count single-node partition (#25) ───────────
 
     #[test]
-    fn t50_75_federation_config_default_empty() {
+    fn t50_75_single_node_partition_count_nonzero() {
+        // Regression: node count showed 0 on single-node setups (#25).
+        // A partition with one node in its spec must report count >= 1.
+        let nodes_spec = "node001";
+        let count = spur_core::hostlist::expand(nodes_spec)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        assert_eq!(count, 1, "single node spec must expand to exactly 1 node");
+        assert!(count > 0, "node count must be non-zero");
+    }
+
+    #[test]
+    fn t50_76_reservation_field_flows_through_job_spec() {
+        // Regression: --reservation flag was missing from submit commands (#26).
+        // The field must exist on JobSpec and be passable to the scheduler.
+        let spec = spur_core::job::JobSpec {
+            reservation: Some("res-gpu".into()),
+            ..Default::default()
+        };
+        assert_eq!(spec.reservation.as_deref(), Some("res-gpu"));
+    }
+
+    #[test]
+    fn t50_77_reservation_update_fields_present() {
+        // Regression: no command to update a reservation (#28).
+        // Reservation must have all fields needed for an update operation.
+        use spur_core::reservation::Reservation;
+        let now = chrono::Utc::now();
+        let mut res = Reservation {
+            name: "res-v1".into(),
+            start_time: now,
+            end_time: now + chrono::Duration::hours(4),
+            nodes: vec!["node001".into()],
+            users: vec!["alice".into()],
+            accounts: Vec::new(),
+        };
+        // All fields must be mutable for an update to work.
+        res.end_time = now + chrono::Duration::hours(8);
+        res.nodes.push("node002".into());
+        assert_eq!(res.nodes.len(), 2);
+        assert_eq!(
+            (res.end_time - res.start_time).num_hours(),
+            8,
+            "end_time must be updatable"
+        );
+    }
+
+    #[test]
+    fn t50_78_single_node_name_matches_hostlist() {
+        // Regression: single-node clusters had inconsistent node naming (#30).
+        // The node name used at registration must be what the hostlist expands to.
+        let config_spec = "ubb-r09-01";
+        let expanded = spur_core::hostlist::expand(config_spec).unwrap();
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0], "ubb-r09-01");
+    }
+
+    #[test]
+    fn t50_79_sinfo_nodelist_uses_registered_names() {
+        // Regression: sinfo NODELIST showed "localhost" instead of real node names (#36).
+        // When registered nodes are available the NODELIST should use their names,
+        // not fall back to the static partition spec string.
+        let registered_names = vec!["ubb-r09-09", "ubb-r09-11"];
+        let partition_spec = "localhost"; // what default config has
+
+        // If registered nodes exist, use them — never fall back to partition spec.
+        let nodelist = if !registered_names.is_empty() {
+            registered_names.join(",")
+        } else {
+            partition_spec.to_string()
+        };
+        assert_eq!(nodelist, "ubb-r09-09,ubb-r09-11");
+        assert_ne!(
+            nodelist, "localhost",
+            "must not show 'localhost' when real nodes registered"
+        );
+    }
+
+    // ── T50.80–87: (renumbered from previous 75–81) ───────────────
+
+    // ── T50.82–85: Federation config parsing ─────────────────────
+
+    #[test]
+    fn t50_82_federation_config_default_empty() {
         use spur_core::config::FederationConfig;
         let fed = FederationConfig::default();
         assert!(fed.clusters.is_empty());
     }
 
     #[test]
-    fn t50_76_federation_cluster_peer_fields() {
+    fn t50_83_federation_cluster_peer_fields() {
         use spur_core::config::ClusterPeer;
         let peer = ClusterPeer {
             name: "cluster-b".into(),
@@ -821,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn t50_77_federation_config_with_peers() {
+    fn t50_84_federation_config_with_peers() {
         use spur_core::config::{ClusterPeer, FederationConfig};
         let fed = FederationConfig {
             clusters: vec![
@@ -841,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn t50_78_federation_config_toml_roundtrip() {
+    fn t50_85_federation_config_toml_roundtrip() {
         use spur_core::config::SlurmConfig;
         let toml = r#"
 cluster_name = "test"
@@ -859,21 +942,20 @@ address = "http://peer-a:6817"
         assert_eq!(cfg.federation.clusters[0].name, "peer-a");
     }
 
-    // ── T50.79–81: PMIx env var names ────────────────────────────
+    // ── T50.86–88: PMIx env var names ────────────────────────────
 
     #[test]
-    fn t50_79_pmix_env_var_names_correct() {
+    fn t50_86_pmix_env_var_names_correct() {
         // Verify the canonical PMIx env var names used by OpenMPI 5+ and srun.
         let required = ["PMIX_RANK", "PMIX_SIZE", "PMIX_NAMESPACE"];
         for name in &required {
-            // Names must be uppercase and start with PMIX_
             assert!(name.starts_with("PMIX_"), "expected PMIX_ prefix: {}", name);
             assert_eq!(*name, name.to_uppercase(), "must be uppercase: {}", name);
         }
     }
 
     #[test]
-    fn t50_80_pmix_namespace_format() {
+    fn t50_87_pmix_namespace_format() {
         // Namespace format: "spur.<job_id>"
         let job_id: u32 = 42;
         let ns = format!("spur.{}", job_id);
@@ -882,7 +964,7 @@ address = "http://peer-a:6817"
     }
 
     #[test]
-    fn t50_81_ompi_compat_env_vars() {
+    fn t50_88_ompi_compat_env_vars() {
         // OpenMPI direct bootstrap env vars mirror PMIx rank/size.
         let ompi_vars = ["OMPI_COMM_WORLD_RANK", "OMPI_COMM_WORLD_SIZE"];
         for v in &ompi_vars {

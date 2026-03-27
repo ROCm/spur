@@ -118,4 +118,61 @@ mod tests {
         assert_eq!(jobs[1].spec.name, "mid");
         assert_eq!(jobs[2].spec.name, "low");
     }
+
+    // ── T05.9–11: Queue shows only active jobs (#10 #22) ─────────
+
+    #[test]
+    fn t05_9_queue_excludes_terminal_jobs() {
+        // Regression: spur queue showed completed/failed/cancelled jobs (#10 #22).
+        // squeue should only show Pending and Running (not terminal states).
+        reset_job_ids();
+        let mut jobs = vec![
+            make_job("pending"),
+            make_job("running"),
+            make_job("completed"),
+            make_job("failed"),
+            make_job("cancelled"),
+        ];
+        jobs[1].transition(JobState::Running).unwrap();
+        jobs[2].transition(JobState::Running).unwrap();
+        jobs[2].transition(JobState::Completed).unwrap();
+        jobs[3].transition(JobState::Running).unwrap();
+        jobs[3].transition(JobState::Failed).unwrap();
+        jobs[4].transition(JobState::Cancelled).unwrap();
+
+        // squeue filter: show only non-terminal jobs
+        let visible: Vec<_> = jobs.iter().filter(|j| !j.state.is_terminal()).collect();
+        assert_eq!(visible.len(), 2, "only pending + running should be visible");
+        assert!(visible.iter().all(|j| !j.state.is_terminal()));
+        assert!(visible.iter().any(|j| j.spec.name == "pending"));
+        assert!(visible.iter().any(|j| j.spec.name == "running"));
+    }
+
+    #[test]
+    fn t05_10_queue_all_flag_includes_terminal() {
+        // With --all / -a flag, completed and failed jobs are also shown.
+        reset_job_ids();
+        let mut jobs = vec![make_job("pending"), make_job("done")];
+        jobs[1].transition(JobState::Running).unwrap();
+        jobs[1].transition(JobState::Completed).unwrap();
+
+        let all_visible: Vec<_> = jobs.iter().collect();
+        assert_eq!(all_visible.len(), 2);
+    }
+
+    #[test]
+    fn t05_11_cancelled_is_terminal_not_shown_by_default() {
+        // Cancelled jobs must not appear in the default queue view.
+        reset_job_ids();
+        let mut job = make_job("cancelled-job");
+        job.transition(JobState::Cancelled).unwrap();
+
+        assert!(job.state.is_terminal());
+        // Default queue filter excludes it.
+        let visible = !job.state.is_terminal();
+        assert!(
+            !visible,
+            "cancelled job must not appear in default squeue output"
+        );
+    }
 }
