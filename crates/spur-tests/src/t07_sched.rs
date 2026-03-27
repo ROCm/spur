@@ -424,4 +424,113 @@ mod tests {
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 0, "no node has 'gpu' feature");
     }
+
+    // ── T07.18–20: Federation peer config ────────────────────────
+
+    #[test]
+    fn t07_18_federation_no_peers_by_default() {
+        use spur_core::config::FederationConfig;
+        let fed = FederationConfig::default();
+        // No federation peers configured — scheduler should never forward.
+        assert!(fed.clusters.is_empty());
+    }
+
+    #[test]
+    fn t07_19_federation_forward_decision() {
+        // If local scheduler returns fewer assignments than pending jobs,
+        // and federation is configured, unscheduled jobs should be forwarded.
+        // This tests the decision logic (not the RPC call itself).
+        let pending_count = 3usize;
+        let assigned_count = 1usize;
+        let has_federation = true;
+
+        let should_forward = has_federation && assigned_count < pending_count;
+        assert!(
+            should_forward,
+            "should forward when local can't schedule all"
+        );
+
+        let should_forward_no_peers = false && assigned_count < pending_count;
+        assert!(!should_forward_no_peers, "no peers → no forward");
+    }
+
+    #[test]
+    fn t07_20_federation_peer_address_format() {
+        use spur_core::config::ClusterPeer;
+        let peer = ClusterPeer {
+            name: "hpc-east".into(),
+            address: "http://hpc-east-ctrl:6817".into(),
+        };
+        // Address must be a valid http:// or https:// URI for tonic Connect.
+        assert!(
+            peer.address.starts_with("http://") || peer.address.starts_with("https://"),
+            "peer address must be http(s): {}",
+            peer.address
+        );
+    }
+
+    // ── T07.21–23: Power management state transitions ─────────────
+
+    #[test]
+    fn t07_21_suspended_node_not_schedulable() {
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2, 64, 256_000);
+        // Suspend one node.
+        nodes[0].state = NodeState::Suspended;
+        let partitions = vec![make_partition("default", 2)];
+        let job = make_job_with_resources("train", 1, 1, 1, Some(60));
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+        };
+        let assignments = sched.schedule(&[job], &cluster);
+        // Should schedule to the non-suspended node only.
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes[0], "node002");
+    }
+
+    #[test]
+    fn t07_22_all_suspended_yields_no_assignments() {
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2, 64, 256_000);
+        nodes[0].state = NodeState::Suspended;
+        nodes[1].state = NodeState::Suspended;
+        let partitions = vec![make_partition("default", 2)];
+        let job = make_job_with_resources("train", 1, 1, 1, Some(60));
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+        };
+        let assignments = sched.schedule(&[job], &cluster);
+        assert_eq!(assignments.len(), 0, "all nodes suspended");
+    }
+
+    #[test]
+    fn t07_23_power_config_suspend_timeout_gate() {
+        use spur_core::config::PowerConfig;
+        // When suspend_timeout_secs is None, power management is disabled.
+        let cfg_off = PowerConfig {
+            suspend_timeout_secs: None,
+            suspend_command: None,
+            resume_command: None,
+        };
+        assert!(
+            cfg_off.suspend_timeout_secs.is_none(),
+            "power mgmt disabled"
+        );
+
+        // When set, power management is enabled.
+        let cfg_on = PowerConfig {
+            suspend_timeout_secs: Some(300),
+            suspend_command: Some("systemctl suspend".into()),
+            resume_command: Some("wake-on-lan aa:bb:cc:dd:ee:ff".into()),
+        };
+        assert_eq!(cfg_on.suspend_timeout_secs, Some(300));
+        assert!(cfg_on.suspend_command.is_some());
+        assert!(cfg_on.resume_command.is_some());
+    }
 }

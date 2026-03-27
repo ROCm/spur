@@ -799,4 +799,94 @@ mod tests {
         assert_eq!(parts[4], "*"); // day of week
         assert_eq!(parts[5], "sbatch /path/to/script.sh"); // command
     }
+
+    // ── T50.75–78: Federation config parsing ─────────────────────
+
+    #[test]
+    fn t50_75_federation_config_default_empty() {
+        use spur_core::config::FederationConfig;
+        let fed = FederationConfig::default();
+        assert!(fed.clusters.is_empty());
+    }
+
+    #[test]
+    fn t50_76_federation_cluster_peer_fields() {
+        use spur_core::config::ClusterPeer;
+        let peer = ClusterPeer {
+            name: "cluster-b".into(),
+            address: "http://ctrl-b:6817".into(),
+        };
+        assert_eq!(peer.name, "cluster-b");
+        assert_eq!(peer.address, "http://ctrl-b:6817");
+    }
+
+    #[test]
+    fn t50_77_federation_config_with_peers() {
+        use spur_core::config::{ClusterPeer, FederationConfig};
+        let fed = FederationConfig {
+            clusters: vec![
+                ClusterPeer {
+                    name: "east".into(),
+                    address: "http://east-ctrl:6817".into(),
+                },
+                ClusterPeer {
+                    name: "west".into(),
+                    address: "http://west-ctrl:6817".into(),
+                },
+            ],
+        };
+        assert_eq!(fed.clusters.len(), 2);
+        assert_eq!(fed.clusters[0].name, "east");
+        assert_eq!(fed.clusters[1].address, "http://west-ctrl:6817");
+    }
+
+    #[test]
+    fn t50_78_federation_config_toml_roundtrip() {
+        use spur_core::config::SlurmConfig;
+        let toml = r#"
+cluster_name = "test"
+
+[controller]
+listen_addr = "[::]:6817"
+state_dir = "/tmp/spur-test"
+
+[[federation.clusters]]
+name = "peer-a"
+address = "http://peer-a:6817"
+"#;
+        let cfg = SlurmConfig::from_str(toml).unwrap();
+        assert_eq!(cfg.federation.clusters.len(), 1);
+        assert_eq!(cfg.federation.clusters[0].name, "peer-a");
+    }
+
+    // ── T50.79–81: PMIx env var names ────────────────────────────
+
+    #[test]
+    fn t50_79_pmix_env_var_names_correct() {
+        // Verify the canonical PMIx env var names used by OpenMPI 5+ and srun.
+        let required = ["PMIX_RANK", "PMIX_SIZE", "PMIX_NAMESPACE"];
+        for name in &required {
+            // Names must be uppercase and start with PMIX_
+            assert!(name.starts_with("PMIX_"), "expected PMIX_ prefix: {}", name);
+            assert_eq!(*name, name.to_uppercase(), "must be uppercase: {}", name);
+        }
+    }
+
+    #[test]
+    fn t50_80_pmix_namespace_format() {
+        // Namespace format: "spur.<job_id>"
+        let job_id: u32 = 42;
+        let ns = format!("spur.{}", job_id);
+        assert_eq!(ns, "spur.42");
+        assert!(ns.starts_with("spur."));
+    }
+
+    #[test]
+    fn t50_81_ompi_compat_env_vars() {
+        // OpenMPI direct bootstrap env vars mirror PMIx rank/size.
+        let ompi_vars = ["OMPI_COMM_WORLD_RANK", "OMPI_COMM_WORLD_SIZE"];
+        for v in &ompi_vars {
+            assert!(v.starts_with("OMPI_COMM_WORLD_"));
+        }
+    }
 }

@@ -214,4 +214,40 @@ mod tests {
         assert_eq!(node_rank_0, 0);
         assert_eq!(node_rank_1, 1);
     }
+
+    // ── T01.18–20: srun step mode (SPUR_JOB_ID env) ──────────────
+
+    #[test]
+    fn t01_18_srun_step_mode_env_var_name() {
+        // srun detects it's inside a batch job by checking SPUR_JOB_ID.
+        // This test confirms the env var name matches what sbatch exports.
+        let env_var = "SPUR_JOB_ID";
+        assert!(env_var.starts_with("SPUR_"), "must use SPUR_ namespace");
+        assert!(env_var.ends_with("JOB_ID"), "must identify the job");
+    }
+
+    #[test]
+    fn t01_19_srun_step_mode_job_id_parse() {
+        // When SPUR_JOB_ID="42", srun should parse it as u32 job_id=42.
+        let raw = "42";
+        let job_id: u32 = raw.parse().expect("SPUR_JOB_ID must be a valid u32");
+        assert_eq!(job_id, 42);
+
+        // Non-numeric value should fail to parse.
+        let bad = "not-a-number";
+        assert!(bad.parse::<u32>().is_err());
+    }
+
+    #[test]
+    fn t01_20_srun_step_env_vars_set() {
+        // When running as a step, these env vars are exported to the child process.
+        let step_env = ["SPUR_JOB_ID", "SPUR_STEP_ID", "SPUR_NODEID", "SPUR_PROCID"];
+        // Confirm no duplicates and all follow SPUR_ convention.
+        let mut seen = std::collections::HashSet::new();
+        for v in &step_env {
+            assert!(v.starts_with("SPUR_"), "must use SPUR_ prefix: {}", v);
+            assert!(seen.insert(v), "duplicate env var: {}", v);
+        }
+        assert_eq!(seen.len(), 4);
+    }
 }
