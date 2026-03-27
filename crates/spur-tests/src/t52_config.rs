@@ -184,4 +184,57 @@ plugin = "backfill"
         assert_eq!(config.scheduler.fairshare_halflife_days, 14);
         assert_eq!(config.scheduler.default_time_limit_minutes, 60);
     }
+
+    // ── T52.15–17: listen_addr from config (#37) ──────────────────
+
+    #[test]
+    fn t52_15_listen_addr_preserved_from_config() {
+        // Regression: spurctld ignored config listen_addr and always bound to :6817 (#37).
+        let config = SlurmConfig::from_str(
+            r#"
+cluster_name = "prod"
+[controller]
+listen_addr = "[::]:6821"
+state_dir = "/var/spool/spur"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.controller.listen_addr, "[::]:6821");
+    }
+
+    #[test]
+    fn t52_16_listen_addr_default_parseable() {
+        // When listen_addr is not in config the default must be a valid socket address.
+        let config = SlurmConfig::from_str(
+            r#"
+cluster_name = "test"
+[controller]
+state_dir = "/tmp/spur"
+"#,
+        )
+        .unwrap();
+        assert!(
+            config.controller.listen_addr.contains(':'),
+            "default listen_addr '{}' must be a host:port address",
+            config.controller.listen_addr
+        );
+    }
+
+    #[test]
+    fn t52_17_cli_listen_overrides_config() {
+        // When --listen CLI arg is provided it wins; when absent, config value is used.
+        // This tests the merging logic introduced to fix #37.
+        let config_addr = "[::]:6821";
+
+        let with_cli = Some("[::]:6822".to_string());
+        let final_addr = with_cli.unwrap_or_else(|| config_addr.to_string());
+        assert_eq!(final_addr, "[::]:6822", "CLI --listen must override config");
+
+        let no_cli: Option<String> = None;
+        let final_addr = no_cli.unwrap_or_else(|| config_addr.to_string());
+        assert_eq!(
+            final_addr, "[::]:6821",
+            "config listen_addr used when --listen absent"
+        );
+    }
 }

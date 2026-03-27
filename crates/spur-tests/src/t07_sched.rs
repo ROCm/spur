@@ -533,4 +533,92 @@ mod tests {
         assert!(cfg_on.suspend_command.is_some());
         assert!(cfg_on.resume_command.is_some());
     }
+
+    // ── T07.24–26: Reservation enforcement (#27) ──────────────────
+
+    #[test]
+    fn t07_24_unreserved_job_skips_reserved_nodes() {
+        // Regression: reserved nodes were allocated to non-reservation jobs (#27).
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(2, 64, 256_000);
+        let partitions = vec![make_partition("default", 2)];
+
+        // node001 is reserved for reservation "res-alice"; node002 is free.
+        let now = Utc::now();
+        let res = spur_core::reservation::Reservation {
+            name: "res-alice".into(),
+            start_time: now - Duration::minutes(10),
+            end_time: now + Duration::hours(2),
+            nodes: vec!["node001".into()],
+            users: vec!["alice".into()],
+            accounts: Vec::new(),
+        };
+
+        // A job with no reservation spec should NOT land on node001.
+        let job = make_job_with_resources("regular-job", 1, 1, 1, Some(60));
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[res],
+        };
+        let assignments = sched.schedule(&[job], &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(
+            assignments[0].nodes[0], "node002",
+            "unreserved job must not land on reserved node001"
+        );
+    }
+
+    #[test]
+    fn t07_25_reserved_job_lands_on_reserved_node() {
+        // A job that targets a reservation should be placed on reserved nodes.
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(2, 64, 256_000);
+        let partitions = vec![make_partition("default", 2)];
+
+        let now = Utc::now();
+        let res = spur_core::reservation::Reservation {
+            name: "res-bob".into(),
+            start_time: now - Duration::minutes(10),
+            end_time: now + Duration::hours(2),
+            nodes: vec!["node001".into()],
+            users: vec!["bob".into()],
+            accounts: Vec::new(),
+        };
+
+        let mut job = make_job_with_resources("reserved-job", 1, 1, 1, Some(60));
+        job.spec.reservation = Some("res-bob".into());
+        job.spec.user = "bob".into();
+
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[res],
+        };
+        let assignments = sched.schedule(&[job], &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(
+            assignments[0].nodes[0], "node001",
+            "job targeting reservation must land on reserved node001"
+        );
+    }
+
+    #[test]
+    fn t07_26_no_reservations_all_nodes_available() {
+        // Without any reservations all nodes are schedulable (baseline sanity).
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(4, 64, 256_000);
+        let partitions = vec![make_partition("default", 4)];
+        let job = make_job_with_resources("free-job", 1, 1, 1, Some(60));
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+        };
+        let assignments = sched.schedule(&[job], &cluster);
+        assert_eq!(assignments.len(), 1);
+    }
 }

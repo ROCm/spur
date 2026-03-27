@@ -819,6 +819,49 @@ mod tests {
         assert!(msg.contains("spur image import"));
     }
 
+    #[test]
+    fn test_resolve_image_error_includes_directory() {
+        // Regression: error message now shows which directory was searched (#35).
+        // Makes it obvious when CLI and agent use different directories.
+        let err = resolve_image("missing-image").unwrap_err();
+        let msg = err.to_string();
+        // Error must tell user where we looked.
+        assert!(
+            msg.contains('/'),
+            "error must include the directory searched, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_image_dir_default_without_env() {
+        // Regression: agent used hardcoded /var/spool/spur/images ignoring env (#35 #23).
+        // Without SPUR_IMAGE_DIR the function must return the system default.
+        // We unset the env var for this test to isolate behavior.
+        std::env::remove_var("SPUR_IMAGE_DIR");
+        let dir = image_dir();
+        assert!(
+            dir.to_str().unwrap().contains("spur"),
+            "default image_dir must be under a spur path, got: {}",
+            dir.display()
+        );
+    }
+
+    #[test]
+    fn test_image_dir_respects_spur_image_dir_env() {
+        // Regression: CLI used SPUR_IMAGE_DIR but agent did not (#35 #23).
+        // Both must use the same env var so images imported by non-root users
+        // (to e.g. ~/.spur/images) are found by the agent.
+        std::env::set_var("SPUR_IMAGE_DIR", "/custom/image/store");
+        let dir = image_dir();
+        std::env::remove_var("SPUR_IMAGE_DIR");
+        assert_eq!(
+            dir,
+            std::path::PathBuf::from("/custom/image/store"),
+            "SPUR_IMAGE_DIR env var must override the default image directory"
+        );
+    }
+
     // --- GPU mounts ---
 
     #[test]
