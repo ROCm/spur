@@ -106,7 +106,17 @@ impl ClusterManager {
     }
 
     /// Submit a new job. If it has an array spec, expand into individual tasks.
-    pub fn submit_job(&self, spec: JobSpec) -> anyhow::Result<JobId> {
+    pub fn submit_job(&self, mut spec: JobSpec) -> anyhow::Result<JobId> {
+        // If no partition specified, assign the default partition.
+        if spec.partition.is_none() {
+            let partitions = self.partitions.read();
+            if let Some(default_part) = partitions.iter().find(|p| p.is_default) {
+                spec.partition = Some(default_part.name.clone());
+            } else if let Some(first) = partitions.first() {
+                spec.partition = Some(first.name.clone());
+            }
+        }
+
         // Validate partition constraints before accepting the job
         self.validate_partition(&spec)?;
 
@@ -1183,6 +1193,85 @@ impl ClusterManager {
     /// Get all reservations.
     pub fn get_reservations(&self) -> Vec<Reservation> {
         self.reservations.read().clone()
+    }
+
+    /// Update pending_reason for jobs the scheduler couldn't schedule.
+    ///
+    /// Called after each scheduling cycle so that `squeue` shows a meaningful
+    /// reason instead of always displaying "Priority".
+    ///
+    /// - `Resources`: no suitable node exists for the job right now
+    ///   (partition mismatch, full, constraint not met, etc.)
+    /// - `Priority`: suitable nodes exist but they're reserved for
+    ///   higher-priority jobs (backfill timeline is in the future)
+    /// - `NodeDown`: all nodes in the target partition are down/drained
+    pub fn update_pending_reasons(
+        &self,
+        unscheduled: &[&spur_core::job::Job],
+        cluster_state: &spur_sched::traits::ClusterState,
+    ) {
+        use spur_core::job::PendingReason;
+        use spur_sched::backfill::BackfillScheduler;
+        use spur_sched::traits::Scheduler;
+
+        let mut jobs = self.jobs.write();
+
+        for job in unscheduled {
+            let job_entry = match jobs.get_mut(&job.job_id) {
+                Some(j) => j,
+                None => continue,
+            };
+
+            // Don't overwrite held jobs
+            if job_entry.pending_reason == PendingReason::Held {
+                continue;
+            }
+
+            // Determine the correct reason
+            let partition_name = job.spec.partition.as_deref();
+
+            // Check if any node is schedulable in the target partition
+            let nodes_in_partition: Vec<&spur_core::node::Node> = cluster_state
+                .nodes
+                .iter()
+                .filter(|n| {
+                    if let Some(pname) = partition_name {
+                        n.partitions.iter().any(|p| p == pname)
+                    } else {
+                        true
+                    }
+                })
+                .collect();
+
+            if nodes_in_partition.is_empty() {
+                // No nodes in partition at all
+                job_entry.pending_reason = PendingReason::Resources;
+                continue;
+            }
+
+            let all_down = nodes_in_partition.iter().all(|n| !n.state.is_available());
+
+            if all_down {
+                job_entry.pending_reason = PendingReason::NodeDown;
+                continue;
+            }
+
+            // Nodes exist but may be fully allocated — check if any idle node
+            // can satisfy resource requirements
+            let required = spur_sched::backfill::job_resource_request(job);
+            let has_capable_node = nodes_in_partition
+                .iter()
+                .any(|n| n.is_schedulable() && n.total_resources.can_satisfy(&required));
+
+            if !has_capable_node {
+                // Resources insufficient on all nodes
+                job_entry.pending_reason = PendingReason::Resources;
+            } else {
+                // Capable nodes exist but currently occupied — backfill will
+                // schedule this job once they free up (or higher-priority jobs run)
+                job_entry.pending_reason = PendingReason::Priority;
+            }
+        }
     }
 
     /// Send a job event notification via webhook (if configured).

@@ -74,6 +74,11 @@ pub async fn run(cluster: Arc<ClusterManager>) {
                 .collect();
 
             if !unscheduled.is_empty() {
+                // Update pending_reason for unscheduled jobs to reflect actual cause.
+                // This helps users distinguish "waiting for higher-priority jobs" vs
+                // "no suitable nodes at all".
+                cluster.update_pending_reasons(&unscheduled, &cluster_state);
+
                 try_preempt(&cluster, &unscheduled);
 
                 // Federation: forward still-unschedulable jobs to peer clusters.

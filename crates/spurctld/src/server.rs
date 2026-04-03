@@ -432,6 +432,68 @@ impl SlurmController for ControllerService {
             reservations: infos,
         }))
     }
+
+    /// Proxy ExecInJob to the agent running the job.
+    ///
+    /// The CLI connects to the controller; the controller looks up which node
+    /// is running the job and forwards the request to that node's agent.
+    async fn exec_in_job(
+        &self,
+        request: Request<ExecInJobRequest>,
+    ) -> Result<Response<ExecInJobResponse>, Status> {
+        use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
+
+        let req = request.into_inner();
+        let job_id = req.job_id;
+
+        // Find the running job
+        let job = self
+            .cluster
+            .get_job(job_id)
+            .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
+
+        if job.state != spur_core::job::JobState::Running {
+            return Err(Status::failed_precondition(format!(
+                "job {} is not running (state: {})",
+                job_id, job.state
+            )));
+        }
+
+        // Get the first allocated node (batch host)
+        let node_name = job
+            .allocated_nodes
+            .first()
+            .ok_or_else(|| Status::internal(format!("job {} has no allocated nodes", job_id)))?
+            .clone();
+
+        // Look up agent address
+        let node = self
+            .cluster
+            .get_node(&node_name)
+            .ok_or_else(|| Status::not_found(format!("node {} not found", node_name)))?;
+        let addr = node
+            .address
+            .as_ref()
+            .ok_or_else(|| Status::internal(format!("node {} has no agent address", node_name)))?;
+        let agent_addr = format!("http://{}:{}", addr, node.port);
+
+        // Forward to agent
+        let mut agent = SlurmAgentClient::connect(agent_addr.clone())
+            .await
+            .map_err(|e| {
+                Status::unavailable(format!("cannot reach agent at {}: {}", agent_addr, e))
+            })?;
+
+        let resp = agent
+            .exec_in_job(ExecInJobRequest {
+                job_id,
+                command: req.command,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("exec failed: {}", e)))?;
+
+        Ok(resp)
+    }
 }
 
 pub async fn serve(addr: SocketAddr, cluster: Arc<ClusterManager>) -> anyhow::Result<()> {

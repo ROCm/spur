@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
+use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::ExecInJobRequest;
 
 /// Execute a command inside a running containerized job.
@@ -15,9 +15,13 @@ pub struct ExecArgs {
     /// Job ID
     pub job_id: u32,
 
-    /// Agent address (host:port of the node running the job)
-    #[arg(long, env = "SPUR_AGENT_ADDR", default_value = "http://localhost:6818")]
-    pub agent: String,
+    /// Controller address (the controller proxies exec to the correct compute node)
+    #[arg(
+        long,
+        env = "SPUR_CONTROLLER_ADDR",
+        default_value = "http://localhost:6817"
+    )]
+    pub controller: String,
 
     /// Command to execute
     #[arg(trailing_var_arg = true, required = true)]
@@ -31,9 +35,9 @@ pub async fn main() -> Result<()> {
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = ExecArgs::try_parse_from(&args)?;
 
-    let mut client = SlurmAgentClient::connect(args.agent.clone())
+    let mut client = SlurmControllerClient::connect(args.controller.clone())
         .await
-        .context("failed to connect to agent")?;
+        .context("failed to connect to controller")?;
 
     let resp = client
         .exec_in_job(ExecInJobRequest {

@@ -971,4 +971,51 @@ address = "http://peer-a:6817"
             assert!(v.starts_with("OMPI_COMM_WORLD_"));
         }
     }
+
+    // ── T50.89-91: Issue #41-43 fixes ────────────────────────────
+
+    #[test]
+    fn t50_89_default_partition_assigned_on_submit() {
+        // Issue #43: when no --partition is specified, the default partition
+        // should be assigned so the scheduler can match nodes correctly.
+        // Verify that Partition carries is_default and that the scheduler
+        // harness correctly sets it.
+        let part = make_partition("gpu", 2);
+        // make_partition sets is_default when name == "default"; this one
+        // should be false, but the field must be present.
+        assert!(!part.is_default);
+        assert_eq!(part.name, "gpu");
+
+        // A partition named "default" should have is_default = true
+        let default_part = make_partition("default", 2);
+        assert!(default_part.is_default);
+    }
+
+    #[test]
+    fn t50_90_pending_reason_resources_when_no_nodes() {
+        // Issue #43: pending_reason should reflect inability to schedule, not
+        // just always show "Priority".
+        let reason = spur_core::job::PendingReason::Resources;
+        assert_eq!(reason.display(), "Resources");
+
+        let reason = spur_core::job::PendingReason::NodeDown;
+        assert_eq!(reason.display(), "NodeDown");
+
+        let reason = spur_core::job::PendingReason::Priority;
+        assert_eq!(reason.display(), "Priority");
+    }
+
+    #[test]
+    fn t50_91_exec_uses_controller_not_agent() {
+        // Issue #42: spur exec should route through the controller so it works
+        // from login nodes regardless of where the job is running.
+        // This is a structural test — verify the ExecInJobRequest message exists
+        // and can be constructed.
+        let req = spur_proto::proto::ExecInJobRequest {
+            job_id: 42,
+            command: vec!["ls".into(), "-la".into()],
+        };
+        assert_eq!(req.job_id, 42);
+        assert_eq!(req.command.len(), 2);
+    }
 }

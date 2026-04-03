@@ -252,6 +252,9 @@ service SlurmController {
   rpc UpdateReservation(UpdateReservationRequest) returns (google.protobuf.Empty);
   rpc DeleteReservation(DeleteReservationRequest) returns (google.protobuf.Empty);
   rpc ListReservations(ListReservationsRequest) returns (ListReservationsResponse);
+
+  // Exec a command inside a running job's container (proxies to correct agent)
+  rpc ExecInJob(ExecInJobRequest) returns (ExecInJobResponse);
 }
 
 // -- Agent service (slurmd) --

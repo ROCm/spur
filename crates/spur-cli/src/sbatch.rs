@@ -380,6 +380,57 @@ fn parse_memory_mb(s: &str) -> Result<u64> {
     }
 }
 
+/// Resolve a container image name to an absolute squashfs path if possible.
+///
+/// When an image is imported via `spur image import`, it is stored in the
+/// local image directory (e.g., `/var/spool/spur/images` or `~/.spur/images`).
+/// By resolving to an absolute path at submit time, compute node agents can
+/// find the image directly — this works when the login node and compute nodes
+/// share a filesystem (NFS, Lustre, etc.).
+///
+/// If the image is already an absolute path, or if the local `.sqsh` file
+/// cannot be found, the original value is returned unchanged so the agent
+/// can attempt its own resolution.
+fn resolve_container_image(image: Option<&str>) -> String {
+    let image = match image {
+        Some(s) if !s.is_empty() => s,
+        _ => return String::new(),
+    };
+
+    // If already an absolute path, keep as-is
+    if image.starts_with('/') {
+        return image.to_string();
+    }
+
+    // Try to find the .sqsh file in the image directory
+    let sanitized = spur_net::oci::sanitize_name(image);
+
+    // Check $SPUR_IMAGE_DIR first, then system default, then user fallback
+    let candidates = {
+        let mut dirs = Vec::new();
+        if let Ok(dir) = std::env::var("SPUR_IMAGE_DIR") {
+            if !dir.is_empty() {
+                dirs.push(std::path::PathBuf::from(dir));
+            }
+        }
+        dirs.push(std::path::PathBuf::from("/var/spool/spur/images"));
+        if let Some(home) = std::env::var_os("HOME") {
+            dirs.push(std::path::PathBuf::from(home).join(".spur/images"));
+        }
+        dirs
+    };
+
+    for dir in candidates {
+        let path = dir.join(format!("{}.sqsh", sanitized));
+        if path.exists() {
+            return path.to_string_lossy().into_owned();
+        }
+    }
+
+    // Not found locally — return original name so agent can try its own lookup
+    image.to_string()
+}
+
 pub async fn main() -> Result<()> {
     main_with_args(std::env::args().collect()).await
 }
@@ -522,7 +573,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         hold: args.hold,
         comment: args.comment.unwrap_or_default(),
         wckey: String::new(),
-        container_image: args.container_image.unwrap_or_default(),
+        container_image: resolve_container_image(args.container_image.as_deref()),
         container_mounts: args.container_mounts,
         container_workdir: args.container_workdir.unwrap_or_default(),
         container_name: args.container_name.unwrap_or_default(),
