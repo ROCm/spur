@@ -23,7 +23,48 @@ mod strigger;
 
 use std::path::Path;
 
+/// If SPUR_CONTROLLER_ADDR is not already set, try to read the controller
+/// address from the config file so that all subcommands pick it up
+/// automatically via their `env = "SPUR_CONTROLLER_ADDR"` clap annotation.
+///
+/// Priority: --controller CLI arg > SPUR_CONTROLLER_ADDR env > config file > default
+fn load_controller_addr_from_config() {
+    if std::env::var("SPUR_CONTROLLER_ADDR").is_ok() {
+        return; // User already set it explicitly
+    }
+
+    // Check SPUR_CONF for custom config path, then /etc/spur/spur.conf
+    let config_path = std::env::var("SPUR_CONF")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/etc/spur/spur.conf"));
+
+    if !config_path.exists() {
+        return;
+    }
+
+    if let Ok(config) = spur_core::config::SlurmConfig::load(&config_path) {
+        // Extract host and port from the config
+        let host = config
+            .controller
+            .hosts
+            .first()
+            .map(|h| h.as_str())
+            .unwrap_or("localhost");
+        let port = config
+            .controller
+            .listen_addr
+            .rsplit(':')
+            .next()
+            .unwrap_or("6817");
+        let addr = format!("http://{}:{}", host, port);
+        std::env::set_var("SPUR_CONTROLLER_ADDR", &addr);
+    }
+}
+
 fn main() -> anyhow::Result<()> {
+    // Load controller address from config file (if not set via env var)
+    load_controller_addr_from_config();
+
     // Multi-call binary: dispatch based on argv[0] (symlink name).
     let argv0 = std::env::args().next().unwrap_or_else(|| "spur".into());
     let bin_name = Path::new(&argv0)

@@ -69,23 +69,46 @@ pub struct ContainerConfig {
 /// - Image name (looked up in image_dir())
 /// - docker:// URI (must be pre-imported with `spur image import`)
 pub fn resolve_image(image: &str) -> anyhow::Result<PathBuf> {
-    // Absolute path to squashfs
     let path = Path::new(image);
-    if path.is_absolute() && path.exists() {
-        return Ok(path.to_path_buf());
+
+    // Absolute path: use directly if it exists
+    if path.is_absolute() {
+        if path.exists() {
+            return Ok(path.to_path_buf());
+        }
+        // Path was resolved on the login node (sbatch) but doesn't exist
+        // locally — try the basename in our local image directory. This
+        // handles the case where login node and compute node use separate
+        // (non-shared) image directories.
+        if let Some(filename) = path.file_name() {
+            let local = image_dir().join(filename);
+            if local.exists() {
+                return Ok(local);
+            }
+        }
     }
 
-    // Check image dir (respects SPUR_IMAGE_DIR env var)
+    // Check image dir with sanitized name (respects SPUR_IMAGE_DIR env var)
     let dir = image_dir();
-    let image_path = dir.join(format!("{}.sqsh", sanitize_name(image)));
+    let sanitized = sanitize_name(image);
+    let image_path = dir.join(format!("{}.sqsh", sanitized));
     if image_path.exists() {
         return Ok(image_path);
     }
 
     // Try without .sqsh extension
-    let image_path = dir.join(sanitize_name(image));
+    let image_path = dir.join(&sanitized);
     if image_path.exists() {
         return Ok(image_path);
+    }
+
+    // Also check ~/.spur/images (matching CLI's resolve_image_dir behavior)
+    if let Some(home) = std::env::var_os("HOME") {
+        let home_dir = PathBuf::from(home).join(".spur/images");
+        let image_path = home_dir.join(format!("{}.sqsh", sanitized));
+        if image_path.exists() {
+            return Ok(image_path);
+        }
     }
 
     bail!(

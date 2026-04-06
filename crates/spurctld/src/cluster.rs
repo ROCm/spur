@@ -688,13 +688,24 @@ impl ClusterManager {
         node.agent_start_time = Some(Utc::now());
         node.last_heartbeat = Some(Utc::now());
 
-        // Assign to partitions based on config
+        // Assign to partitions based on config hostlist patterns
         let partitions = self.partitions.read();
         for part in partitions.iter() {
             if let Ok(hosts) = spur_core::hostlist::expand(&part.nodes) {
                 if hosts.contains(&effective_name) {
                     node.partitions.push(part.name.clone());
                 }
+            }
+        }
+
+        // If node didn't match any partition's hostlist, auto-assign to the
+        // default partition so dynamically-registered nodes are always
+        // schedulable. This matches Slurm's behavior for unconfigured nodes.
+        if node.partitions.is_empty() {
+            if let Some(default_part) = partitions.iter().find(|p| p.is_default) {
+                node.partitions.push(default_part.name.clone());
+            } else if let Some(first) = partitions.first() {
+                node.partitions.push(first.name.clone());
             }
         }
 

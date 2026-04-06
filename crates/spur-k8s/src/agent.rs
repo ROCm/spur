@@ -30,6 +30,7 @@ impl VirtualAgent {
 impl SlurmAgent for VirtualAgent {
     type StreamJobOutputStream =
         tokio_stream::wrappers::ReceiverStream<Result<StreamJobOutputChunk, Status>>;
+    type AttachJobStream = tokio_stream::wrappers::ReceiverStream<Result<AttachJobOutput, Status>>;
 
     async fn launch_job(
         &self,
@@ -388,6 +389,15 @@ impl SlurmAgent for VirtualAgent {
     ) -> Result<Response<Self::StreamJobOutputStream>, Status> {
         Err(Status::unimplemented(
             "output streaming not supported for K8s agent",
+        ))
+    }
+
+    async fn attach_job(
+        &self,
+        _request: Request<tonic::Streaming<AttachJobInput>>,
+    ) -> Result<Response<Self::AttachJobStream>, Status> {
+        Err(Status::unimplemented(
+            "interactive attach not supported for K8s agent",
         ))
     }
 }

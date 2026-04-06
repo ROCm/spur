@@ -265,6 +265,8 @@ service SlurmAgent {
   rpc GetNodeResources(google.protobuf.Empty) returns (NodeResourcesResponse);
   rpc ExecInJob(ExecInJobRequest) returns (ExecInJobResponse);
   rpc StreamJobOutput(StreamJobOutputRequest) returns (stream StreamJobOutputChunk);
+  // Interactive attach: bidirectional streaming for stdin/stdout forwarding
+  rpc AttachJob(stream AttachJobInput) returns (stream AttachJobOutput);
 }
 
 // -- Accounting service (slurmdbd) --
@@ -450,6 +452,16 @@ message StreamJobOutputRequest {
 
 message StreamJobOutputChunk {
   bytes data = 1;
+  bool eof = 2;
+}
+
+message AttachJobInput {
+  uint32 job_id = 1;   // set on first message; ignored after
+  bytes data = 2;       // stdin data to forward to the job
+}
+
+message AttachJobOutput {
+  bytes data = 1;       // stdout+stderr from the job
   bool eof = 2;
 }
 

@@ -244,6 +244,7 @@ async fn report_completion(controller_addr: &str, job_id: u32, exit_code: i32) {
 #[tonic::async_trait]
 impl SlurmAgent for AgentService {
     type StreamJobOutputStream = ReceiverStream<Result<StreamJobOutputChunk, Status>>;
+    type AttachJobStream = ReceiverStream<Result<AttachJobOutput, Status>>;
 
     async fn launch_job(
         &self,
@@ -828,6 +829,212 @@ impl SlurmAgent for AgentService {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn attach_job(
+        &self,
+        request: Request<tonic::Streaming<AttachJobInput>>,
+    ) -> Result<Response<Self::AttachJobStream>, Status> {
+        let mut in_stream = request.into_inner();
+
+        // Read the first message to get the job_id
+        let first_msg = in_stream
+            .message()
+            .await
+            .map_err(|e| Status::internal(format!("failed to read first message: {}", e)))?
+            .ok_or_else(|| {
+                Status::invalid_argument("empty stream — expected job_id in first message")
+            })?;
+
+        let job_id = first_msg.job_id;
+
+        // Check the job is running and get its PID for namespace entry
+        let (pid, env_vars) = {
+            let jobs = self.running.lock().await;
+            match jobs.get(&job_id) {
+                Some(tracked) => {
+                    let pid = tracked.pid.ok_or_else(|| {
+                        Status::failed_precondition(format!("job {} has no PID", job_id))
+                    })?;
+                    // Read a few env vars from /proc to replicate the job's environment
+                    let env = Self::read_proc_env(pid);
+                    (pid, env)
+                }
+                None => {
+                    return Err(Status::not_found(format!(
+                        "job {} not running on this node",
+                        job_id
+                    )));
+                }
+            }
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<AttachJobOutput, Status>>(32);
+
+        tokio::spawn(async move {
+            // Spawn an interactive shell inside the job's cgroup/namespace
+            use std::process::Stdio;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::process::Command;
+
+            // Use nsenter to enter the job process's namespaces if possible,
+            // otherwise just spawn a shell with the same environment.
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-i")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            // Set the job's environment variables
+            for (k, v) in &env_vars {
+                cmd.env(k, v);
+            }
+            cmd.env("SPUR_JOB_ID", job_id.to_string());
+
+            // Try nsenter for namespace isolation (if running as root)
+            let mut child = if nix::unistd::geteuid().is_root() {
+                let mut ns_cmd = Command::new("nsenter");
+                ns_cmd
+                    .args(["-t", &pid.to_string(), "--mount", "--pid", "--"])
+                    .args(["/bin/sh", "-i"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                for (k, v) in &env_vars {
+                    ns_cmd.env(k, v);
+                }
+                ns_cmd.env("SPUR_JOB_ID", job_id.to_string());
+                match ns_cmd.spawn() {
+                    Ok(c) => c,
+                    Err(_) => match cmd.spawn() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(Status::internal(format!(
+                                    "failed to spawn shell: {}",
+                                    e
+                                ))))
+                                .await;
+                            return;
+                        }
+                    },
+                }
+            } else {
+                match cmd.spawn() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Status::internal(format!(
+                                "failed to spawn shell: {}",
+                                e
+                            ))))
+                            .await;
+                        return;
+                    }
+                }
+            };
+
+            let mut child_stdin = child.stdin.take().unwrap();
+            let mut child_stdout = child.stdout.take().unwrap();
+            let mut child_stderr = child.stderr.take().unwrap();
+
+            // Forward initial data from first message (if any)
+            if !first_msg.data.is_empty() {
+                let _ = child_stdin.write_all(&first_msg.data).await;
+            }
+
+            let tx_clone = tx.clone();
+
+            // Task: read from client stream → child stdin
+            let stdin_task = tokio::spawn(async move {
+                while let Ok(Some(msg)) = in_stream.message().await {
+                    if !msg.data.is_empty() {
+                        if child_stdin.write_all(&msg.data).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                drop(child_stdin); // EOF to child
+            });
+
+            // Task: read child stderr → merge into output
+            let tx_stderr = tx.clone();
+            let stderr_task = tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    match child_stderr.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if tx_stderr
+                                .send(Ok(AttachJobOutput {
+                                    data: buf[..n].to_vec(),
+                                    eof: false,
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            // Main: read child stdout → output stream
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match child_stdout.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx_clone
+                            .send(Ok(AttachJobOutput {
+                                data: buf[..n].to_vec(),
+                                eof: false,
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            // Wait for child to exit
+            let _ = child.wait().await;
+            stdin_task.abort();
+            stderr_task.abort();
+
+            // Send EOF
+            let _ = tx_clone
+                .send(Ok(AttachJobOutput {
+                    data: Vec::new(),
+                    eof: true,
+                }))
+                .await;
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+impl AgentService {
+    /// Read environment variables from a running process via /proc.
+    fn read_proc_env(pid: u32) -> Vec<(String, String)> {
+        let path = format!("/proc/{}/environ", pid);
+        match std::fs::read(&path) {
+            Ok(data) => data
+                .split(|&b| b == 0)
+                .filter_map(|entry| {
+                    let s = std::str::from_utf8(entry).ok()?;
+                    let (k, v) = s.split_once('=')?;
+                    Some((k.to_string(), v.to_string()))
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
     }
 }
 

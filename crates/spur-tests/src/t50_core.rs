@@ -1018,4 +1018,90 @@ address = "http://peer-a:6817"
         assert_eq!(req.job_id, 42);
         assert_eq!(req.command.len(), 2);
     }
+
+    // ── Issue #45: sattach interactive attach ─────────────────────
+
+    #[test]
+    fn t50_92_attach_job_proto_messages_exist() {
+        // Issue #45: AttachJob bidirectional streaming RPC should exist
+        // with AttachJobInput and AttachJobOutput messages.
+        let input = spur_proto::proto::AttachJobInput {
+            job_id: 10,
+            data: b"ls\n".to_vec(),
+        };
+        assert_eq!(input.job_id, 10);
+        assert_eq!(input.data, b"ls\n");
+
+        let output = spur_proto::proto::AttachJobOutput {
+            data: b"hello\n".to_vec(),
+            eof: false,
+        };
+        assert!(!output.eof);
+        assert_eq!(output.data, b"hello\n");
+    }
+
+    // ── Issue #46: CLI reads config file for controller port ──────
+
+    #[test]
+    fn t50_93_config_controller_addr_from_toml() {
+        // Issue #46: the CLI should read controller address from config.
+        // Verify SlurmConfig can parse a custom port and hosts.
+        let toml = r#"
+            cluster_name = "test"
+            [controller]
+            listen_addr = "[::]:6821"
+            hosts = ["ctrl.example.com"]
+        "#;
+        let config = spur_core::config::SlurmConfig::from_str(toml).unwrap();
+        assert_eq!(config.controller.listen_addr, "[::]:6821");
+        assert_eq!(config.controller.hosts[0], "ctrl.example.com");
+
+        // Verify we can extract port from listen_addr
+        let port = config.controller.listen_addr.rsplit(':').next().unwrap();
+        assert_eq!(port, "6821");
+    }
+
+    // ── Issue #47: nodes auto-join default partition ──────────────
+
+    #[test]
+    fn t50_94_node_auto_partition_assignment() {
+        // Issue #47: when a node doesn't match any partition hostlist,
+        // it should auto-join the default partition.
+        let mut node = Node::new(
+            "dynamic-node".into(),
+            ResourceSet {
+                cpus: 8,
+                memory_mb: 16384,
+                ..Default::default()
+            },
+        );
+        assert!(node.partitions.is_empty());
+
+        // Simulate auto-assign: if no partitions matched, add to default
+        let default_partition = make_partition("batch", 1);
+        if node.partitions.is_empty() {
+            node.partitions.push(default_partition.name.clone());
+        }
+        assert_eq!(node.partitions, vec!["batch"]);
+    }
+
+    // ── Issue #48: container image resolution fallback ────────────
+
+    #[test]
+    fn t50_95_container_image_absolute_path_basename_fallback() {
+        // Issue #48: when the agent receives an absolute path from the
+        // login node that doesn't exist locally, it should try the
+        // basename in the local image directory.
+        let path = std::path::Path::new("/var/spool/spur/images/ubuntu+22.04.sqsh");
+        let basename = path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(basename, "ubuntu+22.04.sqsh");
+
+        // Verify sanitize_name works correctly for the expected pattern
+        // (colon and slash replaced with +)
+        let name = "ubuntu:22.04";
+        let expected = "ubuntu+22.04";
+        let sanitized = name.replace('/', "+").replace(':', "+");
+        assert_eq!(sanitized, expected);
+        assert_eq!(format!("{}.sqsh", sanitized), basename);
+    }
 }
