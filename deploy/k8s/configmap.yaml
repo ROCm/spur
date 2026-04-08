@@ -5,8 +5,7 @@ metadata:
   namespace: spur
 data:
   spur.conf: |
-    [cluster]
-    name = "spur-k8s"
+    cluster_name = "spur-k8s"
 
     [scheduler]
     interval_secs = 2
@@ -17,8 +16,10 @@ data:
     enabled = true
     address = "spurdbd.spur.svc.cluster.local:6819"
 
-    [partitions.default]
+    [[partitions]]
+    name = "default"
     state = "UP"
     default = true
+    nodes = "ALL"
     max_time = "7d"
     default_time = "1h"

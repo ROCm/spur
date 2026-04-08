@@ -58,11 +58,13 @@ spec:
         - name: config
           configMap:
             name: spur-config
-  volumeClaimTemplates:
-    - metadata:
-        name: spool
-      spec:
-        accessModes: [ReadWriteOnce]
-        resources:
-          requests:
-            storage: 10Gi
+        - name: spool
+          emptyDir: {}
+  # volumeClaimTemplates:
+  #   - metadata:
+  #       name: spool
+  #     spec:
+  #       accessModes: [ReadWriteOnce]
+  #       resources:
+  #         requests:
+  #           storage: 10Gi

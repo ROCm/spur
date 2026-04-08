@@ -33,7 +33,7 @@ spec:
           command: [spurrestd]
           args:
             - --listen=[::]:6820
-            - --controller=spurctld.spur.svc.cluster.local:6817
+            - --controller=http://spurctld.spur.svc.cluster.local:6817
           ports:
             - containerPort: 6820
               name: http

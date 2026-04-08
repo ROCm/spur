@@ -35,7 +35,6 @@ spec:
           image: spur:latest
           command: [spur-k8s-operator]
           args:
-            - run
             - --controller-addr=spurctld.spur.svc.cluster.local:6817
             - --listen=[::]:6818
             - --namespace=spur

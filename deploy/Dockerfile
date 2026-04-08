@@ -1,8 +1,13 @@
 # Multi-stage build: one image with all Spur binaries
-FROM rust:1.82 AS builder
+FROM rust:1.94.1 AS builder
 
 WORKDIR /build
 COPY . .
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    protobuf-compiler \
+    libprotobuf-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # Build all workspace binaries in release mode
 RUN cargo build --release \
