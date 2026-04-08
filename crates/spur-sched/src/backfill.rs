@@ -239,7 +239,7 @@ impl Scheduler for BackfillScheduler {
 
             let required = job_resource_request(job);
             let duration = job.spec.time_limit.unwrap_or(Duration::hours(1));
-            let needed_nodes = job.spec.num_nodes as usize;
+            let needed_nodes = (job.spec.num_nodes as usize).max(1);
 
             // Find earliest start across needed_nodes
             let mut node_starts: Vec<(usize, chrono::DateTime<Utc>)> = suitable

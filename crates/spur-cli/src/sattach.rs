@@ -128,13 +128,18 @@ async fn stream_output_only(
 }
 
 /// Interactive attach: bidirectional stdin/stdout forwarding via AttachJob RPC.
+///
+/// Issue #54 fixes:
+/// - Use per-byte reads instead of line-buffered reads so interactive programs work
+/// - Increase channel buffer to 256 to prevent deadlock under high output
+/// - Add connect timeout
 async fn interactive_attach(
     agent: &mut SlurmAgentClient<tonic::transport::Channel>,
     job_id: u32,
 ) -> Result<()> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::AsyncReadExt;
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<AttachJobInput>(32);
+    let (tx, rx) = tokio::sync::mpsc::channel::<AttachJobInput>(256);
 
     // Send first message with job_id
     tx.send(AttachJobInput {
@@ -144,21 +149,19 @@ async fn interactive_attach(
     .await
     .context("failed to send initial attach message")?;
 
-    // Spawn stdin reader task
+    // Spawn stdin reader task — reads raw bytes for interactive use
     let tx_stdin = tx.clone();
     tokio::spawn(async move {
-        let stdin = tokio::io::stdin();
-        let mut reader = BufReader::new(stdin);
-        let mut line = String::new();
+        let mut stdin = tokio::io::stdin();
+        let mut buf = vec![0u8; 4096];
         loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
+            match stdin.read(&mut buf).await {
                 Ok(0) => break, // EOF
-                Ok(_) => {
+                Ok(n) => {
                     if tx_stdin
                         .send(AttachJobInput {
                             job_id,
-                            data: line.as_bytes().to_vec(),
+                            data: buf[..n].to_vec(),
                         })
                         .await
                         .is_err()

@@ -29,6 +29,13 @@ struct Args {
     #[arg(long, default_value = "[::]:6818")]
     listen: String,
 
+    /// Advertised address for spurctld to reach this operator.
+    /// If unset, falls back to POD_IP env var, then hostname.
+    /// In K8s, set this to the Service DNS name or use the Downward API
+    /// to inject the Pod IP (issue #51).
+    #[arg(long, env = "SPUR_OPERATOR_ADDRESS")]
+    address: Option<String>,
+
     /// K8s namespace for SpurJobs and Pods
     #[arg(long, default_value = "spur")]
     namespace: String,
@@ -82,54 +89,66 @@ async fn main() -> anyhow::Result<()> {
     let client = Client::try_default().await?;
 
     let listen_addr: SocketAddr = args.listen.parse()?;
-    let operator_ip = if listen_addr.ip().is_unspecified() {
+    // Issue #51: Use explicit --address flag, then POD_IP env var (K8s Downward
+    // API), then listen IP, then hostname. Pod hostnames are unroutable —
+    // spurctld can't reach the operator at "spur-k8s-operator-abc123".
+    let operator_ip = if let Some(ref addr) = args.address {
+        addr.clone()
+    } else if let Ok(pod_ip) = std::env::var("POD_IP") {
+        pod_ip
+    } else if !listen_addr.ip().is_unspecified() {
+        listen_addr.ip().to_string()
+    } else {
         hostname::get()
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_else(|_| "127.0.0.1".into())
-    } else {
-        listen_addr.ip().to_string()
     };
     let operator_port = listen_addr.port() as u32;
+    info!(address = %operator_ip, port = operator_port, "operator will advertise this address to spurctld");
 
-    // Spawn health/readiness server
+    // Spawn health/readiness server (issue #52: retry on failure)
     let health_addr: SocketAddr = args.health_addr.parse()?;
     let health_ctrl_addr = args.controller_addr.clone();
     let health_client = client.clone();
     tokio::spawn(async move {
-        if let Err(e) = health::serve(health_addr, health_client, health_ctrl_addr).await {
-            tracing::error!(error = %e, "health server exited");
-        }
+        run_with_retry("health server", || {
+            let c = health_client.clone();
+            let addr = health_ctrl_addr.clone();
+            Box::pin(health::serve(health_addr, c, addr))
+        })
+        .await;
     });
 
-    // Spawn node watcher
+    // Spawn node watcher (issue #52: retry on failure)
     let nw_client = client.clone();
     let nw_ctrl_addr = args.controller_addr.clone();
     let nw_op_addr = operator_ip.clone();
     let nw_ns = args.namespace.clone();
     let nw_selector = args.node_selector.clone();
     tokio::spawn(async move {
-        if let Err(e) = node_watcher::run(
-            nw_client,
-            nw_ctrl_addr,
-            nw_op_addr,
-            operator_port,
-            nw_ns,
-            nw_selector,
-        )
-        .await
-        {
-            tracing::error!(error = %e, "node watcher exited");
-        }
+        run_with_retry("node watcher", || {
+            let c = nw_client.clone();
+            let ctrl = nw_ctrl_addr.clone();
+            let op = nw_op_addr.clone();
+            let ns = nw_ns.clone();
+            let sel = nw_selector.clone();
+            Box::pin(node_watcher::run(c, ctrl, op, operator_port, ns, sel))
+        })
+        .await;
     });
 
-    // Spawn job controller
+    // Spawn job controller (issue #52: retry on failure)
     let jc_client = client.clone();
     let jc_ctrl_addr = args.controller_addr.clone();
     let jc_ns = args.namespace.clone();
     tokio::spawn(async move {
-        if let Err(e) = job_controller::run(jc_client, jc_ctrl_addr, jc_ns).await {
-            tracing::error!(error = %e, "job controller exited");
-        }
+        run_with_retry("job controller", || {
+            let c = jc_client.clone();
+            let ctrl = jc_ctrl_addr.clone();
+            let ns = jc_ns.clone();
+            Box::pin(job_controller::run(c, ctrl, ns))
+        })
+        .await;
     });
 
     // Start virtual agent gRPC server
@@ -142,6 +161,33 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     Ok(())
+}
+
+/// Run an async task with exponential backoff retry on failure (issue #52).
+///
+/// If the task exits with an error, it is restarted after a delay that doubles
+/// each time (1s → 2s → 4s → ... → 60s max). On success the backoff resets.
+async fn run_with_retry<F, Fut>(name: &str, mut factory: F) -> !
+where
+    F: FnMut() -> std::pin::Pin<Box<Fut>>,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let mut backoff = std::time::Duration::from_secs(1);
+    let max_backoff = std::time::Duration::from_secs(60);
+
+    loop {
+        match factory().await {
+            Ok(()) => {
+                tracing::warn!(%name, "task exited cleanly, restarting");
+                backoff = std::time::Duration::from_secs(1);
+            }
+            Err(e) => {
+                tracing::error!(%name, error = %e, backoff_secs = backoff.as_secs(), "task failed, retrying");
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff * 2, max_backoff);
+            }
+        }
+    }
 }
 
 fn generate_crd() {

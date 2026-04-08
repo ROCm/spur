@@ -136,7 +136,17 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(cmd) = canonical {
         // Rewrite argv: replace ["spur", "cmd", ...rest] with ["cmd", ...rest]
+        //
+        // Special case (issue #53): `spur show node X` should dispatch as
+        // `scontrol show node X`, not `scontrol node X`. When the user's
+        // command is "show", insert the implicit "show" subcommand for scontrol.
+        let implicit_show = args[1].as_str() == "show" && cmd == "scontrol";
         let rewritten: Vec<String> = std::iter::once(cmd.to_string())
+            .chain(if implicit_show {
+                vec!["show".to_string()]
+            } else {
+                vec![]
+            })
             .chain(args[2..].iter().cloned())
             .collect();
         // Temporarily override process args for the subcommand parser

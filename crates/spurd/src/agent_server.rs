@@ -869,7 +869,9 @@ impl SlurmAgent for AgentService {
             }
         };
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<AttachJobOutput, Status>>(32);
+        // Issue #54: Use a larger buffer to prevent deadlock when stdout+stderr
+        // produce high-volume output concurrently.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<AttachJobOutput, Status>>(256);
 
         tokio::spawn(async move {
             // Spawn an interactive shell inside the job's cgroup/namespace
@@ -1002,10 +1004,16 @@ impl SlurmAgent for AgentService {
                 }
             }
 
-            // Wait for child to exit
+            // Wait for child to exit, then let I/O tasks drain gracefully
+            // before sending EOF. Aborting immediately loses buffered data
+            // (issue #54).
             let _ = child.wait().await;
+            // Give tasks a moment to flush remaining data
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let _ = stderr_task.await;
+            })
+            .await;
             stdin_task.abort();
-            stderr_task.abort();
 
             // Send EOF
             let _ = tx_clone

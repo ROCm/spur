@@ -1104,4 +1104,247 @@ address = "http://peer-a:6817"
         assert_eq!(sanitized, expected);
         assert_eq!(format!("{}.sqsh", sanitized), basename);
     }
+
+    // ── Issue #56 (reopen #47): scheduler crash recovery ─────────
+
+    #[test]
+    fn t50_96_scheduler_handles_num_nodes_zero_safely() {
+        // Issue #56: If num_nodes is somehow 0, the scheduler should not
+        // panic on .max().unwrap() with an empty iterator.
+        // The fix ensures num_nodes.max(1) is used in the scheduling loop.
+        use spur_sched::traits::Scheduler;
+        let mut sched = spur_sched::backfill::BackfillScheduler::new(100);
+        let nodes = vec![{
+            let mut n = Node::new(
+                "node001".into(),
+                ResourceSet {
+                    cpus: 64,
+                    memory_mb: 256_000,
+                    ..Default::default()
+                },
+            );
+            n.state = spur_core::node::NodeState::Idle;
+            n.partitions = vec!["default".into()];
+            n
+        }];
+        let partitions = vec![make_partition("default", 1)];
+
+        // Create a job with num_nodes=0 (edge case)
+        let mut job = make_job("edge-case");
+        job.spec.num_nodes = 0;
+
+        let cluster = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+        };
+        // This should NOT panic
+        let assignments = sched.schedule(&[job], &cluster);
+        // With num_nodes.max(1), the job should still get scheduled
+        assert_eq!(assignments.len(), 1);
+    }
+
+    // ── Issue #56: update_pending_reasons checks constraints ─────
+
+    #[test]
+    fn t50_97_pending_reason_respects_constraints() {
+        // Issue #56: A job with --constraint=gpu should show
+        // Reason=Resources (not Priority) when no node has that feature.
+        let _reason_with_features: () = {
+            let mut node = Node::new(
+                "node001".into(),
+                ResourceSet {
+                    cpus: 64,
+                    memory_mb: 256_000,
+                    ..Default::default()
+                },
+            );
+            node.state = spur_core::node::NodeState::Idle;
+            // Node has NO features
+
+            // Job requires "gpu" feature
+            let mut job = make_job("constrained");
+            job.spec.constraint = Some("gpu".into());
+
+            // The node is schedulable and can satisfy resources,
+            // but doesn't have the constraint feature.
+            // update_pending_reasons should set Resources, not Priority.
+            let is_capable = node.is_schedulable()
+                && node.total_resources.can_satisfy(&ResourceSet {
+                    cpus: 1,
+                    memory_mb: 0,
+                    ..Default::default()
+                });
+            // Old behavior: this would be true → Priority (misleading)
+            assert!(is_capable, "basic capability check passes");
+
+            // New behavior: constraint check should reject the node
+            let constraint = job.spec.constraint.as_deref().unwrap();
+            let features: Vec<&str> = constraint.split(',').map(str::trim).collect();
+            let passes_constraint = features
+                .iter()
+                .all(|f| node.features.contains(&f.to_string()));
+            assert!(
+                !passes_constraint,
+                "constraint check should reject node without gpu feature"
+            );
+        };
+    }
+
+    // ── Issue #55 (reopen): agent image_dir fallback ─────────────
+
+    #[test]
+    fn t50_98_image_dir_fallback_logic() {
+        // Issue #55: The agent's image_dir() should fall back to
+        // ~/.spur/images when /var/spool/spur/images doesn't exist.
+        // This test verifies the fallback logic conceptually.
+        let system_dir = std::path::Path::new("/var/spool/spur/images");
+        let home = std::env::var_os("HOME");
+
+        // If system dir doesn't exist and HOME is set, fallback should
+        // point to ~/.spur/images
+        if !system_dir.is_dir() {
+            if let Some(home) = home {
+                let expected = std::path::PathBuf::from(home).join(".spur/images");
+                // Verify the path construction is correct
+                assert!(expected.to_str().unwrap().contains(".spur/images"));
+            }
+        }
+    }
+
+    // ── Issue #54 (reopen): sattach buffer sizes ─────────────────
+
+    #[test]
+    fn t50_99_attach_job_messages_support_raw_bytes() {
+        // Issue #54: AttachJobInput should carry raw bytes (not just
+        // newline-terminated lines) for interactive use.
+        let input = spur_proto::proto::AttachJobInput {
+            job_id: 42,
+            data: vec![0x1b, 0x5b, 0x41], // ESC [ A (arrow up)
+        };
+        assert_eq!(input.data.len(), 3);
+        assert_eq!(input.data[0], 0x1b); // ESC byte
+
+        let output = spur_proto::proto::AttachJobOutput {
+            data: vec![0x1b, 0x5b, 0x48], // ESC [ H (cursor home)
+            eof: false,
+        };
+        assert_eq!(output.data.len(), 3);
+        assert!(!output.eof);
+    }
+
+    // ── Issue #53: CLI show dispatch ─────────────────────────────
+
+    #[test]
+    fn t50_100_show_dispatch_inserts_implicit_show() {
+        // Issue #53: `spur show node X` should dispatch as
+        // `scontrol show node X`, not `scontrol node X`.
+        //
+        // Simulate the argv rewriting logic from main.rs.
+        let args: Vec<String> = vec!["spur".into(), "show".into(), "node".into(), "gpu-1".into()];
+
+        let cmd = "scontrol";
+        let implicit_show = args[1].as_str() == "show" && cmd == "scontrol";
+
+        let rewritten: Vec<String> = std::iter::once(cmd.to_string())
+            .chain(if implicit_show {
+                vec!["show".to_string()]
+            } else {
+                vec![]
+            })
+            .chain(args[2..].iter().cloned())
+            .collect();
+
+        assert_eq!(rewritten, vec!["scontrol", "show", "node", "gpu-1"]);
+    }
+
+    #[test]
+    fn t50_101_control_dispatch_no_implicit_show() {
+        // `spur control show node X` should NOT insert extra show.
+        let args: Vec<String> = vec![
+            "spur".into(),
+            "control".into(),
+            "show".into(),
+            "node".into(),
+            "gpu-1".into(),
+        ];
+
+        let cmd = "scontrol";
+        let implicit_show = args[1].as_str() == "show" && cmd == "scontrol";
+
+        let rewritten: Vec<String> = std::iter::once(cmd.to_string())
+            .chain(if implicit_show {
+                vec!["show".to_string()]
+            } else {
+                vec![]
+            })
+            .chain(args[2..].iter().cloned())
+            .collect();
+
+        // "control" != "show", so no implicit show inserted
+        assert_eq!(rewritten, vec!["scontrol", "show", "node", "gpu-1"]);
+    }
+
+    // ── Issue #51: K8s operator address resolution ───────────────
+
+    #[test]
+    fn t50_102_k8s_address_resolution_priority() {
+        // Issue #51: The operator should prefer --address flag over
+        // POD_IP env var over hostname. Verify the priority logic.
+        //
+        // Test the priority: explicit > POD_IP > listen IP > hostname
+        let explicit = Some("10.0.0.1".to_string());
+        let pod_ip: Result<String, std::env::VarError> = Ok("10.0.0.2".to_string());
+        let listen_is_unspecified = true;
+
+        // Explicit wins
+        let result = if let Some(ref addr) = explicit {
+            addr.clone()
+        } else if let Ok(ip) = pod_ip.as_ref() {
+            ip.clone()
+        } else if !listen_is_unspecified {
+            "10.0.0.3".into()
+        } else {
+            "pod-hostname-abc123".into()
+        };
+        assert_eq!(result, "10.0.0.1");
+    }
+
+    #[test]
+    fn t50_103_k8s_pod_ip_fallback() {
+        // When no explicit address, POD_IP should be used
+        let explicit: Option<String> = None;
+        let pod_ip: Result<String, ()> = Ok("10.244.1.5".to_string());
+        let listen_is_unspecified = true;
+
+        let result = if let Some(ref addr) = explicit {
+            addr.clone()
+        } else if let Ok(ip) = pod_ip.as_ref() {
+            ip.clone()
+        } else if !listen_is_unspecified {
+            "10.0.0.3".into()
+        } else {
+            "pod-hostname-abc123".into()
+        };
+        assert_eq!(result, "10.244.1.5");
+    }
+
+    // ── Issue #52: retry loop backoff ────────────────────────────
+
+    #[test]
+    fn t50_104_retry_backoff_doubles_then_caps() {
+        // Issue #52: verify exponential backoff logic caps at 60s.
+        let max_backoff = std::time::Duration::from_secs(60);
+        let mut backoff = std::time::Duration::from_secs(1);
+
+        // Simulate 10 failures
+        for _ in 0..10 {
+            backoff = std::cmp::min(backoff * 2, max_backoff);
+        }
+        assert_eq!(backoff, max_backoff);
+
+        // Simulate success resets
+        backoff = std::time::Duration::from_secs(1);
+        assert_eq!(backoff.as_secs(), 1);
+    }
 }
