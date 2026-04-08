@@ -25,13 +25,25 @@ const CONTAINER_DIR: &str = "/var/spool/spur/containers";
 ///
 /// This must match the CLI's `resolve_image_dir()` logic so that images
 /// imported via `spur image import` are found by the agent at job launch.
+///
+/// Priority (issue #55 — matches CLI's 3-tier fallback):
+/// 1. `$SPUR_IMAGE_DIR` environment variable
+/// 2. `/var/spool/spur/images` if it exists
+/// 3. `~/.spur/images/` as user-local fallback
 fn image_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("SPUR_IMAGE_DIR") {
         if !dir.is_empty() {
             return PathBuf::from(dir);
         }
     }
-    PathBuf::from(DEFAULT_IMAGE_DIR)
+    let system_dir = Path::new(DEFAULT_IMAGE_DIR);
+    if system_dir.is_dir() {
+        return system_dir.to_path_buf();
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".spur/images");
+    }
+    system_dir.to_path_buf()
 }
 
 /// A parsed bind mount specification.

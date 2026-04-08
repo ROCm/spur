@@ -1268,14 +1268,45 @@ impl ClusterManager {
             }
 
             // Nodes exist but may be fully allocated — check if any idle node
-            // can satisfy resource requirements
+            // can satisfy resource requirements.
+            //
+            // This must mirror the checks in BackfillScheduler::find_suitable_nodes
+            // so that the displayed reason accurately reflects why the scheduler
+            // can't place the job (issue #56 — reopened #47).
             let required = spur_sched::backfill::job_resource_request(job);
-            let has_capable_node = nodes_in_partition
-                .iter()
-                .any(|n| n.is_schedulable() && n.total_resources.can_satisfy(&required));
+            let has_capable_node = nodes_in_partition.iter().any(|n| {
+                if !n.is_schedulable() {
+                    return false;
+                }
+                // Skip nodes fully consumed by existing allocations
+                if n.alloc_resources.cpus >= n.total_resources.cpus && n.total_resources.cpus > 0 {
+                    return false;
+                }
+                // Exclusive job needs an idle node (no current allocations)
+                if job.spec.exclusive
+                    && (n.alloc_resources.cpus > 0 || !n.alloc_resources.gpus.is_empty())
+                {
+                    return false;
+                }
+                // Constraint feature check
+                if let Some(ref constraint) = job.spec.constraint {
+                    let required_features: Vec<&str> = constraint
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if !required_features
+                        .iter()
+                        .all(|f| n.features.contains(&f.to_string()))
+                    {
+                        return false;
+                    }
+                }
+                n.total_resources.can_satisfy(&required)
+            });
 
             if !has_capable_node {
-                // Resources insufficient on all nodes
+                // Resources insufficient or constraints prevent scheduling
                 job_entry.pending_reason = PendingReason::Resources;
             } else {
                 // Capable nodes exist but currently occupied — backfill will

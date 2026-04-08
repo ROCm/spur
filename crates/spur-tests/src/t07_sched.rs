@@ -621,4 +621,100 @@ mod tests {
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 1);
     }
+
+    // ── Issue #56: edge cases that could crash the scheduler ─────
+
+    #[test]
+    fn t07_27_num_nodes_zero_does_not_panic() {
+        // Issue #56: A job with num_nodes=0 should be handled safely
+        // instead of panicking on .max().unwrap() with empty iterator.
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(2, 64, 256_000);
+        let partitions = vec![make_partition("default", 2)];
+        let mut job = make_job("zero-nodes");
+        job.spec.num_nodes = 0;
+
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+        };
+        // Must not panic — should schedule with 1 node (the minimum)
+        let assignments = sched.schedule(&[job], &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes.len(), 1);
+    }
+
+    #[test]
+    fn t07_28_single_idle_node_schedules_immediately() {
+        // Issue #56 regression: A single idle node with a single pending
+        // job should result in immediate scheduling (no Reason=Priority).
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(1, 64, 256_000);
+        let partitions = vec![make_partition("default", 1)];
+        let job = make_job("simple");
+
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+        };
+        let assignments = sched.schedule(&[job], &cluster);
+        assert_eq!(
+            assignments.len(),
+            1,
+            "single idle node should schedule job immediately"
+        );
+        assert_eq!(assignments[0].nodes[0], "node001");
+    }
+
+    #[test]
+    fn t07_29_constraint_mismatch_not_scheduled() {
+        // Issue #56: A job with --constraint=gpu should NOT be scheduled
+        // on a node without the "gpu" feature.
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(2, 64, 256_000); // nodes have NO features
+        let partitions = vec![make_partition("default", 2)];
+        let mut job = make_job("gpu-job");
+        job.spec.constraint = Some("gpu".into());
+
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+        };
+        let assignments = sched.schedule(&[job], &cluster);
+        assert_eq!(
+            assignments.len(),
+            0,
+            "job requiring gpu feature should not schedule on featureless nodes"
+        );
+    }
+
+    #[test]
+    fn t07_30_exclusive_job_needs_idle_node() {
+        // Issue #56: An exclusive job should only schedule on a node
+        // with zero current allocations.
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2, 64, 256_000);
+        // Node 1 has partial allocations
+        nodes[0].alloc_resources.cpus = 32;
+        let partitions = vec![make_partition("default", 2)];
+        let mut job = make_job("exclusive");
+        job.spec.exclusive = true;
+
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+        };
+        let assignments = sched.schedule(&[job], &cluster);
+        assert_eq!(assignments.len(), 1);
+        // Should land on node002 (the idle one), not node001 (partially allocated)
+        assert_eq!(assignments[0].nodes[0], "node002");
+    }
 }

@@ -63,7 +63,24 @@ pub async fn run(cluster: Arc<ClusterManager>) {
             reservations: &reservations,
         };
 
-        let assignments = scheduler.schedule(&pending, &cluster_state);
+        // Catch panics in the scheduler so that a single bad job doesn't kill
+        // the entire scheduling loop (issue #56).
+        let sched_ref = &mut scheduler;
+        let assignments = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sched_ref.schedule(&pending, &cluster_state)
+        })) {
+            Ok(a) => a,
+            Err(e) => {
+                error!(
+                    "scheduler panicked: {:?} — skipping cycle",
+                    e.downcast_ref::<String>()
+                        .map(|s| s.as_str())
+                        .or_else(|| e.downcast_ref::<&str>().copied())
+                        .unwrap_or("unknown")
+                );
+                continue;
+            }
+        };
 
         // Preemption: if high-priority jobs couldn't be scheduled,
         // cancel lower-priority running jobs to free resources.
