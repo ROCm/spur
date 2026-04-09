@@ -7,7 +7,7 @@ ARG PROTOC_VERSION=25.1
 RUN yum install -y unzip && yum clean all && \
     curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" \
         -o /tmp/protoc.zip && \
-    unzip -o /tmp/protoc.zip -d /usr/local bin/protoc && \
+    unzip -o /tmp/protoc.zip -d /usr/local && \
     rm /tmp/protoc.zip
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
