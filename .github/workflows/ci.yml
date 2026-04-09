@@ -103,7 +103,8 @@ jobs:
       - name: Deploy fresh binaries and test scripts
         run: |
           cp target/release/spur target/release/spurctld target/release/spurd \
-             target/release/spurdbd target/release/spurrestd ~/spur/bin/
+             target/release/spurdbd target/release/spurrestd \
+             target/release/spur-k8s-operator ~/spur/bin/
           rsync -a --checksum \
             target/release/spur \
             target/release/spurd \
@@ -146,3 +147,28 @@ jobs:
         run: |
           ssh mi300-2 '~/spur/etc/stop-agent.sh' || true
           ~/spur/etc/stop-all.sh || true
+
+  k8s:
+    name: K8s Integration (2x MI300X)
+    runs-on: [self-hosted, mi300x]
+    needs: cluster
+    concurrency:
+      group: cluster-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify binaries from cluster job
+        run: |
+          for bin in spurctld spurd spur spur-k8s-operator; do
+            ls ~/spur/bin/${bin}
+          done
+
+      - name: Run K8s integration tests
+        run: bash deploy/bare-metal/k8s_test.sh
+
+      - name: Cleanup kind cluster
+        if: always()
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          kind delete cluster --name spur-ci 2>/dev/null || true
