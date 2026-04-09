@@ -219,9 +219,6 @@ impl Scheduler for BackfillScheduler {
         let mut assignments = Vec::new();
         let limit = pending.len().min(self.max_jobs);
 
-        // Shadow reservations for top-priority jobs
-        let mut shadows: Vec<(usize, chrono::DateTime<Utc>)> = Vec::new(); // (job_idx, earliest_start)
-
         for (job_idx, job) in pending.iter().enumerate().take(limit) {
             // Skip jobs that are part of an unschedulable het group
             if skip_indices.contains(&job_idx) {
@@ -313,7 +310,6 @@ impl Scheduler for BackfillScheduler {
                 for (ni, _) in &assigned_nodes {
                     self.timelines[*ni].reserve(earliest, earliest + duration, required.clone());
                 }
-                shadows.push((job_idx, earliest));
             }
         }
 
