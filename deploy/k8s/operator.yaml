@@ -39,6 +39,11 @@ spec:
             - --listen=[::]:6818
             - --namespace=spur
             - --health-addr=[::]:8080
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
           ports:
             - containerPort: 6818
               name: grpc
