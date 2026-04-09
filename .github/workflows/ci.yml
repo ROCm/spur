@@ -167,8 +167,8 @@ jobs:
       - name: Run K8s integration tests
         run: bash deploy/bare-metal/k8s_test.sh
 
-      - name: Cleanup K3s
+      - name: Cleanup kind cluster
         if: always()
         run: |
-          ssh mi300-2 'sudo /usr/local/bin/k3s-agent-uninstall.sh 2>/dev/null; true'
-          sudo /usr/local/bin/k3s-uninstall.sh 2>/dev/null || true
+          export PATH="$HOME/.local/bin:$PATH"
+          kind delete cluster --name spur-ci 2>/dev/null || true

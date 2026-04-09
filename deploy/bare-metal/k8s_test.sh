@@ -1,8 +1,7 @@
 #!/bin/bash
-# Spur K8s Integration Tests
+# Spur K8s Integration Tests using kind (Kubernetes in Docker)
 #
-# Validates the full K8s deployment path on a 2-node MI300X cluster:
-#   - K3s cluster setup (server + agent)
+# Validates the full K8s deployment path:
 #   - SpurJob CRD lifecycle (create → schedule → run → complete)
 #   - Operator health and node registration
 #   - Multi-node job coordination
@@ -10,9 +9,7 @@
 #
 # Prerequisites:
 #   - Spur binaries at ~/spur/bin/ (from cluster job)
-#   - SSH access to mi300-2
-#   - Docker installed (for container image build)
-#   - sudo access (for K3s install)
+#   - Docker installed
 #
 # Usage: bash deploy/bare-metal/k8s_test.sh
 
@@ -22,6 +19,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SPUR_HOME="${HOME}/spur"
 SPUR_BIN="${SPUR_HOME}/bin"
+TOOLS_DIR="${HOME}/.local/bin"
+CLUSTER_NAME="spur-ci"
+
+mkdir -p "${TOOLS_DIR}"
+export PATH="${TOOLS_DIR}:${PATH}"
 
 PASS=0
 FAIL=0
@@ -36,19 +38,24 @@ wait_spurjob() {
     local want="$2"
     local timeout="${3:-60}"
     local state=""
-    for i in $(seq 1 $((timeout / 2))); do
+    for _ in $(seq 1 $((timeout / 2))); do
         state=$(kubectl -n spur get spurjob "$name" -o jsonpath='{.status.state}' 2>/dev/null || echo "")
         [ "$state" = "$want" ] && echo "$state" && return 0
-        # Early exit on terminal states if we're not waiting for them
         case "$state" in
             Completed|Failed|Cancelled)
-                [ "$state" = "$want" ] && echo "$state" && return 0
-                echo "$state" && return 1 ;;
+                echo "$state"; return 1 ;;
         esac
         sleep 2
     done
     echo "${state:-timeout}"
     return 1
+}
+
+cleanup() {
+    echo ""
+    echo "=== Cleanup ==="
+    kind delete cluster --name "${CLUSTER_NAME}" 2>/dev/null || true
+    echo "  kind cluster removed"
 }
 
 # ============================================================
@@ -57,7 +64,7 @@ wait_spurjob() {
 section "Prerequisites"
 
 if ! command -v docker &>/dev/null; then
-    echo "SKIP: Docker not installed (required for container image build)"
+    echo "SKIP: Docker not installed"
     exit 0
 fi
 
@@ -69,48 +76,63 @@ fi
 pass "Docker and Spur binaries available"
 
 # ============================================================
-# Cleanup previous K3s (idempotent)
+# Install tools (kind + kubectl)
 # ============================================================
-section "Cleanup previous K3s"
-ssh mi300-2 'sudo /usr/local/bin/k3s-agent-uninstall.sh 2>/dev/null; true'
-sudo /usr/local/bin/k3s-uninstall.sh 2>/dev/null || true
-echo "  Previous K3s state cleared"
+section "Install tools"
+
+if ! command -v kind &>/dev/null; then
+    KIND_VER=$(curl -fsSL https://api.github.com/repos/kubernetes-sigs/kind/releases/latest \
+        | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+    echo "  Installing kind ${KIND_VER}..."
+    curl -fsSL -o "${TOOLS_DIR}/kind" \
+        "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VER}/kind-linux-amd64"
+    chmod +x "${TOOLS_DIR}/kind"
+fi
+pass "kind $(kind version)"
+
+if ! command -v kubectl &>/dev/null; then
+    KUBECTL_VER=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+    echo "  Installing kubectl ${KUBECTL_VER}..."
+    curl -fsSL -o "${TOOLS_DIR}/kubectl" \
+        "https://dl.k8s.io/release/${KUBECTL_VER}/bin/linux/amd64/kubectl"
+    chmod +x "${TOOLS_DIR}/kubectl"
+fi
+pass "kubectl $(kubectl version --client -o json 2>/dev/null | grep gitVersion | cut -d'"' -f4)"
 
 # ============================================================
-# Install K3s cluster
+# Create kind cluster (control-plane + 2 workers)
 # ============================================================
-section "Install K3s cluster"
+section "Create kind cluster"
 
-# Server on this node
-curl -sfL https://get.k3s.io | sudo INSTALL_K3S_EXEC="--disable=traefik --write-kubeconfig-mode=644" sh -
-export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+# Clean up previous cluster
+kind delete cluster --name "${CLUSTER_NAME}" 2>/dev/null || true
 
-kubectl wait --for=condition=Ready "node/$(hostname)" --timeout=60s \
-    && pass "K3s server node ready" \
-    || fail "K3s server not ready"
+trap cleanup EXIT
 
-# Agent on mi300-2
-K3S_TOKEN=$(sudo cat /var/lib/rancher/k3s/server/node-token)
-SERVER_IP=$(hostname -I | awk '{print $1}')
-ssh mi300-2 "curl -sfL https://get.k3s.io | sudo K3S_URL=https://${SERVER_IP}:6443 K3S_TOKEN=${K3S_TOKEN} sh -"
+kind create cluster --name "${CLUSTER_NAME}" --config=- <<'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
+EOF
 
-# Wait for both nodes (agent takes a few seconds to register)
-sleep 10
 kubectl wait --for=condition=Ready node --all --timeout=120s \
-    && pass "Both K3s nodes ready" \
-    || fail "K3s nodes not ready"
+    && pass "Kind cluster ready (3 nodes)" \
+    || fail "Kind cluster not ready"
 
 echo "  Nodes:"
-kubectl get nodes -o wide
+kubectl get nodes
 
-# Label nodes for operator node-watcher
-for node in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
+# Label worker nodes for Spur operator
+for node in $(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' -o jsonpath='{.items[*].metadata.name}'); do
     kubectl label node "$node" spur.ai/managed=true --overwrite
 done
-pass "Nodes labeled for Spur operator"
+pass "Worker nodes labeled for Spur"
 
 # ============================================================
-# Build and import container image
+# Build and load container image
 # ============================================================
 section "Build Spur container image"
 
@@ -132,14 +154,9 @@ docker build -t spur:ci "${BUILD_DIR}" \
     && pass "Container image built" \
     || fail "Container image build failed"
 
-# Import into K3s containerd on both nodes
-docker save spur:ci | sudo k3s ctr images import - \
-    && pass "Image imported (local)" \
-    || fail "Image import failed (local)"
-
-docker save spur:ci | ssh mi300-2 'sudo k3s ctr images import -' \
-    && pass "Image imported (mi300-2)" \
-    || fail "Image import failed (mi300-2)"
+kind load docker-image spur:ci --name "${CLUSTER_NAME}" \
+    && pass "Image loaded into kind" \
+    || fail "Image load failed"
 
 rm -rf "${BUILD_DIR}"
 
@@ -181,13 +198,13 @@ data:
     default_time = "10m"
 EOF
 
-# Deploy controller + operator (image: spur:ci)
+# Deploy controller + operator with CI image
 for f in spurctld.yaml operator.yaml; do
     sed 's|spur:latest|spur:ci|g' "${REPO_ROOT}/deploy/k8s/${f}" \
         | kubectl apply -f -
 done
 
-# Wait for pods
+# Wait for pods to be ready
 kubectl -n spur wait --for=condition=Available deployment/spur-k8s-operator --timeout=120s \
     && pass "Operator deployment ready" \
     || fail "Operator not ready"
@@ -196,11 +213,15 @@ kubectl -n spur wait --for=condition=Ready pod -l app=spurctld --timeout=120s \
     && pass "Controller pod ready" \
     || fail "Controller not ready"
 
-# Health check
+# Health check via exec into operator pod
 OPERATOR_POD=$(kubectl -n spur get pod -l app=spur-k8s-operator -o jsonpath='{.items[0].metadata.name}')
 kubectl -n spur exec "$OPERATOR_POD" -- curl -sf http://localhost:8080/healthz >/dev/null 2>&1 \
     && pass "Operator /healthz OK" \
     || fail "Operator /healthz failed"
+
+# Show what the operator sees
+echo "  Operator logs (last 10 lines):"
+kubectl -n spur logs "$OPERATOR_POD" --tail=10 2>/dev/null | sed 's/^/    /'
 
 # ============================================================
 # TEST 1: Simple SpurJob
@@ -220,8 +241,7 @@ spec:
   numNodes: 1
 EOF
 
-STATE=$(wait_spurjob test-simple Completed 60)
-[ "$STATE" = "Completed" ] \
+STATE=$(wait_spurjob test-simple Completed 60) \
     && pass "Simple SpurJob completed" \
     || fail "Simple SpurJob state: $STATE"
 
@@ -252,8 +272,7 @@ spec:
     CUSTOM_VAR: "spur-ci-test"
 EOF
 
-STATE=$(wait_spurjob test-env Completed 60)
-[ "$STATE" = "Completed" ] \
+STATE=$(wait_spurjob test-env Completed 60) \
     && pass "Env var SpurJob completed" \
     || fail "Env var SpurJob state: $STATE"
 
@@ -277,12 +296,10 @@ spec:
   numNodes: 2
 EOF
 
-STATE=$(wait_spurjob test-multinode Completed 90)
-[ "$STATE" = "Completed" ] \
+STATE=$(wait_spurjob test-multinode Completed 90) \
     && pass "Multi-node SpurJob completed" \
     || fail "Multi-node SpurJob state: $STATE"
 
-# Verify pods were tracked in status
 PODS=$(kubectl -n spur get spurjob test-multinode -o jsonpath='{.status.pods}' 2>/dev/null || echo "")
 [ -n "$PODS" ] && [ "$PODS" != "[]" ] \
     && pass "Multi-node job tracked pods: $PODS" \
@@ -308,7 +325,7 @@ spec:
   numNodes: 1
 EOF
 
-# Wait for it to start (or at least be pending)
+# Wait for pod to appear
 sleep 8
 
 # Delete the SpurJob
@@ -339,15 +356,14 @@ spec:
   numNodes: 1
 EOF
 
-STATE=$(wait_spurjob test-fail Failed 60)
-[ "$STATE" = "Failed" ] \
+STATE=$(wait_spurjob test-fail Failed 60) \
     && pass "Failed SpurJob detected" \
     || fail "Failed SpurJob state: $STATE"
 
 kubectl delete spurjob test-fail -n spur --timeout=30s 2>/dev/null || true
 
 # ============================================================
-# TEST 6: Sequential SpurJobs (scheduler handles queue)
+# TEST 6: Sequential SpurJobs (scheduler queue)
 # ============================================================
 section "TEST 6: Sequential SpurJobs"
 
@@ -368,7 +384,7 @@ done
 
 ALL_DONE=true
 for i in 1 2 3; do
-    STATE=$(wait_spurjob "test-seq-${i}" Completed 60)
+    STATE=$(wait_spurjob "test-seq-${i}" Completed 60) || true
     if [ "$STATE" != "Completed" ]; then
         ALL_DONE=false
         fail "Sequential job ${i} state: $STATE"
