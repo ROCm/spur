@@ -22,23 +22,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install protobuf compiler
-        run: sudo apt-get install -y protobuf-compiler
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Build portable binaries (Ubuntu 22.04+ compatible)
+        uses: docker/build-push-action@v5
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-release-
-
-      - name: Build release
-        run: cargo build --release
+          context: .
+          file: deploy/Dockerfile.manylinux
+          target: dist
+          push: false
+          outputs: type=local,dest=./dist
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Package binaries
         run: |
@@ -46,7 +42,7 @@ jobs:
           DIST="spur-${VERSION}-linux-amd64"
           mkdir -p "${DIST}/bin"
           for bin in spur spurctld spurd spurdbd spurrestd; do
-            cp "target/release/${bin}" "${DIST}/bin/"
+            cp "dist/bin/${bin}" "${DIST}/bin/"
           done
 
           # Create Slurm-compat symlinks
@@ -72,9 +68,49 @@ jobs:
             spur-*.tar.gz
             spur-*.tar.gz.sha256
 
+  verify:
+    name: Verify on ${{ matrix.name }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: "ubuntu:20.04"
+            name: "Ubuntu 20.04"
+          - distro: "ubuntu:22.04"
+            name: "Ubuntu 22.04"
+          - distro: "ubuntu:24.04"
+            name: "Ubuntu 24.04"
+          - distro: "ubuntu:26.04"
+            name: "Ubuntu 26.04 (beta)"
+            experimental: true
+          - distro: "almalinux:8"
+            name: "RHEL 8 (AlmaLinux)"
+    continue-on-error: ${{ matrix.experimental || false }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: spur-linux-amd64
+
+      - name: Test binaries on ${{ matrix.name }}
+        run: |
+          tar xzf spur-*.tar.gz
+          BINDIR=$(ls -d spur-*/bin | head -1)
+          docker run --rm -v "$(pwd)/${BINDIR}:/test:ro" ${{ matrix.distro }} bash -c '
+            set -e
+            echo "=== $(cat /etc/os-release | grep PRETTY_NAME | cut -d\" -f2) ==="
+            echo "glibc: $(ldd --version 2>&1 | head -1)"
+            for bin in spur spurctld spurd spurdbd spurrestd; do
+              /test/${bin} --help > /dev/null 2>&1
+              echo "  ${bin}: OK"
+            done
+            echo "All binaries verified"
+          '
+
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [build, verify]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

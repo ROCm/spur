@@ -13,26 +13,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  nightly:
-    name: Build and publish nightly
+  build:
+    name: Build nightly
     runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+      commits: ${{ steps.check.outputs.commits }}
+      date: ${{ steps.meta.outputs.date }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+      full_sha: ${{ steps.meta.outputs.full_sha }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install protobuf compiler
-        run: sudo apt-get install -y protobuf-compiler
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-nightly-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-nightly-
 
       - name: Check for changes since last nightly
         id: check
@@ -50,20 +41,40 @@ jobs:
             echo "${COMMITS} new commit(s) since last nightly"
           fi
 
-      - name: Build release
+      - name: Set metadata
+        id: meta
         if: steps.check.outputs.skip != 'true'
-        run: cargo build --release
+        run: |
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "full_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build portable binaries (Ubuntu 22.04+ compatible)
+        if: steps.check.outputs.skip != 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: deploy/Dockerfile.manylinux
+          target: dist
+          push: false
+          outputs: type=local,dest=./dist
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Package binaries
         if: steps.check.outputs.skip != 'true'
         run: |
-          DATE=$(date -u +%Y%m%d)
-          SHORT_SHA=$(git rev-parse --short HEAD)
+          DATE="${{ steps.meta.outputs.date }}"
+          SHORT_SHA="${{ steps.meta.outputs.short_sha }}"
           DIST="spur-nightly-${DATE}-${SHORT_SHA}-linux-amd64"
 
           mkdir -p "${DIST}/bin"
           for bin in spur spurctld spurd spurdbd spurrestd; do
-            cp "target/release/${bin}" "${DIST}/bin/"
+            cp "dist/bin/${bin}" "${DIST}/bin/"
           done
 
           cd "${DIST}/bin"
@@ -78,14 +89,75 @@ jobs:
           tar czf "${DIST}.tar.gz" "${DIST}"
           sha256sum "${DIST}.tar.gz" > "${DIST}.tar.gz.sha256"
 
-          echo "DIST=${DIST}" >> "$GITHUB_ENV"
-          echo "DATE=${DATE}" >> "$GITHUB_ENV"
-          echo "SHORT_SHA=${SHORT_SHA}" >> "$GITHUB_ENV"
+      - name: Upload artifact
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: spur-nightly-linux-amd64
+          path: |
+            spur-*.tar.gz
+            spur-*.tar.gz.sha256
+
+  verify:
+    name: Verify on ${{ matrix.name }}
+    needs: build
+    if: needs.build.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: "ubuntu:20.04"
+            name: "Ubuntu 20.04"
+          - distro: "ubuntu:22.04"
+            name: "Ubuntu 22.04"
+          - distro: "ubuntu:24.04"
+            name: "Ubuntu 24.04"
+          - distro: "ubuntu:26.04"
+            name: "Ubuntu 26.04 (beta)"
+            experimental: true
+          - distro: "almalinux:8"
+            name: "RHEL 8 (AlmaLinux)"
+    continue-on-error: ${{ matrix.experimental || false }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: spur-nightly-linux-amd64
+
+      - name: Test binaries on ${{ matrix.name }}
+        run: |
+          tar xzf spur-*.tar.gz
+          BINDIR=$(ls -d spur-*/bin | head -1)
+          docker run --rm -v "$(pwd)/${BINDIR}:/test:ro" ${{ matrix.distro }} bash -c '
+            set -e
+            echo "=== $(cat /etc/os-release | grep PRETTY_NAME | cut -d\" -f2) ==="
+            echo "glibc: $(ldd --version 2>&1 | head -1)"
+            for bin in spur spurctld spurd spurdbd spurrestd; do
+              /test/${bin} --help > /dev/null 2>&1
+              echo "  ${bin}: OK"
+            done
+            echo "All binaries verified"
+          '
+
+  release:
+    name: Publish nightly
+    needs: [build, verify]
+    if: needs.build.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: spur-nightly-linux-amd64
 
       - name: Update nightly release
-        if: steps.check.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          DATE: ${{ needs.build.outputs.date }}
+          SHORT_SHA: ${{ needs.build.outputs.short_sha }}
+          FULL_SHA: ${{ needs.build.outputs.full_sha }}
+          COMMITS: ${{ needs.build.outputs.commits }}
         run: |
           # Delete existing nightly release + tag
           gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
@@ -96,9 +168,9 @@ jobs:
             --notes "$(cat <<EOF
           **Automated nightly build** from \`main\` at $(date -u +"%Y-%m-%d %H:%M UTC").
 
-          Commit: [\`${SHORT_SHA}\`](https://github.com/${{ github.repository }}/commit/$(git rev-parse HEAD))
+          Commit: [\`${SHORT_SHA}\`](https://github.com/${{ github.repository }}/commit/${FULL_SHA})
 
-          ${{ steps.check.outputs.commits }} commit(s) since previous nightly.
+          ${COMMITS} commit(s) since previous nightly.
 
           ### Install
           \`\`\`bash

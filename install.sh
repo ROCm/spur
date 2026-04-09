@@ -12,21 +12,97 @@
 #
 #   # Install to a custom directory:
 #   curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | INSTALL_DIR=/opt/spur/bin bash
+#
+#   # Uninstall:
+#   curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | bash -s -- uninstall
 
 set -euo pipefail
 
 REPO="powderluv/spur"
 INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
-VERSION="${1:-latest}"
+
+BINARIES="spur spurctld spurd spurdbd spurrestd"
+SYMLINKS="sbatch srun squeue scancel sinfo sacct scontrol"
 
 log()  { echo "==> $*"; }
 err()  { echo "ERROR: $*" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+Spur installer — AI-native job scheduler
+
+USAGE:
+    install.sh [OPTIONS] [VERSION]
+
+VERSION:
+    latest          Install the latest stable release (default)
+    nightly         Install the latest nightly build
+    v0.1.0          Install a specific version
+    uninstall       Remove Spur binaries
+
+OPTIONS:
+    -h, --help      Show this help message
+    -d, --dir DIR   Install directory (default: ~/.local/bin)
+
+ENVIRONMENT:
+    INSTALL_DIR     Override install directory (same as --dir)
+
+EXAMPLES:
+    # Install latest stable
+    curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | bash
+
+    # Install nightly
+    curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | bash -s -- nightly
+
+    # Install to /opt/spur/bin
+    curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | bash -s -- -d /opt/spur/bin
+
+    # Uninstall
+    curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | bash -s -- uninstall
+EOF
+    exit 0
+}
+
+do_uninstall() {
+    log "Uninstalling Spur from ${INSTALL_DIR}/"
+    local removed=0
+    for f in ${BINARIES} ${SYMLINKS}; do
+        if [ -e "${INSTALL_DIR}/${f}" ]; then
+            rm -f "${INSTALL_DIR}/${f}"
+            echo "  removed ${f}"
+            removed=$((removed + 1))
+        fi
+    done
+    if [ "${removed}" -eq 0 ]; then
+        log "No Spur files found in ${INSTALL_DIR}/"
+    else
+        log "Removed ${removed} file(s). Spur has been uninstalled."
+    fi
+    exit 0
+}
+
+# --- Parse arguments ---
+VERSION="latest"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)     usage ;;
+        -d|--dir)      INSTALL_DIR="$2"; shift 2 ;;
+        uninstall)     do_uninstall ;;
+        *)             VERSION="$1"; shift ;;
+    esac
+done
 
 # --- Platform check ---
 OS=$(uname -s)
 ARCH=$(uname -m)
 [ "$OS" = "Linux" ] || err "Spur currently supports Linux only (got ${OS})"
 [ "$ARCH" = "x86_64" ] || err "Spur currently supports x86_64 only (got ${ARCH})"
+
+# --- glibc check (binaries built on manylinux_2_28, require glibc >= 2.28) ---
+GLIBC_VER=$(ldd --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+$' || echo "0")
+if [ "$(printf '%s\n' "2.28" "${GLIBC_VER}" | sort -V | head -1)" != "2.28" ]; then
+    err "Spur requires glibc >= 2.28 (found ${GLIBC_VER}). Supported: Ubuntu 20.04+, Debian 10+, RHEL 8+, Fedora 28+"
+fi
 
 # --- Resolve version ---
 if [ "$VERSION" = "latest" ]; then
@@ -87,8 +163,8 @@ fi
 
 # --- PATH hint ---
 log "Installed to ${INSTALL_DIR}/"
-log "Binaries: spur, spurctld, spurd, spurdbd, spurrestd"
-log "Symlinks: sbatch, srun, squeue, scancel, sinfo, sacct, scontrol"
+log "Binaries: ${BINARIES}"
+log "Symlinks: ${SYMLINKS}"
 
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "${INSTALL_DIR}"; then
     echo ""
