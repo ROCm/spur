@@ -103,7 +103,8 @@ jobs:
       - name: Deploy fresh binaries and test scripts
         run: |
           cp target/release/spur target/release/spurctld target/release/spurd \
-             target/release/spurdbd target/release/spurrestd ~/spur/bin/
+             target/release/spurdbd target/release/spurrestd \
+             target/release/spur-k8s-operator ~/spur/bin/
           rsync -a --checksum \
             target/release/spur \
             target/release/spurd \
