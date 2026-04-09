@@ -163,6 +163,12 @@ kind load docker-image spur:ci --name "${CLUSTER_NAME}" \
     && pass "Image loaded into kind" \
     || fail "Image load failed"
 
+# Pre-load busybox for SpurJob pods (avoids Docker Hub pull issues in CI)
+docker pull busybox:latest
+kind load docker-image busybox:latest --name "${CLUSTER_NAME}" \
+    && pass "busybox image loaded into kind" \
+    || fail "busybox image load failed"
+
 rm -rf "${BUILD_DIR}"
 
 # ============================================================
@@ -248,7 +254,11 @@ EOF
 
 STATE=$(wait_spurjob test-simple Completed 60) \
     && pass "Simple SpurJob completed" \
-    || fail "Simple SpurJob state: $STATE"
+    || { fail "Simple SpurJob state: $STATE"; \
+         echo "  Debug: pods in spur namespace:"; \
+         kubectl -n spur get pods -o wide 2>/dev/null | sed 's/^/    /'; \
+         echo "  Debug: operator logs (last 20):"; \
+         kubectl -n spur logs -l app=spur-k8s-operator --tail=20 2>/dev/null | sed 's/^/    /'; }
 
 JOB_ID=$(kubectl -n spur get spurjob test-simple -o jsonpath='{.status.spurJobId}' 2>/dev/null)
 [ -n "$JOB_ID" ] \
