@@ -1,6 +1,7 @@
 mod agent;
 mod crd;
 mod health;
+mod heartbeat;
 mod job_controller;
 mod node_watcher;
 
@@ -119,7 +120,22 @@ async fn main() -> anyhow::Result<()> {
         .await;
     });
 
-    // Spawn node watcher (issue #52: retry on failure)
+    // HeartbeatManager is created once so tracked nodes survive watcher restarts.
+    let hb = std::sync::Arc::new(heartbeat::HeartbeatManager::new(
+        args.controller_addr.clone(),
+    ));
+
+    // Spawn heartbeat sender.
+    let hb_task = hb.clone();
+    tokio::spawn(async move {
+        run_with_retry("node heartbeat", || {
+            let h = hb_task.clone();
+            Box::pin(async move { h.run().await })
+        })
+        .await;
+    });
+
+    // Spawn node watcher — only calls hb.track / hb.untrack, never sends pings.
     let nw_client = client.clone();
     let nw_ctrl_addr = args.controller_addr.clone();
     let nw_op_addr = operator_ip.clone();
@@ -132,7 +148,8 @@ async fn main() -> anyhow::Result<()> {
             let op = nw_op_addr.clone();
             let ns = nw_ns.clone();
             let sel = nw_selector.clone();
-            Box::pin(node_watcher::run(c, ctrl, op, operator_port, ns, sel))
+            let hb = hb.clone();
+            Box::pin(node_watcher::run(c, ctrl, op, operator_port, ns, sel, hb))
         })
         .await;
     });
