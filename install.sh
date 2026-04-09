@@ -2,23 +2,23 @@
 # Install Spur — AI-native job scheduler
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash
 #
 #   # Install nightly:
-#   curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | bash -s -- nightly
+#   curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash -s -- nightly
 #
 #   # Install a specific version:
-#   curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | bash -s -- v0.1.0
+#   curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash -s -- v0.1.0
 #
 #   # Install to a custom directory:
-#   curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | INSTALL_DIR=/opt/spur/bin bash
+#   curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | INSTALL_DIR=/opt/spur/bin bash
 #
 #   # Uninstall:
-#   curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | bash -s -- uninstall
+#   curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash -s -- uninstall
 
 set -euo pipefail
 
-REPO="powderluv/spur"
+REPO="ROCm/spur"
 INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
 
 BINARIES="spur spurctld spurd spurdbd spurrestd"
@@ -49,16 +49,16 @@ ENVIRONMENT:
 
 EXAMPLES:
     # Install latest stable
-    curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | bash
+    curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash
 
     # Install nightly
-    curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | bash -s -- nightly
+    curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash -s -- nightly
 
     # Install to /opt/spur/bin
-    curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | bash -s -- -d /opt/spur/bin
+    curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash -s -- -d /opt/spur/bin
 
     # Uninstall
-    curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | bash -s -- uninstall
+    curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash -s -- uninstall
 EOF
     exit 0
 }

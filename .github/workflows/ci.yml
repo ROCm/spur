@@ -166,10 +166,10 @@ jobs:
           done
 
       - name: Run K8s integration tests
-        run: bash deploy/bare-metal/k8s_test.sh
+        run: sg docker -c "bash deploy/bare-metal/k8s_test.sh"
 
       - name: Cleanup kind cluster
         if: always()
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          kind delete cluster --name spur-ci 2>/dev/null || true
+          sg docker -c "kind delete cluster --name spur-ci" 2>/dev/null || true

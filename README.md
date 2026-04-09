@@ -7,12 +7,28 @@ An AI-native job scheduler written in Rust. Drop-in compatible with Slurm's CLI,
 ### One-Line Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/powderluv/spur/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash
 ```
 
 Downloads the latest release binaries and installs them to `~/.spur/bin`. Add to your PATH with `export PATH="$HOME/.spur/bin:$PATH"`.
 
 **See [docs/quickstart.md](docs/quickstart.md) for the full walkthrough** — single-node setup in 5 minutes, multi-node with WireGuard mesh, GPU job examples, and troubleshooting.
+
+### Docker
+
+```bash
+# Latest release
+docker build -t spur .
+
+# Nightly
+docker build --build-arg VERSION=nightly -t spur:nightly .
+
+# Run
+docker run --rm spur sinfo
+docker run -d --name spurctld -p 6817:6817 spur spurctld --listen=[::]:6817
+```
+
+For Kubernetes deployment, see `deploy/k8s/`.
 
 ### Build from Source
 
@@ -26,6 +42,14 @@ cargo build --release
 
 # Run tests
 cargo test
+```
+
+### Build Portable Binaries
+
+Build glibc 2.28+ compatible binaries using Docker (works on Ubuntu 20.04+, RHEL 8+, Debian 10+):
+
+```bash
+./deploy/build-portable.sh    # outputs to dist/bin/
 ```
 
 ### Binaries
