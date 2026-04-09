@@ -68,6 +68,11 @@ if ! command -v docker &>/dev/null; then
     exit 0
 fi
 
+if ! docker info >/dev/null 2>&1; then
+    echo "SKIP: Docker daemon not accessible (add runner user to docker group: sudo usermod -aG docker \$USER)"
+    exit 0
+fi
+
 if [ ! -x "${SPUR_BIN}/spurctld" ]; then
     echo "ERROR: Spur binaries not found at ${SPUR_BIN}"
     exit 1
