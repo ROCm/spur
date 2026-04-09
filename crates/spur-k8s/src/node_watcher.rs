@@ -1,4 +1,5 @@
 use std::pin::pin;
+use std::sync::Arc;
 
 use futures_util::TryStreamExt;
 use k8s_openapi::api::core::v1::Node as K8sNode;
@@ -11,9 +12,10 @@ use tracing::{debug, error, info, warn};
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{RegisterAgentRequest, ResourceSet, UpdateNodeRequest};
 
-/// Watch K8s nodes with the `spur.ai/managed=true` label and register them
-/// with spurctld as virtual nodes. The operator's own gRPC address is used
-/// as the agent endpoint so that dispatch hits our virtual agent.
+use crate::heartbeat::HeartbeatManager;
+
+/// Watch K8s nodes matching `label_selector`, register them with spurctld, and
+/// keep `hb` in sync so the heartbeat task knows which nodes to ping.
 pub async fn run(
     client: Client,
     controller_addr: String,
@@ -21,6 +23,7 @@ pub async fn run(
     operator_grpc_port: u32,
     _namespace: String,
     label_selector: String,
+    hb: Arc<HeartbeatManager>,
 ) -> anyhow::Result<()> {
     let nodes: Api<K8sNode> = Api::all(client);
 
@@ -39,6 +42,7 @@ pub async fn run(
                 // Check if node is not-ready via taints
                 if is_node_not_ready(&node) {
                     warn!(node = %name, "K8s node has NotReady taint, marking DOWN");
+                    hb.untrack(&name).await;
                     let req = UpdateNodeRequest {
                         name: name.clone(),
                         state: Some(3), // NODE_DOWN
@@ -63,14 +67,18 @@ pub async fn run(
                     wg_pubkey: String::new(),
                 };
 
-                match ctrl_client.register_agent(req).await {
-                    Ok(_) => debug!(node = %name, "K8s node registered with spurctld"),
+                match ctrl_client.register_agent(req.clone()).await {
+                    Ok(_) => {
+                        debug!(node = %name, "K8s node registered with spurctld");
+                        hb.track(name, req).await;
+                    }
                     Err(e) => error!(node = %name, error = %e, "failed to register K8s node"),
                 }
             }
             Event::Delete(node) => {
                 let name = node.metadata.name.clone().unwrap_or_default();
                 warn!(node = %name, "K8s node deleted, marking DOWN");
+                hb.untrack(&name).await;
 
                 let req = UpdateNodeRequest {
                     name: name.clone(),
