@@ -146,3 +146,28 @@ jobs:
         run: |
           ssh mi300-2 '~/spur/etc/stop-agent.sh' || true
           ~/spur/etc/stop-all.sh || true
+
+  k8s:
+    name: K8s Integration (2x MI300X)
+    runs-on: [self-hosted, mi300x]
+    needs: cluster
+    concurrency:
+      group: cluster-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify binaries from cluster job
+        run: |
+          for bin in spurctld spurd spur spur-k8s-operator; do
+            ls ~/spur/bin/${bin}
+          done
+
+      - name: Run K8s integration tests
+        run: bash deploy/bare-metal/k8s_test.sh
+
+      - name: Cleanup K3s
+        if: always()
+        run: |
+          ssh mi300-2 'sudo /usr/local/bin/k3s-agent-uninstall.sh 2>/dev/null; true'
+          sudo /usr/local/bin/k3s-uninstall.sh 2>/dev/null || true
