@@ -129,15 +129,21 @@ async fn stream_output_only(
 
 /// Interactive attach: bidirectional stdin/stdout forwarding via AttachJob RPC.
 ///
-/// Issue #54 fixes:
-/// - Use per-byte reads instead of line-buffered reads so interactive programs work
-/// - Increase channel buffer to 256 to prevent deadlock under high output
-/// - Add connect timeout
+/// Issue #64 (reopen of #54):
+/// - Put terminal into raw mode so keystrokes are forwarded immediately
+///   (not buffered until newline by the kernel's line discipline)
+/// - Restore terminal on exit via Drop guard
+/// - Previous fix only switched to per-byte reads, but the terminal was still
+///   in canonical mode, so reads blocked on newline anyway
 async fn interactive_attach(
     agent: &mut SlurmAgentClient<tonic::transport::Channel>,
     job_id: u32,
 ) -> Result<()> {
     use tokio::io::AsyncReadExt;
+
+    // Enable raw mode on stdin so keystrokes are forwarded immediately.
+    // Save original termios to restore on exit (via Drop guard).
+    let _raw_guard = RawModeGuard::enter().ok(); // Non-fatal: if stdin isn't a TTY, continue in cooked mode
 
     let (tx, rx) = tokio::sync::mpsc::channel::<AttachJobInput>(256);
 
@@ -198,13 +204,61 @@ async fn interactive_attach(
             }
             Ok(None) => break,
             Err(e) => {
-                eprintln!("sattach: stream error: {}", e);
+                eprintln!("\r\nsattach: stream error: {}", e);
                 break;
             }
         }
     }
 
     Ok(())
+}
+
+/// RAII guard that sets the terminal to raw mode and restores it on drop.
+///
+/// Raw mode disables the kernel's line discipline so that:
+/// - Keystrokes are forwarded immediately (no buffering until Enter)
+/// - Special keys (Ctrl-C, Ctrl-Z) are sent as bytes instead of signals
+/// - No local echo (the remote shell handles echo)
+struct RawModeGuard {
+    original: libc::termios,
+}
+
+impl RawModeGuard {
+    fn enter() -> Result<Self> {
+        use std::mem::MaybeUninit;
+        use std::os::unix::io::AsRawFd;
+
+        let fd = std::io::stdin().as_raw_fd();
+
+        // Check stdin is a TTY
+        if unsafe { libc::isatty(fd) } != 1 {
+            anyhow::bail!("stdin is not a TTY");
+        }
+
+        // Save original termios
+        let mut original = MaybeUninit::<libc::termios>::uninit();
+        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
+            anyhow::bail!("tcgetattr failed");
+        }
+        let original = unsafe { original.assume_init() };
+
+        // Set raw mode
+        let mut raw = original;
+        unsafe { libc::cfmakeraw(&mut raw) };
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+            anyhow::bail!("tcsetattr failed");
+        }
+
+        Ok(Self { original })
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        let fd = std::io::stdin().as_raw_fd();
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &self.original) };
+    }
 }
 
 fn state_name(state: i32) -> &'static str {

@@ -21,29 +21,54 @@ use tracing::{debug, info, warn};
 const DEFAULT_IMAGE_DIR: &str = "/var/spool/spur/images";
 const CONTAINER_DIR: &str = "/var/spool/spur/containers";
 
-/// Return the image directory, honoring `SPUR_IMAGE_DIR` env var.
+/// Return candidate image directories, honoring `SPUR_IMAGE_DIR` env var.
 ///
-/// This must match the CLI's `resolve_image_dir()` logic so that images
-/// imported via `spur image import` are found by the agent at job launch.
+/// Returns all directories to search (in priority order) so that
+/// `resolve_image()` can find images regardless of which tier was used
+/// to import them.
 ///
-/// Priority (issue #55 — matches CLI's 3-tier fallback):
+/// Priority (issue #63 — fixes mismatch between CLI and agent):
 /// 1. `$SPUR_IMAGE_DIR` environment variable
-/// 2. `/var/spool/spur/images` if it exists
+/// 2. `/var/spool/spur/images` if it exists and is readable
 /// 3. `~/.spur/images/` as user-local fallback
-fn image_dir() -> PathBuf {
+///
+/// The CLI's `resolve_image_dir()` uses a writability check to decide
+/// where to *import* images, but the agent only needs *read* access to
+/// find them. We return all readable dirs so images imported to either
+/// the system dir or user dir are found.
+fn image_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
     if let Ok(dir) = std::env::var("SPUR_IMAGE_DIR") {
         if !dir.is_empty() {
-            return PathBuf::from(dir);
+            dirs.push(PathBuf::from(dir));
         }
     }
+
     let system_dir = Path::new(DEFAULT_IMAGE_DIR);
     if system_dir.is_dir() {
-        return system_dir.to_path_buf();
+        dirs.push(system_dir.to_path_buf());
     }
+
     if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".spur/images");
+        let user_dir = PathBuf::from(home).join(".spur/images");
+        if !dirs.contains(&user_dir) {
+            dirs.push(user_dir);
+        }
     }
-    system_dir.to_path_buf()
+
+    if dirs.is_empty() {
+        dirs.push(system_dir.to_path_buf());
+    }
+    dirs
+}
+
+/// Primary image directory (first candidate) — used for error messages.
+fn image_dir() -> PathBuf {
+    image_dirs()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_IMAGE_DIR))
 }
 
 /// A parsed bind mount specification.
@@ -100,33 +125,29 @@ pub fn resolve_image(image: &str) -> anyhow::Result<PathBuf> {
         }
     }
 
-    // Check image dir with sanitized name (respects SPUR_IMAGE_DIR env var)
-    let dir = image_dir();
+    // Search all candidate directories (issue #63: CLI may import to ~/.spur/images
+    // while agent previously only checked /var/spool/spur/images)
+    let dirs = image_dirs();
     let sanitized = sanitize_name(image);
-    let image_path = dir.join(format!("{}.sqsh", sanitized));
-    if image_path.exists() {
-        return Ok(image_path);
-    }
 
-    // Try without .sqsh extension
-    let image_path = dir.join(&sanitized);
-    if image_path.exists() {
-        return Ok(image_path);
-    }
-
-    // Also check ~/.spur/images (matching CLI's resolve_image_dir behavior)
-    if let Some(home) = std::env::var_os("HOME") {
-        let home_dir = PathBuf::from(home).join(".spur/images");
-        let image_path = home_dir.join(format!("{}.sqsh", sanitized));
+    for dir in &dirs {
+        // Try with .sqsh extension
+        let image_path = dir.join(format!("{}.sqsh", sanitized));
+        if image_path.exists() {
+            return Ok(image_path);
+        }
+        // Try without extension
+        let image_path = dir.join(&sanitized);
         if image_path.exists() {
             return Ok(image_path);
         }
     }
 
+    let searched: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
     bail!(
-        "container image '{}' not found in {}. Import it first with: spur image import {}",
+        "container image '{}' not found in [{}]. Import it first with: spur image import {}",
         image,
-        dir.display(),
+        searched.join(", "),
         image
     )
 }

@@ -1267,12 +1267,13 @@ impl ClusterManager {
                 continue;
             }
 
-            // Nodes exist but may be fully allocated — check if any idle node
-            // can satisfy resource requirements.
+            // Nodes exist but may be fully allocated — check if any node
+            // can satisfy resource requirements with AVAILABLE resources.
             //
-            // This must mirror the checks in BackfillScheduler::find_suitable_nodes
-            // so that the displayed reason accurately reflects why the scheduler
-            // can't place the job (issue #56 — reopened #47).
+            // Issue #65 (reopen of #56): previous check used total_resources,
+            // which always returned true for idle nodes even when their
+            // available resources (total - alloc) were insufficient because
+            // other jobs consumed them. Must use available = total - alloc.
             let required = spur_sched::backfill::job_resource_request(job);
             let has_capable_node = nodes_in_partition.iter().any(|n| {
                 if !n.is_schedulable() {
@@ -1302,7 +1303,11 @@ impl ClusterManager {
                         return false;
                     }
                 }
-                n.total_resources.can_satisfy(&required)
+                // Check AVAILABLE resources (total minus already allocated),
+                // not just total capacity. This matches what the backfill
+                // scheduler actually does when trying to place a job.
+                let available = n.total_resources.subtract(&n.alloc_resources);
+                available.can_satisfy(&required)
             });
 
             if !has_capable_node {

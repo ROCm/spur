@@ -717,4 +717,62 @@ mod tests {
         // Should land on node002 (the idle one), not node001 (partially allocated)
         assert_eq!(assignments[0].nodes[0], "node002");
     }
+
+    #[test]
+    fn t07_31_fully_allocated_nodes_not_scheduled() {
+        // Issue #65: Jobs stuck PENDING with Reason=Priority when nodes
+        // are fully allocated. Verify that a job requiring more resources
+        // than available (total - alloc) is NOT scheduled.
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(1, 64, 256_000);
+        // Node is nearly fully allocated (60 of 64 CPUs consumed)
+        nodes[0].alloc_resources.cpus = 60;
+        let partitions = vec![make_partition("default", 1)];
+        // Job requests 32 CPUs — more than the 4 available
+        let mut job = make_job("big-job");
+        job.spec.cpus_per_task = 32;
+        job.spec.num_tasks = 1;
+
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+        };
+        let assignments = sched.schedule(&[job], &cluster);
+        // Should NOT be scheduled — insufficient available resources
+        assert_eq!(
+            assignments.len(),
+            0,
+            "job should not schedule on a node with only 4 free CPUs"
+        );
+    }
+
+    #[test]
+    fn t07_32_partially_allocated_node_accepts_fitting_job() {
+        // Issue #65 counterpart: a job that fits in the remaining resources
+        // should still schedule.
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(1, 64, 256_000);
+        // 32 CPUs already allocated, 32 still free
+        nodes[0].alloc_resources.cpus = 32;
+        let partitions = vec![make_partition("default", 1)];
+        // Job requests only 4 CPUs — fits
+        let mut job = make_job("small-job");
+        job.spec.cpus_per_task = 4;
+        job.spec.num_tasks = 1;
+
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+        };
+        let assignments = sched.schedule(&[job], &cluster);
+        assert_eq!(
+            assignments.len(),
+            1,
+            "small job should fit on partially allocated node"
+        );
+    }
 }
