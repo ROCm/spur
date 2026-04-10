@@ -114,13 +114,23 @@ fn is_node_not_ready(node: &K8sNode) -> bool {
         })
 }
 
+/// Parse a Kubernetes CPU quantity into whole cores.
+fn parse_k8s_cpu(q: &str) -> u32 {
+    if let Some(milli_str) = q.strip_suffix('m') {
+        // We only advertise fully available cores, not partial ones.
+        (milli_str.parse::<u64>().unwrap_or(0) / 1000) as u32
+    } else {
+        q.parse::<u32>().unwrap_or(0)
+    }
+}
+
 /// Extract CPU, memory, and GPU resources from a K8s Node's allocatable.
 fn extract_resources(node: &K8sNode) -> ResourceSet {
     let allocatable = node.status.as_ref().and_then(|s| s.allocatable.as_ref());
 
     let cpus = allocatable
         .and_then(|a| a.get("cpu"))
-        .and_then(|q| q.0.parse::<u32>().ok())
+        .map(|q| parse_k8s_cpu(&q.0))
         .unwrap_or(0);
 
     let memory_mb = allocatable
@@ -316,6 +326,34 @@ mod tests {
         assert!(!is_node_not_ready(&node));
     }
 
+    // --- parse_k8s_cpu ---
+
+    #[test]
+    fn test_parse_k8s_cpu_whole_cores() {
+        assert_eq!(parse_k8s_cpu("64"), 64);
+        assert_eq!(parse_k8s_cpu("4"), 4);
+        assert_eq!(parse_k8s_cpu("0"), 0);
+    }
+
+    #[test]
+    fn test_parse_k8s_cpu_millicores_exact() {
+        assert_eq!(parse_k8s_cpu("64000m"), 64);
+        assert_eq!(parse_k8s_cpu("4000m"), 4);
+    }
+
+    #[test]
+    fn test_parse_k8s_cpu_millicores_with_overhead() {
+        assert_eq!(parse_k8s_cpu("3800m"), 3);
+        assert_eq!(parse_k8s_cpu("63800m"), 63);
+    }
+
+    #[test]
+    fn test_parse_k8s_cpu_invalid() {
+        assert_eq!(parse_k8s_cpu(""), 0);
+        assert_eq!(parse_k8s_cpu("bad"), 0);
+        assert_eq!(parse_k8s_cpu("badm"), 0);
+    }
+
     // --- extract_resources ---
 
     #[test]
@@ -329,6 +367,17 @@ mod tests {
         assert_eq!(res.cpus, 64);
         assert_eq!(res.memory_mb, 262144);
         assert!(res.gpus.is_empty());
+    }
+
+    #[test]
+    fn test_extract_resources_millicore_cpu() {
+        let mut alloc = BTreeMap::new();
+        alloc.insert("cpu".into(), Quantity("3800m".into()));
+        alloc.insert("memory".into(), Quantity("7841Mi".into()));
+
+        let node = make_node("node-1", BTreeMap::new(), alloc, vec![]);
+        let res = extract_resources(&node);
+        assert_eq!(res.cpus, 3);
     }
 
     #[test]
