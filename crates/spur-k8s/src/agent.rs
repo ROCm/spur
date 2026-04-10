@@ -87,19 +87,13 @@ impl SlurmAgent for VirtualAgent {
             }
         }
 
-        // Compute node rank from peer_nodes
-        let node_rank = if !target_node.is_empty() {
-            peer_nodes
-                .iter()
-                .position(|p| {
-                    // peer_nodes contains addr:port strings; target_node is a hostname.
-                    // Try matching by checking if the peer starts with the target_node.
-                    p.starts_with(&target_node)
-                })
-                .unwrap_or(0) as u32
-        } else {
-            0
-        };
+        // Compute node rank from task_offset.
+        // Issue #69: peer_nodes contains addr:port strings (e.g., "10.0.0.1:6818")
+        // while target_node is a hostname — starts_with matching never worked,
+        // causing all pods to get rank 0. Instead, derive rank from task_offset
+        // which is incremented per-node by the dispatcher.
+        let tasks_per_node = spec.tasks_per_node.max(1);
+        let node_rank = req.task_offset / tasks_per_node;
 
         // Build env vars
         let mut env_vars: Vec<EnvVar> = vec![

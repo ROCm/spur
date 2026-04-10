@@ -676,6 +676,29 @@ impl ClusterManager {
             }
         };
 
+        // Issue #70: If node is already registered, update its connection
+        // info and resources but PRESERVE its current state and allocations.
+        // The K8s node watcher re-registers nodes on every Apply event, which
+        // was resetting Allocated/Mixed nodes back to Idle.
+        {
+            let mut nodes = self.nodes.write();
+            if let Some(existing) = nodes.get_mut(&effective_name) {
+                // Update connection info and resources, keep state + allocations
+                existing.total_resources = resources.clone();
+                existing.address = Some(address.clone());
+                existing.port = port;
+                existing.source = source;
+                if !wg_pubkey.is_empty() {
+                    existing.wg_pubkey = Some(wg_pubkey);
+                }
+                existing.version = Some(version);
+                existing.last_heartbeat = Some(Utc::now());
+                debug!(node = %effective_name, state = ?existing.state, "node re-registered (state preserved)");
+                return;
+            }
+        }
+
+        // First-time registration: create new node with Idle state
         let mut node = Node::new(effective_name.clone(), resources.clone());
         node.state = NodeState::Idle;
         node.source = source;
