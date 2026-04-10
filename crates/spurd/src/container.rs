@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 
 /// Where squashfs images and container rootfs are stored.
 const DEFAULT_IMAGE_DIR: &str = "/var/spool/spur/images";
-const CONTAINER_DIR: &str = "/var/spool/spur/containers";
+const DEFAULT_CONTAINER_DIR: &str = "/var/spool/spur/containers";
 
 /// Return candidate image directories, honoring `SPUR_IMAGE_DIR` env var.
 ///
@@ -69,6 +69,35 @@ fn image_dir() -> PathBuf {
         .into_iter()
         .next()
         .unwrap_or_else(|| PathBuf::from(DEFAULT_IMAGE_DIR))
+}
+
+/// Return the container rootfs directory, with user-local fallback.
+///
+/// Priority:
+/// 1. `$SPUR_CONTAINER_DIR` environment variable
+/// 2. `/var/spool/spur/containers` if writable
+/// 3. `~/.spur/containers/` as user-local fallback
+fn container_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("SPUR_CONTAINER_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    let system_dir = Path::new(DEFAULT_CONTAINER_DIR);
+    // Check if system dir is writable (need to extract rootfs into it)
+    if system_dir.is_dir() {
+        let test_file = system_dir.join(".spur_write_test");
+        if std::fs::write(&test_file, b"").is_ok() {
+            let _ = std::fs::remove_file(&test_file);
+            return system_dir.to_path_buf();
+        }
+    } else if std::fs::create_dir_all(system_dir).is_ok() {
+        return system_dir.to_path_buf();
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".spur/containers");
+    }
+    system_dir.to_path_buf()
 }
 
 /// A parsed bind mount specification.
@@ -172,10 +201,11 @@ pub fn setup_rootfs(
     job_id: u32,
     name: Option<&str>,
 ) -> anyhow::Result<(PathBuf, RootfsMode)> {
+    let cdir = container_dir();
     let base_dir = if let Some(name) = name {
-        PathBuf::from(CONTAINER_DIR).join(sanitize_name(name))
+        cdir.join(sanitize_name(name))
     } else {
-        PathBuf::from(CONTAINER_DIR).join(format!("job_{}", job_id))
+        cdir.join(format!("job_{}", job_id))
     };
 
     // If named container already exists, reuse it
@@ -673,7 +703,7 @@ pub fn parse_mount(spec: &str) -> anyhow::Result<BindMount> {
 ///
 /// Handles both overlay (unmount) and extracted (rm -rf) modes.
 pub fn cleanup_rootfs(job_id: u32, mode: &RootfsMode) {
-    let base_dir = PathBuf::from(CONTAINER_DIR).join(format!("job_{}", job_id));
+    let base_dir = container_dir().join(format!("job_{}", job_id));
     if !base_dir.exists() {
         return;
     }
