@@ -61,7 +61,7 @@ async fn readyz(State(state): State<Arc<HealthState>>) -> impl IntoResponse {
 
     if k8s_ok && ctrl_ok {
         debug!("readyz: ok");
-        (StatusCode::OK, "ok")
+        (StatusCode::OK, "ok".to_string())
     } else {
         let mut reasons = Vec::new();
         if !k8s_ok {
@@ -70,10 +70,7 @@ async fn readyz(State(state): State<Arc<HealthState>>) -> impl IntoResponse {
         if !ctrl_ok {
             reasons.push("spurctld-unreachable");
         }
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            reasons.join(",").leak() as &'static str,
-        )
+        (StatusCode::SERVICE_UNAVAILABLE, reasons.join(","))
     }
 }
 
