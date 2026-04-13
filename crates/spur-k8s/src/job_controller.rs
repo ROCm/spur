@@ -3,6 +3,9 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use backoff::future::retry;
+use backoff::ExponentialBackoffBuilder;
+
 use futures_util::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Pod, Service};
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
@@ -37,7 +40,6 @@ pub enum ReconcileError {
 pub struct JobControllerCtx {
     pub client: Client,
     pub ctrl_client: Mutex<SlurmControllerClient<Channel>>,
-    pub namespace: String,
     /// Track multi-pod completion: job_id → (expected_count, completed_count, any_failed)
     pub(crate) pod_tracker: Mutex<HashMap<u32, PodTracker>>,
 }
@@ -63,7 +65,7 @@ async fn reconcile(
         .metadata
         .namespace
         .clone()
-        .unwrap_or_else(|| ctx.namespace.clone());
+        .ok_or_else(|| ReconcileError::Other("SpurJob has no namespace".into()))?;
     let api: Api<SpurJob> = Api::namespaced(ctx.client.clone(), &ns);
 
     finalizer(&api, FINALIZER, job, |event| {
@@ -100,6 +102,11 @@ async fn handle_job(
     ctx: &JobControllerCtx,
 ) -> Result<Action, ReconcileError> {
     let name = job.metadata.name.clone().unwrap_or_default();
+    let ns = job
+        .metadata
+        .namespace
+        .clone()
+        .ok_or_else(|| ReconcileError::Other("SpurJob has no namespace".into()))?;
     let status = job.status.clone().unwrap_or_default();
 
     // If already in terminal state, nothing to do
@@ -132,7 +139,7 @@ async fn handle_job(
         {
             Ok(resp) => {
                 let job_id = resp.into_inner().job_id;
-                info!(spurjob = %name, job_id, "SpurJob submitted");
+                info!(spurjob = %name, job_id, namespace = %ns, "SpurJob submitted");
 
                 let new_status = SpurJobStatus {
                     state: "Pending".into(),
@@ -152,6 +159,12 @@ async fn handle_job(
 
     // Poll Spur for job status updates
     let job_id = status.spur_job_id.unwrap();
+
+    // Required for VirtualAgent namespace lookup; retry until applied.
+    if ensure_job_id_label(&job, api, &name, job_id).await.is_err() {
+        return Ok(Action::requeue(Duration::from_secs(2)));
+    }
+
     let mut ctrl = ctx.ctrl_client.lock().await;
 
     match ctrl.get_job(GetJobRequest { job_id }).await {
@@ -190,6 +203,11 @@ async fn handle_job(
 /// kube::runtime::finalizer removes spur.ai/cleanup automatically after this returns Ok.
 async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action, ReconcileError> {
     let name = job.metadata.name.clone().unwrap_or_default();
+    let ns = job
+        .metadata
+        .namespace
+        .clone()
+        .ok_or_else(|| ReconcileError::Other("SpurJob has no namespace".into()))?;
     let status = job.status.clone().unwrap_or_default();
 
     info!(spurjob = %name, "handling SpurJob deletion");
@@ -208,7 +226,7 @@ async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action
         }
 
         // Delete all Pods by label
-        let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
+        let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &ns);
         let lp = ListParams::default().labels(&format!("spur.ai/job-id={}", job_id));
         if let Ok(pod_list) = pods.list(&lp).await {
             for pod in pod_list {
@@ -218,7 +236,7 @@ async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action
         }
 
         // Delete headless Service
-        let services: Api<Service> = Api::namespaced(ctx.client.clone(), &ctx.namespace);
+        let services: Api<Service> = Api::namespaced(ctx.client.clone(), &ns);
         let svc_name = format!("spur-job-{}", job_id);
         let _ = services.delete(&svc_name, &DeleteParams::default()).await;
     }
@@ -233,7 +251,11 @@ fn error_policy(_job: Arc<SpurJob>, error: &ReconcileError, _ctx: Arc<JobControl
 }
 
 /// Start the SpurJob controller and Pod watcher.
-pub async fn run(client: Client, controller_addr: String, namespace: String) -> anyhow::Result<()> {
+pub async fn run(
+    client: Client,
+    controller_addr: String,
+    operator_namespace: String,
+) -> anyhow::Result<()> {
     let url = if controller_addr.starts_with("http") {
         controller_addr
     } else {
@@ -244,27 +266,24 @@ pub async fn run(client: Client, controller_addr: String, namespace: String) -> 
     let ctx = Arc::new(JobControllerCtx {
         client: client.clone(),
         ctrl_client: Mutex::new(ctrl_client),
-        namespace: namespace.clone(),
         pod_tracker: Mutex::new(HashMap::new()),
     });
 
-    let spurjobs: Api<SpurJob> = Api::namespaced(client.clone(), &namespace);
-    let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
+    let spurjobs: Api<SpurJob> = Api::all(client.clone());
+    let pods: Api<Pod> = Api::all(client.clone());
 
-    info!(namespace = %namespace, "starting SpurJob controller");
+    info!(namespace = %operator_namespace, "starting SpurJob controller");
 
     // Clean up orphan Pods on startup
     let cleanup_client = client.clone();
-    let cleanup_ns = namespace.clone();
     tokio::spawn(async move {
-        cleanup_orphan_pods(cleanup_client, cleanup_ns).await;
+        cleanup_orphan_pods(cleanup_client).await;
     });
 
     // Run pod watcher for completion callbacks in background
     let pod_ctx = ctx.clone();
-    let pod_ns = namespace.clone();
     tokio::spawn(async move {
-        if let Err(e) = watch_pods(pod_ctx, pod_ns).await {
+        if let Err(e) = watch_pods(pod_ctx).await {
             error!(error = %e, "pod watcher exited");
         }
     });
@@ -287,8 +306,8 @@ pub async fn run(client: Client, controller_addr: String, namespace: String) -> 
 }
 
 /// Watch Pods labeled with spur.ai/job-id and report terminal states back to spurctld.
-async fn watch_pods(ctx: Arc<JobControllerCtx>, namespace: String) -> anyhow::Result<()> {
-    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &namespace);
+async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
+    let pods: Api<Pod> = Api::all(ctx.client.clone());
 
     let stream = kube::runtime::watcher::watcher(
         pods,
@@ -464,9 +483,9 @@ fn extract_failure_details(pod: &Pod) -> (i32, i32, String) {
 }
 
 /// Clean up orphan Pods on startup — Pods with spur labels but no matching SpurJob.
-async fn cleanup_orphan_pods(client: Client, namespace: String) {
-    let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
-    let spurjobs: Api<SpurJob> = Api::namespaced(client, &namespace);
+async fn cleanup_orphan_pods(client: Client) {
+    let pods: Api<Pod> = Api::all(client.clone());
+    let spurjobs: Api<SpurJob> = Api::all(client.clone());
 
     let lp = ListParams::default().labels("spur.ai/managed-by=spur-k8s-operator");
     let pod_list = match pods.list(&lp).await {
@@ -497,6 +516,10 @@ async fn cleanup_orphan_pods(client: Client, namespace: String) {
 
     for pod in pod_list {
         let pod_name = pod.metadata.name.clone().unwrap_or_default();
+        let pod_ns = match pod.metadata.namespace.as_deref() {
+            Some(ns) => ns.to_string(),
+            None => continue,
+        };
         let job_id = pod
             .metadata
             .labels
@@ -514,11 +537,52 @@ async fn cleanup_orphan_pods(client: Client, namespace: String) {
                 .unwrap_or("");
 
             if phase == "Succeeded" || phase == "Failed" {
-                info!(pod = %pod_name, job_id, "cleaning up orphan Pod");
-                let _ = pods.delete(&pod_name, &DeleteParams::default()).await;
+                info!(pod = %pod_name, namespace = %pod_ns, job_id, "cleaning up orphan Pod");
+                let ns_api: Api<Pod> = Api::namespaced(client.clone(), &pod_ns);
+                let _ = ns_api.delete(&pod_name, &DeleteParams::default()).await;
             }
         }
     }
+}
+
+fn has_job_id_label(job: &SpurJob) -> bool {
+    job.metadata
+        .labels
+        .as_ref()
+        .and_then(|l| l.get("spur.ai/job-id"))
+        .is_some()
+}
+
+/// Ensure `spur.ai/job-id` is set on the SpurJob, retrying on transient API errors.
+/// Returns Ok if the label is already present or was applied successfully.
+async fn ensure_job_id_label(
+    job: &SpurJob,
+    api: &Api<SpurJob>,
+    name: &str,
+    job_id: u32,
+) -> Result<(), kube::Error> {
+    if has_job_id_label(job) {
+        return Ok(());
+    }
+
+    let patch = serde_json::json!({
+        "metadata": { "labels": { "spur.ai/job-id": job_id.to_string() } }
+    });
+
+    let backoff = ExponentialBackoffBuilder::new()
+        .with_initial_interval(Duration::from_millis(200))
+        .with_max_elapsed_time(Some(Duration::from_secs(3)))
+        .build();
+
+    retry(backoff, || async {
+        api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+            .map(|_| ())
+            .map_err(backoff::Error::transient)
+    })
+    .await
+    .inspect(|_| info!(spurjob = %name, job_id, "applied job-id label"))
+    .inspect_err(|e| warn!(spurjob = %name, job_id, error = %e, "failed to apply job-id label"))
 }
 
 async fn patch_status(api: &Api<SpurJob>, name: &str, status: &SpurJobStatus) {
