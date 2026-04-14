@@ -9,19 +9,19 @@
 #   - Leader election via K8s Lease
 #
 # Prerequisites:
-#   - Spur binaries at ~/spur/bin/ (from cluster job)
 #   - Docker installed
+#   - SPUR_CI_IMAGE set to a pre-built Spur container image (e.g. spur:ci)
 #
-# Usage: bash deploy/bare-metal/k8s_test.sh
+# Usage:
+#   SPUR_CI_IMAGE=spur:ci bash deploy/bare-metal/k8s_test.sh
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-SPUR_HOME="${HOME}/spur"
-SPUR_BIN="${SPUR_HOME}/bin"
 TOOLS_DIR="${HOME}/.local/bin"
 CLUSTER_NAME="spur-ci"
+SPUR_CI_IMAGE="${SPUR_CI_IMAGE:?SPUR_CI_IMAGE must be set to a Docker image (e.g. spur:ci)}"
 
 mkdir -p "${TOOLS_DIR}"
 export PATH="${TOOLS_DIR}:${PATH}"
@@ -74,12 +74,7 @@ if ! docker info >/dev/null 2>&1; then
     exit 0
 fi
 
-if [ ! -x "${SPUR_BIN}/spurctld" ]; then
-    echo "ERROR: Spur binaries not found at ${SPUR_BIN}"
-    exit 1
-fi
-
-pass "Docker and Spur binaries available"
+pass "Docker available"
 
 # ============================================================
 # Install tools (kind + kubectl)
@@ -138,27 +133,14 @@ done
 pass "Worker nodes labeled for Spur"
 
 # ============================================================
-# Build and load container image
+# Load container image into kind
 # ============================================================
-section "Build Spur container image"
+section "Load Spur container image"
 
-BUILD_DIR=$(mktemp -d)
-
-cat > "${BUILD_DIR}/Dockerfile" <<'DOCKERFILE'
-FROM ubuntu:22.04
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates util-linux curl && rm -rf /var/lib/apt/lists/*
-COPY bin/ /usr/local/bin/
-DOCKERFILE
-
-mkdir -p "${BUILD_DIR}/bin"
-for b in spur spurctld spurd spurdbd spurrestd spur-k8s-operator; do
-    cp "${SPUR_BIN}/${b}" "${BUILD_DIR}/bin/"
-done
-
-docker build -t spur:ci "${BUILD_DIR}" \
-    && pass "Container image built" \
-    || fail "Container image build failed"
+echo "  Source image: ${SPUR_CI_IMAGE}"
+if [ "$SPUR_CI_IMAGE" != "spur:ci" ]; then
+    docker tag "$SPUR_CI_IMAGE" spur:ci
+fi
 
 kind load docker-image spur:ci --name "${CLUSTER_NAME}" \
     && pass "Image loaded into kind" \
@@ -170,15 +152,13 @@ kind load docker-image busybox:latest --name "${CLUSTER_NAME}" \
     && pass "busybox image loaded into kind" \
     || fail "busybox image load failed"
 
-rm -rf "${BUILD_DIR}"
-
 # ============================================================
 # Deploy Spur to K8s
 # ============================================================
 section "Deploy Spur to K8s"
 
 # Register SpurJob CRD
-"${SPUR_BIN}/spur-k8s-operator" generate-crd | kubectl apply -f - \
+docker run --rm spur:ci generate-crd | kubectl apply -f - \
     && pass "SpurJob CRD registered" \
     || fail "CRD registration failed"
 
@@ -225,9 +205,11 @@ kubectl -n spur wait --for=condition=Ready pod -l app=spurctld --timeout=120s \
     && pass "Controller pod ready" \
     || fail "Controller not ready"
 
-# Health check via exec into operator pod
+# Health check via a temporary busybox pod hitting the operator's pod IP
 OPERATOR_POD=$(kubectl -n spur get pod -l app=spur-k8s-operator -o jsonpath='{.items[0].metadata.name}')
-kubectl -n spur exec "$OPERATOR_POD" -- curl -sf http://localhost:8080/healthz >/dev/null 2>&1 \
+OPERATOR_IP=$(kubectl -n spur get pod "$OPERATOR_POD" -o jsonpath='{.status.podIP}')
+kubectl run healthcheck -n spur --image=busybox:latest --restart=Never --rm -i \
+    -- wget -qO- -T 5 "http://${OPERATOR_IP}:8080/healthz" >/dev/null 2>&1 \
     && pass "Operator /healthz OK" \
     || fail "Operator /healthz failed"
 

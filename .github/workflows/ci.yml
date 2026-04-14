@@ -149,24 +149,47 @@ jobs:
           ssh mi300-2 '~/spur/etc/stop-agent.sh' || true
           ~/spur/etc/stop-all.sh || true
 
-  k8s:
-    name: K8s Integration (2x MI300X)
+  build-docker-image:
+    name: Build Docker Image
     runs-on: [self-hosted, mi300x]
-    needs: cluster
+    needs: [build-and-test, fmt, clippy]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build container image
+        run: sg docker -c "docker build -f deploy/Dockerfile -t spur:ci ."
+
+      - name: Save image as artifact
+        run: sg docker -c "docker save spur:ci -o /tmp/spur-ci-image.tar"
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spur-ci-image
+          path: /tmp/spur-ci-image.tar
+          retention-days: 1
+
+  k8s:
+    name: K8s Integration
+    runs-on: [self-hosted, mi300x]
+    needs: build-docker-image
     concurrency:
-      group: cluster-${{ github.ref }}
+      group: k8s-${{ github.ref }}
       cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify binaries from cluster job
-        run: |
-          for bin in spurctld spurd spur spur-k8s-operator; do
-            ls ~/spur/bin/${bin}
-          done
+      - name: Download CI image
+        uses: actions/download-artifact@v4
+        with:
+          name: spur-ci-image
+          path: /tmp
+
+      - name: Load CI image
+        run: sg docker -c "docker load -i /tmp/spur-ci-image.tar"
 
       - name: Run K8s integration tests
-        run: sg docker -c "bash deploy/bare-metal/k8s_test.sh"
+        run: sg docker -c "SPUR_CI_IMAGE=spur:ci bash deploy/bare-metal/k8s_test.sh"
 
       - name: Cleanup kind cluster
         if: always()
