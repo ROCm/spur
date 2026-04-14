@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
+use backoff::future::retry;
+use backoff::ExponentialBackoffBuilder;
 use k8s_openapi::api::core::v1::{
     Container, EnvVar, HostPathVolumeSource, Pod, PodSpec, ResourceRequirements, Service,
     ServicePort, ServiceSpec, Volume, VolumeMount,
@@ -12,18 +15,53 @@ use tokio::io::AsyncReadExt;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, warn};
 
+use crate::crd::SpurJob;
 use spur_proto::proto::slurm_agent_server::SlurmAgent;
 use spur_proto::proto::*;
 
 /// Virtual SlurmAgent that creates K8s Pods instead of fork/exec.
 pub struct VirtualAgent {
     client: Client,
-    namespace: String,
 }
 
 impl VirtualAgent {
-    pub fn new(client: Client, namespace: String) -> Self {
-        Self { client, namespace }
+    pub fn new(client: Client) -> Self {
+        Self { client }
+    }
+
+    /// Look up the namespace of the SpurJob labeled `spur.ai/job-id=<id>`.
+    /// Fails loudly if not found so pods are never placed in the wrong namespace.
+    async fn resolve_namespace(&self, job_id: u32) -> Result<String, Status> {
+        let api: Api<SpurJob> = Api::all(self.client.clone());
+        let lp = ListParams::default().labels(&format!("spur.ai/job-id={}", job_id));
+
+        let backoff = ExponentialBackoffBuilder::new()
+            .with_initial_interval(Duration::from_millis(200))
+            .with_max_elapsed_time(Some(Duration::from_secs(5)))
+            .build();
+
+        retry(backoff, || async {
+            let list = tokio::time::timeout(Duration::from_millis(300), api.list(&lp))
+                .await
+                .map_err(|_| backoff::Error::transient(Status::unavailable("k8s API timeout")))?
+                .map_err(|e| backoff::Error::permanent(Status::internal(e.to_string())))?;
+
+            list.items
+                .into_iter()
+                .next()
+                .and_then(|j| j.metadata.namespace)
+                .ok_or_else(|| {
+                    backoff::Error::transient(Status::not_found(format!(
+                        "spur.ai/job-id={job_id} label not yet visible"
+                    )))
+                })
+        })
+        .await
+        .map_err(|e| {
+            Status::not_found(format!(
+                "no SpurJob with label spur.ai/job-id={job_id} found: {e}"
+            ))
+        })
     }
 }
 
@@ -39,6 +77,7 @@ impl SlurmAgent for VirtualAgent {
     ) -> Result<Response<LaunchJobResponse>, Status> {
         let req = request.into_inner();
         let job_id = req.job_id;
+        let ns = self.resolve_namespace(job_id).await?;
         let target_node = req.target_node.clone();
         let peer_nodes = &req.peer_nodes;
         let num_peers = peer_nodes.len();
@@ -128,7 +167,7 @@ impl SlurmAgent for VirtualAgent {
         // For multi-node jobs, add distributed training env vars
         if num_peers > 1 {
             // MASTER_ADDR: first peer node's address (or headless service DNS)
-            let master_addr = format!("spur-job-{}.{}.svc.cluster.local", job_id, self.namespace);
+            let master_addr = format!("spur-job-{}.{}.svc.cluster.local", job_id, ns);
             env_vars.push(EnvVar {
                 name: "MASTER_ADDR".into(),
                 value: Some(master_addr),
@@ -247,7 +286,7 @@ impl SlurmAgent for VirtualAgent {
 
         // For multi-node jobs, create headless Service for DNS discovery
         if num_peers > 1 {
-            if let Err(e) = self.ensure_headless_service(job_id, &labels).await {
+            if let Err(e) = self.ensure_headless_service(job_id, &labels, &ns).await {
                 warn!(job_id, error = %e, "failed to create headless service");
             }
         }
@@ -272,7 +311,7 @@ impl SlurmAgent for VirtualAgent {
         let pod = Pod {
             metadata: ObjectMeta {
                 name: Some(pod_name.clone()),
-                namespace: Some(self.namespace.clone()),
+                namespace: Some(ns.clone()),
                 labels: Some(labels),
                 ..Default::default()
             },
@@ -292,10 +331,10 @@ impl SlurmAgent for VirtualAgent {
             ..Default::default()
         };
 
-        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &ns);
         match pods.create(&PostParams::default(), &pod).await {
             Ok(_) => {
-                info!(job_id, pod = %pod_name, target = %req.target_node, "K8s Pod created");
+                info!(job_id, pod = %pod_name, namespace = %ns, target = %req.target_node, "K8s Pod created");
                 Ok(Response::new(LaunchJobResponse {
                     success: true,
                     error: String::new(),
@@ -317,9 +356,10 @@ impl SlurmAgent for VirtualAgent {
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         let job_id = req.job_id;
+        let ns = self.resolve_namespace(job_id).await?;
 
         // Delete all pods for this job by label selector
-        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &ns);
         let lp = ListParams::default().labels(&format!("spur.ai/job-id={}", job_id));
 
         match pods.list(&lp).await {
@@ -343,7 +383,7 @@ impl SlurmAgent for VirtualAgent {
         }
 
         // Also clean up the headless service if it exists
-        let services: Api<Service> = Api::namespaced(self.client.clone(), &self.namespace);
+        let services: Api<Service> = Api::namespaced(self.client.clone(), &ns);
         let svc_name = format!("spur-job-{}", job_id);
         match services.delete(&svc_name, &DeleteParams::default()).await {
             Ok(_) => debug!(job_id, "deleted headless Service"),
@@ -371,7 +411,9 @@ impl SlurmAgent for VirtualAgent {
         request: Request<ExecInJobRequest>,
     ) -> Result<Response<ExecInJobResponse>, Status> {
         let req = request.into_inner();
-        let pod_name = format!("spur-job-{}", req.job_id);
+        let job_id = req.job_id;
+        let ns = self.resolve_namespace(job_id).await?;
+        let pod_name = format!("spur-job-{}", job_id);
         let command: Vec<String> = if req.command.is_empty() {
             vec!["bash".into(), "-c".into(), "echo ok".into()]
         } else {
@@ -380,7 +422,7 @@ impl SlurmAgent for VirtualAgent {
 
         debug!(pod = %pod_name, cmd = ?command, "exec in K8s pod");
 
-        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &ns);
 
         let attach = AttachParams {
             stdin: false,
@@ -433,11 +475,13 @@ impl SlurmAgent for VirtualAgent {
         request: Request<StreamJobOutputRequest>,
     ) -> Result<Response<Self::StreamJobOutputStream>, Status> {
         let req = request.into_inner();
-        let pod_name = format!("spur-job-{}", req.job_id);
+        let job_id = req.job_id;
+        let ns = self.resolve_namespace(job_id).await?;
+        let pod_name = format!("spur-job-{}", job_id);
 
         debug!(pod = %pod_name, "streaming logs from K8s pod");
 
-        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &ns);
         let log_params = kube::api::LogParams {
             follow: true,
             tail_lines: Some(100),
@@ -502,8 +546,9 @@ impl VirtualAgent {
         &self,
         job_id: u32,
         labels: &BTreeMap<String, String>,
+        namespace: &str,
     ) -> Result<(), kube::Error> {
-        let services: Api<Service> = Api::namespaced(self.client.clone(), &self.namespace);
+        let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
         let svc_name = format!("spur-job-{}", job_id);
 
         let selector = BTreeMap::from([("spur.ai/job-id".to_string(), job_id.to_string())]);
@@ -511,7 +556,7 @@ impl VirtualAgent {
         let svc = Service {
             metadata: ObjectMeta {
                 name: Some(svc_name.clone()),
-                namespace: Some(self.namespace.clone()),
+                namespace: Some(namespace.to_string()),
                 labels: Some(labels.clone()),
                 ..Default::default()
             },

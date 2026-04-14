@@ -39,10 +39,6 @@ struct Args {
     #[arg(long, env = "SPUR_OPERATOR_ADDRESS")]
     address: Option<String>,
 
-    /// K8s namespace for SpurJobs and Pods
-    #[arg(long, default_value = "spur")]
-    namespace: String,
-
     /// K8s node label selector
     #[arg(long, default_value = "spur.ai/managed=true")]
     node_selector: String,
@@ -90,6 +86,10 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let client = Client::try_default().await?;
+
+    // Operator's own namespace: injected by K8s Downward API as POD_NAMESPACE.
+    // Empty string if not set; callers that require it should validate and error out.
+    let operator_namespace = std::env::var("POD_NAMESPACE").unwrap_or_default();
 
     let listen_addr: SocketAddr = args.listen.parse()?;
     // Issue #51: Use explicit --address flag, then POD_IP env var (K8s Downward
@@ -141,17 +141,15 @@ async fn main() -> anyhow::Result<()> {
     let nw_client = client.clone();
     let nw_ctrl_addr = args.controller_addr.clone();
     let nw_op_addr = operator_ip.clone();
-    let nw_ns = args.namespace.clone();
     let nw_selector = args.node_selector.clone();
     tokio::spawn(async move {
         run_with_retry("node watcher", || {
             let c = nw_client.clone();
             let ctrl = nw_ctrl_addr.clone();
             let op = nw_op_addr.clone();
-            let ns = nw_ns.clone();
             let sel = nw_selector.clone();
             let hb = hb.clone();
-            Box::pin(node_watcher::run(c, ctrl, op, operator_port, ns, sel, hb))
+            Box::pin(node_watcher::run(c, ctrl, op, operator_port, sel, hb))
         })
         .await;
     });
@@ -159,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
     // Spawn job controller (issue #52: retry on failure)
     let jc_client = client.clone();
     let jc_ctrl_addr = args.controller_addr.clone();
-    let jc_ns = args.namespace.clone();
+    let jc_ns = operator_namespace.clone();
     tokio::spawn(async move {
         run_with_retry("job controller", || {
             let c = jc_client.clone();
@@ -171,7 +169,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Start virtual agent gRPC server
-    let virtual_agent = agent::VirtualAgent::new(client, args.namespace);
+    let virtual_agent = agent::VirtualAgent::new(client);
     info!(%listen_addr, "virtual agent gRPC server listening");
 
     tonic::transport::Server::builder()

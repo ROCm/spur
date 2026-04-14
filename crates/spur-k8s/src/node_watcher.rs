@@ -21,7 +21,6 @@ pub async fn run(
     controller_addr: String,
     operator_grpc_addr: String,
     operator_grpc_port: u32,
-    _namespace: String,
     label_selector: String,
     hb: Arc<HeartbeatManager>,
 ) -> anyhow::Result<()> {

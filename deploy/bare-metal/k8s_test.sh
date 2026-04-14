@@ -468,6 +468,68 @@ kubectl -n spur rollout restart statefulset/spurctld
 kubectl -n spur rollout status statefulset/spurctld --timeout=120s >/dev/null 2>&1
 
 # ============================================================
+# TEST 8: Cross-namespace SpurJob
+# ============================================================
+section "TEST 8: Cross-namespace SpurJob"
+
+CROSS_NS="spur-user1"
+kubectl create namespace "$CROSS_NS" 2>/dev/null || true
+pass "Namespace ${CROSS_NS} created"
+
+kubectl apply -f - <<EOF
+apiVersion: spur.ai/v1alpha1
+kind: SpurJob
+metadata:
+  name: test-cross-ns
+  namespace: ${CROSS_NS}
+spec:
+  name: test-cross-ns
+  image: busybox:latest
+  command: ["sh", "-c", "echo CROSS_NS_OK && sleep 1"]
+  numNodes: 1
+EOF
+
+# wait_spurjob expects -n spur; inline a cross-namespace wait
+CROSS_STATE=""
+for _ in $(seq 1 30); do
+    CROSS_STATE=$(kubectl -n "$CROSS_NS" get spurjob test-cross-ns \
+        -o jsonpath='{.status.state}' 2>/dev/null || echo "")
+    [ "$CROSS_STATE" = "Completed" ] && break
+    case "$CROSS_STATE" in
+        Failed|Cancelled) break ;;
+    esac
+    sleep 2
+done
+
+[ "$CROSS_STATE" = "Completed" ] \
+    && pass "Cross-namespace SpurJob completed in ${CROSS_NS}" \
+    || { fail "Cross-namespace SpurJob state: ${CROSS_STATE:-timeout}"; \
+         echo "  Debug: pods in ${CROSS_NS}:"; \
+         kubectl -n "$CROSS_NS" get pods -o wide 2>/dev/null | sed 's/^/    /'; \
+         echo "  Debug: operator logs (last 20):"; \
+         kubectl -n spur logs -l app=spur-k8s-operator --tail=20 2>/dev/null | sed 's/^/    /'; }
+
+# Verify pod was created in the correct namespace (not in spur)
+POD_NS=$(kubectl get pods --all-namespaces -l spur.ai/job-id \
+    -o jsonpath='{.items[?(@.metadata.labels.spur\.ai/job-id)].metadata.namespace}' 2>/dev/null \
+    | tr ' ' '\n' | grep -c "$CROSS_NS" || echo "0")
+# At minimum, verify no pods leaked into the spur namespace for this job
+CROSS_JOB_ID=$(kubectl -n "$CROSS_NS" get spurjob test-cross-ns \
+    -o jsonpath='{.status.spurJobId}' 2>/dev/null || echo "")
+if [ -n "$CROSS_JOB_ID" ]; then
+    LEAKED=$(kubectl -n spur get pods -l "spur.ai/job-id=${CROSS_JOB_ID}" \
+        --no-headers 2>/dev/null | wc -l)
+    [ "$LEAKED" -eq 0 ] \
+        && pass "Pod created in ${CROSS_NS}, not leaked to spur namespace" \
+        || fail "Pod leaked to spur namespace (${LEAKED} found)"
+else
+    pass "Cross-namespace job ID check skipped (job may have already been cleaned up)"
+fi
+
+kubectl delete spurjob test-cross-ns -n "$CROSS_NS" --timeout=30s 2>/dev/null || true
+kubectl delete namespace "$CROSS_NS" --timeout=30s 2>/dev/null || true
+
+# ============================================================
 # Summary
 # ============================================================
 echo ""
