@@ -30,7 +30,7 @@ pub async fn acquire_lease(namespace: &str) -> anyhow::Result<()> {
 
     // Try to acquire the Lease in a loop
     loop {
-        match try_acquire(&leases, &identity).await {
+        match try_acquire(&leases, namespace, &identity).await {
             Ok(true) => {
                 info!("acquired leader Lease");
                 break;
@@ -56,7 +56,7 @@ pub async fn acquire_lease(namespace: &str) -> anyhow::Result<()> {
 }
 
 /// Try to create or update the Lease. Returns true if we became the leader.
-async fn try_acquire(leases: &Api<Lease>, identity: &str) -> anyhow::Result<bool> {
+async fn try_acquire(leases: &Api<Lease>, namespace: &str, identity: &str) -> anyhow::Result<bool> {
     let now = Utc::now();
     let now_micro = k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime(now);
 
@@ -104,7 +104,7 @@ async fn try_acquire(leases: &Api<Lease>, identity: &str) -> anyhow::Result<bool
             let lease = Lease {
                 metadata: ObjectMeta {
                     name: Some(LEASE_NAME.into()),
-                    namespace: Some(leases.resource_url().to_string()),
+                    namespace: Some(namespace.into()),
                     ..Default::default()
                 },
                 spec: Some(k8s_openapi::api::coordination::v1::LeaseSpec {
