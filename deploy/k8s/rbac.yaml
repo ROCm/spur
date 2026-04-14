@@ -21,7 +21,7 @@ rules:
   - apiGroups: [""]
     resources: [nodes]
     verbs: [get, list, watch]
-  # ConfigMaps (leader election, config)
+  # ConfigMaps
   - apiGroups: [""]
     resources: [configmaps]
     verbs: [get, list, watch, create, update, patch, delete]
@@ -29,10 +29,6 @@ rules:
   - apiGroups: [""]
     resources: [events]
     verbs: [create, patch]
-  # Leader election via Leases
-  - apiGroups: [coordination.k8s.io]
-    resources: [leases]
-    verbs: [get, list, watch, create, update, patch, delete]
   # SpurJob CRD
   - apiGroups: [spur.ai]
     resources: [spurjobs, spurjobs/status, spurjobs/finalizers]
