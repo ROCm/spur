@@ -29,6 +29,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&pending, &cluster);
 
@@ -53,6 +54,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&pending, &cluster);
 
@@ -76,6 +78,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&pending, &cluster);
 
@@ -95,6 +98,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&pending, &cluster);
 
@@ -117,6 +121,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&pending, &cluster);
 
@@ -142,6 +147,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&pending, &cluster);
 
@@ -171,6 +177,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&[job], &cluster);
 
@@ -316,6 +323,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 1);
@@ -342,6 +350,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&[job], &cluster);
         // No idle nodes available, so exclusive job cannot be scheduled
@@ -366,6 +375,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 1);
@@ -391,6 +401,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 1);
@@ -420,6 +431,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 0, "no node has 'gpu' feature");
@@ -484,6 +496,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&[job], &cluster);
         // Should schedule to the non-suspended node only.
@@ -504,6 +517,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 0, "all nodes suspended");
@@ -561,6 +575,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[res],
+            topology: None,
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 1);
@@ -596,6 +611,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[res],
+            topology: None,
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 1);
@@ -617,6 +633,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 1);
@@ -639,6 +656,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         // Must not panic — should schedule with 1 node (the minimum)
         let assignments = sched.schedule(&[job], &cluster);
@@ -660,6 +678,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(
@@ -685,6 +704,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(
@@ -711,6 +731,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(assignments.len(), 1);
@@ -738,6 +759,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&[job], &cluster);
         // Should NOT be scheduled — insufficient available resources
@@ -767,6 +789,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&[job], &cluster);
         assert_eq!(
@@ -774,5 +797,203 @@ mod tests {
             1,
             "small job should fit on partially allocated node"
         );
+    }
+
+    // ── T07.40–49: Topology-aware scheduling ─────────────────────
+
+    #[test]
+    fn t07_40_topology_block_keeps_nodes_in_same_switch() {
+        // 8 nodes split across 2 racks (4 per rack).
+        // A 4-node job with topology=block should get all nodes from one rack.
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(8, 64, 256_000);
+        // Assign switch names to simulate two racks
+        for (i, node) in nodes.iter_mut().enumerate() {
+            node.switch_name = Some(if i < 4 {
+                "rack01".into()
+            } else {
+                "rack02".into()
+            });
+        }
+        let partitions = vec![make_partition("default", 8)];
+
+        let mut job = make_job_with_resources("train", 4, 64, 1, Some(60));
+        job.spec.topology = Some("block".into());
+        let pending = vec![job];
+
+        let topo = spur_core::topology::TopologyTree::from_switches(&[
+            spur_core::topology::SwitchConfig {
+                name: "rack01".into(),
+                nodes: Some("node001,node002,node003,node004".into()),
+                switches: None,
+            },
+            spur_core::topology::SwitchConfig {
+                name: "rack02".into(),
+                nodes: Some("node005,node006,node007,node008".into()),
+                switches: None,
+            },
+        ]);
+
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: Some(&topo),
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes.len(), 4);
+
+        // All nodes should be from the same rack
+        let first_switch = nodes
+            .iter()
+            .find(|n| n.name == assignments[0].nodes[0])
+            .unwrap()
+            .switch_name
+            .as_ref()
+            .unwrap()
+            .clone();
+        for node_name in &assignments[0].nodes {
+            let node = nodes.iter().find(|n| &n.name == node_name).unwrap();
+            assert_eq!(
+                node.switch_name.as_ref().unwrap(),
+                &first_switch,
+                "node {} should be in switch {}, but is in {:?}",
+                node_name,
+                first_switch,
+                node.switch_name
+            );
+        }
+    }
+
+    #[test]
+    fn t07_41_topology_tree_prefers_same_switch() {
+        // 8 nodes across 2 racks. A 2-node job with topology=tree
+        // should prefer nodes from the same rack.
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(8, 64, 256_000);
+        let partitions = vec![make_partition("default", 8)];
+
+        let mut job = make_job_with_resources("infer", 2, 64, 1, Some(60));
+        job.spec.topology = Some("tree".into());
+        let pending = vec![job];
+
+        let topo = spur_core::topology::TopologyTree::from_switches(&[
+            spur_core::topology::SwitchConfig {
+                name: "rack01".into(),
+                nodes: Some("node001,node002,node003,node004".into()),
+                switches: None,
+            },
+            spur_core::topology::SwitchConfig {
+                name: "rack02".into(),
+                nodes: Some("node005,node006,node007,node008".into()),
+                switches: None,
+            },
+            spur_core::topology::SwitchConfig {
+                name: "fabric0".into(),
+                nodes: None,
+                switches: Some("rack01,rack02".into()),
+            },
+        ]);
+
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: Some(&topo),
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes.len(), 2);
+
+        // Both nodes should be from the same rack (same switch)
+        let sw0 = topo.node_switch.get(&assignments[0].nodes[0]).unwrap();
+        let sw1 = topo.node_switch.get(&assignments[0].nodes[1]).unwrap();
+        assert_eq!(sw0, sw1, "both nodes should be on the same switch");
+    }
+
+    #[test]
+    fn t07_42_no_topology_ignores_switch_grouping() {
+        // Without topology preference, nodes are selected by time/weight
+        // regardless of switch grouping.
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(8, 64, 256_000);
+        let partitions = vec![make_partition("default", 8)];
+
+        // No topology preference — default behavior
+        let job = make_job_with_resources("train", 4, 64, 1, Some(60));
+        let pending = vec![job];
+
+        let topo = spur_core::topology::TopologyTree::from_switches(&[
+            spur_core::topology::SwitchConfig {
+                name: "rack01".into(),
+                nodes: Some("node001,node002,node003,node004".into()),
+                switches: None,
+            },
+            spur_core::topology::SwitchConfig {
+                name: "rack02".into(),
+                nodes: Some("node005,node006,node007,node008".into()),
+                switches: None,
+            },
+        ]);
+
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: Some(&topo),
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes.len(), 4);
+        // No assertion on which rack — default behavior is fine
+    }
+
+    #[test]
+    fn t07_43_topology_spans_switches_when_needed() {
+        // 4 nodes per rack, need 6 nodes — must span both racks.
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(8, 64, 256_000);
+        let partitions = vec![make_partition("default", 8)];
+
+        let mut job = make_job_with_resources("big-train", 6, 64, 1, Some(60));
+        job.spec.topology = Some("tree".into());
+        let pending = vec![job];
+
+        let topo = spur_core::topology::TopologyTree::from_switches(&[
+            spur_core::topology::SwitchConfig {
+                name: "rack01".into(),
+                nodes: Some("node001,node002,node003,node004".into()),
+                switches: None,
+            },
+            spur_core::topology::SwitchConfig {
+                name: "rack02".into(),
+                nodes: Some("node005,node006,node007,node008".into()),
+                switches: None,
+            },
+            spur_core::topology::SwitchConfig {
+                name: "fabric0".into(),
+                nodes: None,
+                switches: Some("rack01,rack02".into()),
+            },
+        ]);
+
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: Some(&topo),
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes.len(), 6, "should span both racks");
     }
 }

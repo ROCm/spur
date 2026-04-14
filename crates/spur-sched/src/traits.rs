@@ -2,6 +2,7 @@ use spur_core::job::{Job, JobId};
 use spur_core::node::Node;
 use spur_core::partition::Partition;
 use spur_core::reservation::Reservation;
+use spur_core::topology::TopologyTree;
 
 /// An assignment of a job to one or more nodes.
 #[derive(Debug, Clone)]
@@ -15,6 +16,8 @@ pub struct ClusterState<'a> {
     pub nodes: &'a [Node],
     pub partitions: &'a [Partition],
     pub reservations: &'a [Reservation],
+    /// Fabric topology (switch hierarchy). None if topology is not configured.
+    pub topology: Option<&'a TopologyTree>,
 }
 
 /// Trait for pluggable scheduler implementations.

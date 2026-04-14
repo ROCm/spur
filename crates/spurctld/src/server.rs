@@ -686,6 +686,11 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
                 .unwrap_or_else(chrono::Utc::now)
         }),
         spread_job: spec.spread_job,
+        topology: if spec.topology.is_empty() {
+            None
+        } else {
+            Some(spec.topology)
+        },
         open_mode: if spec.open_mode.is_empty() {
             None
         } else {
@@ -817,6 +822,7 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         boot_time: node.boot_time.map(datetime_to_proto),
         last_busy: node.last_busy.map(datetime_to_proto),
         slurmd_start_time: node.agent_start_time.map(datetime_to_proto),
+        switch_name: node.switch_name.clone().unwrap_or_default(),
     }
 }
 

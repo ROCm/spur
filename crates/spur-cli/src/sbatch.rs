@@ -132,6 +132,10 @@ pub struct SbatchArgs {
     #[arg(long)]
     pub spread_job: bool,
 
+    /// Topology-aware scheduling: "tree" (minimize switch hops) or "block" (keep within rack)
+    #[arg(long)]
+    pub topology: Option<String>,
+
     /// Output file open mode: "truncate" (default) or "append"
     #[arg(long)]
     pub open_mode: Option<String>,
@@ -616,6 +620,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
                 nanos: dt.timestamp_subsec_nanos() as i32,
             }),
         spread_job: args.spread_job,
+        topology: args.topology.clone().unwrap_or_default(),
         open_mode: args.open_mode.unwrap_or_default(),
     };
 

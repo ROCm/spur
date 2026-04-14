@@ -622,6 +622,7 @@ fn core_job_spec_to_proto(spec: &spur_core::job::JobSpec) -> spur_proto::proto::
             nanos: dt.timestamp_subsec_nanos() as i32,
         }),
         spread_job: spec.spread_job,
+        topology: spec.topology.clone().unwrap_or_default(),
         open_mode: spec.open_mode.clone().unwrap_or_default(),
     }
 }

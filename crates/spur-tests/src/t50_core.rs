@@ -1137,6 +1137,7 @@ address = "http://peer-a:6817"
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         // This should NOT panic
         let assignments = sched.schedule(&[job], &cluster);

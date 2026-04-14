@@ -114,6 +114,9 @@ pub struct Node {
     /// Scheduling weight. Higher weight = preferred for scheduling.
     #[serde(default = "default_weight")]
     pub weight: u32,
+    /// Leaf switch this node belongs to (from topology config).
+    #[serde(default)]
+    pub switch_name: Option<String>,
 }
 
 fn default_weight() -> u32 {
@@ -144,6 +147,7 @@ impl Node {
             wg_pubkey: None,
             version: None,
             weight: 1,
+            switch_name: None,
         }
     }
 

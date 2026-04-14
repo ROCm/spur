@@ -111,6 +111,7 @@ message JobSpec {
   google.protobuf.Timestamp deadline = 56;     // Cancel if still pending after this
   bool spread_job = 57;                        // Spread across least-loaded nodes
   string open_mode = 58;                       // "truncate" or "append"
+  string topology = 59;                        // Topology preference: "tree", "block", or empty
 
   // Misc
   bool requeue = 60;
@@ -185,6 +186,8 @@ message NodeInfo {
   google.protobuf.Timestamp boot_time = 30;
   google.protobuf.Timestamp last_busy = 31;
   google.protobuf.Timestamp slurmd_start_time = 32;
+
+  string switch_name = 40;   // Leaf switch from topology config
 }
 
 message PartitionInfo {

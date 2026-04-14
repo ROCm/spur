@@ -206,6 +206,9 @@ pub struct JobSpec {
     // Scheduling strategy
     /// Spread job across least-loaded nodes.
     pub spread_job: bool,
+    /// Topology-aware scheduling: "tree" (minimize switch hops) or
+    /// "block" (keep within one rack). None = default (no topology preference).
+    pub topology: Option<String>,
 
     // Output mode
     /// How to open stdout/stderr files: "truncate" (default) or "append".
@@ -268,6 +271,7 @@ impl Default for JobSpec {
             begin_time: None,
             deadline: None,
             spread_job: false,
+            topology: None,
             open_mode: None,
         }
     }

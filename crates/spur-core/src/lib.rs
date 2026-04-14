@@ -11,4 +11,5 @@ pub mod qos;
 pub mod reservation;
 pub mod resource;
 pub mod step;
+pub mod topology;
 pub mod wal;

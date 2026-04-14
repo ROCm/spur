@@ -278,6 +278,34 @@ impl Scheduler for BackfillScheduler {
                 continue;
             }
 
+            // Topology-aware reordering for multi-node jobs
+            if needed_nodes > 1 {
+                if let Some(topo) = &cluster.topology {
+                    let wants_topo = job.spec.topology.as_deref();
+                    if matches!(wants_topo, Some("tree") | Some("block")) {
+                        let candidate_names: Vec<&str> = node_starts
+                            .iter()
+                            .map(|(ni, _)| cluster.nodes[*ni].name.as_str())
+                            .collect();
+                        let local_order = topo.select_local_nodes(&candidate_names, needed_nodes);
+
+                        // Rebuild node_starts ordered by topology locality
+                        let mut reordered = Vec::with_capacity(needed_nodes);
+                        for name in &local_order {
+                            if let Some(pos) = node_starts
+                                .iter()
+                                .position(|(ni, _)| cluster.nodes[*ni].name == *name)
+                            {
+                                reordered.push(node_starts.remove(pos));
+                            }
+                        }
+                        // Append any remaining (shouldn't happen, but safety)
+                        reordered.extend(node_starts);
+                        node_starts = reordered;
+                    }
+                }
+            }
+
             let assigned_nodes: Vec<(usize, chrono::DateTime<Utc>)> =
                 node_starts.into_iter().take(needed_nodes).collect();
 
@@ -427,6 +455,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -449,6 +478,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -470,6 +500,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -515,6 +546,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -536,6 +568,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -560,6 +593,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -581,6 +615,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -612,6 +647,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 1);
@@ -638,6 +674,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 0); // No nodes with mi300x
@@ -663,6 +700,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 1);
@@ -684,6 +722,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -720,6 +759,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -753,6 +793,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -798,6 +839,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -830,6 +872,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -872,6 +915,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 1);
@@ -898,6 +942,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 1);
@@ -942,6 +987,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
+            topology: None,
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -975,6 +1021,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
+            topology: None,
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -1008,6 +1055,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
+            topology: None,
         };
 
         let assignments = sched.schedule(&pending, &cluster);
@@ -1041,6 +1089,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[future_reservation],
+            topology: None,
         };
 
         let assignments = sched.schedule(&pending, &cluster);

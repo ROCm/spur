@@ -31,10 +31,39 @@ pub async fn run(cluster: Arc<ClusterManager>) {
 
     let mut scheduler = BackfillScheduler::new(max_jobs);
 
+    // Build topology tree from config (if configured)
+    let topology = cluster.config.topology.as_ref().and_then(|topo_config| {
+        use spur_core::topology::TopologyTree;
+        match topo_config.plugin.as_str() {
+            "tree" => {
+                let tree = TopologyTree::from_switches(&topo_config.switches);
+                info!(
+                    switches = tree.switches.len(),
+                    nodes = tree.node_switch.len(),
+                    "topology/tree loaded"
+                );
+                Some(tree)
+            }
+            "block" => {
+                let block_size = topo_config.block_size.unwrap_or(18);
+                let all_nodes = cluster.get_nodes();
+                let node_names: Vec<String> = all_nodes.iter().map(|n| n.name.clone()).collect();
+                let tree = TopologyTree::from_blocks(&node_names, block_size);
+                info!(
+                    blocks = tree.switches.len(),
+                    block_size, "topology/block loaded"
+                );
+                Some(tree)
+            }
+            _ => None,
+        }
+    });
+
     info!(
         interval_secs,
         max_jobs,
         plugin = scheduler.name(),
+        topology = topology.is_some(),
         "scheduler loop started"
     );
 
@@ -61,6 +90,7 @@ pub async fn run(cluster: Arc<ClusterManager>) {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
+            topology: topology.as_ref(),
         };
 
         // Catch panics in the scheduler so that a single bad job doesn't kill
@@ -404,6 +434,7 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
             nanos: 0,
         }),
         spread_job: s.spread_job,
+        topology: s.topology.clone().unwrap_or_default(),
         open_mode: s.open_mode.clone().unwrap_or_default(),
     }
 }
@@ -484,6 +515,7 @@ async fn dispatch_to_agent(
             nanos: dt.timestamp_subsec_nanos() as i32,
         }),
         spread_job: spec.spread_job,
+        topology: spec.topology.clone().unwrap_or_default(),
         open_mode: spec.open_mode.clone().unwrap_or_default(),
     };
 

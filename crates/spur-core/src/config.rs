@@ -61,6 +61,10 @@ pub struct SlurmConfig {
     #[serde(default)]
     pub federation: FederationConfig,
 
+    /// Topology configuration (switch hierarchy for locality-aware scheduling).
+    #[serde(default)]
+    pub topology: Option<crate::topology::TopologyConfig>,
+
     /// Cluster-wide license pool, e.g., {"fluent": 20, "comsol": 5}.
     #[serde(default)]
     pub licenses: HashMap<String, u64>,

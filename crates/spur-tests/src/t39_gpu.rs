@@ -238,6 +238,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 1);
@@ -303,6 +304,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 0);
@@ -365,6 +367,7 @@ mod tests {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
+            topology: None,
         };
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 1);
