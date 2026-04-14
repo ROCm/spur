@@ -16,9 +16,7 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /build
 COPY . .
 
-# Build all workspace binaries in release mode.
-# Limit parallel jobs to avoid "too many open files" in constrained CI builders.
-RUN CARGO_BUILD_JOBS=4 cargo build --release \
+RUN cargo build --release \
     --bin spur \
     --bin spurctld \
     --bin spurd \
