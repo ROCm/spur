@@ -15,16 +15,19 @@ use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::traits::{ClusterState, Scheduler};
 
 use crate::cluster::ClusterManager;
+use crate::raft::RaftHandle;
 
 /// Spawn the time-limit enforcement watchdog and power manager alongside the scheduler loop.
-pub async fn run(cluster: Arc<ClusterManager>) {
+pub async fn run(cluster: Arc<ClusterManager>, raft: Option<Arc<RaftHandle>>) {
     let enforcer_cluster = cluster.clone();
+    let enforcer_raft = raft.clone();
     tokio::spawn(async move {
-        enforce_time_limits(enforcer_cluster).await;
+        enforce_time_limits(enforcer_cluster, enforcer_raft).await;
     });
     let power_cluster = cluster.clone();
+    let power_raft = raft.clone();
     tokio::spawn(async move {
-        manage_power(power_cluster).await;
+        manage_power(power_cluster, power_raft).await;
     });
     let interval_secs = cluster.config.scheduler.interval_secs.max(1) as u64;
     let max_jobs = cluster.config.scheduler.max_jobs_per_cycle as usize;
@@ -71,6 +74,12 @@ pub async fn run(cluster: Arc<ClusterManager>) {
 
     loop {
         interval.tick().await;
+
+        if let Some(ref r) = raft {
+            if !r.is_leader() {
+                continue;
+            }
+        }
 
         let pending = cluster.pending_jobs();
         if pending.is_empty() {
@@ -578,17 +587,22 @@ fn core_resource_to_proto(r: &spur_core::resource::ResourceSet) -> ProtoResource
 ///      mark it as Timeout and send SIGKILL (signal 9).
 ///
 /// Runs every 10 seconds.
-async fn enforce_time_limits(cluster: Arc<ClusterManager>) {
+async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Option<Arc<RaftHandle>>) {
     const GRACE_PERIOD_SECS: i64 = 30;
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
-    // Jobs that have been warned (SIGTERM sent) — maps job_id → warn timestamp
     let mut warned_jobs: HashSet<spur_core::job::JobId> = HashSet::new();
     let mut warn_times: std::collections::HashMap<spur_core::job::JobId, chrono::DateTime<Utc>> =
         std::collections::HashMap::new();
 
     loop {
         interval.tick().await;
+
+        if let Some(ref r) = raft {
+            if !r.is_leader() {
+                continue;
+            }
+        }
 
         let now = Utc::now();
 
@@ -675,10 +689,10 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>) {
 /// Power management: suspend idle nodes and resume them when jobs are pending.
 ///
 /// Disabled when `power.suspend_timeout_secs` is not set in the config.
-async fn manage_power(cluster: Arc<ClusterManager>) {
+async fn manage_power(cluster: Arc<ClusterManager>, raft: Option<Arc<RaftHandle>>) {
     let suspend_timeout = match cluster.config.power.suspend_timeout_secs {
         Some(t) => t,
-        None => return, // Power management disabled
+        None => return,
     };
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
@@ -686,6 +700,13 @@ async fn manage_power(cluster: Arc<ClusterManager>) {
 
     loop {
         interval.tick().await;
+
+        if let Some(ref r) = raft {
+            if !r.is_leader() {
+                continue;
+            }
+        }
+
         let now = Utc::now();
         let nodes = cluster.get_nodes();
 

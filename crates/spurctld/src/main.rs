@@ -1,5 +1,6 @@
 mod cluster;
 mod raft;
+mod raft_server;
 mod scheduler_loop;
 mod server;
 
@@ -73,17 +74,35 @@ async fn main() -> anyhow::Result<()> {
     // Keep config in sync so downstream code sees the final address.
     config.controller.listen_addr = listen_addr.clone();
 
-    // Initialize Raft consensus if peers are configured
-    let _raft_handle = if !config.controller.peers.is_empty() {
-        let node_id = config.controller.node_id.unwrap_or(1);
+    let raft_handle: Option<Arc<raft::RaftHandle>> = if !config.controller.peers.is_empty() {
+        let node_id = config
+            .controller
+            .node_id
+            .or_else(raft::detect_node_id_from_hostname)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Raft peers configured but node_id could not be determined. \
+                 Set controller.node_id in spur.conf or use a hostname ending \
+                 in -N (e.g. spurctld-0)."
+                )
+            })?;
         info!(
             node_id,
             peers = ?config.controller.peers,
             "initializing Raft consensus"
         );
-        let handle = raft::start_raft(node_id, &config.controller.peers).await?;
+        let handle = raft::start_raft(node_id, &config.controller.peers, &args.state_dir).await?;
         info!(node_id, "Raft node started");
-        Some(handle)
+
+        let raft_addr: std::net::SocketAddr = config.controller.raft_listen_addr.parse()?;
+        let raft_instance = handle.raft.clone();
+        tokio::spawn(async move {
+            if let Err(e) = raft_server::serve_raft(raft_addr, raft_instance).await {
+                tracing::error!(error = %e, "raft internal gRPC server failed");
+            }
+        });
+
+        Some(Arc::new(handle))
     } else {
         info!("single-node mode (no peers configured)");
         None
@@ -92,18 +111,30 @@ async fn main() -> anyhow::Result<()> {
     // Initialize cluster manager
     let cluster = Arc::new(ClusterManager::new(config.clone(), &args.state_dir)?);
 
-    // Start scheduler loop
+    if let Some(ref rh) = raft_handle {
+        rh.store.set_applier(cluster.clone());
+        cluster.set_raft(rh.raft.clone());
+    }
+
+    // Start scheduler loop (only schedules when this node is Raft leader)
     let sched_cluster = cluster.clone();
+    let sched_raft = raft_handle.clone();
     let sched_handle = tokio::spawn(async move {
-        scheduler_loop::run(sched_cluster).await;
+        scheduler_loop::run(sched_cluster, sched_raft).await;
     });
 
-    // Start node health checker (90s timeout)
+    // Start node health checker (90s timeout, only on leader)
     let health_cluster = cluster.clone();
+    let health_raft = raft_handle.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
+            if let Some(ref r) = health_raft {
+                if !r.is_leader() {
+                    continue;
+                }
+            }
             health_cluster.check_node_health(90);
         }
     });
@@ -111,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
     // Start gRPC server
     let addr = listen_addr.parse()?;
     info!(%addr, "gRPC server listening");
-    server::serve(addr, cluster).await?;
+    server::serve(addr, cluster, raft_handle).await?;
 
     sched_handle.abort();
     Ok(())
