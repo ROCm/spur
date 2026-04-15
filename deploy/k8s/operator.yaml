@@ -47,6 +47,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: SPUR_OPERATOR_ADDRESS
+              value: "spur-k8s-operator.$(POD_NAMESPACE).svc.cluster.local"
           ports:
             - containerPort: 6818
               name: grpc

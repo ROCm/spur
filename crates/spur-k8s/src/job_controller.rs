@@ -52,11 +52,7 @@ pub(crate) struct PodTracker {
     message: String,
 }
 
-/// Reconcile a SpurJob CRD: submit to Spur, track status, clean up.
-///
-/// Delegates to kube::runtime::finalizer which atomically manages the
-/// spur.ai/cleanup finalizer via Server-Side Apply, avoiding the TOCTOU
-/// race that a manual read-then-patch approach would have.
+/// Reconcile a SpurJob: delegates to kube's finalizer for atomic cleanup management.
 async fn reconcile(
     job: Arc<SpurJob>,
     ctx: Arc<JobControllerCtx>,
@@ -95,7 +91,73 @@ fn map_finalizer_err(e: finalizer::Error<ReconcileError>) -> ReconcileError {
     }
 }
 
-/// Normal reconcile path: submit job to Spur and poll for status changes.
+/// Returns true if the SpurJob has not yet been submitted to spurctld.
+fn should_submit(status: &SpurJobStatus) -> bool {
+    status.spur_job_id.is_none()
+}
+
+/// Submit to spurctld, apply job-id label, and patch CRD status.
+/// Re-reads from the API server first to guard against stale informer cache.
+/// Returns `Ok(None)` if a prior reconcile already submitted.
+async fn submit_to_controller(
+    api: &Api<SpurJob>,
+    ctx: &JobControllerCtx,
+    name: &str,
+    ns: &str,
+    job: &SpurJob,
+) -> Result<Option<u32>, ReconcileError> {
+    // Fresh read from API server — informer cache may be stale after finalizer patch
+    let fresh = api.get(name).await.map_err(ReconcileError::Kube)?;
+    let fresh_status = fresh.status.clone().unwrap_or_default();
+    if !should_submit(&fresh_status) {
+        debug!(spurjob = %name, "already submitted by prior reconcile");
+        return Ok(None);
+    }
+
+    let user = job
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get("spur.ai/user"))
+        .cloned()
+        .unwrap_or_else(|| "k8s".to_string());
+
+    let core_spec = to_core_job_spec(&job.spec, &user);
+    let proto_spec = core_job_spec_to_proto(&core_spec);
+
+    let mut ctrl = ctx.ctrl_client.lock().await;
+    let job_id = match ctrl
+        .submit_job(SubmitJobRequest {
+            spec: Some(proto_spec),
+        })
+        .await
+    {
+        Ok(resp) => resp.into_inner().job_id,
+        Err(e) => {
+            error!(spurjob = %name, error = %e, "failed to submit SpurJob");
+            return Err(ReconcileError::Grpc(e));
+        }
+    };
+    drop(ctrl);
+
+    info!(spurjob = %name, job_id, namespace = %ns, "SpurJob submitted");
+
+    // Label first — VirtualAgent needs it for namespace resolution before dispatch.
+    // Best-effort: status patch below is what prevents double-submit, so we must
+    // not bail here. The poll path's ensure_job_id_label retries if this fails.
+    ensure_job_id_label(&fresh, api, name, job_id).await.ok();
+
+    let new_status = SpurJobStatus {
+        state: "Pending".into(),
+        spur_job_id: Some(job_id),
+        ..fresh_status
+    };
+    patch_status(api, name, &new_status).await;
+
+    Ok(Some(job_id))
+}
+
+/// State-machine dispatcher: submit if no job_id, otherwise poll spurctld.
 async fn handle_job(
     job: Arc<SpurJob>,
     api: &Api<SpurJob>,
@@ -109,61 +171,23 @@ async fn handle_job(
         .ok_or_else(|| ReconcileError::Other("SpurJob has no namespace".into()))?;
     let status = job.status.clone().unwrap_or_default();
 
-    // If already in terminal state, nothing to do
     if is_terminal(&status.state) {
         return Ok(Action::await_change());
     }
 
-    // If no spur_job_id yet, submit to Spur
-    if status.spur_job_id.is_none() {
-        info!(spurjob = %name, "submitting SpurJob to controller");
-
-        // Extract user from annotation or default to "k8s"
-        let user = job
-            .metadata
-            .annotations
-            .as_ref()
-            .and_then(|a| a.get("spur.ai/user"))
-            .cloned()
-            .unwrap_or_else(|| "k8s".to_string());
-
-        let core_spec = to_core_job_spec(&job.spec, &user);
-        let proto_spec = core_job_spec_to_proto(&core_spec);
-
-        let mut ctrl = ctx.ctrl_client.lock().await;
-        match ctrl
-            .submit_job(SubmitJobRequest {
-                spec: Some(proto_spec),
-            })
-            .await
-        {
-            Ok(resp) => {
-                let job_id = resp.into_inner().job_id;
-                info!(spurjob = %name, job_id, namespace = %ns, "SpurJob submitted");
-
-                let new_status = SpurJobStatus {
-                    state: "Pending".into(),
-                    spur_job_id: Some(job_id),
-                    ..status
-                };
-                patch_status(api, &name, &new_status).await;
-            }
-            Err(e) => {
-                error!(spurjob = %name, error = %e, "failed to submit SpurJob");
-                return Ok(Action::requeue(Duration::from_secs(10)));
-            }
-        }
-
-        return Ok(Action::requeue(Duration::from_secs(5)));
+    // Phase 1: Submit (no spur_job_id yet)
+    if should_submit(&status) {
+        return match submit_to_controller(api, ctx, &name, &ns, &job).await? {
+            Some(_job_id) => Ok(Action::requeue(Duration::from_secs(5))),
+            None => Ok(Action::requeue(Duration::from_secs(2))),
+        };
     }
 
-    // Poll Spur for job status updates
+    // Phase 2: Poll spurctld for state changes
     let job_id = status.spur_job_id.unwrap();
 
-    // Required for VirtualAgent namespace lookup; retry until applied.
-    if ensure_job_id_label(&job, api, &name, job_id).await.is_err() {
-        return Ok(Action::requeue(Duration::from_secs(2)));
-    }
+    // Fallback for jobs submitted before label was set in submit path
+    ensure_job_id_label(&job, api, &name, job_id).await.ok();
 
     let mut ctrl = ctx.ctrl_client.lock().await;
 
@@ -1224,5 +1248,42 @@ mod tests {
             .clone()
             .ok_or_else(|| ReconcileError::Other("SpurJob has no namespace".into()));
         assert_eq!(result.unwrap(), "ml-team");
+    }
+
+    // --- should_submit (re-read guard) ---
+
+    #[test]
+    fn test_should_submit_when_no_job_id() {
+        let status = SpurJobStatus::default();
+        assert!(should_submit(&status));
+    }
+
+    #[test]
+    fn test_should_not_submit_when_job_id_present() {
+        let status = SpurJobStatus {
+            spur_job_id: Some(42),
+            ..Default::default()
+        };
+        assert!(!should_submit(&status));
+    }
+
+    #[test]
+    fn test_should_submit_ignores_state() {
+        let status = SpurJobStatus {
+            state: "Running".into(),
+            spur_job_id: None,
+            ..Default::default()
+        };
+        assert!(should_submit(&status));
+    }
+
+    #[test]
+    fn test_should_not_submit_regardless_of_state() {
+        let status = SpurJobStatus {
+            state: "Pending".into(),
+            spur_job_id: Some(1),
+            ..Default::default()
+        };
+        assert!(!should_submit(&status));
     }
 }
