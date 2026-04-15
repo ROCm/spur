@@ -91,18 +91,26 @@ pub struct ControllerConfig {
     #[serde(default = "default_one")]
     pub first_job_id: u32,
 
-    /// Raft peers for HA consensus. Each entry is "host:port" (gRPC address).
+    /// Raft peers for HA consensus. Each entry is "host:port" (Raft gRPC address).
     /// If empty, single-node mode (no Raft, no replication).
-    /// Example: ["node1:6817", "node2:6817", "node3:6817"]
+    /// Example: ["node1:6821", "node2:6821", "node3:6821"]
     #[serde(default)]
     pub peers: Vec<String>,
 
-    /// This node's Raft ID. If not set, auto-assigned from position in peers list.
+    /// This node's Raft ID. If not set, auto-derived from hostname ordinal
+    /// (e.g. spurctld-2 → node_id 3) or defaults to 1.
     pub node_id: Option<u64>,
+
+    /// Listen address for Raft internal gRPC traffic (separate from client API).
+    #[serde(default = "default_raft_listen_addr")]
+    pub raft_listen_addr: String,
 }
 
 fn default_listen_addr() -> String {
     "[::]:6817".into()
+}
+fn default_raft_listen_addr() -> String {
+    "[::]:6821".into()
 }
 fn default_rest_addr() -> String {
     "[::]:6820".into()
@@ -128,6 +136,7 @@ impl Default for ControllerConfig {
             first_job_id: 1,
             peers: Vec::new(),
             node_id: None,
+            raft_listen_addr: "[::]:6821".into(),
         }
     }
 }

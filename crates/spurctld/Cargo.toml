@@ -27,3 +27,6 @@ serde_json = { workspace = true }
 hostname = "0.4.2"
 tokio-stream = "0.1.18"
 openraft = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
