@@ -996,4 +996,85 @@ mod tests {
         assert_eq!(assignments.len(), 1);
         assert_eq!(assignments[0].nodes.len(), 6, "should span both racks");
     }
+
+    // ── T07.50–59: Issue regression tests ────────────────────────
+
+    #[test]
+    fn t07_50_issue90_initial_pending_reason_is_none() {
+        // Issue #90: New jobs should have PendingReason::None, not Priority.
+        // The scheduler loop's update_pending_reasons() sets the actual reason.
+        let job = make_job("test-90");
+        assert_eq!(
+            job.pending_reason,
+            spur_core::job::PendingReason::None,
+            "initial pending reason should be None, not Priority"
+        );
+    }
+
+    #[test]
+    fn t07_51_issue90_held_job_keeps_held_reason() {
+        // Held jobs should still get PendingReason::Held
+        reset_job_ids();
+        let id = 1;
+        let job = Job::new(
+            id,
+            JobSpec {
+                name: "held-job".into(),
+                hold: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.pending_reason, spur_core::job::PendingReason::Held);
+    }
+
+    #[test]
+    fn t07_52_issue90_job_schedules_on_idle_nodes() {
+        // A simple job should schedule immediately on idle nodes,
+        // not stay stuck in PENDING.
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(2, 64, 256_000);
+        let partitions = vec![make_partition("default", 2)];
+        let pending = vec![make_job("test-immediate")];
+
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1, "job should be scheduled immediately");
+    }
+
+    #[test]
+    fn t07_53_issue91_container_job_schedules_same_as_bare() {
+        // Container jobs should pass scheduling (resource check) the
+        // same as non-container jobs — container_image doesn't affect
+        // resource requirements.
+        reset_job_ids();
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(2, 64, 256_000);
+        let partitions = vec![make_partition("default", 2)];
+
+        let mut job = make_job("container-test");
+        job.spec.container_image = Some("ubuntu:22.04".into());
+
+        let pending = vec![job];
+
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(
+            assignments.len(),
+            1,
+            "container job should schedule the same as bare-process job"
+        );
+    }
 }

@@ -161,11 +161,29 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         }
     });
 
-    // Wait for the job to start running
+    // Wait for the job to start running (with timeout and progress)
     #[allow(unused_assignments)]
     let mut nodelist = String::new();
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(300); // 5 minute timeout
+    let mut last_reason = String::new();
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+        if start.elapsed() > timeout {
+            eprintln!(
+                "salloc: timed out waiting for job {} to start (last reason: {})",
+                job_id, last_reason
+            );
+            let _ = client
+                .cancel_job(CancelJobRequest {
+                    job_id,
+                    signal: 0,
+                    user: whoami::username().unwrap_or_default(),
+                })
+                .await;
+            std::process::exit(1);
+        }
 
         match client.get_job(GetJobRequest { job_id }).await {
             Ok(resp) => {
@@ -181,7 +199,14 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                         eprintln!("salloc: job {} ended before allocation was granted", job_id);
                         std::process::exit(1);
                     }
-                    _ => {} // Still pending
+                    _ => {
+                        // Still pending — show reason
+                        let reason = job.state_reason.clone();
+                        if reason != last_reason && !reason.is_empty() && reason != "None" {
+                            eprintln!("salloc: job {} pending ({})", job_id, reason);
+                            last_reason = reason;
+                        }
+                    }
                 }
             }
             Err(e) => {

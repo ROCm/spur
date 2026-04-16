@@ -326,7 +326,11 @@ impl Job {
         let pending_reason = if spec.hold {
             PendingReason::Held
         } else {
-            PendingReason::Priority
+            // Start with None — the scheduler loop's update_pending_reasons()
+            // will set the actual reason (Priority, Resources, etc.) on the
+            // first cycle. This avoids showing a misleading "Priority" reason
+            // before the scheduler has evaluated the job. (Issue #90)
+            PendingReason::None
         };
         Self {
             job_id,
