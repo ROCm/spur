@@ -1,10 +1,9 @@
-//! Raft-based consensus for spurctld HA.
+//! Raft-based consensus for spurctld.
 //!
-//! When `controller.peers` is configured, spurctld forms a Raft cluster
-//! for leader election and state replication. The Raft log replaces the
-//! local WAL — entries are `WalOperation` values proposed via
+//! Raft is always-on: even single-node deployments run a 1-member Raft
+//! cluster that self-elects instantly.  The Raft log is the sole durable
+//! store — entries are `WalOperation` values proposed via
 //! `ClusterManager::propose()` and applied through `StateMachineApply`.
-//! When peers is empty, single-node mode is used (local WAL, no Raft).
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -40,7 +39,7 @@ pub struct ClientResponse;
 /// Trait for applying committed Raft entries to the cluster state.
 /// Implemented by ClusterManager to avoid a circular dependency with SpurStore.
 pub trait StateMachineApply: Send + Sync {
-    fn apply_wal_operation(&self, op: &WalOperation);
+    fn apply_operation(&self, op: &WalOperation);
     fn snapshot_state(&self) -> Vec<u8>;
     fn restore_from_snapshot(&self, data: &[u8]);
 }
@@ -50,7 +49,7 @@ pub trait StateMachineApply: Send + Sync {
 pub struct SpurStore {
     inner: RwLock<StoreInner>,
     raft_dir: PathBuf,
-    applier: RwLock<Option<Arc<dyn StateMachineApply>>>,
+    applier: Arc<dyn StateMachineApply>,
 }
 
 impl std::fmt::Debug for SpurStore {
@@ -79,7 +78,7 @@ struct PersistedSnapshot {
 }
 
 impl SpurStore {
-    pub fn new(state_dir: &Path) -> anyhow::Result<Self> {
+    pub fn new(state_dir: &Path, applier: Arc<dyn StateMachineApply>) -> anyhow::Result<Self> {
         let raft_dir = state_dir.join("raft");
         let log_dir = raft_dir.join("log");
         std::fs::create_dir_all(&log_dir)?;
@@ -121,6 +120,7 @@ impl SpurStore {
                     Ok(ps) => {
                         inner.last_applied = ps.meta.last_log_id;
                         inner.last_membership = ps.meta.last_membership.clone();
+                        applier.restore_from_snapshot(&ps.data);
                     }
                     Err(e) => warn!("failed to parse snapshot.json: {e}"),
                 },
@@ -137,12 +137,8 @@ impl SpurStore {
         Ok(Self {
             inner: RwLock::new(inner),
             raft_dir,
-            applier: RwLock::new(None),
+            applier,
         })
-    }
-
-    pub fn set_applier(&self, applier: Arc<dyn StateMachineApply>) {
-        *self.applier.write() = Some(applier);
     }
 
     fn persist_vote(&self, vote: &Vote<NodeId>) -> Result<(), std::io::Error> {
@@ -213,16 +209,7 @@ impl RaftSnapshotBuilder<SpurTypeConfig> for Arc<SpurStore> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<SpurTypeConfig>, StorageError<NodeId>> {
         let inner = self.inner.read();
 
-        let snapshot_data = {
-            let applier = self.applier.read();
-            match applier.as_ref() {
-                Some(a) => a.snapshot_state(),
-                None => serde_json::to_vec(&serde_json::json!({
-                    "applied_count": inner.applied_count,
-                }))
-                .unwrap_or_default(),
-            }
-        };
+        let snapshot_data = self.applier.snapshot_state();
 
         let snap_id = format!(
             "{}-{}",
@@ -343,10 +330,7 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
                 EntryPayload::Normal(op) => {
                     debug!(index = entry.log_id.index, "raft: applying WalOperation");
                     inner.applied_count += 1;
-                    let applier = self.applier.read();
-                    if let Some(ref a) = *applier {
-                        a.apply_wal_operation(op);
-                    }
+                    self.applier.apply_operation(op);
                 }
                 EntryPayload::Membership(mem) => {
                     inner.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
@@ -382,10 +366,7 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
             )
         })?;
 
-        let applier = self.applier.read();
-        if let Some(ref a) = *applier {
-            a.restore_from_snapshot(&data);
-        }
+        self.applier.restore_from_snapshot(&data);
 
         let mut inner = self.inner.write();
         inner.last_applied = meta.last_log_id;
@@ -590,7 +571,6 @@ impl openraft::RaftNetwork<SpurTypeConfig> for SpurNetworkConnection {
 pub struct RaftHandle {
     pub raft: SpurRaft,
     pub node_id: NodeId,
-    pub store: Arc<SpurStore>,
     pub peers: BTreeMap<NodeId, String>,
 }
 
@@ -631,6 +611,7 @@ pub async fn start_raft(
     node_id: NodeId,
     peers: &[String],
     state_dir: &Path,
+    applier: Arc<dyn StateMachineApply>,
 ) -> anyhow::Result<RaftHandle> {
     let config = Config {
         heartbeat_interval: 500,
@@ -640,7 +621,7 @@ pub async fn start_raft(
     };
     let config = Arc::new(config.validate().map_err(|e| anyhow::anyhow!("{e}"))?);
 
-    let store = Arc::new(SpurStore::new(state_dir)?);
+    let store = Arc::new(SpurStore::new(state_dir, applier)?);
     let peer_map = build_peer_map(peers);
     let network = Arc::new(SpurNetwork {
         peers: peer_map.clone(),
@@ -657,7 +638,6 @@ pub async fn start_raft(
     Ok(RaftHandle {
         raft,
         node_id,
-        store,
         peers: peer_map,
     })
 }
@@ -742,6 +722,19 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    struct NoopApplier;
+    impl StateMachineApply for NoopApplier {
+        fn apply_operation(&self, _op: &WalOperation) {}
+        fn snapshot_state(&self) -> Vec<u8> {
+            Vec::new()
+        }
+        fn restore_from_snapshot(&self, _data: &[u8]) {}
+    }
+
+    fn noop_applier() -> Arc<dyn StateMachineApply> {
+        Arc::new(NoopApplier)
+    }
+
     #[test]
     fn peer_map_empty() {
         let m = build_peer_map(&[]);
@@ -792,7 +785,7 @@ mod tests {
     #[test]
     fn store_persists_vote() {
         let dir = TempDir::new().unwrap();
-        let store = SpurStore::new(dir.path()).unwrap();
+        let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
 
         let vote = Vote {
             leader_id: openraft::LeaderId {
@@ -803,7 +796,7 @@ mod tests {
         };
         store.persist_vote(&vote).unwrap();
 
-        let store2 = SpurStore::new(dir.path()).unwrap();
+        let store2 = SpurStore::new(dir.path(), noop_applier()).unwrap();
         let inner = store2.inner.read();
         let recovered = inner.vote.as_ref().unwrap();
         assert_eq!(recovered.leader_id.term, 5);
@@ -814,7 +807,7 @@ mod tests {
     #[test]
     fn store_persists_log_entries() {
         let dir = TempDir::new().unwrap();
-        let store = SpurStore::new(dir.path()).unwrap();
+        let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
 
         let entry = Entry {
             log_id: LogId {
@@ -828,7 +821,7 @@ mod tests {
         };
         store.persist_log_entry(&entry).unwrap();
 
-        let store2 = SpurStore::new(dir.path()).unwrap();
+        let store2 = SpurStore::new(dir.path(), noop_applier()).unwrap();
         let inner = store2.inner.read();
         assert!(inner.log.contains_key(&42));
         assert_eq!(inner.log[&42].log_id.index, 42);
@@ -837,7 +830,7 @@ mod tests {
     #[test]
     fn store_removes_log_entries() {
         let dir = TempDir::new().unwrap();
-        let store = SpurStore::new(dir.path()).unwrap();
+        let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
 
         for idx in 0..5 {
             let entry = Entry {
@@ -857,7 +850,7 @@ mod tests {
         store.remove_log_entry(2);
         store.remove_log_entry(3);
 
-        let store2 = SpurStore::new(dir.path()).unwrap();
+        let store2 = SpurStore::new(dir.path(), noop_applier()).unwrap();
         let inner = store2.inner.read();
         assert_eq!(inner.log.len(), 3); // 0, 1, 4
         assert!(inner.log.contains_key(&0));
@@ -870,7 +863,7 @@ mod tests {
     #[test]
     fn store_persists_snapshot() {
         let dir = TempDir::new().unwrap();
-        let store = SpurStore::new(dir.path()).unwrap();
+        let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
 
         let meta = SnapshotMeta {
             last_log_id: Some(LogId {
@@ -894,7 +887,7 @@ mod tests {
     #[test]
     fn store_empty_dir_recovery() {
         let dir = TempDir::new().unwrap();
-        let store = SpurStore::new(dir.path()).unwrap();
+        let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
 
         let inner = store.inner.read();
         assert!(inner.vote.is_none());

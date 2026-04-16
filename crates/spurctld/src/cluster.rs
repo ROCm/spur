@@ -15,15 +15,14 @@ use spur_core::qos::{check_qos_limits, QosCheckResult};
 use spur_core::reservation::Reservation;
 use spur_core::resource::ResourceSet;
 use spur_core::step::{JobStep, StepState, STEP_BATCH};
-use spur_core::wal::{WalEntry, WalOperation, WalStore};
-use spur_state::snapshot::SnapshotStore;
-use spur_state::wal_store::FileWalStore;
+use spur_core::wal::WalOperation;
 
 use crate::raft::{SpurRaft, StateMachineApply};
 
 /// Central cluster state manager.
 ///
 /// Thread-safe via RwLock. The scheduler and gRPC server both access this.
+/// State recovery happens through Raft log replay (via `StateMachineApply`).
 pub struct ClusterManager {
     pub config: SlurmConfig,
     jobs: RwLock<HashMap<JobId, Job>>,
@@ -32,22 +31,13 @@ pub struct ClusterManager {
     next_job_id: AtomicU32,
     reservations: RwLock<Vec<Reservation>>,
     steps: RwLock<HashMap<(JobId, u32), JobStep>>,
-    wal: RwLock<FileWalStore>,
-    snapshot: RwLock<Option<SnapshotStore>>,
-    wal_since_snapshot: AtomicU32,
     license_pool: RwLock<HashMap<String, u64>>,
     hostname_aliases: RwLock<HashMap<String, String>>,
-    /// When set, mutations go through Raft consensus instead of the local WAL.
     raft: RwLock<Option<SpurRaft>>,
 }
 
 impl ClusterManager {
-    pub fn new(config: SlurmConfig, state_dir: &Path) -> anyhow::Result<Self> {
-        let wal = FileWalStore::new(&state_dir.join("wal"))?;
-        std::fs::create_dir_all(state_dir)?;
-        let snap_path = state_dir.join("snapshot.redb");
-        let snapshot = open_snapshot_with_retry(&snap_path)?;
-
+    pub fn new(config: SlurmConfig, _state_dir: &Path) -> anyhow::Result<Self> {
         let partitions = config.build_partitions();
         let license_pool = config.licenses.clone();
 
@@ -59,44 +49,12 @@ impl ClusterManager {
             reservations: RwLock::new(Vec::new()),
             steps: RwLock::new(HashMap::new()),
             next_job_id: AtomicU32::new(1),
-            wal: RwLock::new(wal),
-            snapshot: RwLock::new(snapshot),
-            wal_since_snapshot: AtomicU32::new(0),
             license_pool: RwLock::new(license_pool),
             hostname_aliases: RwLock::new(HashMap::new()),
             raft: RwLock::new(None),
         };
 
-        // Recover from snapshot + WAL using the same apply path as runtime
-        if let Some(ref snap) = *cm.snapshot.read() {
-            let snap_seq = snap.wal_sequence().unwrap_or(0);
-            for job in snap.load_jobs().unwrap_or_default() {
-                cm.next_job_id.fetch_max(job.job_id + 1, Ordering::Relaxed);
-                cm.jobs.write().insert(job.job_id, job);
-            }
-            for node in snap.load_nodes().unwrap_or_default() {
-                cm.nodes.write().insert(node.name.clone(), node);
-            }
-
-            let wal_entries = cm.wal.read().read_from(snap_seq + 1).unwrap_or_default();
-            if !wal_entries.is_empty() {
-                info!(
-                    count = wal_entries.len(),
-                    from_seq = snap_seq + 1,
-                    "replaying WAL entries"
-                );
-                for entry in &wal_entries {
-                    cm.apply_wal_op_internal(&entry.operation);
-                }
-            }
-        }
-
-        info!(
-            jobs = cm.jobs.read().len(),
-            nodes = cm.nodes.read().len(),
-            next_job_id = cm.next_job_id.load(Ordering::Relaxed),
-            "cluster state recovered"
-        );
+        info!("cluster manager initialized (state will be recovered via Raft)");
 
         Ok(cm)
     }
@@ -129,7 +87,6 @@ impl ClusterManager {
         });
 
         info!(job_id, name = %spec.name, user = %spec.user, "job submitted");
-        self.maybe_snapshot();
         Ok(job_id)
     }
 
@@ -435,7 +392,6 @@ impl ClusterManager {
             self.maybe_requeue(job_id);
         }
 
-        self.maybe_snapshot();
         debug!(job_id, exit_code, "job completed");
         Ok(())
     }
@@ -1299,32 +1255,24 @@ impl ClusterManager {
         *self.raft.write() = Some(raft);
     }
 
-    /// Persist a mutation. Without Raft: local WAL + apply. With Raft:
-    /// `client_write` (the apply callback handles state on all nodes).
+    /// Persist a mutation via Raft consensus. The apply callback
+    /// (`StateMachineApply`) handles in-memory state on all nodes.
     fn propose(&self, op: WalOperation) {
-        if let Some(raft) = self.raft.read().clone() {
-            // block_in_place bridges sync callers to the async client_write
-            if let Err(e) = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async { raft.client_write(op).await })
-            }) {
-                warn!(error = %e, "raft propose failed");
-            }
-            return;
+        let raft = self
+            .raft
+            .read()
+            .clone()
+            .expect("raft must be set before propose is called");
+        if let Err(e) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async { raft.client_write(op).await })
+        }) {
+            warn!(error = %e, "raft propose failed");
         }
-
-        let mut wal = self.wal.write();
-        let seq = wal.latest_sequence() + 1;
-        let entry = WalEntry::new(seq, op.clone());
-        if let Err(e) = wal.append(&entry) {
-            warn!(error = %e, "failed to append WAL entry");
-        }
-        self.wal_since_snapshot.fetch_add(1, Ordering::Relaxed);
-        self.apply_wal_op_internal(&op);
     }
 
-    /// Apply a WalOperation to in-memory state. Single code path used by
-    /// both Local mode (via propose) and Raft mode (via StateMachineApply).
-    fn apply_wal_op_internal(&self, op: &WalOperation) {
+    /// Apply a WalOperation to in-memory state.
+    /// Called by Raft's `apply_to_state_machine` on commit.
+    fn apply_operation(&self, op: &WalOperation) {
         let mut jobs = self.jobs.write();
         let mut nodes = self.nodes.write();
         let mut next_id = self.next_job_id.load(Ordering::Relaxed);
@@ -1558,32 +1506,6 @@ impl ClusterManager {
         self.next_job_id.store(next_id, Ordering::Relaxed);
     }
 
-    fn maybe_snapshot(&self) {
-        if self.raft.read().is_some() {
-            return; // Raft manages its own snapshots
-        }
-        let count = self.wal_since_snapshot.load(Ordering::Relaxed);
-        if count >= 10_000 {
-            self.take_snapshot();
-        }
-    }
-
-    pub fn take_snapshot(&self) {
-        let snap = self.snapshot.read();
-        if let Some(ref store) = *snap {
-            let jobs: Vec<Job> = self.jobs.read().values().cloned().collect();
-            let nodes: Vec<Node> = self.nodes.read().values().cloned().collect();
-            let seq = self.wal.read().latest_sequence();
-
-            match store.save(&jobs, &nodes, seq) {
-                Ok(()) => {
-                    self.wal_since_snapshot.store(0, Ordering::Relaxed);
-                    debug!(wal_sequence = seq, "snapshot taken");
-                }
-                Err(e) => warn!(error = %e, "failed to take snapshot"),
-            }
-        }
-    }
 }
 
 /// Snapshot data for Raft serialization.
@@ -1599,8 +1521,8 @@ struct ClusterSnapshot {
 }
 
 impl StateMachineApply for ClusterManager {
-    fn apply_wal_operation(&self, op: &WalOperation) {
-        self.apply_wal_op_internal(op);
+    fn apply_operation(&self, op: &WalOperation) {
+        self.apply_operation(op);
     }
 
     fn snapshot_state(&self) -> Vec<u8> {
@@ -1652,28 +1574,6 @@ impl StateMachineApply for ClusterManager {
     }
 }
 
-/// Open the snapshot store, retrying a few times to handle stale flock
-/// left behind by a SIGKILL'd predecessor (common with K8s pod force-delete).
-fn open_snapshot_with_retry(path: &Path) -> anyhow::Result<Option<SnapshotStore>> {
-    let max_attempts = 5;
-    for attempt in 1..=max_attempts {
-        match SnapshotStore::open(path) {
-            Ok(s) => return Ok(Some(s)),
-            Err(e) if attempt < max_attempts => {
-                warn!(
-                    attempt,
-                    max_attempts,
-                    error = %e,
-                    "snapshot store locked, retrying"
-                );
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-    unreachable!()
-}
-
 /// Extract license requirements from a job's GRES list.
 /// License GRES entries are formatted as "license:<name>:<count>" or "license:<name>".
 fn extract_license_requirements(spec: &JobSpec) -> HashMap<String, u64> {
@@ -1691,6 +1591,8 @@ fn extract_license_requirements(spec: &JobSpec) -> HashMap<String, u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use spur_core::job::JobSpec;
     use spur_core::resource::ResourceSet;
@@ -1732,8 +1634,18 @@ mod tests {
         }
     }
 
-    fn test_cluster(dir: &TempDir) -> ClusterManager {
-        ClusterManager::new(test_config(), dir.path()).unwrap()
+    async fn test_cluster(dir: &TempDir) -> Arc<ClusterManager> {
+        let cm = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+        let handle = crate::raft::start_raft(
+            1,
+            &["[::1]:0".into()],
+            dir.path(),
+            cm.clone(),
+        )
+        .await
+        .unwrap();
+        cm.set_raft(handle.raft);
+        cm
     }
 
     fn basic_spec(name: &str) -> JobSpec {
@@ -1764,13 +1676,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn apply_job_submit() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_job_submit() {
         let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
+        let cm = test_cluster(&dir).await;
 
         let spec = basic_spec("test-job");
-        cm.apply_wal_op_internal(&WalOperation::JobSubmit {
+        cm.apply_operation(&WalOperation::JobSubmit {
             job_id: 1,
             spec: spec.clone(),
         });
@@ -1782,16 +1694,16 @@ mod tests {
         assert!(cm.next_job_id.load(Ordering::Relaxed) >= 2);
     }
 
-    #[test]
-    fn apply_job_state_change() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_job_state_change() {
         let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
+        let cm = test_cluster(&dir).await;
 
-        cm.apply_wal_op_internal(&WalOperation::JobSubmit {
+        cm.apply_operation(&WalOperation::JobSubmit {
             job_id: 1,
             spec: basic_spec("j"),
         });
-        cm.apply_wal_op_internal(&WalOperation::JobStateChange {
+        cm.apply_operation(&WalOperation::JobStateChange {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
@@ -1801,13 +1713,13 @@ mod tests {
         assert_eq!(job.state, JobState::Running);
     }
 
-    #[test]
-    fn apply_job_start_allocates_resources() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_job_start_allocates_resources() {
         let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
+        let cm = test_cluster(&dir).await;
 
         register_node(&cm, "node1", 8, 16000);
-        cm.apply_wal_op_internal(&WalOperation::JobSubmit {
+        cm.apply_operation(&WalOperation::JobSubmit {
             job_id: 1,
             spec: basic_spec("j"),
         });
@@ -1817,7 +1729,7 @@ mod tests {
             memory_mb: 8000,
             ..Default::default()
         };
-        cm.apply_wal_op_internal(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["node1".into()],
             resources: resources.clone(),
@@ -1832,22 +1744,22 @@ mod tests {
         assert_eq!(node.alloc_resources.memory_mb, 8000);
     }
 
-    #[test]
-    fn apply_job_complete_deallocates_resources() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_job_complete_deallocates_resources() {
         let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
+        let cm = test_cluster(&dir).await;
 
         register_node(&cm, "node1", 8, 16000);
-        cm.apply_wal_op_internal(&WalOperation::JobSubmit {
+        cm.apply_operation(&WalOperation::JobSubmit {
             job_id: 1,
             spec: basic_spec("j"),
         });
-        cm.apply_wal_op_internal(&WalOperation::JobStateChange {
+        cm.apply_operation(&WalOperation::JobStateChange {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
         });
-        cm.apply_wal_op_internal(&WalOperation::JobStart {
+        cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["node1".into()],
             resources: ResourceSet {
@@ -1857,7 +1769,7 @@ mod tests {
             },
         });
 
-        cm.apply_wal_op_internal(&WalOperation::JobComplete {
+        cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
@@ -1873,12 +1785,12 @@ mod tests {
         assert_eq!(node.alloc_resources.memory_mb, 0);
     }
 
-    #[test]
-    fn apply_node_register() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_node_register() {
         let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
+        let cm = test_cluster(&dir).await;
 
-        cm.apply_wal_op_internal(&WalOperation::NodeRegister {
+        cm.apply_operation(&WalOperation::NodeRegister {
             name: "gpu-node".into(),
             resources: ResourceSet {
                 cpus: 64,
@@ -1900,13 +1812,13 @@ mod tests {
         assert_eq!(node.partitions[0], "default");
     }
 
-    #[test]
-    fn apply_node_state_change() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_node_state_change() {
         let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
+        let cm = test_cluster(&dir).await;
 
         register_node(&cm, "n1", 4, 8000);
-        cm.apply_wal_op_internal(&WalOperation::NodeStateChange {
+        cm.apply_operation(&WalOperation::NodeStateChange {
             name: "n1".into(),
             old_state: NodeState::Idle,
             new_state: NodeState::Drain,
@@ -1918,16 +1830,16 @@ mod tests {
         assert_eq!(node.state_reason, Some("maintenance".into()));
     }
 
-    #[test]
-    fn apply_job_priority_change() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_job_priority_change() {
         let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
+        let cm = test_cluster(&dir).await;
 
-        cm.apply_wal_op_internal(&WalOperation::JobSubmit {
+        cm.apply_operation(&WalOperation::JobSubmit {
             job_id: 1,
             spec: basic_spec("j"),
         });
-        cm.apply_wal_op_internal(&WalOperation::JobPriorityChange {
+        cm.apply_operation(&WalOperation::JobPriorityChange {
             job_id: 1,
             old_priority: 1000,
             new_priority: 5000,
@@ -1937,13 +1849,13 @@ mod tests {
         assert_eq!(job.priority, 5000);
     }
 
-    #[test]
-    fn apply_node_heartbeat() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_node_heartbeat() {
         let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
+        let cm = test_cluster(&dir).await;
 
         register_node(&cm, "n1", 4, 8000);
-        cm.apply_wal_op_internal(&WalOperation::NodeHeartbeat {
+        cm.apply_operation(&WalOperation::NodeHeartbeat {
             name: "n1".into(),
             cpu_load: 75,
             free_memory_mb: 4000,
@@ -1954,30 +1866,10 @@ mod tests {
         assert_eq!(node.free_memory_mb, 4000);
     }
 
-    #[test]
-    fn propose_local_mode_persists_and_applies() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_assigns_id_and_applies() {
         let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
-
-        cm.propose(WalOperation::JobSubmit {
-            job_id: 10,
-            spec: basic_spec("proposed-job"),
-        });
-
-        // Job should be in memory
-        let job = cm.get_job(10).unwrap();
-        assert_eq!(job.spec.name, "proposed-job");
-
-        // WAL should have the entry
-        let wal = cm.wal.read();
-        let entries = wal.read_from(1).unwrap();
-        assert!(!entries.is_empty());
-    }
-
-    #[test]
-    fn submit_job_assigns_id_and_applies() {
-        let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
+        let cm = test_cluster(&dir).await;
 
         let id = cm.submit_job(basic_spec("my-job")).unwrap();
         assert!(id >= 1);
@@ -1988,10 +1880,10 @@ mod tests {
         assert_eq!(job.spec.partition, Some("default".into()));
     }
 
-    #[test]
-    fn submit_multiple_jobs_increments_ids() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_multiple_jobs_increments_ids() {
         let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
+        let cm = test_cluster(&dir).await;
 
         let id1 = cm.submit_job(basic_spec("a")).unwrap();
         let id2 = cm.submit_job(basic_spec("b")).unwrap();
@@ -2001,10 +1893,10 @@ mod tests {
         assert!(id3 > id2);
     }
 
-    #[test]
-    fn start_and_complete_job_lifecycle() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_and_complete_job_lifecycle() {
         let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
+        let cm = test_cluster(&dir).await;
 
         register_node(&cm, "worker1", 8, 16000);
         let job_id = cm.submit_job(basic_spec("lifecycle")).unwrap();
@@ -2034,10 +1926,10 @@ mod tests {
         assert_eq!(node.alloc_resources.cpus, 0);
     }
 
-    #[test]
-    fn cancel_job() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_job() {
         let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
+        let cm = test_cluster(&dir).await;
 
         let job_id = cm.submit_job(basic_spec("cancel-me")).unwrap();
         cm.cancel_job(job_id, "testuser").unwrap();
@@ -2046,10 +1938,10 @@ mod tests {
         assert_eq!(job.state, JobState::Cancelled);
     }
 
-    #[test]
-    fn complete_terminal_job_errors() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn complete_terminal_job_errors() {
         let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
+        let cm = test_cluster(&dir).await;
 
         let job_id = cm.submit_job(basic_spec("j")).unwrap();
         cm.cancel_job(job_id, "u").unwrap();
@@ -2058,10 +1950,10 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn snapshot_and_restore() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_and_restore() {
         let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
+        let cm = test_cluster(&dir).await;
 
         register_node(&cm, "n1", 4, 8000);
         cm.submit_job(basic_spec("snap-job")).unwrap();
@@ -2071,46 +1963,17 @@ mod tests {
 
         // Create a fresh cluster and restore
         let dir2 = TempDir::new().unwrap();
-        let cm2 = test_cluster(&dir2);
+        let cm2 = test_cluster(&dir2).await;
         cm2.restore_from_snapshot(&data);
 
         assert!(cm2.get_job(1).is_some());
         assert!(cm2.get_node("n1").is_some());
     }
 
-    #[test]
-    fn wal_recovery_on_restart() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hold_and_release_job() {
         let dir = TempDir::new().unwrap();
-
-        // First instance: submit jobs
-        {
-            let cm = test_cluster(&dir);
-            cm.submit_job(basic_spec("persist-1")).unwrap();
-            cm.submit_job(basic_spec("persist-2")).unwrap();
-        }
-
-        // Second instance: should recover from WAL
-        {
-            let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
-            assert!(cm.get_job(1).is_some());
-            assert!(cm.get_job(2).is_some());
-            assert_eq!(cm.get_job(1).unwrap().spec.name, "persist-1");
-        }
-    }
-
-    #[test]
-    fn maybe_snapshot_triggers_in_local_mode() {
-        let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
-        cm.wal_since_snapshot.store(20000, Ordering::Relaxed);
-        cm.maybe_snapshot();
-        assert_eq!(cm.wal_since_snapshot.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn hold_and_release_job() {
-        let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
+        let cm = test_cluster(&dir).await;
         let id = cm.submit_job(basic_spec("holdme")).unwrap();
 
         cm.hold_job(id).unwrap();
@@ -2124,10 +1987,10 @@ mod tests {
         assert_eq!(job.pending_reason, PendingReason::Priority);
     }
 
-    #[test]
-    fn update_job_priority() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_priority() {
         let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
+        let cm = test_cluster(&dir).await;
         let id = cm.submit_job(basic_spec("prio")).unwrap();
 
         cm.update_job(id, None, Some(5000), None, None, None, None)
@@ -2135,10 +1998,10 @@ mod tests {
         assert_eq!(cm.get_job(id).unwrap().priority, 5000);
     }
 
-    #[test]
-    fn update_node_state() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_node_state() {
         let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
+        let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 4, 8000);
 
         cm.update_node_state("n1", NodeState::Drain, Some("maint".into()))
@@ -2148,10 +2011,10 @@ mod tests {
         assert_eq!(node.state_reason, Some("maint".into()));
     }
 
-    #[test]
-    fn check_node_health_marks_stale_down() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn check_node_health_marks_stale_down() {
         let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
+        let cm = test_cluster(&dir).await;
         register_node(&cm, "stale", 4, 8000);
 
         // Set last_heartbeat far in the past
@@ -2164,71 +2027,10 @@ mod tests {
         assert_eq!(node.state, NodeState::Down);
     }
 
-    #[test]
-    fn wal_recovery_preserves_resource_allocation() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeue_resets_fields_via_apply() {
         let dir = TempDir::new().unwrap();
-
-        {
-            let cm = test_cluster(&dir);
-            register_node(&cm, "worker", 8, 16000);
-            let id = cm.submit_job(basic_spec("alloc-test")).unwrap();
-            cm.start_job(
-                id,
-                vec!["worker".into()],
-                ResourceSet {
-                    cpus: 4,
-                    memory_mb: 8000,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        }
-
-        // Recover from WAL — apply_wal_op_internal should restore allocations
-        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
-        let node = cm.get_node("worker").unwrap();
-        assert_eq!(node.alloc_resources.cpus, 4);
-        assert_eq!(node.alloc_resources.memory_mb, 8000);
-
-        let job = cm.get_job(1).unwrap();
-        assert_eq!(job.state, JobState::Running);
-        assert!(job.start_time.is_some());
-    }
-
-    #[test]
-    fn wal_recovery_complete_frees_resources() {
-        let dir = TempDir::new().unwrap();
-
-        {
-            let cm = test_cluster(&dir);
-            register_node(&cm, "w1", 8, 16000);
-            let id = cm.submit_job(basic_spec("complete-test")).unwrap();
-            cm.start_job(
-                id,
-                vec!["w1".into()],
-                ResourceSet {
-                    cpus: 4,
-                    memory_mb: 8000,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-            cm.complete_job(id, 0, JobState::Completed).unwrap();
-        }
-
-        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
-        let node = cm.get_node("w1").unwrap();
-        assert_eq!(
-            node.alloc_resources.cpus, 0,
-            "resources should be freed after recovery"
-        );
-        assert_eq!(cm.get_job(1).unwrap().state, JobState::Completed);
-    }
-
-    #[test]
-    fn requeue_resets_fields_via_apply() {
-        let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
+        let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 4, 8000);
         let id = cm.submit_job(basic_spec("requeue-me")).unwrap();
 
@@ -2244,7 +2046,7 @@ mod tests {
         .unwrap();
 
         // Transition to a terminal state first (requeue only works from terminal)
-        cm.apply_wal_op_internal(&WalOperation::JobComplete {
+        cm.apply_operation(&WalOperation::JobComplete {
             job_id: id,
             exit_code: -1,
             state: JobState::Timeout,
@@ -2252,7 +2054,7 @@ mod tests {
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Timeout);
 
         // Requeue: Timeout → Pending should reset allocation fields
-        cm.apply_wal_op_internal(&WalOperation::JobStateChange {
+        cm.apply_operation(&WalOperation::JobStateChange {
             job_id: id,
             old_state: JobState::Timeout,
             new_state: JobState::Pending,
@@ -2276,10 +2078,10 @@ mod tests {
         assert_eq!(job.pending_reason, PendingReason::Priority);
     }
 
-    #[test]
-    fn register_node_gets_partition_via_propose() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_node_gets_partition_via_propose() {
         let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir);
+        let cm = test_cluster(&dir).await;
         register_node(&cm, "test-node", 4, 8000);
 
         let node = cm.get_node("test-node").unwrap();

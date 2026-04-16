@@ -18,7 +18,7 @@ use crate::cluster::ClusterManager;
 use crate::raft::RaftHandle;
 
 /// Spawn the time-limit enforcement watchdog and power manager alongside the scheduler loop.
-pub async fn run(cluster: Arc<ClusterManager>, raft: Option<Arc<RaftHandle>>) {
+pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     let enforcer_cluster = cluster.clone();
     let enforcer_raft = raft.clone();
     tokio::spawn(async move {
@@ -75,10 +75,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Option<Arc<RaftHandle>>) {
     loop {
         interval.tick().await;
 
-        if let Some(ref r) = raft {
-            if !r.is_leader() {
-                continue;
-            }
+        if !raft.is_leader() {
+            continue;
         }
 
         let pending = cluster.pending_jobs();
@@ -587,7 +585,7 @@ fn core_resource_to_proto(r: &spur_core::resource::ResourceSet) -> ProtoResource
 ///      mark it as Timeout and send SIGKILL (signal 9).
 ///
 /// Runs every 10 seconds.
-async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Option<Arc<RaftHandle>>) {
+async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     const GRACE_PERIOD_SECS: i64 = 30;
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
@@ -598,10 +596,8 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Option<Arc<Raft
     loop {
         interval.tick().await;
 
-        if let Some(ref r) = raft {
-            if !r.is_leader() {
-                continue;
-            }
+        if !raft.is_leader() {
+            continue;
         }
 
         let now = Utc::now();
@@ -689,7 +685,7 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Option<Arc<Raft
 /// Power management: suspend idle nodes and resume them when jobs are pending.
 ///
 /// Disabled when `power.suspend_timeout_secs` is not set in the config.
-async fn manage_power(cluster: Arc<ClusterManager>, raft: Option<Arc<RaftHandle>>) {
+async fn manage_power(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     let suspend_timeout = match cluster.config.power.suspend_timeout_secs {
         Some(t) => t,
         None => return,
@@ -701,10 +697,8 @@ async fn manage_power(cluster: Arc<ClusterManager>, raft: Option<Arc<RaftHandle>
     loop {
         interval.tick().await;
 
-        if let Some(ref r) = raft {
-            if !r.is_leader() {
-                continue;
-            }
+        if !raft.is_leader() {
+            continue;
         }
 
         let now = Utc::now();

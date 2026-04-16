@@ -18,8 +18,8 @@ const LEADER_HEADER: &str = "x-spur-leader";
 
 pub struct ControllerService {
     cluster: Arc<ClusterManager>,
-    raft: Option<Arc<RaftHandle>>,
-    leader_proxy: Option<LeaderProxy>,
+    raft: Arc<RaftHandle>,
+    leader_proxy: LeaderProxy,
     /// Node ID → client API address (host:6817) for the x-spur-leader header.
     client_addrs: BTreeMap<u64, String>,
 }
@@ -76,18 +76,11 @@ impl LeaderProxy {
 }
 
 impl ControllerService {
-    /// Returns Ok if this node should handle the request (leader or single-node).
     fn check_leader<T>(&self, request: &Request<T>) -> Result<(), Status> {
-        let raft = match &self.raft {
-            Some(r) => r,
-            None => return Ok(()), // single-node mode
-        };
-
-        if raft.is_leader() {
+        if self.raft.is_leader() {
             return Ok(());
         }
 
-        // If this is already a forwarded request, don't forward again
         if request.metadata().get(FORWARDED_HEADER).is_some() {
             return Err(self.not_leader_status());
         }
@@ -97,12 +90,10 @@ impl ControllerService {
 
     fn not_leader_status(&self) -> Status {
         let mut status = Status::unavailable("not the Raft leader");
-        if let Some(ref raft) = self.raft {
-            if let Some(leader_id) = raft.current_leader() {
-                if let Some(addr) = self.client_addrs.get(&leader_id) {
-                    if let Ok(val) = addr.parse::<MetadataValue<tonic::metadata::Ascii>>() {
-                        status.metadata_mut().insert(LEADER_HEADER, val);
-                    }
+        if let Some(leader_id) = self.raft.current_leader() {
+            if let Some(addr) = self.client_addrs.get(&leader_id) {
+                if let Ok(val) = addr.parse::<MetadataValue<tonic::metadata::Ascii>>() {
+                    status.metadata_mut().insert(LEADER_HEADER, val);
                 }
             }
         }
@@ -123,7 +114,8 @@ impl SlurmController for ControllerService {
         request: Request<SubmitJobRequest>,
     ) -> Result<Response<SubmitJobResponse>, Status> {
         if let Err(status) = self.check_leader(&request) {
-            if let Some(ref proxy) = self.leader_proxy {
+            {
+                let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
                 let mut fwd = Request::new(request.into_inner());
                 *fwd.metadata_mut() = Self::forwarded_metadata();
@@ -151,7 +143,8 @@ impl SlurmController for ControllerService {
         request: Request<GetJobsRequest>,
     ) -> Result<Response<GetJobsResponse>, Status> {
         if let Err(_) = self.check_leader(&request) {
-            if let Some(ref proxy) = self.leader_proxy {
+            {
+                let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
                 let mut fwd = Request::new(request.into_inner());
                 *fwd.metadata_mut() = Self::forwarded_metadata();
@@ -194,7 +187,8 @@ impl SlurmController for ControllerService {
 
     async fn get_job(&self, request: Request<GetJobRequest>) -> Result<Response<JobInfo>, Status> {
         if let Err(_) = self.check_leader(&request) {
-            if let Some(ref proxy) = self.leader_proxy {
+            {
+                let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
                 let mut fwd = Request::new(request.into_inner());
                 *fwd.metadata_mut() = Self::forwarded_metadata();
@@ -213,7 +207,8 @@ impl SlurmController for ControllerService {
 
     async fn cancel_job(&self, request: Request<CancelJobRequest>) -> Result<Response<()>, Status> {
         if let Err(status) = self.check_leader(&request) {
-            if let Some(ref proxy) = self.leader_proxy {
+            {
+                let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
                 let mut fwd = Request::new(request.into_inner());
                 *fwd.metadata_mut() = Self::forwarded_metadata();
@@ -231,7 +226,8 @@ impl SlurmController for ControllerService {
 
     async fn update_job(&self, request: Request<UpdateJobRequest>) -> Result<Response<()>, Status> {
         if let Err(status) = self.check_leader(&request) {
-            if let Some(ref proxy) = self.leader_proxy {
+            {
+                let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
                 let mut fwd = Request::new(request.into_inner());
                 *fwd.metadata_mut() = Self::forwarded_metadata();
@@ -278,7 +274,8 @@ impl SlurmController for ControllerService {
         request: Request<GetNodesRequest>,
     ) -> Result<Response<GetNodesResponse>, Status> {
         if let Err(_) = self.check_leader(&request) {
-            if let Some(ref proxy) = self.leader_proxy {
+            {
+                let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
                 let mut fwd = Request::new(request.into_inner());
                 *fwd.metadata_mut() = Self::forwarded_metadata();
@@ -297,7 +294,8 @@ impl SlurmController for ControllerService {
         request: Request<GetNodeRequest>,
     ) -> Result<Response<NodeInfo>, Status> {
         if let Err(_) = self.check_leader(&request) {
-            if let Some(ref proxy) = self.leader_proxy {
+            {
+                let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
                 let mut fwd = Request::new(request.into_inner());
                 *fwd.metadata_mut() = Self::forwarded_metadata();
@@ -319,7 +317,8 @@ impl SlurmController for ControllerService {
         request: Request<UpdateNodeRequest>,
     ) -> Result<Response<()>, Status> {
         if let Err(status) = self.check_leader(&request) {
-            if let Some(ref proxy) = self.leader_proxy {
+            {
+                let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
                 let mut fwd = Request::new(request.into_inner());
                 *fwd.metadata_mut() = Self::forwarded_metadata();
@@ -344,7 +343,8 @@ impl SlurmController for ControllerService {
         request: Request<GetPartitionsRequest>,
     ) -> Result<Response<GetPartitionsResponse>, Status> {
         if let Err(_) = self.check_leader(&request) {
-            if let Some(ref proxy) = self.leader_proxy {
+            {
+                let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
                 let mut fwd = Request::new(request.into_inner());
                 *fwd.metadata_mut() = Self::forwarded_metadata();
@@ -384,7 +384,8 @@ impl SlurmController for ControllerService {
         request: Request<RegisterAgentRequest>,
     ) -> Result<Response<RegisterAgentResponse>, Status> {
         if let Err(status) = self.check_leader(&request) {
-            if let Some(ref proxy) = self.leader_proxy {
+            {
+                let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
                 let mut fwd = Request::new(request.into_inner());
                 *fwd.metadata_mut() = Self::forwarded_metadata();
@@ -452,7 +453,8 @@ impl SlurmController for ControllerService {
         request: Request<ReportJobStatusRequest>,
     ) -> Result<Response<()>, Status> {
         if let Err(status) = self.check_leader(&request) {
-            if let Some(ref proxy) = self.leader_proxy {
+            {
+                let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
                 let mut fwd = Request::new(request.into_inner());
                 *fwd.metadata_mut() = Self::forwarded_metadata();
@@ -490,7 +492,8 @@ impl SlurmController for ControllerService {
         request: Request<GetJobStepsRequest>,
     ) -> Result<Response<GetJobStepsResponse>, Status> {
         if let Err(_) = self.check_leader(&request) {
-            if let Some(ref proxy) = self.leader_proxy {
+            {
+                let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
                 let mut fwd = Request::new(request.into_inner());
                 *fwd.metadata_mut() = Self::forwarded_metadata();
@@ -518,7 +521,8 @@ impl SlurmController for ControllerService {
         request: Request<CreateJobStepRequest>,
     ) -> Result<Response<CreateJobStepResponse>, Status> {
         if let Err(status) = self.check_leader(&request) {
-            if let Some(ref proxy) = self.leader_proxy {
+            {
+                let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
                 let mut fwd = Request::new(request.into_inner());
                 *fwd.metadata_mut() = Self::forwarded_metadata();
@@ -573,7 +577,8 @@ impl SlurmController for ControllerService {
         request: Request<CreateReservationRequest>,
     ) -> Result<Response<()>, Status> {
         if let Err(status) = self.check_leader(&request) {
-            if let Some(ref proxy) = self.leader_proxy {
+            {
+                let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
                 let mut fwd = Request::new(request.into_inner());
                 *fwd.metadata_mut() = Self::forwarded_metadata();
@@ -616,7 +621,8 @@ impl SlurmController for ControllerService {
         request: Request<UpdateReservationRequest>,
     ) -> Result<Response<()>, Status> {
         if let Err(status) = self.check_leader(&request) {
-            if let Some(ref proxy) = self.leader_proxy {
+            {
+                let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
                 let mut fwd = Request::new(request.into_inner());
                 *fwd.metadata_mut() = Self::forwarded_metadata();
@@ -646,7 +652,8 @@ impl SlurmController for ControllerService {
         request: Request<DeleteReservationRequest>,
     ) -> Result<Response<()>, Status> {
         if let Err(status) = self.check_leader(&request) {
-            if let Some(ref proxy) = self.leader_proxy {
+            {
+                let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
                 let mut fwd = Request::new(request.into_inner());
                 *fwd.metadata_mut() = Self::forwarded_metadata();
@@ -667,7 +674,8 @@ impl SlurmController for ControllerService {
         request: Request<ListReservationsRequest>,
     ) -> Result<Response<ListReservationsResponse>, Status> {
         if let Err(_) = self.check_leader(&request) {
-            if let Some(ref proxy) = self.leader_proxy {
+            {
+                let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
                 let mut fwd = Request::new(request.into_inner());
                 *fwd.metadata_mut() = Self::forwarded_metadata();
@@ -696,7 +704,8 @@ impl SlurmController for ControllerService {
         request: Request<ExecInJobRequest>,
     ) -> Result<Response<ExecInJobResponse>, Status> {
         if let Err(_) = self.check_leader(&request) {
-            if let Some(ref proxy) = self.leader_proxy {
+            {
+                let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
                 let mut fwd = Request::new(request.into_inner());
                 *fwd.metadata_mut() = Self::forwarded_metadata();
@@ -758,34 +767,28 @@ impl SlurmController for ControllerService {
 pub async fn serve(
     addr: SocketAddr,
     cluster: Arc<ClusterManager>,
-    raft_handle: Option<Arc<RaftHandle>>,
+    raft_handle: Arc<RaftHandle>,
 ) -> anyhow::Result<()> {
-    let (raft, leader_proxy, client_addrs) = match raft_handle {
-        Some(rh) => {
-            let client_addrs: BTreeMap<u64, String> = rh
-                .peers
-                .iter()
-                .map(|(id, raft_addr)| {
-                    let client_addr = if let Some(host) = raft_addr.rsplit_once(':').map(|(h, _)| h)
-                    {
-                        format!("{}:6817", host)
-                    } else {
-                        format!("{}:6817", raft_addr)
-                    };
-                    (*id, client_addr)
-                })
-                .collect();
+    let client_addrs: BTreeMap<u64, String> = raft_handle
+        .peers
+        .iter()
+        .map(|(id, raft_addr)| {
+            let client_addr =
+                if let Some(host) = raft_addr.rsplit_once(':').map(|(h, _)| h) {
+                    format!("{}:6817", host)
+                } else {
+                    format!("{}:6817", raft_addr)
+                };
+            (*id, client_addr)
+        })
+        .collect();
 
-            let proxy = LeaderProxy::new(rh.clone(), client_addrs.clone());
-            (Some(rh), Some(proxy), client_addrs)
-        }
-        None => (None, None, BTreeMap::new()),
-    };
+    let leader_proxy = LeaderProxy::new(raft_handle.clone(), client_addrs.clone());
 
     let service = ControllerService {
         cluster,
         client_addrs,
-        raft,
+        raft: raft_handle,
         leader_proxy,
     };
 
