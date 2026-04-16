@@ -8,7 +8,7 @@ publish = false
 spur-proto = { path = "../spur-proto" }
 spur-core = { path = "../spur-core" }
 spur-sched = { path = "../spur-sched" }
-spur-state = { path = "../spur-state" }
+
 spur-spank = { path = "../spur-spank" }
 tokio = { workspace = true }
 tonic = { workspace = true }

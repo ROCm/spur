@@ -22,7 +22,6 @@
 //! | 50    | core types    | —            | t50_core |
 //! | 51    | hostlist      | —            | t51_hostlist |
 //! | 52    | config        | —            | t52_config |
-//! | 53    | WAL/state     | —            | t53_state |
 //! | 54    | REST API      | —            | t54_rest |
 //! | 55    | CLI format    | —            | t55_format |
 //! | 56    | FFI           | —            | t56_ffi |
@@ -45,7 +44,6 @@ pub mod t39_gpu;
 pub mod t50_core;
 pub mod t51_hostlist;
 pub mod t52_config;
-pub mod t53_state;
 pub mod t55_format;
 pub mod t56_deps;
 pub mod t57_auth;
