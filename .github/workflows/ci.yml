@@ -89,6 +89,8 @@ jobs:
       - name: Build release binaries
         run: |
           export PATH="$HOME/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          export PROTOC="$HOME/bin/protoc"
+          export PROTOC_INCLUDE="$HOME/protoc-install/include"
           cargo build --release -j 4
 
       - name: Stop any running cluster and clear state
