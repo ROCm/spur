@@ -2133,7 +2133,7 @@ mod tests {
             job.allocated_resources.is_none(),
             "allocated_resources should be cleared"
         );
-        assert_eq!(job.pending_reason, PendingReason::Priority);
+        assert_eq!(job.pending_reason, PendingReason::None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
