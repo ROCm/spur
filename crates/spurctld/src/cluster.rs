@@ -1638,6 +1638,15 @@ mod tests {
         let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
             .await
             .unwrap();
+        // Wait for the single-node Raft to self-elect before returning.
+        // Without this, the first propose() call may hit a not-yet-leader
+        // node and silently fail.
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .expect("single-node raft did not self-elect within 5s");
         cm.set_raft(handle.raft);
         cm
     }
@@ -1654,6 +1663,21 @@ mod tests {
         }
     }
 
+    /// Spin until a Raft-proposed mutation is visible in memory.
+    /// In tests, `propose()` can be called before the single-node Raft
+    /// has finished its initial self-election, causing `client_write` to
+    /// fail silently. This helper retries until the election completes
+    /// and the mutation is applied.
+    fn wait_for<F: Fn() -> bool>(label: &str, f: F) {
+        for _ in 0..200 {
+            if f() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("timed out waiting for: {label}");
+    }
+
     fn register_node(cm: &ClusterManager, name: &str, cpus: u32, mem: u64) {
         cm.register_node(
             name.into(),
@@ -1668,6 +1692,25 @@ mod tests {
             String::new(),
             spur_core::node::NodeSource::BareMetal,
         );
+        let n = name.to_string();
+        wait_for(&format!("node '{n}' registered"), || {
+            cm.get_node(&n).is_some()
+        });
+    }
+
+    fn submit_and_wait(cm: &ClusterManager, spec: JobSpec) -> JobId {
+        let id = cm.submit_job(spec).unwrap();
+        wait_for(&format!("job {id} applied"), || cm.get_job(id).is_some());
+        id
+    }
+
+    /// Wait for a job to reach the expected state.
+    /// Handles the test-only race where propose() is called before the
+    /// single-node Raft has self-elected.
+    fn settle(cm: &ClusterManager, job_id: JobId, expected: JobState) {
+        wait_for(&format!("job {job_id} -> {expected:?}"), || {
+            cm.get_job(job_id).map_or(false, |j| j.state == expected)
+        });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1865,7 +1908,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
-        let id = cm.submit_job(basic_spec("my-job")).unwrap();
+        let id = submit_and_wait(&cm, basic_spec("my-job"));
         assert!(id >= 1);
 
         let job = cm.get_job(id).unwrap();
@@ -1879,9 +1922,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
-        let id1 = cm.submit_job(basic_spec("a")).unwrap();
-        let id2 = cm.submit_job(basic_spec("b")).unwrap();
-        let id3 = cm.submit_job(basic_spec("c")).unwrap();
+        let id1 = submit_and_wait(&cm, basic_spec("a"));
+        let id2 = submit_and_wait(&cm, basic_spec("b"));
+        let id3 = submit_and_wait(&cm, basic_spec("c"));
 
         assert!(id2 > id1);
         assert!(id3 > id2);
@@ -1893,7 +1936,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         register_node(&cm, "worker1", 8, 16000);
-        let job_id = cm.submit_job(basic_spec("lifecycle")).unwrap();
+        let job_id = submit_and_wait(&cm, basic_spec("lifecycle"));
 
         let resources = ResourceSet {
             cpus: 2,
@@ -1902,6 +1945,7 @@ mod tests {
         };
         cm.start_job(job_id, vec!["worker1".into()], resources)
             .unwrap();
+        settle(&cm, job_id, JobState::Running);
 
         let job = cm.get_job(job_id).unwrap();
         assert_eq!(job.state, JobState::Running);
@@ -1911,6 +1955,7 @@ mod tests {
         assert_eq!(node.alloc_resources.cpus, 2);
 
         cm.complete_job(job_id, 0, JobState::Completed).unwrap();
+        settle(&cm, job_id, JobState::Completed);
 
         let job = cm.get_job(job_id).unwrap();
         assert_eq!(job.state, JobState::Completed);
@@ -1925,8 +1970,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
-        let job_id = cm.submit_job(basic_spec("cancel-me")).unwrap();
+        let job_id = submit_and_wait(&cm, basic_spec("cancel-me"));
         cm.cancel_job(job_id, "testuser").unwrap();
+        settle(&cm, job_id, JobState::Cancelled);
 
         let job = cm.get_job(job_id).unwrap();
         assert_eq!(job.state, JobState::Cancelled);
@@ -1937,8 +1983,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
-        let job_id = cm.submit_job(basic_spec("j")).unwrap();
+        let job_id = submit_and_wait(&cm, basic_spec("j"));
         cm.cancel_job(job_id, "u").unwrap();
+        settle(&cm, job_id, JobState::Cancelled);
 
         let result = cm.complete_job(job_id, 1, JobState::Failed);
         assert!(result.is_err());
@@ -1950,7 +1997,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         register_node(&cm, "n1", 4, 8000);
-        cm.submit_job(basic_spec("snap-job")).unwrap();
+        submit_and_wait(&cm, basic_spec("snap-job"));
 
         let data = cm.snapshot_state();
         assert!(!data.is_empty());
@@ -1968,14 +2015,20 @@ mod tests {
     async fn hold_and_release_job() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
-        let id = cm.submit_job(basic_spec("holdme")).unwrap();
+        let id = submit_and_wait(&cm, basic_spec("holdme"));
 
         cm.hold_job(id).unwrap();
+        wait_for("hold applied", || {
+            cm.get_job(id).map_or(false, |j| j.priority == 0)
+        });
         let job = cm.get_job(id).unwrap();
         assert_eq!(job.priority, 0);
         assert_eq!(job.pending_reason, PendingReason::Held);
 
         cm.release_job(id).unwrap();
+        wait_for("release applied", || {
+            cm.get_job(id).map_or(false, |j| j.priority > 0)
+        });
         let job = cm.get_job(id).unwrap();
         assert_eq!(job.priority, 1000);
         assert_eq!(job.pending_reason, PendingReason::Priority);
@@ -1985,10 +2038,13 @@ mod tests {
     async fn update_job_priority() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
-        let id = cm.submit_job(basic_spec("prio")).unwrap();
+        let id = submit_and_wait(&cm, basic_spec("prio"));
 
         cm.update_job(id, None, Some(5000), None, None, None, None)
             .unwrap();
+        wait_for("priority updated", || {
+            cm.get_job(id).map_or(false, |j| j.priority == 5000)
+        });
         assert_eq!(cm.get_job(id).unwrap().priority, 5000);
     }
 
@@ -2000,6 +2056,10 @@ mod tests {
 
         cm.update_node_state("n1", NodeState::Drain, Some("maint".into()))
             .unwrap();
+        wait_for("node drain applied", || {
+            cm.get_node("n1")
+                .map_or(false, |n| n.state == NodeState::Drain)
+        });
         let node = cm.get_node("n1").unwrap();
         assert_eq!(node.state, NodeState::Drain);
         assert_eq!(node.state_reason, Some("maint".into()));
@@ -2017,6 +2077,10 @@ mod tests {
         }
 
         cm.check_node_health(90);
+        wait_for("health check applied", || {
+            cm.get_node("stale")
+                .map_or(false, |n| n.state == NodeState::Down)
+        });
         let node = cm.get_node("stale").unwrap();
         assert_eq!(node.state, NodeState::Down);
     }
@@ -2026,7 +2090,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 4, 8000);
-        let id = cm.submit_job(basic_spec("requeue-me")).unwrap();
+        let id = submit_and_wait(&cm, basic_spec("requeue-me"));
 
         cm.start_job(
             id,
@@ -2038,8 +2102,8 @@ mod tests {
             },
         )
         .unwrap();
+        settle(&cm, id, JobState::Running);
 
-        // Transition to a terminal state first (requeue only works from terminal)
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: id,
             exit_code: -1,
