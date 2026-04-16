@@ -598,7 +598,7 @@ impl ClusterManager {
         job.exit_code = None;
         job.allocated_nodes.clear();
         job.allocated_resources = None;
-        job.pending_reason = PendingReason::Priority;
+        job.pending_reason = PendingReason::None;
 
         self.append_wal(WalOperation::JobStateChange {
             job_id,
@@ -612,6 +612,37 @@ impl ClusterManager {
             from = %old_state,
             "job requeued"
         );
+    }
+
+    /// Requeue a job back to Pending after a dispatch failure.
+    /// Unlike `maybe_requeue`, this is unconditional and doesn't require
+    /// the requeue flag on the spec. Used when the agent rejects a job
+    /// (e.g., container image not found) so it can be retried after the
+    /// user fixes the issue. (Issue #91)
+    pub fn requeue_job(&self, job_id: JobId) {
+        let mut jobs = self.jobs.write();
+        let Some(job) = jobs.get_mut(&job_id) else {
+            return;
+        };
+
+        let old_state = job.state;
+        if job.transition(JobState::Pending).is_err() {
+            return;
+        }
+        job.requeue_count += 1;
+        job.start_time = None;
+        job.exit_code = None;
+        job.allocated_nodes.clear();
+        job.allocated_resources = None;
+        job.pending_reason = PendingReason::Resources;
+
+        self.append_wal(WalOperation::JobStateChange {
+            job_id,
+            old_state,
+            new_state: JobState::Pending,
+        });
+
+        info!(job_id, from = %old_state, "job requeued after dispatch failure");
     }
 
     /// Register a node agent.

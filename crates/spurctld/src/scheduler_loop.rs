@@ -252,13 +252,17 @@ pub async fn run(cluster: Arc<ClusterManager>) {
                     }
                 }
 
-                // If ALL dispatches failed, mark job as Failed
+                // If ALL dispatches failed, requeue the job back to Pending
+                // so the scheduler can retry (e.g., container image may be
+                // imported later, or a transient agent error may resolve).
+                // Issue #91: previously marked as Failed immediately, which
+                // didn't give users a chance to fix the problem.
                 if successes == 0 && total > 0 {
                     error!(
                         job_id,
-                        failures, "all dispatches failed — marking job as Failed"
+                        failures, "all dispatches failed — requeueing job to Pending"
                     );
-                    let _ = cluster_ref.complete_job(job_id, -1, spur_core::job::JobState::Failed);
+                    cluster_ref.requeue_job(job_id);
                 } else if failures > 0 {
                     warn!(
                         job_id,
