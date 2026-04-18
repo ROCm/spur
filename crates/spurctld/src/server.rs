@@ -982,6 +982,15 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         } else {
             Some(spec.topology)
         },
+        host_network: spec.host_network,
+        privileged: spec.privileged,
+        host_ipc: spec.host_ipc,
+        shm_size: if spec.shm_size.is_empty() {
+            None
+        } else {
+            Some(spec.shm_size)
+        },
+        extra_resources: spec.extra_resources,
         open_mode: if spec.open_mode.is_empty() {
             None
         } else {

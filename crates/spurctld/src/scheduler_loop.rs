@@ -446,6 +446,11 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
         }),
         spread_job: s.spread_job,
         topology: s.topology.clone().unwrap_or_default(),
+        host_network: s.host_network,
+        privileged: s.privileged,
+        host_ipc: s.host_ipc,
+        shm_size: s.shm_size.clone().unwrap_or_default(),
+        extra_resources: s.extra_resources.clone(),
         open_mode: s.open_mode.clone().unwrap_or_default(),
     }
 }
@@ -527,6 +532,11 @@ async fn dispatch_to_agent(
         }),
         spread_job: spec.spread_job,
         topology: spec.topology.clone().unwrap_or_default(),
+        host_network: spec.host_network,
+        privileged: spec.privileged,
+        host_ipc: spec.host_ipc,
+        shm_size: spec.shm_size.clone().unwrap_or_default(),
+        extra_resources: spec.extra_resources.clone(),
         open_mode: spec.open_mode.clone().unwrap_or_default(),
     };
 

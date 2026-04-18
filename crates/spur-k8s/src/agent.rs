@@ -240,13 +240,38 @@ impl SlurmAgent for VirtualAgent {
         };
 
         // Parse container_mounts → volumes + volume_mounts
-        let (volumes, volume_mounts) = parse_mounts(&spec.container_mounts);
+        let (mut volumes, mut volume_mounts) = parse_mounts(&spec.container_mounts);
 
         // Set working_dir from work_dir or container_workdir
         let working_dir = if !spec.container_workdir.is_empty() {
             Some(spec.container_workdir.clone())
         } else if !spec.work_dir.is_empty() {
             Some(spec.work_dir.clone())
+        } else {
+            None
+        };
+
+        // Add extra device plugin resources (RDMA, MIG, etc.) — Issue #88
+        for (key, val) in &spec.extra_resources {
+            resource_requests.insert(key.clone(), Quantity(val.clone()));
+            resource_limits.insert(key.clone(), Quantity(val.clone()));
+        }
+
+        // Shared memory volume mount — Issue #87
+        if !spec.shm_size.is_empty() {
+            volume_mounts.push(k8s_openapi::api::core::v1::VolumeMount {
+                name: "dshm".into(),
+                mount_path: "/dev/shm".into(),
+                ..Default::default()
+            });
+        }
+
+        // Privileged mode / SecurityContext — Issue #86
+        let security_context = if spec.privileged {
+            Some(k8s_openapi::api::core::v1::SecurityContext {
+                privileged: Some(true),
+                ..Default::default()
+            })
         } else {
             None
         };
@@ -267,6 +292,7 @@ impl SlurmAgent for VirtualAgent {
                 limits: Some(resource_limits),
                 ..Default::default()
             }),
+            security_context,
             ..Default::default()
         };
 
@@ -315,18 +341,36 @@ impl SlurmAgent for VirtualAgent {
                 labels: Some(labels),
                 ..Default::default()
             },
-            spec: Some(PodSpec {
-                containers: vec![container],
-                restart_policy: Some("Never".into()),
-                node_name,
-                hostname,
-                subdomain,
-                volumes: if volumes.is_empty() {
-                    None
-                } else {
-                    Some(volumes)
-                },
-                ..Default::default()
+            spec: Some({
+                // Shared memory emptyDir volume — Issue #87
+                if !spec.shm_size.is_empty() {
+                    volumes.push(k8s_openapi::api::core::v1::Volume {
+                        name: "dshm".into(),
+                        empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource {
+                            medium: Some("Memory".into()),
+                            size_limit: Some(Quantity(spec.shm_size.clone())),
+                        }),
+                        ..Default::default()
+                    });
+                }
+
+                PodSpec {
+                    containers: vec![container],
+                    restart_policy: Some("Never".into()),
+                    node_name,
+                    hostname,
+                    subdomain,
+                    volumes: if volumes.is_empty() {
+                        None
+                    } else {
+                        Some(volumes)
+                    },
+                    // Issue #85: host_network
+                    host_network: if spec.host_network { Some(true) } else { None },
+                    // Issue #87: host_ipc
+                    host_ipc: if spec.host_ipc { Some(true) } else { None },
+                    ..Default::default()
+                }
             }),
             ..Default::default()
         };

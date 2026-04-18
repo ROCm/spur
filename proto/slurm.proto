@@ -121,6 +121,13 @@ message JobSpec {
   string wckey = 64;
   bool interactive = 65;  // salloc interactive allocation
 
+  // Kubernetes pod options
+  bool host_network = 66;          // Enable host networking (RDMA/NCCL)
+  bool privileged = 67;            // Run in privileged mode
+  bool host_ipc = 68;              // Share host IPC namespace
+  string shm_size = 69;            // Shared memory size (e.g., "64Gi")
+  map<string, string> extra_resources = 80; // Custom device plugin resources
+
   // Container
   string container_image = 70;     // OCI image ref or squashfs path
   repeated string container_mounts = 71;  // "/src:/dst:ro" bind mounts
