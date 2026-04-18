@@ -511,6 +511,10 @@ impl ClusterManager {
         // info and resources but PRESERVE its current state and allocations.
         // The K8s node watcher re-registers nodes on every Apply event, which
         // was resetting Allocated/Mixed nodes back to Idle.
+        //
+        // Issue #95: Exception — if a node is Down due to heartbeat timeout
+        // ("Not responding"), re-registration means the agent came back.
+        // Recover it to Idle so it can accept jobs again.
         {
             let mut nodes = self.nodes.write();
             if let Some(existing) = nodes.get_mut(&effective_name) {
@@ -524,7 +528,27 @@ impl ClusterManager {
                 }
                 existing.version = Some(version);
                 existing.last_heartbeat = Some(Utc::now());
-                debug!(node = %effective_name, state = ?existing.state, "node re-registered (state preserved)");
+
+                // Auto-recover from heartbeat-timeout Down state
+                if existing.state == NodeState::Down {
+                    let is_auto_down = existing
+                        .state_reason
+                        .as_deref()
+                        .map(|r| r == "Not responding")
+                        .unwrap_or(false);
+                    if is_auto_down {
+                        info!(
+                            node = %effective_name,
+                            "node re-registered after heartbeat timeout — recovering to Idle"
+                        );
+                        existing.state = NodeState::Idle;
+                        existing.state_reason = None;
+                    } else {
+                        debug!(node = %effective_name, state = ?existing.state, "node re-registered (admin Down preserved)");
+                    }
+                } else {
+                    debug!(node = %effective_name, state = ?existing.state, "node re-registered (state preserved)");
+                }
                 return;
             }
         }
@@ -551,6 +575,11 @@ impl ClusterManager {
     }
 
     /// Update node heartbeat data.
+    ///
+    /// If a node is Down due to heartbeat timeout ("Not responding"), receiving
+    /// a fresh heartbeat automatically recovers it to Idle. Admin-set Down
+    /// states (any other reason) are NOT cleared — those require explicit
+    /// `scontrol update`. (Issue #95)
     pub fn update_heartbeat(&self, name: &str, cpu_load: u32, free_memory_mb: u64) {
         // Resolve hostname alias (agent may use real hostname, node stored under config name)
         let effective_name = self
@@ -564,6 +593,25 @@ impl ClusterManager {
             node.cpu_load = cpu_load;
             node.free_memory_mb = free_memory_mb;
             node.last_heartbeat = Some(Utc::now());
+
+            // Auto-recover nodes that went Down from heartbeat timeout.
+            // Only recover if the reason is "Not responding" (auto-detected).
+            // Admin-set Down (e.g., "maintenance", "hardware issue") stays Down.
+            if node.state == NodeState::Down {
+                let is_auto_down = node
+                    .state_reason
+                    .as_deref()
+                    .map(|r| r == "Not responding")
+                    .unwrap_or(false);
+                if is_auto_down {
+                    info!(
+                        node = %node.name,
+                        "node recovered from heartbeat timeout — transitioning to Idle"
+                    );
+                    node.state = NodeState::Idle;
+                    node.state_reason = None;
+                }
+            }
         }
     }
 
