@@ -4,6 +4,7 @@ mod executor;
 mod gpu;
 pub mod pmi;
 mod reporter;
+mod seccomp;
 
 use std::sync::Arc;
 

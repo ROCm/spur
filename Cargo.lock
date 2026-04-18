@@ -3399,6 +3399,7 @@ dependencies = [
  "chrono",
  "clap",
  "hostname",
+ "libc",
  "nix",
  "prost-types",
  "serde",

@@ -24,5 +24,6 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 nix = { workspace = true }
+libc = "0.2"
 hostname = "0.4.2"
 tokio-stream = "0.1"

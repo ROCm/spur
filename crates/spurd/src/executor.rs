@@ -333,7 +333,22 @@ pub async fn launch_job(
         debug!(job_id, uid, gid, "job will run as non-root user");
     }
 
-    // If cgroup is set up, launch via cgexec or write PID to cgroup
+    // Issue #99: Apply seccomp-BPF syscall filter (opt-in via SPUR_SECCOMP=1).
+    let enable_seccomp = std::env::var("SPUR_SECCOMP")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    if enable_seccomp {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                if let Err(e) = crate::seccomp::apply_seccomp_filter() {
+                    eprintln!("spur: seccomp filter not applied: {e}");
+                }
+                Ok(())
+            });
+        }
+    }
+
     let child = cmd.spawn().context("failed to spawn job process")?;
 
     // Move process into cgroup
