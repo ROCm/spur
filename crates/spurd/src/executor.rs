@@ -280,7 +280,7 @@ pub async fn launch_job(
             .iter()
             .map(|id| {
                 format!(
-                    "if [ -e /host_dev/dri/renderD{r} ]; then\n  touch /dev/dri/renderD{r}\n  mount --bind /host_dev/dri/renderD{r} /dev/dri/renderD{r}\nfi\n",
+                    "  if [ -e $SPUR_HOST_DRI/renderD{r} ]; then\n    cp -a $SPUR_HOST_DRI/renderD{r} /dev/dri/renderD{r} 2>/dev/null || true\n  fi\n",
                     r = 128 + id,
                 )
             })
@@ -288,7 +288,20 @@ pub async fn launch_job(
             .join("");
 
         let wrapper = format!(
-            "#!/bin/bash\nset -e\nmount -t proc proc /proc 2>/dev/null || true\nmount -t tmpfs tmpfs /tmp 2>/dev/null || true\nmount -t tmpfs tmpfs /dev/shm 2>/dev/null || true\nif [ -d /dev/dri ]; then\n  mkdir -p /host_dev/dri\n  mount --bind /dev/dri /host_dev/dri 2>/dev/null || true\n  mount -t tmpfs tmpfs /dev/dri 2>/dev/null || true\n  mkdir -p /dev/dri\n{gpu_mounts}fi\nexec /bin/bash {script}\n",
+            concat!(
+                "#!/bin/bash\n",
+                "# Namespace isolation wrapper — all mounts best-effort\n",
+                "mount -t proc proc /proc 2>/dev/null || true\n",
+                "mount -t tmpfs tmpfs /dev/shm 2>/dev/null || true\n",
+                "# GPU device restriction: save original /dev/dri, replace with\n",
+                "# tmpfs, then selectively copy only allocated devices back.\n",
+                "SPUR_HOST_DRI=$(mktemp -d /tmp/.spur_dri_XXXXXX 2>/dev/null || echo /tmp/.spur_dri)\n",
+                "if [ -d /dev/dri ] && cp -a /dev/dri/. $SPUR_HOST_DRI/ 2>/dev/null; then\n",
+                "  mount -t tmpfs tmpfs /dev/dri 2>/dev/null || true\n",
+                "{gpu_mounts}",
+                "fi\n",
+                "exec /bin/bash {script}\n",
+            ),
             gpu_mounts = gpu_mounts,
             script = script_path.display(),
         );
