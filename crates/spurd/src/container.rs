@@ -441,7 +441,7 @@ mkdir -p {rootfs}{home}
     script.push_str(&format!(
         r#"
 if [ "$(id -u)" = "0" ]; then
-  exec unshare --mount bash -c '
+  exec unshare --mount --pid --fork bash -c '
 set -e
 ROOTFS="{rootfs}"
 

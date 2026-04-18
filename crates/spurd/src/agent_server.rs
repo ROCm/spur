@@ -34,6 +34,8 @@ struct TrackedJob {
     stdout_path: String,
     /// Stderr path for output streaming.
     stderr_path: String,
+    /// Whether this job has a PID namespace (for nsenter flags).
+    has_pid_namespace: bool,
 }
 
 pub struct AgentService {
@@ -615,6 +617,7 @@ impl SlurmAgent for AgentService {
                         allocation: alloc_result,
                         stdout_path,
                         stderr_path,
+                        has_pid_namespace: nix::unistd::geteuid().is_root(),
                     },
                 );
                 info!(job_id, gpus = ?gpu_devices, "job launched successfully");
@@ -721,9 +724,19 @@ impl SlurmAgent for AgentService {
             "exec into running job"
         );
 
-        // Use nsenter to enter the job's mount namespace and run the command
+        // Use nsenter to enter the job's namespace(s) and run the command
+        let has_pid_ns = {
+            let jobs = self.running.lock().await;
+            jobs.get(&req.job_id)
+                .map(|j| j.has_pid_namespace)
+                .unwrap_or(false)
+        };
         let mut cmd = tokio::process::Command::new("nsenter");
-        cmd.args(["--target", &pid.to_string(), "--mount", "--"]);
+        cmd.arg("--target").arg(pid.to_string()).arg("--mount");
+        if has_pid_ns {
+            cmd.arg("--pid");
+        }
+        cmd.arg("--");
         cmd.arg(&req.command[0]);
         for arg in &req.command[1..] {
             cmd.arg(arg);

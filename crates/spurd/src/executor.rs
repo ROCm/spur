@@ -272,9 +272,53 @@ pub async fn launch_job(
     env.insert("VECLIB_MAXIMUM_THREADS".into(), cpus.to_string());
     env.insert("NUMEXPR_NUM_THREADS".into(), cpus.to_string());
 
+    // Issue #99: If root, wrap job with namespace isolation.
+    let use_namespaces = nix::unistd::geteuid().is_root();
+    let (launch_cmd, launch_args) = if use_namespaces {
+        let wrapper_path = PathBuf::from(work_dir).join(format!(".spur_ns_{}.sh", job_id));
+        let gpu_mounts = gpu_devices
+            .iter()
+            .map(|id| {
+                format!(
+                    "if [ -e /host_dev/dri/renderD{r} ]; then\n  touch /dev/dri/renderD{r}\n  mount --bind /host_dev/dri/renderD{r} /dev/dri/renderD{r}\nfi\n",
+                    r = 128 + id,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
+
+        let wrapper = format!(
+            "#!/bin/bash\nset -e\nmount -t proc proc /proc 2>/dev/null || true\nmount -t tmpfs tmpfs /tmp 2>/dev/null || true\nmount -t tmpfs tmpfs /dev/shm 2>/dev/null || true\nif [ -d /dev/dri ]; then\n  mkdir -p /host_dev/dri\n  mount --bind /dev/dri /host_dev/dri 2>/dev/null || true\n  mount -t tmpfs tmpfs /dev/dri 2>/dev/null || true\n  mkdir -p /dev/dri\n{gpu_mounts}fi\nexec /bin/bash {script}\n",
+            gpu_mounts = gpu_mounts,
+            script = script_path.display(),
+        );
+        tokio::fs::write(&wrapper_path, &wrapper).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755))?;
+        }
+        debug!(job_id, "namespace isolation wrapper created");
+        (
+            "/usr/bin/unshare".to_string(),
+            vec![
+                "--pid".into(),
+                "--mount".into(),
+                "--fork".into(),
+                "/bin/bash".into(),
+                wrapper_path.to_string_lossy().to_string(),
+            ],
+        )
+    } else {
+        (
+            "/bin/bash".to_string(),
+            vec![script_path.to_string_lossy().to_string()],
+        )
+    };
+
     // Launch the process
-    let mut cmd = Command::new("/bin/bash");
-    cmd.arg(&script_path)
+    let mut cmd = Command::new(&launch_cmd);
+    cmd.args(&launch_args)
         .current_dir(work_dir)
         .envs(&env)
         .stdout(stdout_file.into_std().await)
@@ -282,7 +326,6 @@ pub async fn launch_job(
         .stdin(Stdio::null());
 
     // Issue #99: Run job as the submitting user (not root).
-    // Requires spurd to run as root. Non-root spurd skips setuid.
     if uid > 0 && nix::unistd::geteuid().is_root() {
         use std::os::unix::process::CommandExt;
         cmd.uid(uid);
