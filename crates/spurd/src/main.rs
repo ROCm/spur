@@ -2,6 +2,7 @@ mod agent_server;
 pub mod container;
 mod executor;
 mod gpu;
+mod landlock;
 pub mod pmi;
 mod reporter;
 mod seccomp;

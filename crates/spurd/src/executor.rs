@@ -349,6 +349,23 @@ pub async fn launch_job(
         }
     }
 
+    // Issue #99: Apply Landlock filesystem restrictions (opt-in via SPUR_LANDLOCK=1).
+    let work_dir_for_landlock = work_dir.to_string();
+    let enable_landlock = std::env::var("SPUR_LANDLOCK")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    if enable_landlock {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(move || {
+                if let Err(e) = crate::landlock::apply_landlock_rules(&work_dir_for_landlock) {
+                    eprintln!("spur: landlock not applied: {e}");
+                }
+                Ok(())
+            });
+        }
+    }
+
     let child = cmd.spawn().context("failed to spawn job process")?;
 
     // Move process into cgroup
