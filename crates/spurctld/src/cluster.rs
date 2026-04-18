@@ -2,14 +2,14 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
 use spur_core::accounting::{Qos, TresRecord, TresType};
 use spur_core::config::SlurmConfig;
 use spur_core::job::{Job, JobId, JobSpec, JobState, PendingReason};
-use spur_core::node::{Node, NodeSource, NodeState};
+use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::Partition;
 use spur_core::qos::{check_qos_limits, QosCheckResult};
 use spur_core::reservation::Reservation;
@@ -507,71 +507,45 @@ impl ClusterManager {
             }
         };
 
-        // Issue #70: If node is already registered, update its connection
-        // info and resources but PRESERVE its current state and allocations.
-        // The K8s node watcher re-registers nodes on every Apply event, which
-        // was resetting Allocated/Mixed nodes back to Idle.
-        //
-        // Issue #95: Exception — if a node is Down due to heartbeat timeout
-        // ("Not responding"), re-registration means the agent came back.
-        // Recover it to Idle so it can accept jobs again.
-        {
-            let mut nodes = self.nodes.write();
-            if let Some(existing) = nodes.get_mut(&effective_name) {
-                // Update connection info and resources, keep state + allocations
-                existing.total_resources = resources.clone();
-                existing.address = Some(address.clone());
-                existing.port = port;
-                existing.source = source;
-                if !wg_pubkey.is_empty() {
-                    existing.wg_pubkey = Some(wg_pubkey);
-                }
-                existing.version = Some(version);
-                existing.last_heartbeat = Some(Utc::now());
+        let action = {
+            let nodes = self.nodes.read();
+            evaluate_registration(nodes.get(&effective_name), &resources)
+        };
 
-                // Auto-recover from heartbeat-timeout Down state
-                if existing.state == NodeState::Down {
-                    let is_auto_down = existing
-                        .state_reason
-                        .as_deref()
-                        .map(|r| r == "Not responding")
-                        .unwrap_or(false);
-                    if is_auto_down {
-                        info!(
-                            node = %effective_name,
-                            "node re-registered after heartbeat timeout — recovering to Idle"
-                        );
-                        existing.state = NodeState::Idle;
-                        existing.state_reason = None;
-                    } else {
-                        debug!(node = %effective_name, state = ?existing.state, "node re-registered (admin Down preserved)");
-                    }
-                } else {
-                    debug!(node = %effective_name, state = ?existing.state, "node re-registered (state preserved)");
+        match action {
+            RegistrationAction::Skip => {
+                debug!(node = %effective_name, "node unchanged, skipping");
+            }
+            RegistrationAction::Update => {
+                self.propose(WalOperation::NodeUpdate {
+                    name: effective_name.clone(),
+                    resources,
+                    address,
+                    port,
+                    wg_pubkey,
+                    version,
+                });
+                if let Some(node) = self.nodes.write().get_mut(&effective_name) {
+                    node.source = source;
                 }
-                return;
+                info!(node = %effective_name, "node updated (resources changed)");
+            }
+            RegistrationAction::Register => {
+                self.propose(WalOperation::NodeRegister {
+                    name: effective_name.clone(),
+                    resources,
+                    address,
+                    port,
+                    wg_pubkey,
+                    version,
+                });
+                if let Some(node) = self.nodes.write().get_mut(&effective_name) {
+                    node.source = source;
+                    node.agent_start_time = Some(Utc::now());
+                }
+                info!(node = %effective_name, "node registered");
             }
         }
-
-        self.propose(WalOperation::NodeRegister {
-            name: effective_name.clone(),
-            resources,
-            address,
-        });
-
-        // Set ephemeral connection info not tracked by the WAL
-        if let Some(node) = self.nodes.write().get_mut(&effective_name) {
-            node.port = port;
-            node.source = source;
-            if !wg_pubkey.is_empty() {
-                node.wg_pubkey = Some(wg_pubkey);
-            }
-            node.version = Some(version);
-            node.agent_start_time = Some(Utc::now());
-            node.last_heartbeat = Some(Utc::now());
-        }
-
-        info!(node = %effective_name, "node registered");
     }
 
     /// Update node heartbeat data.
@@ -756,55 +730,75 @@ impl ClusterManager {
                 .get(name)
                 .ok_or_else(|| anyhow::anyhow!("node {} not found", name))?;
             let old = node.state;
-            let effective = if state == NodeState::Drain
+            let requested = old
+                .transition(&NodeEvent::AdminSetState(state), node.admin_locked)
+                .unwrap_or(state);
+            // Drain with active allocations becomes Draining
+            let effective = if requested == NodeState::Drain
                 && (node.alloc_resources.cpus > 0 || !node.alloc_resources.gpus.is_empty())
             {
                 NodeState::Draining
             } else {
-                state
+                requested
             };
             (old, effective)
         };
+
+        // Admin-initiated state changes that move into a hold state are
+        // locked so auto-recovery won't override the operator's intent.
+        // Resuming to Idle clears the lock.
+        let admin_locked = effective_state.is_admin_hold();
 
         self.propose(WalOperation::NodeStateChange {
             name: name.to_string(),
             old_state,
             new_state: effective_state,
             reason,
+            admin_locked,
         });
         info!(node = %name, old = ?old_state, new = ?effective_state, "node state updated");
         Ok(())
     }
 
-    /// Check for stale nodes (no heartbeat within timeout) and mark them DOWN.
+    /// Reconcile node liveness state with heartbeat data.
+    /// Marks stale nodes Down and recovers nodes whose heartbeat has resumed.
     pub fn check_node_health(&self, timeout_secs: u64) {
-        let now = Utc::now();
-        let threshold = chrono::Duration::seconds(timeout_secs as i64);
-
-        // Collect nodes that need to be marked DOWN (avoid holding write lock across propose)
-        let stale_nodes: Vec<(String, NodeState)> = {
+        let actions = {
             let nodes = self.nodes.read();
-            nodes
-                .values()
-                .filter(|n| {
-                    n.state != NodeState::Down
-                        && n.state != NodeState::Drain
-                        && n.last_heartbeat
-                            .map(|hb| now - hb > threshold)
-                            .unwrap_or(false)
-                })
-                .map(|n| (n.name.clone(), n.state))
-                .collect()
+            let refs: Vec<&Node> = nodes.values().collect();
+            evaluate_node_health(&refs, Utc::now(), timeout_secs)
         };
+        self.apply_health_actions(actions);
+    }
 
-        for (name, old_state) in stale_nodes {
-            warn!(node = %name, "node marked DOWN (heartbeat timeout)");
-            self.propose(WalOperation::NodeStateChange {
-                name,
-                old_state,
-                new_state: NodeState::Down,
-                reason: Some("Not responding".into()),
-            });
+    fn apply_health_actions(&self, actions: Vec<HealthAction>) {
+        for action in actions {
+            match action {
+                HealthAction::MarkDown {
+                    name,
+                    old_state,
+                    admin_locked,
+                } => {
+                    warn!(node = %name, "node marked DOWN (heartbeat timeout)");
+                    self.propose(WalOperation::NodeStateChange {
+                        name,
+                        old_state,
+                        new_state: NodeState::Down,
+                        reason: Some("Not responding".into()),
+                        admin_locked,
+                    });
+                }
+                HealthAction::Recover { name, old_state } => {
+                    info!(node = %name, "node recovered (heartbeat resumed)");
+                    self.propose(WalOperation::NodeStateChange {
+                        name,
+                        old_state,
+                        new_state: NodeState::Idle,
+                        reason: None,
+                        admin_locked: false,
+                    });
+                }
+            }
         }
     }
 
@@ -1490,10 +1484,24 @@ impl ClusterManager {
                 name,
                 resources,
                 address,
+                port,
+                wg_pubkey,
+                version,
             } => {
                 let mut node = Node::new(name.clone(), resources.clone());
                 node.address = Some(address.clone());
-                node.state = NodeState::Idle;
+                node.port = *port;
+                if !wg_pubkey.is_empty() {
+                    node.wg_pubkey = Some(wg_pubkey.clone());
+                }
+                if !version.is_empty() {
+                    node.version = Some(version.clone());
+                }
+                node.last_heartbeat = Some(Utc::now());
+                node.state = node
+                    .state
+                    .transition(&NodeEvent::Register, false)
+                    .unwrap_or(NodeState::Idle);
 
                 // Assign partitions from config
                 drop(nodes);
@@ -1529,15 +1537,38 @@ impl ClusterManager {
                 self.next_job_id.store(next_id, Ordering::Relaxed);
                 return;
             }
+            WalOperation::NodeUpdate {
+                name,
+                resources,
+                address,
+                port,
+                wg_pubkey,
+                version,
+            } => {
+                if let Some(node) = nodes.get_mut(name) {
+                    node.total_resources = resources.clone();
+                    node.address = Some(address.clone());
+                    node.port = *port;
+                    if !wg_pubkey.is_empty() {
+                        node.wg_pubkey = Some(wg_pubkey.clone());
+                    }
+                    if !version.is_empty() {
+                        node.version = Some(version.clone());
+                    }
+                    node.last_heartbeat = Some(Utc::now());
+                }
+            }
             WalOperation::NodeStateChange {
                 name,
                 new_state,
                 reason,
+                admin_locked,
                 ..
             } => {
                 if let Some(node) = nodes.get_mut(name) {
                     node.state = *new_state;
                     node.state_reason = reason.clone();
+                    node.admin_locked = *admin_locked;
                 }
             }
             WalOperation::NodeHeartbeat {
@@ -1634,6 +1665,77 @@ fn extract_license_requirements(spec: &JobSpec) -> HashMap<String, u64> {
         }
     }
     licenses
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum RegistrationAction {
+    Skip,
+    Update,
+    Register,
+}
+
+pub(crate) fn evaluate_registration(
+    existing: Option<&Node>,
+    incoming_resources: &ResourceSet,
+) -> RegistrationAction {
+    match existing {
+        None => RegistrationAction::Register,
+        Some(node) if node.total_resources != *incoming_resources => RegistrationAction::Update,
+        Some(_) => RegistrationAction::Skip,
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum HealthAction {
+    MarkDown {
+        name: String,
+        old_state: NodeState,
+        admin_locked: bool,
+    },
+    Recover {
+        name: String,
+        old_state: NodeState,
+    },
+}
+
+pub(crate) fn evaluate_node_health(
+    nodes: &[&Node],
+    now: DateTime<Utc>,
+    timeout_secs: u64,
+) -> Vec<HealthAction> {
+    let threshold = chrono::Duration::seconds(timeout_secs as i64);
+    let mut actions = Vec::new();
+
+    for node in nodes {
+        let Some(hb) = node.last_heartbeat else {
+            continue;
+        };
+        let stale = now - hb > threshold;
+
+        if stale {
+            if node
+                .state
+                .transition(&NodeEvent::HeartbeatTimeout, node.admin_locked)
+                .is_some()
+            {
+                actions.push(HealthAction::MarkDown {
+                    name: node.name.clone(),
+                    old_state: node.state,
+                    admin_locked: node.admin_locked,
+                });
+            }
+        } else if node
+            .state
+            .transition(&NodeEvent::HeartbeatRecovered, node.admin_locked)
+            .is_some()
+        {
+            actions.push(HealthAction::Recover {
+                name: node.name.clone(),
+                old_state: node.state,
+            });
+        }
+    }
+    actions
 }
 
 #[cfg(test)]
@@ -1884,6 +1986,9 @@ mod tests {
                 ..Default::default()
             },
             address: "10.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: "1.0".into(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -1909,6 +2014,7 @@ mod tests {
             old_state: NodeState::Idle,
             new_state: NodeState::Drain,
             reason: Some("maintenance".into()),
+            admin_locked: true,
         });
 
         let node = cm.get_node("n1").unwrap();
@@ -2135,6 +2241,109 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_drained_node_stays_locked_through_timeout_and_reregister() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "locked", 4, 8000);
+
+        // Give the node an allocation so Drain becomes Draining
+        let id = submit_and_wait(&cm, basic_spec("hold-job"));
+        cm.start_job(
+            id,
+            vec!["locked".into()],
+            ResourceSet {
+                cpus: 2,
+                memory_mb: 4000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+
+        // Admin drains while job is running — becomes Draining (admin_locked)
+        cm.update_node_state("locked", NodeState::Drain, Some("hw swap".into()))
+            .unwrap();
+        wait_for("draining applied", || {
+            cm.get_node("locked")
+                .map_or(false, |n| n.state == NodeState::Draining)
+        });
+        assert!(cm.get_node("locked").unwrap().admin_locked);
+
+        // Heartbeat times out — Draining → Down, admin_locked preserved
+        if let Some(node) = cm.nodes.write().get_mut("locked") {
+            node.last_heartbeat = Some(Utc::now() - chrono::Duration::seconds(200));
+        }
+        cm.check_node_health(90);
+        wait_for("health check applied", || {
+            cm.get_node("locked")
+                .map_or(false, |n| n.state == NodeState::Down)
+        });
+        let node = cm.get_node("locked").unwrap();
+        assert_eq!(node.state, NodeState::Down);
+        assert!(
+            node.admin_locked,
+            "admin lock must survive heartbeat timeout"
+        );
+
+        // Agent reconnects — re-registration must NOT recover to Idle
+        cm.register_node(
+            "locked".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            "127.0.0.1".into(),
+            6818,
+            String::new(),
+            "1.0".into(),
+            NodeSource::BareMetal,
+        );
+        let node = cm.get_node("locked").unwrap();
+        assert_eq!(
+            node.state,
+            NodeState::Down,
+            "admin-locked node must not auto-recover"
+        );
+        assert!(node.admin_locked);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auto_downed_node_recovers_via_health_check() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "auto", 4, 8000);
+
+        // Heartbeat timeout — auto Down, admin_locked = false
+        if let Some(node) = cm.nodes.write().get_mut("auto") {
+            node.last_heartbeat = Some(Utc::now() - chrono::Duration::seconds(200));
+        }
+        cm.check_node_health(90);
+        wait_for("health check applied", || {
+            cm.get_node("auto")
+                .map_or(false, |n| n.state == NodeState::Down)
+        });
+        let node = cm.get_node("auto").unwrap();
+        assert!(!node.admin_locked, "auto-downed must not be admin_locked");
+
+        // Agent heartbeat resumes — refresh last_heartbeat
+        cm.update_heartbeat("auto", 50, 4000);
+
+        // Next health check cycle detects fresh heartbeat → recovers to Idle
+        cm.check_node_health(90);
+        wait_for("recovery applied", || {
+            cm.get_node("auto")
+                .map_or(false, |n| n.state == NodeState::Idle)
+        });
+        let node = cm.get_node("auto").unwrap();
+        assert_eq!(
+            node.state,
+            NodeState::Idle,
+            "auto-downed node must recover via health check"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn requeue_resets_fields_via_apply() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -2194,5 +2403,187 @@ mod tests {
         let node = cm.get_node("test-node").unwrap();
         assert!(!node.partitions.is_empty());
         assert_eq!(node.partitions[0], "default");
+    }
+
+    // --- Pure evaluate_node_health tests (no Raft needed) ---
+
+    fn make_health_node(
+        name: &str,
+        state: NodeState,
+        admin_locked: bool,
+        last_hb: Option<chrono::DateTime<Utc>>,
+    ) -> Node {
+        let mut node = Node::new(name.into(), ResourceSet::default());
+        node.state = state;
+        node.admin_locked = admin_locked;
+        node.last_heartbeat = last_hb;
+        node
+    }
+
+    #[test]
+    fn health_stale_idle_marks_down() {
+        let node = make_health_node(
+            "n1",
+            NodeState::Idle,
+            false,
+            Some(Utc::now() - chrono::Duration::seconds(200)),
+        );
+        let actions = super::evaluate_node_health(&[&node], Utc::now(), 90);
+        assert_eq!(
+            actions,
+            vec![super::HealthAction::MarkDown {
+                name: "n1".into(),
+                old_state: NodeState::Idle,
+                admin_locked: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn health_fresh_down_recovers() {
+        let node = make_health_node(
+            "n1",
+            NodeState::Down,
+            false,
+            Some(Utc::now() - chrono::Duration::seconds(10)),
+        );
+        let actions = super::evaluate_node_health(&[&node], Utc::now(), 90);
+        assert_eq!(
+            actions,
+            vec![super::HealthAction::Recover {
+                name: "n1".into(),
+                old_state: NodeState::Down,
+            }]
+        );
+    }
+
+    #[test]
+    fn health_admin_locked_down_no_recovery() {
+        let node = make_health_node(
+            "n1",
+            NodeState::Down,
+            true,
+            Some(Utc::now() - chrono::Duration::seconds(10)),
+        );
+        let actions = super::evaluate_node_health(&[&node], Utc::now(), 90);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn health_drain_not_marked_down() {
+        let node = make_health_node(
+            "n1",
+            NodeState::Drain,
+            true,
+            Some(Utc::now() - chrono::Duration::seconds(200)),
+        );
+        let actions = super::evaluate_node_health(&[&node], Utc::now(), 90);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn health_idle_fresh_no_action() {
+        let node = make_health_node(
+            "n1",
+            NodeState::Idle,
+            false,
+            Some(Utc::now() - chrono::Duration::seconds(10)),
+        );
+        let actions = super::evaluate_node_health(&[&node], Utc::now(), 90);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn health_no_heartbeat_skipped() {
+        let node = make_health_node("n1", NodeState::Idle, false, None);
+        let actions = super::evaluate_node_health(&[&node], Utc::now(), 90);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn health_mixed_actions() {
+        let stale = make_health_node(
+            "stale",
+            NodeState::Idle,
+            false,
+            Some(Utc::now() - chrono::Duration::seconds(200)),
+        );
+        let recovering = make_health_node(
+            "back",
+            NodeState::Down,
+            false,
+            Some(Utc::now() - chrono::Duration::seconds(10)),
+        );
+        let stable = make_health_node(
+            "ok",
+            NodeState::Idle,
+            false,
+            Some(Utc::now() - chrono::Duration::seconds(10)),
+        );
+        let actions = super::evaluate_node_health(&[&stale, &recovering, &stable], Utc::now(), 90);
+        assert_eq!(actions.len(), 2);
+        assert_eq!(
+            actions[0],
+            super::HealthAction::MarkDown {
+                name: "stale".into(),
+                old_state: NodeState::Idle,
+                admin_locked: false,
+            }
+        );
+        assert_eq!(
+            actions[1],
+            super::HealthAction::Recover {
+                name: "back".into(),
+                old_state: NodeState::Down,
+            }
+        );
+    }
+
+    // --- Pure evaluate_registration tests ---
+
+    #[test]
+    fn registration_new_node() {
+        let resources = ResourceSet {
+            cpus: 4,
+            memory_mb: 8000,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::evaluate_registration(None, &resources),
+            super::RegistrationAction::Register,
+        );
+    }
+
+    #[test]
+    fn registration_unchanged_skip() {
+        let resources = ResourceSet {
+            cpus: 4,
+            memory_mb: 8000,
+            ..Default::default()
+        };
+        let node = Node::new("n1".into(), resources.clone());
+        assert_eq!(
+            super::evaluate_registration(Some(&node), &resources),
+            super::RegistrationAction::Skip,
+        );
+    }
+
+    #[test]
+    fn registration_resources_changed_update() {
+        let old = ResourceSet {
+            cpus: 4,
+            memory_mb: 8000,
+            ..Default::default()
+        };
+        let new = ResourceSet {
+            cpus: 8,
+            memory_mb: 16000,
+            ..Default::default()
+        };
+        let node = Node::new("n1".into(), old);
+        assert_eq!(
+            super::evaluate_registration(Some(&node), &new),
+            super::RegistrationAction::Update,
+        );
     }
 }

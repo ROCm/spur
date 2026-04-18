@@ -10,7 +10,7 @@ pub enum GpuLinkType {
 }
 
 /// A single GPU resource.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GpuResource {
     pub device_id: u32,
     pub gpu_type: String,
@@ -20,7 +20,7 @@ pub struct GpuResource {
 }
 
 /// A set of compute resources (node-level or job-level).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResourceSet {
     pub cpus: u32,
     pub memory_mb: u64,

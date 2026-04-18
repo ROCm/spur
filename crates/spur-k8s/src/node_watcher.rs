@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::pin::pin;
 use std::sync::Arc;
 
@@ -10,9 +12,79 @@ use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
-use spur_proto::proto::{RegisterAgentRequest, ResourceSet, UpdateNodeRequest};
+use spur_proto::proto::{NodeState, RegisterAgentRequest, ResourceSet, UpdateNodeRequest};
 
 use crate::heartbeat::HeartbeatManager;
+
+/// Tracks the taint state of a K8s node and whether spurctld has been notified.
+/// On every taint transition, `synced` flips to false and the operator retries
+/// until spurctld acknowledges the state change.
+struct NodeTaintState {
+    tainted: bool,
+    synced: bool,
+}
+
+/// Resource fingerprint — purely about compute resources, not health/taints.
+#[derive(Hash, PartialEq, Eq)]
+struct NodeFingerprint {
+    cpus: u32,
+    memory_mb: u64,
+    gpu_count: u32,
+    gpu_type: String,
+    gpu_memory_mb: u64,
+    gpu_link_type: i32,
+}
+
+fn fingerprint(resources: &ResourceSet) -> u64 {
+    let fp = NodeFingerprint {
+        cpus: resources.cpus,
+        memory_mb: resources.memory_mb,
+        gpu_count: resources.gpus.len() as u32,
+        gpu_type: resources
+            .gpus
+            .first()
+            .map(|g| g.gpu_type.clone())
+            .unwrap_or_default(),
+        gpu_memory_mb: resources.gpus.first().map(|g| g.memory_mb).unwrap_or(0),
+        gpu_link_type: resources.gpus.first().map(|g| g.link_type).unwrap_or(0),
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    fp.hash(&mut hasher);
+    hasher.finish()
+}
+
+async fn sync_taint_state(
+    name: &str,
+    entry: &mut NodeTaintState,
+    client: &mut SlurmControllerClient<Channel>,
+) {
+    let (state, reason) = if entry.tainted {
+        (NodeState::NodeDown as i32, Some("K8s node NotReady".into()))
+    } else {
+        (NodeState::NodeIdle as i32, None)
+    };
+
+    let req = UpdateNodeRequest {
+        name: name.into(),
+        state: Some(state),
+        reason,
+    };
+
+    match client.update_node(req).await {
+        Ok(_) => {
+            entry.synced = true;
+            if entry.tainted {
+                warn!(node = %name, "K8s node marked DOWN (NotReady taint)");
+            } else {
+                info!(node = %name, "K8s node resumed (NotReady taint removed)");
+            }
+        }
+        Err(e) => {
+            let action = if entry.tainted { "mark DOWN" } else { "resume" };
+            error!(node = %name, error = %e, "failed to {action}, will retry");
+        }
+    }
+}
 
 /// Watch K8s nodes matching `label_selector`, register them with spurctld, and
 /// keep `hb` in sync so the heartbeat task knows which nodes to ping.
@@ -29,6 +101,8 @@ pub async fn run(
     info!(selector = %label_selector, "starting K8s node watcher");
 
     let mut ctrl_client = connect_controller(&controller_addr).await?;
+    let mut fingerprints: HashMap<String, u64> = HashMap::new();
+    let mut taint_states: HashMap<String, NodeTaintState> = HashMap::new();
 
     let stream = watcher::watcher(nodes, watcher::Config::default().labels(&label_selector));
     let mut stream = pin!(stream);
@@ -37,51 +111,60 @@ pub async fn run(
         match event {
             Event::Apply(node) | Event::InitApply(node) => {
                 let name = node.metadata.name.clone().unwrap_or_default();
-
-                // Check if node is not-ready via taints
-                if is_node_not_ready(&node) {
-                    warn!(node = %name, "K8s node has NotReady taint, marking DOWN");
-                    hb.untrack(&name).await;
-                    let req = UpdateNodeRequest {
-                        name: name.clone(),
-                        state: Some(3), // NODE_DOWN
-                        reason: Some("K8s node NotReady".into()),
-                    };
-                    if let Err(e) = ctrl_client.update_node(req).await {
-                        error!(node = %name, error = %e, "failed to mark node DOWN");
-                    }
-                    continue;
-                }
-
+                let tainted = is_node_not_ready(&node);
                 let resources = extract_resources(&node);
 
-                info!(node = %name, cpus = resources.cpus, memory_mb = resources.memory_mb, gpus = resources.gpus.len(), "registering K8s node");
+                let fp = fingerprint(&resources);
 
-                let req = RegisterAgentRequest {
-                    hostname: name.clone(),
-                    resources: Some(resources),
-                    version: "spur-k8s-operator".into(),
-                    address: operator_grpc_addr.clone(),
-                    port: operator_grpc_port,
-                    wg_pubkey: String::new(),
-                };
+                if fingerprints.get(&name) != Some(&fp) {
+                    fingerprints.insert(name.clone(), fp);
 
-                match ctrl_client.register_agent(req.clone()).await {
-                    Ok(_) => {
-                        debug!(node = %name, "K8s node registered with spurctld");
-                        hb.track(name, req).await;
+                    info!(node = %name, cpus = resources.cpus, memory_mb = resources.memory_mb, gpus = resources.gpus.len(), "registering K8s node");
+
+                    let req = RegisterAgentRequest {
+                        hostname: name.clone(),
+                        resources: Some(resources),
+                        version: "spur-k8s-operator".into(),
+                        address: operator_grpc_addr.clone(),
+                        port: operator_grpc_port,
+                        wg_pubkey: String::new(),
+                    };
+
+                    match ctrl_client.register_agent(req.clone()).await {
+                        Ok(_) => {
+                            debug!(node = %name, "K8s node registered with spurctld");
+                            hb.track(name.clone(), req).await;
+                        }
+                        Err(e) => {
+                            error!(node = %name, error = %e, "failed to register K8s node")
+                        }
                     }
-                    Err(e) => error!(node = %name, error = %e, "failed to register K8s node"),
+                }
+
+                let entry = taint_states.entry(name.clone()).or_insert(NodeTaintState {
+                    tainted,
+                    synced: false,
+                });
+
+                if entry.tainted != tainted {
+                    entry.tainted = tainted;
+                    entry.synced = false;
+                }
+
+                if !entry.synced {
+                    sync_taint_state(&name, entry, &mut ctrl_client).await;
                 }
             }
             Event::Delete(node) => {
                 let name = node.metadata.name.clone().unwrap_or_default();
                 warn!(node = %name, "K8s node deleted, marking DOWN");
+                fingerprints.remove(&name);
+                taint_states.remove(&name);
                 hb.untrack(&name).await;
 
                 let req = UpdateNodeRequest {
                     name: name.clone(),
-                    state: Some(3), // NODE_DOWN
+                    state: Some(NodeState::NodeDown as i32),
                     reason: Some("K8s node removed".into()),
                 };
 
@@ -612,5 +695,58 @@ mod tests {
         assert_eq!(res.gpus[0].gpu_type, "mi250x");
         assert_eq!(res.gpus[0].memory_mb, 131072);
         assert_eq!(res.gpus[0].link_type, 1);
+    }
+
+    // --- Fingerprint tests ---
+
+    fn make_resources(cpus: u32, mem: u64, gpu_count: u32) -> ResourceSet {
+        let gpus: Vec<spur_proto::proto::GpuResource> = (0..gpu_count)
+            .map(|i| spur_proto::proto::GpuResource {
+                device_id: i,
+                gpu_type: "mi300x".into(),
+                memory_mb: 196608,
+                peer_gpus: vec![],
+                link_type: 1,
+            })
+            .collect();
+        ResourceSet {
+            cpus,
+            memory_mb: mem,
+            gpus,
+            generic: Default::default(),
+        }
+    }
+
+    #[test]
+    fn fingerprint_same_input_same_hash() {
+        let r = make_resources(64, 262144, 8);
+        assert_eq!(fingerprint(&r), fingerprint(&r));
+    }
+
+    #[test]
+    fn fingerprint_different_cpus() {
+        let r1 = make_resources(64, 262144, 8);
+        let r2 = make_resources(32, 262144, 8);
+        assert_ne!(fingerprint(&r1), fingerprint(&r2));
+    }
+
+    #[test]
+    fn fingerprint_different_memory() {
+        let r1 = make_resources(64, 262144, 8);
+        let r2 = make_resources(64, 131072, 8);
+        assert_ne!(fingerprint(&r1), fingerprint(&r2));
+    }
+
+    #[test]
+    fn fingerprint_different_gpu_count() {
+        let r1 = make_resources(64, 262144, 8);
+        let r2 = make_resources(64, 262144, 4);
+        assert_ne!(fingerprint(&r1), fingerprint(&r2));
+    }
+
+    #[test]
+    fn fingerprint_no_gpus() {
+        let r = make_resources(4, 8000, 0);
+        assert_eq!(fingerprint(&r), fingerprint(&r));
     }
 }
