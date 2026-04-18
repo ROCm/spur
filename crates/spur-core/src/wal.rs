@@ -4,6 +4,10 @@ use crate::job::{JobId, JobSpec, JobState};
 use crate::node::NodeState;
 use crate::resource::ResourceSet;
 
+fn default_port() -> u16 {
+    6818
+}
+
 /// All state-mutating operations that get logged to the Raft log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalOperation {
@@ -38,12 +42,28 @@ pub enum WalOperation {
         name: String,
         resources: ResourceSet,
         address: String,
+        #[serde(default = "default_port")]
+        port: u16,
+        #[serde(default)]
+        wg_pubkey: String,
+        #[serde(default)]
+        version: String,
+    },
+    NodeUpdate {
+        name: String,
+        resources: ResourceSet,
+        address: String,
+        port: u16,
+        wg_pubkey: String,
+        version: String,
     },
     NodeStateChange {
         name: String,
         old_state: NodeState,
         new_state: NodeState,
         reason: Option<String>,
+        #[serde(default)]
+        admin_locked: bool,
     },
     NodeHeartbeat {
         name: String,
