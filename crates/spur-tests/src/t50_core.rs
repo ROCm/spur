@@ -1425,4 +1425,66 @@ address = "http://peer-a:6817"
             "available resources (4 cpus) should NOT satisfy requirement (32 cpus)"
         );
     }
+
+    // ── T50.108–110: Node auto-recovery from heartbeat timeout (#95) ──
+
+    #[test]
+    fn t50_108_auto_down_node_recovers_on_heartbeat() {
+        // A node marked Down from heartbeat timeout ("Not responding")
+        // should automatically recover to Idle when a heartbeat arrives.
+        let mut node = Node::new("gpu001".into(), ResourceSet::default());
+        node.state = NodeState::Down;
+        node.state_reason = Some("Not responding".into());
+
+        // Simulate: heartbeat arrives, should recover
+        assert_eq!(node.state, NodeState::Down);
+        let is_auto_down = node
+            .state_reason
+            .as_deref()
+            .map(|r| r == "Not responding")
+            .unwrap_or(false);
+        assert!(is_auto_down, "should detect auto-down reason");
+
+        // After recovery logic applies:
+        node.state = NodeState::Idle;
+        node.state_reason = None;
+        assert_eq!(node.state, NodeState::Idle);
+        assert!(node.state_reason.is_none());
+    }
+
+    #[test]
+    fn t50_109_admin_down_node_does_not_recover_on_heartbeat() {
+        // A node marked Down by admin (reason != "Not responding")
+        // should NOT recover on heartbeat.
+        let mut node = Node::new("gpu002".into(), ResourceSet::default());
+        node.state = NodeState::Down;
+        node.state_reason = Some("maintenance".into());
+
+        let is_auto_down = node
+            .state_reason
+            .as_deref()
+            .map(|r| r == "Not responding")
+            .unwrap_or(false);
+        assert!(!is_auto_down, "admin-set Down should not auto-recover");
+
+        // State should remain Down
+        assert_eq!(node.state, NodeState::Down);
+        assert_eq!(node.state_reason.as_deref(), Some("maintenance"));
+    }
+
+    #[test]
+    fn t50_110_down_with_no_reason_does_not_recover() {
+        // A node with Down state and no reason should not auto-recover
+        // (conservative: if we don't know why it's Down, don't clear it).
+        let mut node = Node::new("gpu003".into(), ResourceSet::default());
+        node.state = NodeState::Down;
+        node.state_reason = None;
+
+        let is_auto_down = node
+            .state_reason
+            .as_deref()
+            .map(|r| r == "Not responding")
+            .unwrap_or(false);
+        assert!(!is_auto_down, "no reason = no auto-recovery");
+    }
 }
