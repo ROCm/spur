@@ -210,6 +210,18 @@ pub struct JobSpec {
     /// "block" (keep within one rack). None = default (no topology preference).
     pub topology: Option<String>,
 
+    // Kubernetes pod options
+    /// Enable host networking for the pod (for RDMA/NCCL).
+    pub host_network: bool,
+    /// Run container in privileged mode.
+    pub privileged: bool,
+    /// Enable host IPC namespace sharing (for NCCL shared memory).
+    pub host_ipc: bool,
+    /// Shared memory size (e.g., "64Gi"). Mounted as emptyDir at /dev/shm.
+    pub shm_size: Option<String>,
+    /// Extra device plugin resources (e.g., {"rdma/devices": "1"}).
+    pub extra_resources: std::collections::HashMap<String, String>,
+
     // Output mode
     /// How to open stdout/stderr files: "truncate" (default) or "append".
     pub open_mode: Option<String>,
@@ -272,6 +284,11 @@ impl Default for JobSpec {
             deadline: None,
             spread_job: false,
             topology: None,
+            host_network: false,
+            privileged: false,
+            host_ipc: false,
+            shm_size: None,
+            extra_resources: std::collections::HashMap::new(),
             open_mode: None,
         }
     }

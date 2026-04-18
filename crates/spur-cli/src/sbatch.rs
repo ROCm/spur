@@ -621,6 +621,11 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
             }),
         spread_job: args.spread_job,
         topology: args.topology.clone().unwrap_or_default(),
+        host_network: false,
+        privileged: false,
+        host_ipc: false,
+        shm_size: String::new(),
+        extra_resources: std::collections::HashMap::new(),
         open_mode: args.open_mode.unwrap_or_default(),
     };
 

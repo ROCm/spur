@@ -711,6 +711,11 @@ fn core_job_spec_to_proto(spec: &spur_core::job::JobSpec) -> spur_proto::proto::
         }),
         spread_job: spec.spread_job,
         topology: spec.topology.clone().unwrap_or_default(),
+        host_network: spec.host_network,
+        privileged: spec.privileged,
+        host_ipc: spec.host_ipc,
+        shm_size: spec.shm_size.clone().unwrap_or_default(),
+        extra_resources: spec.extra_resources.clone(),
         open_mode: spec.open_mode.clone().unwrap_or_default(),
     }
 }
@@ -1174,6 +1179,10 @@ mod tests {
                 account: None,
                 volumes: vec![],
                 host_network: false,
+                privileged: false,
+                host_ipc: false,
+                shm_size: None,
+                extra_resources: std::collections::HashMap::new(),
                 tolerations: vec![],
                 node_selector: Default::default(),
                 priority_class: None,

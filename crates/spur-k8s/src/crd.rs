@@ -76,6 +76,22 @@ pub struct SpurJobSpec {
     #[serde(default)]
     pub host_network: bool,
 
+    /// Run container in privileged mode.
+    #[serde(default)]
+    pub privileged: bool,
+
+    /// Enable host IPC namespace sharing (for NCCL shared memory).
+    #[serde(default)]
+    pub host_ipc: bool,
+
+    /// Shared memory size (e.g., "64Gi"). Mounted as emptyDir at /dev/shm.
+    #[serde(default)]
+    pub shm_size: Option<String>,
+
+    /// Extra device plugin resources (e.g., {"rdma/devices": "1"}).
+    #[serde(default)]
+    pub extra_resources: std::collections::HashMap<String, String>,
+
     /// K8s tolerations.
     #[serde(default)]
     pub tolerations: Vec<TolerationSpec>,
@@ -194,6 +210,11 @@ pub fn to_core_job_spec(spec: &SpurJobSpec, user: &str) -> spur_core::job::JobSp
         time_limit,
         dependency: spec.dependencies.clone(),
         array_spec: spec.array_spec.clone(),
+        host_network: spec.host_network,
+        privileged: spec.privileged,
+        host_ipc: spec.host_ipc,
+        shm_size: spec.shm_size.clone(),
+        extra_resources: spec.extra_resources.clone(),
         ..Default::default()
     }
 }
@@ -277,6 +298,10 @@ mod tests {
             account: None,
             volumes: vec![],
             host_network: false,
+            privileged: false,
+            host_ipc: false,
+            shm_size: None,
+            extra_resources: std::collections::HashMap::new(),
             tolerations: vec![],
             node_selector: Default::default(),
             priority_class: None,
@@ -408,6 +433,10 @@ mod tests {
             account: None,
             volumes: vec!["/data:/mnt/data:ro".into()],
             host_network: false,
+            privileged: false,
+            host_ipc: false,
+            shm_size: None,
+            extra_resources: std::collections::HashMap::new(),
             tolerations: vec![],
             node_selector: Default::default(),
             priority_class: None,
@@ -594,6 +623,10 @@ mod tests {
             account: Some("acct".into()),
             volumes: vec!["/data:/data".into()],
             host_network: true,
+            privileged: false,
+            host_ipc: false,
+            shm_size: None,
+            extra_resources: std::collections::HashMap::new(),
             tolerations: vec![TolerationSpec {
                 key: Some("spur.ai/gpu-node".into()),
                 operator: "Exists".into(),
@@ -659,6 +692,10 @@ mod tests {
                 "pvc:checkpoints:/checkpoints".into(),
             ],
             host_network: false,
+            privileged: false,
+            host_ipc: false,
+            shm_size: None,
+            extra_resources: std::collections::HashMap::new(),
             tolerations: vec![TolerationSpec {
                 key: Some("spur.ai/gpu-node".into()),
                 operator: "Exists".into(),
