@@ -110,6 +110,8 @@ pub async fn launch_job(
     cpu_ids: &[u32],
     spank: Option<&SpankHost>,
     open_mode: Option<&str>,
+    uid: u32,
+    gid: u32,
 ) -> anyhow::Result<RunningJob> {
     info!(job_id, work_dir, "launching job");
 
@@ -279,6 +281,15 @@ pub async fn launch_job(
         .stderr(stderr_file.into_std().await)
         .stdin(Stdio::null());
 
+    // Issue #99: Run job as the submitting user (not root).
+    // Requires spurd to run as root. Non-root spurd skips setuid.
+    if uid > 0 && nix::unistd::geteuid().is_root() {
+        use std::os::unix::process::CommandExt;
+        cmd.uid(uid);
+        cmd.gid(gid);
+        debug!(job_id, uid, gid, "job will run as non-root user");
+    }
+
     // If cgroup is set up, launch via cgexec or write PID to cgroup
     let child = cmd.spawn().context("failed to spawn job process")?;
 
@@ -340,6 +351,17 @@ fn setup_cgroup(
         if let Err(e) = std::fs::write(cgroup_path.join("memory.max"), memory_bytes.to_string()) {
             warn!(job_id, error = %e, "failed to set memory.max");
         }
+    }
+
+    // OOM isolation: kill entire cgroup on OOM, not a random process
+    if let Err(e) = std::fs::write(cgroup_path.join("memory.oom.group"), "1") {
+        warn!(job_id, error = %e, "failed to set memory.oom.group");
+    }
+
+    // Fork bomb protection: limit total processes per job
+    let max_pids = (cpus as u64 * 256).max(1024);
+    if let Err(e) = std::fs::write(cgroup_path.join("pids.max"), max_pids.to_string()) {
+        warn!(job_id, error = %e, "failed to set pids.max");
     }
 
     // Pin to specific CPU cores via cpuset

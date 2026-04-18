@@ -597,6 +597,8 @@ impl SlurmAgent for AgentService {
             &cpu_ids,
             (*self.spank).as_ref(),
             open_mode,
+            spec.uid,
+            spec.gid,
         )
         .await
         {
