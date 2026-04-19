@@ -18,15 +18,16 @@ Build takes ~30s on a modern machine. All crates build in one `cargo build`.
 cargo test
 ```
 
-314 tests, all must pass. No external services needed (no database, no network, no GPU). Tests are self-contained.
+All tests must pass. No external services needed (no database, no network, no GPU). Tests are self-contained.
 
 ## Project Layout
 
 ```
-proto/slurm.proto              # Single protobuf file — all gRPC service definitions
+proto/slurm.proto              # Public API: Slurm-compatible gRPC service definitions
+proto/raft_internal.proto      # Internal: Raft consensus RPCs between controllers
 crates/
   spur-proto/                  # Generated gRPC code (build.rs runs tonic-build)
-  spur-core/                   # Core types: Job, Node, ResourceSet, config, hostlist, WalOperation
+  spur-core/                   # Core types: Job, Node, ResourceSet, config, hostlist, WalOperation, partition, qos, step, topology, reservation, dependency, array, auth, accounting
   spur-net/                    # WireGuard mesh networking, IP pool, address detection
   spur-sched/                  # Backfill scheduler
   spurctld/                    # Controller daemon (the brain)
@@ -36,13 +37,13 @@ crates/
   spur-cli/                    # Multi-call CLI binary (spur, sbatch, squeue, etc.)
   spur-ffi/                    # C FFI shim (libspur_compat.so)
   spur-spank/                  # SPANK plugin host
-  spur-k8s/                    # K8s integration (stub)
+  spur-k8s/                    # K8s integration
   spur-tests/                  # Integration test suite
 ```
 
 ## Key Architecture Decisions
 
-- **Single proto file**: All services defined in `proto/slurm.proto`. Controller is `SlurmController` (port 6817), agent is `SlurmAgent` (port 6818), accounting is `SlurmAccounting` (port 6819).
+- **Proto files**: `proto/slurm.proto` defines the public API — `SlurmController` (port 6817), `SlurmAgent` (port 6818), `SlurmAccounting` (port 6819). `proto/raft_internal.proto` is separate because Raft consensus is internal controller-to-controller plumbing, not part of the Slurm-compatible API surface that FFI and REST depend on.
 - **State**: Always-on Raft consensus (openraft) in `spurctld/src/raft.rs`. Even single-node deployments run a 1-member Raft cluster. The Raft log is the sole durable store; snapshots are JSON-serialized `ClusterSnapshot` blobs. Recovery happens via Raft log replay + snapshot restore.
 - **Scheduler**: Backfill scheduler in `spur-sched`. Runs every N seconds, assigns pending jobs to idle/mixed nodes.
 - **Job dispatch**: Controller dispatches `LaunchJobRequest` to ALL allocated nodes (not just the first). Each node gets `peer_nodes` list and `task_offset`.
@@ -62,7 +63,8 @@ crates/
 
 1. Create a new module in `crates/spur-cli/src/` (see `net.rs` as an example)
 2. Add `mod yourcommand;` to `crates/spur-cli/src/main.rs`
-3. Add dispatch in the `match args[1].as_str()` block
+3. Add symlink dispatch in the `match bin_name` block (for backward-compat invocation via argv[0])
+4. Add native dispatch in the `match args[1].as_str()` block (for `spur <command>` invocation)
 
 ### Adding a new config section
 
@@ -85,14 +87,14 @@ crates/
 - Async runtime: tokio (full features).
 - Logging: `tracing` crate with `tracing-subscriber`.
 - Proto conversion: Each gRPC handler converts between proto types and core types. Conversion helpers live in the same file as the server (e.g., `server.rs` has `proto_to_job_spec`, `job_to_proto`, etc.).
-- Node state machine: `Idle → Mixed → Allocated` based on resource usage; `Down`/`Drain`/`Error` are admin states that override.
-- Job state machine: `Pending → Running → Completing → Completed/Failed/Cancelled`. See `spur-core/src/job.rs`.
+- Node state machine: `Idle`/`Mixed`/`Allocated` based on resource usage; `Down`/`Drain`/`Draining`/`Error`/`Unknown`/`Suspended` are admin/system states that override.
+- Job state machine: `Pending → Running → Completing → Completed/Failed/Cancelled/Timeout/NodeFail/Preempted`. Jobs can also be `Suspended`. See `spur-core/src/job.rs`.
 
 ## Environment Variables
 
 | Variable | Used by | Description |
 |----------|---------|-------------|
-| `SPUR_CONTROLLER_ADDR` | CLI, spurd | Controller gRPC address (default: `http://localhost:6817`) |
+| `SPUR_CONTROLLER_ADDR` | CLI, spurd, spurrestd | Controller gRPC address (default: `http://localhost:6817`) |
 | `SPUR_WG_INTERFACE` | spurd | WireGuard interface name for address detection (default: `spur0`) |
 | `SPUR_PROLOG` | spurd | Script to run before each job |
 | `SPUR_EPILOG` | spurd | Script to run after each job |
