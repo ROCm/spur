@@ -338,12 +338,34 @@ pub async fn launch_job(
         .stderr(stderr_file.into_std().await)
         .stdin(Stdio::null());
 
-    // Issue #99: Run job as the submitting user (not root).
+    // Issue #99, #107: Run job as the submitting user (not root).
+    // Must set supplementary groups (video, render) via initgroups()
+    // so the process can access GPU device nodes.
     if uid > 0 && nix::unistd::geteuid().is_root() {
         use std::os::unix::process::CommandExt;
+        let target_uid = uid;
+        let target_gid = gid;
+        unsafe {
+            cmd.pre_exec(move || {
+                // Set supplementary groups from /etc/group for this user.
+                // This is critical for GPU access — /dev/dri and /dev/kfd
+                // are typically owned by root:video or root:render.
+                let username = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(target_uid))
+                    .ok()
+                    .flatten()
+                    .map(|u| u.name)
+                    .unwrap_or_else(|| format!("{}", target_uid));
+                let c_name = std::ffi::CString::new(username).unwrap_or_default();
+                libc::initgroups(c_name.as_ptr(), target_gid);
+                Ok(())
+            });
+        }
         cmd.uid(uid);
         cmd.gid(gid);
-        debug!(job_id, uid, gid, "job will run as non-root user");
+        debug!(
+            job_id,
+            uid, gid, "job will run as non-root user with supplementary groups"
+        );
     }
 
     // Issue #99: Apply seccomp-BPF syscall filter (opt-in via SPUR_SECCOMP=1).
