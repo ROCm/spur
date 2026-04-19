@@ -278,7 +278,7 @@ spur/
 ├── docs/quickstart.md          # Getting started guide
 ├── crates/
 │   ├── spur-proto/             # Generated gRPC code
-│   ├── spur-core/              # Job, Node, ResourceSet, config, hostlist, WalOperation
+│   ├── spur-core/              # Core types: Job, Node, ResourceSet, config, hostlist, partition, qos, and more
 │   ├── spur-net/               # WireGuard mesh networking, address detection
 │   ├── spur-sched/             # Backfill scheduler, priority, timeline
 
@@ -289,14 +289,14 @@ spur/
 │   ├── spur-cli/               # CLI binary (multi-call: spur, sbatch, squeue, ...)
 │   ├── spur-ffi/               # C FFI shim (libspur_compat.so)
 │   ├── spur-spank/             # SPANK plugin host
-│   ├── spur-k8s/               # K8s integration (post-MVP)
+│   ├── spur-k8s/               # K8s integration
 │   └── spur-tests/             # Test suite (mirrors Slurm numbering)
 ```
 
 ## Testing
 
 ```bash
-cargo test                    # Run all 314 tests
+cargo test                    # Run all tests
 cargo test -p spur-tests      # Run integration test suite only
 cargo test -p spur-core       # Run core library tests only
 ```
