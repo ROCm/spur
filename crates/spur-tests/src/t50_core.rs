@@ -1374,15 +1374,12 @@ address = "http://peer-a:6817"
 
     #[test]
     fn t50_106_attach_raw_mode_is_nonfatal_for_pipes() {
-        // Issue #64: sattach enters raw terminal mode for interactive I/O.
-        // When stdin is a pipe (not a TTY), the raw mode setup should
-        // fail gracefully. Verify the libc::isatty check works.
-        // (The actual RawModeGuard is in spur-cli; here we verify the
-        // underlying principle that CI/test stdin is not a TTY.)
-        use std::os::unix::io::AsRawFd;
-        let fd = std::io::stdin().as_raw_fd();
-        let is_tty = unsafe { libc::isatty(fd) } == 1;
-        assert!(!is_tty, "expected stdin to be a pipe in test environment");
+        // Moved to spur-cli/src/sattach.rs::tests::raw_mode_fails_on_pipe
+        // which tests the REAL RawModeGuard::enter_on_fd() with an explicit
+        // pipe fd. See issue #111 — the old test simulated isatty() instead
+        // of calling the actual unit, and depended on the test runner env.
+        //
+        // This placeholder ensures the test ID isn't reused.
     }
 
     // ── Issue #65 (reopen of #56): pending reason uses available resources ──

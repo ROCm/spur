@@ -219,20 +219,27 @@ async fn interactive_attach(
 /// - Keystrokes are forwarded immediately (no buffering until Enter)
 /// - Special keys (Ctrl-C, Ctrl-Z) are sent as bytes instead of signals
 /// - No local echo (the remote shell handles echo)
-struct RawModeGuard {
+/// RAII guard that sets the terminal to raw mode and restores it on drop.
+pub(crate) struct RawModeGuard {
+    fd: i32,
     original: libc::termios,
 }
 
 impl RawModeGuard {
-    fn enter() -> Result<Self> {
-        use std::mem::MaybeUninit;
+    /// Enter raw mode on stdin. Returns Err if stdin is not a TTY.
+    pub(crate) fn enter() -> Result<Self> {
         use std::os::unix::io::AsRawFd;
+        Self::enter_on_fd(std::io::stdin().as_raw_fd())
+    }
 
-        let fd = std::io::stdin().as_raw_fd();
+    /// Enter raw mode on a specific file descriptor.
+    /// Exposed for testing with explicit fds (pipes, ptys).
+    pub(crate) fn enter_on_fd(fd: i32) -> Result<Self> {
+        use std::mem::MaybeUninit;
 
-        // Check stdin is a TTY
+        // Check fd is a TTY
         if unsafe { libc::isatty(fd) } != 1 {
-            anyhow::bail!("stdin is not a TTY");
+            anyhow::bail!("fd {} is not a TTY", fd);
         }
 
         // Save original termios
@@ -249,15 +256,13 @@ impl RawModeGuard {
             anyhow::bail!("tcsetattr failed");
         }
 
-        Ok(Self { original })
+        Ok(Self { fd, original })
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        use std::os::unix::io::AsRawFd;
-        let fd = std::io::stdin().as_raw_fd();
-        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &self.original) };
+        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
     }
 }
 
@@ -274,5 +279,33 @@ fn state_name(state: i32) -> &'static str {
         8 => "PREEMPTED",
         9 => "SUSPENDED",
         _ => "UNKNOWN",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_mode_fails_on_pipe() {
+        // Create a pipe — a non-TTY fd — and verify RawModeGuard::enter_on_fd
+        // returns Err. This tests the REAL RawModeGuard code, not a simulation.
+        // Works identically in CI, interactive terminal, and IDE.
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read_fd = fds[0];
+
+        let result = RawModeGuard::enter_on_fd(read_fd);
+        assert!(result.is_err(), "RawModeGuard should fail on a pipe fd");
+        let err_msg = format!("{}", result.err().unwrap());
+        assert!(
+            err_msg.contains("not a TTY"),
+            "error should mention TTY, got: {err_msg}"
+        );
+
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
     }
 }
