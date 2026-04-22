@@ -101,6 +101,8 @@ crates/
 
 ## Do Not
 
+- Do not write tests that simulate a unit's behavior instead of calling the actual unit. Tests must exercise real Spur code — the function, struct, or method under test. 
+- Do not write tests that depend on the test runner's environment. Use explicit fixtures so tests pass identically in an interactive terminal, in CI, and when spawned by an IDE/agent.
 - Do not add timeouts to tests. Tests should be fast and deterministic.
 - Do not add external service dependencies to unit tests (no database, no network).
 - Do not change the proto package name (`package slurm;`) — FFI and REST compatibility depend on it.
