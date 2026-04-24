@@ -261,16 +261,21 @@ mod tests {
         let req = ResourceSet {
             cpus: 4,
             memory_mb: 0,
-            gpus: (0..4).map(|i| GpuResource {
-                device_id: i as u32,
-                gpu_type: "mi355x".into(),
-                memory_mb: 0,
-                peer_gpus: vec![],
-                link_type: spur_core::resource::GpuLinkType::PCIe,
-            }).collect(),
+            gpus: (0..4)
+                .map(|i| GpuResource {
+                    device_id: i as u32,
+                    gpu_type: "mi355x".into(),
+                    memory_mb: 0,
+                    peer_gpus: vec![],
+                    link_type: spur_core::resource::GpuLinkType::PCIe,
+                })
+                .collect(),
             ..Default::default()
         };
-        assert!(!avail.can_satisfy(&req), "should not schedule when GPUs are full");
+        assert!(
+            !avail.can_satisfy(&req),
+            "should not schedule when GPUs are full"
+        );
     }
 
     #[test]
