@@ -60,6 +60,15 @@ pub struct SpurJobSpec {
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
 
+    /// Environment variables from K8s Secrets.
+    /// Map of env var name → "secret-name/key" reference.
+    /// The operator injects these as secretKeyRef env vars into the pod,
+    /// keeping secrets out of the SpurJob spec.
+    ///
+    /// Example: `{"HF_TOKEN": "hf-creds/token", "API_KEY": "my-secret/api-key"}`
+    #[serde(default)]
+    pub secret_env: std::collections::HashMap<String, String>,
+
     /// Spur partition to submit to.
     #[serde(default)]
     pub partition: Option<String>,
@@ -302,6 +311,7 @@ mod tests {
             host_ipc: false,
             shm_size: None,
             extra_resources: std::collections::HashMap::new(),
+            secret_env: std::collections::HashMap::new(),
             tolerations: vec![],
             node_selector: Default::default(),
             priority_class: None,
@@ -437,6 +447,7 @@ mod tests {
             host_ipc: false,
             shm_size: None,
             extra_resources: std::collections::HashMap::new(),
+            secret_env: std::collections::HashMap::new(),
             tolerations: vec![],
             node_selector: Default::default(),
             priority_class: None,
@@ -627,6 +638,7 @@ mod tests {
             host_ipc: false,
             shm_size: None,
             extra_resources: std::collections::HashMap::new(),
+            secret_env: std::collections::HashMap::new(),
             tolerations: vec![TolerationSpec {
                 key: Some("spur.ai/gpu-node".into()),
                 operator: "Exists".into(),
@@ -696,6 +708,7 @@ mod tests {
             host_ipc: false,
             shm_size: None,
             extra_resources: std::collections::HashMap::new(),
+            secret_env: std::collections::HashMap::new(),
             tolerations: vec![TolerationSpec {
                 key: Some("spur.ai/gpu-node".into()),
                 operator: "Exists".into(),

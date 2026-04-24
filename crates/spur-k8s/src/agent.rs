@@ -230,6 +230,36 @@ impl SlurmAgent for VirtualAgent {
             });
         }
 
+        // Issue #117: Inject secret env vars from SpurJob CRD's secretEnv field.
+        // These reference K8s Secrets and are injected as secretKeyRef, keeping
+        // secret values out of the SpurJob spec and Raft log.
+        {
+            let api: kube::Api<crate::crd::SpurJob> = kube::Api::all(self.client.clone());
+            let lp = kube::api::ListParams::default().labels(&format!("spur.ai/job-id={}", job_id));
+            if let Ok(list) = api.list(&lp).await {
+                if let Some(spurjob) = list.items.into_iter().next() {
+                    for (env_name, secret_ref) in &spurjob.spec.secret_env {
+                        if let Some((secret_name, secret_key)) = secret_ref.split_once('/') {
+                            env_vars.push(EnvVar {
+                                name: env_name.clone(),
+                                value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
+                                    secret_key_ref: Some(
+                                        k8s_openapi::api::core::v1::SecretKeySelector {
+                                            name: secret_name.to_string(),
+                                            key: secret_key.to_string(),
+                                            optional: Some(true),
+                                        },
+                                    ),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         // Build command
         let command = if !spec.argv.is_empty() {
             Some(spec.argv.clone())

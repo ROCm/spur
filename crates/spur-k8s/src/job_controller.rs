@@ -1212,6 +1212,7 @@ mod tests {
                 host_ipc: false,
                 shm_size: None,
                 extra_resources: std::collections::HashMap::new(),
+                secret_env: std::collections::HashMap::new(),
                 tolerations: vec![],
                 node_selector: Default::default(),
                 priority_class: None,
