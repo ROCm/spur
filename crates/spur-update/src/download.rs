@@ -8,10 +8,7 @@ use crate::check::ReleaseInfo;
 
 /// Download a release tarball and verify its SHA256 checksum.
 /// Returns the path to the verified tarball file.
-pub async fn download_and_verify(
-    release: &ReleaseInfo,
-    tmp_dir: &Path,
-) -> Result<PathBuf> {
+pub async fn download_and_verify(release: &ReleaseInfo, tmp_dir: &Path) -> Result<PathBuf> {
     let tarball_url = release
         .tarball_url
         .as_ref()
