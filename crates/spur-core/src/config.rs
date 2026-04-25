@@ -72,6 +72,49 @@ pub struct SlurmConfig {
     /// Cluster-wide license pool, e.g., {"fluent": 20, "comsol": 5}.
     #[serde(default)]
     pub licenses: HashMap<String, u64>,
+
+    /// Auto-update configuration.
+    #[serde(default)]
+    pub update: UpdateConfig,
+}
+
+/// Configuration for auto-update checking and self-update.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateConfig {
+    /// Check for updates on daemon startup (default: true).
+    #[serde(default = "default_true_fn")]
+    pub check_on_startup: bool,
+
+    /// Automatically download and install updates (default: false).
+    /// Even when true, daemons will NOT auto-restart.
+    #[serde(default)]
+    pub auto_update: bool,
+
+    /// Release channel: "stable" or "nightly" (default: "stable").
+    #[serde(default = "default_stable")]
+    pub channel: String,
+
+    /// Directory for the update check cache file.
+    #[serde(default = "default_cache_dir")]
+    pub cache_dir: String,
+}
+
+fn default_stable() -> String {
+    "stable".into()
+}
+fn default_cache_dir() -> String {
+    "/var/cache/spur".into()
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            check_on_startup: true,
+            auto_update: false,
+            channel: "stable".into(),
+            cache_dir: "/var/cache/spur".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

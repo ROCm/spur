@@ -11,6 +11,7 @@ path = "src/main.rs"
 spur-proto = { path = "../spur-proto" }
 spur-core = { path = "../spur-core" }
 spur-sched = { path = "../spur-sched" }
+spur-update = { path = "../spur-update" }
 
 tokio = { workspace = true }
 tonic = { workspace = true }

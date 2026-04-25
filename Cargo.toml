@@ -15,6 +15,7 @@ members = [
     "crates/spur-spank",
     "crates/spur-k8s",
     "crates/spur-tests",
+    "crates/spur-update",
 ]
 
 [workspace.package]
@@ -83,3 +84,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 futures-util = "0.3"
 flate2 = "1"
 tar = "0.4"
+semver = "1"
+sha2 = "0.10"
+
+# Internal
+spur-update = { path = "crates/spur-update" }
