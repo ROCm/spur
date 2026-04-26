@@ -84,6 +84,17 @@ async fn main() -> anyhow::Result<()> {
         "spurd starting"
     );
 
+    // Background update check (non-blocking)
+    spur_update::spawn_startup_check(
+        "ROCm/spur",
+        env!("CARGO_PKG_VERSION"),
+        true,  // check_on_startup (spurd doesn't load spur.conf)
+        false, // auto_update
+        "stable",
+        "/var/cache/spur",
+        spur_update::SPUR_BINARIES,
+    );
+
     // Detect node address (explicit --address > WireGuard > hostname)
     let node_address = if let Some(ref addr) = args.address {
         info!(ip = %addr, "using explicit node address");

@@ -74,6 +74,17 @@ async fn main() -> anyhow::Result<()> {
     // Keep config in sync so downstream code sees the final address.
     config.controller.listen_addr = listen_addr.clone();
 
+    // Background update check (non-blocking — does not delay startup)
+    spur_update::spawn_startup_check(
+        "ROCm/spur",
+        env!("CARGO_PKG_VERSION"),
+        config.update.check_on_startup,
+        config.update.auto_update,
+        &config.update.channel,
+        &config.update.cache_dir,
+        spur_update::SPUR_BINARIES,
+    );
+
     // Initialize cluster manager first so Raft recovery can apply entries
     let cluster = Arc::new(ClusterManager::new(config.clone(), &args.state_dir)?);
 
@@ -178,5 +189,6 @@ fn default_config() -> spur_core::config::SlurmConfig {
         topology: None,
         isolation: Default::default(),
         licenses: std::collections::HashMap::new(),
+        update: Default::default(),
     }
 }

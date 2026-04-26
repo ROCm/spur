@@ -1756,6 +1756,7 @@ mod tests {
             topology: None,
             isolation: Default::default(),
             licenses: HashMap::new(),
+            update: Default::default(),
         }
     }
 

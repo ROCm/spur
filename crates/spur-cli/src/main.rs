@@ -189,7 +189,45 @@ fn main() -> anyhow::Result<()> {
     match args[1].as_str() {
         "version" | "--version" | "-V" => {
             println!("spur {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
+            if args.len() > 2 && args[2] == "--check" {
+                runtime.block_on(async {
+                    print!("Checking for updates... ");
+                    match spur_update::check::check_for_update(
+                        "ROCm/spur",
+                        env!("CARGO_PKG_VERSION"),
+                        &spur_update::check::Channel::Stable,
+                    )
+                    .await
+                    {
+                        Ok(result) if result.update_available => {
+                            println!(
+                                "update available: {} → {}",
+                                result.current_version, result.latest.tag
+                            );
+                            println!("Run `spur self-update` to install.");
+                        }
+                        Ok(_) => println!("up to date."),
+                        Err(e) => println!("could not check: {e}"),
+                    }
+                    Ok(())
+                })
+            } else {
+                Ok(())
+            }
+        }
+        "self-update" | "update" => {
+            let nightly = args.iter().any(|a| a == "--nightly");
+            let channel = if nightly {
+                spur_update::check::Channel::Nightly
+            } else {
+                spur_update::check::Channel::Stable
+            };
+            runtime.block_on(spur_update::self_update_cli(
+                "ROCm/spur",
+                env!("CARGO_PKG_VERSION"),
+                &channel,
+                spur_update::SPUR_BINARIES,
+            ))
         }
         "help" | "--help" | "-h" => {
             print_usage();
@@ -231,7 +269,8 @@ fn print_usage() {
     eprintln!("  attach      Attach to a running job's I/O");
     eprintln!("  crontab     Manage recurring cron-style jobs");
     eprintln!("  health      Node health monitoring");
-    eprintln!("  version     Show version");
+    eprintln!("  version     Show version (--check to check for updates)");
+    eprintln!("  self-update Download and install the latest version (--nightly)");
     eprintln!();
     eprintln!("Slurm-compatible aliases (also work as symlinks):");
     eprintln!("  salloc sbatch srun squeue scancel sinfo sacct sacctmgr scontrol");
