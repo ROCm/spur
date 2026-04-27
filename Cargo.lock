@@ -3230,6 +3230,7 @@ dependencies = [
  "spur-core",
  "spur-net",
  "spur-proto",
+ "spur-update",
  "tar",
  "thiserror 2.0.18",
  "tokio",
@@ -3367,6 +3368,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "spur-update"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "flate2",
+ "reqwest",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "spurctld"
 version = "0.1.0"
 dependencies = [
@@ -3383,6 +3401,7 @@ dependencies = [
  "spur-core",
  "spur-proto",
  "spur-sched",
+ "spur-update",
  "tempfile",
  "tokio",
  "tonic",
@@ -3408,6 +3427,7 @@ dependencies = [
  "spur-proto",
  "spur-sched",
  "spur-spank",
+ "spur-update",
  "tokio",
  "tokio-stream",
  "tonic",
