@@ -703,15 +703,17 @@ impl SlurmAgent for AgentService {
         request: Request<ExecInJobRequest>,
     ) -> Result<Response<ExecInJobResponse>, Status> {
         let req = request.into_inner();
-        let jobs = self.running.lock().await;
 
-        let tracked = jobs.get(&req.job_id).ok_or_else(|| {
-            Status::not_found(format!("job {} not running on this node", req.job_id))
-        })?;
-
-        let pid = tracked.pid.ok_or_else(|| {
-            Status::failed_precondition(format!("job {} has no tracked PID", req.job_id))
-        })?;
+        let (pid, has_pid_ns) = {
+            let jobs = self.running.lock().await;
+            let tracked = jobs.get(&req.job_id).ok_or_else(|| {
+                Status::not_found(format!("job {} not running on this node", req.job_id))
+            })?;
+            let pid = tracked.pid.ok_or_else(|| {
+                Status::failed_precondition(format!("job {} has no tracked PID", req.job_id))
+            })?;
+            (pid, tracked.has_pid_namespace)
+        };
 
         if req.command.is_empty() {
             return Err(Status::invalid_argument("no command specified"));
@@ -725,12 +727,6 @@ impl SlurmAgent for AgentService {
         );
 
         // Use nsenter to enter the job's namespace(s) and run the command
-        let has_pid_ns = {
-            let jobs = self.running.lock().await;
-            jobs.get(&req.job_id)
-                .map(|j| j.has_pid_namespace)
-                .unwrap_or(false)
-        };
         let mut cmd = tokio::process::Command::new("nsenter");
         cmd.arg("--target").arg(pid.to_string()).arg("--mount");
         if has_pid_ns {
@@ -1064,4 +1060,83 @@ impl AgentService {
 pub fn create_server(reporter: Arc<NodeReporter>) -> SlurmAgentServer<AgentService> {
     let service = AgentService::new(reporter);
     SlurmAgentServer::new(service)
+}
+
+#[cfg(test)]
+impl TrackedJob {
+    fn dummy(pid: u32) -> Self {
+        let child = tokio::process::Command::new("sleep")
+            .arg("3600")
+            .spawn()
+            .expect("failed to spawn dummy process");
+        Self {
+            child,
+            pid: Some(pid),
+            rootfs_mode: crate::container::RootfsMode::Extracted,
+            allocation: None,
+            stdout_path: "/dev/null".into(),
+            stderr_path: "/dev/null".into(),
+            has_pid_namespace: false,
+        }
+    }
+}
+
+#[cfg(test)]
+impl AgentService {
+    async fn insert_test_job(&self, job_id: u32, job: TrackedJob) {
+        self.running.lock().await.insert(job_id, job);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spur_core::resource::ResourceSet;
+    use tonic::Request;
+
+    fn test_reporter() -> Arc<NodeReporter> {
+        Arc::new(NodeReporter::new(
+            "test-node".into(),
+            "http://localhost:6817".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8192,
+                ..Default::default()
+            },
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "test-node".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn exec_in_job_returns_without_deadlock() {
+        let svc = AgentService::new(test_reporter());
+        let pid = std::process::id();
+        svc.insert_test_job(42, TrackedJob::dummy(pid)).await;
+
+        let req = Request::new(ExecInJobRequest {
+            job_id: 42,
+            command: vec!["echo".into(), "hello".into()],
+        });
+
+        let result = svc.exec_in_job(req).await;
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[tokio::test]
+    async fn exec_in_job_not_found() {
+        let svc = AgentService::new(test_reporter());
+
+        let req = Request::new(ExecInJobRequest {
+            job_id: 999,
+            command: vec!["echo".into()],
+        });
+
+        let err = svc.exec_in_job(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
 }
