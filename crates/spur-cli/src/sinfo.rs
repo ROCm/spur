@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
-use spur_proto::proto::{GetNodesRequest, GetPartitionsRequest};
+use spur_proto::proto::{GetNodesRequest, GetPartitionsRequest, NodeInfo, PartitionInfo};
 
 use crate::format_engine;
 
@@ -95,29 +97,58 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     if !args.noheader {
         println!("{}", format_engine::format_header(&fields));
     }
-
-    if args.node_oriented {
-        // One line per node
-        for node in &nodes {
-            let row = format_engine::format_row(&fields, &|spec| {
-                resolve_node_field(node, &partitions, spec)
-            });
-            println!("{}", row);
-        }
-    } else {
-        // One line per partition (summarized)
-        for part in &partitions {
-            // Collect nodes belonging to this partition
-            let part_nodes: Vec<_> = nodes.iter().filter(|n| n.partition == part.name).collect();
-
-            let row = format_engine::format_row(&fields, &|spec| {
-                resolve_partition_field(part, &part_nodes, spec)
-            });
-            println!("{}", row);
-        }
+    for line in render_sinfo_output(&fields, &partitions, &nodes, args.node_oriented) {
+        println!("{}", line);
     }
 
     Ok(())
+}
+
+fn group_nodes_by_state<'a>(nodes: &[&'a NodeInfo]) -> Vec<(i32, Vec<&'a NodeInfo>)> {
+    let mut groups: BTreeMap<i32, Vec<&'a NodeInfo>> = BTreeMap::new();
+    for node in nodes {
+        groups.entry(node.state).or_default().push(node);
+    }
+    groups.into_iter().collect()
+}
+
+fn render_sinfo_output(
+    fields: &[format_engine::FormatField],
+    partitions: &[PartitionInfo],
+    nodes: &[NodeInfo],
+    node_oriented: bool,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    if node_oriented {
+        for node in nodes {
+            let row = format_engine::format_row(fields, &|spec| {
+                resolve_node_field(node, partitions, spec)
+            });
+            lines.push(row);
+        }
+    } else {
+        for part in partitions {
+            let part_nodes: Vec<_> = nodes.iter().filter(|n| n.partition == part.name).collect();
+            let state_groups = group_nodes_by_state(&part_nodes);
+
+            if state_groups.is_empty() {
+                let row = format_engine::format_row(fields, &|spec| {
+                    resolve_partition_field(part, &[], spec)
+                });
+                lines.push(row);
+            } else {
+                for (_, group_nodes) in &state_groups {
+                    let row = format_engine::format_row(fields, &|spec| {
+                        resolve_partition_field(part, group_nodes, spec)
+                    });
+                    lines.push(row);
+                }
+            }
+        }
+    }
+
+    lines
 }
 
 fn resolve_node_field(
@@ -215,18 +246,10 @@ fn resolve_partition_field(
             }
         }
         't' | 'T' => {
-            // Summarize node states
             if nodes.is_empty() {
-                // No node details available; default to idle
                 "idle".into()
             } else {
-                // Show most common state
-                let mut counts = std::collections::HashMap::new();
-                for n in nodes {
-                    *counts.entry(n.state).or_insert(0u32) += 1;
-                }
-                let (most_common, _) = counts.iter().max_by_key(|(_, &c)| c).unwrap();
-                node_state_str(*most_common)
+                node_state_str(nodes[0].state)
             }
         }
         'N' => {
