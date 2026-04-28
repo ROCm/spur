@@ -275,35 +275,7 @@ pub async fn launch_job(
     let use_namespaces = nix::unistd::geteuid().is_root();
     let (launch_cmd, launch_args) = if use_namespaces {
         let wrapper_path = PathBuf::from(work_dir).join(format!(".spur_ns_{}.sh", job_id));
-        let gpu_mounts = gpu_devices
-            .iter()
-            .map(|id| {
-                format!(
-                    "  if [ -e $SPUR_HOST_DRI/renderD{r} ]; then\n    cp -a $SPUR_HOST_DRI/renderD{r} /dev/dri/renderD{r} 2>/dev/null || true\n  fi\n",
-                    r = 128 + id,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("");
-
-        let wrapper = format!(
-            concat!(
-                "#!/bin/bash\n",
-                "# Namespace isolation wrapper — all mounts best-effort\n",
-                "mount -t proc proc /proc 2>/dev/null || true\n",
-                "mount -t tmpfs tmpfs /dev/shm 2>/dev/null || true\n",
-                "# GPU device restriction: save original /dev/dri, replace with\n",
-                "# tmpfs, then selectively copy only allocated devices back.\n",
-                "SPUR_HOST_DRI=$(mktemp -d /tmp/.spur_dri_XXXXXX 2>/dev/null || echo /tmp/.spur_dri)\n",
-                "if [ -d /dev/dri ] && cp -a /dev/dri/. $SPUR_HOST_DRI/ 2>/dev/null; then\n",
-                "  mount -t tmpfs tmpfs /dev/dri 2>/dev/null || true\n",
-                "{gpu_mounts}",
-                "fi\n",
-                "exec /bin/bash {script}\n",
-            ),
-            gpu_mounts = gpu_mounts,
-            script = script_path.display(),
-        );
+        let wrapper = build_namespace_wrapper(uid, gid, gpu_devices, &script_path);
         tokio::fs::write(&wrapper_path, &wrapper).await?;
         #[cfg(unix)]
         {
@@ -340,7 +312,12 @@ pub async fn launch_job(
     // Issue #99, #107: Run job as the submitting user (not root).
     // Must set supplementary groups (video, render) via initgroups()
     // so the process can access GPU device nodes.
-    if uid > 0 && nix::unistd::geteuid().is_root() {
+    //
+    // Issue #128: when use_namespaces is true, the wrapper handles the priv
+    // drop *after* unshare runs (via setpriv). Dropping priv here would cause
+    // unshare(2) to fail with EPERM since the unprivileged user lacks
+    // CAP_SYS_ADMIN.
+    if uid > 0 && nix::unistd::geteuid().is_root() && !use_namespaces {
         use std::os::unix::process::CommandExt;
         let target_uid = uid;
         let target_gid = gid;
@@ -604,6 +581,61 @@ fn resolve_output_path(pattern: &str, job_id: JobId, work_dir: &str) -> String {
 /// The `bb` string contains semicolon-separated directives:
 ///   - `stage_in:<cmd>` — run before the job
 ///   - `stage_out:<cmd>` — run after the job (best-effort, ignores failures)
+/// Build the bash wrapper that runs inside the unshare PID/mount namespace.
+///
+/// The wrapper executes as root (the same uid as spurd), so it can perform
+/// the proc/tmpfs/dri mounts that need CAP_SYS_ADMIN. Once isolation is in
+/// place, it drops privilege via `setpriv --init-groups` and exec's the user
+/// script.
+///
+/// Issue #128: previously the priv drop happened in `Command::pre_exec` before
+/// exec'ing unshare, which made the unshare(2) syscall fail with EPERM and
+/// the mounts silently no-op. Doing the drop inside the wrapper (after the
+/// mounts) keeps the unshare and mounts privileged while still landing the
+/// user payload as the unprivileged uid.
+fn build_namespace_wrapper(uid: u32, gid: u32, gpu_devices: &[u32], script_path: &Path) -> String {
+    let gpu_mounts = gpu_devices
+        .iter()
+        .map(|id| {
+            format!(
+                "  if [ -e $SPUR_HOST_DRI/renderD{r} ]; then\n    cp -a $SPUR_HOST_DRI/renderD{r} /dev/dri/renderD{r} 2>/dev/null || true\n  fi\n",
+                r = 128 + id,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+    let final_exec = if uid > 0 {
+        format!(
+            "exec setpriv --reuid={uid} --regid={gid} --init-groups -- /bin/bash {script}\n",
+            uid = uid,
+            gid = gid,
+            script = script_path.display(),
+        )
+    } else {
+        format!("exec /bin/bash {}\n", script_path.display())
+    };
+
+    format!(
+        concat!(
+            "#!/bin/bash\n",
+            "# Namespace isolation wrapper — all mounts best-effort\n",
+            "mount -t proc proc /proc 2>/dev/null || true\n",
+            "mount -t tmpfs tmpfs /dev/shm 2>/dev/null || true\n",
+            "# GPU device restriction: save original /dev/dri, replace with\n",
+            "# tmpfs, then selectively copy only allocated devices back.\n",
+            "SPUR_HOST_DRI=$(mktemp -d /tmp/.spur_dri_XXXXXX 2>/dev/null || echo /tmp/.spur_dri)\n",
+            "if [ -d /dev/dri ] && cp -a /dev/dri/. $SPUR_HOST_DRI/ 2>/dev/null; then\n",
+            "  mount -t tmpfs tmpfs /dev/dri 2>/dev/null || true\n",
+            "{gpu_mounts}",
+            "fi\n",
+            "{final_exec}",
+        ),
+        gpu_mounts = gpu_mounts,
+        final_exec = final_exec,
+    )
+}
+
 fn wrap_with_burst_buffer(script: &str, bb: &str) -> String {
     let mut stage_in = Vec::new();
     let mut stage_out = Vec::new();
@@ -704,5 +736,65 @@ mod tests {
         let script = "#!/bin/bash\necho hello\n";
         let wrapped = wrap_with_burst_buffer(script, "");
         assert_eq!(wrapped, script);
+    }
+
+    /// Issue #128: when uid > 0, the wrapper must drop privilege via setpriv
+    /// *after* the mounts (which need CAP_SYS_ADMIN). Dropping priv before
+    /// unshare would cause unshare(2) to fail with EPERM.
+    #[test]
+    fn test_namespace_wrapper_drops_priv_via_setpriv() {
+        let script = PathBuf::from("/work/.spur_job_42.sh");
+        let wrapper = build_namespace_wrapper(1000, 1000, &[], &script);
+
+        // setpriv must appear with both --reuid and --regid plus --init-groups
+        // (so video/render supplementary groups are picked up for GPU access).
+        assert!(
+            wrapper.contains("setpriv --reuid=1000 --regid=1000 --init-groups"),
+            "wrapper missing setpriv invocation: {wrapper}"
+        );
+        // The setpriv exec must be the *last* exec, after the mount commands.
+        let mount_pos = wrapper.find("mount -t proc").expect("missing proc mount");
+        let setpriv_pos = wrapper.find("setpriv").expect("missing setpriv");
+        assert!(
+            mount_pos < setpriv_pos,
+            "mounts must run before priv drop:\n{wrapper}"
+        );
+        // No bare `exec /bin/bash` slip-through that would run as root.
+        assert!(
+            !wrapper.contains("exec /bin/bash /work"),
+            "uid>0 wrapper must not exec bash directly as root:\n{wrapper}"
+        );
+    }
+
+    /// When uid == 0 (root job), no priv drop is needed and the wrapper exec's
+    /// bash directly.
+    #[test]
+    fn test_namespace_wrapper_root_no_setpriv() {
+        let script = PathBuf::from("/work/.spur_job_7.sh");
+        let wrapper = build_namespace_wrapper(0, 0, &[], &script);
+
+        assert!(
+            !wrapper.contains("setpriv"),
+            "root job should not invoke setpriv:\n{wrapper}"
+        );
+        assert!(
+            wrapper.contains("exec /bin/bash /work/.spur_job_7.sh"),
+            "root wrapper should exec the job script directly:\n{wrapper}"
+        );
+    }
+
+    /// GPU device restriction lines are emitted for each allocated device.
+    #[test]
+    fn test_namespace_wrapper_gpu_mounts() {
+        let script = PathBuf::from("/work/.spur_job_1.sh");
+        let wrapper = build_namespace_wrapper(1000, 1000, &[0, 2], &script);
+
+        // Only allocated GPUs (renderD128 for id 0, renderD130 for id 2) get
+        // copied back into the tmpfs-masked /dev/dri.
+        assert!(wrapper.contains("renderD128"));
+        assert!(wrapper.contains("renderD130"));
+        // Must not include unallocated devices.
+        assert!(!wrapper.contains("renderD129"));
+        assert!(!wrapper.contains("renderD131"));
     }
 }
