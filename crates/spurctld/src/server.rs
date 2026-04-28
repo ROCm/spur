@@ -935,6 +935,9 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         } else {
             Some(spec.array_spec)
         },
+        array_job_id: None,
+        array_task_id: None,
+        array_max_concurrent: None,
         requeue: spec.requeue,
         exclusive: spec.exclusive,
         hold: spec.hold,
@@ -1119,8 +1122,8 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         resources: job.allocated_resources.as_ref().map(resource_to_proto),
         priority: job.priority,
         qos: job.spec.qos.clone().unwrap_or_default(),
-        array_job_id: job.array_job_id.unwrap_or(0),
-        array_task_id: job.array_task_id.unwrap_or(0),
+        array_job_id: job.spec.array_job_id.unwrap_or(0),
+        array_task_id: job.spec.array_task_id.unwrap_or(0),
     }
 }
 

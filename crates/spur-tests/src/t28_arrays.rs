@@ -49,8 +49,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        job.array_job_id = Some(100);
-        job.array_task_id = Some(5);
+        job.spec.array_job_id = Some(100);
+        job.spec.array_task_id = Some(5);
 
         assert_eq!(job.resolved_stdout(), "output_100_5.log");
     }
@@ -82,11 +82,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        job.array_job_id = Some(200);
-        job.array_task_id = Some(42);
+        job.spec.array_job_id = Some(200);
+        job.spec.array_task_id = Some(42);
 
-        assert_eq!(job.array_job_id, Some(200));
-        assert_eq!(job.array_task_id, Some(42));
+        assert_eq!(job.spec.array_job_id, Some(200));
+        assert_eq!(job.spec.array_task_id, Some(42));
     }
 
     // ── T28.6: Array tasks are independent jobs ──────────────────
@@ -101,8 +101,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        task1.array_job_id = Some(200);
-        task1.array_task_id = Some(0);
+        task1.spec.array_job_id = Some(200);
+        task1.spec.array_task_id = Some(0);
 
         let mut task2 = Job::new(
             202,
@@ -112,8 +112,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        task2.array_job_id = Some(200);
-        task2.array_task_id = Some(1);
+        task2.spec.array_job_id = Some(200);
+        task2.spec.array_task_id = Some(1);
 
         // Transition task1 to running, task2 stays pending
         task1.transition(JobState::Running).unwrap();
@@ -154,8 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn t28_10_array_max_concurrent_stored_on_job() {
-        // Verify array_max_concurrent field on Job struct
+    fn t28_10_array_max_concurrent_stored_on_spec() {
         let mut job = Job::new(
             300,
             JobSpec {
@@ -165,7 +164,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        job.array_max_concurrent = Some(5);
-        assert_eq!(job.array_max_concurrent, Some(5));
+        job.spec.array_max_concurrent = Some(5);
+        assert_eq!(job.spec.array_max_concurrent, Some(5));
     }
 }

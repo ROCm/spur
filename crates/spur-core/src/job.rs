@@ -172,6 +172,12 @@ pub struct JobSpec {
 
     // Array
     pub array_spec: Option<String>,
+    #[serde(default)]
+    pub array_job_id: Option<JobId>,
+    #[serde(default)]
+    pub array_task_id: Option<u32>,
+    #[serde(default)]
+    pub array_max_concurrent: Option<u32>,
 
     // Flags
     pub requeue: bool,
@@ -262,6 +268,9 @@ impl Default for JobSpec {
             distribution: None,
             het_group: None,
             array_spec: None,
+            array_job_id: None,
+            array_task_id: None,
+            array_max_concurrent: None,
             requeue: false,
             exclusive: false,
             hold: false,
@@ -316,13 +325,6 @@ pub struct Job {
     #[serde(default)]
     pub requeue_count: u32,
 
-    // Array support
-    pub array_job_id: Option<JobId>,
-    pub array_task_id: Option<u32>,
-    /// Max concurrent tasks for this array (0 = unlimited).
-    #[serde(default)]
-    pub array_max_concurrent: Option<u32>,
-
     // Heterogeneous job support
     /// Links het job components to the first component's job ID.
     #[serde(default)]
@@ -362,9 +364,6 @@ impl Job {
             allocated_resources: None,
             exit_code: None,
             requeue_count: 0,
-            array_job_id: None,
-            array_task_id: None,
-            array_max_concurrent: None,
             het_job_id: None,
             het_group: None,
         }
@@ -392,9 +391,12 @@ impl Job {
         result = result.replace("%j", &self.job_id.to_string());
         result = result.replace("%J", &self.job_id.to_string());
         result = result.replace("%x", &self.spec.name);
-        if let Some(tid) = self.array_task_id {
+        if let Some(tid) = self.spec.array_task_id {
             result = result.replace("%a", &tid.to_string());
-            result = result.replace("%A", &self.array_job_id.unwrap_or(self.job_id).to_string());
+            result = result.replace(
+                "%A",
+                &self.spec.array_job_id.unwrap_or(self.job_id).to_string(),
+            );
         }
         if let Some(node) = self.allocated_nodes.first() {
             result = result.replace("%N", node);
