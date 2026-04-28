@@ -3215,7 +3215,7 @@ dependencies = [
 
 [[package]]
 name = "spur-cli"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "atty",
@@ -3241,7 +3241,7 @@ dependencies = [
 
 [[package]]
 name = "spur-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3261,7 +3261,7 @@ dependencies = [
 
 [[package]]
 name = "spur-ffi"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "prost-types",
  "spur-core",
@@ -3272,7 +3272,7 @@ dependencies = [
 
 [[package]]
 name = "spur-k8s"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3299,7 +3299,7 @@ dependencies = [
 
 [[package]]
 name = "spur-net"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3316,7 +3316,7 @@ dependencies = [
 
 [[package]]
 name = "spur-proto"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -3326,7 +3326,7 @@ dependencies = [
 
 [[package]]
 name = "spur-sched"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "spur-core",
@@ -3335,7 +3335,7 @@ dependencies = [
 
 [[package]]
 name = "spur-spank"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "libloading",
@@ -3346,7 +3346,7 @@ dependencies = [
 
 [[package]]
 name = "spur-tests"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3369,7 +3369,7 @@ dependencies = [
 
 [[package]]
 name = "spur-update"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3386,7 +3386,7 @@ dependencies = [
 
 [[package]]
 name = "spurctld"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3411,7 +3411,7 @@ dependencies = [
 
 [[package]]
 name = "spurd"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3437,7 +3437,7 @@ dependencies = [
 
 [[package]]
 name = "spurdbd"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3457,7 +3457,7 @@ dependencies = [
 
 [[package]]
 name = "spurrestd"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
