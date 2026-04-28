@@ -40,7 +40,7 @@ pub struct ClientResponse;
 /// Implemented by ClusterManager to avoid a circular dependency with SpurStore.
 pub trait StateMachineApply: Send + Sync {
     fn apply_operation(&self, op: &WalOperation);
-    fn snapshot_state(&self) -> Vec<u8>;
+    fn snapshot_state(&self) -> Result<Vec<u8>, anyhow::Error>;
     fn restore_from_snapshot(&self, data: &[u8]);
 }
 
@@ -209,7 +209,13 @@ impl RaftSnapshotBuilder<SpurTypeConfig> for Arc<SpurStore> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<SpurTypeConfig>, StorageError<NodeId>> {
         let inner = self.inner.read();
 
-        let snapshot_data = self.applier.snapshot_state();
+        let snapshot_data = self.applier.snapshot_state().map_err(|e| {
+            StorageError::from_io_error(
+                openraft::ErrorSubject::Store,
+                openraft::ErrorVerb::Read,
+                std::io::Error::new(std::io::ErrorKind::Other, e),
+            )
+        })?;
 
         let snap_id = format!(
             "{}-{}",
@@ -659,8 +665,8 @@ mod tests {
     struct NoopApplier;
     impl StateMachineApply for NoopApplier {
         fn apply_operation(&self, _op: &WalOperation) {}
-        fn snapshot_state(&self) -> Vec<u8> {
-            Vec::new()
+        fn snapshot_state(&self) -> Result<Vec<u8>, anyhow::Error> {
+            Ok(Vec::new())
         }
         fn restore_from_snapshot(&self, _data: &[u8]) {}
     }

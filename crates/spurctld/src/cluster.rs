@@ -1540,7 +1540,7 @@ impl StateMachineApply for ClusterManager {
         self.apply_operation(op);
     }
 
-    fn snapshot_state(&self) -> Vec<u8> {
+    fn snapshot_state(&self) -> Result<Vec<u8>, anyhow::Error> {
         let snap = ClusterSnapshot {
             jobs: self.jobs.read().values().cloned().collect(),
             nodes: self.nodes.read().values().cloned().collect(),
@@ -1549,7 +1549,7 @@ impl StateMachineApply for ClusterManager {
             license_pool: self.license_pool.read().clone(),
             hostname_aliases: self.hostname_aliases.read().clone(),
         };
-        serde_json::to_vec(&snap).unwrap_or_default()
+        serde_json::to_vec(&snap).map_err(Into::into)
     }
 
     fn restore_from_snapshot(&self, data: &[u8]) {
@@ -2117,7 +2117,7 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         submit_and_wait(&cm, basic_spec("snap-job"));
 
-        let data = cm.snapshot_state();
+        let data = cm.snapshot_state().unwrap();
         assert!(!data.is_empty());
 
         // Create a fresh cluster and restore
