@@ -270,6 +270,48 @@ memory_mb = 1024000
 | `SPUR_CONTROLLER_ADDR` | `http://localhost:6817` | Controller gRPC address |
 | `SPUR_ACCOUNTING_ADDR` | `http://localhost:6819` | Accounting gRPC address |
 
+## Auto-Update
+
+Spur queries the [GitHub releases API](https://api.github.com/repos/ROCm/spur/releases)
+to detect newer versions. Daemons (`spurctld`, `spurd`) check on startup and
+log an info message when an update is available — they never auto-restart. The
+`spur` CLI provides explicit commands to check and install.
+
+### CLI
+
+```bash
+# Show current version
+spur version
+
+# Check the stable channel for a newer release (no install)
+spur version --check
+
+# Download + verify (sha256) + install latest stable; replaces all five
+# binaries (spur, spurctld, spurd, spurdbd, spurrestd) atomically with
+# rollback on failure. Existing daemons keep running until restarted.
+sudo spur self-update
+
+# Track the nightly channel instead
+sudo spur self-update --nightly
+```
+
+### Daemon startup check
+
+Both `spurctld` and `spurd` emit an `info` log line on startup if a newer
+release is available. Disable via the `[update]` section in `spur.conf`:
+
+```toml
+[update]
+check_on_startup = true     # default: true — startup check
+auto_update      = false    # default: false — never download silently
+channel          = "stable" # "stable" or "nightly"
+cache_dir        = "/var/cache/spur"  # 1h TTL JSON cache (avoids API spam)
+```
+
+`check_on_startup = false` skips the GitHub query entirely. `auto_update`
+exists for orchestrators that want unattended installs but is opt-in — even
+with `auto_update = true`, the daemons do not restart themselves.
+
 ## Project Structure
 
 ```
