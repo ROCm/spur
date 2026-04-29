@@ -599,7 +599,7 @@ else
   export LD_LIBRARY_PATH="$ROOTFS/usr/lib:$ROOTFS/lib:$ROOTFS/usr/lib64:$ROOTFS/lib64:${{LD_LIBRARY_PATH:-}}"
   export SPUR_CONTAINER_ROOTFS="$ROOTFS"
   export HOME="{home}"
-  cd {workdir}
+  cd "$ROOTFS{workdir}"
   {entrypoint}/bin/bash $ROOTFS/tmp/spur_job_{job_id}.sh
 fi
 "#,
@@ -1066,7 +1066,14 @@ mod tests {
         let rootfs = Path::new("/tmp/test-rootfs");
         let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
 
-        assert!(script.contains("cd /workspace"));
+        // Root branch: cd runs inside chroot so workdir is unqualified.
+        assert!(script.contains(r#"cd /workspace &&"#));
+        // Non-root fallback: no chroot, so cd must be prefixed with $ROOTFS
+        // so it resolves against the container rootfs, not the host filesystem.
+        // Regression test for: https://github.com/ROCm/spur/issues/136
+        assert!(script.contains(r#"cd "$ROOTFS/workspace""#));
+        // The old broken form must not appear in the non-root branch.
+        assert!(!script.contains("\n  cd /workspace\n"));
     }
 
     #[test]
