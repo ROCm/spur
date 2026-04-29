@@ -599,7 +599,7 @@ else
   export LD_LIBRARY_PATH="$ROOTFS/usr/lib:$ROOTFS/lib:$ROOTFS/usr/lib64:$ROOTFS/lib64:${{LD_LIBRARY_PATH:-}}"
   export SPUR_CONTAINER_ROOTFS="$ROOTFS"
   export HOME="{home}"
-  cd {workdir}
+  cd "$ROOTFS{workdir}"
   {entrypoint}/bin/bash $ROOTFS/tmp/spur_job_{job_id}.sh
 fi
 "#,
