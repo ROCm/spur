@@ -1130,9 +1130,8 @@ mod tests {
         assert!(script.contains("/mnt/data"));
         assert!(script.contains("remount,bind,ro"));
         assert!(script.contains("mount --bind \"/models\""));
-        // Directory mounts must use mkdir -p, not touch.
+        // The else branch for directory mounts must emit mkdir -p.
         assert!(script.contains("mkdir -p $ROOTFS/mnt/data"));
-        assert!(!script.contains("touch $ROOTFS/mnt/data"));
     }
 
     #[test]
@@ -1162,14 +1161,15 @@ mod tests {
         let rootfs = Path::new("/tmp/test-rootfs");
         let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
 
+        // The if branch must emit touch; the [ -f ] guard must be present.
         assert!(
             script.contains("touch $ROOTFS/etc/resolv.conf"),
-            "file mount must use touch, not mkdir -p, got:\n{}",
+            "file mount must use touch, got:\n{}",
             script
         );
         assert!(
-            !script.contains("mkdir -p $ROOTFS/etc/resolv.conf"),
-            "mkdir -p must not be used for file mount targets"
+            script.contains("if [ -f \"/etc/resolv.conf\" ]"),
+            "file detection guard must be present"
         );
         assert!(script.contains("mount --bind \"/etc/resolv.conf\""));
     }
@@ -1197,8 +1197,14 @@ mod tests {
         let rootfs = Path::new("/tmp/test-rootfs");
         let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
 
-        assert!(script.contains("/etc/resolv.conf"), "resolv.conf must be auto-mounted");
-        assert!(script.contains("/etc/hosts"), "/etc/hosts must be auto-mounted");
+        assert!(
+            script.contains("/etc/resolv.conf"),
+            "resolv.conf must be auto-mounted"
+        );
+        assert!(
+            script.contains("/etc/hosts"),
+            "/etc/hosts must be auto-mounted"
+        );
         assert!(script.contains("touch $ROOTFS$dns_file"));
     }
 
