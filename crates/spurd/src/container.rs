@@ -538,7 +538,13 @@ mount --bind {home} $ROOTFS{home} 2>/dev/null || true
     // User bind mounts
     for mount in &config.mounts {
         script.push_str(&format!(
-            "\nmkdir -p $ROOTFS{target}\nmount --bind \"{source}\" $ROOTFS{target} 2>/dev/null || true",
+            r#"
+if [ -f "{source}" ]; then
+  mkdir -p "$(dirname $ROOTFS{target})" && touch $ROOTFS{target}
+else
+  mkdir -p $ROOTFS{target}
+fi
+mount --bind "{source}" $ROOTFS{target} 2>/dev/null || true"#,
             source = mount.source,
             target = mount.target,
         ));
@@ -549,6 +555,18 @@ mount --bind {home} $ROOTFS{home} 2>/dev/null || true
             ));
         }
     }
+
+    // Bind-mount host DNS files so name resolution works inside the container.
+    script.push_str(
+        r#"
+for dns_file in /etc/resolv.conf /etc/hosts; do
+  if [ -f "$dns_file" ]; then
+    touch $ROOTFS$dns_file 2>/dev/null || true
+    mount --bind "$dns_file" $ROOTFS$dns_file 2>/dev/null || true
+  fi
+done
+"#,
+    );
 
     // Hook: config.d — source any system/user hook scripts
     script.push_str(
@@ -573,7 +591,13 @@ for fstab in /etc/spur/container.d/mounts.d/*.fstab; do
       src=$(echo "$line" | awk "{print \$1}")
       dst=$(echo "$line" | awk "{print \$2}")
       [ -n "$src" ] && [ -n "$dst" ] && {
-        mkdir -p $ROOTFS$dst
+        # Use touch for files, mkdir -p for directories — types must match.
+        if [ -f "$src" ]; then
+          mkdir -p "$(dirname $ROOTFS$dst)"
+          touch $ROOTFS$dst 2>/dev/null || true
+        else
+          mkdir -p $ROOTFS$dst
+        fi
         mount --bind "$src" $ROOTFS$dst 2>/dev/null || true
       }
     }
@@ -1113,6 +1137,82 @@ mod tests {
         assert!(script.contains("/mnt/data"));
         assert!(script.contains("remount,bind,ro"));
         assert!(script.contains("mount --bind \"/models\""));
+        // The else branch for directory mounts must emit mkdir -p.
+        assert!(script.contains("mkdir -p $ROOTFS/mnt/data"));
+    }
+
+    #[test]
+    fn test_launch_script_file_mount_uses_touch_not_mkdir() {
+        // File bind mounts must use touch, not mkdir -p — mismatched types fail silently.
+        let config = ContainerConfig {
+            image: "test".into(),
+            mounts: vec![BindMount {
+                source: "/etc/resolv.conf".into(),
+                target: "/etc/resolv.conf".into(),
+                readonly: true,
+            }],
+            workdir: None,
+            name: None,
+            readonly: false,
+            mount_home: false,
+            remap_root: false,
+            gpu_devices: vec![],
+            environment: HashMap::new(),
+            container_env: HashMap::new(),
+            entrypoint: None,
+            uid: 1000,
+            gid: 1000,
+            username: "testuser".into(),
+            home_dir: "/home/testuser".into(),
+        };
+        let rootfs = Path::new("/tmp/test-rootfs");
+        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
+
+        // The if branch must emit touch; the [ -f ] guard must be present.
+        assert!(
+            script.contains("touch $ROOTFS/etc/resolv.conf"),
+            "file mount must use touch, got:\n{}",
+            script
+        );
+        assert!(
+            script.contains("if [ -f \"/etc/resolv.conf\" ]"),
+            "file detection guard must be present"
+        );
+        assert!(script.contains("mount --bind \"/etc/resolv.conf\""));
+    }
+
+    #[test]
+    fn test_launch_script_dns_files_always_mounted() {
+        // DNS files must be auto-mounted even when the user specifies no mounts.
+        let config = ContainerConfig {
+            image: "test".into(),
+            mounts: vec![],
+            workdir: None,
+            name: None,
+            readonly: false,
+            mount_home: false,
+            remap_root: false,
+            gpu_devices: vec![],
+            environment: HashMap::new(),
+            container_env: HashMap::new(),
+            entrypoint: None,
+            uid: 1000,
+            gid: 1000,
+            username: "testuser".into(),
+            home_dir: "/home/testuser".into(),
+        };
+        let rootfs = Path::new("/tmp/test-rootfs");
+        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
+
+        assert!(
+            script.contains("/etc/resolv.conf"),
+            "resolv.conf must be auto-mounted"
+        );
+        assert!(
+            script.contains("/etc/hosts"),
+            "/etc/hosts must be auto-mounted"
+        );
+        assert!(script.contains("touch $ROOTFS$dns_file"));
     }
 
     // --- Image removal ---
