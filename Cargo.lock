@@ -3428,6 +3428,7 @@ dependencies = [
  "spur-sched",
  "spur-spank",
  "spur-update",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",
