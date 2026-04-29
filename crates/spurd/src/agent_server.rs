@@ -415,8 +415,12 @@ impl SlurmAgent for AgentService {
                 home_dir,
             };
 
-            let image_path = crate::container::resolve_image(&spec.container_image)
-                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            let image_path = crate::container::resolve_image(
+                &spec.container_image,
+                Some(&spec.user),
+                Some(spec.uid),
+            )
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
 
             let (rootfs, rootfs_mode) = crate::container::setup_rootfs(
                 &image_path,

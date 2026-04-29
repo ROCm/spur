@@ -21,22 +21,34 @@ use tracing::{debug, info, warn};
 const DEFAULT_IMAGE_DIR: &str = "/var/spool/spur/images";
 const DEFAULT_CONTAINER_DIR: &str = "/var/spool/spur/containers";
 
-/// Return candidate image directories, honoring `SPUR_IMAGE_DIR` env var.
+/// Resolve the home directory of the job's submitting user via passwd lookup.
+fn resolve_job_user_home(job_user: Option<&str>, job_uid: Option<u32>) -> Option<PathBuf> {
+    if let Some(uid) = job_uid {
+        if let Ok(Some(user)) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
+            return Some(user.dir);
+        }
+    }
+    if let Some(name) = job_user {
+        if let Ok(Some(user)) = nix::unistd::User::from_name(name) {
+            return Some(user.dir);
+        }
+    }
+    None
+}
+
+/// Return candidate image directories for a job, honoring `SPUR_IMAGE_DIR`
+/// env var and the submitting user's personal image store.
 ///
-/// Returns all directories to search (in priority order) so that
-/// `resolve_image()` can find images regardless of which tier was used
-/// to import them.
+/// The agent only needs *read* access to find images. We return all readable
+/// dirs so images imported to either the system dir or a user's home dir are
+/// found.
 ///
-/// Priority (issue #63 — fixes mismatch between CLI and agent):
+/// Search order:
 /// 1. `$SPUR_IMAGE_DIR` environment variable
-/// 2. `/var/spool/spur/images` if it exists and is readable
-/// 3. `~/.spur/images/` as user-local fallback
-///
-/// The CLI's `resolve_image_dir()` uses a writability check to decide
-/// where to *import* images, but the agent only needs *read* access to
-/// find them. We return all readable dirs so images imported to either
-/// the system dir or user dir are found.
-fn image_dirs() -> Vec<PathBuf> {
+/// 2. `/var/spool/spur/images` (system-wide store)
+/// 3. `~job_user/.spur/images` (submitting user's personal store)
+/// 4. `$HOME/.spur/images` (agent process fallback)
+fn image_dirs_for_job(job_user: Option<&str>, job_uid: Option<u32>) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
     if let Ok(dir) = std::env::var("SPUR_IMAGE_DIR") {
@@ -50,10 +62,19 @@ fn image_dirs() -> Vec<PathBuf> {
         dirs.push(system_dir.to_path_buf());
     }
 
-    if let Some(home) = std::env::var_os("HOME") {
-        let user_dir = PathBuf::from(home).join(".spur/images");
-        if !dirs.contains(&user_dir) {
+    // Submitting user's personal image store
+    if let Some(home) = resolve_job_user_home(job_user, job_uid) {
+        let user_dir = home.join(".spur/images");
+        if user_dir.is_dir() && !dirs.contains(&user_dir) {
             dirs.push(user_dir);
+        }
+    }
+
+    // Agent process $HOME fallback (e.g. /root/.spur/images)
+    if let Some(home) = std::env::var_os("HOME") {
+        let agent_dir = PathBuf::from(home).join(".spur/images");
+        if agent_dir.is_dir() && !dirs.contains(&agent_dir) {
+            dirs.push(agent_dir);
         }
     }
 
@@ -65,7 +86,7 @@ fn image_dirs() -> Vec<PathBuf> {
 
 /// Primary image directory (first candidate) — used for error messages.
 fn image_dir() -> PathBuf {
-    image_dirs()
+    image_dirs_for_job(None, None)
         .into_iter()
         .next()
         .unwrap_or_else(|| PathBuf::from(DEFAULT_IMAGE_DIR))
@@ -132,9 +153,16 @@ pub struct ContainerConfig {
 ///
 /// Supports:
 /// - Absolute path to squashfs file
-/// - Image name (looked up in image_dir())
+/// - Image name (looked up in candidate image directories)
 /// - docker:// URI (must be pre-imported with `spur image import`)
-pub fn resolve_image(image: &str) -> anyhow::Result<PathBuf> {
+///
+/// `job_user` / `job_uid` identify the submitting user so we can search
+/// their personal image store (`~job_user/.spur/images`).
+pub fn resolve_image(
+    image: &str,
+    job_user: Option<&str>,
+    job_uid: Option<u32>,
+) -> anyhow::Result<PathBuf> {
     let path = Path::new(image);
 
     // Absolute path: use directly if it exists
@@ -154,9 +182,7 @@ pub fn resolve_image(image: &str) -> anyhow::Result<PathBuf> {
         }
     }
 
-    // Search all candidate directories (issue #63: CLI may import to ~/.spur/images
-    // while agent previously only checked /var/spool/spur/images)
-    let dirs = image_dirs();
+    let dirs = image_dirs_for_job(job_user, job_uid);
     let sanitized = sanitize_name(image);
 
     for dir in &dirs {
@@ -901,7 +927,7 @@ mod tests {
 
     #[test]
     fn test_resolve_image_not_found() {
-        let err = resolve_image("nonexistent-image-xyz").unwrap_err();
+        let err = resolve_image("nonexistent-image-xyz", None, None).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("not found"),
@@ -917,13 +943,13 @@ mod tests {
 
     #[test]
     fn test_resolve_image_absolute_path_not_found() {
-        let err = resolve_image("/nonexistent/path/to/image.sqsh").unwrap_err();
+        let err = resolve_image("/nonexistent/path/to/image.sqsh", None, None).unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 
     #[test]
     fn test_resolve_image_docker_uri_not_imported() {
-        let err = resolve_image("docker://ubuntu:22.04").unwrap_err();
+        let err = resolve_image("docker://ubuntu:22.04", None, None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("not found"));
         assert!(msg.contains("spur image import"));
@@ -933,7 +959,7 @@ mod tests {
     fn test_resolve_image_error_includes_directory() {
         // Regression: error message now shows which directory was searched (#35).
         // Makes it obvious when CLI and agent use different directories.
-        let err = resolve_image("missing-image").unwrap_err();
+        let err = resolve_image("missing-image", None, None).unwrap_err();
         let msg = err.to_string();
         // Error must tell user where we looked.
         assert!(
@@ -969,6 +995,15 @@ mod tests {
             dir,
             std::path::PathBuf::from("/custom/image/store"),
             "SPUR_IMAGE_DIR env var must override the default image directory"
+        );
+    }
+
+    #[test]
+    fn test_image_dirs_for_job_no_user_falls_back() {
+        let dirs = image_dirs_for_job(None, None);
+        assert!(
+            !dirs.is_empty(),
+            "image_dirs_for_job(None, None) must return at least one directory"
         );
     }
 
