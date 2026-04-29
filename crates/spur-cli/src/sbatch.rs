@@ -8,40 +8,50 @@ use std::collections::HashMap;
 #[derive(Parser, Debug)]
 #[command(name = "sbatch", about = "Submit a batch job script")]
 pub struct SbatchArgs {
+    // CLI args override #SBATCH directives. clap merges directives + CLI argv;
+    // `overrides_with = "self"` allows duplicates with last-wins, so a CLI flag
+    // appearing after a directive flag wins. Vec args (gres, licenses,
+    // container_mounts, container_env) accumulate by design and have no
+    // `overrides_with`. Closes #143.
     /// Job name
-    #[arg(short = 'J', long)]
+    #[arg(short = 'J', long, overrides_with = "job_name")]
     pub job_name: Option<String>,
 
     /// Partition
-    #[arg(short = 'p', long)]
+    #[arg(short = 'p', long, overrides_with = "partition")]
     pub partition: Option<String>,
 
     /// Account
-    #[arg(short = 'A', long)]
+    #[arg(short = 'A', long, overrides_with = "account")]
     pub account: Option<String>,
 
     /// Number of nodes
-    #[arg(short = 'N', long, default_value = "1")]
+    #[arg(short = 'N', long, default_value = "1", overrides_with = "nodes")]
     pub nodes: u32,
 
     /// Number of tasks
-    #[arg(short = 'n', long, default_value = "1")]
+    #[arg(short = 'n', long, default_value = "1", overrides_with = "ntasks")]
     pub ntasks: u32,
 
     /// Tasks per node
-    #[arg(long)]
+    #[arg(long, overrides_with = "ntasks_per_node")]
     pub ntasks_per_node: Option<u32>,
 
     /// CPUs per task
-    #[arg(short = 'c', long, default_value = "1")]
+    #[arg(
+        short = 'c',
+        long,
+        default_value = "1",
+        overrides_with = "cpus_per_task"
+    )]
     pub cpus_per_task: u32,
 
     /// Memory per node (e.g., "4G", "4096M", "4096")
-    #[arg(long)]
+    #[arg(long, overrides_with = "mem")]
     pub mem: Option<String>,
 
     /// Memory per CPU
-    #[arg(long)]
+    #[arg(long, overrides_with = "mem_per_cpu")]
     pub mem_per_cpu: Option<String>,
 
     /// Generic resources (e.g., "gpu:4", "gpu:mi300x:8")
@@ -53,128 +63,128 @@ pub struct SbatchArgs {
     pub licenses: Vec<String>,
 
     /// GPUs (shorthand, e.g., "4" or "mi300x:4")
-    #[arg(short = 'G', long)]
+    #[arg(short = 'G', long, overrides_with = "gpus")]
     pub gpus: Option<String>,
 
     /// GPUs per node
-    #[arg(long)]
+    #[arg(long, overrides_with = "gpus_per_node")]
     pub gpus_per_node: Option<String>,
 
     /// Time limit (e.g., "4:00:00", "1-00:00:00")
-    #[arg(short = 't', long)]
+    #[arg(short = 't', long, overrides_with = "time")]
     pub time: Option<String>,
 
     /// Minimum time limit
-    #[arg(long)]
+    #[arg(long, overrides_with = "time_min")]
     pub time_min: Option<String>,
 
     /// Working directory
-    #[arg(short = 'D', long)]
+    #[arg(short = 'D', long, overrides_with = "chdir")]
     pub chdir: Option<String>,
 
     /// Stdout file
-    #[arg(short = 'o', long)]
+    #[arg(short = 'o', long, overrides_with = "output")]
     pub output: Option<String>,
 
     /// Stderr file
-    #[arg(short = 'e', long)]
+    #[arg(short = 'e', long, overrides_with = "error")]
     pub error: Option<String>,
 
     /// QoS
-    #[arg(short = 'q', long)]
+    #[arg(short = 'q', long, overrides_with = "qos")]
     pub qos: Option<String>,
 
     /// Job dependency (e.g., "afterok:123")
-    #[arg(short = 'd', long)]
+    #[arg(short = 'd', long, overrides_with = "dependency")]
     pub dependency: Option<String>,
 
     /// Node list
-    #[arg(short = 'w', long)]
+    #[arg(short = 'w', long, overrides_with = "nodelist")]
     pub nodelist: Option<String>,
 
     /// Exclude nodes
-    #[arg(short = 'x', long)]
+    #[arg(short = 'x', long, overrides_with = "exclude")]
     pub exclude: Option<String>,
 
     /// Required node features (e.g., "mi300x,nvlink")
-    #[arg(short = 'C', long)]
+    #[arg(short = 'C', long, overrides_with = "constraint")]
     pub constraint: Option<String>,
 
     /// Target a named reservation
-    #[arg(long)]
+    #[arg(long, overrides_with = "reservation")]
     pub reservation: Option<String>,
 
     /// Job array (e.g., "0-99%10")
-    #[arg(short = 'a', long)]
+    #[arg(short = 'a', long, overrides_with = "array")]
     pub array: Option<String>,
 
     /// Task distribution (block, cyclic, plane, arbitrary)
-    #[arg(short = 'm', long)]
+    #[arg(short = 'm', long, overrides_with = "distribution")]
     pub distribution: Option<String>,
 
     /// Heterogeneous job component index (0 = first component)
-    #[arg(long)]
+    #[arg(long, overrides_with = "het_group")]
     pub het_group: Option<u32>,
 
     /// Burst buffer specification ("stage_in:cmd;stage_out:cmd")
-    #[arg(long)]
+    #[arg(long, overrides_with = "bb")]
     pub bb: Option<String>,
 
     /// Earliest start time (ISO 8601, e.g. "2026-03-22T10:00:00Z" or "now+1hour")
-    #[arg(long)]
+    #[arg(long, overrides_with = "begin")]
     pub begin: Option<String>,
 
     /// Cancel if still pending after this time (ISO 8601)
-    #[arg(long)]
+    #[arg(long, overrides_with = "deadline")]
     pub deadline: Option<String>,
 
     /// Spread job across least-loaded nodes
-    #[arg(long)]
+    #[arg(long, overrides_with = "spread_job")]
     pub spread_job: bool,
 
     /// Topology-aware scheduling: "tree" (minimize switch hops) or "block" (keep within rack)
-    #[arg(long)]
+    #[arg(long, overrides_with = "topology")]
     pub topology: Option<String>,
 
     /// Output file open mode: "truncate" (default) or "append"
-    #[arg(long)]
+    #[arg(long, overrides_with = "open_mode")]
     pub open_mode: Option<String>,
 
     /// MPI type (none, pmix, pmi2)
-    #[arg(long, default_value = "none")]
+    #[arg(long, default_value = "none", overrides_with = "mpi")]
     pub mpi: String,
 
     /// Allow requeue
-    #[arg(long)]
+    #[arg(long, overrides_with = "requeue")]
     pub requeue: bool,
 
     /// Exclusive node access
-    #[arg(long)]
+    #[arg(long, overrides_with = "exclusive")]
     pub exclusive: bool,
 
     /// Hold job
-    #[arg(short = 'H', long)]
+    #[arg(short = 'H', long, overrides_with = "hold")]
     pub hold: bool,
 
     /// Comment
-    #[arg(long)]
+    #[arg(long, overrides_with = "comment")]
     pub comment: Option<String>,
 
     /// Mail notification type (comma-separated: BEGIN,END,FAIL,ALL)
-    #[arg(long)]
+    #[arg(long, overrides_with = "mail_type")]
     pub mail_type: Option<String>,
 
     /// Mail notification user/address
-    #[arg(long)]
+    #[arg(long, overrides_with = "mail_user")]
     pub mail_user: Option<String>,
 
     /// Export environment variables
-    #[arg(long, default_value = "ALL")]
+    #[arg(long, default_value = "ALL", overrides_with = "export")]
     pub export: String,
 
     // Container
     /// Container image (OCI ref or squashfs path)
-    #[arg(long)]
+    #[arg(long, overrides_with = "container_image")]
     pub container_image: Option<String>,
 
     /// Container bind mounts ("/src:/dst:ro")
@@ -182,19 +192,19 @@ pub struct SbatchArgs {
     pub container_mounts: Vec<String>,
 
     /// Working directory inside the container
-    #[arg(long)]
+    #[arg(long, overrides_with = "container_workdir")]
     pub container_workdir: Option<String>,
 
     /// Named container (persists across jobs)
-    #[arg(long)]
+    #[arg(long, overrides_with = "container_name")]
     pub container_name: Option<String>,
 
     /// Read-only container rootfs
-    #[arg(long)]
+    #[arg(long, overrides_with = "container_readonly")]
     pub container_readonly: bool,
 
     /// Mount user home directory in container
-    #[arg(long)]
+    #[arg(long, overrides_with = "container_mount_home")]
     pub container_mount_home: bool,
 
     /// Set environment variable inside container (KEY=VAL)
@@ -202,18 +212,19 @@ pub struct SbatchArgs {
     pub container_env: Vec<String>,
 
     /// Override container entrypoint
-    #[arg(long)]
+    #[arg(long, overrides_with = "container_entrypoint")]
     pub container_entrypoint: Option<String>,
 
     /// Remap user to root inside container
-    #[arg(long)]
+    #[arg(long, overrides_with = "container_remap_root")]
     pub container_remap_root: bool,
 
     /// Controller address
     #[arg(
         long,
         env = "SPUR_CONTROLLER_ADDR",
-        default_value = "http://localhost:6817"
+        default_value = "http://localhost:6817",
+        overrides_with = "controller"
     )]
     pub controller: String,
 
@@ -248,6 +259,18 @@ pub fn parse_sbatch_directives(script: &str) -> Vec<String> {
         }
     }
     args
+}
+
+/// Build the argv that clap parses: directives first, CLI args after.
+///
+/// Order is load-bearing: scalar args in `SbatchArgs` use `overrides_with =
+/// "self"` for last-wins semantics, so a CLI flag appearing after a directive
+/// flag wins. Vec args (e.g. `--gres`) accumulate from both sources.
+pub fn merge_directives_and_cli(directives: &[String], cli_args: &[String]) -> Vec<String> {
+    let mut merged = vec!["sbatch".to_string()];
+    merged.extend(directives.iter().cloned());
+    merged.extend(cli_args.iter().skip(1).cloned()); // skip argv[0]
+    merged
 }
 
 /// Basic shell word splitting (handles simple quoting).
@@ -440,9 +463,6 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
-    // Build argv: merge #SBATCH directives (from script) with CLI args.
-    // CLI args take precedence (they come after in the merged argv).
-
     // If script is provided, parse directives from it
     let script_content = if let Some(script_path) = cli_args.last() {
         if !script_path.starts_with('-') && script_path != "sbatch" {
@@ -457,12 +477,11 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         None
     };
 
-    let mut merged_args = vec!["sbatch".to_string()];
-    if let Some(ref content) = script_content {
-        merged_args.extend(parse_sbatch_directives(content));
-    }
-    // CLI args override (skip argv[0])
-    merged_args.extend(cli_args.into_iter().skip(1));
+    let directive_args = script_content
+        .as_deref()
+        .map(parse_sbatch_directives)
+        .unwrap_or_default();
+    let merged_args = merge_directives_and_cli(&directive_args, &cli_args);
 
     let args = SbatchArgs::try_parse_from(&merged_args)?;
 
@@ -692,5 +711,98 @@ echo "hello world"
             convert_pbs_to_sbatch("-l walltime=4:00:00"),
             Some("--time=4:00:00".into())
         );
+    }
+
+    // --- #143: CLI args override #SBATCH directives ---
+    //
+    // Regression: clap previously rejected duplicate scalar args with
+    // "the argument '--nodes <NODES>' cannot be used multiple times".
+    // overrides_with = "self" makes scalars last-wins.
+
+    fn parse_merged(directives: &[&str], cli: &[&str]) -> SbatchArgs {
+        let directives: Vec<String> = directives.iter().map(|s| s.to_string()).collect();
+        let cli: Vec<String> = cli.iter().map(|s| s.to_string()).collect();
+        let merged = merge_directives_and_cli(&directives, &cli);
+        SbatchArgs::try_parse_from(&merged).expect("parse failed")
+    }
+
+    #[test]
+    fn test_cli_overrides_directive_long_form() {
+        // Reproduces the exact scenario from #143.
+        let args = parse_merged(&["--nodes=2"], &["sbatch", "--nodes=4"]);
+        assert_eq!(args.nodes, 4, "CLI must override directive");
+    }
+
+    #[test]
+    fn test_cli_overrides_directive_short_form() {
+        let args = parse_merged(&["-N", "2"], &["sbatch", "-N", "8"]);
+        assert_eq!(args.nodes, 8);
+    }
+
+    #[test]
+    fn test_cli_overrides_directive_mixed_forms() {
+        // Directive uses --nodes=N, CLI uses -N N.
+        let args = parse_merged(&["--nodes=2"], &["sbatch", "-N", "16"]);
+        assert_eq!(args.nodes, 16);
+    }
+
+    #[test]
+    fn test_cli_overrides_directive_string_arg() {
+        let args = parse_merged(
+            &["--job-name=from-script"],
+            &["sbatch", "--job-name=from-cli"],
+        );
+        assert_eq!(args.job_name.as_deref(), Some("from-cli"));
+    }
+
+    #[test]
+    fn test_cli_overrides_directive_bool_flag() {
+        // Bool flags: directive sets, CLI re-sets — must not error.
+        let args = parse_merged(&["--exclusive"], &["sbatch", "--exclusive"]);
+        assert!(args.exclusive);
+    }
+
+    #[test]
+    fn test_directive_only_when_no_cli_override() {
+        let args = parse_merged(&["--nodes=2", "--time=1:00:00"], &["sbatch"]);
+        assert_eq!(args.nodes, 2);
+        assert_eq!(args.time.as_deref(), Some("1:00:00"));
+    }
+
+    #[test]
+    fn test_cli_only_when_no_directive() {
+        let args = parse_merged(&[], &["sbatch", "--nodes=4"]);
+        assert_eq!(args.nodes, 4);
+    }
+
+    #[test]
+    fn test_vec_args_accumulate_from_both_sources() {
+        // Vec args have no overrides_with — they intentionally accumulate.
+        let args = parse_merged(
+            &["--gres=gpu:mi300x:8"],
+            &["sbatch", "--gres=license:fluent:1"],
+        );
+        assert_eq!(args.gres, vec!["gpu:mi300x:8", "license:fluent:1"]);
+    }
+
+    #[test]
+    fn test_partial_override_preserves_other_directives() {
+        // CLI overrides nodes but leaves time/job-name from directives.
+        let args = parse_merged(
+            &["--nodes=2", "--time=1:00:00", "--job-name=script-name"],
+            &["sbatch", "--nodes=4"],
+        );
+        assert_eq!(args.nodes, 4);
+        assert_eq!(args.time.as_deref(), Some("1:00:00"));
+        assert_eq!(args.job_name.as_deref(), Some("script-name"));
+    }
+
+    #[test]
+    fn test_cli_can_override_default_value_arg() {
+        // `--cpus-per-task` has default_value = "1". Verify directive sets it
+        // and CLI overrides — no surprises from the default interacting with
+        // overrides_with.
+        let args = parse_merged(&["--cpus-per-task=4"], &["sbatch", "--cpus-per-task=8"]);
+        assert_eq!(args.cpus_per_task, 8);
     }
 }
