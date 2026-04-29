@@ -406,12 +406,25 @@ impl ClusterManager {
             let Some(job) = jobs.get(&job_id) else {
                 return Ok(());
             };
+            if job.state.is_terminal() {
+                return Ok(());
+            }
             job.state
         };
 
+        // transition to Failed via JobComplete so node resources,
+        // licenses, and steps are properly cleaned up.
+        self.propose(WalOperation::JobComplete {
+            job_id,
+            exit_code: -1,
+            state: JobState::Failed,
+        })?;
+
+        // Failed → Pending resets allocation fields and makes
+        // the job schedulable again.
         self.propose(WalOperation::JobStateChange {
             job_id,
-            old_state,
+            old_state: JobState::Failed,
             new_state: JobState::Pending,
         })?;
 
@@ -2343,6 +2356,60 @@ mod tests {
             "allocated_resources should be cleared"
         );
         assert_eq!(job.pending_reason, PendingReason::None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeue_job_frees_node_resources() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("dispatch-fail"));
+
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            ResourceSet {
+                cpus: 2,
+                memory_mb: 4000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(
+            node.alloc_resources.cpus, 2,
+            "CPUs should be allocated after start"
+        );
+
+        // Simulate all-dispatch-failed requeue (the fix under test)
+        cm.requeue_job(id).unwrap();
+        settle(&cm, id, JobState::Pending);
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.requeue_count, 1);
+        assert!(job.start_time.is_none(), "start_time should be cleared");
+        assert!(
+            job.allocated_nodes.is_empty(),
+            "allocated_nodes should be cleared"
+        );
+        assert!(
+            job.allocated_resources.is_none(),
+            "allocated_resources should be cleared"
+        );
+
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(
+            node.alloc_resources.cpus, 0,
+            "node CPUs must be freed after requeue"
+        );
+        assert!(
+            node.alloc_resources.gpus.is_empty(),
+            "node GPUs must be freed after requeue"
+        );
+        assert_eq!(node.state, NodeState::Idle, "node should return to Idle");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
