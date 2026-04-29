@@ -871,6 +871,15 @@ fn which(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serialize tests that mutate `SPUR_IMAGE_DIR` (or any process-global
+    /// env var). Cargo runs tests in parallel within a binary, so without
+    /// a lock these races produce intermittent CI failures.
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     // --- Mount parsing ---
 
@@ -996,9 +1005,13 @@ mod tests {
     fn test_image_dir_default_without_env() {
         // Regression: agent used hardcoded /var/spool/spur/images ignoring env (#35 #23).
         // Without SPUR_IMAGE_DIR the function must return the system default.
-        // We unset the env var for this test to isolate behavior.
+        let _guard = env_lock();
+        let prev = std::env::var_os("SPUR_IMAGE_DIR");
         std::env::remove_var("SPUR_IMAGE_DIR");
         let dir = image_dir();
+        if let Some(v) = prev {
+            std::env::set_var("SPUR_IMAGE_DIR", v);
+        }
         assert!(
             dir.to_str().unwrap().contains("spur"),
             "default image_dir must be under a spur path, got: {}",
@@ -1011,9 +1024,14 @@ mod tests {
         // Regression: CLI used SPUR_IMAGE_DIR but agent did not (#35 #23).
         // Both must use the same env var so images imported by non-root users
         // (to e.g. ~/.spur/images) are found by the agent.
+        let _guard = env_lock();
+        let prev = std::env::var_os("SPUR_IMAGE_DIR");
         std::env::set_var("SPUR_IMAGE_DIR", "/custom/image/store");
         let dir = image_dir();
-        std::env::remove_var("SPUR_IMAGE_DIR");
+        match prev {
+            Some(v) => std::env::set_var("SPUR_IMAGE_DIR", v),
+            None => std::env::remove_var("SPUR_IMAGE_DIR"),
+        }
         assert_eq!(
             dir,
             std::path::PathBuf::from("/custom/image/store"),
@@ -1170,10 +1188,9 @@ mod tests {
         std::fs::write(&image_path, b"fake squashfs").unwrap();
 
         // Use SPUR_IMAGE_DIR to inject a known dir into the search path.
-        // SAFETY: env mutation in tests — keep this test isolated by not
-        // running it in parallel with other env-dependent tests
-        // (cargo test runs tests in parallel by default within a binary,
-        // but no other test in this file reads SPUR_IMAGE_DIR mid-test).
+        // env_lock() serializes against other env-mutating tests in this
+        // module, since cargo runs tests in parallel within a binary.
+        let _guard = env_lock();
         let prev = std::env::var_os("SPUR_IMAGE_DIR");
         std::env::set_var("SPUR_IMAGE_DIR", images_dir.path());
 
