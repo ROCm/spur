@@ -2,10 +2,12 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 
+use spur_core::reservation::Reservation;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::slurm_controller_server::{SlurmController, SlurmControllerServer};
 use spur_proto::proto::*;
@@ -285,7 +287,9 @@ impl SlurmController for ControllerService {
 
         let _req = request.into_inner();
         let nodes = self.cluster.get_nodes();
-        let proto_nodes: Vec<NodeInfo> = nodes.iter().map(node_to_proto).collect();
+        let mut proto_nodes: Vec<NodeInfo> = nodes.iter().map(node_to_proto).collect();
+        let reservations = self.cluster.get_reservations();
+        annotate_nodes_with_reservations(&mut proto_nodes, &reservations, Utc::now());
         Ok(Response::new(GetNodesResponse { nodes: proto_nodes }))
     }
 
@@ -308,7 +312,14 @@ impl SlurmController for ControllerService {
             .cluster
             .get_node(&name)
             .ok_or_else(|| Status::not_found(format!("node {} not found", name)))?;
-        Ok(Response::new(node_to_proto(&node)))
+        let mut proto_node = node_to_proto(&node);
+        let reservations = self.cluster.get_reservations();
+        annotate_nodes_with_reservations(
+            std::slice::from_mut(&mut proto_node),
+            &reservations,
+            Utc::now(),
+        );
+        Ok(Response::new(proto_node))
     }
 
     async fn update_node(
@@ -1143,6 +1154,7 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         last_busy: node.last_busy.map(datetime_to_proto),
         slurmd_start_time: node.agent_start_time.map(datetime_to_proto),
         switch_name: node.switch_name.clone().unwrap_or_default(),
+        active_reservation: String::new(),
     }
 }
 
@@ -1238,5 +1250,108 @@ pub(crate) fn datetime_to_proto(dt: chrono::DateTime<chrono::Utc>) -> prost_type
     prost_types::Timestamp {
         seconds: dt.timestamp(),
         nanos: dt.timestamp_subsec_nanos() as i32,
+    }
+}
+
+fn annotate_nodes_with_reservations(
+    nodes: &mut [NodeInfo],
+    reservations: &[Reservation],
+    now: DateTime<Utc>,
+) {
+    for node_info in nodes.iter_mut() {
+        for res in reservations {
+            if res.is_active(now) && res.covers_node(&node_info.name) {
+                node_info.active_reservation = res.name.clone();
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+
+    fn make_node_info(name: &str) -> NodeInfo {
+        NodeInfo {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    fn make_reservation(
+        name: &str,
+        nodes: &[&str],
+        start_offset_hours: i64,
+        end_offset_hours: i64,
+    ) -> Reservation {
+        let now = Utc::now();
+        Reservation {
+            name: name.into(),
+            start_time: now + Duration::hours(start_offset_hours),
+            end_time: now + Duration::hours(end_offset_hours),
+            nodes: nodes.iter().map(|s| s.to_string()).collect(),
+            accounts: Vec::new(),
+            users: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_annotate_no_reservations() {
+        let mut nodes = vec![make_node_info("n1"), make_node_info("n2")];
+        annotate_nodes_with_reservations(&mut nodes, &[], Utc::now());
+        assert!(nodes[0].active_reservation.is_empty());
+        assert!(nodes[1].active_reservation.is_empty());
+    }
+
+    #[test]
+    fn test_annotate_active_reservation() {
+        let mut nodes = vec![make_node_info("n1"), make_node_info("n2")];
+        let reservations = vec![make_reservation("maint", &["n1"], -1, 1)];
+        annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now());
+        assert_eq!(nodes[0].active_reservation, "maint");
+        assert!(nodes[1].active_reservation.is_empty());
+    }
+
+    #[test]
+    fn test_annotate_expired_reservation() {
+        let mut nodes = vec![make_node_info("n1")];
+        let reservations = vec![make_reservation("old", &["n1"], -3, -1)];
+        annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now());
+        assert!(nodes[0].active_reservation.is_empty());
+    }
+
+    #[test]
+    fn test_annotate_future_reservation() {
+        let mut nodes = vec![make_node_info("n1")];
+        let reservations = vec![make_reservation("future", &["n1"], 1, 3)];
+        annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now());
+        assert!(nodes[0].active_reservation.is_empty());
+    }
+
+    #[test]
+    fn test_annotate_partial_coverage() {
+        let mut nodes = vec![
+            make_node_info("n1"),
+            make_node_info("n2"),
+            make_node_info("n3"),
+        ];
+        let reservations = vec![make_reservation("gpu-resv", &["n1", "n3"], -1, 1)];
+        annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now());
+        assert_eq!(nodes[0].active_reservation, "gpu-resv");
+        assert!(nodes[1].active_reservation.is_empty());
+        assert_eq!(nodes[2].active_reservation, "gpu-resv");
+    }
+
+    #[test]
+    fn test_annotate_multiple_reservations_first_wins() {
+        let mut nodes = vec![make_node_info("n1")];
+        let reservations = vec![
+            make_reservation("first", &["n1"], -1, 1),
+            make_reservation("second", &["n1"], -1, 1),
+        ];
+        annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now());
+        assert_eq!(nodes[0].active_reservation, "first");
     }
 }
