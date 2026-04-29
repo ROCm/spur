@@ -195,6 +195,8 @@ message NodeInfo {
   google.protobuf.Timestamp slurmd_start_time = 32;
 
   string switch_name = 40;   // Leaf switch from topology config
+
+  string active_reservation = 50;
 }
 
 message PartitionInfo {
