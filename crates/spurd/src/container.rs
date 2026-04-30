@@ -665,15 +665,47 @@ done
 chroot $ROOTFS /bin/bash -c "cd {workdir} && {entrypoint}{script}"
 '
 else
-  # Non-root fallback: PATH-based execution, no namespace isolation
+  # Non-root path: no chroot/pivot_root capability. We can't run binaries
+  # from $ROOTFS naively because the kernel honors the binary's PT_INTERP
+  # (e.g. /lib64/ld-linux-x86-64.so.2) which resolves to the *host's*
+  # dynamic loader, which then loads the *host's* libc — producing a
+  # GLIBC version mismatch when the container's binaries are newer than
+  # the host's libc (#149).
+  #
+  # Fix: invoke the container's dynamic loader explicitly with
+  # --library-path so binaries see the container's libc + dependent libs.
   ROOTFS="{rootfs}"
   {env_exports}
   export PATH="$ROOTFS/usr/bin:$ROOTFS/bin:$ROOTFS/usr/sbin:$ROOTFS/sbin:$PATH"
-  export LD_LIBRARY_PATH="$ROOTFS/usr/lib:$ROOTFS/lib:$ROOTFS/usr/lib64:$ROOTFS/lib64:${{LD_LIBRARY_PATH:-}}"
+  export LD_LIBRARY_PATH="$ROOTFS/lib/x86_64-linux-gnu:$ROOTFS/usr/lib/x86_64-linux-gnu:$ROOTFS/lib64:$ROOTFS/usr/lib64:$ROOTFS/lib:$ROOTFS/usr/lib:${{LD_LIBRARY_PATH:-}}"
   export SPUR_CONTAINER_ROOTFS="$ROOTFS"
   export HOME="{home}"
   cd "$ROOTFS{workdir}"
-  {entrypoint}/bin/bash $ROOTFS/tmp/spur_job_{job_id}.sh
+
+  # Locate the container's dynamic loader. Order: glibc x86_64 (Ubuntu /
+  # Debian / RHEL), then musl (Alpine).
+  SPUR_LOADER=""
+  for _cand in \
+      "$ROOTFS/lib64/ld-linux-x86-64.so.2" \
+      "$ROOTFS/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2" \
+      "$ROOTFS/lib/ld-linux-x86-64.so.2" \
+      "$ROOTFS/lib/ld-musl-x86_64.so.1"; do
+    if [ -e "$_cand" ]; then
+      SPUR_LOADER="$_cand"
+      break
+    fi
+  done
+
+  if [ -n "$SPUR_LOADER" ] && [ -e "$ROOTFS/bin/bash" ]; then
+    {entrypoint}exec "$SPUR_LOADER" --library-path "$LD_LIBRARY_PATH" \
+      "$ROOTFS/bin/bash" "$ROOTFS/tmp/spur_job_{job_id}.sh"
+  else
+    # Statically linked / non-glibc / no bash in container — fall back to
+    # the host bash. This will fail with a glibc mismatch if the host's
+    # libc is older than what the user's job binaries require, but it's
+    # the best we can do without container internals.
+    {entrypoint}/bin/bash $ROOTFS/tmp/spur_job_{job_id}.sh
+  fi
 fi
 "#,
         env_exports = env_exports,
@@ -1447,6 +1479,144 @@ mod tests {
             "/etc/hosts must be auto-mounted"
         );
         assert!(script.contains("touch $ROOTFS$dns_file"));
+    }
+
+    // --- #149: non-root container glibc mismatch ---
+    //
+    // Regression: the non-root branch of the launch script previously did
+    //   {entrypoint}/bin/bash $ROOTFS/tmp/spur_job_X.sh
+    // which executes the *host's* /bin/bash. When that bash (or anything
+    // it spawns from $ROOTFS) is dynamically linked, the kernel honors
+    // the binary's PT_INTERP (e.g. /lib64/ld-linux-x86-64.so.2) which
+    // resolves to the host's loader, which then loads the host's libc.
+    // If the container's libc is newer (e.g. Ubuntu 24 / GLIBC_2.38) than
+    // the host's (Ubuntu 22 / GLIBC_2.35), the job fails with:
+    //   bash: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found
+    //
+    // Fix: invoke the container's own dynamic loader explicitly with
+    // --library-path, so the container's libc + transitive deps are used
+    // even though we haven't chrooted.
+
+    fn rootless_default_config() -> ContainerConfig {
+        ContainerConfig {
+            image: "test".into(),
+            mounts: vec![],
+            workdir: None,
+            name: None,
+            readonly: false,
+            mount_home: false,
+            remap_root: false,
+            gpu_devices: vec![],
+            environment: HashMap::new(),
+            container_env: HashMap::new(),
+            entrypoint: None,
+            uid: 1000,
+            gid: 1000,
+            username: "testuser".into(),
+            home_dir: "/home/testuser".into(),
+        }
+    }
+
+    fn extract_rootless_branch(script: &str) -> &str {
+        // The launch script has a single `if [ "$(id -u)" = "0" ]; then ... else ... fi`
+        // block. The non-root path is the `else` branch. We slice on the
+        // literal text that opens it.
+        let marker = "  # Non-root path: no chroot/pivot_root capability.";
+        let idx = script.find(marker).expect("non-root branch marker missing");
+        &script[idx..]
+    }
+
+    #[test]
+    fn launch_script_non_root_invokes_container_loader_explicitly() {
+        let config = rootless_default_config();
+        let rootfs = Path::new("/tmp/test-rootfs");
+        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 7).unwrap();
+        let rootless = extract_rootless_branch(&script);
+
+        // Loader detection iterates the well-known glibc paths first.
+        assert!(
+            rootless.contains("$ROOTFS/lib64/ld-linux-x86-64.so.2"),
+            "must probe glibc x86_64 loader path"
+        );
+        assert!(
+            rootless.contains("$ROOTFS/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"),
+            "must probe Debian/Ubuntu glibc loader path"
+        );
+        assert!(
+            rootless.contains("$ROOTFS/lib/ld-musl-x86_64.so.1"),
+            "must probe musl loader (Alpine) as fallback"
+        );
+
+        // The loader must be invoked with --library-path pointing at the
+        // container's libs, then bash, then the job script.
+        assert!(
+            rootless.contains("\"$SPUR_LOADER\" --library-path \"$LD_LIBRARY_PATH\""),
+            "loader must be invoked with --library-path; got:\n{}",
+            rootless
+        );
+        assert!(
+            rootless.contains("\"$ROOTFS/bin/bash\" \"$ROOTFS/tmp/spur_job_7.sh\""),
+            "must run the container's bash on the staged script"
+        );
+    }
+
+    #[test]
+    fn launch_script_non_root_includes_debian_libdir_in_ld_path() {
+        // Debian/Ubuntu install libc at /lib/x86_64-linux-gnu/libc.so.6.
+        // The original LD_LIBRARY_PATH only listed /lib + /lib64 + /usr/lib,
+        // which would miss it.
+        let config = rootless_default_config();
+        let rootfs = Path::new("/tmp/test-rootfs");
+        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
+        let rootless = extract_rootless_branch(&script);
+
+        assert!(
+            rootless.contains("$ROOTFS/lib/x86_64-linux-gnu"),
+            "LD_LIBRARY_PATH must include Debian/Ubuntu libdir"
+        );
+        assert!(
+            rootless.contains("$ROOTFS/usr/lib/x86_64-linux-gnu"),
+            "LD_LIBRARY_PATH must include Debian/Ubuntu /usr libdir"
+        );
+    }
+
+    #[test]
+    fn launch_script_non_root_falls_back_to_host_bash_when_no_loader() {
+        // Some images (scratch, distroless static) have no dynamic loader.
+        // Don't crash the script — fall back to legacy host-bash invocation.
+        let config = rootless_default_config();
+        let rootfs = Path::new("/tmp/test-rootfs");
+        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
+        let rootless = extract_rootless_branch(&script);
+
+        // The fallback branch is reached only if no loader was found.
+        assert!(
+            rootless.contains("/bin/bash $ROOTFS/tmp/spur_job_"),
+            "must retain fallback to host bash when no loader exists"
+        );
+    }
+
+    #[test]
+    fn launch_script_non_root_no_longer_uses_host_bash_unconditionally() {
+        // Regression guard for #149: the original code unconditionally
+        // ran `/bin/bash $ROOTFS/tmp/spur_job_X.sh` as its only command,
+        // which is what caused the GLIBC mismatch. After the fix, the
+        // loader path must come first.
+        let config = rootless_default_config();
+        let rootfs = Path::new("/tmp/test-rootfs");
+        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
+        let rootless = extract_rootless_branch(&script);
+
+        let loader_idx = rootless
+            .find("$SPUR_LOADER")
+            .expect("loader invocation absent");
+        let host_bash_idx = rootless
+            .find("/bin/bash $ROOTFS/tmp/spur_job_")
+            .expect("host-bash fallback absent");
+        assert!(
+            loader_idx < host_bash_idx,
+            "loader path must precede host-bash fallback"
+        );
     }
 
     // --- Image removal ---
