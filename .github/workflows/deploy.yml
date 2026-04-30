@@ -65,13 +65,6 @@ jobs:
             "s|image: spur:latest|image: ${IMAGE_TAG}|g"
           grep -r "image:" deploy/k8s/
 
-      - name: Install protoc
-        run: |
-          curl -sLo /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v25.3/protoc-25.3-linux-x86_64.zip
-          python3 -c "import zipfile; zipfile.ZipFile('/tmp/protoc.zip').extractall('$HOME/.local')"
-          chmod +x $HOME/.local/bin/protoc
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-
       - name: Rebuild CRD generator
         run: |
           source ~/.cargo/env
