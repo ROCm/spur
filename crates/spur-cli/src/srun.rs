@@ -454,15 +454,25 @@ async fn print_job_output(work_dir: &str, job_id: u32) {
     }
 }
 
-/// When srun runs inside a sbatch script (SPUR_JOB_ID is set), it creates a
-/// job step and executes the command directly on the allocated node.
+/// When srun runs inside an allocation (SPUR_JOB_ID is set, e.g. inside an
+/// `salloc` interactive shell or sbatch script on the submit host), it
+/// dispatches the command to one of the allocation's nodes via the
+/// controller's RunStep RPC. The controller picks an allocated node and
+/// forwards to that agent's RunCommand RPC.
+///
+/// Closes #146 — previously this ran the command locally, so `srun hostname`
+/// inside `salloc` printed the controller's hostname instead of the
+/// allocated compute node's.
 async fn run_as_step(args: &SrunArgs, job_id: u32) -> Result<()> {
+    use spur_proto::proto::RunStepRequest;
+
     let mut client = SlurmControllerClient::connect(args.controller.clone())
         .await
         .context("failed to connect to spurctld")?;
 
-    // Create a step on the controller for tracking
-    let resp = client
+    // Create a step on the controller for tracking. The controller doesn't
+    // currently use this for dispatch — it's just bookkeeping.
+    let _ = client
         .create_job_step(CreateJobStepRequest {
             job_id,
             command: args.command.clone(),
@@ -472,18 +482,38 @@ async fn run_as_step(args: &SrunArgs, job_id: u32) -> Result<()> {
         .await
         .context("failed to create job step")?;
 
-    let step_id = resp.into_inner().step_id;
-    eprintln!("srun: created step {}.{}", job_id, step_id);
+    let work_dir = args.chdir.as_deref().map(String::from).unwrap_or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default()
+    });
 
-    // Execute the command directly — we are already on an allocated node
-    let status = tokio::process::Command::new(&args.command[0])
-        .args(&args.command[1..])
-        .status()
+    let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+
+    let resp = client
+        .run_step(RunStepRequest {
+            job_id,
+            command: args.command.clone(),
+            uid: nix::unistd::geteuid().as_raw(),
+            gid: nix::unistd::getegid().as_raw(),
+            work_dir,
+            environment: env,
+        })
         .await
-        .context("failed to execute command")?;
+        .context("RunStep dispatch failed")?
+        .into_inner();
 
-    let exit_code = status.code().unwrap_or(-1);
-    std::process::exit(exit_code);
+    if !resp.node.is_empty() {
+        eprintln!("srun: dispatched to node {}", resp.node);
+    }
+    if !resp.stdout.is_empty() {
+        print!("{}", resp.stdout);
+    }
+    if !resp.stderr.is_empty() {
+        eprint!("{}", resp.stderr);
+    }
+    std::process::exit(resp.exit_code);
 }
 
 fn parse_memory_mb(s: &str) -> Result<u64> {

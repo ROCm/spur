@@ -267,6 +267,11 @@ service SlurmController {
 
   // Exec a command inside a running job's container (proxies to correct agent)
   rpc ExecInJob(ExecInJobRequest) returns (ExecInJobResponse);
+
+  // Run a step on one of an allocation's nodes — used by `srun` inside an
+  // `salloc` interactive shell. The controller picks an allocated node and
+  // proxies to its agent's RunCommand RPC (#146).
+  rpc RunStep(RunStepRequest) returns (RunStepResponse);
 }
 
 // -- Agent service (slurmd) --
@@ -276,6 +281,8 @@ service SlurmAgent {
   rpc CancelJob(AgentCancelJobRequest) returns (google.protobuf.Empty);
   rpc GetNodeResources(google.protobuf.Empty) returns (NodeResourcesResponse);
   rpc ExecInJob(ExecInJobRequest) returns (ExecInJobResponse);
+  // Run a one-shot command on this node (for srun-in-salloc step dispatch, #146)
+  rpc RunCommand(RunCommandRequest) returns (RunCommandResponse);
   rpc StreamJobOutput(StreamJobOutputRequest) returns (stream StreamJobOutputChunk);
   // Interactive attach: bidirectional streaming for stdin/stdout forwarding
   rpc AttachJob(stream AttachJobInput) returns (stream AttachJobOutput);
@@ -452,6 +459,42 @@ message ExecInJobResponse {
   int32 exit_code = 2;
   string stdout = 3;
   string stderr = 4;
+}
+
+// Controller-side request: run a step inside an allocation. The controller
+// selects a node from the allocation's allocated_nodes and forwards to that
+// agent's RunCommand RPC. Used for srun-in-salloc (#146).
+message RunStepRequest {
+  uint32 job_id = 1;
+  repeated string command = 2;
+  uint32 uid = 3;
+  uint32 gid = 4;
+  string work_dir = 5;
+  map<string, string> environment = 6;
+}
+
+message RunStepResponse {
+  int32 exit_code = 1;
+  string stdout = 2;
+  string stderr = 3;
+  string node = 4;  // Hostname of the allocated node the command ran on
+}
+
+// Agent-side request: run a command directly on this node (no namespace
+// entry, since salloc allocations don't track a job process). The agent
+// runs the command as the requested uid/gid in the requested work_dir.
+message RunCommandRequest {
+  repeated string command = 1;
+  uint32 uid = 2;
+  uint32 gid = 3;
+  string work_dir = 4;
+  map<string, string> environment = 5;
+}
+
+message RunCommandResponse {
+  int32 exit_code = 1;
+  string stdout = 2;
+  string stderr = 3;
 }
 
 message StreamJobOutputRequest {

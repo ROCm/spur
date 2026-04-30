@@ -755,6 +755,67 @@ impl SlurmAgent for AgentService {
         }))
     }
 
+    /// #146: run a one-shot command on this node, used by `srun` inside an
+    /// `salloc` interactive shell. Unlike ExecInJob, this does not require
+    /// a tracked job process — salloc allocations don't run anything until
+    /// `srun` dispatches a step.
+    async fn run_command(
+        &self,
+        request: Request<RunCommandRequest>,
+    ) -> Result<Response<RunCommandResponse>, Status> {
+        let req = request.into_inner();
+        if req.command.is_empty() {
+            return Err(Status::invalid_argument("no command specified"));
+        }
+
+        let work_dir = if req.work_dir.is_empty() {
+            "/tmp".to_string()
+        } else {
+            req.work_dir
+        };
+
+        let mut cmd = tokio::process::Command::new(&req.command[0]);
+        cmd.args(&req.command[1..]).current_dir(&work_dir);
+        for (k, v) in &req.environment {
+            cmd.env(k, v);
+        }
+
+        // Drop privilege if requested (and we're root). Mirrors the privilege
+        // drop in launch_job's non-namespace path.
+        if req.uid > 0 && nix::unistd::geteuid().is_root() {
+            use std::os::unix::process::CommandExt;
+            let target_uid = req.uid;
+            let target_gid = req.gid;
+            unsafe {
+                cmd.pre_exec(move || {
+                    nix::unistd::setgid(nix::unistd::Gid::from_raw(target_gid))
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                    nix::unistd::setuid(nix::unistd::Uid::from_raw(target_uid))
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                    Ok(())
+                });
+            }
+        }
+
+        info!(
+            command = ?req.command,
+            uid = req.uid,
+            work_dir = %work_dir,
+            "RunCommand: executing one-shot step"
+        );
+
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("command failed: {}", e)))?;
+
+        Ok(Response::new(RunCommandResponse {
+            exit_code: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        }))
+    }
+
     async fn stream_job_output(
         &self,
         request: Request<StreamJobOutputRequest>,
@@ -1142,5 +1203,102 @@ mod tests {
 
         let err = svc.exec_in_job(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    // --- #146: srun-in-salloc step dispatch via RunCommand ---
+    //
+    // Regression: srun's run_as_step previously called
+    //   tokio::process::Command::new(args.command[0]).status()
+    // which executed the command on whichever host the user had typed
+    // srun on (the controller / submit host), not on the allocated
+    // compute node. After the fix, srun calls the controller's RunStep
+    // RPC, which forwards to the allocated agent's RunCommand.
+    //
+    // These tests cover the agent-side RunCommand handler. The controller
+    // routing is glue (~50 lines) that mirrors exec_in_job's pattern.
+
+    #[tokio::test]
+    async fn run_command_executes_simple_command() {
+        let svc = AgentService::new(test_reporter());
+        let req = Request::new(RunCommandRequest {
+            command: vec!["echo".into(), "hello-from-agent".into()],
+            uid: 0,
+            gid: 0,
+            work_dir: String::new(),
+            environment: HashMap::new(),
+        });
+        let resp = svc.run_command(req).await.unwrap().into_inner();
+        assert_eq!(resp.exit_code, 0);
+        assert_eq!(resp.stdout.trim(), "hello-from-agent");
+        assert!(resp.stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_command_propagates_nonzero_exit_code() {
+        let svc = AgentService::new(test_reporter());
+        let req = Request::new(RunCommandRequest {
+            command: vec!["false".into()],
+            uid: 0,
+            gid: 0,
+            work_dir: String::new(),
+            environment: HashMap::new(),
+        });
+        let resp = svc.run_command(req).await.unwrap().into_inner();
+        assert_eq!(resp.exit_code, 1, "false exits 1");
+    }
+
+    #[tokio::test]
+    async fn run_command_passes_environment() {
+        let svc = AgentService::new(test_reporter());
+        let mut env = HashMap::new();
+        env.insert("SPUR_TEST_VAR".into(), "step-dispatched".into());
+        let req = Request::new(RunCommandRequest {
+            command: vec!["/bin/sh".into(), "-c".into(), "echo $SPUR_TEST_VAR".into()],
+            uid: 0,
+            gid: 0,
+            work_dir: String::new(),
+            environment: env,
+        });
+        let resp = svc.run_command(req).await.unwrap().into_inner();
+        assert_eq!(resp.exit_code, 0);
+        assert_eq!(resp.stdout.trim(), "step-dispatched");
+    }
+
+    #[tokio::test]
+    async fn run_command_empty_command_is_rejected() {
+        let svc = AgentService::new(test_reporter());
+        let req = Request::new(RunCommandRequest {
+            command: vec![],
+            uid: 0,
+            gid: 0,
+            work_dir: String::new(),
+            environment: HashMap::new(),
+        });
+        let err = svc.run_command(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn run_command_uses_provided_work_dir() {
+        // The bug repro: the user's workflow is `salloc; srun hostname`.
+        // hostname runs in whatever cwd the agent picks; we can't easily
+        // assert it's a specific directory without mounting a tempdir as
+        // the agent's cwd. Instead use `pwd` and assert it matches the
+        // dir we passed.
+        let svc = AgentService::new(test_reporter());
+        let tmp = std::env::temp_dir();
+        // Resolve symlinks (e.g., macOS /tmp -> /private/tmp).
+        let tmp_canonical = std::fs::canonicalize(&tmp).unwrap_or(tmp.clone());
+        let req = Request::new(RunCommandRequest {
+            command: vec!["pwd".into()],
+            uid: 0,
+            gid: 0,
+            work_dir: tmp_canonical.to_string_lossy().into_owned(),
+            environment: HashMap::new(),
+        });
+        let resp = svc.run_command(req).await.unwrap().into_inner();
+        assert_eq!(resp.exit_code, 0);
+        let observed_canonical = std::fs::canonicalize(resp.stdout.trim()).unwrap();
+        assert_eq!(observed_canonical, tmp_canonical);
     }
 }

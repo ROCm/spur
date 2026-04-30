@@ -790,6 +790,75 @@ impl SlurmController for ControllerService {
 
         Ok(resp)
     }
+
+    /// #146: route a step from `srun-in-salloc` to one of the job's
+    /// allocated nodes. Unlike ExecInJob, the job may not have a tracked
+    /// process — salloc allocations only exist as scheduler bookkeeping.
+    async fn run_step(
+        &self,
+        request: Request<RunStepRequest>,
+    ) -> Result<Response<RunStepResponse>, Status> {
+        if let Err(_) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            let mut client = proxy.get_leader_client().await?;
+            let mut fwd = Request::new(request.into_inner());
+            *fwd.metadata_mut() = Self::forwarded_metadata();
+            return client.run_step(fwd).await;
+        }
+
+        use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
+
+        let req = request.into_inner();
+        let job_id = req.job_id;
+
+        let job = self
+            .cluster
+            .get_job(job_id)
+            .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
+
+        if job.allocated_nodes.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "job {} has no allocated nodes — is the allocation still active?",
+                job_id
+            )));
+        }
+
+        let node_name = job.allocated_nodes[0].clone();
+        let node = self
+            .cluster
+            .get_node(&node_name)
+            .ok_or_else(|| Status::not_found(format!("node {} not found", node_name)))?;
+        let addr = node
+            .address
+            .as_ref()
+            .ok_or_else(|| Status::internal(format!("node {} has no agent address", node_name)))?;
+        let agent_addr = format!("http://{}:{}", addr, node.port);
+
+        let mut agent = SlurmAgentClient::connect(agent_addr.clone())
+            .await
+            .map_err(|e| {
+                Status::unavailable(format!("cannot reach agent at {}: {}", agent_addr, e))
+            })?;
+
+        let agent_resp = agent
+            .run_command(RunCommandRequest {
+                command: req.command,
+                uid: req.uid,
+                gid: req.gid,
+                work_dir: req.work_dir,
+                environment: req.environment,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("run_command failed: {}", e)))?
+            .into_inner();
+
+        Ok(Response::new(RunStepResponse {
+            exit_code: agent_resp.exit_code,
+            stdout: agent_resp.stdout,
+            stderr: agent_resp.stderr,
+            node: node_name,
+        }))
+    }
 }
 
 pub async fn serve(
