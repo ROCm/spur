@@ -12,7 +12,7 @@ jobs:
   # ── 1. Build the Docker image ─────────────────────────────────
   build:
     name: Build & Push Image
-    runs-on: self-hosted
+    runs-on: [self-hosted, amd-aac02-rocm]
     outputs:
       image_tag: ${{ steps.tag.outputs.value }}
 
@@ -48,7 +48,7 @@ jobs:
   # ── 2. Deploy to Kubernetes ───────────────────────────────────
   deploy:
     name: Deploy to Kubernetes
-    runs-on: self-hosted
+    runs-on: [self-hosted, amd-aac02-rocm]
     needs: build
     environment: production
 
