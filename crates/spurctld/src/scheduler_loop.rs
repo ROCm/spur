@@ -153,19 +153,10 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 None => continue,
             };
 
-            // Compute per-node resources (including GPUs from GRES)
             let per_node = backfill::job_resource_request(&job);
-            let node_count = assignment.nodes.len() as u32;
-            let resources = spur_core::resource::ResourceSet {
-                cpus: per_node.cpus * node_count,
-                memory_mb: per_node.memory_mb * node_count as u64,
-                gpus: per_node.gpus.clone(),
-                generic: per_node
-                    .generic
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v * node_count as u64))
-                    .collect(),
-            };
+            let resources = compute_job_allocation(&job, &assignment.nodes, |name| {
+                cluster.get_node(name).map(|n| n.total_resources.clone())
+            });
 
             // Transition job to Running
             if let Err(e) =
@@ -281,6 +272,66 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                     );
                 }
             });
+        }
+    }
+}
+
+/// Compute the resource set to record against the cluster for an assignment.
+///
+/// Non-exclusive: per-node request × node count (cpus, memory, generic),
+/// plus the per-job GPU list verbatim.
+///
+/// Exclusive (#147): cpus / gpus / generic gres are bumped to the **sum of
+/// each assigned node's total resources**, so the node shows as fully
+/// allocated and the backfill scheduler's CPU-saturation check fires for
+/// subsequent jobs. Memory stays at requested (matches Slurm semantics).
+///
+/// `node_totals` returns the total resources for a node by name. Returns
+/// `None` if the node has been deregistered between assignment and start;
+/// in that case its contribution is silently zero.
+pub(crate) fn compute_job_allocation<F>(
+    job: &spur_core::job::Job,
+    assignment_nodes: &[String],
+    node_totals: F,
+) -> spur_core::resource::ResourceSet
+where
+    F: Fn(&str) -> Option<spur_core::resource::ResourceSet>,
+{
+    use spur_core::resource::{GpuResource, ResourceSet};
+    use std::collections::HashMap;
+
+    let per_node = backfill::job_resource_request(job);
+    let node_count = assignment_nodes.len() as u32;
+
+    if job.spec.exclusive {
+        let mut cpus: u32 = 0;
+        let mut gpus: Vec<GpuResource> = Vec::new();
+        let mut generic: HashMap<String, u64> = HashMap::new();
+        for name in assignment_nodes {
+            if let Some(total) = node_totals(name) {
+                cpus = cpus.saturating_add(total.cpus);
+                gpus.extend(total.gpus.iter().cloned());
+                for (k, v) in &total.generic {
+                    *generic.entry(k.clone()).or_insert(0) += v;
+                }
+            }
+        }
+        ResourceSet {
+            cpus,
+            memory_mb: per_node.memory_mb * node_count as u64,
+            gpus,
+            generic,
+        }
+    } else {
+        ResourceSet {
+            cpus: per_node.cpus * node_count,
+            memory_mb: per_node.memory_mb * node_count as u64,
+            gpus: per_node.gpus.clone(),
+            generic: per_node
+                .generic
+                .iter()
+                .map(|(k, v)| (k.clone(), v * node_count as u64))
+                .collect(),
         }
     }
 }
@@ -833,5 +884,196 @@ async fn send_cancel_to_agents(
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spur_core::job::{Job, JobSpec, JobState};
+    use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
+    use std::collections::HashMap;
+
+    fn job_with_spec(mut spec: JobSpec) -> Job {
+        spec.cpus_per_task = spec.cpus_per_task.max(1);
+        spec.num_tasks = spec.num_tasks.max(1);
+        spec.num_nodes = spec.num_nodes.max(1);
+        Job::new(1, spec)
+    }
+
+    fn node_total(cpus: u32, memory_mb: u64, gpus: Vec<GpuResource>) -> ResourceSet {
+        ResourceSet {
+            cpus,
+            memory_mb,
+            gpus,
+            generic: HashMap::new(),
+        }
+    }
+
+    fn gpu(device_id: u32, gpu_type: &str) -> GpuResource {
+        GpuResource {
+            device_id,
+            gpu_type: gpu_type.into(),
+            memory_mb: 192_000,
+            peer_gpus: vec![],
+            link_type: GpuLinkType::PCIe,
+        }
+    }
+
+    // ── #147: --exclusive enforcement ─────────────────────────────
+    //
+    // Repro of the reported bug: an exclusive job that requests 1 CPU
+    // would only record 1 CPU as allocated against the node. Backfill's
+    // `alloc.cpus >= total.cpus` saturation check would never fire,
+    // letting other jobs schedule onto the node. compute_job_allocation
+    // must bump cpus / gpus / generic to the sum of node totals.
+
+    #[test]
+    fn exclusive_job_bumps_cpus_to_node_total() {
+        let mut spec = JobSpec::default();
+        spec.cpus_per_task = 2;
+        spec.num_tasks = 1;
+        spec.num_nodes = 1;
+        spec.exclusive = true;
+        let job = job_with_spec(spec);
+
+        let nodes = vec!["n1".to_string()];
+        let alloc = compute_job_allocation(&job, &nodes, |name| match name {
+            "n1" => Some(node_total(64, 256_000, vec![])),
+            _ => None,
+        });
+
+        assert_eq!(
+            alloc.cpus, 64,
+            "exclusive job must record full node CPU count, not requested"
+        );
+    }
+
+    #[test]
+    fn exclusive_job_bumps_cpus_across_multiple_nodes() {
+        let mut spec = JobSpec::default();
+        spec.cpus_per_task = 1;
+        spec.num_nodes = 2;
+        spec.exclusive = true;
+        let job = job_with_spec(spec);
+
+        let nodes = vec!["n1".to_string(), "n2".to_string()];
+        let alloc = compute_job_allocation(&job, &nodes, |name| match name {
+            "n1" => Some(node_total(64, 256_000, vec![])),
+            "n2" => Some(node_total(48, 128_000, vec![])),
+            _ => None,
+        });
+
+        assert_eq!(alloc.cpus, 112, "exclusive job must sum CPUs across nodes");
+    }
+
+    #[test]
+    fn exclusive_job_takes_all_gpus_from_each_node() {
+        let mut spec = JobSpec::default();
+        spec.exclusive = true;
+        let job = job_with_spec(spec);
+
+        let nodes = vec!["n1".to_string()];
+        let alloc = compute_job_allocation(&job, &nodes, |name| match name {
+            "n1" => Some(node_total(
+                64,
+                256_000,
+                vec![gpu(0, "mi300x"), gpu(1, "mi300x")],
+            )),
+            _ => None,
+        });
+
+        assert_eq!(alloc.gpus.len(), 2, "exclusive job must take every GPU");
+        assert_eq!(alloc.gpus[0].device_id, 0);
+        assert_eq!(alloc.gpus[1].device_id, 1);
+    }
+
+    #[test]
+    fn exclusive_job_keeps_memory_at_request_not_node_total() {
+        // Slurm semantics: exclusive nodes give all CPUs/GRES but only
+        // the requested memory.
+        let mut spec = JobSpec::default();
+        spec.cpus_per_task = 1;
+        spec.exclusive = true;
+        spec.memory_per_node_mb = Some(4096);
+        let job = job_with_spec(spec);
+
+        let nodes = vec!["n1".to_string()];
+        let alloc = compute_job_allocation(&job, &nodes, |_| Some(node_total(64, 256_000, vec![])));
+
+        assert_eq!(
+            alloc.memory_mb, 4096,
+            "exclusive memory must stay at request, not node total"
+        );
+    }
+
+    #[test]
+    fn exclusive_job_sums_generic_gres_from_each_node() {
+        let mut spec = JobSpec::default();
+        spec.exclusive = true;
+        let job = job_with_spec(spec);
+
+        let mut gen_a = HashMap::new();
+        gen_a.insert("license:fluent".to_string(), 5u64);
+        let total_a = ResourceSet {
+            cpus: 64,
+            memory_mb: 256_000,
+            gpus: vec![],
+            generic: gen_a,
+        };
+
+        let mut gen_b = HashMap::new();
+        gen_b.insert("license:fluent".to_string(), 3u64);
+        let total_b = ResourceSet {
+            cpus: 64,
+            memory_mb: 256_000,
+            gpus: vec![],
+            generic: gen_b,
+        };
+
+        let nodes = vec!["n1".to_string(), "n2".to_string()];
+        let alloc = compute_job_allocation(&job, &nodes, |name| match name {
+            "n1" => Some(total_a.clone()),
+            "n2" => Some(total_b.clone()),
+            _ => None,
+        });
+
+        assert_eq!(alloc.generic.get("license:fluent").copied(), Some(8));
+    }
+
+    #[test]
+    fn non_exclusive_job_records_request_not_node_total() {
+        // Regression guard: don't accidentally bump non-exclusive jobs.
+        let mut spec = JobSpec::default();
+        spec.cpus_per_task = 2;
+        spec.num_tasks = 1;
+        spec.num_nodes = 1;
+        spec.exclusive = false;
+        let job = job_with_spec(spec);
+
+        let nodes = vec!["n1".to_string()];
+        let alloc = compute_job_allocation(&job, &nodes, |_| Some(node_total(64, 256_000, vec![])));
+
+        assert_eq!(
+            alloc.cpus, 2,
+            "non-exclusive job must record exactly what was requested"
+        );
+    }
+
+    #[test]
+    fn exclusive_job_handles_missing_node_metadata() {
+        // If a node was deregistered between schedule and start, that
+        // node's contribution is zero — don't panic.
+        let mut spec = JobSpec::default();
+        spec.exclusive = true;
+        let job = job_with_spec(spec);
+
+        let nodes = vec!["n1".to_string(), "ghost".to_string()];
+        let alloc = compute_job_allocation(&job, &nodes, |name| match name {
+            "n1" => Some(node_total(64, 256_000, vec![])),
+            _ => None,
+        });
+
+        assert_eq!(alloc.cpus, 64);
     }
 }
