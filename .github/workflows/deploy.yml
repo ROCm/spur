@@ -65,6 +65,9 @@ jobs:
             "s|image: spur:latest|image: ${IMAGE_TAG}|g"
           grep -r "image:" deploy/k8s/
 
+      - name: Install protoc
+        run: sudo apt-get install -y protobuf-compiler
+
       - name: Rebuild CRD generator
         run: |
           source ~/.cargo/env
