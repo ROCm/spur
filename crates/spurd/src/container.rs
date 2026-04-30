@@ -404,6 +404,40 @@ fn setup_rootfs_extract(image_path: &Path, rootfs: &Path) -> anyhow::Result<()> 
 /// - rocm: bind-mount AMD ROCm libs + /dev/kfd + /dev/dri
 /// - mellanox: bind-mount InfiniBand devices + MOFED libs
 /// - cgroups: already handled by executor.rs
+/// Build the bash snippet that exposes `/dev/dri/renderD*` to the container.
+///
+/// When `gpu_devices` is non-empty, only those specific render nodes are
+/// bind-mounted (using the conventional `renderD(128 + device_id)` mapping
+/// that the namespace wrapper uses). Sub-resource isolation: a job with
+/// `--gres=gpu:2` only sees its 2 GPUs, not all 8 on the host (#148).
+///
+/// When `gpu_devices` is empty, no GPUs are exposed (a CPU-only job has
+/// no business touching `/dev/dri`).
+///
+/// **Note**: this is filesystem-level isolation. A privileged process
+/// inside the container could still mknod its own renderD nodes if it
+/// has the major/minor numbers and CAP_MKNOD. Full kernel-level
+/// enforcement requires a cgroup v2 BPF device controller — tracked
+/// as a follow-up.
+pub(crate) fn build_gpu_dri_mount_block(gpu_devices: &[u32]) -> String {
+    if gpu_devices.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("if [ -d /dev/dri ]; then\n  mkdir -p $ROOTFS/dev/dri\n");
+    for id in gpu_devices {
+        let r = 128 + id;
+        s.push_str(&format!(
+            "  if [ -e /dev/dri/renderD{r} ]; then\n    \
+                touch $ROOTFS/dev/dri/renderD{r} 2>/dev/null\n    \
+                mount --bind /dev/dri/renderD{r} $ROOTFS/dev/dri/renderD{r} 2>/dev/null || true\n  \
+              fi\n",
+            r = r,
+        ));
+    }
+    s.push_str("fi\n");
+    s
+}
+
 pub fn build_container_launch_script(
     config: &ContainerConfig,
     rootfs: &Path,
@@ -520,11 +554,16 @@ ln -sf /proc/self/fd/0 $ROOTFS/dev/stdin 2>/dev/null || true
 ln -sf /proc/self/fd/1 $ROOTFS/dev/stdout 2>/dev/null || true
 ln -sf /proc/self/fd/2 $ROOTFS/dev/stderr 2>/dev/null || true
 
-# Hook: GPU — AMD (ROCm)
-if [ -d /dev/dri ]; then
-  mkdir -p $ROOTFS/dev/dri
-  mount --bind /dev/dri $ROOTFS/dev/dri 2>/dev/null || true
-fi
+"#,
+    );
+
+    // Hook: GPU — AMD (ROCm). Mount only the assigned /dev/dri/renderD*
+    // devices when gpu_devices is non-empty (#148). Without this, a job
+    // with --gres=gpu:2 saw all 8 GPUs inside the container.
+    script.push_str(&build_gpu_dri_mount_block(&config.gpu_devices));
+
+    script.push_str(
+        r#"
 if [ -e /dev/kfd ]; then
   touch $ROOTFS/dev/kfd 2>/dev/null
   mount --bind /dev/kfd $ROOTFS/dev/kfd 2>/dev/null || true
@@ -1447,6 +1486,129 @@ mod tests {
             "/etc/hosts must be auto-mounted"
         );
         assert!(script.contains("touch $ROOTFS$dns_file"));
+    }
+
+    // --- #148: GPU isolation in containers ---
+    //
+    // Regression: spurd's container path used to bind-mount the entire
+    // host /dev/dri into the container, so a job with --gres=gpu:2 on
+    // an 8-GPU node still saw all 8 GPUs inside its container. The
+    // gpu_devices field on ContainerConfig was even hard-coded to vec![]
+    // in agent_server.rs.
+    //
+    // Fix: ContainerConfig.gpu_devices is now populated from the GRES
+    // allocation (in agent_server.rs), and build_gpu_dri_mount_block
+    // emits a selective bind-mount of only the assigned renderD<N>.
+
+    fn config_with_gpus(gpu_devices: Vec<u32>) -> ContainerConfig {
+        ContainerConfig {
+            image: "test".into(),
+            mounts: vec![],
+            workdir: None,
+            name: None,
+            readonly: false,
+            mount_home: false,
+            remap_root: false,
+            gpu_devices,
+            environment: HashMap::new(),
+            container_env: HashMap::new(),
+            entrypoint: None,
+            uid: 1000,
+            gid: 1000,
+            username: "testuser".into(),
+            home_dir: "/home/testuser".into(),
+        }
+    }
+
+    #[test]
+    fn gpu_dri_block_empty_when_no_gpus_allocated() {
+        // CPU-only jobs must not get any access to /dev/dri.
+        let block = build_gpu_dri_mount_block(&[]);
+        assert!(
+            block.is_empty(),
+            "no-GPU jobs should produce no /dev/dri mount, got: {:?}",
+            block
+        );
+    }
+
+    #[test]
+    fn gpu_dri_block_mounts_only_assigned_render_nodes() {
+        // Repro of #148: with gpu_devices=[0, 2], only renderD128 and
+        // renderD130 must be exposed. renderD129, 131, etc., must not.
+        let block = build_gpu_dri_mount_block(&[0, 2]);
+
+        assert!(
+            block.contains("/dev/dri/renderD128"),
+            "must mount the assigned renderD128"
+        );
+        assert!(
+            block.contains("/dev/dri/renderD130"),
+            "must mount the assigned renderD130"
+        );
+        assert!(
+            !block.contains("renderD129"),
+            "must NOT mount renderD129 (unassigned), got:\n{}",
+            block
+        );
+        assert!(
+            !block.contains("renderD131"),
+            "must NOT mount renderD131 (unassigned)"
+        );
+
+        // Critical: must not bind-mount the entire /dev/dri directory
+        // (the original bug). Look for the old pattern explicitly.
+        assert!(
+            !block.contains("mount --bind /dev/dri $ROOTFS/dev/dri"),
+            "must NOT bulk-mount /dev/dri (regression of #148), got:\n{}",
+            block
+        );
+    }
+
+    #[test]
+    fn gpu_dri_block_uses_per_device_bind_mounts() {
+        // Each assigned render node gets its own bind mount, with the
+        // touch+bind pattern that handles file (not directory) targets.
+        let block = build_gpu_dri_mount_block(&[1]);
+        assert!(block.contains("touch $ROOTFS/dev/dri/renderD129"));
+        assert!(
+            block.contains("mount --bind /dev/dri/renderD129 $ROOTFS/dev/dri/renderD129"),
+            "must bind-mount the device file specifically"
+        );
+    }
+
+    #[test]
+    fn launch_script_with_gpus_does_not_bulk_mount_dev_dri() {
+        // End-to-end: when ContainerConfig.gpu_devices is set, the full
+        // generated launch script must not contain the original bulk
+        // bind-mount of /dev/dri.
+        let config = config_with_gpus(vec![0, 1]);
+        let rootfs = Path::new("/tmp/test-rootfs");
+        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
+
+        assert!(
+            !script.contains("mount --bind /dev/dri $ROOTFS/dev/dri"),
+            "regression of #148 — must not bulk-mount /dev/dri"
+        );
+        // But the assigned renderD nodes must be bound.
+        assert!(script.contains("/dev/dri/renderD128"));
+        assert!(script.contains("/dev/dri/renderD129"));
+    }
+
+    #[test]
+    fn launch_script_no_gpus_skips_dri_mount_entirely() {
+        // CPU-only container — must not touch /dev/dri at all.
+        let config = config_with_gpus(vec![]);
+        let rootfs = Path::new("/tmp/test-rootfs");
+        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
+
+        assert!(
+            !script.contains("renderD"),
+            "CPU-only job must produce no renderD references"
+        );
+        assert!(
+            !script.contains("mount --bind /dev/dri $ROOTFS/dev/dri"),
+            "CPU-only job must not bulk-mount /dev/dri"
+        );
     }
 
     // --- Image removal ---

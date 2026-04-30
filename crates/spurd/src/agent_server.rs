@@ -365,6 +365,44 @@ impl SlurmAgent for AgentService {
             env.insert("SPUR_NODE_RANK".into(), node_rank.to_string());
         }
 
+        // Allocate GPU devices from the node's pool. Done up-front (before
+        // container setup) so the container path can selectively bind-mount
+        // only the assigned /dev/dri/renderD* devices (#148).
+        let mut gpu_count = 0u32;
+        let mut gpu_type: Option<String> = None;
+        for gres in &spec.gres {
+            if let Some((name, gtype, count)) = spur_core::resource::parse_gres(gres) {
+                if name == "gpu" {
+                    gpu_count += count;
+                    if let Some(t) = gtype {
+                        gpu_type = Some(t);
+                    }
+                }
+            }
+        }
+
+        let alloc_result = if gpu_count > 0 || spec.cpus_per_task > 0 {
+            let mut alloc = self.allocation.lock().await;
+            alloc.try_allocate(
+                spec.cpus_per_task.max(1),
+                spec.memory_per_node_mb,
+                gpu_count,
+                gpu_type.as_deref(),
+            )
+        } else {
+            None
+        };
+
+        let gpu_devices: Vec<u32> = alloc_result
+            .as_ref()
+            .map(|a| a.gpu_ids.clone())
+            .unwrap_or_default();
+
+        let cpu_ids: Vec<u32> = alloc_result
+            .as_ref()
+            .map(|a| a.cpu_ids.clone())
+            .unwrap_or_default();
+
         // If container image is specified, wrap the job in a container
         let (launch_script, rootfs_mode) = if !spec.container_image.is_empty() {
             info!(job_id, image = %spec.container_image, "launching containerized job");
@@ -397,7 +435,7 @@ impl SlurmAgent for AgentService {
                 readonly: spec.container_readonly,
                 mount_home: spec.container_mount_home,
                 remap_root: spec.container_remap_root,
-                gpu_devices: vec![], // TODO: from GRES allocation
+                gpu_devices: gpu_devices.clone(),
                 environment: env.clone(),
                 container_env: spec.container_env.clone(),
                 entrypoint: if spec.container_entrypoint.is_empty() {
@@ -536,41 +574,7 @@ impl SlurmAgent for AgentService {
             launch_script
         };
 
-        // Allocate GPU devices from the node's pool
-        let mut gpu_count = 0u32;
-        let mut gpu_type: Option<String> = None;
-        for gres in &spec.gres {
-            if let Some((name, gtype, count)) = spur_core::resource::parse_gres(gres) {
-                if name == "gpu" {
-                    gpu_count += count;
-                    if let Some(t) = gtype {
-                        gpu_type = Some(t);
-                    }
-                }
-            }
-        }
-
-        let alloc_result = if gpu_count > 0 || spec.cpus_per_task > 0 {
-            let mut alloc = self.allocation.lock().await;
-            alloc.try_allocate(
-                spec.cpus_per_task.max(1),
-                spec.memory_per_node_mb,
-                gpu_count,
-                gpu_type.as_deref(),
-            )
-        } else {
-            None
-        };
-
-        let gpu_devices: Vec<u32> = alloc_result
-            .as_ref()
-            .map(|a| a.gpu_ids.clone())
-            .unwrap_or_default();
-
-        let cpu_ids: Vec<u32> = alloc_result
-            .as_ref()
-            .map(|a| a.cpu_ids.clone())
-            .unwrap_or_default();
+        // (gpu_devices and cpu_ids were allocated above, before container setup)
 
         // Resolve stdout/stderr paths
         let stdout_path = if spec.stdout_path.is_empty() {
