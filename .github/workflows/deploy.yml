@@ -66,7 +66,10 @@ jobs:
           grep -r "image:" deploy/k8s/
 
       - name: Install protoc
-        run: sudo apt-get install -y protobuf-compiler
+        run: |
+          curl -sLo /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v25.3/protoc-25.3-linux-x86_64.zip
+          unzip -o /tmp/protoc.zip -d $HOME/.local
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Rebuild CRD generator
         run: |
