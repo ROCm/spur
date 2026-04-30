@@ -67,6 +67,7 @@ jobs:
 
       - name: Rebuild CRD generator
         run: |
+          source ~/.cargo/env
           cargo build --release --bin spur-k8s-operator
 
       - name: Deploy to Kubernetes
