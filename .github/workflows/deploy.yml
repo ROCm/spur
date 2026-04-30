@@ -2,7 +2,7 @@ name: Build and Deploy Spur
 
 on:
   push:
-    branches: [main, chore/remove-fork-sync-workflow]
+    branches: [main, ci/build-deploy-spur-k8s]
   workflow_dispatch:
 
 env:
