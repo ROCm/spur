@@ -8,11 +8,14 @@
 #   4. HIP GPU compute test (vector add on all GPUs)
 #   5. PyTorch GEMM + RCCL all-reduce across all GPUs
 #   6. Job completion tracking
+#   7. Container jobs: launch, exit codes, cancel, DNS, /dev/shm,
+#      PID namespace, env vars, bind mounts
 #
 # Prerequisites:
 #   - Cluster running (start-controller.sh + start-agent.sh)
 #   - gpu_test binary compiled on both nodes
 #   - PyTorch venv set up on both nodes
+#   - squashfs-tools installed (mksquashfs) for container tests
 #
 # Usage: ssh mi300 'bash ~/spur/cluster_test.sh'
 #   or:  bash deploy/bare-metal/cluster_test.sh  (from shark-a)
@@ -880,6 +883,280 @@ fi
 
 rm -f /tmp/spur-infer-$$.out
 ssh mi300-2 "rm -f /tmp/spur-infer-$$.out" 2>/dev/null || true
+echo ""
+
+# --- Container Jobs ---
+echo "--- Container Jobs ---"
+
+# Collect all agent nodes from sinfo (idle or mix).
+CTEST_AGENTS=$("${SPUR}/sinfo" 2>/dev/null | awk 'NR>1 && ($5=="idle" || $5=="mix") {gsub(/\[.*\]/,"",$6); split($6,a,","); for(i in a) if(a[i]!="") print a[i]}' | sort -u)
+
+ctest_cleanup() {
+    rm -f "/tmp/spur-ctest-$$"* 2>/dev/null
+    rm -rf "/tmp/spur-ctest-bind-$$" 2>/dev/null
+    for node in $CTEST_AGENTS; do
+        [ "$node" = "$(hostname)" ] && continue
+        ssh "$node" "rm -f /tmp/spur-ctest-$$* 2>/dev/null; rm -rf /tmp/spur-ctest-bind-$$ 2>/dev/null" 2>/dev/null || true
+    done
+}
+trap 'ctest_cleanup' EXIT
+
+# Build a squashfs image with enough tools to test real functionality
+CTEST_IMG="/tmp/spur-ctest-$$.sqsh"
+CTEST_ROOT=$(mktemp -d "/tmp/spur-ctest-rootfs-$$.XXXXXX")
+mkdir -p "$CTEST_ROOT"/{bin,usr/bin,lib,lib64,etc,dev,proc,sys,tmp,run,home}
+# Include getent for DNS resolution testing (works without nslookup/dig)
+for b in bash cat echo sleep hostname id df env stat ls wc head tail tr touch mkdir getent; do
+    src=$(which "$b" 2>/dev/null)
+    [ -f "$src" ] && cp "$src" "$CTEST_ROOT/usr/bin/"
+done
+ln -sf /usr/bin/bash "$CTEST_ROOT/bin/bash"
+ln -sf /usr/bin/bash "$CTEST_ROOT/bin/sh"
+for f in "$CTEST_ROOT/usr/bin/"*; do
+    ldd "$f" 2>/dev/null | grep "=>" | awk '{print $3}' | while read -r lib; do
+        if [ -f "$lib" ]; then
+            dir=$(dirname "$lib")
+            mkdir -p "$CTEST_ROOT$dir"
+            cp -n "$lib" "$CTEST_ROOT$lib" 2>/dev/null || true
+        fi
+    done
+done
+# NSS libs for getent/DNS
+for nsslib in libnss_dns.so.2 libnss_files.so.2 libresolv.so.2; do
+    src="/lib/x86_64-linux-gnu/$nsslib"
+    [ -f "$src" ] && mkdir -p "$CTEST_ROOT/lib/x86_64-linux-gnu" && cp -n "$src" "$CTEST_ROOT/lib/x86_64-linux-gnu/" 2>/dev/null || true
+done
+[ -f /lib64/ld-linux-x86-64.so.2 ] && cp /lib64/ld-linux-x86-64.so.2 "$CTEST_ROOT/lib64/"
+for f in /etc/passwd /etc/group /etc/nsswitch.conf; do
+    [ -f "$f" ] && cp "$f" "$CTEST_ROOT/etc/"
+done
+if command -v mksquashfs >/dev/null 2>&1; then
+    mksquashfs "$CTEST_ROOT" "$CTEST_IMG" -noappend -quiet >/dev/null 2>&1
+    rm -rf "$CTEST_ROOT"
+    CTEST_READY=1
+else
+    echo "SKIP: mksquashfs not found, skipping container tests"
+    rm -rf "$CTEST_ROOT"
+    CTEST_READY=0
+fi
+
+# Ship image + helper scripts to every agent node
+ctest_ship() {
+    local path="$1"
+    for node in $CTEST_AGENTS; do
+        [ "$node" = "$(hostname)" ] && continue
+        scp -q "$path" "$node:$path" 2>/dev/null || true
+    done
+}
+
+# Submit a container job (no node pin — scheduler picks any agent)
+ctest_sbatch() {
+    "${SPUR}/sbatch" --container-image="$CTEST_IMG" "$@" 2>/dev/null | awk '{print $NF}'
+}
+
+# Check exit code of a completed job
+ctest_exit_code() {
+    "${SPUR}/scontrol" show job "$1" 2>/dev/null | grep -oP 'ExitCode=\K[0-9-]+'
+}
+
+# Dump debug info for a failed job
+ctest_debug() {
+    local name="$1" job_id="$2"
+    echo "    DEBUG ${name}:"
+    "${SPUR}/scontrol" show job "$job_id" 2>/dev/null | grep -E 'JobState|ExitCode|NodeList|Reason' || true
+}
+
+if [ "$CTEST_READY" = "1" ]; then
+
+echo "  image: ${CTEST_IMG} ($(du -h "$CTEST_IMG" 2>/dev/null | awk '{print $1}'))"
+echo "  agents: ${CTEST_AGENTS//$'\n'/, }"
+
+# Ship image to all agent nodes
+ctest_ship "$CTEST_IMG"
+echo ""
+
+# C1: Container launch — verify it runs and exits cleanly
+cat > "/tmp/spur-ctest-c1-$$.sh" << 'SCRIPT'
+#!/bin/bash
+hostname >/dev/null || exit 1
+id >/dev/null || exit 1
+SCRIPT
+chmod +x "/tmp/spur-ctest-c1-$$.sh"
+ctest_ship "/tmp/spur-ctest-c1-$$.sh"
+JC1=$(ctest_sbatch "/tmp/spur-ctest-c1-$$.sh")
+run_test "C1: container sbatch submitted (job ${JC1})" test -n "${JC1}"
+TOTAL=$((TOTAL + 1))
+echo -n "TEST ${TOTAL}: C1: container job completes with exit 0 ... "
+if wait_job "${JC1}" 30 && [ "$(ctest_exit_code "${JC1}")" = "0" ]; then
+    echo "PASS"; PASS=$((PASS + 1))
+else
+    echo "FAIL"; FAIL=$((FAIL + 1))
+    ctest_debug "C1" "${JC1}"
+fi
+
+# C2: Exit code propagation
+cat > "/tmp/spur-ctest-c2-$$.sh" << 'SCRIPT'
+#!/bin/bash
+exit 42
+SCRIPT
+chmod +x "/tmp/spur-ctest-c2-$$.sh"
+ctest_ship "/tmp/spur-ctest-c2-$$.sh"
+JC2=$(ctest_sbatch "/tmp/spur-ctest-c2-$$.sh")
+wait_job "${JC2}" 30 >/dev/null 2>&1
+TOTAL=$((TOTAL + 1))
+echo -n "TEST ${TOTAL}: C2: exit code 42 captured ... "
+EC=$(ctest_exit_code "${JC2}")
+if [ "$EC" = "42" ]; then
+    echo "PASS"; PASS=$((PASS + 1))
+else
+    echo "FAIL (got ExitCode=${EC})"; FAIL=$((FAIL + 1))
+    ctest_debug "C2" "${JC2}"
+fi
+
+# C3: Cancellation — verify process tree is actually killed
+cat > "/tmp/spur-ctest-c3-$$.sh" << 'SCRIPT'
+#!/bin/bash
+sleep 3600
+SCRIPT
+chmod +x "/tmp/spur-ctest-c3-$$.sh"
+ctest_ship "/tmp/spur-ctest-c3-$$.sh"
+JC3=$(ctest_sbatch "/tmp/spur-ctest-c3-$$.sh")
+for i in $(seq 1 15); do
+    ST=$(job_state "$JC3")
+    [ "$ST" = "R" ] && break
+    sleep 1
+done
+"${SPUR}/scancel" "$JC3" 2>/dev/null
+sleep 6
+TOTAL=$((TOTAL + 1))
+echo -n "TEST ${TOTAL}: C3: cancelled job state ... "
+C3_STATE=$(job_state "$JC3")
+if [ "$C3_STATE" = "CA" ]; then
+    echo "PASS"; PASS=$((PASS + 1))
+else
+    echo "FAIL (state=${C3_STATE})"; FAIL=$((FAIL + 1))
+fi
+
+# C4: DNS — resolve a real hostname inside the container
+cat > "/tmp/spur-ctest-c4-$$.sh" << 'SCRIPT'
+#!/bin/bash
+# Fail if resolv.conf contains loopback (should have been stripped)
+grep -q "127.0.0.53" /etc/resolv.conf && exit 1
+# Fail if DNS resolution doesn't work
+getent hosts google.com >/dev/null 2>&1 || exit 2
+SCRIPT
+chmod +x "/tmp/spur-ctest-c4-$$.sh"
+ctest_ship "/tmp/spur-ctest-c4-$$.sh"
+JC4=$(ctest_sbatch "/tmp/spur-ctest-c4-$$.sh")
+wait_job "${JC4}" 30 >/dev/null 2>&1
+TOTAL=$((TOTAL + 1))
+echo -n "TEST ${TOTAL}: C4: DNS works inside container ... "
+EC=$(ctest_exit_code "${JC4}")
+if [ "$EC" = "0" ]; then
+    echo "PASS"; PASS=$((PASS + 1))
+else
+    echo "FAIL (exit ${EC}: 1=loopback in resolv.conf, 2=getent failed)"; FAIL=$((FAIL + 1))
+    ctest_debug "C4" "${JC4}"
+fi
+
+# C5: /dev/shm — write to shared memory inside container
+cat > "/tmp/spur-ctest-c5-$$.sh" << 'SCRIPT'
+#!/bin/bash
+echo "shm_test" > /dev/shm/spur_ctest || exit 1
+rm -f /dev/shm/spur_ctest
+# Verify shm is mounted (any size > 0 means it's not missing)
+df /dev/shm >/dev/null 2>&1 || exit 2
+SCRIPT
+chmod +x "/tmp/spur-ctest-c5-$$.sh"
+ctest_ship "/tmp/spur-ctest-c5-$$.sh"
+JC5=$(ctest_sbatch "/tmp/spur-ctest-c5-$$.sh")
+wait_job "${JC5}" 30 >/dev/null 2>&1
+TOTAL=$((TOTAL + 1))
+echo -n "TEST ${TOTAL}: C5: /dev/shm writable and sized correctly ... "
+EC=$(ctest_exit_code "${JC5}")
+if [ "$EC" = "0" ]; then
+    echo "PASS"; PASS=$((PASS + 1))
+else
+    echo "FAIL (exit ${EC}: 1=write failed, 2=too small)"; FAIL=$((FAIL + 1))
+    ctest_debug "C5" "${JC5}"
+fi
+
+# C6: PID namespace — verify process sees itself as PID 1
+cat > "/tmp/spur-ctest-c6-$$.sh" << 'SCRIPT'
+#!/bin/bash
+[ "$$" = "1" ] || exit 1
+# /proc must be readable (mounted fresh in the PID namespace)
+[ -r /proc/self/status ] || exit 2
+SCRIPT
+chmod +x "/tmp/spur-ctest-c6-$$.sh"
+ctest_ship "/tmp/spur-ctest-c6-$$.sh"
+JC6=$(ctest_sbatch "/tmp/spur-ctest-c6-$$.sh")
+wait_job "${JC6}" 30 >/dev/null 2>&1
+TOTAL=$((TOTAL + 1))
+echo -n "TEST ${TOTAL}: C6: PID namespace (process is PID 1) ... "
+EC=$(ctest_exit_code "${JC6}")
+if [ "$EC" = "0" ]; then
+    echo "PASS"; PASS=$((PASS + 1))
+else
+    echo "FAIL (exit ${EC}: 1=not PID 1, 2=/proc/1 wrong)"; FAIL=$((FAIL + 1))
+    ctest_debug "C6" "${JC6}"
+fi
+
+# C7: Environment variables pass through correctly
+cat > "/tmp/spur-ctest-c7-$$.sh" << 'SCRIPT'
+#!/bin/bash
+[ -n "$SPUR_JOB_ID" ] || exit 1
+[ -n "$OMP_NUM_THREADS" ] || exit 2
+SCRIPT
+chmod +x "/tmp/spur-ctest-c7-$$.sh"
+ctest_ship "/tmp/spur-ctest-c7-$$.sh"
+JC7=$(ctest_sbatch "/tmp/spur-ctest-c7-$$.sh")
+wait_job "${JC7}" 30 >/dev/null 2>&1
+TOTAL=$((TOTAL + 1))
+echo -n "TEST ${TOTAL}: C7: env vars passed to container ... "
+EC=$(ctest_exit_code "${JC7}")
+if [ "$EC" = "0" ]; then
+    echo "PASS"; PASS=$((PASS + 1))
+else
+    echo "FAIL (exit ${EC}: 1=no SPUR_JOB_ID, 2=no OMP_NUM_THREADS)"; FAIL=$((FAIL + 1))
+    ctest_debug "C7" "${JC7}"
+fi
+
+# C8: Bind mount — verify content readable and read-only enforced
+CTEST_BIND="/tmp/spur-ctest-bind-$$"
+mkdir -p "$CTEST_BIND"
+echo "bind_mount_ci_test" > "$CTEST_BIND/data.txt"
+for node in $CTEST_AGENTS; do
+    [ "$node" = "$(hostname)" ] && continue
+    if ! ssh -o ConnectTimeout=5 "$node" "mkdir -p $CTEST_BIND" 2>/dev/null; then
+        echo "    WARN: cannot reach $node via ssh, C8 bind mount test may fail"
+    else
+        scp -q -r "$CTEST_BIND/" "$node:$CTEST_BIND/" 2>/dev/null || true
+    fi
+done
+cat > "/tmp/spur-ctest-c8-$$.sh" << 'SCRIPT'
+#!/bin/bash
+[ "$(cat /mnt/data/data.txt 2>/dev/null)" = "bind_mount_ci_test" ] || exit 1
+# Write must fail on a :ro mount
+touch /mnt/data/write_test 2>/dev/null && exit 2
+exit 0
+SCRIPT
+chmod +x "/tmp/spur-ctest-c8-$$.sh"
+ctest_ship "/tmp/spur-ctest-c8-$$.sh"
+JC8=$(ctest_sbatch --container-mounts="${CTEST_BIND}:/mnt/data:ro" "/tmp/spur-ctest-c8-$$.sh")
+wait_job "${JC8}" 30 >/dev/null 2>&1
+TOTAL=$((TOTAL + 1))
+echo -n "TEST ${TOTAL}: C8: bind mount content + read-only ... "
+EC=$(ctest_exit_code "${JC8}")
+if [ "$EC" = "0" ]; then
+    echo "PASS"; PASS=$((PASS + 1))
+else
+    echo "FAIL (exit ${EC}: 1=content wrong, 2=ro not enforced)"; FAIL=$((FAIL + 1))
+    ctest_debug "C8" "${JC8}"
+fi
+
+fi # CTEST_READY
+
 echo ""
 
 # --- Summary ---

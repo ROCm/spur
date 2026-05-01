@@ -835,7 +835,7 @@ async fn manage_power(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 }
 
 /// Send CancelJob RPC to all agents for a job with a specific signal.
-async fn send_cancel_to_agents(
+pub async fn send_cancel_to_agents(
     cluster: &Arc<ClusterManager>,
     job: &spur_core::job::Job,
     signal: i32,

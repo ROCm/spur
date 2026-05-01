@@ -1,9 +1,12 @@
 use std::collections::HashMap;
+use std::ffi::CString;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use tokio::process::Command;
@@ -13,6 +16,7 @@ use spur_core::job::JobId;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_spank::SpankHost;
 
+use crate::container::ContainerConfig;
 use crate::reporter::NodeReporter;
 
 /// Cgroup root for slurmd-managed jobs.
@@ -29,7 +33,7 @@ pub async fn job_execution_loop(reporter: Arc<NodeReporter>) {
         // Check status of running jobs
         let mut completed = Vec::new();
         for (job_id, rj) in running.iter_mut() {
-            if let Some(status) = rj.try_wait().await {
+            if let Ok(Some(status)) = rj.try_wait() {
                 info!(job_id, exit_code = status, "job completed");
                 completed.push((*job_id, status));
             }
@@ -61,41 +65,122 @@ async fn report_completion(
     Ok(())
 }
 
-/// A running job process.
-pub struct RunningJob {
-    job_id: JobId,
-    child: tokio::process::Child,
-    cgroup_path: Option<PathBuf>,
+pub struct ContainerLaunchConfig {
+    pub config: ContainerConfig,
+    pub rootfs: PathBuf,
 }
 
-impl RunningJob {
-    /// Consume self and return the child process (for tracking by agent server).
-    pub fn into_child(self) -> tokio::process::Child {
-        self.child
+/// A running job process — either a tokio-managed child or a raw-forked container.
+pub enum RunningJob {
+    /// Non-container jobs managed by tokio::process::Child.
+    Managed {
+        job_id: JobId,
+        child: tokio::process::Child,
+        cgroup_path: Option<PathBuf>,
+    },
+    /// Container jobs: raw fork with optional pidfd for PID-recycling safety.
+    Forked {
+        job_id: JobId,
+        pid: i32,
+        /// Holds a kernel reference preventing PID recycling. None on kernels < 5.3.
+        _pidfd: Option<OwnedFd>,
+        cgroup_path: Option<PathBuf>,
+        reaped: bool,
+    },
+}
+
+fn pidfd_open(pid: i32) -> std::io::Result<OwnedFd> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as RawFd;
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
     }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 impl RunningJob {
-    /// Check if the job has finished. Returns exit code if done.
-    async fn try_wait(&mut self) -> Option<i32> {
-        match self.child.try_wait() {
-            Ok(Some(status)) => {
-                // Clean up cgroup
-                if let Some(ref path) = self.cgroup_path {
-                    cleanup_cgroup(path);
+    pub fn pid(&self) -> Option<u32> {
+        match self {
+            RunningJob::Managed { child, .. } => child.id(),
+            RunningJob::Forked { pid, .. } => Some(*pid as u32),
+        }
+    }
+
+    pub fn job_id(&self) -> JobId {
+        match self {
+            RunningJob::Managed { job_id, .. } => *job_id,
+            RunningJob::Forked { job_id, .. } => *job_id,
+        }
+    }
+
+    /// Non-blocking check for process exit. Returns exit code if done.
+    pub fn try_wait(&mut self) -> anyhow::Result<Option<i32>> {
+        match self {
+            RunningJob::Managed { child, .. } => match child.try_wait() {
+                Ok(Some(status)) => Ok(Some(status.code().unwrap_or(-1))),
+                Ok(None) => Ok(None),
+                Err(e) => Err(e.into()),
+            },
+            RunningJob::Forked { pid, reaped, .. } => {
+                if *reaped {
+                    return Ok(None);
                 }
-                Some(status.code().unwrap_or(-1))
+                match nix::sys::wait::waitpid(
+                    Pid::from_raw(*pid),
+                    Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+                ) {
+                    Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
+                        *reaped = true;
+                        Ok(Some(code))
+                    }
+                    Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => {
+                        *reaped = true;
+                        Ok(Some(128 + sig as i32))
+                    }
+                    Ok(nix::sys::wait::WaitStatus::StillAlive) => Ok(None),
+                    Ok(_) => Ok(None),
+                    Err(e) => Err(e.into()),
+                }
             }
-            Ok(None) => None, // Still running
-            Err(e) => {
-                warn!(job_id = self.job_id, error = %e, "failed to check job status");
-                None
+        }
+    }
+
+    /// Send a signal to the running process.
+    ///
+    /// For container (Forked) jobs, signals the entire process subtree
+    /// since the tracked PID is the intermediate parent and the actual
+    /// workload runs as a grandchild inside a PID namespace.
+    pub fn kill_signal(&self, sig: Signal) -> anyhow::Result<()> {
+        match self {
+            RunningJob::Managed { child, .. } => {
+                if let Some(pid) = child.id() {
+                    signal::kill(Pid::from_raw(pid as i32), sig)?;
+                }
+                Ok(())
             }
+            RunningJob::Forked { pid, reaped, .. } => {
+                if *reaped {
+                    return Ok(());
+                }
+                kill_process_tree(*pid, sig);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn take_cgroup(&mut self) -> Option<PathBuf> {
+        match self {
+            RunningJob::Managed { cgroup_path, .. } => cgroup_path.take(),
+            RunningJob::Forked { cgroup_path, .. } => cgroup_path.take(),
         }
     }
 }
 
 /// Launch a job script on this node.
+///
+/// If `container` is `Some`, the job runs inside a container via explicit
+/// `fork()` + `container_init()` (namespace, mounts, pivot_root, priv drop).
+/// Otherwise, it uses the standard `tokio::Command` path with optional
+/// `build_namespace_wrapper()` for non-container namespace isolation.
 pub async fn launch_job(
     job_id: JobId,
     script: &str,
@@ -111,6 +196,7 @@ pub async fn launch_job(
     open_mode: Option<&str>,
     uid: u32,
     gid: u32,
+    container: Option<ContainerLaunchConfig>,
 ) -> anyhow::Result<RunningJob> {
     info!(job_id, work_dir, "launching job");
 
@@ -271,6 +357,25 @@ pub async fn launch_job(
     env.insert("VECLIB_MAXIMUM_THREADS".into(), cpus.to_string());
     env.insert("NUMEXPR_NUM_THREADS".into(), cpus.to_string());
 
+    // Container jobs: use explicit fork() + container_init() instead of bash wrapper.
+    if let Some(ctn) = container {
+        return launch_container_job(
+            job_id,
+            &ctn,
+            &env,
+            &stdout_resolved,
+            &stderr_resolved,
+            use_append,
+            cpus,
+            memory_mb,
+            cpu_ids,
+            work_dir,
+        )
+        .await;
+    }
+
+    // --- Non-container jobs: existing tokio::Command path ---
+
     // Issue #99: If root, wrap job with namespace isolation.
     let use_namespaces = nix::unistd::geteuid().is_root();
     let (launch_cmd, launch_args) = if use_namespaces {
@@ -393,7 +498,7 @@ pub async fn launch_job(
         "job process spawned"
     );
 
-    Ok(RunningJob {
+    Ok(RunningJob::Managed {
         job_id,
         child,
         cgroup_path,
@@ -509,10 +614,26 @@ fn cleanup_cgroup(cgroup_path: &Path) {
 
 /// Send a signal to a running job.
 pub fn signal_job(job: &RunningJob, sig: Signal) -> anyhow::Result<()> {
-    if let Some(pid) = job.child.id() {
-        signal::kill(Pid::from_raw(pid as i32), sig).context("failed to signal job process")?;
+    job.kill_signal(sig)
+}
+
+/// Recursively signal a process and all its descendants (children first).
+fn kill_process_tree(pid: i32, sig: Signal) {
+    let children = get_child_pids(pid);
+    for child in &children {
+        kill_process_tree(*child, sig);
     }
-    Ok(())
+    let _ = signal::kill(Pid::from_raw(pid), sig);
+}
+
+/// Read immediate child PIDs from /proc/<pid>/task/<pid>/children.
+fn get_child_pids(pid: i32) -> Vec<i32> {
+    let path = format!("/proc/{}/task/{}/children", pid, pid);
+    std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect()
 }
 
 /// Run a prolog/epilog hook script.
@@ -573,6 +694,202 @@ fn resolve_output_path(pattern: &str, job_id: JobId, work_dir: &str) -> String {
             .join(resolved)
             .to_string_lossy()
             .into()
+    }
+}
+
+/// Launch a containerized job via explicit fork() + container_init().
+///
+/// The child process does all container setup (namespaces, mounts, pivot_root,
+/// priv drop) in Rust, then execs the job. No generated bash scripts, no
+/// dependency on host binaries inside the container.
+///
+/// The parent tracks the child PID via a sync pipe and wraps waitpid in a
+/// blocking tokio task so it doesn't stall the async runtime.
+#[allow(clippy::too_many_arguments)]
+async fn launch_container_job(
+    job_id: JobId,
+    ctn: &ContainerLaunchConfig,
+    env: &HashMap<String, String>,
+    stdout_path: &str,
+    stderr_path: &str,
+    use_append: bool,
+    cpus: u32,
+    memory_mb: u64,
+    cpu_ids: &[u32],
+    work_dir: &str,
+) -> anyhow::Result<RunningJob> {
+    let cgroup_path = setup_cgroup(job_id, cpus, memory_mb, cpu_ids)?;
+
+    // Open stdout/stderr files before fork (child will dup2 these)
+    let stdout_fd: std::fs::File = if use_append {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(stdout_path)
+            .context("open stdout for container job")?
+    } else {
+        std::fs::File::create(stdout_path).context("create stdout for container job")?
+    };
+    let stderr_fd: std::fs::File = if use_append {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(stderr_path)
+            .context("open stderr for container job")?
+    } else {
+        std::fs::File::create(stderr_path).context("create stderr for container job")?
+    };
+
+    // Sync pipe: child writes status, parent reads.
+    // Convert OwnedFd to raw fds for manual lifecycle management across fork.
+    let (pipe_r, pipe_w) = nix::unistd::pipe().context("create sync pipe")?;
+    let ready_r = pipe_r.as_raw_fd();
+    let ready_w = pipe_w.as_raw_fd();
+    // Prevent read end from leaking into exec'd process
+    nix::fcntl::fcntl(
+        ready_r,
+        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+    )
+    .ok();
+    // Keep OwnedFd alive so the fds aren't closed prematurely
+    let _pipe_r_owner = pipe_r;
+    let _pipe_w_owner = pipe_w;
+
+    // Snapshot everything the child needs (must not reference async state after fork)
+    let config = &ctn.config;
+    let rootfs = ctn.rootfs.clone();
+    let env_snapshot = env.clone();
+    let container_env = config.container_env.clone();
+    let entrypoint = config.entrypoint.clone();
+
+    match unsafe { nix::unistd::fork().context("fork for container job")? } {
+        nix::unistd::ForkResult::Child => {
+            // === CHILD PROCESS ===
+            // CRITICAL: synchronous code only. Tokio runtime is broken after fork.
+            drop(stdout_fd);
+            drop(stderr_fd);
+            unsafe {
+                libc::close(ready_r);
+            }
+
+            // Reset signal handlers
+            unsafe {
+                libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            }
+
+            // Redirect stdout/stderr
+            let stdout_reopen = std::fs::File::options().append(true).open(stdout_path).ok();
+            let stderr_reopen = std::fs::File::options().append(true).open(stderr_path).ok();
+            if let Some(f) = stdout_reopen.as_ref() {
+                nix::unistd::dup2(f.as_raw_fd(), libc::STDOUT_FILENO).ok();
+            }
+            if let Some(f) = stderr_reopen.as_ref() {
+                nix::unistd::dup2(f.as_raw_fd(), libc::STDERR_FILENO).ok();
+            }
+
+            // Close inherited fds (gRPC sockets, other jobs' files)
+            crate::container::close_inherited_fds(ready_w);
+
+            // Run container init: namespaces, mounts, pivot_root, priv drop
+            let hook_env = match crate::container::container_init(config, &rootfs) {
+                Ok(env) => env,
+                Err(e) => {
+                    let msg = format!("E:{}", e);
+                    unsafe {
+                        libc::write(ready_w, msg.as_ptr() as *const _, msg.len());
+                    }
+                    std::process::exit(1);
+                }
+            };
+
+            // Signal parent: setup complete
+            unsafe {
+                libc::write(ready_w, b"OK".as_ptr() as *const _, 2);
+                libc::close(ready_w);
+            }
+
+            // Build final environment: base + container_env + hook environ.d
+            let mut final_env = env_snapshot;
+            for (k, v) in &container_env {
+                final_env.insert(k.clone(), v.clone());
+            }
+            for (k, v) in hook_env {
+                final_env.insert(k, v);
+            }
+            let c_env: Vec<CString> = final_env
+                .iter()
+                .filter_map(|(k, v)| CString::new(format!("{}={}", k, v)).ok())
+                .collect();
+            let c_env_refs: Vec<&std::ffi::CStr> = c_env.iter().map(|s| s.as_c_str()).collect();
+
+            // Build exec args: with or without entrypoint
+            let c_bash = CString::new("/bin/bash").unwrap();
+            let exec_args: Vec<CString> = if let Some(ref ep) = entrypoint {
+                let cmd = format!("{} && /bin/bash /tmp/spur_job_{}.sh", ep, job_id);
+                vec![
+                    c_bash.clone(),
+                    CString::new("-c").unwrap(),
+                    CString::new(cmd).unwrap(),
+                ]
+            } else {
+                vec![
+                    c_bash.clone(),
+                    CString::new(format!("/tmp/spur_job_{}.sh", job_id)).unwrap(),
+                ]
+            };
+            let exec_arg_refs: Vec<&std::ffi::CStr> =
+                exec_args.iter().map(|s| s.as_c_str()).collect();
+
+            let _ = nix::unistd::execve(&c_bash, &exec_arg_refs, &c_env_refs);
+            eprintln!("spur: execve failed: {}", std::io::Error::last_os_error());
+            std::process::exit(1);
+        }
+
+        nix::unistd::ForkResult::Parent { child } => {
+            unsafe {
+                libc::close(ready_w);
+            }
+
+            let child_pid = child.as_raw();
+
+            if let Some(ref cgroup) = cgroup_path {
+                let _ = std::fs::write(cgroup.join("cgroup.procs"), child_pid.to_string());
+            }
+
+            // pidfd prevents PID recycling; falls back gracefully on kernels < 5.3
+            let pidfd = pidfd_open(child_pid).ok();
+            if pidfd.is_none() {
+                debug!("pidfd_open unavailable, falling back to raw PID tracking");
+            }
+
+            let mut buf = [0u8; 512];
+            let n = unsafe { libc::read(ready_r, buf.as_mut_ptr() as *mut _, buf.len()) };
+            let n = n.max(0) as usize;
+            unsafe {
+                libc::close(ready_r);
+            }
+
+            if n < 2 || &buf[..2] != b"OK" {
+                let msg = String::from_utf8_lossy(&buf[..n]);
+                bail!("container init failed for job {}: {}", job_id, msg);
+            }
+
+            info!(
+                job_id,
+                pid = child_pid,
+                rootfs = %ctn.rootfs.display(),
+                "containerized job launched (fork + pivot_root)"
+            );
+
+            Ok(RunningJob::Forked {
+                job_id,
+                pid: child_pid,
+                _pidfd: pidfd,
+                cgroup_path,
+                reaped: false,
+            })
+        }
     }
 }
 
