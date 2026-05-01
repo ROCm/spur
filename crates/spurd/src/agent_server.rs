@@ -21,20 +21,12 @@ use crate::executor;
 use crate::pmi::PmiServer;
 use crate::reporter::NodeReporter;
 
-/// Running job handle for tracking.
 struct TrackedJob {
-    child: tokio::process::Child,
-    /// PID of the container init process (for nsenter/exec).
-    pid: Option<u32>,
-    /// How the container rootfs was set up (for cleanup).
+    job: executor::RunningJob,
     rootfs_mode: crate::container::RootfsMode,
-    /// GPU/CPU allocation result for release on completion.
     allocation: Option<AllocationResult>,
-    /// Stdout path for output streaming.
     stdout_path: String,
-    /// Stderr path for output streaming.
     stderr_path: String,
-    /// Whether this job has a PID namespace (for nsenter flags).
     has_pid_namespace: bool,
 }
 
@@ -127,9 +119,8 @@ impl AgentService {
                 )> = Vec::new();
 
                 for (job_id, tracked) in jobs.iter_mut() {
-                    match tracked.child.try_wait() {
-                        Ok(Some(status)) => {
-                            let exit_code = status.code().unwrap_or(-1);
+                    match tracked.job.try_wait() {
+                        Ok(Some(exit_code)) => {
                             info!(job_id, exit_code, "job finished");
                             completed.push((
                                 *job_id,
@@ -138,7 +129,7 @@ impl AgentService {
                                 tracked.allocation.take(),
                             ));
                         }
-                        Ok(None) => {} // Still running
+                        Ok(None) => {}
                         Err(e) => {
                             warn!(job_id, error = %e, "failed to check job status");
                         }
@@ -365,7 +356,11 @@ impl SlurmAgent for AgentService {
             env.insert("SPUR_NODE_RANK".into(), node_rank.to_string());
         }
 
-        // If container image is specified, wrap the job in a container
+        // If container image is specified, prepare rootfs and config for
+        // the Rust container runtime (fork + container_init + pivot_root).
+        let mut container_config: Option<crate::container::ContainerConfig> = None;
+        let mut rootfs_path: Option<std::path::PathBuf> = None;
+
         let (launch_script, rootfs_mode) = if !spec.container_image.is_empty() {
             info!(job_id, image = %spec.container_image, "launching containerized job");
 
@@ -375,13 +370,12 @@ impl SlurmAgent for AgentService {
                 .filter_map(|m| crate::container::parse_mount(m).ok())
                 .collect();
 
-            // Resolve user info for shadow hook
             let username = spec.user.clone();
             let uid = spec.uid;
             let gid = spec.gid;
             let home_dir = std::env::var("HOME").unwrap_or_else(|_| format!("/home/{}", username));
 
-            let container_config = crate::container::ContainerConfig {
+            let cfg = crate::container::ContainerConfig {
                 image: spec.container_image.clone(),
                 mounts,
                 workdir: if spec.container_workdir.is_empty() {
@@ -397,7 +391,7 @@ impl SlurmAgent for AgentService {
                 readonly: spec.container_readonly,
                 mount_home: spec.container_mount_home,
                 remap_root: spec.container_remap_root,
-                gpu_devices: vec![], // TODO: from GRES allocation
+                gpu_devices: vec![], // overwritten below after GRES allocation
                 environment: env.clone(),
                 container_env: spec.container_env.clone(),
                 entrypoint: if spec.container_entrypoint.is_empty() {
@@ -422,36 +416,31 @@ impl SlurmAgent for AgentService {
             )
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
 
-            let (rootfs, rootfs_mode) = crate::container::setup_rootfs(
-                &image_path,
-                job_id,
-                container_config.name.as_deref(),
-            )
-            .map_err(|e| Status::internal(format!("container setup failed: {}", e)))?;
+            let (rootfs, rootfs_mode) =
+                crate::container::setup_rootfs(&image_path, job_id, cfg.name.as_deref())
+                    .map_err(|e| Status::internal(format!("container setup failed: {}", e)))?;
 
-            // Write the user's actual script to a separate file
-            // (the executor will write the *wrapper* as .spur_job_{id}.sh)
-            let inner_script_path = format!("{}/.spur_inner_{}.sh", work_dir, job_id);
-            std::fs::write(&inner_script_path, &script)
-                .map_err(|e| Status::internal(format!("failed to write inner script: {}", e)))?;
+            // Copy user script into rootfs/tmp/ so it's accessible after pivot_root
+            let container_script = format!("{}/tmp/spur_job_{}.sh", rootfs.display(), job_id);
+            std::fs::write(&container_script, &script).map_err(|e| {
+                Status::internal(format!("failed to write container script: {}", e))
+            })?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(
-                    &inner_script_path,
+                    &container_script,
                     std::fs::Permissions::from_mode(0o755),
                 );
             }
 
-            let wrapper = crate::container::build_container_launch_script(
-                &container_config,
-                &rootfs,
-                &inner_script_path,
-                job_id,
-            )
-            .map_err(|e| Status::internal(format!("container script failed: {}", e)))?;
+            rootfs_path = Some(rootfs);
+            container_config = Some(cfg);
 
-            (wrapper, rootfs_mode)
+            // The launch_script passed to executor is the user's script
+            // (used as fallback for non-container path; for container path,
+            // the executor reads from rootfs/tmp/ directly).
+            (script, rootfs_mode)
         } else {
             (script, crate::container::RootfsMode::Extracted)
         };
@@ -567,6 +556,12 @@ impl SlurmAgent for AgentService {
             .map(|a| a.gpu_ids.clone())
             .unwrap_or_default();
 
+        // Wire allocated GPU IDs into container config so mount_hw_devices
+        // can selectively expose only the allocated GPUs.
+        if let Some(ref mut cfg) = container_config {
+            cfg.gpu_devices = gpu_devices.clone();
+        }
+
         let cpu_ids: Vec<u32> = alloc_result
             .as_ref()
             .map(|a| a.cpu_ids.clone())
@@ -590,6 +585,16 @@ impl SlurmAgent for AgentService {
         } else {
             Some(spec.open_mode.as_str())
         };
+        // Build container launch config if this is a containerized job
+        let container_launch = if !spec.container_image.is_empty() {
+            Some(executor::ContainerLaunchConfig {
+                config: container_config.take().unwrap(),
+                rootfs: rootfs_path.take().unwrap(),
+            })
+        } else {
+            None
+        };
+
         match executor::launch_job(
             job_id,
             &launch_script,
@@ -605,18 +610,16 @@ impl SlurmAgent for AgentService {
             open_mode,
             spec.uid,
             spec.gid,
+            container_launch,
         )
         .await
         {
             Ok(running_job) => {
-                let child = running_job.into_child();
-                let pid = child.id();
                 let mut jobs = self.running.lock().await;
                 jobs.insert(
                     job_id,
                     TrackedJob {
-                        child,
-                        pid,
+                        job: running_job,
                         rootfs_mode: rootfs_mode.clone(),
                         allocation: alloc_result,
                         stdout_path,
@@ -652,37 +655,32 @@ impl SlurmAgent for AgentService {
         let job_id = req.job_id;
         let signal = req.signal;
 
-        let pid = {
+        {
             let jobs = self.running.lock().await;
-            jobs.get(&job_id).and_then(|t| t.pid)
-        };
+            let Some(tracked) = jobs.get(&job_id) else {
+                return Ok(Response::new(()));
+            };
 
-        let Some(pid) = pid else {
-            return Ok(Response::new(()));
-        };
+            let sig = if signal > 0 {
+                info!(job_id, signal, "sending signal to job");
+                nix::sys::signal::Signal::try_from(signal)
+                    .unwrap_or(nix::sys::signal::Signal::SIGTERM)
+            } else {
+                info!(job_id, "graceful cancel: SIGTERM → 5s grace → SIGKILL");
+                nix::sys::signal::Signal::SIGTERM
+            };
 
-        if signal > 0 {
-            // Send the specific signal requested (e.g., SIGTERM=15, SIGUSR1=10)
-            info!(job_id, signal, "sending signal to job");
-            let sig = nix::sys::signal::Signal::try_from(signal)
-                .unwrap_or(nix::sys::signal::Signal::SIGTERM);
-            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), sig);
-        } else {
-            // Default: graceful shutdown — SIGTERM, wait 5s, then SIGKILL
-            info!(job_id, "graceful cancel: SIGTERM → 5s grace → SIGKILL");
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            );
+            let _ = tracked.job.kill_signal(sig);
+        }
 
+        if signal == 0 {
             let running = self.running.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 let mut jobs = running.lock().await;
-                if let Some(tracked) = jobs.get_mut(&job_id) {
-                    // Still running after grace period — force kill
+                if let Some(tracked) = jobs.get(&job_id) {
                     info!(job_id, "grace period expired, sending SIGKILL");
-                    let _ = tracked.child.kill().await;
+                    let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                     jobs.remove(&job_id);
                 }
             });
@@ -713,7 +711,7 @@ impl SlurmAgent for AgentService {
             let tracked = jobs.get(&req.job_id).ok_or_else(|| {
                 Status::not_found(format!("job {} not running on this node", req.job_id))
             })?;
-            let pid = tracked.pid.ok_or_else(|| {
+            let pid = tracked.job.pid().ok_or_else(|| {
                 Status::failed_precondition(format!("job {} has no tracked PID", req.job_id))
             })?;
             (pid, tracked.has_pid_namespace)
@@ -929,7 +927,7 @@ impl SlurmAgent for AgentService {
             let jobs = self.running.lock().await;
             match jobs.get(&job_id) {
                 Some(tracked) => {
-                    let pid = tracked.pid.ok_or_else(|| {
+                    let pid = tracked.job.pid().ok_or_else(|| {
                         Status::failed_precondition(format!("job {} has no PID", job_id))
                     })?;
                     // Read a few env vars from /proc to replicate the job's environment
@@ -1129,14 +1127,17 @@ pub fn create_server(reporter: Arc<NodeReporter>) -> SlurmAgentServer<AgentServi
 
 #[cfg(test)]
 impl TrackedJob {
-    fn dummy(pid: u32) -> Self {
+    fn dummy(_pid: u32) -> Self {
         let child = tokio::process::Command::new("sleep")
             .arg("3600")
             .spawn()
             .expect("failed to spawn dummy process");
         Self {
-            child,
-            pid: Some(pid),
+            job: executor::RunningJob::Managed {
+                job_id: 0,
+                child,
+                cgroup_path: None,
+            },
             rootfs_mode: crate::container::RootfsMode::Extracted,
             allocation: None,
             stdout_path: "/dev/null".into(),

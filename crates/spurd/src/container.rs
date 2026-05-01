@@ -11,10 +11,13 @@
 //! - NVIDIA: bind-mount /dev/nvidia* + libnvidia-container or driver libs
 
 use std::collections::HashMap;
+use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{bail, Context};
+use nix::mount::MsFlags;
+use nix::sched::CloneFlags;
 use tracing::{debug, info, warn};
 
 /// Where squashfs images and container rootfs are stored.
@@ -37,19 +40,6 @@ fn resolve_job_user_home(job_user: Option<&str>, job_uid: Option<u32>) -> Option
 }
 
 /// Pure composition of the image search path.
-///
-/// Filters each candidate by `is_dir()` and dedupes. This function does no
-/// I/O outside the existence check, takes no env or passwd dependencies, and
-/// is the unit-testable core of `image_dirs_for_job`.
-///
-/// Order:
-/// 1. `env_override` (no `is_dir()` filter — caller controls)
-/// 2. `system_dir` if it exists
-/// 3. `job_user_home/.spur/images` if it exists
-/// 4. `agent_home/.spur/images` if it exists
-///
-/// If everything is filtered out, falls back to `system_dir` so callers
-/// always get a non-empty list (used in error messages).
 fn compose_image_dirs(
     env_override: Option<&Path>,
     system_dir: &Path,
@@ -80,17 +70,7 @@ fn compose_image_dirs(
 }
 
 /// Return candidate image directories for a job, honoring `SPUR_IMAGE_DIR`
-/// env var and the submitting user's personal image store.
-///
-/// The agent only needs *read* access to find images. We return all readable
-/// dirs so images imported to either the system dir or a user's home dir are
-/// found.
-///
-/// Search order:
-/// 1. `$SPUR_IMAGE_DIR` environment variable
-/// 2. `/var/spool/spur/images` (system-wide store)
-/// 3. `~job_user/.spur/images` (submitting user's personal store)
-/// 4. `$HOME/.spur/images` (agent process fallback)
+/// and the submitting user's personal image store.
 fn image_dirs_for_job(job_user: Option<&str>, job_uid: Option<u32>) -> Vec<PathBuf> {
     let env_override = std::env::var("SPUR_IMAGE_DIR")
         .ok()
@@ -394,398 +374,6 @@ fn setup_rootfs_extract(image_path: &Path, rootfs: &Path) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Build the wrapper script that launches a job inside a container.
-///
-/// Implements Enroot-equivalent hooks:
-/// - shadow: map host user into container /etc/passwd + /etc/group
-/// - home: bind-mount user home directory
-/// - devices: restrict /dev or passthrough GPU devices
-/// - nvidia: bind-mount NVIDIA driver libs + devices
-/// - rocm: bind-mount AMD ROCm libs + /dev/kfd + /dev/dri
-/// - mellanox: bind-mount InfiniBand devices + MOFED libs
-/// - cgroups: already handled by executor.rs
-pub fn build_container_launch_script(
-    config: &ContainerConfig,
-    rootfs: &Path,
-    inner_script_path: &str,
-    job_id: u32,
-) -> anyhow::Result<String> {
-    let mut script = String::new();
-    script.push_str("#!/bin/bash\nset -e\n\n");
-
-    let rootfs_str = rootfs.to_string_lossy();
-
-    // Ensure key directories exist in rootfs
-    script.push_str(&format!(
-        "mkdir -p {rootfs}/dev {rootfs}/proc {rootfs}/sys {rootfs}/tmp {rootfs}/etc {rootfs}/run\n",
-        rootfs = rootfs_str
-    ));
-
-    // --- Hook: shadow (user mapping) ---
-    // Map host user into container's /etc/passwd and /etc/group
-    script.push_str(&format!(
-        r#"
-# Hook: shadow — map host user into container
-if [ -f {rootfs}/etc/passwd ]; then
-  grep -q "^{username}:" {rootfs}/etc/passwd 2>/dev/null || \
-    echo "{username}:x:{uid}:{gid}::{home}:/bin/bash" >> {rootfs}/etc/passwd
-fi
-if [ -f {rootfs}/etc/group ]; then
-  grep -q "^{username}:" {rootfs}/etc/group 2>/dev/null || \
-    echo "{username}:x:{gid}:" >> {rootfs}/etc/group
-fi
-mkdir -p {rootfs}{home}
-"#,
-        rootfs = rootfs_str,
-        username = config.username,
-        uid = config.uid,
-        gid = config.gid,
-        home = config.home_dir,
-    ));
-
-    // Copy the job script into the rootfs
-    let container_script = format!("{}/tmp/spur_job_{}.sh", rootfs_str, job_id);
-    script.push_str(&format!(
-        "cp \"{}\" \"{}\"\nchmod +x \"{}\"\n",
-        inner_script_path, container_script, container_script
-    ));
-
-    // Pre-create mount targets
-    for mount in &config.mounts {
-        let target = format!("{}{}", rootfs_str, mount.target);
-        script.push_str(&format!("mkdir -p \"{}\"\n", target));
-    }
-
-    // Build container-specific env exports
-    let mut env_exports = String::new();
-    // GPU visibility
-    if !config.gpu_devices.is_empty() {
-        let gpu_list: String = config
-            .gpu_devices
-            .iter()
-            .map(|d| d.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        env_exports.push_str(&format!(
-            "export ROCR_VISIBLE_DEVICES={gl}\nexport CUDA_VISIBLE_DEVICES={gl}\nexport GPU_DEVICE_ORDINAL={gl}\n",
-            gl = gpu_list
-        ));
-    }
-    // User-specified container env vars (--container-env KEY=VAL)
-    for (key, value) in &config.container_env {
-        let escaped = value.replace('\'', "'\\''");
-        env_exports.push_str(&format!("export {}='{}'\n", key, escaped));
-    }
-
-    let workdir = config.workdir.as_deref().unwrap_or("/tmp");
-
-    // Build entrypoint prefix if specified
-    let entrypoint_cmd = if let Some(ref ep) = config.entrypoint {
-        format!("{} && ", ep)
-    } else {
-        String::new()
-    };
-
-    // === ROOT MODE: full namespace + chroot ===
-    script.push_str(&format!(
-        r#"
-if [ "$(id -u)" = "0" ]; then
-  exec unshare --mount --pid --fork bash -c '
-set -e
-ROOTFS="{rootfs}"
-
-# Hook: filesystem mounts
-mount -t proc proc $ROOTFS/proc 2>/dev/null || true
-mount -t sysfs sys $ROOTFS/sys 2>/dev/null || true
-mount -t tmpfs tmpfs $ROOTFS/run 2>/dev/null || true
-"#,
-        rootfs = rootfs_str,
-    ));
-
-    // Hook: devices — restricted /dev with only essential devices
-    script.push_str(
-        r#"
-# Hook: devices — minimal /dev + GPU passthrough
-mount -t tmpfs -o mode=755 tmpfs $ROOTFS/dev
-mkdir -p $ROOTFS/dev/pts $ROOTFS/dev/shm $ROOTFS/dev/mqueue
-mount -t devpts devpts $ROOTFS/dev/pts 2>/dev/null || true
-mount -t tmpfs tmpfs $ROOTFS/dev/shm 2>/dev/null || true
-# Essential devices
-for d in null zero random urandom tty console; do
-  touch $ROOTFS/dev/$d 2>/dev/null
-  mount --bind /dev/$d $ROOTFS/dev/$d 2>/dev/null || true
-done
-ln -sf /proc/self/fd $ROOTFS/dev/fd 2>/dev/null || true
-ln -sf /proc/self/fd/0 $ROOTFS/dev/stdin 2>/dev/null || true
-ln -sf /proc/self/fd/1 $ROOTFS/dev/stdout 2>/dev/null || true
-ln -sf /proc/self/fd/2 $ROOTFS/dev/stderr 2>/dev/null || true
-
-# Hook: GPU — AMD (ROCm)
-if [ -d /dev/dri ]; then
-  mkdir -p $ROOTFS/dev/dri
-  mount --bind /dev/dri $ROOTFS/dev/dri 2>/dev/null || true
-fi
-if [ -e /dev/kfd ]; then
-  touch $ROOTFS/dev/kfd 2>/dev/null
-  mount --bind /dev/kfd $ROOTFS/dev/kfd 2>/dev/null || true
-fi
-for p in /opt/rocm /opt/rocm/lib /opt/rocm/lib64; do
-  if [ -d "$p" ]; then
-    mkdir -p $ROOTFS$p
-    mount --bind $p $ROOTFS$p 2>/dev/null || true
-  fi
-done
-
-# Hook: GPU — NVIDIA
-for dev in /dev/nvidia*; do
-  if [ -e "$dev" ]; then
-    touch $ROOTFS$dev 2>/dev/null || true
-    mount --bind $dev $ROOTFS$dev 2>/dev/null || true
-  fi
-done
-for libdir in /usr/lib/x86_64-linux-gnu /usr/lib64; do
-  if ls $libdir/libnvidia* 1>/dev/null 2>&1; then
-    mkdir -p $ROOTFS$libdir
-    for lib in $libdir/libnvidia* $libdir/libcuda* $libdir/libnvoptix*; do
-      [ -e "$lib" ] && mount --bind $lib $ROOTFS$lib 2>/dev/null || true
-    done
-  fi
-done
-
-# Hook: InfiniBand / Mellanox (MOFED)
-if [ -d /dev/infiniband ]; then
-  mkdir -p $ROOTFS/dev/infiniband
-  mount --bind /dev/infiniband $ROOTFS/dev/infiniband 2>/dev/null || true
-fi
-for ibdev in /dev/uverbs* /dev/rdma_cm; do
-  if [ -e "$ibdev" ]; then
-    touch $ROOTFS$ibdev 2>/dev/null || true
-    mount --bind $ibdev $ROOTFS$ibdev 2>/dev/null || true
-  fi
-done
-for mofed in /etc/libibverbs.d /usr/lib/x86_64-linux-gnu/libibverbs /usr/lib64/libibverbs; do
-  if [ -d "$mofed" ]; then
-    mkdir -p $ROOTFS$mofed
-    mount --bind $mofed $ROOTFS$mofed 2>/dev/null || true
-  fi
-done
-"#,
-    );
-
-    // Hook: home — bind-mount user home directory
-    if config.mount_home {
-        script.push_str(&format!(
-            r#"
-# Hook: home — mount user home directory
-mkdir -p $ROOTFS{home}
-mount --bind {home} $ROOTFS{home} 2>/dev/null || true
-"#,
-            home = config.home_dir,
-        ));
-    }
-
-    // User bind mounts
-    for mount in &config.mounts {
-        script.push_str(&format!(
-            r#"
-if [ -f "{source}" ]; then
-  mkdir -p "$(dirname $ROOTFS{target})" && touch $ROOTFS{target}
-else
-  mkdir -p $ROOTFS{target}
-fi
-mount --bind "{source}" $ROOTFS{target} 2>/dev/null || true"#,
-            source = mount.source,
-            target = mount.target,
-        ));
-        if mount.readonly {
-            script.push_str(&format!(
-                "\nmount -o remount,bind,ro $ROOTFS{target} 2>/dev/null || true",
-                target = mount.target,
-            ));
-        }
-    }
-
-    // Bind-mount host DNS files so name resolution works inside the container.
-    script.push_str(
-        r#"
-for dns_file in /etc/resolv.conf /etc/hosts; do
-  if [ -f "$dns_file" ]; then
-    touch $ROOTFS$dns_file 2>/dev/null || true
-    mount --bind "$dns_file" $ROOTFS$dns_file 2>/dev/null || true
-  fi
-done
-"#,
-    );
-
-    // Hook: config.d — source any system/user hook scripts
-    script.push_str(
-        r#"
-
-# Hook: config.d — run hook scripts from /etc/spur/container.d/hooks.d/
-for hook in /etc/spur/container.d/hooks.d/*.sh; do
-  [ -x "$hook" ] && ENROOT_ROOTFS=$ROOTFS ENROOT_PID=$$ . "$hook" 2>/dev/null || true
-done
-
-# Hook: environ.d — source extra environment files
-for envf in /etc/spur/container.d/environ.d/*.env; do
-  [ -f "$envf" ] && while IFS= read -r line; do
-    [ -n "$line" ] && [ "${line#\#}" = "$line" ] && export "$line"
-  done < "$envf"
-done
-
-# Hook: mounts.d — process extra mount specs
-for fstab in /etc/spur/container.d/mounts.d/*.fstab; do
-  [ -f "$fstab" ] && while IFS= read -r line; do
-    [ -n "$line" ] && [ "${line#\#}" = "$line" ] && {
-      src=$(echo "$line" | awk "{print \$1}")
-      dst=$(echo "$line" | awk "{print \$2}")
-      [ -n "$src" ] && [ -n "$dst" ] && {
-        # Use touch for files, mkdir -p for directories — types must match.
-        if [ -f "$src" ]; then
-          mkdir -p "$(dirname $ROOTFS$dst)"
-          touch $ROOTFS$dst 2>/dev/null || true
-        else
-          mkdir -p $ROOTFS$dst
-        fi
-        mount --bind "$src" $ROOTFS$dst 2>/dev/null || true
-      }
-    }
-  done < "$fstab"
-done
-"#,
-    );
-
-    // Chroot and execute
-    script.push_str(&format!(
-        r#"
-# Set environment
-{env_exports}
-
-# Enter container
-chroot $ROOTFS /bin/bash -c "cd {workdir} && {entrypoint}{script}"
-'
-else
-  # Non-root path: no chroot/pivot_root capability. We can't run binaries
-  # from $ROOTFS naively because the kernel honors the binary's PT_INTERP
-  # (e.g. /lib64/ld-linux-x86-64.so.2) which resolves to the *host's*
-  # dynamic loader, which then loads the *host's* libc — producing a
-  # GLIBC version mismatch when the container's binaries are newer than
-  # the host's libc (#149).
-  #
-  # Fix: invoke the container's dynamic loader explicitly with
-  # --library-path so binaries see the container's libc + dependent libs.
-  ROOTFS="{rootfs}"
-  {env_exports}
-  export PATH="$ROOTFS/usr/bin:$ROOTFS/bin:$ROOTFS/usr/sbin:$ROOTFS/sbin:$PATH"
-  export LD_LIBRARY_PATH="$ROOTFS/lib/x86_64-linux-gnu:$ROOTFS/usr/lib/x86_64-linux-gnu:$ROOTFS/lib64:$ROOTFS/usr/lib64:$ROOTFS/lib:$ROOTFS/usr/lib:${{LD_LIBRARY_PATH:-}}"
-  export SPUR_CONTAINER_ROOTFS="$ROOTFS"
-  export HOME="{home}"
-  cd "$ROOTFS{workdir}"
-
-  # Locate the container's dynamic loader. Order: glibc x86_64 (Ubuntu /
-  # Debian / RHEL), then musl (Alpine).
-  SPUR_LOADER=""
-  for _cand in \
-      "$ROOTFS/lib64/ld-linux-x86-64.so.2" \
-      "$ROOTFS/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2" \
-      "$ROOTFS/lib/ld-linux-x86-64.so.2" \
-      "$ROOTFS/lib/ld-musl-x86_64.so.1"; do
-    if [ -e "$_cand" ]; then
-      SPUR_LOADER="$_cand"
-      break
-    fi
-  done
-
-  if [ -n "$SPUR_LOADER" ] && [ -e "$ROOTFS/bin/bash" ]; then
-    {entrypoint}exec "$SPUR_LOADER" --library-path "$LD_LIBRARY_PATH" \
-      "$ROOTFS/bin/bash" "$ROOTFS/tmp/spur_job_{job_id}.sh"
-  else
-    # Statically linked / non-glibc / no bash in container — fall back to
-    # the host bash. This will fail with a glibc mismatch if the host's
-    # libc is older than what the user's job binaries require, but it's
-    # the best we can do without container internals.
-    {entrypoint}/bin/bash $ROOTFS/tmp/spur_job_{job_id}.sh
-  fi
-fi
-"#,
-        env_exports = env_exports,
-        workdir = workdir,
-        job_id = job_id,
-        rootfs = rootfs_str,
-        home = config.home_dir,
-        entrypoint = entrypoint_cmd,
-        script = format!("/tmp/spur_job_{}.sh", job_id),
-    ));
-
-    Ok(script)
-}
-
-/// Generate mount commands for GPU device passthrough.
-fn build_gpu_mounts(config: &ContainerConfig, rootfs: &str) -> String {
-    let mut script = String::new();
-
-    // Always try to bind-mount /dev/dri if it exists (for GPU access)
-    script.push_str(&format!(
-        "if [ -d /dev/dri ]; then\n  mkdir -p {rootfs}/dev/dri\n  mount --bind /dev/dri {rootfs}/dev/dri\nfi\n",
-        rootfs = rootfs
-    ));
-
-    // AMD: /dev/kfd is needed for ROCm
-    script.push_str(&format!(
-        "if [ -e /dev/kfd ]; then\n  touch {rootfs}/dev/kfd 2>/dev/null\n  mount --bind /dev/kfd {rootfs}/dev/kfd\nfi\n",
-        rootfs = rootfs
-    ));
-
-    // AMD: bind-mount ROCm libraries if present
-    for rocm_path in &["/opt/rocm", "/opt/rocm/lib"] {
-        script.push_str(&format!(
-            "if [ -d {rp} ]; then\n  mkdir -p {rootfs}{rp}\n  mount --bind {rp} {rootfs}{rp}\nfi\n",
-            rp = rocm_path,
-            rootfs = rootfs
-        ));
-    }
-
-    // NVIDIA: bind-mount nvidia device files
-    script.push_str(&format!(
-        "for dev in /dev/nvidia*; do\n  if [ -e \"$dev\" ]; then\n    touch {rootfs}/$dev 2>/dev/null\n    mount --bind $dev {rootfs}/$dev\n  fi\ndone\n",
-        rootfs = rootfs
-    ));
-
-    // NVIDIA: bind-mount driver libraries if present
-    for nvidia_path in &[
-        "/usr/lib/x86_64-linux-gnu/libnvidia",
-        "/usr/lib64/libnvidia",
-    ] {
-        let dir = Path::new(nvidia_path)
-            .parent()
-            .unwrap_or(Path::new("/usr/lib"))
-            .display();
-        script.push_str(&format!(
-            "if ls {np}* 1>/dev/null 2>&1; then\n  mkdir -p {rootfs}{dir}\n  for lib in {np}*; do\n    mount --bind $lib {rootfs}$lib\n  done\nfi\n",
-            np = nvidia_path,
-            rootfs = rootfs,
-            dir = dir
-        ));
-    }
-
-    // Set GPU visibility environment variables
-    if !config.gpu_devices.is_empty() {
-        let gpu_list: String = config
-            .gpu_devices
-            .iter()
-            .map(|d| d.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        script.push_str(&format!(
-            "export ROCR_VISIBLE_DEVICES={gpu_list}\n\
-             export CUDA_VISIBLE_DEVICES={gpu_list}\n\
-             export GPU_DEVICE_ORDINAL={gpu_list}\n"
-        ));
-    }
-
-    script
-}
-
 /// Parse a bind mount spec like "/src:/dst:ro" into a BindMount.
 pub fn parse_mount(spec: &str) -> anyhow::Result<BindMount> {
     let parts: Vec<&str> = spec.split(':').collect();
@@ -834,6 +422,757 @@ pub fn cleanup_rootfs(job_id: u32, mode: &RootfsMode) {
     } else {
         debug!(path = %base_dir.display(), "container rootfs cleaned up");
     }
+}
+
+/// Creates a file or directory at the mount-point destination to match the
+/// source type — bind mounts require the target to already exist.
+pub fn create_mount_target(rootfs: &Path, target: &str, source: &Path) -> anyhow::Result<()> {
+    let dest = rootfs.join(target.trim_start_matches('/'));
+    if source.is_file() {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating parent dirs for {}", dest.display()))?;
+        }
+        if !dest.exists() {
+            std::fs::File::create(&dest)
+                .with_context(|| format!("creating mount target file {}", dest.display()))?;
+        }
+    } else if source.is_dir() {
+        std::fs::create_dir_all(&dest)
+            .with_context(|| format!("creating mount target dir {}", dest.display()))?;
+    }
+    Ok(())
+}
+
+fn bind_mount(rootfs: &Path, source: &Path, target: &str, readonly: bool) -> anyhow::Result<()> {
+    create_mount_target(rootfs, target, source)?;
+    let dest = rootfs.join(target.trim_start_matches('/'));
+    nix::mount::mount(
+        Some(source),
+        &dest,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        None::<&str>,
+    )
+    .with_context(|| format!("bind mount {} -> {}", source.display(), dest.display()))?;
+
+    if readonly {
+        nix::mount::mount(
+            None::<&str>,
+            &dest,
+            None::<&str>,
+            MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+            None::<&str>,
+        )
+        .with_context(|| format!("remount readonly {}", dest.display()))?;
+    }
+    Ok(())
+}
+
+/// Set up /proc, /sys, /dev, and /run inside the container rootfs.
+pub fn mount_filesystems(rootfs: &Path) -> anyhow::Result<()> {
+    let dirs = ["dev", "proc", "sys", "tmp", "etc", "run"];
+    for d in &dirs {
+        std::fs::create_dir_all(rootfs.join(d)).ok();
+    }
+
+    // /proc
+    nix::mount::mount(
+        Some("proc"),
+        &rootfs.join("proc"),
+        Some("proc"),
+        MsFlags::MS_NOEXEC | MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        None::<&str>,
+    )
+    .context("mount proc")?;
+
+    // /sys (read-only)
+    nix::mount::mount(
+        Some("sysfs"),
+        &rootfs.join("sys"),
+        Some("sysfs"),
+        MsFlags::MS_NOEXEC | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_RDONLY,
+        None::<&str>,
+    )
+    .unwrap_or_else(|e| warn!(error = %e, "mount sysfs (non-critical)"));
+
+    // /dev (tmpfs, mode=755)
+    nix::mount::mount(
+        Some("tmpfs"),
+        &rootfs.join("dev"),
+        Some("tmpfs"),
+        MsFlags::MS_NOEXEC | MsFlags::MS_STRICTATIME,
+        Some("mode=755"),
+    )
+    .context("mount /dev tmpfs")?;
+
+    // /dev/pts
+    let devpts = rootfs.join("dev/pts");
+    std::fs::create_dir_all(&devpts).ok();
+    nix::mount::mount(
+        Some("devpts"),
+        &devpts,
+        Some("devpts"),
+        MsFlags::MS_NOEXEC | MsFlags::MS_NOSUID,
+        Some("newinstance,ptmxmode=0666,mode=620"),
+    )
+    .unwrap_or_else(|e| warn!(error = %e, "mount devpts (non-critical)"));
+
+    // /dev/shm
+    let devshm = rootfs.join("dev/shm");
+    std::fs::create_dir_all(&devshm).ok();
+    nix::mount::mount(
+        Some("tmpfs"),
+        &devshm,
+        Some("tmpfs"),
+        MsFlags::MS_NOEXEC | MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some("mode=1777,size=50%"),
+    )
+    .unwrap_or_else(|e| warn!(error = %e, "mount /dev/shm (non-critical)"));
+
+    // /run
+    nix::mount::mount(
+        Some("tmpfs"),
+        &rootfs.join("run"),
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some("mode=755"),
+    )
+    .unwrap_or_else(|e| warn!(error = %e, "mount /run (non-critical)"));
+
+    // Essential device nodes — bind-mount from host
+    for dev in &["null", "zero", "full", "random", "urandom", "tty"] {
+        let host = PathBuf::from(format!("/dev/{}", dev));
+        let target = rootfs.join(format!("dev/{}", dev));
+        if host.exists() {
+            if !target.exists() {
+                std::fs::File::create(&target).ok();
+            }
+            nix::mount::mount(
+                Some(&host),
+                &target,
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )
+            .unwrap_or_else(|e| warn!(dev, error = %e, "bind mount /dev device"));
+        }
+    }
+
+    // /dev/console — only if a tty is attached
+    let console = rootfs.join("dev/console");
+    if !console.exists() {
+        std::fs::File::create(&console).ok();
+    }
+
+    let dev = rootfs.join("dev");
+    std::os::unix::fs::symlink("/proc/self/fd", dev.join("fd")).ok();
+    std::os::unix::fs::symlink("/proc/self/fd/0", dev.join("stdin")).ok();
+    std::os::unix::fs::symlink("/proc/self/fd/1", dev.join("stdout")).ok();
+    std::os::unix::fs::symlink("/proc/self/fd/2", dev.join("stderr")).ok();
+    std::os::unix::fs::symlink("/dev/pts/ptmx", dev.join("ptmx")).ok();
+
+    Ok(())
+}
+
+/// Expose host GPU and RDMA devices inside the container rootfs.
+pub fn mount_hw_devices(rootfs: &Path, gpu_devices: &[u32]) {
+    mount_dri_devices(rootfs, gpu_devices);
+    mount_amd_devices(rootfs);
+    mount_nvidia_devices(rootfs);
+    mount_infiniband_devices(rootfs);
+}
+
+/// DRI render/card nodes — either all of /dev/dri or only the allocated subset.
+fn mount_dri_devices(rootfs: &Path, gpu_devices: &[u32]) {
+    let host_dri = Path::new("/dev/dri");
+    if !host_dri.is_dir() {
+        return;
+    }
+    if gpu_devices.is_empty() {
+        if let Err(e) = bind_mount(rootfs, host_dri, "/dev/dri", false) {
+            warn!(error = %e, "failed to bind mount /dev/dri");
+        }
+        return;
+    }
+    for &id in gpu_devices {
+        let render = format!("/dev/dri/renderD{}", 128 + id);
+        let card = format!("/dev/dri/card{}", id);
+        let render_p = Path::new(&render);
+        let card_p = Path::new(&card);
+        if render_p.exists() {
+            if let Err(e) = bind_mount(rootfs, render_p, &render, false) {
+                warn!(device = %render, error = %e, "failed to bind mount GPU render node");
+            }
+        }
+        if card_p.exists() {
+            if let Err(e) = bind_mount(rootfs, card_p, &card, false) {
+                warn!(device = %card, error = %e, "failed to bind mount GPU card node");
+            }
+        }
+    }
+}
+
+/// AMD ROCm: /dev/kfd + userspace libraries.
+fn mount_amd_devices(rootfs: &Path) {
+    let kfd = Path::new("/dev/kfd");
+    if kfd.exists() {
+        if let Err(e) = bind_mount(rootfs, kfd, "/dev/kfd", false) {
+            warn!(error = %e, "failed to bind mount /dev/kfd");
+        }
+    }
+    for rocm in &["/opt/rocm", "/opt/rocm/lib", "/opt/rocm/lib64"] {
+        let p = Path::new(rocm);
+        if p.is_dir() {
+            if let Err(e) = bind_mount(rootfs, p, rocm, false) {
+                warn!(path = %rocm, error = %e, "failed to bind mount ROCm path");
+            }
+        }
+    }
+}
+
+/// NVIDIA: /dev/nvidia* devices + driver/CUDA libraries.
+fn mount_nvidia_devices(rootfs: &Path) {
+    mount_dev_matching(rootfs, "nvidia");
+    for libdir in &["/usr/lib/x86_64-linux-gnu", "/usr/lib64"] {
+        mount_libs_matching(rootfs, libdir, |name| {
+            name.starts_with("libnvidia")
+                || name.starts_with("libcuda")
+                || name.starts_with("libnvoptix")
+        });
+    }
+}
+
+/// InfiniBand / Mellanox (MOFED): verbs devices + userspace libraries.
+fn mount_infiniband_devices(rootfs: &Path) {
+    let ib = Path::new("/dev/infiniband");
+    if ib.is_dir() {
+        if let Err(e) = bind_mount(rootfs, ib, "/dev/infiniband", false) {
+            warn!(error = %e, "failed to bind mount /dev/infiniband");
+        }
+    }
+    mount_dev_matching(rootfs, "uverbs");
+    let rdma = Path::new("/dev/rdma_cm");
+    if rdma.exists() {
+        if let Err(e) = bind_mount(rootfs, rdma, "/dev/rdma_cm", false) {
+            warn!(error = %e, "failed to bind mount /dev/rdma_cm");
+        }
+    }
+    for mofed in &[
+        "/etc/libibverbs.d",
+        "/usr/lib/x86_64-linux-gnu/libibverbs",
+        "/usr/lib64/libibverbs",
+    ] {
+        let p = Path::new(mofed);
+        if p.is_dir() {
+            if let Err(e) = bind_mount(rootfs, p, mofed, false) {
+                warn!(path = %mofed, error = %e, "failed to bind mount MOFED path");
+            }
+        }
+    }
+}
+
+/// Bind-mount each /dev entry whose name starts with `prefix` into rootfs.
+fn mount_dev_matching(rootfs: &Path, prefix: &str) {
+    if let Ok(entries) = std::fs::read_dir("/dev") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with(prefix) {
+                let host = entry.path();
+                let target = format!("/dev/{}", name_str);
+                if let Err(e) = bind_mount(rootfs, &host, &target, false) {
+                    warn!(device = %target, error = %e, "failed to bind mount device");
+                }
+            }
+        }
+    }
+}
+
+/// Bind-mount matching library files from a host directory into rootfs.
+fn mount_libs_matching(rootfs: &Path, libdir: &str, predicate: impl Fn(&str) -> bool) {
+    let dir = Path::new(libdir);
+    if !dir.is_dir() {
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if predicate(&name_str) {
+                let host = entry.path();
+                let target = format!("{}/{}", libdir, name_str);
+                if let Err(e) = bind_mount(rootfs, &host, &target, false) {
+                    warn!(path = %target, error = %e, "failed to bind mount library");
+                }
+            }
+        }
+    }
+}
+
+/// Process user-specified `--container-mounts` with source-type detection.
+pub fn mount_user_binds(rootfs: &Path, mounts: &[BindMount]) -> anyhow::Result<()> {
+    for m in mounts {
+        let source = Path::new(&m.source);
+        bind_mount(rootfs, source, &m.target, m.readonly)
+            .with_context(|| format!("user mount {}:{}", m.source, m.target))?;
+    }
+    Ok(())
+}
+
+/// Bind-mount user home directory into the rootfs.
+pub fn mount_home(rootfs: &Path, home_dir: &str) -> anyhow::Result<()> {
+    let source = Path::new(home_dir);
+    if source.is_dir() {
+        bind_mount(rootfs, source, home_dir, false)
+            .with_context(|| format!("mount home {}", home_dir))?;
+    }
+    Ok(())
+}
+
+fn is_loopback_nameserver(ip: &str) -> bool {
+    ip.starts_with("127.") || ip == "::1"
+}
+
+/// Strip loopback nameservers from resolv.conf since local stub resolvers
+/// (systemd-resolved, dnsmasq) are unreachable after pivot_root.
+fn build_container_resolv_conf() -> String {
+    const FALLBACK_RESOLV_CONF: &str = "\
+# Generated by spur: no usable host resolv.conf found\n\
+nameserver 1.1.1.1\n\
+nameserver 8.8.8.8\n";
+    let etc_resolv = Path::new("/etc/resolv.conf");
+    let resolved = std::fs::canonicalize(etc_resolv).unwrap_or_else(|_| etc_resolv.to_path_buf());
+    let contents = match std::fs::read_to_string(&resolved) {
+        Ok(c) if !c.trim().is_empty() => c,
+        _ => return FALLBACK_RESOLV_CONF.to_string(),
+    };
+
+    let has_loopback = contents.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("nameserver")
+            && line
+                .split_whitespace()
+                .nth(1)
+                .is_some_and(is_loopback_nameserver)
+    });
+
+    if !has_loopback {
+        return contents;
+    }
+
+    // Try systemd-resolved's upstream config which has the real nameservers.
+    let upstream = Path::new("/run/systemd/resolve/resolv.conf");
+    if let Ok(upstream_contents) = std::fs::read_to_string(upstream) {
+        let upstream_has_loopback = upstream_contents.lines().any(|line| {
+            let line = line.trim();
+            line.starts_with("nameserver")
+                && line
+                    .split_whitespace()
+                    .nth(1)
+                    .is_some_and(is_loopback_nameserver)
+        });
+        if !upstream_has_loopback {
+            return upstream_contents;
+        }
+    }
+
+    // Last resort: strip loopback entries; if nothing remains, add public DNS.
+    let mut filtered: Vec<&str> = Vec::new();
+    let mut has_nameserver = false;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("nameserver") {
+            if let Some(ip) = trimmed.split_whitespace().nth(1) {
+                if is_loopback_nameserver(ip) {
+                    continue;
+                }
+                has_nameserver = true;
+            }
+        }
+        filtered.push(line);
+    }
+    if !has_nameserver {
+        return FALLBACK_RESOLV_CONF.to_string();
+    }
+    filtered.join("\n") + "\n"
+}
+
+/// Inject DNS/NSS config into the container, skipping any the user already mounted.
+pub fn mount_dns(rootfs: &Path, user_mounts: &[BindMount]) -> anyhow::Result<()> {
+    let user_mounted = |target: &str| user_mounts.iter().any(|m| m.target == target);
+
+    if !user_mounted("/etc/resolv.conf") {
+        std::fs::create_dir_all(rootfs.join("etc")).ok();
+        let cleaned = build_container_resolv_conf();
+        std::fs::write(rootfs.join("etc/resolv.conf"), &cleaned)
+            .unwrap_or_else(|e| warn!(error = %e, "failed to write container resolv.conf"));
+    }
+
+    for file in &["/etc/hosts", "/etc/nsswitch.conf"] {
+        if !user_mounted(file) {
+            let source = Path::new(file);
+            if source.is_file() {
+                bind_mount(rootfs, source, file, false).unwrap_or_else(|e| {
+                    warn!(file, error = %e, "failed to mount DNS file");
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Map the host user into the container's /etc/passwd and /etc/group.
+///
+/// Only appends if the user doesn't already exist. Creates the home
+/// directory inside the rootfs if it doesn't exist.
+pub fn setup_shadow(rootfs: &Path, config: &ContainerConfig) -> anyhow::Result<()> {
+    let passwd = rootfs.join("etc/passwd");
+    if passwd.is_file() {
+        let content = std::fs::read_to_string(&passwd).unwrap_or_default();
+        let has_user = content
+            .lines()
+            .any(|l| l.starts_with(&format!("{}:", config.username)));
+        if !has_user {
+            let entry = format!(
+                "{}:x:{}:{}::{}:/bin/bash\n",
+                config.username, config.uid, config.gid, config.home_dir
+            );
+            let mut f = std::fs::OpenOptions::new().append(true).open(&passwd)?;
+            std::io::Write::write_all(&mut f, entry.as_bytes())?;
+        }
+    }
+
+    let group = rootfs.join("etc/group");
+    if group.is_file() {
+        let content = std::fs::read_to_string(&group).unwrap_or_default();
+        let has_group = content
+            .lines()
+            .any(|l| l.starts_with(&format!("{}:", config.username)));
+        if !has_group {
+            let entry = format!("{}:x:{}:\n", config.username, config.gid);
+            let mut f = std::fs::OpenOptions::new().append(true).open(&group)?;
+            std::io::Write::write_all(&mut f, entry.as_bytes())?;
+        }
+    }
+
+    // Ensure home directory exists inside rootfs
+    let home = rootfs.join(config.home_dir.trim_start_matches('/'));
+    std::fs::create_dir_all(&home).ok();
+
+    Ok(())
+}
+
+/// Execute admin hooks, parse environ.d, process mounts.d.
+///
+/// Returns additional environment variables from hook and environ.d files.
+/// Hooks can inject env vars by appending KEY=VALUE lines to the file at
+/// $SPUR_HOOK_ENVIRON (also available as $ENROOT_ENVIRON for compatibility).
+pub fn run_hooks(rootfs: &Path) -> anyhow::Result<HashMap<String, String>> {
+    let mut extra_env = HashMap::new();
+
+    // Shared env file for hooks to write KEY=VALUE lines into
+    let hook_env_file = rootfs.join("tmp/.spur_hook_environ");
+
+    let hooks_dir = Path::new("/etc/spur/container.d/hooks.d");
+    if hooks_dir.is_dir() {
+        std::fs::write(&hook_env_file, "").ok();
+
+        if let Ok(mut entries) = std::fs::read_dir(hooks_dir) {
+            let mut scripts: Vec<PathBuf> = Vec::new();
+            while let Some(Ok(entry)) = entries.next() {
+                let path = entry.path();
+                if path.extension().map_or(false, |e| e == "sh") {
+                    scripts.push(path);
+                }
+            }
+            scripts.sort();
+            for script in scripts {
+                debug!(hook = %script.display(), "running container hook");
+                let status = std::process::Command::new("bash")
+                    .arg(&script)
+                    .env("ENROOT_ROOTFS", rootfs)
+                    .env("ENROOT_PID", std::process::id().to_string())
+                    .env("SPUR_HOOK_ENVIRON", &hook_env_file)
+                    .env("ENROOT_ENVIRON", &hook_env_file)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                if let Err(e) = status {
+                    warn!(hook = %script.display(), error = %e, "hook failed");
+                }
+            }
+        }
+
+        if let Ok(content) = std::fs::read_to_string(&hook_env_file) {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((key, value)) = line.split_once('=') {
+                    extra_env.insert(key.to_string(), value.to_string());
+                }
+            }
+        }
+        std::fs::remove_file(&hook_env_file).ok();
+    }
+
+    // environ.d — parse KEY=VALUE lines and return them
+    let environ_dir = Path::new("/etc/spur/container.d/environ.d");
+    if environ_dir.is_dir() {
+        if let Ok(mut entries) = std::fs::read_dir(environ_dir) {
+            let mut files: Vec<PathBuf> = Vec::new();
+            while let Some(Ok(entry)) = entries.next() {
+                let path = entry.path();
+                if path.extension().map_or(false, |e| e == "env") {
+                    files.push(path);
+                }
+            }
+            files.sort();
+            for file in files {
+                if let Ok(content) = std::fs::read_to_string(&file) {
+                    for line in content.lines() {
+                        let line = line.trim();
+                        if line.is_empty() || line.starts_with('#') {
+                            continue;
+                        }
+                        if let Some((key, value)) = line.split_once('=') {
+                            extra_env.insert(key.to_string(), value.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // mounts.d — parse fstab-style "src dst" lines, mount with source-type detection
+    let mounts_dir = Path::new("/etc/spur/container.d/mounts.d");
+    if mounts_dir.is_dir() {
+        if let Ok(mut entries) = std::fs::read_dir(mounts_dir) {
+            let mut files: Vec<PathBuf> = Vec::new();
+            while let Some(Ok(entry)) = entries.next() {
+                let path = entry.path();
+                if path.extension().map_or(false, |e| e == "fstab") {
+                    files.push(path);
+                }
+            }
+            files.sort();
+            for file in files {
+                if let Ok(content) = std::fs::read_to_string(&file) {
+                    for line in content.lines() {
+                        let line = line.trim();
+                        if line.is_empty() || line.starts_with('#') {
+                            continue;
+                        }
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            let src = Path::new(parts[0]);
+                            let dst = parts[1];
+                            if src.exists() {
+                                bind_mount(rootfs, src, dst, false).unwrap_or_else(|e| {
+                                    warn!(src = parts[0], dst, error = %e, "mounts.d entry failed");
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(extra_env)
+}
+
+/// pivot_root into the container rootfs — stronger than chroot since the
+/// old root is unmounted, preventing escape via open file descriptors.
+pub fn pivot_into_rootfs(rootfs: &Path, workdir: &str) -> anyhow::Result<()> {
+    // Make rootfs a mount point (required by pivot_root)
+    nix::mount::mount(
+        Some(rootfs),
+        rootfs,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        None::<&str>,
+    )
+    .context("bind mount rootfs onto itself")?;
+
+    std::env::set_current_dir(rootfs).context("chdir to rootfs")?;
+
+    nix::unistd::pivot_root(".", ".").context("pivot_root")?;
+
+    // Unmount old root (stacked on top of new root after pivot)
+    nix::mount::umount2(".", nix::mount::MntFlags::MNT_DETACH)
+        .context("umount old root after pivot")?;
+
+    // Set working directory
+    std::env::set_current_dir(workdir)
+        .or_else(|_| std::env::set_current_dir("/"))
+        .context("chdir to workdir after pivot")?;
+
+    Ok(())
+}
+
+/// Drop root privileges. Must call setgroups before setgid before setuid,
+/// since each step requires the privilege dropped by the next.
+pub fn drop_privileges(uid: u32, gid: u32, supplementary_gids: &[u32]) -> anyhow::Result<()> {
+    if uid == 0 {
+        return Ok(());
+    }
+
+    let gids: Vec<nix::unistd::Gid> = supplementary_gids
+        .iter()
+        .map(|g| nix::unistd::Gid::from_raw(*g))
+        .collect();
+    nix::unistd::setgroups(&gids).context("setgroups")?;
+    nix::unistd::setgid(nix::unistd::Gid::from_raw(gid)).context("setgid")?;
+    nix::unistd::setuid(nix::unistd::Uid::from_raw(uid)).context("setuid")?;
+
+    Ok(())
+}
+
+/// Collect the user's supplementary group IDs (e.g. video, render) from the
+/// host. Must be called before fork while host /etc/group is still accessible.
+pub fn resolve_supplementary_gids(uid: u32, gid: u32) -> Vec<u32> {
+    let mut gids = vec![gid];
+
+    let username = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(|u| u.name);
+
+    if let Some(ref name) = username {
+        if let Ok(content) = std::fs::read_to_string("/etc/group") {
+            for line in content.lines() {
+                let parts: Vec<&str> = line.split(':').collect();
+                if parts.len() >= 4 {
+                    let group_gid: u32 = parts[2].parse().unwrap_or(0);
+                    let members: Vec<&str> = parts[3].split(',').collect();
+                    if members.contains(&name.as_str()) && !gids.contains(&group_gid) {
+                        gids.push(group_gid);
+                    }
+                }
+            }
+        }
+    }
+
+    gids
+}
+
+/// Set up a user namespace for non-root container operation.
+///
+/// Maps the calling user to root inside the namespace, giving
+/// CAP_SYS_ADMIN for mounts and pivot_root.
+fn setup_user_namespace(uid: u32, gid: u32) -> anyhow::Result<()> {
+    nix::sched::unshare(
+        CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID,
+    )
+    .context("unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID)")?;
+
+    std::fs::write("/proc/self/uid_map", format!("0 {} 1", uid)).context("write uid_map")?;
+    std::fs::write("/proc/self/setgroups", "deny").context("write setgroups deny")?;
+    std::fs::write("/proc/self/gid_map", format!("0 {} 1", gid)).context("write gid_map")?;
+
+    Ok(())
+}
+
+/// Make all mounts private so pivot_root works and mount/unmount events
+/// don't propagate between the container and host.
+fn set_mount_propagation_private() -> anyhow::Result<()> {
+    nix::mount::mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+        None::<&str>,
+    )
+    .context("set mount propagation to private")
+}
+
+/// Fork to enter a new PID namespace. The child (PID 1 inside the
+/// namespace) returns Ok(()); the parent waits for the child and exits.
+fn fork_into_pid_namespace() -> anyhow::Result<()> {
+    match unsafe { nix::unistd::fork().context("fork for PID namespace")? } {
+        nix::unistd::ForkResult::Child => Ok(()),
+        nix::unistd::ForkResult::Parent { child } => {
+            let code = match nix::sys::wait::waitpid(child, None) {
+                Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => code,
+                _ => 1,
+            };
+            std::process::exit(code);
+        }
+    }
+}
+
+/// Close all inherited file descriptors except stdin/stdout/stderr
+/// and the given preserve_fd (the sync pipe).
+///
+/// Prevents gRPC sockets, other jobs' output files, etc. from leaking
+/// into the container process.
+pub fn close_inherited_fds(preserve_fd: RawFd) {
+    let fd_dir = Path::new("/proc/self/fd");
+    // Collect fds first — iterating /proc/self/fd holds a directory fd
+    // that we must not close while the iterator is alive.
+    let fds: Vec<RawFd> = std::fs::read_dir(fd_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<RawFd>().ok())
+        .filter(|&fd| fd > 2 && fd != preserve_fd)
+        .collect();
+    for fd in fds {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}
+
+/// The main child-process function for container setup.
+pub fn container_init(
+    config: &ContainerConfig,
+    rootfs: &Path,
+) -> anyhow::Result<HashMap<String, String>> {
+    let is_root = nix::unistd::geteuid().is_root();
+
+    // Resolve supplementary GIDs while host /etc/group is still accessible.
+    let supplementary_gids = if is_root {
+        resolve_supplementary_gids(config.uid, config.gid)
+    } else {
+        vec![]
+    };
+
+    if is_root {
+        nix::sched::unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID)
+            .context("unshare(CLONE_NEWNS | CLONE_NEWPID)")?;
+    } else {
+        setup_user_namespace(config.uid, config.gid)
+            .context("user namespace required for rootless containers — check that unprivileged user namespaces are enabled (sysctl kernel.unprivileged_userns_clone=1)")?;
+    }
+
+    set_mount_propagation_private()?;
+    fork_into_pid_namespace()?;
+
+    mount_filesystems(rootfs)?;
+    mount_hw_devices(rootfs, &config.gpu_devices);
+    setup_shadow(rootfs, config)?;
+    mount_user_binds(rootfs, &config.mounts)?;
+    mount_dns(rootfs, &config.mounts)?;
+
+    if config.mount_home {
+        mount_home(rootfs, &config.home_dir)?;
+    }
+
+    let hook_env = run_hooks(rootfs)?;
+
+    let workdir = config.workdir.as_deref().unwrap_or("/tmp");
+    pivot_into_rootfs(rootfs, workdir)?;
+
+    if is_root {
+        drop_privileges(config.uid, config.gid, &supplementary_gids)?;
+    }
+
+    Ok(hook_env)
 }
 
 /// Import a Docker/OCI image to squashfs format.
@@ -1238,70 +1577,50 @@ mod tests {
         assert_eq!(resolved, image_path);
     }
 
-    // --- GPU mounts ---
+    // --- create_mount_target: source-type detection ---
 
     #[test]
-    fn test_gpu_mounts_with_devices() {
-        let config = ContainerConfig {
-            image: "test".into(),
-            mounts: vec![],
-            workdir: None,
-            name: None,
-            readonly: false,
-            mount_home: false,
-            remap_root: false,
-            gpu_devices: vec![0, 1],
-            environment: HashMap::new(),
-            container_env: HashMap::new(),
-            entrypoint: None,
-            uid: 1000,
-            gid: 1000,
-            username: "testuser".into(),
-            home_dir: "/home/testuser".into(),
-        };
-        let script = build_gpu_mounts(&config, "/tmp/rootfs");
-        // AMD devices
-        assert!(script.contains("/dev/dri"));
-        assert!(script.contains("/dev/kfd"));
-        assert!(script.contains("/opt/rocm"));
-        // NVIDIA devices
-        assert!(script.contains("/dev/nvidia"));
-        // Visibility env vars
-        assert!(script.contains("ROCR_VISIBLE_DEVICES=0,1"));
-        assert!(script.contains("CUDA_VISIBLE_DEVICES=0,1"));
+    fn test_create_mount_target_file() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let source = tempfile::NamedTempFile::new().unwrap();
+        create_mount_target(rootfs.path(), "/etc/resolv.conf", source.path()).unwrap();
+        let target = rootfs.path().join("etc/resolv.conf");
+        assert!(target.exists(), "target file must exist");
+        assert!(target.is_file(), "target must be a file, not directory");
     }
 
     #[test]
-    fn test_gpu_mounts_no_devices() {
-        let config = ContainerConfig {
-            image: "test".into(),
-            mounts: vec![],
-            workdir: None,
-            name: None,
-            readonly: false,
-            mount_home: false,
-            remap_root: false,
-            gpu_devices: vec![],
-            environment: HashMap::new(),
-            container_env: HashMap::new(),
-            entrypoint: None,
-            uid: 1000,
-            gid: 1000,
-            username: "testuser".into(),
-            home_dir: "/home/testuser".into(),
-        };
-        let script = build_gpu_mounts(&config, "/tmp/rootfs");
-        // Should still mount device dirs (if they exist on host)
-        assert!(script.contains("/dev/dri"));
-        // But no visibility env vars
-        assert!(!script.contains("ROCR_VISIBLE_DEVICES"));
-        assert!(!script.contains("CUDA_VISIBLE_DEVICES"));
+    fn test_create_mount_target_directory() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        create_mount_target(rootfs.path(), "/mnt/data", source.path()).unwrap();
+        let target = rootfs.path().join("mnt/data");
+        assert!(target.exists(), "target dir must exist");
+        assert!(target.is_dir(), "target must be a directory, not file");
     }
 
-    // --- Container launch script ---
+    #[test]
+    fn test_create_mount_target_nested_file() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let source = tempfile::NamedTempFile::new().unwrap();
+        create_mount_target(rootfs.path(), "/deep/nested/path/file.conf", source.path()).unwrap();
+        let target = rootfs.path().join("deep/nested/path/file.conf");
+        assert!(
+            target.is_file(),
+            "deeply nested file target must be created"
+        );
+    }
+
+    // --- setup_shadow ---
 
     #[test]
-    fn test_launch_script_basic_structure() {
+    fn test_setup_shadow_creates_user_entry() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let etc = rootfs.path().join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(etc.join("passwd"), "root:x:0:0:root:/root:/bin/bash\n").unwrap();
+        std::fs::write(etc.join("group"), "root:x:0:\n").unwrap();
+
         let config = ContainerConfig {
             image: "test".into(),
             mounts: vec![],
@@ -1316,140 +1635,32 @@ mod tests {
             entrypoint: None,
             uid: 1000,
             gid: 1000,
-            username: "testuser".into(),
-            home_dir: "/home/testuser".into(),
+            username: "alice".into(),
+            home_dir: "/home/alice".into(),
         };
-        let rootfs = Path::new("/tmp/test-rootfs");
-        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 42).unwrap();
+        setup_shadow(rootfs.path(), &config).unwrap();
 
-        assert!(script.starts_with("#!/bin/bash"));
-        assert!(script.contains("set -e"));
-        // Copies inner script into rootfs
-        assert!(script.contains("/tmp/inner.sh"));
-        assert!(script.contains("spur_job_42.sh"));
-        // Has namespace/chroot logic
-        assert!(script.contains("unshare"));
-        assert!(script.contains("chroot"));
-        // Non-root fallback
-        assert!(script.contains("SPUR_CONTAINER_ROOTFS"));
+        let passwd = std::fs::read_to_string(etc.join("passwd")).unwrap();
+        assert!(passwd.contains("alice:x:1000:1000::/home/alice:/bin/bash"));
+
+        let group = std::fs::read_to_string(etc.join("group")).unwrap();
+        assert!(group.contains("alice:x:1000:"));
+
+        assert!(rootfs.path().join("home/alice").is_dir());
     }
 
     #[test]
-    fn test_launch_script_with_workdir() {
-        let config = ContainerConfig {
-            image: "test".into(),
-            mounts: vec![],
-            workdir: Some("/workspace".into()),
-            name: None,
-            readonly: false,
-            mount_home: false,
-            remap_root: false,
-            gpu_devices: vec![],
-            environment: HashMap::new(),
-            container_env: HashMap::new(),
-            entrypoint: None,
-            uid: 1000,
-            gid: 1000,
-            username: "testuser".into(),
-            home_dir: "/home/testuser".into(),
-        };
-        let rootfs = Path::new("/tmp/test-rootfs");
-        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
+    fn test_setup_shadow_idempotent() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let etc = rootfs.path().join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(
+            etc.join("passwd"),
+            "alice:x:1000:1000::/home/alice:/bin/bash\n",
+        )
+        .unwrap();
+        std::fs::write(etc.join("group"), "alice:x:1000:\n").unwrap();
 
-        // Root branch: cd runs inside chroot so workdir is unqualified.
-        assert!(script.contains(r#"cd /workspace &&"#));
-        // Non-root fallback: no chroot, so cd must be prefixed with $ROOTFS
-        // so it resolves against the container rootfs, not the host filesystem.
-        // Regression test for: https://github.com/ROCm/spur/issues/136
-        assert!(script.contains(r#"cd "$ROOTFS/workspace""#));
-        // The old broken form must not appear in the non-root branch.
-        assert!(!script.contains("\n  cd /workspace\n"));
-    }
-
-    #[test]
-    fn test_launch_script_with_mounts() {
-        let config = ContainerConfig {
-            image: "test".into(),
-            mounts: vec![
-                BindMount {
-                    source: "/data".into(),
-                    target: "/mnt/data".into(),
-                    readonly: true,
-                },
-                BindMount {
-                    source: "/models".into(),
-                    target: "/models".into(),
-                    readonly: false,
-                },
-            ],
-            workdir: None,
-            name: None,
-            readonly: false,
-            mount_home: false,
-            remap_root: false,
-            gpu_devices: vec![],
-            environment: HashMap::new(),
-            container_env: HashMap::new(),
-            entrypoint: None,
-            uid: 1000,
-            gid: 1000,
-            username: "testuser".into(),
-            home_dir: "/home/testuser".into(),
-        };
-        let rootfs = Path::new("/tmp/test-rootfs");
-        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
-
-        assert!(script.contains("mount --bind \"/data\""));
-        assert!(script.contains("/mnt/data"));
-        assert!(script.contains("remount,bind,ro"));
-        assert!(script.contains("mount --bind \"/models\""));
-        // The else branch for directory mounts must emit mkdir -p.
-        assert!(script.contains("mkdir -p $ROOTFS/mnt/data"));
-    }
-
-    #[test]
-    fn test_launch_script_file_mount_uses_touch_not_mkdir() {
-        // File bind mounts must use touch, not mkdir -p — mismatched types fail silently.
-        let config = ContainerConfig {
-            image: "test".into(),
-            mounts: vec![BindMount {
-                source: "/etc/resolv.conf".into(),
-                target: "/etc/resolv.conf".into(),
-                readonly: true,
-            }],
-            workdir: None,
-            name: None,
-            readonly: false,
-            mount_home: false,
-            remap_root: false,
-            gpu_devices: vec![],
-            environment: HashMap::new(),
-            container_env: HashMap::new(),
-            entrypoint: None,
-            uid: 1000,
-            gid: 1000,
-            username: "testuser".into(),
-            home_dir: "/home/testuser".into(),
-        };
-        let rootfs = Path::new("/tmp/test-rootfs");
-        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
-
-        // The if branch must emit touch; the [ -f ] guard must be present.
-        assert!(
-            script.contains("touch $ROOTFS/etc/resolv.conf"),
-            "file mount must use touch, got:\n{}",
-            script
-        );
-        assert!(
-            script.contains("if [ -f \"/etc/resolv.conf\" ]"),
-            "file detection guard must be present"
-        );
-        assert!(script.contains("mount --bind \"/etc/resolv.conf\""));
-    }
-
-    #[test]
-    fn test_launch_script_dns_files_always_mounted() {
-        // DNS files must be auto-mounted even when the user specifies no mounts.
         let config = ContainerConfig {
             image: "test".into(),
             mounts: vec![],
@@ -1464,159 +1675,55 @@ mod tests {
             entrypoint: None,
             uid: 1000,
             gid: 1000,
-            username: "testuser".into(),
-            home_dir: "/home/testuser".into(),
+            username: "alice".into(),
+            home_dir: "/home/alice".into(),
         };
-        let rootfs = Path::new("/tmp/test-rootfs");
-        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
+        setup_shadow(rootfs.path(), &config).unwrap();
 
-        assert!(
-            script.contains("/etc/resolv.conf"),
-            "resolv.conf must be auto-mounted"
+        let passwd = std::fs::read_to_string(etc.join("passwd")).unwrap();
+        assert_eq!(
+            passwd.lines().filter(|l| l.starts_with("alice:")).count(),
+            1,
+            "should not duplicate user entry"
         );
-        assert!(
-            script.contains("/etc/hosts"),
-            "/etc/hosts must be auto-mounted"
-        );
-        assert!(script.contains("touch $ROOTFS$dns_file"));
     }
 
-    // --- #149: non-root container glibc mismatch ---
-    //
-    // Regression: the non-root branch of the launch script previously did
-    //   {entrypoint}/bin/bash $ROOTFS/tmp/spur_job_X.sh
-    // which executes the *host's* /bin/bash. When that bash (or anything
-    // it spawns from $ROOTFS) is dynamically linked, the kernel honors
-    // the binary's PT_INTERP (e.g. /lib64/ld-linux-x86-64.so.2) which
-    // resolves to the host's loader, which then loads the host's libc.
-    // If the container's libc is newer (e.g. Ubuntu 24 / GLIBC_2.38) than
-    // the host's (Ubuntu 22 / GLIBC_2.35), the job fails with:
-    //   bash: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found
-    //
-    // Fix: invoke the container's own dynamic loader explicitly with
-    // --library-path, so the container's libc + transitive deps are used
-    // even though we haven't chrooted.
+    // --- build_container_resolv_conf ---
 
-    fn rootless_default_config() -> ContainerConfig {
-        ContainerConfig {
-            image: "test".into(),
-            mounts: vec![],
-            workdir: None,
-            name: None,
-            readonly: false,
-            mount_home: false,
-            remap_root: false,
-            gpu_devices: vec![],
-            environment: HashMap::new(),
-            container_env: HashMap::new(),
-            entrypoint: None,
-            uid: 1000,
-            gid: 1000,
-            username: "testuser".into(),
-            home_dir: "/home/testuser".into(),
-        }
-    }
-
-    fn extract_rootless_branch(script: &str) -> &str {
-        // The launch script has a single `if [ "$(id -u)" = "0" ]; then ... else ... fi`
-        // block. The non-root path is the `else` branch. We slice on the
-        // literal text that opens it.
-        let marker = "  # Non-root path: no chroot/pivot_root capability.";
-        let idx = script.find(marker).expect("non-root branch marker missing");
-        &script[idx..]
+    #[test]
+    fn test_build_container_resolv_conf_not_empty() {
+        let contents = build_container_resolv_conf();
+        assert!(!contents.is_empty(), "resolv.conf must not be empty");
     }
 
     #[test]
-    fn launch_script_non_root_invokes_container_loader_explicitly() {
-        let config = rootless_default_config();
-        let rootfs = Path::new("/tmp/test-rootfs");
-        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 7).unwrap();
-        let rootless = extract_rootless_branch(&script);
+    fn test_is_loopback_nameserver() {
+        assert!(is_loopback_nameserver("127.0.0.1"));
+        assert!(is_loopback_nameserver("127.0.0.53"));
+        assert!(is_loopback_nameserver("127.0.1.1"));
+        assert!(is_loopback_nameserver("::1"));
+        assert!(!is_loopback_nameserver("8.8.8.8"));
+        assert!(!is_loopback_nameserver("1.1.1.1"));
+        assert!(!is_loopback_nameserver("192.168.1.1"));
+    }
 
-        // Loader detection iterates the well-known glibc paths first.
-        assert!(
-            rootless.contains("$ROOTFS/lib64/ld-linux-x86-64.so.2"),
-            "must probe glibc x86_64 loader path"
-        );
-        assert!(
-            rootless.contains("$ROOTFS/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"),
-            "must probe Debian/Ubuntu glibc loader path"
-        );
-        assert!(
-            rootless.contains("$ROOTFS/lib/ld-musl-x86_64.so.1"),
-            "must probe musl loader (Alpine) as fallback"
-        );
+    // --- resolve_supplementary_gids ---
 
-        // The loader must be invoked with --library-path pointing at the
-        // container's libs, then bash, then the job script.
+    #[test]
+    fn test_resolve_supplementary_gids_includes_primary() {
+        let gids = resolve_supplementary_gids(1000, 1000);
         assert!(
-            rootless.contains("\"$SPUR_LOADER\" --library-path \"$LD_LIBRARY_PATH\""),
-            "loader must be invoked with --library-path; got:\n{}",
-            rootless
-        );
-        assert!(
-            rootless.contains("\"$ROOTFS/bin/bash\" \"$ROOTFS/tmp/spur_job_7.sh\""),
-            "must run the container's bash on the staged script"
+            gids.contains(&1000),
+            "must include the primary GID, got: {:?}",
+            gids
         );
     }
 
-    #[test]
-    fn launch_script_non_root_includes_debian_libdir_in_ld_path() {
-        // Debian/Ubuntu install libc at /lib/x86_64-linux-gnu/libc.so.6.
-        // The original LD_LIBRARY_PATH only listed /lib + /lib64 + /usr/lib,
-        // which would miss it.
-        let config = rootless_default_config();
-        let rootfs = Path::new("/tmp/test-rootfs");
-        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
-        let rootless = extract_rootless_branch(&script);
-
-        assert!(
-            rootless.contains("$ROOTFS/lib/x86_64-linux-gnu"),
-            "LD_LIBRARY_PATH must include Debian/Ubuntu libdir"
-        );
-        assert!(
-            rootless.contains("$ROOTFS/usr/lib/x86_64-linux-gnu"),
-            "LD_LIBRARY_PATH must include Debian/Ubuntu /usr libdir"
-        );
-    }
+    // --- drop_privileges ---
 
     #[test]
-    fn launch_script_non_root_falls_back_to_host_bash_when_no_loader() {
-        // Some images (scratch, distroless static) have no dynamic loader.
-        // Don't crash the script — fall back to legacy host-bash invocation.
-        let config = rootless_default_config();
-        let rootfs = Path::new("/tmp/test-rootfs");
-        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
-        let rootless = extract_rootless_branch(&script);
-
-        // The fallback branch is reached only if no loader was found.
-        assert!(
-            rootless.contains("/bin/bash $ROOTFS/tmp/spur_job_"),
-            "must retain fallback to host bash when no loader exists"
-        );
-    }
-
-    #[test]
-    fn launch_script_non_root_no_longer_uses_host_bash_unconditionally() {
-        // Regression guard for #149: the original code unconditionally
-        // ran `/bin/bash $ROOTFS/tmp/spur_job_X.sh` as its only command,
-        // which is what caused the GLIBC mismatch. After the fix, the
-        // loader path must come first.
-        let config = rootless_default_config();
-        let rootfs = Path::new("/tmp/test-rootfs");
-        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
-        let rootless = extract_rootless_branch(&script);
-
-        let loader_idx = rootless
-            .find("$SPUR_LOADER")
-            .expect("loader invocation absent");
-        let host_bash_idx = rootless
-            .find("/bin/bash $ROOTFS/tmp/spur_job_")
-            .expect("host-bash fallback absent");
-        assert!(
-            loader_idx < host_bash_idx,
-            "loader path must precede host-bash fallback"
-        );
+    fn test_drop_privileges_noop_for_root() {
+        assert!(drop_privileges(0, 0, &[]).is_ok());
     }
 
     // --- Image removal ---
@@ -1664,212 +1771,95 @@ mod tests {
         assert!(!which("nonexistent-binary-that-doesnt-exist-xyz"));
     }
 
-    // --- New hook tests ---
+    // --- run_hooks ---
 
     #[test]
-    fn test_launch_script_has_shadow_hook() {
-        let config = ContainerConfig {
-            image: "test".into(),
-            mounts: vec![],
-            workdir: None,
-            name: None,
-            readonly: false,
-            mount_home: false,
-            remap_root: false,
-            gpu_devices: vec![],
-            environment: HashMap::new(),
-            container_env: HashMap::new(),
-            entrypoint: None,
-            uid: 1000,
-            gid: 1000,
-            username: "alice".into(),
-            home_dir: "/home/alice".into(),
-        };
-        let rootfs = Path::new("/tmp/test-rootfs");
-        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
-        // Shadow hook: maps user into container
-        assert!(script.contains("alice:x:1000:1000"));
-        assert!(script.contains("/etc/passwd"));
-        assert!(script.contains("/etc/group"));
+    fn test_run_hooks_returns_empty_when_no_dirs() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let env = run_hooks(rootfs.path()).unwrap();
+        assert!(env.is_empty());
     }
 
     #[test]
-    fn test_launch_script_mount_home() {
-        let config = ContainerConfig {
-            image: "test".into(),
-            mounts: vec![],
-            workdir: None,
-            name: None,
-            readonly: false,
-            mount_home: true,
-            remap_root: false,
-            gpu_devices: vec![],
-            environment: HashMap::new(),
-            container_env: HashMap::new(),
-            entrypoint: None,
-            uid: 1000,
-            gid: 1000,
-            username: "alice".into(),
-            home_dir: "/home/alice".into(),
-        };
-        let rootfs = Path::new("/tmp/test-rootfs");
-        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
-        assert!(script.contains("mount --bind /home/alice"));
+    fn test_build_container_resolv_conf_strips_loopback() {
+        let contents = build_container_resolv_conf();
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("nameserver") {
+                if let Some(ip) = trimmed.split_whitespace().nth(1) {
+                    assert!(
+                        !is_loopback_nameserver(ip),
+                        "loopback nameserver {ip} leaked into container resolv.conf"
+                    );
+                }
+            }
+        }
+        assert!(
+            contents.contains("nameserver"),
+            "container resolv.conf has no nameservers at all: {contents}"
+        );
     }
 
     #[test]
-    fn test_launch_script_no_mount_home_by_default() {
-        let config = ContainerConfig {
-            image: "test".into(),
-            mounts: vec![],
-            workdir: None,
-            name: None,
+    fn test_mount_dns_skips_user_mounted_resolv_conf() {
+        let rootfs = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(rootfs.path().join("etc")).unwrap();
+        let sentinel = "# user-provided resolv.conf\nnameserver 9.9.9.9\n";
+        std::fs::write(rootfs.path().join("etc/resolv.conf"), sentinel).unwrap();
+
+        let user_mounts = vec![BindMount {
+            source: "/dev/null".into(),
+            target: "/etc/resolv.conf".into(),
             readonly: false,
-            mount_home: false,
-            remap_root: false,
-            gpu_devices: vec![],
-            environment: HashMap::new(),
-            container_env: HashMap::new(),
-            entrypoint: None,
-            uid: 1000,
-            gid: 1000,
-            username: "alice".into(),
-            home_dir: "/home/alice".into(),
-        };
-        let rootfs = Path::new("/tmp/test-rootfs");
-        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
-        assert!(!script.contains("Hook: home"));
+        }];
+        mount_dns(rootfs.path(), &user_mounts).unwrap();
+
+        let after = std::fs::read_to_string(rootfs.path().join("etc/resolv.conf")).unwrap();
+        assert_eq!(
+            after, sentinel,
+            "mount_dns overwrote user-mounted resolv.conf"
+        );
     }
 
     #[test]
-    fn test_launch_script_has_infiniband_hook() {
-        let config = ContainerConfig {
-            image: "test".into(),
-            mounts: vec![],
-            workdir: None,
-            name: None,
-            readonly: false,
-            mount_home: false,
-            remap_root: false,
-            gpu_devices: vec![],
-            environment: HashMap::new(),
-            container_env: HashMap::new(),
-            entrypoint: None,
-            uid: 1000,
-            gid: 1000,
-            username: "testuser".into(),
-            home_dir: "/home/testuser".into(),
-        };
-        let rootfs = Path::new("/tmp/test-rootfs");
-        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
-        assert!(script.contains("/dev/infiniband"));
-        assert!(script.contains("libibverbs"));
-    }
+    fn test_close_inherited_fds_preserves_target() {
+        use std::os::unix::io::AsRawFd;
 
-    #[test]
-    fn test_launch_script_has_restricted_dev() {
-        let config = ContainerConfig {
-            image: "test".into(),
-            mounts: vec![],
-            workdir: None,
-            name: None,
-            readonly: false,
-            mount_home: false,
-            remap_root: false,
-            gpu_devices: vec![],
-            environment: HashMap::new(),
-            container_env: HashMap::new(),
-            entrypoint: None,
-            uid: 1000,
-            gid: 1000,
-            username: "testuser".into(),
-            home_dir: "/home/testuser".into(),
-        };
-        let rootfs = Path::new("/tmp/test-rootfs");
-        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
-        // Restricted /dev with essential devices only
-        assert!(script.contains("tmpfs tmpfs $ROOTFS/dev"));
-        assert!(script.contains("null zero random urandom tty console"));
-        assert!(script.contains("/dev/pts"));
-        assert!(script.contains("/dev/shm"));
-    }
+        // Run in a forked child so we don't close the test runner's fds
+        match unsafe { nix::unistd::fork().unwrap() } {
+            nix::unistd::ForkResult::Child => {
+                let f1 = std::fs::File::open("/dev/null").unwrap();
+                let f2 = std::fs::File::open("/dev/null").unwrap();
+                let preserve = std::fs::File::open("/dev/null").unwrap();
+                let preserve_fd = preserve.as_raw_fd();
+                let f1_fd = f1.as_raw_fd();
+                let f2_fd = f2.as_raw_fd();
 
-    #[test]
-    fn test_launch_script_container_env() {
-        let mut container_env = HashMap::new();
-        container_env.insert("MY_VAR".into(), "my_value".into());
-        container_env.insert("ANOTHER".into(), "val2".into());
-        let config = ContainerConfig {
-            image: "test".into(),
-            mounts: vec![],
-            workdir: None,
-            name: None,
-            readonly: false,
-            mount_home: false,
-            remap_root: false,
-            gpu_devices: vec![],
-            environment: HashMap::new(),
-            container_env,
-            entrypoint: None,
-            uid: 1000,
-            gid: 1000,
-            username: "testuser".into(),
-            home_dir: "/home/testuser".into(),
-        };
-        let rootfs = Path::new("/tmp/test-rootfs");
-        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
-        assert!(script.contains("MY_VAR='my_value'"));
-        assert!(script.contains("ANOTHER='val2'"));
-    }
+                std::mem::forget(f1);
+                std::mem::forget(f2);
+                std::mem::forget(preserve);
 
-    #[test]
-    fn test_launch_script_entrypoint() {
-        let config = ContainerConfig {
-            image: "test".into(),
-            mounts: vec![],
-            workdir: None,
-            name: None,
-            readonly: false,
-            mount_home: false,
-            remap_root: false,
-            gpu_devices: vec![],
-            environment: HashMap::new(),
-            container_env: HashMap::new(),
-            entrypoint: Some("/entrypoint.sh".into()),
-            uid: 1000,
-            gid: 1000,
-            username: "testuser".into(),
-            home_dir: "/home/testuser".into(),
-        };
-        let rootfs = Path::new("/tmp/test-rootfs");
-        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
-        assert!(script.contains("/entrypoint.sh &&"));
-    }
+                close_inherited_fds(preserve_fd);
 
-    #[test]
-    fn test_launch_script_config_hooks() {
-        let config = ContainerConfig {
-            image: "test".into(),
-            mounts: vec![],
-            workdir: None,
-            name: None,
-            readonly: false,
-            mount_home: false,
-            remap_root: false,
-            gpu_devices: vec![],
-            environment: HashMap::new(),
-            container_env: HashMap::new(),
-            entrypoint: None,
-            uid: 1000,
-            gid: 1000,
-            username: "testuser".into(),
-            home_dir: "/home/testuser".into(),
-        };
-        let rootfs = Path::new("/tmp/test-rootfs");
-        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
-        // Config hook directories
-        assert!(script.contains("container.d/hooks.d"));
-        assert!(script.contains("container.d/environ.d"));
-        assert!(script.contains("container.d/mounts.d"));
+                let preserved_ok =
+                    nix::fcntl::fcntl(preserve_fd, nix::fcntl::FcntlArg::F_GETFD).is_ok();
+                let f1_closed = nix::fcntl::fcntl(f1_fd, nix::fcntl::FcntlArg::F_GETFD).is_err();
+                let f2_closed = nix::fcntl::fcntl(f2_fd, nix::fcntl::FcntlArg::F_GETFD).is_err();
+
+                if preserved_ok && f1_closed && f2_closed {
+                    std::process::exit(0);
+                } else {
+                    std::process::exit(1);
+                }
+            }
+            nix::unistd::ForkResult::Parent { child } => {
+                let status = nix::sys::wait::waitpid(child, None).unwrap();
+                assert!(
+                    matches!(status, nix::sys::wait::WaitStatus::Exited(_, 0)),
+                    "close_inherited_fds did not preserve/close correctly: {:?}",
+                    status
+                );
+            }
+        }
     }
 }
