@@ -7,7 +7,6 @@ mod types;
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_uint};
-use std::ptr;
 use std::sync::OnceLock;
 
 use types::*;
