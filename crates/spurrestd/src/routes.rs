@@ -158,9 +158,17 @@ async fn get_jobs(
         .await
         .map_err(|e| error_response(&format!("connection failed: {}", e)))?;
 
+    let states: Vec<i32> = query
+        .state
+        .iter()
+        .flat_map(|s| s.split(','))
+        .filter_map(|s| parse_job_state(s.trim()))
+        .map(|s| s as i32)
+        .collect();
+
     let resp = client
         .get_jobs(spur_proto::proto::GetJobsRequest {
-            states: Vec::new(),
+            states,
             user: query.user.unwrap_or_default(),
             partition: query.partition.unwrap_or_default(),
             account: query.account.unwrap_or_default(),
@@ -454,5 +462,22 @@ fn node_state_name(state: i32) -> &'static str {
         5 => "draining",
         6 => "error",
         _ => "unknown",
+    }
+}
+
+fn parse_job_state(s: &str) -> Option<spur_proto::proto::JobState> {
+    use spur_proto::proto::JobState;
+    match s.to_uppercase().as_str() {
+        "PD" | "PENDING" => Some(JobState::JobPending),
+        "R" | "RUNNING" => Some(JobState::JobRunning),
+        "CG" | "COMPLETING" => Some(JobState::JobCompleting),
+        "CD" | "COMPLETED" => Some(JobState::JobCompleted),
+        "F" | "FAILED" => Some(JobState::JobFailed),
+        "CA" | "CANCELLED" => Some(JobState::JobCancelled),
+        "TO" | "TIMEOUT" => Some(JobState::JobTimeout),
+        "NF" | "NODE_FAIL" => Some(JobState::JobNodeFail),
+        "PR" | "PREEMPTED" => Some(JobState::JobPreempted),
+        "S" | "SUSPENDED" => Some(JobState::JobSuspended),
+        _ => None,
     }
 }
