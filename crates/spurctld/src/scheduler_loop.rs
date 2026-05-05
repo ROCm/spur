@@ -890,7 +890,7 @@ pub async fn send_cancel_to_agents(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spur_core::job::{Job, JobSpec, JobState};
+    use spur_core::job::{Job, JobSpec};
     use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
     use std::collections::HashMap;
 

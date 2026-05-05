@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
+use tracing::warn;
 
 use spur_core::reservation::Reservation;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
@@ -116,14 +117,18 @@ impl SlurmController for ControllerService {
         request: Request<SubmitJobRequest>,
     ) -> Result<Response<SubmitJobResponse>, Status> {
         if let Err(status) = self.check_leader(&request) {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.submit_job(fwd).await;
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.submit_job(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward submit_job to leader: {e}");
+                    return Err(status);
+                }
             }
-            return Err(status);
         }
 
         let spec = request
@@ -209,14 +214,18 @@ impl SlurmController for ControllerService {
 
     async fn cancel_job(&self, request: Request<CancelJobRequest>) -> Result<Response<()>, Status> {
         if let Err(status) = self.check_leader(&request) {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.cancel_job(fwd).await;
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.cancel_job(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward cancel_job to leader: {e}");
+                    return Err(status);
+                }
             }
-            return Err(status);
         }
 
         let req = request.into_inner();
@@ -242,14 +251,18 @@ impl SlurmController for ControllerService {
 
     async fn update_job(&self, request: Request<UpdateJobRequest>) -> Result<Response<()>, Status> {
         if let Err(status) = self.check_leader(&request) {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.update_job(fwd).await;
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.update_job(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward update_job to leader: {e}");
+                    return Err(status);
+                }
             }
-            return Err(status);
         }
 
         let req = request.into_inner();
@@ -341,14 +354,18 @@ impl SlurmController for ControllerService {
         request: Request<UpdateNodeRequest>,
     ) -> Result<Response<()>, Status> {
         if let Err(status) = self.check_leader(&request) {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.update_node(fwd).await;
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.update_node(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward update_node to leader: {e}");
+                    return Err(status);
+                }
             }
-            return Err(status);
         }
 
         let req = request.into_inner();
@@ -408,14 +425,18 @@ impl SlurmController for ControllerService {
         request: Request<RegisterAgentRequest>,
     ) -> Result<Response<RegisterAgentResponse>, Status> {
         if let Err(status) = self.check_leader(&request) {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.register_agent(fwd).await;
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.register_agent(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward register_agent to leader: {e}");
+                    return Err(status);
+                }
             }
-            return Err(status);
         }
 
         // Extract the remote IP from the gRPC connection as fallback
@@ -476,14 +497,18 @@ impl SlurmController for ControllerService {
         request: Request<ReportJobStatusRequest>,
     ) -> Result<Response<()>, Status> {
         if let Err(status) = self.check_leader(&request) {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.report_job_status(fwd).await;
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.report_job_status(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward report_job_status to leader: {e}");
+                    return Err(status);
+                }
             }
-            return Err(status);
         }
 
         let req = request.into_inner();
@@ -504,15 +529,18 @@ impl SlurmController for ControllerService {
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
         if let Err(status) = self.check_leader(&request) {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.heartbeat(fwd).await;
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.heartbeat(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward heartbeat to leader: {e}");
+                    return Err(status);
+                }
             }
-            #[allow(unreachable_code)]
-            return Err(status);
         }
 
         let req = request.into_inner();
@@ -563,14 +591,18 @@ impl SlurmController for ControllerService {
         request: Request<CreateJobStepRequest>,
     ) -> Result<Response<CreateJobStepResponse>, Status> {
         if let Err(status) = self.check_leader(&request) {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.create_job_step(fwd).await;
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.create_job_step(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward create_job_step to leader: {e}");
+                    return Err(status);
+                }
             }
-            return Err(status);
         }
 
         let req = request.into_inner();
@@ -619,14 +651,18 @@ impl SlurmController for ControllerService {
         request: Request<CreateReservationRequest>,
     ) -> Result<Response<()>, Status> {
         if let Err(status) = self.check_leader(&request) {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.create_reservation(fwd).await;
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.create_reservation(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward create_reservation to leader: {e}");
+                    return Err(status);
+                }
             }
-            return Err(status);
         }
 
         let req = request.into_inner();
@@ -663,14 +699,18 @@ impl SlurmController for ControllerService {
         request: Request<UpdateReservationRequest>,
     ) -> Result<Response<()>, Status> {
         if let Err(status) = self.check_leader(&request) {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.update_reservation(fwd).await;
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.update_reservation(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward update_reservation to leader: {e}");
+                    return Err(status);
+                }
             }
-            return Err(status);
         }
 
         let req = request.into_inner();
@@ -694,14 +734,18 @@ impl SlurmController for ControllerService {
         request: Request<DeleteReservationRequest>,
     ) -> Result<Response<()>, Status> {
         if let Err(status) = self.check_leader(&request) {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.delete_reservation(fwd).await;
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.delete_reservation(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward delete_reservation to leader: {e}");
+                    return Err(status);
+                }
             }
-            return Err(status);
         }
 
         let name = request.into_inner().name;
