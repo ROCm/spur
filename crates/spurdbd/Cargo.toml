@@ -10,7 +10,6 @@ path = "src/main.rs"
 [dependencies]
 spur-proto = { path = "../spur-proto" }
 spur-core = { path = "../spur-core" }
-spur-sched = { path = "../spur-sched" }
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost-types = { workspace = true }

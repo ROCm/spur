@@ -52,21 +52,6 @@ pub fn compute_fairshare(
     factors
 }
 
-/// Compute effective priority for a job given fair-share data.
-pub fn effective_priority(
-    base_priority: u32,
-    fair_share_factor: f64,
-    age_minutes: i64,
-    partition_tier: u32,
-) -> u32 {
-    spur_sched::priority::effective_priority(
-        base_priority,
-        fair_share_factor,
-        age_minutes,
-        partition_tier,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
