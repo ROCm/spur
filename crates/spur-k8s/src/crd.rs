@@ -181,8 +181,10 @@ pub struct SpurJobStatus {
 pub fn to_core_job_spec(spec: &SpurJobSpec, user: &str) -> spur_core::job::JobSpec {
     let mut gres = Vec::new();
     if spec.gpus.count > 0 {
-        let gpu_type = spec.gpus.gpu_type.as_deref().unwrap_or("any");
-        gres.push(format!("gpu:{}:{}", gpu_type, spec.gpus.count));
+        gres.push(crate::agent::gpu_request_to_gres(
+            spec.gpus.count,
+            spec.gpus.gpu_type.as_deref(),
+        ));
     }
 
     let memory_per_node_mb = spec

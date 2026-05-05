@@ -782,10 +782,9 @@ fn is_nvidia_gpu(gpu_type: &str) -> bool {
 
 /// Build a gres string from GPU count and type.
 pub fn gpu_request_to_gres(count: u32, gpu_type: Option<&str>) -> String {
-    match gpu_type {
-        Some(t) if !t.is_empty() => format!("gpu:{}:{}", t, count),
-        _ => format!("gpu:{}", count),
-    }
+    let t = gpu_type.unwrap_or("any");
+    let t = if t.is_empty() { "any" } else { t };
+    format!("gpu:{}:{}", t, count)
 }
 
 #[cfg(test)]
@@ -797,8 +796,8 @@ mod tests {
     #[test]
     fn test_gpu_request_to_gres() {
         assert_eq!(gpu_request_to_gres(8, Some("mi300x")), "gpu:mi300x:8");
-        assert_eq!(gpu_request_to_gres(4, None), "gpu:4");
-        assert_eq!(gpu_request_to_gres(2, Some("")), "gpu:2");
+        assert_eq!(gpu_request_to_gres(4, None), "gpu:any:4");
+        assert_eq!(gpu_request_to_gres(2, Some("")), "gpu:any:2");
     }
 
     #[test]
