@@ -4,11 +4,11 @@
 //! the spank_* callback API (11 hooks, ~12 API functions).
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::path::{Path, PathBuf};
 
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// SPANK callback hook points (matches Slurm's spank.h).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -158,11 +158,12 @@ impl SpankHost {
 
                 match func {
                     Ok(f) => {
-                        debug!(plugin = %plugin.name, hook = symbol, "invoking SPANK hook");
+                        debug!(plugin = %plugin.name, path = %plugin.path.display(), hook = symbol, "invoking SPANK hook");
                         let rc = unsafe { f(handle_ptr, 0, std::ptr::null_mut()) };
                         if rc != 0 {
                             warn!(
                                 plugin = %plugin.name,
+                                path = %plugin.path.display(),
                                 hook = symbol,
                                 rc,
                                 "SPANK hook returned error"
@@ -178,6 +179,7 @@ impl SpankHost {
                         // Plugin doesn't implement this hook — that's fine
                         debug!(
                             plugin = %plugin.name,
+                            path = %plugin.path.display(),
                             hook = symbol,
                             "SPANK hook not found, skipping"
                         );
