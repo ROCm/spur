@@ -12,7 +12,7 @@
 //! restriction for those.
 
 use std::path::Path;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 // Landlock ABI constants (from linux/landlock.h)
 const LANDLOCK_CREATE_RULESET: i64 = 444;

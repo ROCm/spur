@@ -1,8 +1,7 @@
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
-use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
+use spur_core::resource::{GpuLinkType, ResourceSet};
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{RegisterAgentRequest, ResourceSet as ProtoResourceSet};
 use tracing::{debug, info, warn};

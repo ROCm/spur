@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 
 use tokio_stream::wrappers::ReceiverStream;
 
-use spur_proto::proto::slurm_agent_server::{SlurmAgent, SlurmAgentServer};
+use spur_proto::proto::slurm_agent_server::SlurmAgent;
 use spur_proto::proto::*;
 
 use spur_sched::cons_tres::{AllocationResult, NodeAllocation};
@@ -116,6 +116,7 @@ impl AgentService {
                     i32,
                     crate::container::RootfsMode,
                     Option<AllocationResult>,
+                    Option<std::path::PathBuf>,
                 )> = Vec::new();
 
                 for (job_id, tracked) in jobs.iter_mut() {
@@ -127,6 +128,7 @@ impl AgentService {
                                 exit_code,
                                 tracked.rootfs_mode.clone(),
                                 tracked.allocation.take(),
+                                tracked.job.take_cgroup(),
                             ));
                         }
                         Ok(None) => {}
@@ -136,9 +138,12 @@ impl AgentService {
                     }
                 }
 
-                for (job_id, _exit_code, mode, alloc) in &completed {
+                for (job_id, _exit_code, mode, alloc, cgroup) in &completed {
                     jobs.remove(job_id);
                     crate::container::cleanup_rootfs(*job_id, mode);
+                    if let Some(cgroup) = cgroup {
+                        crate::executor::cleanup_cgroup(cgroup);
+                    }
                     // Release GPU/CPU allocation
                     if let Some(alloc) = alloc {
                         allocation.lock().await.release(alloc);
@@ -156,7 +161,7 @@ impl AgentService {
 
                 // Invoke SPANK TaskExit and JobEpilog hooks for completed jobs
                 if let Some(ref spank_host) = *spank {
-                    for (job_id, _exit_code, _mode, _alloc) in &completed {
+                    for (job_id, _exit_code, _mode, _alloc, _cgroup) in &completed {
                         if let Err(e) = spank_host.invoke_hook(SpankHook::TaskExit) {
                             warn!(job_id, error = %e, "SPANK TaskExit hook failed");
                         }
@@ -166,7 +171,7 @@ impl AgentService {
                     }
                 }
 
-                for (job_id, exit_code, _mode, _alloc) in &completed {
+                for (job_id, exit_code, _mode, _alloc, _cgroup) in &completed {
                     report_completion(&controller_addr, *job_id, *exit_code).await;
                 }
             }
@@ -781,7 +786,6 @@ impl SlurmAgent for AgentService {
         // Drop privilege if requested (and we're root). Mirrors the privilege
         // drop in launch_job's non-namespace path.
         if req.uid > 0 && nix::unistd::geteuid().is_root() {
-            use std::os::unix::process::CommandExt;
             let target_uid = req.uid;
             let target_gid = req.gid;
             unsafe {
@@ -1120,11 +1124,6 @@ impl AgentService {
     }
 }
 
-pub fn create_server(reporter: Arc<NodeReporter>) -> SlurmAgentServer<AgentService> {
-    let service = AgentService::new(reporter);
-    SlurmAgentServer::new(service)
-}
-
 #[cfg(test)]
 impl TrackedJob {
     fn dummy(_pid: u32) -> Self {
@@ -1134,7 +1133,6 @@ impl TrackedJob {
             .expect("failed to spawn dummy process");
         Self {
             job: executor::RunningJob::Managed {
-                job_id: 0,
                 child,
                 cgroup_path: None,
             },

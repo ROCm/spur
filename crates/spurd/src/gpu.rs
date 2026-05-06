@@ -1,6 +1,6 @@
 use spur_core::resource::{GpuLinkType, GpuResource};
 use std::path::Path;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Discover GPUs from sysfs (works for both AMD and NVIDIA).
 pub fn discover_gpus() -> Vec<GpuResource> {
@@ -158,7 +158,7 @@ fn read_amd_vram_mb(device_path: &Path) -> u64 {
     0
 }
 
-fn detect_amd_topology(device_path: &Path, device_id: u32) -> (Vec<u32>, GpuLinkType) {
+fn detect_amd_topology(device_path: &Path, _device_id: u32) -> (Vec<u32>, GpuLinkType) {
     // Check for xGMI links via /sys/class/drm/cardN/device/amdgpu_xgmi_*
     let xgmi_hive = device_path.join("xgmi_hive_info");
     if xgmi_hive.exists() {
