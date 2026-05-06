@@ -201,7 +201,7 @@ impl ClusterManager {
 
     /// Cancel a job.
     pub fn cancel_job(&self, job_id: JobId, _user: &str) -> anyhow::Result<()> {
-        let old_state = {
+        {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
@@ -209,8 +209,7 @@ impl ClusterManager {
             if job.state.is_terminal() {
                 anyhow::bail!("job {} is already {:?}", job_id, job.state);
             }
-            job.state
-        };
+        }
 
         // Use JobComplete (not JobStateChange) so that resource deallocation
         // fires for any allocated nodes. For pending jobs, allocated_nodes is empty
@@ -782,20 +781,6 @@ impl ClusterManager {
         debug!(job_id, step_id, "step created");
     }
 
-    /// Complete a job step.
-    pub fn complete_step(&self, job_id: JobId, step_id: u32, exit_code: i32) {
-        if let Some(step) = self.steps.write().get_mut(&(job_id, step_id)) {
-            step.state = if exit_code == 0 {
-                StepState::Completed
-            } else {
-                StepState::Failed
-            };
-            step.exit_code = Some(exit_code);
-            step.end_time = Some(Utc::now());
-            debug!(job_id, step_id, exit_code, "step completed");
-        }
-    }
-
     /// Get all steps for a job.
     pub fn get_steps(&self, job_id: JobId) -> Vec<JobStep> {
         self.steps
@@ -981,16 +966,6 @@ impl ClusterManager {
         pending
     }
 
-    /// Find jobs by name and user (for singleton dependency).
-    pub fn get_jobs_by_name_user(&self, name: &str, user: &str) -> Vec<Job> {
-        self.jobs
-            .read()
-            .values()
-            .filter(|j| j.spec.name == name && j.spec.user == user)
-            .cloned()
-            .collect()
-    }
-
     /// Create a new reservation.
     pub fn create_reservation(&self, res: Reservation) -> anyhow::Result<()> {
         let mut reservations = self.reservations.write();
@@ -1079,8 +1054,6 @@ impl ClusterManager {
         cluster_state: &spur_sched::traits::ClusterState,
     ) {
         use spur_core::job::PendingReason;
-        use spur_sched::backfill::BackfillScheduler;
-        use spur_sched::traits::Scheduler;
 
         let mut jobs = self.jobs.write();
 
