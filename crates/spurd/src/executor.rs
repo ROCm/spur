@@ -4,66 +4,20 @@ use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 
 use anyhow::{bail, Context};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use tokio::process::Command;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use spur_core::job::JobId;
-use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_spank::SpankHost;
 
 use crate::container::ContainerConfig;
-use crate::reporter::NodeReporter;
 
 /// Cgroup root for slurmd-managed jobs.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup/spur";
-
-/// Job execution loop: polls controller for assigned jobs and runs them.
-pub async fn job_execution_loop(reporter: Arc<NodeReporter>) {
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
-    let mut running: HashMap<JobId, RunningJob> = HashMap::new();
-
-    loop {
-        interval.tick().await;
-
-        // Check status of running jobs
-        let mut completed = Vec::new();
-        for (job_id, rj) in running.iter_mut() {
-            if let Ok(Some(status)) = rj.try_wait() {
-                info!(job_id, exit_code = status, "job completed");
-                completed.push((*job_id, status));
-            }
-        }
-
-        // Report completions to controller
-        for (job_id, exit_code) in &completed {
-            running.remove(job_id);
-            if let Err(e) = report_completion(&reporter.controller_addr, *job_id, *exit_code).await
-            {
-                warn!(job_id, error = %e, "failed to report job completion");
-            }
-        }
-
-        // Poll for new jobs (via GetJobs filtered to RUNNING state for our node)
-        // In a full implementation, the controller pushes jobs via streaming.
-        // For now, we rely on the scheduler_loop in slurmctld to track assignments.
-    }
-}
-
-/// Report job completion back to the controller.
-async fn report_completion(
-    controller_addr: &str,
-    job_id: JobId,
-    exit_code: i32,
-) -> anyhow::Result<()> {
-    // Stub: completion is reported via ReportJobStatus RPC from the agent server.
-    debug!(job_id, exit_code, "would report completion to controller");
-    Ok(())
-}
 
 pub struct ContainerLaunchConfig {
     pub config: ContainerConfig,
@@ -74,13 +28,11 @@ pub struct ContainerLaunchConfig {
 pub enum RunningJob {
     /// Non-container jobs managed by tokio::process::Child.
     Managed {
-        job_id: JobId,
         child: tokio::process::Child,
         cgroup_path: Option<PathBuf>,
     },
     /// Container jobs: raw fork with optional pidfd for PID-recycling safety.
     Forked {
-        job_id: JobId,
         pid: i32,
         /// Holds a kernel reference preventing PID recycling. None on kernels < 5.3.
         _pidfd: Option<OwnedFd>,
@@ -102,13 +54,6 @@ impl RunningJob {
         match self {
             RunningJob::Managed { child, .. } => child.id(),
             RunningJob::Forked { pid, .. } => Some(*pid as u32),
-        }
-    }
-
-    pub fn job_id(&self) -> JobId {
-        match self {
-            RunningJob::Managed { job_id, .. } => *job_id,
-            RunningJob::Forked { job_id, .. } => *job_id,
         }
     }
 
@@ -423,7 +368,6 @@ pub async fn launch_job(
     // unshare(2) to fail with EPERM since the unprivileged user lacks
     // CAP_SYS_ADMIN.
     if uid > 0 && nix::unistd::geteuid().is_root() && !use_namespaces {
-        use std::os::unix::process::CommandExt;
         let target_uid = uid;
         let target_gid = gid;
         unsafe {
@@ -454,7 +398,6 @@ pub async fn launch_job(
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
     if enable_seccomp {
-        use std::os::unix::process::CommandExt;
         unsafe {
             cmd.pre_exec(|| {
                 if let Err(e) = crate::seccomp::apply_seccomp_filter() {
@@ -471,7 +414,6 @@ pub async fn launch_job(
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
     if enable_landlock {
-        use std::os::unix::process::CommandExt;
         unsafe {
             cmd.pre_exec(move || {
                 if let Err(e) = crate::landlock::apply_landlock_rules(&work_dir_for_landlock) {
@@ -498,11 +440,7 @@ pub async fn launch_job(
         "job process spawned"
     );
 
-    Ok(RunningJob::Managed {
-        job_id,
-        child,
-        cgroup_path,
-    })
+    Ok(RunningJob::Managed { child, cgroup_path })
 }
 
 /// Set up a cgroups v2 hierarchy for a job.
@@ -596,7 +534,7 @@ fn move_to_cgroup(cgroup_path: &Path, pid: u32) -> bool {
 }
 
 /// Clean up a job's cgroup.
-fn cleanup_cgroup(cgroup_path: &Path) {
+pub fn cleanup_cgroup(cgroup_path: &Path) {
     // Kill any remaining processes
     if let Ok(pids) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) {
         for pid_str in pids.lines() {
@@ -610,11 +548,6 @@ fn cleanup_cgroup(cgroup_path: &Path) {
     if let Err(e) = std::fs::remove_dir(cgroup_path) {
         debug!(error = %e, path = %cgroup_path.display(), "failed to remove cgroup");
     }
-}
-
-/// Send a signal to a running job.
-pub fn signal_job(job: &RunningJob, sig: Signal) -> anyhow::Result<()> {
-    job.kill_signal(sig)
 }
 
 /// Recursively signal a process and all its descendants (children first).
@@ -666,17 +599,6 @@ async fn run_hook(
     Ok(())
 }
 
-/// Run epilog after job completion (best-effort).
-pub async fn run_epilog(job_id: JobId, work_dir: &str) {
-    if let Ok(epilog) = std::env::var("SPUR_EPILOG") {
-        if !epilog.is_empty() {
-            if let Err(e) = run_hook(&epilog, job_id, work_dir, "epilog").await {
-                warn!(job_id, error = %e, "epilog failed");
-            }
-        }
-    }
-}
-
 /// Resolve output path patterns (%j → job_id, etc.)
 fn resolve_output_path(pattern: &str, job_id: JobId, work_dir: &str) -> String {
     let resolved = if pattern.is_empty() {
@@ -716,7 +638,7 @@ async fn launch_container_job(
     cpus: u32,
     memory_mb: u64,
     cpu_ids: &[u32],
-    work_dir: &str,
+    _work_dir: &str,
 ) -> anyhow::Result<RunningJob> {
     let cgroup_path = setup_cgroup(job_id, cpus, memory_mb, cpu_ids)?;
 
@@ -883,7 +805,6 @@ async fn launch_container_job(
             );
 
             Ok(RunningJob::Forked {
-                job_id,
                 pid: child_pid,
                 _pidfd: pidfd,
                 cgroup_path,

@@ -1228,17 +1228,6 @@ fn sanitize_name(name: &str) -> String {
         .replace(':', "+")
 }
 
-/// Check if a binary is on PATH.
-fn which(name: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(name)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1757,18 +1746,6 @@ mod tests {
         // Should not panic when cleaning up a rootfs that doesn't exist
         cleanup_rootfs(999999, &RootfsMode::Extracted);
         cleanup_rootfs(999998, &RootfsMode::Overlay);
-    }
-
-    // --- Which ---
-
-    #[test]
-    fn test_which_finds_bash() {
-        assert!(which("bash"));
-    }
-
-    #[test]
-    fn test_which_not_found() {
-        assert!(!which("nonexistent-binary-that-doesnt-exist-xyz"));
     }
 
     // --- run_hooks ---
