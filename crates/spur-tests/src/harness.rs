@@ -3,12 +3,10 @@
 //! Provides helpers for standing up test clusters, submitting jobs,
 //! and asserting state transitions.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
 
 use spur_core::config::SlurmConfig;
-use spur_core::job::{Job, JobId, JobSpec, JobState};
+use spur_core::job::{Job, JobSpec, JobState};
 use spur_core::node::{Node, NodeState};
 use spur_core::partition::{Partition, PartitionState};
 use spur_core::resource::ResourceSet;

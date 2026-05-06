@@ -218,7 +218,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let mut job = Job::new(
+        let job = Job::new(
             1,
             JobSpec {
                 name: "test".into(),

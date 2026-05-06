@@ -9,7 +9,6 @@ mod tests {
     use chrono::{Duration, Utc};
     use spur_core::job::*;
     use spur_core::node::*;
-    use spur_core::partition::*;
     use spur_core::resource::*;
     use spur_sched::backfill::BackfillScheduler;
     use spur_sched::timeline::NodeTimeline;
