@@ -10,6 +10,12 @@ spur-core = { path = "../spur-core" }
 spur-sched = { path = "../spur-sched" }
 
 spur-spank = { path = "../spur-spank" }
+spur-k8s = { path = "../spur-k8s" }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+schemars = { workspace = true }
+futures-util = { workspace = true }
+tracing = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost-types = { workspace = true }
@@ -17,9 +23,12 @@ chrono = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-libc = "0.2"
+serde_yaml = "0.9"
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 jsonwebtoken.workspace = true
+
+[dev-dependencies]
+serial_test = "3.4.0"
