@@ -11,8 +11,8 @@ on:
 #   CLUSTER_NAME      - Cluster identifier (e.g. "mi300x-cluster")
 #   CONTROLLER_HOST   - SSH hostname/alias for the controller node
 #   CONTROLLER_IP     - Controller's advertised IP (agents connect to this)
-#   AGENT_HOSTS       - Space-separated SSH hostnames of agent-only nodes (can be empty)
-#   AGENT_IPS         - Corresponding advertised IPs, space-separated, same order as AGENT_HOSTS
+#   COMPUTE_NODE_HOSTS       - Space-separated SSH hostnames of compute nodes (can be empty)
+#   COMPUTE_NODE_IPS         - Corresponding advertised IPs, space-separated, same order as COMPUTE_NODE_HOSTS
 #   REMOTE_USER       - SSH username on all cluster nodes
 #   SPUR_HOME         - Spur install directory on remote nodes (e.g. /home/amd/spur)
 #   NODE_CPUS         - CPU count per node (default: 256)
@@ -71,8 +71,8 @@ jobs:
       CLUSTER_NAME:    ${{ vars.CLUSTER_NAME }}
       CONTROLLER_HOST: ${{ vars.CONTROLLER_HOST }}
       CONTROLLER_IP:   ${{ vars.CONTROLLER_IP }}
-      AGENT_HOSTS:     ${{ vars.AGENT_HOSTS }}
-      AGENT_IPS:       ${{ vars.AGENT_IPS }}
+      COMPUTE_NODE_HOSTS:     ${{ vars.COMPUTE_NODE_HOSTS }}
+      COMPUTE_NODE_IPS:       ${{ vars.COMPUTE_NODE_IPS }}
       REMOTE_USER:     ${{ vars.REMOTE_USER }}
       SPUR_HOME:       ${{ vars.SPUR_HOME }}
       NODE_CPUS:       ${{ vars.NODE_CPUS || '256' }}
@@ -128,11 +128,11 @@ jobs:
           format = "text"
           EOF
 
-          # Build the full host list: controller first, then agents
-          read -ra AGENT_HOST_ARR <<< "${AGENT_HOSTS}"
-          read -ra AGENT_IP_ARR  <<< "${AGENT_IPS}"
-          ALL_HOSTS=("${CONTROLLER_HOST}" "${AGENT_HOST_ARR[@]}")
-          ALL_IPS=("${CONTROLLER_IP}"   "${AGENT_IP_ARR[@]}")
+          # Build the full host list: controller first, then compute nodes
+          read -ra COMPUTE_NODE_HOST_ARR <<< "${COMPUTE_NODE_HOSTS}"
+          read -ra COMPUTE_NODE_IP_ARR  <<< "${COMPUTE_NODE_IPS}"
+          ALL_HOSTS=("${CONTROLLER_HOST}" "${COMPUTE_NODE_HOST_ARR[@]}")
+          ALL_IPS=("${CONTROLLER_IP}"   "${COMPUTE_NODE_IP_ARR[@]}")
 
           # Append [[partitions]]
           {
@@ -167,12 +167,12 @@ jobs:
         run: |
           set -euo pipefail
           SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
-          read -ra AGENT_HOST_ARR <<< "${AGENT_HOSTS}"
+          read -ra COMPUTE_NODE_HOST_ARR <<< "${COMPUTE_NODE_HOSTS}"
 
-          for host in "${AGENT_HOST_ARR[@]}"; do
-            echo "==> Stopping agent on ${host}..."
+          for host in "${COMPUTE_NODE_HOST_ARR[@]}"; do
+            echo "==> Stopping compute node ${host}..."
             $SSH "${REMOTE_USER}@${host}" \
-              "[ -f ${SPUR_HOME}/etc/stop-agent.sh ] && bash ${SPUR_HOME}/etc/stop-agent.sh || pkill -f 'spurd.*controller' 2>/dev/null || true"
+              "[ -f ${SPUR_HOME}/etc/stop-compute-node.sh ] && bash ${SPUR_HOME}/etc/stop-compute-node.sh || pkill -f 'spurd.*controller' 2>/dev/null || true"
           done
 
           echo "==> Stopping controller on ${CONTROLLER_HOST}..."
@@ -185,9 +185,9 @@ jobs:
         run: |
           set -euo pipefail
           SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
-          read -ra AGENT_HOST_ARR <<< "${AGENT_HOSTS}"
+          read -ra COMPUTE_NODE_HOST_ARR <<< "${COMPUTE_NODE_HOSTS}"
 
-          for host in "${CONTROLLER_HOST}" "${AGENT_HOST_ARR[@]}"; do
+          for host in "${CONTROLLER_HOST}" "${COMPUTE_NODE_HOST_ARR[@]}"; do
             echo "==> Clearing state on ${host}..."
             $SSH "${REMOTE_USER}@${host}" "rm -rf ${SPUR_HOME}/state/*" 2>/dev/null || true
           done
@@ -196,9 +196,9 @@ jobs:
         run: |
           set -euo pipefail
           SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
-          read -ra AGENT_HOST_ARR <<< "${AGENT_HOSTS}"
+          read -ra COMPUTE_NODE_HOST_ARR <<< "${COMPUTE_NODE_HOSTS}"
 
-          for host in "${CONTROLLER_HOST}" "${AGENT_HOST_ARR[@]}"; do
+          for host in "${CONTROLLER_HOST}" "${COMPUTE_NODE_HOST_ARR[@]}"; do
             echo "==> Creating directories on ${host}..."
             $SSH "${REMOTE_USER}@${host}" "mkdir -p ${SPUR_HOME}/{bin,etc,state,log}"
           done
@@ -223,13 +223,13 @@ jobs:
           $SSH "${REMOTE_USER}@${CONTROLLER_HOST}" \
             "cd ${SPUR_HOME}/bin && for cmd in sbatch srun squeue scancel sinfo sacct scontrol; do ln -sf spur \$cmd; done"
 
-      - name: Push binaries to agent nodes
+      - name: Push binaries to compute nodes
         run: |
           set -euo pipefail
           SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
-          read -ra AGENT_HOST_ARR <<< "${AGENT_HOSTS}"
+          read -ra COMPUTE_NODE_HOST_ARR <<< "${COMPUTE_NODE_HOSTS}"
 
-          for host in "${AGENT_HOST_ARR[@]}"; do
+          for host in "${COMPUTE_NODE_HOST_ARR[@]}"; do
             echo "==> Pushing binaries to ${host}..."
             sshpass -e rsync -e "ssh -o StrictHostKeyChecking=no" -av --checksum \
               /tmp/spur-artifacts/bin/spurd \
@@ -243,7 +243,7 @@ jobs:
       - name: Generate start/stop scripts on controller
         env:
           CONTROLLER_PORT: 6817
-          AGENT_PORT: 6818
+          COMPUTE_NODE_PORT: 6818
         run: |
           SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 
@@ -313,18 +313,18 @@ jobs:
           EOF
           $SSH "${REMOTE_USER}@${CONTROLLER_HOST}" "chmod +x ${SPUR_HOME}/etc/stop-all.sh"
 
-      - name: Generate start/stop scripts on agent nodes
+      - name: Generate start/stop scripts on compute nodes
         run: |
           set -euo pipefail
           SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
-          read -ra AGENT_HOST_ARR <<< "${AGENT_HOSTS}"
-          read -ra AGENT_IP_ARR  <<< "${AGENT_IPS}"
+          read -ra COMPUTE_NODE_HOST_ARR <<< "${COMPUTE_NODE_HOSTS}"
+          read -ra COMPUTE_NODE_IP_ARR  <<< "${COMPUTE_NODE_IPS}"
 
-          for i in "${!AGENT_HOST_ARR[@]}"; do
-            host="${AGENT_HOST_ARR[$i]}"
-            ip="${AGENT_IP_ARR[$i]}"
+          for i in "${!COMPUTE_NODE_HOST_ARR[@]}"; do
+            host="${COMPUTE_NODE_HOST_ARR[$i]}"
+            ip="${COMPUTE_NODE_IP_ARR[$i]}"
 
-            $SSH "${REMOTE_USER}@${host}" "cat > ${SPUR_HOME}/etc/start-agent.sh" << EOF
+            $SSH "${REMOTE_USER}@${host}" "cat > ${SPUR_HOME}/etc/start-compute-node.sh" << EOF
           #!/bin/bash
           set -euo pipefail
           export PATH="${SPUR_HOME}/bin:\${PATH}"
@@ -343,27 +343,27 @@ jobs:
           echo "  PID: \$!"
           echo "Agent started. Log: ${SPUR_HOME}/log/spurd.log"
           EOF
-            $SSH "${REMOTE_USER}@${host}" "chmod +x ${SPUR_HOME}/etc/start-agent.sh"
+            $SSH "${REMOTE_USER}@${host}" "chmod +x ${SPUR_HOME}/etc/start-compute-node.sh"
 
-            $SSH "${REMOTE_USER}@${host}" "cat > ${SPUR_HOME}/etc/stop-agent.sh" << 'EOF'
+            $SSH "${REMOTE_USER}@${host}" "cat > ${SPUR_HOME}/etc/stop-compute-node.sh" << 'EOF'
           #!/bin/bash
           pkill -f 'spurd.*controller' 2>/dev/null && echo "  spurd stopped" || echo "  spurd not running"
           EOF
-            $SSH "${REMOTE_USER}@${host}" "chmod +x ${SPUR_HOME}/etc/stop-agent.sh"
+            $SSH "${REMOTE_USER}@${host}" "chmod +x ${SPUR_HOME}/etc/stop-compute-node.sh"
           done
 
       - name: Start cluster
         run: |
           set -euo pipefail
           SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
-          read -ra AGENT_HOST_ARR <<< "${AGENT_HOSTS}"
+          read -ra COMPUTE_NODE_HOST_ARR <<< "${COMPUTE_NODE_HOSTS}"
 
           echo "==> Starting controller..."
           $SSH "${REMOTE_USER}@${CONTROLLER_HOST}" "bash ${SPUR_HOME}/etc/start-controller.sh"
 
-          for host in "${AGENT_HOST_ARR[@]}"; do
-            echo "==> Starting agent on ${host}..."
-            $SSH "${REMOTE_USER}@${host}" "bash ${SPUR_HOME}/etc/start-agent.sh"
+          for host in "${COMPUTE_NODE_HOST_ARR[@]}"; do
+            echo "==> Starting compute node ${host}..."
+            $SSH "${REMOTE_USER}@${host}" "bash ${SPUR_HOME}/etc/start-compute-node.sh"
           done
 
           sleep 5
@@ -372,8 +372,8 @@ jobs:
         run: |
           set -euo pipefail
           SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
-          read -ra AGENT_HOST_ARR <<< "${AGENT_HOSTS}"
-          EXPECTED_NODES=$(( 1 + ${#AGENT_HOST_ARR[@]} ))
+          read -ra COMPUTE_NODE_HOST_ARR <<< "${COMPUTE_NODE_HOSTS}"
+          EXPECTED_NODES=$(( 1 + ${#COMPUTE_NODE_HOST_ARR[@]} ))
 
           echo "==> Cluster state (expecting ${EXPECTED_NODES} idle node(s)):"
           $SSH "${REMOTE_USER}@${CONTROLLER_HOST}" "${SPUR_HOME}/bin/sinfo"
@@ -400,10 +400,10 @@ jobs:
       #   if: always()
       #   run: |
       #     SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
-      #     read -ra AGENT_HOST_ARR <<< "${AGENT_HOSTS}"
+      #     read -ra COMPUTE_NODE_HOST_ARR <<< "${COMPUTE_NODE_HOSTS}"
 
-      #     for host in "${AGENT_HOST_ARR[@]}"; do
-      #       $SSH "${REMOTE_USER}@${host}" "bash ${SPUR_HOME}/etc/stop-agent.sh" 2>/dev/null || true
+      #     for host in "${COMPUTE_NODE_HOST_ARR[@]}"; do
+      #       $SSH "${REMOTE_USER}@${host}" "bash ${SPUR_HOME}/etc/stop-compute-node.sh" 2>/dev/null || true
       #     done
 
       #     $SSH "${REMOTE_USER}@${CONTROLLER_HOST}" "bash ${SPUR_HOME}/etc/stop-all.sh" 2>/dev/null || true
