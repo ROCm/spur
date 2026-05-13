@@ -1,0 +1,409 @@
+name: Build and Deploy Spur (Bare Metal)
+
+on:
+  # pull_request:
+  #   branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Required vars (set in GitHub Actions → Settings → Variables):
+#   CLUSTER_NAME      - Cluster identifier (e.g. "mi300x-cluster")
+#   CONTROLLER_HOST   - SSH hostname/alias for the controller node
+#   CONTROLLER_IP     - Controller's advertised IP (agents connect to this)
+#   AGENT_HOSTS       - Space-separated SSH hostnames of agent-only nodes (can be empty)
+#   AGENT_IPS         - Corresponding advertised IPs, space-separated, same order as AGENT_HOSTS
+#   REMOTE_USER       - SSH username on all cluster nodes
+#   SPUR_HOME         - Spur install directory on remote nodes (e.g. /home/amd/spur)
+#   NODE_CPUS         - CPU count per node (default: 256)
+#   NODE_MEMORY_MB    - Memory per node in MiB (default: 2097152)
+#   NODE_GPUS         - GPU count per node (default: 8)
+#   PG_DB_URL         - PostgreSQL connection URL for spurdbd (default: postgresql://spur:Spur123!@localhost/spur)
+#
+# Required secrets (set in GitHub Actions → Settings → Secrets):
+#   SSH_PASSWORD      - SSH password for REMOTE_USER on all cluster nodes
+
+jobs:
+  # ── 1. Build release binaries ──────────────────────────────────
+  build:
+    name: Build Release Binaries
+    runs-on: [self-hosted, amd-aac02-rocm]
+    outputs:
+      sha: ${{ github.sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build release binaries
+        run: |
+          export PATH="$HOME/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          export PROTOC="$HOME/bin/protoc"
+          export PROTOC_INCLUDE="$HOME/protoc-install/include"
+          cargo build --release -j 4
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p /tmp/spur-artifacts/bin
+          cp target/release/spurctld \
+             target/release/spurd \
+             target/release/spurrestd \
+             target/release/spurdbd \
+             target/release/spur \
+             /tmp/spur-artifacts/bin/
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: spur-binaries-${{ github.sha }}
+          path: /tmp/spur-artifacts/bin/
+          retention-days: 1
+
+
+  # ── 2. Deploy to bare metal cluster ────────────────────────────
+  deploy:
+    name: Deploy to Bare Metal
+    runs-on: [self-hosted, amd-aac02-rocm]
+    needs: build
+    environment: production
+
+    env:
+      CLUSTER_NAME:    ${{ vars.CLUSTER_NAME }}
+      CONTROLLER_HOST: ${{ vars.CONTROLLER_HOST }}
+      CONTROLLER_IP:   ${{ vars.CONTROLLER_IP }}
+      AGENT_HOSTS:     ${{ vars.AGENT_HOSTS }}
+      AGENT_IPS:       ${{ vars.AGENT_IPS }}
+      REMOTE_USER:     ${{ vars.REMOTE_USER }}
+      SPUR_HOME:       ${{ vars.SPUR_HOME }}
+      NODE_CPUS:       ${{ vars.NODE_CPUS || '256' }}
+      NODE_MEMORY_MB:  ${{ vars.NODE_MEMORY_MB || '2097152' }}
+      NODE_GPUS:       ${{ vars.NODE_GPUS || '8' }}
+      PG_DB_URL:       ${{ vars.PG_DB_URL || 'postgresql://spur:Spur123!@localhost/spur' }}
+      SSHPASS:         ${{ secrets.SSH_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: spur-binaries-${{ github.sha }}
+          path: /tmp/spur-artifacts/bin/
+
+      - name: Ensure sshpass is installed
+        run: command -v sshpass || sudo apt-get install -y sshpass
+
+      - name: Render spur.conf
+        run: |
+          set -euo pipefail
+
+          cat > /tmp/spur.conf << EOF
+          cluster_name = "${CLUSTER_NAME}"
+
+          [controller]
+          listen_addr = "[::]:6817"
+          raft_listen_addr = "[::]:6820"
+          hosts = ["${CONTROLLER_HOST}"]
+          state_dir = "${SPUR_HOME}/state"
+
+          [scheduler]
+          plugin = "backfill"
+          interval_secs = 1
+          max_jobs_per_cycle = 10000
+          fairshare_halflife_days = 14
+
+          [accounting]
+          host = "localhost:6819"
+
+          [auth]
+          plugin = "none"
+
+          [network]
+          wg_enabled = false
+          agent_port = 6818
+
+          [logging]
+          level = "info"
+          format = "text"
+          EOF
+
+          # Build the full host list: controller first, then agents
+          read -ra AGENT_HOST_ARR <<< "${AGENT_HOSTS}"
+          read -ra AGENT_IP_ARR  <<< "${AGENT_IPS}"
+          ALL_HOSTS=("${CONTROLLER_HOST}" "${AGENT_HOST_ARR[@]}")
+          ALL_IPS=("${CONTROLLER_IP}"   "${AGENT_IP_ARR[@]}")
+
+          # Append [[partitions]]
+          {
+            echo ""
+            echo "[[partitions]]"
+            echo "name = \"gpu\""
+            echo "default = true"
+            echo "state = \"UP\""
+            echo "nodes = \"$(IFS=,; echo "${ALL_HOSTS[*]}")\""
+            echo "max_time = \"7-00:00:00\""
+            echo "default_time = \"1:00:00\""
+            echo "min_nodes = 1"
+            echo "priority_tier = 1"
+          } >> /tmp/spur.conf
+
+          # Append one [[nodes]] stanza per host
+          for i in "${!ALL_HOSTS[@]}"; do
+            {
+              echo ""
+              echo "[[nodes]]"
+              echo "names = \"${ALL_HOSTS[$i]}\""
+              echo "cpus = ${NODE_CPUS}"
+              echo "memory_mb = ${NODE_MEMORY_MB}"
+              echo "gres = [\"gpu:mi300x:${NODE_GPUS}\"]"
+            } >> /tmp/spur.conf
+          done
+
+          echo "==> Rendered spur.conf:"
+          cat /tmp/spur.conf
+
+      - name: Stop existing cluster
+        run: |
+          set -euo pipefail
+          SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+          read -ra AGENT_HOST_ARR <<< "${AGENT_HOSTS}"
+
+          for host in "${AGENT_HOST_ARR[@]}"; do
+            echo "==> Stopping agent on ${host}..."
+            $SSH "${REMOTE_USER}@${host}" \
+              "[ -f ${SPUR_HOME}/etc/stop-agent.sh ] && bash ${SPUR_HOME}/etc/stop-agent.sh || pkill -f 'spurd.*controller' 2>/dev/null || true"
+          done
+
+          echo "==> Stopping controller on ${CONTROLLER_HOST}..."
+          $SSH "${REMOTE_USER}@${CONTROLLER_HOST}" \
+            "[ -f ${SPUR_HOME}/etc/stop-all.sh ] && bash ${SPUR_HOME}/etc/stop-all.sh || true"
+
+          sleep 2
+
+      - name: Clear cluster state
+        run: |
+          set -euo pipefail
+          SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+          read -ra AGENT_HOST_ARR <<< "${AGENT_HOSTS}"
+
+          for host in "${CONTROLLER_HOST}" "${AGENT_HOST_ARR[@]}"; do
+            echo "==> Clearing state on ${host}..."
+            $SSH "${REMOTE_USER}@${host}" "rm -rf ${SPUR_HOME}/state/*" 2>/dev/null || true
+          done
+
+      - name: Create directories on all nodes
+        run: |
+          set -euo pipefail
+          SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+          read -ra AGENT_HOST_ARR <<< "${AGENT_HOSTS}"
+
+          for host in "${CONTROLLER_HOST}" "${AGENT_HOST_ARR[@]}"; do
+            echo "==> Creating directories on ${host}..."
+            $SSH "${REMOTE_USER}@${host}" "mkdir -p ${SPUR_HOME}/{bin,etc,state,log}"
+          done
+
+      - name: Push config to controller
+        run: |
+          sshpass -e scp -o StrictHostKeyChecking=no \
+            /tmp/spur.conf "${REMOTE_USER}@${CONTROLLER_HOST}:${SPUR_HOME}/etc/spur.conf"
+
+      - name: Push binaries to controller
+        run: |
+          SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+          chmod +x /tmp/spur-artifacts/bin/*
+          sshpass -e rsync -e "ssh -o StrictHostKeyChecking=no" -av --checksum \
+            /tmp/spur-artifacts/bin/spurctld \
+            /tmp/spur-artifacts/bin/spurd \
+            /tmp/spur-artifacts/bin/spurrestd \
+            /tmp/spur-artifacts/bin/spurdbd \
+            /tmp/spur-artifacts/bin/spur \
+            "${REMOTE_USER}@${CONTROLLER_HOST}:${SPUR_HOME}/bin/"
+
+          $SSH "${REMOTE_USER}@${CONTROLLER_HOST}" \
+            "cd ${SPUR_HOME}/bin && for cmd in sbatch srun squeue scancel sinfo sacct scontrol; do ln -sf spur \$cmd; done"
+
+      - name: Push binaries to agent nodes
+        run: |
+          set -euo pipefail
+          SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+          read -ra AGENT_HOST_ARR <<< "${AGENT_HOSTS}"
+
+          for host in "${AGENT_HOST_ARR[@]}"; do
+            echo "==> Pushing binaries to ${host}..."
+            sshpass -e rsync -e "ssh -o StrictHostKeyChecking=no" -av --checksum \
+              /tmp/spur-artifacts/bin/spurd \
+              /tmp/spur-artifacts/bin/spur \
+              "${REMOTE_USER}@${host}:${SPUR_HOME}/bin/"
+
+            $SSH "${REMOTE_USER}@${host}" \
+              "cd ${SPUR_HOME}/bin && for cmd in sbatch srun squeue scancel sinfo sacct scontrol; do ln -sf spur \$cmd; done"
+          done
+
+      - name: Generate start/stop scripts on controller
+        env:
+          CONTROLLER_PORT: 6817
+          AGENT_PORT: 6818
+        run: |
+          SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+
+          # start-controller.sh
+          $SSH "${REMOTE_USER}@${CONTROLLER_HOST}" "cat > ${SPUR_HOME}/etc/start-controller.sh" << EOF
+          #!/bin/bash
+          set -euo pipefail
+          export PATH="${SPUR_HOME}/bin:\${PATH}"
+
+          "${SPUR_HOME}/etc/stop-all.sh" 2>/dev/null || true
+          sleep 1
+
+          echo "Starting spurdbd..."
+          nohup spurdbd \\
+              --database-url "${PG_DB_URL}" \\
+              --listen "[::]:6819" \\
+              --migrate \\
+              > "${SPUR_HOME}/log/spurdbd.log" 2>&1 &
+          echo "  PID: \$!"
+
+          sleep 2
+
+          echo "Starting spurctld..."
+          nohup spurctld \\
+              -f "${SPUR_HOME}/etc/spur.conf" \\
+              --listen "[::]:6817" \\
+              --state-dir "${SPUR_HOME}/state" \\
+              --log-level info \\
+              -D \\
+              > "${SPUR_HOME}/log/spurctld.log" 2>&1 &
+          echo "  PID: \$!"
+
+          sleep 2
+
+          echo "Starting spurd (local agent)..."
+          nohup spurd \\
+              --controller "http://127.0.0.1:6817" \\
+              --listen "0.0.0.0:6818" \\
+              --hostname "${CONTROLLER_HOST}" \\
+              --address "${CONTROLLER_IP}" \\
+              --log-level info \\
+              -D \\
+              > "${SPUR_HOME}/log/spurd.log" 2>&1 &
+          echo "  PID: \$!"
+
+          sleep 1
+
+          echo "Starting spurrestd..."
+          nohup spurrestd \\
+              --listen "0.0.0.0:6820" \\
+              --controller "http://127.0.0.1:6817" \\
+              > "${SPUR_HOME}/log/spurrestd.log" 2>&1 &
+          echo "  PID: \$!"
+
+          sleep 1
+          echo "Controller started. Logs: ${SPUR_HOME}/log/"
+          EOF
+          $SSH "${REMOTE_USER}@${CONTROLLER_HOST}" "chmod +x ${SPUR_HOME}/etc/start-controller.sh"
+
+          # stop-all.sh
+          $SSH "${REMOTE_USER}@${CONTROLLER_HOST}" "cat > ${SPUR_HOME}/etc/stop-all.sh" << 'EOF'
+          #!/bin/bash
+          pkill -f 'spurctld.*spur.conf' 2>/dev/null && echo "  spurctld stopped" || echo "  spurctld not running"
+          pkill -f spurrestd            2>/dev/null && echo "  spurrestd stopped" || echo "  spurrestd not running"
+          pkill -f 'spurd.*controller'  2>/dev/null && echo "  spurd stopped"    || echo "  spurd not running"
+          pkill -f 'spurdbd.*database'  2>/dev/null && echo "  spurdbd stopped"  || echo "  spurdbd not running"
+          EOF
+          $SSH "${REMOTE_USER}@${CONTROLLER_HOST}" "chmod +x ${SPUR_HOME}/etc/stop-all.sh"
+
+      - name: Generate start/stop scripts on agent nodes
+        run: |
+          set -euo pipefail
+          SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+          read -ra AGENT_HOST_ARR <<< "${AGENT_HOSTS}"
+          read -ra AGENT_IP_ARR  <<< "${AGENT_IPS}"
+
+          for i in "${!AGENT_HOST_ARR[@]}"; do
+            host="${AGENT_HOST_ARR[$i]}"
+            ip="${AGENT_IP_ARR[$i]}"
+
+            $SSH "${REMOTE_USER}@${host}" "cat > ${SPUR_HOME}/etc/start-agent.sh" << EOF
+          #!/bin/bash
+          set -euo pipefail
+          export PATH="${SPUR_HOME}/bin:\${PATH}"
+
+          pkill -f 'spurd.*controller' 2>/dev/null && sleep 1 || true
+
+          echo "Starting spurd on ${host}..."
+          nohup spurd \\
+              --controller "http://${CONTROLLER_IP}:6817" \\
+              --listen "0.0.0.0:6818" \\
+              --hostname "${host}" \\
+              --address "${ip}" \\
+              --log-level info \\
+              -D \\
+              > "${SPUR_HOME}/log/spurd.log" 2>&1 &
+          echo "  PID: \$!"
+          echo "Agent started. Log: ${SPUR_HOME}/log/spurd.log"
+          EOF
+            $SSH "${REMOTE_USER}@${host}" "chmod +x ${SPUR_HOME}/etc/start-agent.sh"
+
+            $SSH "${REMOTE_USER}@${host}" "cat > ${SPUR_HOME}/etc/stop-agent.sh" << 'EOF'
+          #!/bin/bash
+          pkill -f 'spurd.*controller' 2>/dev/null && echo "  spurd stopped" || echo "  spurd not running"
+          EOF
+            $SSH "${REMOTE_USER}@${host}" "chmod +x ${SPUR_HOME}/etc/stop-agent.sh"
+          done
+
+      - name: Start cluster
+        run: |
+          set -euo pipefail
+          SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+          read -ra AGENT_HOST_ARR <<< "${AGENT_HOSTS}"
+
+          echo "==> Starting controller..."
+          $SSH "${REMOTE_USER}@${CONTROLLER_HOST}" "bash ${SPUR_HOME}/etc/start-controller.sh"
+
+          for host in "${AGENT_HOST_ARR[@]}"; do
+            echo "==> Starting agent on ${host}..."
+            $SSH "${REMOTE_USER}@${host}" "bash ${SPUR_HOME}/etc/start-agent.sh"
+          done
+
+          sleep 5
+
+      - name: Verify cluster health
+        run: |
+          set -euo pipefail
+          SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+          read -ra AGENT_HOST_ARR <<< "${AGENT_HOSTS}"
+          EXPECTED_NODES=$(( 1 + ${#AGENT_HOST_ARR[@]} ))
+
+          echo "==> Cluster state (expecting ${EXPECTED_NODES} idle node(s)):"
+          $SSH "${REMOTE_USER}@${CONTROLLER_HOST}" "${SPUR_HOME}/bin/sinfo"
+
+          if ! $SSH "${REMOTE_USER}@${CONTROLLER_HOST}" \
+              "${SPUR_HOME}/bin/sinfo" | grep -qE "${EXPECTED_NODES}\s+idle"; then
+            echo "ERROR: Expected ${EXPECTED_NODES} idle nodes. Dumping controller log:"
+            $SSH "${REMOTE_USER}@${CONTROLLER_HOST}" "tail -50 ${SPUR_HOME}/log/spurctld.log" || true
+            exit 1
+          fi
+
+          echo "==> Cluster healthy."
+
+      # - name: Run integration tests
+      #   run: |
+      #     sshpass -e rsync -e "ssh -o StrictHostKeyChecking=no" -av --checksum \
+      #       deploy/bare-metal/cluster_test.sh \
+      #       "${REMOTE_USER}@${CONTROLLER_HOST}:${SPUR_HOME}/"
+
+      #     sshpass -e ssh -o StrictHostKeyChecking=no "${REMOTE_USER}@${CONTROLLER_HOST}" \
+      #       "export PATH=${SPUR_HOME}/bin:\$PATH; bash ${SPUR_HOME}/cluster_test.sh"
+
+      # - name: Stop cluster
+      #   if: always()
+      #   run: |
+      #     SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+      #     read -ra AGENT_HOST_ARR <<< "${AGENT_HOSTS}"
+
+      #     for host in "${AGENT_HOST_ARR[@]}"; do
+      #       $SSH "${REMOTE_USER}@${host}" "bash ${SPUR_HOME}/etc/stop-agent.sh" 2>/dev/null || true
+      #     done
+
+      #     $SSH "${REMOTE_USER}@${CONTROLLER_HOST}" "bash ${SPUR_HOME}/etc/stop-all.sh" 2>/dev/null || true
