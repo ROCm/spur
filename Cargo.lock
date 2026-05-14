@@ -3302,6 +3302,7 @@ name = "spur-net"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bytes",
  "flate2",
  "futures-util",

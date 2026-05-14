@@ -15,6 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use flate2::read::GzDecoder;
 use reqwest::header::{ACCEPT, AUTHORIZATION};
 use serde::Deserialize;
@@ -416,6 +417,12 @@ fn parse_netrc(content: &str, registry: &str) -> Option<RegistryCredentials> {
     None
 }
 
+/// Decode the `auth` field from Docker `config.json` (standard Base64 of `user:password`).
+fn decode_registry_auth_b64(s: &str) -> Option<String> {
+    let bytes = STANDARD.decode(s.trim()).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
 fn load_docker_config_auth(registry: &str) -> Option<RegistryCredentials> {
     let docker_config = if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home).join(".docker/config.json")
@@ -441,7 +448,7 @@ fn load_docker_config_auth(registry: &str) -> Option<RegistryCredentials> {
     for key in keys_to_try {
         if let Some(entry) = auths.get(key) {
             if let Some(auth_b64) = entry.get("auth").and_then(|a| a.as_str()) {
-                let decoded = base64_decode(auth_b64)?;
+                let decoded = decode_registry_auth_b64(auth_b64)?;
                 let (user, pass) = decoded.split_once(':')?;
                 return Some(RegistryCredentials {
                     username: user.to_string(),
@@ -452,38 +459,6 @@ fn load_docker_config_auth(registry: &str) -> Option<RegistryCredentials> {
     }
 
     None
-}
-
-fn base64_decode(input: &str) -> Option<String> {
-    // Simple base64 decode without pulling in a crate
-    let input = input.trim();
-    let bytes: Vec<u8> = input
-        .bytes()
-        .filter_map(|b| match b {
-            b'A'..=b'Z' => Some(b - b'A'),
-            b'a'..=b'z' => Some(b - b'a' + 26),
-            b'0'..=b'9' => Some(b - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            b'=' => None,
-            _ => None,
-        })
-        .collect();
-
-    let mut result = Vec::new();
-    for chunk in bytes.chunks(4) {
-        if chunk.len() >= 2 {
-            result.push((chunk[0] << 2) | (chunk[1] >> 4));
-        }
-        if chunk.len() >= 3 {
-            result.push((chunk[1] << 4) | (chunk[2] >> 2));
-        }
-        if chunk.len() >= 4 {
-            result.push((chunk[2] << 6) | chunk[3]);
-        }
-    }
-
-    String::from_utf8(result).ok()
 }
 
 /// Get an auth token from the registry.
@@ -525,7 +500,7 @@ async fn get_auth_token(
         write!(
             basic,
             "Basic {}",
-            encode_basic_auth(&creds.username, &creds.password)
+            STANDARD.encode(format!("{}:{}", creds.username, creds.password))
         )
         .ok();
         return Ok(Some(basic));
@@ -533,32 +508,6 @@ async fn get_auth_token(
 
     // Try anonymous access
     Ok(None)
-}
-
-fn encode_basic_auth(user: &str, pass: &str) -> String {
-    let input = format!("{}:{}", user, pass);
-    let mut result = String::new();
-    let b64_chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let bytes = input.as_bytes();
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        result.push(b64_chars[((triple >> 18) & 0x3F) as usize] as char);
-        result.push(b64_chars[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            result.push(b64_chars[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            result.push('=');
-        }
-        if chunk.len() > 2 {
-            result.push(b64_chars[(triple & 0x3F) as usize] as char);
-        } else {
-            result.push('=');
-        }
-    }
-    result
 }
 
 /// Resolve a manifest list (multi-arch) to a single amd64/linux manifest.
@@ -688,7 +637,49 @@ pub fn sanitize_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
     use super::*;
+
+    #[test]
+    fn test_decode_registry_auth_b64_valid() {
+        // echo -n 'alice:secret' | base64 -w0
+        let decoded = super::decode_registry_auth_b64("YWxpY2U6c2VjcmV0").expect("decode");
+        assert_eq!(decoded, "alice:secret");
+        let (u, p) = decoded.split_once(':').unwrap();
+        assert_eq!(u, "alice");
+        assert_eq!(p, "secret");
+    }
+
+    #[test]
+    fn test_decode_registry_auth_b64_trims_whitespace() {
+        assert_eq!(
+            super::decode_registry_auth_b64("  YWxpY2U6c2VjcmV0  ").as_deref(),
+            Some("alice:secret")
+        );
+    }
+
+    #[test]
+    fn test_decode_registry_auth_b64_invalid_characters() {
+        assert!(super::decode_registry_auth_b64("YWxpY2U6c2VjcmV0!!!").is_none());
+    }
+
+    #[test]
+    fn test_decode_registry_auth_b64_truncated() {
+        assert!(super::decode_registry_auth_b64("YWxpY2U6c2V").is_none());
+    }
+
+    #[test]
+    fn test_decode_registry_auth_b64_rejects_nonstandard_alphabet() {
+        assert!(super::decode_registry_auth_b64("Y_WxpY2U6c2VjcmV0").is_none());
+    }
+
+    #[test]
+    fn test_registry_auth_b64_roundtrip() {
+        let cred = "myuser:mypassword";
+        let enc = STANDARD.encode(cred);
+        assert_eq!(super::decode_registry_auth_b64(&enc).as_deref(), Some(cred));
+    }
 
     #[test]
     fn test_parse_dockerhub_official() {

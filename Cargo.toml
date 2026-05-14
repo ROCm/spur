@@ -86,6 +86,7 @@ flate2 = "1"
 tar = "0.4"
 semver = "1"
 sha2 = "0.10"
+base64 = "0.22"
 
 # Internal
 spur-update = { path = "crates/spur-update" }
