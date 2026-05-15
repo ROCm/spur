@@ -253,6 +253,9 @@ jobs:
             --docker-password="$REGISTRY_PASSWORD" \
             -n "$SPUR_TEST_NS" \
             --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Attach pull secret to default ServiceAccount
+        run: |
           kubectl patch serviceaccount default -n "$SPUR_TEST_NS" \
             -p '{"imagePullSecrets": [{"name": "regcred"}]}'
 
@@ -273,8 +276,17 @@ jobs:
           fi
           kubectl delete pod image-pull-check -n "$SPUR_TEST_NS" --ignore-not-found --wait=true
 
-      - name: Run K8s integration tests
-        run: bash deploy/bare-metal/k8s_test.sh
+      - name: Run single-node K8s tests
+        run: |
+          set -euo pipefail
+          source "$HOME/.cargo/env"
+          cargo test -p spur-tests --lib k8s::single_node -- --ignored
+
+      - name: Run multi-node K8s tests
+        run: |
+          set -euo pipefail
+          source "$HOME/.cargo/env"
+          cargo test -p spur-tests --lib k8s::multi_node -- --ignored
 
       - name: Cleanup test resources
         if: always()
