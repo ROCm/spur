@@ -172,10 +172,18 @@ jobs:
               context: 'E2E / K8s Integration'
             });
 
-      - name: Checkout test scripts from main
+      - name: Download K8s test binary
+        uses: actions/download-artifact@v4
+        with:
+          name: k8s-test-binary
+          path: /tmp/k8s-bin
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout K8s manifests from main
         uses: actions/checkout@v4
         with:
-          sparse-checkout: deploy
+          sparse-checkout: deploy/k8s
           sparse-checkout-cone-mode: false
           path: trusted-repo
 
@@ -263,8 +271,18 @@ jobs:
           fi
           kubectl delete pod image-pull-check -n "$SPUR_TEST_NS" --ignore-not-found --wait=true
 
-      - name: Run K8s integration tests
-        run: bash trusted-repo/deploy/bare-metal/k8s_test.sh
+      - name: Run single-node K8s tests
+        env:
+          SPUR_DEPLOY_DIR: trusted-repo/deploy/k8s
+        run: |
+          chmod +x /tmp/k8s-bin/spur-k8s-tests
+          /tmp/k8s-bin/spur-k8s-tests k8s::single_node --ignored --test-threads=1
+
+      - name: Run multi-node K8s tests
+        env:
+          SPUR_DEPLOY_DIR: trusted-repo/deploy/k8s
+        run: |
+          /tmp/k8s-bin/spur-k8s-tests k8s::multi_node --ignored --test-threads=1
 
       - name: Cleanup test resources
         if: always()

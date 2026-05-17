@@ -23,6 +23,7 @@ metadata:
 spec:
   serviceName: spurctld
   replicas: 3
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
       app: spurctld

@@ -99,6 +99,20 @@ jobs:
       - name: Test
         run: cargo test
 
+      - name: Prepare K8s test binary
+        run: |
+          BIN=$(cargo test -p spur-tests --lib --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.executable != null) | .executable' | head -1)
+          mkdir -p artifacts
+          cp "$BIN" artifacts/spur-k8s-tests
+
+      - name: Upload K8s test binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-test-binary
+          path: artifacts/spur-k8s-tests
+          retention-days: 1
+
   build-e2e-artifacts:
     name: Build E2E Artifacts
     needs: [test]
