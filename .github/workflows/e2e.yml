@@ -74,6 +74,55 @@ jobs:
         env:
           BM_SSH_KEY: ${{ secrets.BM_SSH_KEY }}
 
+      - name: Verify node connectivity
+        run: |
+          IFS=',' read -ra NODES <<< "$BM_NODES"
+          FAILED=0
+          for node in "${NODES[@]}"; do
+            if ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 \
+              "${BM_SSH_USER}@${node}" "echo ok" >/dev/null 2>&1; then
+              echo "PASS: ${node}"
+            else
+              echo "FAIL: ${node} unreachable"
+              FAILED=1
+            fi
+          done
+          [ "$FAILED" -eq 0 ] || { echo "ERROR: not all nodes reachable"; exit 1; }
+
+      - name: Check if DNS injection needed
+        id: dns-check
+        run: |
+          IFS=',' read -ra NODES <<< "$BM_NODES"
+          for node in "${NODES[@]}"; do
+            if ! [[ "$node" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "needed=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "needed=false" >> "$GITHUB_OUTPUT"
+
+      - name: Inject node DNS on cluster
+        if: steps.dns-check.outputs.needed == 'true'
+        run: |
+          MARKER="## SPUR_CI_DYNAMIC_NODES"
+          IFS=',' read -ra NODES <<< "$BM_NODES"
+          HOSTS_BLOCK="${MARKER}"
+          for node in "${NODES[@]}"; do
+            IP=$(getent ahosts "$node" 2>/dev/null | awk 'NR==1{print $1}')
+            if [ -z "$IP" ]; then
+              echo "ERROR: cannot resolve $node from runner"
+              exit 1
+            fi
+            HOSTS_BLOCK="${HOSTS_BLOCK}
+          ${IP} ${node}"
+          done
+          for node in "${NODES[@]}"; do
+            ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "${BM_SSH_USER}@${node}" "
+              grep -q '${MARKER}' /etc/hosts 2>/dev/null && exit 0
+              echo '${HOSTS_BLOCK}' | sudo tee -a /etc/hosts >/dev/null
+            "
+          done
+
       - name: Load AppArmor profiles for rootless containers
         run: |
           IFS=',' read -ra NODES <<< "$BM_NODES"
@@ -160,17 +209,35 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-      - name: Cleanup remote dirs and AppArmor profiles
+      - name: Cleanup remote dirs
+        if: always()
+        run: |
+          IFS=',' read -ra NODES <<< "$BM_NODES"
+          for node in "${NODES[@]}"; do
+            ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+              "${BM_SSH_USER}@${node}" "rm -rf '${BM_REMOTE_BASE}'" || true
+          done
+
+      - name: Cleanup AppArmor profiles
         if: always()
         run: |
           IFS=',' read -ra NODES <<< "$BM_NODES"
           for node in "${NODES[@]}"; do
             ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "${BM_SSH_USER}@${node}" "
-              rm -rf '${BM_REMOTE_BASE}'
               sudo aa-status 2>/dev/null | grep -o 'spur-ci-[^ ]*' | sort -u | while read -r prof; do
                 sudo apparmor_parser -R /dev/stdin 2>/dev/null <<< \"profile \$prof /dev/null {}\" || true
               done
             " || true
+          done
+
+      - name: Cleanup injected DNS
+        if: always() && steps.dns-check.outputs.needed == 'true'
+        run: |
+          IFS=',' read -ra NODES <<< "$BM_NODES"
+          for node in "${NODES[@]}"; do
+            ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+              "${BM_SSH_USER}@${node}" \
+              "sudo sed -i '/## SPUR_CI_DYNAMIC_NODES/,\$d' /etc/hosts 2>/dev/null" || true
           done
 
       - name: Kill SSH agent
