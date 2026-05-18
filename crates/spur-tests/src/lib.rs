@@ -33,6 +33,9 @@ pub mod harness;
 // K8s integration tests (require a live cluster, run with `-- --ignored`)
 pub mod k8s;
 
+// Bare-metal E2E tests (require SSH + nodes, run with `-- --ignored`)
+pub mod bare_metal;
+
 // Unit / component tests (no running daemons needed)
 pub mod t01_run;
 pub mod t05_queue;

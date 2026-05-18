@@ -29,6 +29,7 @@ assert_cmd = "2"
 predicates = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 jsonwebtoken.workspace = true
+openssh = { version = "0.11", default-features = false, features = ["process-mux"] }
 
 [dev-dependencies]
 serial_test = "3.4.0"

@@ -1,0 +1,27 @@
+pub mod container;
+pub mod dispatch;
+pub mod scheduling;
+
+use tokio::sync::OnceCell;
+
+use crate::bare_metal::config::TestConfig;
+use crate::bare_metal::fixture::BareMetalFixture;
+
+static FIXTURE: OnceCell<BareMetalFixture> = OnceCell::const_new();
+
+pub async fn fixture() -> &'static BareMetalFixture {
+    FIXTURE
+        .get_or_init(|| async {
+            let config = TestConfig::from_env().expect("SPUR_TEST_BM_* config");
+            if config.nodes.len() < 2 {
+                panic!(
+                    "bare_metal::multi_node requires at least 2 nodes in SPUR_TEST_BM_NODES (got {})",
+                    config.nodes.len()
+                );
+            }
+            BareMetalFixture::deploy(config)
+                .await
+                .expect("failed to deploy bare-metal cluster for multi_node tests")
+        })
+        .await
+}
