@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Consumable TRES resource selection.
 //!
 //! Tracks resources at core/socket/GPU granularity within a node.

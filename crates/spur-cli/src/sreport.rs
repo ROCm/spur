@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use spur_proto::proto::slurm_accounting_client::SlurmAccountingClient;

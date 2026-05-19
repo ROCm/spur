@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! T58: SPANK plugin host tests.
 //!
 //! Tests the SPANK plugin loading, hook invocation, and plugstack parsing.

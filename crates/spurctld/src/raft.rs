@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Raft-based consensus for spurctld.
 //!
 //! Raft is always-on: even single-node deployments run a 1-member Raft

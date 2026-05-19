@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! QOS enforcement logic.
 //!
 //! Checks per-QOS limits before allowing a job to be scheduled.

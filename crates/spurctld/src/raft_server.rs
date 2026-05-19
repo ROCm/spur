@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! gRPC server for Raft internal RPCs.
 //!
 //! Runs on a dedicated port (default 6821) separate from the client API,

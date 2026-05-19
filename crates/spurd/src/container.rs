@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Native container support for Spur.
 //!
 //! Implements Enroot-like rootless containers using Linux user namespaces

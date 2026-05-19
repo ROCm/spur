@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! HTTP health, readiness, and metrics server for the K8s operator.
 
 use std::net::SocketAddr;

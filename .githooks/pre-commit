@@ -1,15 +1,27 @@
 #!/usr/bin/env bash
 #
-# Runs cargo fmt --check before each commit. Bypass with: git commit --no-verify
+# Pre-commit checks:
+#   1. cargo fmt --check
+#   2. SPDX license headers on staged source files
+#
+# Bypass with: git commit --no-verify
 
-if ! command -v cargo >/dev/null 2>&1; then
-  exit 0
+if command -v cargo >/dev/null 2>&1; then
+  if ! cargo fmt --all --check 2>/dev/null; then
+    echo "pre-commit: cargo fmt found unformatted code."
+    echo ""
+    echo "  Run: cargo fmt --all"
+    echo "  Bypass with: git commit --no-verify"
+    exit 1
+  fi
 fi
 
-if ! cargo fmt --all --check 2>/dev/null; then
-  echo "pre-commit: cargo fmt found unformatted code."
-  echo ""
-  echo "  Run: cargo fmt --all"
-  echo "  Bypass with: git commit --no-verify"
-  exit 1
+# Check SPDX license headers on staged source files
+mapfile -t staged < <(
+    git diff --cached --name-only --diff-filter=d -- '*.rs' '*.proto' '*.py' '*.sh' 'Dockerfile' '*/Dockerfile' '*/Dockerfile.*'
+)
+
+if [ ${#staged[@]} -gt 0 ]; then
+  REPO_ROOT="$(git rev-parse --show-toplevel)"
+  "$REPO_ROOT/scripts/check-license-headers.sh" "${staged[@]}" || exit 1
 fi

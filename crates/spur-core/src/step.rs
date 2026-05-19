@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Job steps — sub-executions within a running job.
 //!
 //! When `srun` is called inside a batch script, it creates a job step.

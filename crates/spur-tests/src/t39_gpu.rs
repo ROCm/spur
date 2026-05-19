@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! T39: GPU/GRES scheduling tests.
 //!
 //! Corresponds to Slurm's test39.x series.

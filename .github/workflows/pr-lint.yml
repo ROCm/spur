@@ -59,3 +59,12 @@ jobs:
             exit 1
           fi
           echo "PASS: all commit messages are valid."
+
+  license-headers:
+    name: SPDX License Headers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check SPDX license headers
+        run: ./scripts/check-license-headers.sh

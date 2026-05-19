@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! T05: Job queue viewing (squeue / spur queue).
 //!
 //! Corresponds to Slurm's test5.x series.

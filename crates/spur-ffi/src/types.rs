@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! #[repr(C)] types matching Slurm's ABI layout.
 
 use std::os::raw::{c_char, c_uint};

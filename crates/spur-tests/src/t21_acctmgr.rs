@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! T21: Accounting management tests.
 //!
 //! Corresponds to Slurm's test21.x series (sacctmgr).

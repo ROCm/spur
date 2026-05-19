@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! `spur net` subcommands for WireGuard mesh management.
 
 use std::net::Ipv4Addr;

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Job array specification parsing and task expansion.
 //!
 //! Supports Slurm-compatible array specs:

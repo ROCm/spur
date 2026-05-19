@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! T52: Configuration parsing.
 //!
 //! Tests for TOML config loading, time parsing, partition building.

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! T01: Job step and task distribution tests.
 //!
 //! Corresponds to Slurm's test1.x series (srun).

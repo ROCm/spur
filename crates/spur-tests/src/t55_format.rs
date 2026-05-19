@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! T55: CLI format string engine.
 //!
 //! Tests the Slurm-compatible %X format string parser and renderer.

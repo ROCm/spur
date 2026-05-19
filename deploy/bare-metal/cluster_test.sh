@@ -1,4 +1,8 @@
 #!/bin/bash
+
+# Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Spur MI300X Cluster Integration Test
 #
 # Runs a sequence of tests against a live Spur cluster:

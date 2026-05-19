@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Spur Test Suite
 //!
 //! Test numbering mirrors Slurm's testsuite for 1-1 mapping:

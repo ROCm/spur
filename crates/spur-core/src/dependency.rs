@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Job dependency parsing and checking.
 //!
 //! Supports: afterok:N, afterany:N, afternotok:N, aftercorr:N, singleton

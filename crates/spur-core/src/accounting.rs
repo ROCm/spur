@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Accounting data models: accounts, users, QOS, associations, TRES.
 
 use serde::{Deserialize, Serialize};

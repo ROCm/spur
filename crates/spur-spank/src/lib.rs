@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! SPANK plugin host.
 //!
 //! Loads existing Slurm SPANK plugins (.so files) via dlopen and provides

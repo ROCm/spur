@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;

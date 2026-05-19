@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Minimal PMI-1 wire protocol server for MPI rank bootstrap.
 
 use std::collections::HashMap;

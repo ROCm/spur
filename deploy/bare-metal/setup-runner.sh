@@ -1,4 +1,8 @@
 #!/bin/bash
+
+# Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Install a GitHub Actions self-hosted runner on mi300.
 #
 # Run this once on mi300 (ssh mi300, then bash setup-runner.sh <REPO> <TOKEN>).

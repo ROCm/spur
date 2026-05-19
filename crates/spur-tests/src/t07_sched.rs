@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! T07: Scheduler tests.
 //!
 //! Corresponds to Slurm's test7.x series (scheduling/plugins).

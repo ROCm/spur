@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Seccomp-BPF syscall filter for job isolation.
 //!
 //! Implements a default-deny syscall whitelist inspired by the AXIS sandbox

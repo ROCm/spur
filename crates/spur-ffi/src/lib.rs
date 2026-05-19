@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! C FFI compatibility shim — libslurm-compat.so
 //!
 //! Exports extern "C" functions matching a subset of Slurm's libslurm ABI,

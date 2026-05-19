@@ -1,4 +1,8 @@
 #!/bin/bash
+
+# Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Install Spur — AI-native job scheduler
 #
 # Usage:

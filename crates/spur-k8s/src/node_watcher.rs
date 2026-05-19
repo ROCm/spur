@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::pin::pin;

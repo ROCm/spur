@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Landlock filesystem access control for bare-metal job isolation.
 //!
 //! Restricts filesystem access to the job's working directory, GPU device

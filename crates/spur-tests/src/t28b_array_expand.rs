@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! T28b: Job array expansion tests.
 //!
 //! Tests array spec parsing — complement to t28_arrays which tests

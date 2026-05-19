@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 /// Calculate effective job priority.
 ///
 /// effective_priority = base_priority * fair_share_factor * age_factor * partition_tier

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! `spur exec` — execute a command inside a running container job.
 
 use anyhow::{Context, Result};

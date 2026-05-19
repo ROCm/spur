@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! T24: Priority and fair-share.
 //!
 //! Corresponds to Slurm's test24.x series.

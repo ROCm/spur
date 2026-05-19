@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Detect the node's network address for registration with the controller.
 //!
 //! Priority: WireGuard interface IP > hostname resolution > fallback.

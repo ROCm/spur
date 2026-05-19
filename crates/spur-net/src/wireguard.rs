@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! WireGuard key generation and config file management.
 //!
 //! Shells out to `wg` and `wg-quick` which are standard on any Linux

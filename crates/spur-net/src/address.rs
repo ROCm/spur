@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! IP address pool allocation from a CIDR block.
 //!
 //! The controller maintains a pool of IPs and hands them out to agents

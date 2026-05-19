@@ -1,4 +1,8 @@
 #!/bin/bash
+
+# Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Build portable Spur binaries using manylinux_2_28 Docker image (glibc 2.28)
 #
 # Outputs binaries to dist/bin/ in the repo root.

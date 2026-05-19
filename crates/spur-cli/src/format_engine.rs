@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 /// Slurm-compatible format string engine.
 ///
 /// Parses format strings like `"%.18i %.9P %.8j %.8u %.2t %10M %6D %R"`

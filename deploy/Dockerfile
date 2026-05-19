@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Multi-stage build: one image with all Spur binaries
 # Builder uses manylinux_2_28 (glibc 2.28) for broad compatibility
 FROM quay.io/pypa/manylinux_2_28_x86_64 AS builder

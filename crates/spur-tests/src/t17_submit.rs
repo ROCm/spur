@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! T17: Job submission (sbatch / spur submit).
 //!
 //! Corresponds to Slurm's test17.x series.
