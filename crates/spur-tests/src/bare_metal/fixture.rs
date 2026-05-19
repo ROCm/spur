@@ -357,6 +357,7 @@ impl BareMetalFixture {
     pub async fn ship_gpu_assets(&self) {
         let deploy = bare_metal_deploy_dir();
         let rd = &self.remote_dir;
+        let venv_path = self.resolve_gpu_venv().await;
 
         // Ship Python test scripts
         for name in ["distributed_test.py", "inference_test.py"] {
@@ -368,9 +369,9 @@ impl BareMetalFixture {
             }
         }
 
-        // Generate job wrappers that point to the ephemeral venv + remote_dir
+        // Generate job wrappers pointing to the resolved venv
         let dist_wrapper = format!(
-            "#!/bin/bash\nsource '{rd}/venv/bin/activate'\nexec python3 '{rd}/distributed_test.py'\n"
+            "#!/bin/bash\nsource '{venv_path}/bin/activate'\nexec python3 '{rd}/distributed_test.py'\n"
         );
         self.ship_bytes_to_all_agents("distributed_job.sh", dist_wrapper.as_bytes())
             .await
@@ -382,7 +383,7 @@ impl BareMetalFixture {
         }
 
         let infer_wrapper = format!(
-            "#!/bin/bash\nsource '{rd}/venv/bin/activate'\nexec python3 '{rd}/inference_test.py'\n"
+            "#!/bin/bash\nsource '{venv_path}/bin/activate'\nexec python3 '{rd}/inference_test.py'\n"
         );
         self.ship_bytes_to_all_agents("inference_job.sh", infer_wrapper.as_bytes())
             .await
@@ -409,25 +410,57 @@ impl BareMetalFixture {
                     .await;
             }
         }
+    }
 
-        // Create ephemeral venv with PyTorch on each node
+    /// Resolve the GPU venv path. If `SPUR_TEST_BM_GPU_VENV` is set, use it
+    /// directly. Otherwise, provision a fresh venv with PyTorch on all nodes
+    /// in parallel.
+    async fn resolve_gpu_venv(&self) -> String {
+        if let Ok(path) = std::env::var("SPUR_TEST_BM_GPU_VENV") {
+            if !path.is_empty() {
+                info!(path, "using pre-existing GPU venv");
+                return path;
+            }
+        }
+        let venv_path = format!("{}/venv", self.remote_dir);
+        self.provision_gpu_venv(&venv_path).await;
+        venv_path
+    }
+
+    /// Provision an ephemeral venv with PyTorch on all nodes in parallel.
+    async fn provision_gpu_venv(&self, venv_path: &str) {
         let torch_index = std::env::var("SPUR_TEST_BM_TORCH_INDEX")
             .unwrap_or_else(|_| "https://download.pytorch.org/whl/rocm6.3".into());
-        for (i, node) in self.nodes.iter().enumerate() {
-            let name = &self.node_names[i];
-            info!(name, "creating GPU venv");
-            node.exec(&format!("python3 -m venv '{rd}/venv'"))
-                .await
-                .unwrap_or_else(|e| {
-                    panic!("venv creation failed on {name} — is python3-venv installed? {e}")
-                });
-            info!(name, "installing torch");
-            node.exec(&format!(
-                "'{rd}/venv/bin/pip' install --quiet torch --index-url '{torch_index}'"
-            ))
-            .await
-            .unwrap_or_else(|e| panic!("pip install torch failed on {name}: {e}"));
-        }
+        info!(venv_path, torch_index = %torch_index, "provisioning GPU venv on all nodes");
+
+        let futs: Vec<_> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| {
+                let name = self.node_names[i].clone();
+                let venv_path = venv_path.to_owned();
+                let torch_index = torch_index.clone();
+                async move {
+                    info!(name = %name, "creating GPU venv");
+                    node.exec(&format!("python3 -m venv '{venv_path}'"))
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "venv creation failed on {name} — is python3-venv installed? {e}"
+                            )
+                        });
+                    info!(name = %name, "installing torch");
+                    node.exec(&format!(
+                        "'{venv_path}/bin/pip' install --quiet torch --index-url '{torch_index}'"
+                    ))
+                    .await
+                    .unwrap_or_else(|e| panic!("pip install torch failed on {name}: {e}"));
+                    info!(name = %name, "GPU venv ready");
+                }
+            })
+            .collect();
+        futures_util::future::join_all(futs).await;
     }
 
     /// Collect diagnostic info for a failed job (scontrol, sinfo, squeue,
