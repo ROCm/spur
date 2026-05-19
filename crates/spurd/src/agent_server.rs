@@ -661,37 +661,11 @@ impl SlurmAgent for AgentService {
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         let job_id = req.job_id;
-        let signal = req.signal;
 
-        {
-            let jobs = self.running.lock().await;
-            let Some(tracked) = jobs.get(&job_id) else {
-                return Ok(Response::new(()));
-            };
-
-            let sig = if signal > 0 {
-                info!(job_id, signal, "sending signal to job");
-                nix::sys::signal::Signal::try_from(signal)
-                    .unwrap_or(nix::sys::signal::Signal::SIGTERM)
-            } else {
-                info!(job_id, "graceful cancel: SIGTERM → 5s grace → SIGKILL");
-                nix::sys::signal::Signal::SIGTERM
-            };
-
-            let _ = tracked.job.kill_signal(sig);
-        }
-
-        if signal == 0 {
-            let running = self.running.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                let mut jobs = running.lock().await;
-                if let Some(tracked) = jobs.get(&job_id) {
-                    info!(job_id, "grace period expired, sending SIGKILL");
-                    let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
-                    jobs.remove(&job_id);
-                }
-            });
+        if req.signal > 0 {
+            self.send_explicit_signal(job_id, req.signal).await;
+        } else {
+            self.graceful_cancel(job_id).await;
         }
 
         Ok(Response::new(()))
@@ -1110,6 +1084,41 @@ impl SlurmAgent for AgentService {
 }
 
 impl AgentService {
+    /// Send a user-specified signal to a running job.
+    async fn send_explicit_signal(&self, job_id: u32, signal: i32) {
+        let jobs = self.running.lock().await;
+        let Some(tracked) = jobs.get(&job_id) else {
+            return;
+        };
+        let sig =
+            nix::sys::signal::Signal::try_from(signal).unwrap_or(nix::sys::signal::Signal::SIGTERM);
+        info!(job_id, signal, "sending explicit signal to job");
+        let _ = tracked.job.kill_signal(sig);
+    }
+
+    /// SIGTERM now, escalate to SIGKILL after a 5-second grace period.
+    async fn graceful_cancel(&self, job_id: u32) {
+        {
+            let jobs = self.running.lock().await;
+            let Some(tracked) = jobs.get(&job_id) else {
+                return;
+            };
+            info!(job_id, "graceful cancel: SIGTERM → 5s grace → SIGKILL");
+            let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGTERM);
+        }
+
+        let running = self.running.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            let jobs = running.lock().await;
+            if let Some(tracked) = jobs.get(&job_id) {
+                info!(job_id, "grace period expired, sending SIGKILL");
+                let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
+                // Job stays in `running` and monitor loop reaps it and does full cleanup.
+            }
+        });
+    }
+
     /// Read environment variables from a running process via /proc.
     fn read_proc_env(pid: u32) -> Vec<(String, String)> {
         let path = format!("/proc/{}/environ", pid);
@@ -1302,5 +1311,84 @@ mod tests {
         assert_eq!(resp.exit_code, 0);
         let observed_canonical = std::fs::canonicalize(resp.stdout.trim()).unwrap();
         assert_eq!(observed_canonical, tmp_canonical);
+    }
+
+    /// Helper: poll until the job is removed from `running` (by the monitor).
+    async fn wait_job_reaped(svc: &AgentService, job_id: u32, timeout_ms: u64) -> bool {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
+        while tokio::time::Instant::now() < deadline {
+            if svc.running.lock().await.get(&job_id).is_none() {
+                return true;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn graceful_cancel_sigterm_responsive() {
+        let svc = AgentService::new(test_reporter());
+        svc.start_monitor("http://127.0.0.1:1".into());
+
+        let job_id = 900;
+        svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
+
+        svc.graceful_cancel(job_id).await;
+
+        assert!(
+            wait_job_reaped(&svc, job_id, 5_000).await,
+            "monitor should reap SIGTERM-killed job within 5s"
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_cancel_escalates_to_sigkill() {
+        let svc = AgentService::new(test_reporter());
+        svc.start_monitor("http://127.0.0.1:1".into());
+
+        let job_id = 901;
+        let child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "trap '' TERM; while true; do sleep 1; done"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn SIGTERM-trapping process");
+        let tracked = TrackedJob {
+            job: executor::RunningJob::Managed {
+                child,
+                cgroup_path: None,
+            },
+            rootfs_mode: crate::container::RootfsMode::Extracted,
+            allocation: None,
+            stdout_path: "/dev/null".into(),
+            stderr_path: "/dev/null".into(),
+            has_pid_namespace: false,
+        };
+        svc.insert_test_job(job_id, tracked).await;
+
+        svc.graceful_cancel(job_id).await;
+
+        // 5s grace + up to 2s monitor tick + buffer
+        assert!(
+            wait_job_reaped(&svc, job_id, 10_000).await,
+            "monitor should reap job after SIGKILL escalation"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_explicit_signal_kills_job() {
+        let svc = AgentService::new(test_reporter());
+        svc.start_monitor("http://127.0.0.1:1".into());
+
+        let job_id = 902;
+        svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
+
+        svc.send_explicit_signal(job_id, 9).await; // SIGKILL
+
+        assert!(
+            wait_job_reaped(&svc, job_id, 5_000).await,
+            "monitor should reap SIGKILL'd job within 5s"
+        );
     }
 }

@@ -2132,6 +2132,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_running_job_releases_resources() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = submit_and_wait(&cm, basic_spec("cancel-alloc"));
+
+        let resources = ResourceSet {
+            cpus: 2,
+            memory_mb: 4000,
+            ..Default::default()
+        };
+        cm.start_job(job_id, vec!["worker1".into()], resources)
+            .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        let node = cm.get_node("worker1").unwrap();
+        assert_eq!(node.alloc_resources.cpus, 2);
+
+        cm.cancel_job(job_id, "testuser").unwrap();
+        settle(&cm, job_id, JobState::Cancelled);
+
+        let node = cm.get_node("worker1").unwrap();
+        assert_eq!(
+            node.alloc_resources.cpus, 0,
+            "resources must be freed after cancel"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn double_cancel_returns_error() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let job_id = submit_and_wait(&cm, basic_spec("double-cancel"));
+        cm.cancel_job(job_id, "testuser").unwrap();
+        settle(&cm, job_id, JobState::Cancelled);
+
+        let result = cm.cancel_job(job_id, "testuser");
+        assert!(
+            result.is_err(),
+            "cancelling an already-cancelled job must fail"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn snapshot_and_restore() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;

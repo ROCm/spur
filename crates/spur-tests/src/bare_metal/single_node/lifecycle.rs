@@ -9,7 +9,7 @@ mod tests {
 
     use crate::bare_metal::fixture::parse_job_id;
     use crate::bare_metal::single_node::fixture;
-    use crate::bare_metal::{job_state, wait_final_state, wait_job};
+    use crate::bare_metal::{assert_eventually, job_state, wait_final_state, wait_job};
 
     #[tokio::test]
     #[ignore]
@@ -38,6 +38,44 @@ mod tests {
             "expected cancelled, got {:?}",
             state
         );
+    }
+
+    /// After cancellation, the node must return to idle (resources released).
+    /// Regression test: the force-kill path previously removed the job from
+    /// the agent's tracking map without releasing allocations.
+    #[tokio::test]
+    #[ignore]
+    #[serial]
+    async fn job_cancel_releases_resources() {
+        let f = fixture().await;
+        let script = f
+            .write_script(
+                "test-cancel-res.sh",
+                "#!/bin/bash\ntrap '' TERM\nsleep 300\n",
+            )
+            .await
+            .expect("script");
+
+        let sb = f
+            .sbatch(&["-J", "cancel-res", "-N", "1", &script])
+            .await
+            .expect("sbatch");
+        let job_id = parse_job_id(&sb).expect("job id");
+
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        f.scancel(&job_id.to_string()).await.expect("scancel");
+
+        // Wait for SIGTERM grace (5s) + SIGKILL + monitor reap
+        assert_eventually(
+            Duration::from_secs(15),
+            Duration::from_secs(2),
+            "node should return to idle after cancel",
+            || async {
+                let info = f.sinfo().await.unwrap_or_default();
+                info.contains("idle") && !info.contains("mix") && !info.contains("alloc")
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
