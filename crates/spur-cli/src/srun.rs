@@ -266,6 +266,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let mut poll_interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
     #[allow(unused_assignments)]
     let mut nodelist = String::new();
+    let mut warned_unknown_state = false;
 
     loop {
         poll_interval.tick().await;
@@ -290,7 +291,16 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                     ) => {
                         handle_terminal_state(state, job_id, job.exit_code, &work_dir).await;
                     }
-                    _ => {}
+                    Ok(_) => {}
+                    Err(_) if !warned_unknown_state => {
+                        warned_unknown_state = true;
+                        eprintln!(
+                            "srun: warning: job {} has unrecognized state {} \
+                             (controller may be newer than client)",
+                            job_id, job.state
+                        );
+                    }
+                    Err(_) => {}
                 }
             }
             Err(e) => {
@@ -378,24 +388,34 @@ async fn try_stream_output(
 
     // Wait for terminal state and get exit code
     let mut poll_interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+    let mut warned_unknown_state = false;
     loop {
         poll_interval.tick().await;
         match controller.get_job(GetJobRequest { job_id }).await {
             Ok(resp) => {
                 let job = resp.into_inner();
-                if let Ok(state) = JobState::try_from(job.state) {
-                    match state {
-                        JobState::JobCompleted => {
-                            std::process::exit(job.exit_code);
-                        }
+                match JobState::try_from(job.state) {
+                    Ok(JobState::JobCompleted) => {
+                        std::process::exit(job.exit_code);
+                    }
+                    Ok(
                         JobState::JobFailed
                         | JobState::JobCancelled
                         | JobState::JobTimeout
-                        | JobState::JobNodeFail => {
-                            std::process::exit(job.exit_code.max(1));
-                        }
-                        _ => {}
+                        | JobState::JobNodeFail,
+                    ) => {
+                        std::process::exit(job.exit_code.max(1));
                     }
+                    Ok(_) => {}
+                    Err(_) if !warned_unknown_state => {
+                        warned_unknown_state = true;
+                        eprintln!(
+                            "srun: warning: job {} has unrecognized state {} \
+                             (controller may be newer than client)",
+                            job_id, job.state
+                        );
+                    }
+                    Err(_) => {}
                 }
             }
             Err(_) => {}
@@ -410,20 +430,32 @@ async fn poll_for_completion(
     work_dir: &str,
 ) {
     let mut poll_interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+    let mut warned_unknown_state = false;
     loop {
         poll_interval.tick().await;
         match client.get_job(GetJobRequest { job_id }).await {
             Ok(resp) => {
                 let job = resp.into_inner();
-                if let Ok(
-                    state @ (JobState::JobCompleted
-                    | JobState::JobFailed
-                    | JobState::JobCancelled
-                    | JobState::JobTimeout
-                    | JobState::JobNodeFail),
-                ) = JobState::try_from(job.state)
-                {
-                    handle_terminal_state(state, job_id, job.exit_code, work_dir).await;
+                match JobState::try_from(job.state) {
+                    Ok(
+                        state @ (JobState::JobCompleted
+                        | JobState::JobFailed
+                        | JobState::JobCancelled
+                        | JobState::JobTimeout
+                        | JobState::JobNodeFail),
+                    ) => {
+                        handle_terminal_state(state, job_id, job.exit_code, work_dir).await;
+                    }
+                    Ok(_) => {}
+                    Err(_) if !warned_unknown_state => {
+                        warned_unknown_state = true;
+                        eprintln!(
+                            "srun: warning: job {} has unrecognized state {} \
+                             (controller may be newer than client)",
+                            job_id, job.state
+                        );
+                    }
+                    Err(_) => {}
                 }
             }
             Err(e) => {
