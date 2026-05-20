@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn test_group_nodes_by_display_state_mixed() {
-        let nodes = vec![
+        let nodes = [
             make_node("n1", NodeState::NodeIdle, "p"),
             make_node("n2", NodeState::NodeIdle, "p"),
             make_node("n3", NodeState::NodeDown, "p"),
@@ -346,7 +346,7 @@ mod tests {
 
     #[test]
     fn test_group_nodes_by_display_state_all_same() {
-        let nodes = vec![
+        let nodes = [
             make_node("n1", NodeState::NodeIdle, "p"),
             make_node("n2", NodeState::NodeIdle, "p"),
             make_node("n3", NodeState::NodeIdle, "p"),
@@ -527,7 +527,7 @@ mod tests {
 
     #[test]
     fn test_group_separates_reserved_idle_from_idle() {
-        let nodes = vec![
+        let nodes = [
             make_node("n1", NodeState::NodeIdle, "p"),
             make_node("n2", NodeState::NodeIdle, "p"),
             make_reserved_node("n3", NodeState::NodeIdle, "p", "maint"),
@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn test_group_alloc_reserved_stays_with_alloc() {
-        let nodes = vec![
+        let nodes = [
             make_node("n1", NodeState::NodeAllocated, "p"),
             make_reserved_node("n2", NodeState::NodeAllocated, "p", "maint"),
         ];
