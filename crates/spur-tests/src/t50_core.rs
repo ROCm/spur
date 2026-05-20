@@ -868,7 +868,7 @@ mod tests {
         // Regression: sinfo NODELIST showed "localhost" instead of real node names (#36).
         // When registered nodes are available the NODELIST should use their names,
         // not fall back to the static partition spec string.
-        let registered_names = vec!["ubb-r09-09", "ubb-r09-11"];
+        let registered_names = ["ubb-r09-09", "ubb-r09-11"];
         let partition_spec = "localhost"; // what default config has
 
         // If registered nodes exist, use them — never fall back to partition spec.

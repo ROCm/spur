@@ -70,7 +70,7 @@ mod tests {
         held.priority = 0;
         let normal = make_job("normal");
 
-        let jobs = vec![held.clone(), normal.clone()];
+        let jobs = [held.clone(), normal.clone()];
         let schedulable: Vec<_> = jobs
             .iter()
             .filter(|j| j.state == JobState::Pending && j.pending_reason != PendingReason::Held)

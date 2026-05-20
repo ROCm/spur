@@ -40,7 +40,7 @@ mod tests {
     #[test]
     fn t05_4_filter_by_state() {
         reset_job_ids();
-        let mut jobs = vec![
+        let mut jobs = [
             make_job("pending1"),
             make_job("pending2"),
             make_job("running1"),
@@ -70,7 +70,7 @@ mod tests {
         let mut j3 = make_job("c");
         j3.spec.user = "alice".into();
 
-        let jobs = vec![j1, j2, j3];
+        let jobs = [j1, j2, j3];
         let alice_jobs: Vec<_> = jobs.iter().filter(|j| j.spec.user == "alice").collect();
         assert_eq!(alice_jobs.len(), 2);
     }
@@ -85,7 +85,7 @@ mod tests {
         let mut j3 = make_job("c");
         j3.spec.partition = Some("gpu".into());
 
-        let jobs = vec![j1, j2, j3];
+        let jobs = [j1, j2, j3];
         let gpu_jobs: Vec<_> = jobs
             .iter()
             .filter(|j| j.spec.partition.as_deref() == Some("gpu"))
@@ -116,7 +116,7 @@ mod tests {
         let mut j3 = make_job("mid");
         j3.priority = 1000;
 
-        let mut jobs = vec![j1, j2, j3];
+        let mut jobs = [j1, j2, j3];
         jobs.sort_by(|a, b| b.priority.cmp(&a.priority));
 
         assert_eq!(jobs[0].spec.name, "high");
@@ -131,7 +131,7 @@ mod tests {
         // Regression: spur queue showed completed/failed/cancelled jobs (#10 #22).
         // squeue should only show Pending and Running (not terminal states).
         reset_job_ids();
-        let mut jobs = vec![
+        let mut jobs = [
             make_job("pending"),
             make_job("running"),
             make_job("completed"),
@@ -157,7 +157,7 @@ mod tests {
     fn t05_10_queue_all_flag_includes_terminal() {
         // With --all / -a flag, completed and failed jobs are also shown.
         reset_job_ids();
-        let mut jobs = vec![make_job("pending"), make_job("done")];
+        let mut jobs = [make_job("pending"), make_job("done")];
         jobs[1].transition(JobState::Running).unwrap();
         jobs[1].transition(JobState::Completed).unwrap();
 
