@@ -1192,7 +1192,7 @@ mod tests {
             metadata: kube::api::ObjectMeta {
                 name: Some("test-job".into()),
                 namespace: namespace.map(String::from),
-                labels: labels,
+                labels,
                 ..Default::default()
             },
             spec: crate::crd::SpurJobSpec {
