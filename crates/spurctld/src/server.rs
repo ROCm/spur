@@ -152,7 +152,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetJobsRequest>,
     ) -> Result<Response<GetJobsResponse>, Status> {
-        if let Err(_) = self.check_leader(&request) {
+        if self.check_leader(&request).is_err() {
             {
                 let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
@@ -196,7 +196,7 @@ impl SlurmController for ControllerService {
     }
 
     async fn get_job(&self, request: Request<GetJobRequest>) -> Result<Response<JobInfo>, Status> {
-        if let Err(_) = self.check_leader(&request) {
+        if self.check_leader(&request).is_err() {
             {
                 let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
@@ -305,7 +305,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetNodesRequest>,
     ) -> Result<Response<GetNodesResponse>, Status> {
-        if let Err(_) = self.check_leader(&request) {
+        if self.check_leader(&request).is_err() {
             {
                 let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
@@ -327,7 +327,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetNodeRequest>,
     ) -> Result<Response<NodeInfo>, Status> {
-        if let Err(_) = self.check_leader(&request) {
+        if self.check_leader(&request).is_err() {
             {
                 let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
@@ -386,7 +386,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetPartitionsRequest>,
     ) -> Result<Response<GetPartitionsResponse>, Status> {
-        if let Err(_) = self.check_leader(&request) {
+        if self.check_leader(&request).is_err() {
             {
                 let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
@@ -564,7 +564,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetJobStepsRequest>,
     ) -> Result<Response<GetJobStepsResponse>, Status> {
-        if let Err(_) = self.check_leader(&request) {
+        if self.check_leader(&request).is_err() {
             {
                 let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
@@ -762,7 +762,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<ListReservationsRequest>,
     ) -> Result<Response<ListReservationsResponse>, Status> {
-        if let Err(_) = self.check_leader(&request) {
+        if self.check_leader(&request).is_err() {
             {
                 let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
@@ -792,7 +792,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<ExecInJobRequest>,
     ) -> Result<Response<ExecInJobResponse>, Status> {
-        if let Err(_) = self.check_leader(&request) {
+        if self.check_leader(&request).is_err() {
             {
                 let proxy = &self.leader_proxy;
                 let mut client = proxy.get_leader_client().await?;
@@ -859,7 +859,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<RunStepRequest>,
     ) -> Result<Response<RunStepResponse>, Status> {
-        if let Err(_) = self.check_leader(&request) {
+        if self.check_leader(&request).is_err() {
             let proxy = &self.leader_proxy;
             let mut client = proxy.get_leader_client().await?;
             let mut fwd = Request::new(request.into_inner());
