@@ -469,10 +469,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
     // If script is provided, parse directives from it
     let script_content = if let Some(script_path) = cli_args.last() {
         if !script_path.starts_with('-') && script_path != "sbatch" {
-            match std::fs::read_to_string(script_path) {
-                Ok(content) => Some(content),
-                Err(_) => None,
-            }
+            std::fs::read_to_string(script_path).ok()
         } else {
             None
         }
