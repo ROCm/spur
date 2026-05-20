@@ -633,9 +633,7 @@ fn registry_base_url(registry: &str) -> String {
 
 /// Sanitize an image name for use as a filename.
 pub fn sanitize_name(name: &str) -> String {
-    name.replace("docker://", "")
-        .replace('/', "+")
-        .replace(':', "+")
+    name.replace("docker://", "").replace(['/', ':'], "+")
 }
 
 #[cfg(test)]
