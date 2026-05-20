@@ -204,7 +204,7 @@ impl Scheduler for BackfillScheduler {
         let mut skip_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
         // Pre-check het groups: if any component can't find suitable nodes, skip all
-        for (_het_id, indices) in &het_groups {
+        for indices in het_groups.values() {
             if indices.len() <= 1 {
                 continue; // Single-component "het" job, treat normally
             }
