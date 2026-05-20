@@ -121,19 +121,14 @@ impl std::fmt::Display for NodeState {
 }
 
 /// Where a node originates from.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum NodeSource {
     /// Traditional bare-metal node running spurd.
+    #[default]
     BareMetal,
     /// Kubernetes node managed by the spur-k8s operator.
     Kubernetes { namespace: String },
-}
-
-impl Default for NodeSource {
-    fn default() -> Self {
-        Self::BareMetal
-    }
 }
 
 /// A compute node in the cluster.
