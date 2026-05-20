@@ -58,10 +58,13 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Checkout GPU test assets from main
+      - name: Checkout trusted deploy assets and scripts from main
         uses: actions/checkout@v4
         with:
-          sparse-checkout: deploy/bare-metal
+          persist-credentials: false
+          sparse-checkout: |
+            deploy/bare-metal
+            scripts
           sparse-checkout-cone-mode: false
           path: trusted-repo
 
@@ -73,6 +76,16 @@ jobs:
           echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
         env:
           BM_SSH_KEY: ${{ secrets.BM_SSH_KEY }}
+
+      - name: Mask sensitive values in console
+        run: |
+          IFS=',' read -ra NODES <<< "$BM_NODES"
+          for node in "${NODES[@]}"; do
+            node="${node#"${node%%[![:space:]]*}"}"
+            node="${node%"${node##*[![:space:]]}"}"
+            [ -n "$node" ] && echo "::add-mask::${node}"
+          done
+          echo "::add-mask::${BM_SSH_USER}"
 
       - name: Verify node connectivity
         run: |
@@ -183,13 +196,18 @@ jobs:
         run: /tmp/e2e-bin/spur-k8s-tests bare_metal::gpu::multi_node --ignored --test-threads=1
 
       - name: Collect cluster logs
-        if: always()
+        if: failure()
         run: |
           set -euo pipefail
           mkdir -p /tmp/bm-logs
           IFS=',' read -ra NODES <<< "$BM_NODES"
+          idx=0
           for node in "${NODES[@]}"; do
-            node_dir="/tmp/bm-logs/${node}"
+            node="${node#"${node%%[![:space:]]*}"}"
+            node="${node%"${node##*[![:space:]]}"}"
+            [ -n "$node" ] || continue
+            node_dir="/tmp/bm-logs/node-${idx}"
+            idx=$((idx + 1))
             mkdir -p "$node_dir"
             for step in single-node multi-node gpu-single-node gpu-multi-node; do
               remote="${BM_REMOTE_BASE}/${step}/log"
@@ -202,13 +220,22 @@ jobs:
           echo "Collected logs:"
           find /tmp/bm-logs -type f -name '*.log' | head -20
 
+      - name: Scrub cluster logs
+        id: scrub-logs
+        if: failure()
+        run: |
+          chmod +x trusted-repo/scripts/scrub-ci-logs.sh
+          trusted-repo/scripts/scrub-ci-logs.sh /tmp/bm-logs \
+            --hostnames "$BM_NODES" \
+            --ssh-user "$BM_SSH_USER"
+
       - name: Upload cluster logs
-        if: always()
+        if: failure() && steps.scrub-logs.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: bare-metal-logs
           path: /tmp/bm-logs/
-          retention-days: 7
+          retention-days: 3
           if-no-files-found: ignore
 
       - name: Cleanup remote processes
@@ -333,6 +360,7 @@ jobs:
       - name: Checkout K8s manifests from main
         uses: actions/checkout@v4
         with:
+          persist-credentials: false
           sparse-checkout: deploy/k8s
           sparse-checkout-cone-mode: false
           path: trusted-repo
