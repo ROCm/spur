@@ -214,6 +214,7 @@ pub struct SpankHandle {
 /// 1=JobUid, etc.).  On success the value is written through `val` and 0
 /// is returned; on error -1 is returned.
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn spur_spank_get_item(
     handle: *mut SpankHandle,
     item: c_int,
@@ -296,6 +297,7 @@ pub extern "C" fn spur_spank_get_item(
 ///
 /// Returns 0 on success, -1 if any pointer is null.
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn spur_spank_set_var(
     handle: *mut SpankHandle,
     key: *const c_char,

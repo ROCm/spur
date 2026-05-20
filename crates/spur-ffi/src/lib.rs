@@ -37,6 +37,7 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 ///
 /// Equivalent to slurm_init_job_desc_msg().
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn slurm_init_job_desc_msg(desc: *mut SlurmJobDescMsg) {
     if desc.is_null() {
         return;
@@ -52,6 +53,7 @@ pub extern "C" fn slurm_init_job_desc_msg(desc: *mut SlurmJobDescMsg) {
 /// Returns 0 on success, -1 on error.
 /// On success, *job_id is set to the assigned job ID.
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn slurm_submit_batch_job(
     desc: *const SlurmJobDescMsg,
     job_id: *mut c_uint,
@@ -110,6 +112,7 @@ pub extern "C" fn slurm_submit_batch_job(
 ///
 /// Caller must free with slurm_free_job_info_msg().
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn slurm_load_jobs(
     _update_time: i64,
     job_info_msg: *mut *mut SlurmJobInfoMsg,
@@ -168,6 +171,7 @@ pub extern "C" fn slurm_load_jobs(
 
 /// Free a job info message.
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn slurm_free_job_info_msg(msg: *mut SlurmJobInfoMsg) {
     if !msg.is_null() {
         unsafe {
@@ -186,6 +190,7 @@ pub extern "C" fn slurm_free_job_info_msg(msg: *mut SlurmJobInfoMsg) {
 
 /// Load node information.
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn slurm_load_node(
     _update_time: i64,
     node_info_msg: *mut *mut SlurmNodeInfoMsg,
@@ -239,6 +244,7 @@ pub extern "C" fn slurm_load_node(
 
 /// Load partition information.
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn slurm_load_partitions(
     _update_time: i64,
     part_info_msg: *mut *mut SlurmPartInfoMsg,
@@ -375,6 +381,7 @@ pub extern "C" fn slurm_seterrno(errnum: c_int) {
 
 /// Print a Slurm error message to stderr.
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn slurm_perror(msg: *const c_char) {
     let prefix = c_str_to_string(msg);
     let errno = slurm_get_errno();
