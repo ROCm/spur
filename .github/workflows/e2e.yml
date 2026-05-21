@@ -24,7 +24,7 @@ jobs:
     if: github.event.workflow_run.conclusion == 'success'
     concurrency:
       group: bare-metal-cluster
-      cancel-in-progress: true
+      cancel-in-progress: false
     env:
       BM_NODES: ${{ secrets.BM_NODES }}
       BM_SSH_USER: ${{ secrets.BM_SSH_USER }}
@@ -330,7 +330,7 @@ jobs:
     needs: push-image
     concurrency:
       group: k8s-integration
-      cancel-in-progress: true
+      cancel-in-progress: false
     env:
       KUBECONFIG: /home/amd/.kube/config
       SPUR_TEST_NS: spur-ci-${{ github.event.workflow_run.id }}
