@@ -3,8 +3,11 @@
 
 //! Accounting data models: accounts, users, QOS, associations, TRES.
 
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::str::FromStr;
+
+use serde::{Deserialize, Serialize};
 
 /// Trackable RESource types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -158,14 +161,16 @@ pub enum QosPreemptMode {
     Suspend,
 }
 
-impl QosPreemptMode {
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+impl FromStr for QosPreemptMode {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Infallible> {
+        Ok(match s.to_lowercase().as_str() {
             "cancel" => Self::Cancel,
             "requeue" => Self::Requeue,
             "suspend" => Self::Suspend,
             _ => Self::Off,
-        }
+        })
     }
 }
 
@@ -241,9 +246,18 @@ mod tests {
 
     #[test]
     fn test_qos_preempt_mode() {
-        assert_eq!(QosPreemptMode::from_str("cancel"), QosPreemptMode::Cancel);
-        assert_eq!(QosPreemptMode::from_str("off"), QosPreemptMode::Off);
-        assert_eq!(QosPreemptMode::from_str("unknown"), QosPreemptMode::Off);
+        assert_eq!(
+            "cancel".parse::<QosPreemptMode>().unwrap(),
+            QosPreemptMode::Cancel
+        );
+        assert_eq!(
+            "off".parse::<QosPreemptMode>().unwrap(),
+            QosPreemptMode::Off
+        );
+        assert_eq!(
+            "unknown".parse::<QosPreemptMode>().unwrap(),
+            QosPreemptMode::Off
+        );
     }
 
     #[test]

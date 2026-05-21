@@ -6,6 +6,9 @@
 //! When `srun` is called inside a batch script, it creates a job step.
 //! Steps track their own resource allocation, task distribution, and status.
 
+use std::convert::Infallible;
+use std::str::FromStr;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -80,14 +83,16 @@ pub enum TaskDistribution {
     Arbitrary,
 }
 
-impl TaskDistribution {
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+impl FromStr for TaskDistribution {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Infallible> {
+        Ok(match s.to_lowercase().as_str() {
             "cyclic" => Self::Cyclic,
             "plane" => Self::Plane,
             "arbitrary" => Self::Arbitrary,
             _ => Self::Block,
-        }
+        })
     }
 }
 
@@ -163,10 +168,12 @@ pub enum CpuBind {
     Mask(String),
 }
 
-impl CpuBind {
-    pub fn from_str(s: &str) -> Self {
+impl FromStr for CpuBind {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Infallible> {
         let lower = s.to_lowercase();
-        if lower.starts_with("map_cpu:") {
+        Ok(if lower.starts_with("map_cpu:") {
             Self::Map(s[8..].to_string())
         } else if lower.starts_with("mask_cpu:") {
             Self::Mask(s[9..].to_string())
@@ -179,7 +186,7 @@ impl CpuBind {
                 "rank" => Self::Rank,
                 _ => Self::None,
             }
-        }
+        })
     }
 }
 
@@ -196,10 +203,12 @@ pub enum GpuBind {
     Mask(String),
 }
 
-impl GpuBind {
-    pub fn from_str(s: &str) -> Self {
+impl FromStr for GpuBind {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Infallible> {
         let lower = s.to_lowercase();
-        if lower.starts_with("map_gpu:") {
+        Ok(if lower.starts_with("map_gpu:") {
             Self::Map(s[8..].to_string())
         } else if lower.starts_with("mask_gpu:") {
             Self::Mask(s[9..].to_string())
@@ -208,7 +217,7 @@ impl GpuBind {
                 "closest" => Self::Closest,
                 _ => Self::None,
             }
-        }
+        })
     }
 }
 
@@ -250,30 +259,39 @@ mod tests {
 
     #[test]
     fn test_cpu_bind_parse() {
-        assert_eq!(CpuBind::from_str("cores"), CpuBind::Cores);
-        assert_eq!(CpuBind::from_str("threads"), CpuBind::Threads);
-        assert_eq!(CpuBind::from_str("none"), CpuBind::None);
+        assert_eq!("cores".parse::<CpuBind>().unwrap(), CpuBind::Cores);
+        assert_eq!("threads".parse::<CpuBind>().unwrap(), CpuBind::Threads);
+        assert_eq!("none".parse::<CpuBind>().unwrap(), CpuBind::None);
         assert!(matches!(
-            CpuBind::from_str("map_cpu:0,1,2,3"),
+            "map_cpu:0,1,2,3".parse::<CpuBind>().unwrap(),
             CpuBind::Map(_)
         ));
     }
 
     #[test]
     fn test_gpu_bind_parse() {
-        assert_eq!(GpuBind::from_str("closest"), GpuBind::Closest);
-        assert_eq!(GpuBind::from_str("none"), GpuBind::None);
-        assert!(matches!(GpuBind::from_str("map_gpu:0,1"), GpuBind::Map(_)));
+        assert_eq!("closest".parse::<GpuBind>().unwrap(), GpuBind::Closest);
+        assert_eq!("none".parse::<GpuBind>().unwrap(), GpuBind::None);
+        assert!(matches!(
+            "map_gpu:0,1".parse::<GpuBind>().unwrap(),
+            GpuBind::Map(_)
+        ));
     }
 
     #[test]
     fn test_task_distribution_from_str() {
         assert_eq!(
-            TaskDistribution::from_str("cyclic"),
+            "cyclic".parse::<TaskDistribution>().unwrap(),
             TaskDistribution::Cyclic
         );
-        assert_eq!(TaskDistribution::from_str("block"), TaskDistribution::Block);
-        assert_eq!(TaskDistribution::from_str("plane"), TaskDistribution::Plane);
+        assert_eq!(
+            "block".parse::<TaskDistribution>().unwrap(),
+            TaskDistribution::Block
+        );
+        assert_eq!(
+            "plane".parse::<TaskDistribution>().unwrap(),
+            TaskDistribution::Plane
+        );
     }
 
     #[test]

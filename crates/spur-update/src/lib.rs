@@ -43,7 +43,7 @@ pub fn spawn_startup_check(
         return;
     }
 
-    let channel = Channel::from_str(channel);
+    let channel = channel.parse::<Channel>().unwrap();
     let cache_dir = PathBuf::from(cache_dir);
 
     tokio::spawn(async move {

@@ -1,6 +1,9 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::convert::Infallible;
+use std::str::FromStr;
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use semver::Version;
@@ -14,12 +17,14 @@ pub enum Channel {
     Nightly,
 }
 
-impl Channel {
-    pub fn from_str(s: &str) -> Self {
-        match s {
+impl FromStr for Channel {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Infallible> {
+        Ok(match s {
             "nightly" => Self::Nightly,
             _ => Self::Stable,
-        }
+        })
     }
 }
 
@@ -145,9 +150,9 @@ mod tests {
 
     #[test]
     fn channel_from_str() {
-        assert_eq!(Channel::from_str("stable"), Channel::Stable);
-        assert_eq!(Channel::from_str("nightly"), Channel::Nightly);
-        assert_eq!(Channel::from_str("anything"), Channel::Stable);
+        assert_eq!("stable".parse::<Channel>().unwrap(), Channel::Stable);
+        assert_eq!("nightly".parse::<Channel>().unwrap(), Channel::Nightly);
+        assert_eq!("anything".parse::<Channel>().unwrap(), Channel::Stable);
     }
 
     #[test]
