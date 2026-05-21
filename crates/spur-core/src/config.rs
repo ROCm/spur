@@ -521,7 +521,7 @@ pub struct ClusterPeer {
 
 impl SlurmConfig {
     /// Load from a TOML file.
-    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+    pub fn load_from_file(path: &Path) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&content)?;
         config.validate()?;
@@ -529,7 +529,7 @@ impl SlurmConfig {
     }
 
     /// Load from a TOML string.
-    pub fn from_str(s: &str) -> Result<Self, ConfigError> {
+    pub fn load_from_str(s: &str) -> Result<Self, ConfigError> {
         let config: Self = toml::from_str(s)?;
         config.validate()?;
         Ok(config)
@@ -770,7 +770,7 @@ cpus = 256
 memory_mb = 1024000
 "#;
 
-        let config = SlurmConfig::from_str(toml).unwrap();
+        let config = SlurmConfig::load_from_str(toml).unwrap();
         assert_eq!(config.cluster_name, "test-cluster");
         assert_eq!(config.partitions.len(), 2);
         assert_eq!(config.nodes.len(), 2);

@@ -56,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Load config if it exists, otherwise use defaults
     let mut config = if args.config.exists() {
-        spur_core::config::SlurmConfig::load(&args.config)?
+        spur_core::config::SlurmConfig::load_from_file(&args.config)?
     } else {
         info!("no config file found, using defaults");
         spur_core::config::SlurmConfig {

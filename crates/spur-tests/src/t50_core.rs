@@ -941,7 +941,7 @@ state_dir = "/tmp/spur-test"
 name = "peer-a"
 address = "http://peer-a:6817"
 "#;
-        let cfg = SlurmConfig::from_str(toml).unwrap();
+        let cfg = SlurmConfig::load_from_str(toml).unwrap();
         assert_eq!(cfg.federation.clusters.len(), 1);
         assert_eq!(cfg.federation.clusters[0].name, "peer-a");
     }
@@ -1056,7 +1056,7 @@ address = "http://peer-a:6817"
             listen_addr = "[::]:6821"
             hosts = ["ctrl.example.com"]
         "#;
-        let config = spur_core::config::SlurmConfig::from_str(toml).unwrap();
+        let config = spur_core::config::SlurmConfig::load_from_str(toml).unwrap();
         assert_eq!(config.controller.listen_addr, "[::]:6821");
         assert_eq!(config.controller.hosts[0], "ctrl.example.com");
 

@@ -66,19 +66,19 @@ mod tests {
 
     #[test]
     fn t52_10_minimal_config() {
-        let config = SlurmConfig::from_str(r#"cluster_name = "test""#).unwrap();
+        let config = SlurmConfig::load_from_str(r#"cluster_name = "test""#).unwrap();
         assert_eq!(config.cluster_name, "test");
     }
 
     #[test]
     fn t52_11_missing_cluster_name() {
-        let result = SlurmConfig::from_str(r#"[controller]"#);
+        let result = SlurmConfig::load_from_str(r#"[controller]"#);
         assert!(result.is_err());
     }
 
     #[test]
     fn t52_12_full_config() {
-        let config = SlurmConfig::from_str(
+        let config = SlurmConfig::load_from_str(
             r#"
 cluster_name = "prod-cluster"
 
@@ -138,7 +138,7 @@ memory_mb = 1024000
 
     #[test]
     fn t52_13_build_partitions() {
-        let config = SlurmConfig::from_str(
+        let config = SlurmConfig::load_from_str(
             r#"
 cluster_name = "test"
 
@@ -174,7 +174,7 @@ max_time = "1:00"
 
     #[test]
     fn t52_14_scheduler_defaults() {
-        let config = SlurmConfig::from_str(
+        let config = SlurmConfig::load_from_str(
             r#"
 cluster_name = "test"
 [scheduler]
@@ -193,7 +193,7 @@ plugin = "backfill"
     #[test]
     fn t52_15_listen_addr_preserved_from_config() {
         // Regression: spurctld ignored config listen_addr and always bound to :6817 (#37).
-        let config = SlurmConfig::from_str(
+        let config = SlurmConfig::load_from_str(
             r#"
 cluster_name = "prod"
 [controller]
@@ -208,7 +208,7 @@ state_dir = "/var/spool/spur"
     #[test]
     fn t52_16_listen_addr_default_parseable() {
         // When listen_addr is not in config the default must be a valid socket address.
-        let config = SlurmConfig::from_str(
+        let config = SlurmConfig::load_from_str(
             r#"
 cluster_name = "test"
 [controller]

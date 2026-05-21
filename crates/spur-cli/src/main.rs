@@ -45,7 +45,7 @@ fn load_controller_addr_from_config() {
         return;
     }
 
-    if let Ok(config) = spur_core::config::SlurmConfig::load(&config_path) {
+    if let Ok(config) = spur_core::config::SlurmConfig::load_from_file(&config_path) {
         // Extract host and port from the config
         let host = config
             .controller

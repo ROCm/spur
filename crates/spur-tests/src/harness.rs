@@ -149,7 +149,7 @@ pub fn test_script(directives: &[&str], body: &str) -> String {
 
 /// Minimal TOML config for testing.
 pub fn test_config() -> SlurmConfig {
-    SlurmConfig::from_str(
+    SlurmConfig::load_from_str(
         r#"
 cluster_name = "test-cluster"
 
