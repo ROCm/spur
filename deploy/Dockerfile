@@ -13,8 +13,10 @@ RUN yum install -y unzip && yum clean all && \
     unzip -o /tmp/protoc.zip -d /usr/local && \
     rm /tmp/protoc.zip
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+COPY rust-toolchain.toml .
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
 ENV PATH="/root/.cargo/bin:${PATH}"
+RUN rustup show
 
 RUN cargo install cargo-chef --locked --version 0.1.77
 

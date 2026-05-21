@@ -17,9 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - name: Install Rust toolchain
+        run: rustup show
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -31,9 +30,8 @@ jobs:
       - name: Install protobuf compiler
         run: sudo apt-get install -y protobuf-compiler
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: Install Rust toolchain
+        run: rustup show
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
@@ -58,7 +56,8 @@ jobs:
       - name: Install protobuf compiler
         run: sudo apt-get install -y protobuf-compiler
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        run: rustup show
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
@@ -97,7 +96,8 @@ jobs:
       - name: Install protobuf compiler
         run: sudo apt-get install -y protobuf-compiler
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        run: rustup show
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
