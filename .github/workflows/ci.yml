@@ -9,6 +9,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
 
 # All jobs run on ephemeral GitHub-hosted runners.
 # Zero secrets, zero self-hosted runners — safe for fork PRs.
@@ -46,7 +47,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Clippy
-        run: cargo clippy --workspace --exclude spur-ffi --all-targets --locked -- -W clippy::all -D unused
+        run: cargo clippy --workspace --exclude spur-ffi --all-targets --locked
 
   build:
     runs-on: ubuntu-latest
