@@ -33,6 +33,14 @@ struct TrackedJob {
     has_pid_namespace: bool,
 }
 
+struct CompletedJob {
+    job_id: u32,
+    exit_code: i32,
+    rootfs_mode: crate::container::RootfsMode,
+    allocation: Option<AllocationResult>,
+    cgroup: Option<std::path::PathBuf>,
+}
+
 pub struct AgentService {
     pub reporter: Arc<NodeReporter>,
     running: Arc<Mutex<HashMap<u32, TrackedJob>>>,
@@ -114,25 +122,19 @@ impl AgentService {
             loop {
                 interval.tick().await;
                 let mut jobs = running.lock().await;
-                let mut completed: Vec<(
-                    u32,
-                    i32,
-                    crate::container::RootfsMode,
-                    Option<AllocationResult>,
-                    Option<std::path::PathBuf>,
-                )> = Vec::new();
+                let mut completed: Vec<CompletedJob> = Vec::new();
 
                 for (job_id, tracked) in jobs.iter_mut() {
                     match tracked.job.try_wait() {
                         Ok(Some(exit_code)) => {
                             info!(job_id, exit_code, "job finished");
-                            completed.push((
-                                *job_id,
+                            completed.push(CompletedJob {
+                                job_id: *job_id,
                                 exit_code,
-                                tracked.rootfs_mode.clone(),
-                                tracked.allocation.take(),
-                                tracked.job.take_cgroup(),
-                            ));
+                                rootfs_mode: tracked.rootfs_mode.clone(),
+                                allocation: tracked.allocation.take(),
+                                cgroup: tracked.job.take_cgroup(),
+                            });
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -141,18 +143,18 @@ impl AgentService {
                     }
                 }
 
-                for (job_id, _exit_code, mode, alloc, cgroup) in &completed {
-                    jobs.remove(job_id);
-                    crate::container::cleanup_rootfs(*job_id, mode);
-                    if let Some(cgroup) = cgroup {
+                for c in &completed {
+                    jobs.remove(&c.job_id);
+                    crate::container::cleanup_rootfs(c.job_id, &c.rootfs_mode);
+                    if let Some(ref cgroup) = c.cgroup {
                         crate::executor::cleanup_cgroup(cgroup);
                     }
                     // Release GPU/CPU allocation
-                    if let Some(alloc) = alloc {
+                    if let Some(ref alloc) = c.allocation {
                         allocation.lock().await.release(alloc);
                     }
                     // Cleanup PMI server if one was started for this job
-                    if let Some(pmi) = pmi_servers.lock().await.remove(job_id) {
+                    if let Some(pmi) = pmi_servers.lock().await.remove(&c.job_id) {
                         pmi.cleanup();
                     }
                 }
@@ -164,18 +166,18 @@ impl AgentService {
 
                 // Invoke SPANK TaskExit and JobEpilog hooks for completed jobs
                 if let Some(ref spank_host) = *spank {
-                    for (job_id, _exit_code, _mode, _alloc, _cgroup) in &completed {
+                    for c in &completed {
                         if let Err(e) = spank_host.invoke_hook(SpankHook::TaskExit) {
-                            warn!(job_id, error = %e, "SPANK TaskExit hook failed");
+                            warn!(c.job_id, error = %e, "SPANK TaskExit hook failed");
                         }
                         if let Err(e) = spank_host.invoke_hook(SpankHook::JobEpilog) {
-                            warn!(job_id, error = %e, "SPANK JobEpilog hook failed");
+                            warn!(c.job_id, error = %e, "SPANK JobEpilog hook failed");
                         }
                     }
                 }
 
-                for (job_id, exit_code, _mode, _alloc, _cgroup) in &completed {
-                    report_completion(&controller_addr, *job_id, *exit_code).await;
+                for c in &completed {
+                    report_completion(&controller_addr, c.job_id, c.exit_code).await;
                 }
             }
         });
