@@ -127,6 +127,7 @@ CREATE INDEX IF NOT EXISTS idx_assoc_account ON associations(account);
 "#;
 
 /// Record a job start in the database.
+#[allow(clippy::too_many_arguments)]
 pub async fn record_job_start(
     pool: &PgPool,
     job_id: i32,
@@ -564,6 +565,7 @@ pub struct UserRecord {
 }
 
 /// Create or update a QOS.
+#[allow(clippy::too_many_arguments)]
 pub async fn upsert_qos(
     pool: &PgPool,
     name: &str,

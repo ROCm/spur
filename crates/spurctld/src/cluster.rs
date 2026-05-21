@@ -440,6 +440,7 @@ impl ClusterManager {
     }
 
     /// Register a node agent.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_node(
         &self,
         name: String,
@@ -636,6 +637,7 @@ impl ClusterManager {
     }
 
     /// Update job properties.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_job(
         &self,
         job_id: JobId,
@@ -988,6 +990,7 @@ impl ClusterManager {
     }
 
     /// Update an existing reservation.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_reservation(
         &self,
         name: &str,
