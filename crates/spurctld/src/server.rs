@@ -82,6 +82,8 @@ impl LeaderProxy {
 }
 
 impl ControllerService {
+    // tonic::Status is 176 bytes (over clippy's 128-byte threshold); fixed upstream in tonic 0.13+
+    #[allow(clippy::result_large_err)]
     fn check_leader<T>(&self, request: &Request<T>) -> Result<(), Status> {
         if self.raft.is_leader() {
             return Ok(());
@@ -959,6 +961,8 @@ pub async fn serve(
 
 // ---- Proto conversion helpers ----
 
+// tonic::Status is 176 bytes (over clippy's 128-byte threshold); fixed upstream in tonic 0.13+
+#[allow(clippy::result_large_err)]
 fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
     let mut gres = spec.gres;
     for lic in &spec.licenses {
