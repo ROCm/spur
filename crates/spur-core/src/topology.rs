@@ -241,7 +241,7 @@ impl TopologyTree {
 
         let groups = self.group_by_switch(candidates);
         let mut sorted_groups: Vec<(String, Vec<&'a str>)> = groups.into_iter().collect();
-        sorted_groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        sorted_groups.sort_by_key(|g| std::cmp::Reverse(g.1.len()));
 
         // If the largest group has enough, use it
         if sorted_groups[0].1.len() >= count {

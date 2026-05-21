@@ -117,7 +117,7 @@ mod tests {
         j3.priority = 1000;
 
         let mut jobs = [j1, j2, j3];
-        jobs.sort_by(|a, b| b.priority.cmp(&a.priority));
+        jobs.sort_by_key(|j| std::cmp::Reverse(j.priority));
 
         assert_eq!(jobs[0].spec.name, "high");
         assert_eq!(jobs[1].spec.name, "mid");
