@@ -86,7 +86,7 @@ impl ClusterManager {
             };
             self.propose(WalOperation::JobSubmit {
                 job_id: task_id,
-                spec: task_spec,
+                spec: Box::new(task_spec),
             })?;
         }
 
@@ -1290,7 +1290,7 @@ impl ClusterManager {
 
         match op {
             WalOperation::JobSubmit { job_id, spec } => {
-                let mut job = Job::new(*job_id, spec.clone());
+                let mut job = Job::new(*job_id, (**spec).clone());
                 if let Some(het_group) = spec.het_group {
                     job.het_group = Some(het_group);
                     if het_group > 0 {
@@ -1877,7 +1877,7 @@ mod tests {
         let spec = basic_spec("test-job");
         cm.apply_operation(&WalOperation::JobSubmit {
             job_id: 1,
-            spec: spec.clone(),
+            spec: Box::new(spec.clone()),
         });
 
         let job = cm.get_job(1).unwrap();
@@ -1894,7 +1894,7 @@ mod tests {
 
         cm.apply_operation(&WalOperation::JobSubmit {
             job_id: 1,
-            spec: basic_spec("j"),
+            spec: Box::new(basic_spec("j")),
         });
         cm.apply_operation(&WalOperation::JobStateChange {
             job_id: 1,
@@ -1914,7 +1914,7 @@ mod tests {
         register_node(&cm, "node1", 8, 16000);
         cm.apply_operation(&WalOperation::JobSubmit {
             job_id: 1,
-            spec: basic_spec("j"),
+            spec: Box::new(basic_spec("j")),
         });
 
         let resources = ResourceSet {
@@ -1945,7 +1945,7 @@ mod tests {
         register_node(&cm, "node1", 8, 16000);
         cm.apply_operation(&WalOperation::JobSubmit {
             job_id: 1,
-            spec: basic_spec("j"),
+            spec: Box::new(basic_spec("j")),
         });
         cm.apply_operation(&WalOperation::JobStateChange {
             job_id: 1,
@@ -2034,7 +2034,7 @@ mod tests {
 
         cm.apply_operation(&WalOperation::JobSubmit {
             job_id: 1,
-            spec: basic_spec("j"),
+            spec: Box::new(basic_spec("j")),
         });
         cm.apply_operation(&WalOperation::JobPriorityChange {
             job_id: 1,

@@ -17,7 +17,7 @@ pub enum WalOperation {
     // Job operations
     JobSubmit {
         job_id: JobId,
-        spec: JobSpec,
+        spec: Box<JobSpec>,
     },
     JobStateChange {
         job_id: JobId,
