@@ -974,7 +974,7 @@ impl ClusterManager {
             );
         }
 
-        pending.sort_by(|a, b| b.priority.cmp(&a.priority));
+        pending.sort_by_key(|j| std::cmp::Reverse(j.priority));
         pending
     }
 
