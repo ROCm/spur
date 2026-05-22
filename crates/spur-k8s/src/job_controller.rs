@@ -655,20 +655,9 @@ fn is_terminal(state: &str) -> bool {
 }
 
 fn proto_job_state_to_string(state: i32) -> String {
-    match state {
-        0 => "Pending",
-        1 => "Running",
-        2 => "Completing",
-        3 => "Completed",
-        4 => "Failed",
-        5 => "Cancelled",
-        6 => "Timeout",
-        7 => "NodeFail",
-        8 => "Preempted",
-        9 => "Suspended",
-        _ => "Unknown",
-    }
-    .to_string()
+    spur_core::job::JobState::from_proto_i32(state)
+        .map(|s| format!("{s:?}"))
+        .unwrap_or_else(|| "Unknown".into())
 }
 
 /// Convert a core JobSpec into proto JobSpec for gRPC submission.
@@ -758,27 +747,13 @@ mod tests {
     // --- proto_job_state_to_string ---
 
     #[test]
-    fn test_proto_job_state_to_string() {
-        assert_eq!(proto_job_state_to_string(0), "Pending");
-        assert_eq!(proto_job_state_to_string(1), "Running");
-        assert_eq!(proto_job_state_to_string(3), "Completed");
-        assert_eq!(proto_job_state_to_string(4), "Failed");
-        assert_eq!(proto_job_state_to_string(99), "Unknown");
-    }
-
-    #[test]
-    fn test_proto_job_state_all_values() {
-        assert_eq!(proto_job_state_to_string(2), "Completing");
-        assert_eq!(proto_job_state_to_string(5), "Cancelled");
-        assert_eq!(proto_job_state_to_string(6), "Timeout");
-        assert_eq!(proto_job_state_to_string(7), "NodeFail");
-        assert_eq!(proto_job_state_to_string(8), "Preempted");
-        assert_eq!(proto_job_state_to_string(9), "Suspended");
-    }
-
-    #[test]
-    fn test_proto_job_state_negative() {
+    fn test_proto_job_state_to_string_all_values() {
+        for &state in &spur_core::job::JobState::ALL {
+            let wire = state.to_proto_i32();
+            assert_eq!(proto_job_state_to_string(wire), format!("{state:?}"));
+        }
         assert_eq!(proto_job_state_to_string(-1), "Unknown");
+        assert_eq!(proto_job_state_to_string(99), "Unknown");
     }
 
     // --- is_terminal ---
