@@ -453,32 +453,15 @@ async fn ping(controller: &str) -> Result<()> {
 }
 
 fn state_name(state: i32) -> &'static str {
-    match state {
-        0 => "PENDING",
-        1 => "RUNNING",
-        2 => "COMPLETING",
-        3 => "COMPLETED",
-        4 => "FAILED",
-        5 => "CANCELLED",
-        6 => "TIMEOUT",
-        7 => "NODE_FAIL",
-        8 => "PREEMPTED",
-        9 => "SUSPENDED",
-        _ => "UNKNOWN",
-    }
+    spur_core::job::JobState::from_proto_i32(state)
+        .map(|s| s.display())
+        .unwrap_or("UNKNOWN")
 }
 
 fn node_state_name(state: i32) -> &'static str {
-    match state {
-        0 => "IDLE",
-        1 => "ALLOCATED",
-        2 => "MIXED",
-        3 => "DOWN",
-        4 => "DRAINED",
-        5 => "DRAINING",
-        6 => "ERROR",
-        _ => "UNKNOWN",
-    }
+    spur_core::node::NodeState::from_proto_i32(state)
+        .map(|s| s.display_upper())
+        .unwrap_or("UNKNOWN")
 }
 
 fn format_ts(ts: Option<&prost_types::Timestamp>) -> String {

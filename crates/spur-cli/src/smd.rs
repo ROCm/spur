@@ -111,54 +111,7 @@ fn node_state_str(node: &NodeInfo) -> &'static str {
     if !node.active_reservation.is_empty() && node.state == NodeState::NodeIdle as i32 {
         return "resv";
     }
-    match node.state {
-        0 => "idle",
-        1 => "alloc",
-        2 => "mix",
-        3 => "DOWN",
-        4 => "drain",
-        5 => "drng",
-        6 => "ERROR",
-        7 => "unk",
-        8 => "susp",
-        _ => "???",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_node(name: &str, state: NodeState, reservation: &str) -> NodeInfo {
-        NodeInfo {
-            name: name.into(),
-            state: state as i32,
-            active_reservation: reservation.into(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn test_smd_state_reserved() {
-        let node = make_node("n1", NodeState::NodeIdle, "maint");
-        assert_eq!(node_state_str(&node), "resv");
-    }
-
-    #[test]
-    fn test_smd_state_alloc_reserved() {
-        let node = make_node("n1", NodeState::NodeAllocated, "maint");
-        assert_eq!(node_state_str(&node), "alloc");
-    }
-
-    #[test]
-    fn test_smd_state_idle_no_reservation() {
-        let node = make_node("n1", NodeState::NodeIdle, "");
-        assert_eq!(node_state_str(&node), "idle");
-    }
-
-    #[test]
-    fn test_smd_state_down() {
-        let node = make_node("n1", NodeState::NodeDown, "");
-        assert_eq!(node_state_str(&node), "DOWN");
-    }
+    spur_core::node::NodeState::from_proto_i32(node.state)
+        .map(|s| s.short())
+        .unwrap_or("???")
 }

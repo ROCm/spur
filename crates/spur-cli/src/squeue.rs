@@ -76,20 +76,13 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let fields = format_engine::parse_format(&fmt, &format_engine::squeue_header);
 
     // Parse state filter — default to Pending+Running when no filter specified (Slurm default)
-    let states = args
-        .states
-        .as_ref()
-        .map(|s| {
-            s.split(',')
-                .filter_map(|st| parse_state_filter(st.trim()))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_else(|| {
-            vec![
-                spur_proto::proto::JobState::JobPending,
-                spur_proto::proto::JobState::JobRunning,
-            ]
-        });
+    let states = match args.states.as_deref() {
+        Some(s) => parse_states_arg(s)?,
+        None => vec![
+            spur_proto::proto::JobState::JobPending,
+            spur_proto::proto::JobState::JobRunning,
+        ],
+    };
 
     // Parse job ID filter
     let job_ids = args
@@ -168,53 +161,44 @@ fn resolve_job_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
 }
 
 fn state_code(state: i32) -> String {
-    match state {
-        0 => "PD",
-        1 => "R",
-        2 => "CG",
-        3 => "CD",
-        4 => "F",
-        5 => "CA",
-        6 => "TO",
-        7 => "NF",
-        8 => "PR",
-        9 => "S",
-        _ => "?",
-    }
-    .into()
+    spur_core::job::JobState::from_proto_i32(state)
+        .map(|s| s.code().to_string())
+        .unwrap_or_else(|| "?".into())
 }
 
 fn state_name(state: i32) -> String {
-    match state {
-        0 => "PENDING",
-        1 => "RUNNING",
-        2 => "COMPLETING",
-        3 => "COMPLETED",
-        4 => "FAILED",
-        5 => "CANCELLED",
-        6 => "TIMEOUT",
-        7 => "NODE_FAIL",
-        8 => "PREEMPTED",
-        9 => "SUSPENDED",
-        _ => "UNKNOWN",
-    }
-    .into()
+    spur_core::job::JobState::from_proto_i32(state)
+        .map(|s| s.display().to_string())
+        .unwrap_or_else(|| "UNKNOWN".into())
 }
 
-fn parse_state_filter(s: &str) -> Option<spur_proto::proto::JobState> {
-    match s.to_uppercase().as_str() {
-        "PD" | "PENDING" => Some(spur_proto::proto::JobState::JobPending),
-        "R" | "RUNNING" => Some(spur_proto::proto::JobState::JobRunning),
-        "CG" | "COMPLETING" => Some(spur_proto::proto::JobState::JobCompleting),
-        "CD" | "COMPLETED" => Some(spur_proto::proto::JobState::JobCompleted),
-        "F" | "FAILED" => Some(spur_proto::proto::JobState::JobFailed),
-        "CA" | "CANCELLED" => Some(spur_proto::proto::JobState::JobCancelled),
-        "TO" | "TIMEOUT" => Some(spur_proto::proto::JobState::JobTimeout),
-        "NF" | "NODE_FAIL" => Some(spur_proto::proto::JobState::JobNodeFail),
-        "PR" | "PREEMPTED" => Some(spur_proto::proto::JobState::JobPreempted),
-        "S" | "SUSPENDED" => Some(spur_proto::proto::JobState::JobSuspended),
-        _ => None,
+/// Parse `-t` / `--states` (comma-separated). Whole-string `all` means no state filter.
+/// Unknown tokens are rejected (Slurm exits with an error rather than showing all jobs).
+fn parse_states_arg(s: &str) -> Result<Vec<spur_proto::proto::JobState>> {
+    use spur_core::job::JobState;
+
+    let trimmed = s.trim();
+    if trimmed.eq_ignore_ascii_case("all") {
+        return Ok(Vec::new());
     }
+
+    let tokens: Vec<&str> = trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    if tokens.is_empty() {
+        anyhow::bail!("Invalid job state specified: (empty)");
+    }
+
+    let mut states = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let core = JobState::from_code_or_name(token)
+            .ok_or_else(|| anyhow::anyhow!("Invalid job state specified: {token}"))?;
+        states.push(core.to_proto());
+    }
+    Ok(states)
 }
 
 fn format_runtime(job: &spur_proto::proto::JobInfo) -> String {
@@ -257,5 +241,40 @@ fn format_timestamp(ts: Option<&prost_types::Timestamp>) -> String {
             dt.format("%Y-%m-%dT%H:%M:%S").to_string()
         }
         _ => "N/A".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spur_proto::proto::JobState as P;
+
+    #[test]
+    fn parse_states_arg_accepts_codes_and_names() {
+        let states = parse_states_arg("R,PD").unwrap();
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0], P::JobRunning);
+        assert_eq!(states[1], P::JobPending);
+    }
+
+    #[test]
+    fn parse_states_arg_all_means_no_filter() {
+        assert!(parse_states_arg("all").unwrap().is_empty());
+        assert!(parse_states_arg("ALL").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_states_arg_rejects_unknown() {
+        let err = parse_states_arg("BOGUS").unwrap_err();
+        assert!(err.to_string().contains("BOGUS"));
+
+        let err = parse_states_arg("R,BOGUS").unwrap_err();
+        assert!(err.to_string().contains("BOGUS"));
+    }
+
+    #[test]
+    fn parse_states_arg_rejects_empty_list() {
+        assert!(parse_states_arg("").is_err());
+        assert!(parse_states_arg("  ,  ").is_err());
     }
 }

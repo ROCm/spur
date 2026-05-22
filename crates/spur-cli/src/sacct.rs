@@ -192,20 +192,9 @@ fn resolve_sacct_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
 }
 
 fn state_name(state: i32) -> String {
-    match state {
-        0 => "PENDING",
-        1 => "RUNNING",
-        2 => "COMPLETING",
-        3 => "COMPLETED",
-        4 => "FAILED",
-        5 => "CANCELLED",
-        6 => "TIMEOUT",
-        7 => "NODE_FAIL",
-        8 => "PREEMPTED",
-        9 => "SUSPENDED",
-        _ => "UNKNOWN",
-    }
-    .into()
+    spur_core::job::JobState::from_proto_i32(state)
+        .map(|s| s.display().to_string())
+        .unwrap_or_else(|| "UNKNOWN".into())
 }
 
 fn parse_acct_state(s: &str) -> Option<i32> {

@@ -241,19 +241,9 @@ fn resolve_field(job: &spur_proto::proto::JobInfo, field: &StatField) -> String 
 }
 
 fn state_name(state: i32) -> &'static str {
-    match state {
-        0 => "PENDING",
-        1 => "RUNNING",
-        2 => "COMPLETING",
-        3 => "COMPLETED",
-        4 => "FAILED",
-        5 => "CANCELLED",
-        6 => "TIMEOUT",
-        7 => "NODE_FAIL",
-        8 => "PREEMPTED",
-        9 => "SUSPENDED",
-        _ => "UNKNOWN",
-    }
+    spur_core::job::JobState::from_proto_i32(state)
+        .map(|s| s.display())
+        .unwrap_or("UNKNOWN")
 }
 
 fn format_duration(total_seconds: i64) -> String {

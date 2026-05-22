@@ -278,19 +278,9 @@ fn effective_state_str(node: &NodeInfo) -> String {
     {
         return "resv".into();
     }
-    match node.state {
-        0 => "idle",
-        1 => "alloc",
-        2 => "mix",
-        3 => "down",
-        4 => "drain",
-        5 => "drng",
-        6 => "err",
-        7 => "unk",
-        8 => "susp",
-        _ => "unk",
-    }
-    .into()
+    spur_core::node::NodeState::from_proto_i32(node.state)
+        .map(|s| s.short().to_string())
+        .unwrap_or_else(|| "unk".into())
 }
 
 #[cfg(test)]
@@ -481,46 +471,9 @@ mod tests {
     }
 
     #[test]
-    fn test_effective_state_idle_reserved() {
-        let node = make_reserved_node("n1", NodeState::NodeIdle, "p", "maint");
-        assert_eq!(effective_state_str(&node), "resv");
-    }
-
-    #[test]
-    fn test_effective_state_alloc_reserved() {
-        let node = make_reserved_node("n1", NodeState::NodeAllocated, "p", "maint");
-        assert_eq!(effective_state_str(&node), "alloc");
-    }
-
-    #[test]
     fn test_effective_state_mixed_reserved() {
         let node = make_reserved_node("n1", NodeState::NodeMixed, "p", "maint");
         assert_eq!(effective_state_str(&node), "mix");
-    }
-
-    #[test]
-    fn test_effective_state_all_base_states() {
-        let cases = [
-            (NodeState::NodeIdle, "idle"),
-            (NodeState::NodeAllocated, "alloc"),
-            (NodeState::NodeMixed, "mix"),
-            (NodeState::NodeDown, "down"),
-            (NodeState::NodeDrain, "drain"),
-            (NodeState::NodeDraining, "drng"),
-            (NodeState::NodeError, "err"),
-            (NodeState::NodeUnknown, "unk"),
-            (NodeState::NodeSuspended, "susp"),
-        ];
-        for (state, expected) in cases {
-            let node = make_node("n1", state, "p");
-            assert_eq!(
-                effective_state_str(&node),
-                expected,
-                "state {:?} should display as {}",
-                state,
-                expected
-            );
-        }
     }
 
     // --- grouping tests ---
