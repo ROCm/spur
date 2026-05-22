@@ -52,56 +52,57 @@ mod tests {
     #[test]
     fn t55_7_job_state_display_matches_slurm() {
         use spur_core::job::JobState;
-        // These must match Slurm's output exactly
-        let expected = vec![
-            (JobState::Pending, "PD", "PENDING"),
-            (JobState::Running, "R", "RUNNING"),
-            (JobState::Completing, "CG", "COMPLETING"),
-            (JobState::Completed, "CD", "COMPLETED"),
-            (JobState::Failed, "F", "FAILED"),
-            (JobState::Cancelled, "CA", "CANCELLED"),
-            (JobState::Timeout, "TO", "TIMEOUT"),
-            (JobState::NodeFail, "NF", "NODE_FAIL"),
-            (JobState::Preempted, "PR", "PREEMPTED"),
-            (JobState::Suspended, "S", "SUSPENDED"),
+        let expected: [(&str, &str); JobState::COUNT] = [
+            ("PD", "PENDING"),
+            ("R", "RUNNING"),
+            ("CG", "COMPLETING"),
+            ("CD", "COMPLETED"),
+            ("F", "FAILED"),
+            ("CA", "CANCELLED"),
+            ("TO", "TIMEOUT"),
+            ("NF", "NODE_FAIL"),
+            ("PR", "PREEMPTED"),
+            ("S", "SUSPENDED"),
         ];
-        for (state, code, name) in expected {
-            assert_eq!(state.code(), code, "code mismatch for {:?}", state);
-            assert_eq!(state.display(), name, "display mismatch for {:?}", state);
+        assert_eq!(JobState::ALL.len(), expected.len());
+        for (i, state) in JobState::ALL.iter().enumerate() {
+            let (code, name) = expected[i];
+            assert_eq!(state.code(), code, "code mismatch for {state:?}");
+            assert_eq!(state.display(), name, "display mismatch for {state:?}");
         }
     }
 
     #[test]
     fn t55_8_node_state_display_matches_slurm() {
         use spur_core::node::NodeState;
-        let expected = vec![
-            (NodeState::Idle, "idle"),
-            (NodeState::Allocated, "allocated"),
-            (NodeState::Mixed, "mixed"),
-            (NodeState::Down, "down"),
-            (NodeState::Drain, "drained"),
-            (NodeState::Draining, "draining"),
-            (NodeState::Error, "error"),
-            (NodeState::Unknown, "unknown"),
+        let expected: [&str; NodeState::COUNT] = [
+            "idle",
+            "allocated",
+            "mixed",
+            "down",
+            "drained",
+            "draining",
+            "error",
+            "unknown",
+            "suspended",
         ];
-        for (state, name) in expected {
-            assert_eq!(state.display(), name);
+        for (i, state) in NodeState::ALL.iter().enumerate() {
+            assert_eq!(
+                state.display(),
+                expected[i],
+                "display mismatch for {state:?}"
+            );
         }
     }
 
     #[test]
     fn t55_9_node_state_short_matches_slurm() {
         use spur_core::node::NodeState;
-        let expected = vec![
-            (NodeState::Idle, "idle"),
-            (NodeState::Allocated, "alloc"),
-            (NodeState::Mixed, "mix"),
-            (NodeState::Down, "down"),
-            (NodeState::Drain, "drain"),
-            (NodeState::Draining, "drng"),
+        let expected: [&str; NodeState::COUNT] = [
+            "idle", "alloc", "mix", "down", "drain", "drng", "err", "unk", "susp",
         ];
-        for (state, short) in expected {
-            assert_eq!(state.short(), short);
+        for (i, state) in NodeState::ALL.iter().enumerate() {
+            assert_eq!(state.short(), expected[i], "short mismatch for {state:?}");
         }
     }
 

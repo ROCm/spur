@@ -118,29 +118,6 @@ mod tests {
         assert_transition_err(&mut job, JobState::Failed);
     }
 
-    // ── T50.13: Job state display ─────────────────────────────────
-
-    #[test]
-    fn t50_13_state_codes() {
-        assert_eq!(JobState::Pending.code(), "PD");
-        assert_eq!(JobState::Running.code(), "R");
-        assert_eq!(JobState::Completing.code(), "CG");
-        assert_eq!(JobState::Completed.code(), "CD");
-        assert_eq!(JobState::Failed.code(), "F");
-        assert_eq!(JobState::Cancelled.code(), "CA");
-        assert_eq!(JobState::Timeout.code(), "TO");
-        assert_eq!(JobState::NodeFail.code(), "NF");
-        assert_eq!(JobState::Preempted.code(), "PR");
-        assert_eq!(JobState::Suspended.code(), "S");
-    }
-
-    #[test]
-    fn t50_14_state_display_names() {
-        assert_eq!(JobState::Pending.display(), "PENDING");
-        assert_eq!(JobState::Running.display(), "RUNNING");
-        assert_eq!(JobState::Completed.display(), "COMPLETED");
-    }
-
     // ── T50.15: Job path resolution ───────────────────────────────
 
     #[test]
@@ -233,15 +210,6 @@ mod tests {
         node.update_state_from_alloc();
         // Should stay Drain, not flip to Idle
         assert_eq!(node.state, NodeState::Drain);
-    }
-
-    #[test]
-    fn t50_23_node_schedulable() {
-        assert!(NodeState::Idle.is_available());
-        assert!(NodeState::Mixed.is_available());
-        assert!(!NodeState::Down.is_available());
-        assert!(!NodeState::Drain.is_available());
-        assert!(!NodeState::Allocated.is_available());
     }
 
     // ── T50.24: ResourceSet ───────────────────────────────────────
@@ -509,15 +477,14 @@ mod tests {
 
     #[test]
     fn t50_43_node_available_states() {
-        // Comprehensive check: only Idle and Mixed are available
-        assert!(NodeState::Idle.is_available());
-        assert!(NodeState::Mixed.is_available());
-        assert!(!NodeState::Down.is_available());
-        assert!(!NodeState::Drain.is_available());
-        assert!(!NodeState::Draining.is_available());
-        assert!(!NodeState::Allocated.is_available());
-        assert!(!NodeState::Error.is_available());
-        assert!(!NodeState::Unknown.is_available());
+        for state in &NodeState::ALL {
+            let available = state.is_available();
+            assert_eq!(
+                available,
+                matches!(state, NodeState::Idle | NodeState::Mixed),
+                "{state:?} availability"
+            );
+        }
     }
 
     // ── T50.44: Mail type field ─────────────────────────────────
@@ -694,14 +661,6 @@ mod tests {
         node.state = NodeState::Suspended;
         node.update_state_from_alloc();
         assert_eq!(node.state, NodeState::Suspended);
-    }
-
-    // ── T50.62: Suspended display and short ───────────────────────
-
-    #[test]
-    fn t50_62_suspended_display() {
-        assert_eq!(NodeState::Suspended.display(), "suspended");
-        assert_eq!(NodeState::Suspended.short(), "susp");
     }
 
     // ── T50.63–70: Begin time, deadline, spread_job, open_mode fields ──
