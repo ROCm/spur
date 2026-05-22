@@ -490,7 +490,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         Some(path) => std::fs::read_to_string(path)
             .with_context(|| format!("failed to read script: {}", path))?,
         None => {
-            if atty::is(atty::Stream::Stdin) {
+            if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
                 bail!("sbatch: no script file specified");
             }
             // Read from stdin

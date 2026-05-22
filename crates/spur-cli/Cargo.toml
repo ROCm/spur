@@ -2,6 +2,8 @@
 name = "spur-cli"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "spur"
@@ -23,7 +25,6 @@ thiserror = { workspace = true }
 prost-types = { workspace = true }
 tokio-stream = "0.1"
 whoami = "2.1.1"
-atty = "0.2.14"
 nix = { workspace = true, features = ["user"] }
 libc = "0.2"
 flate2 = { workspace = true }
