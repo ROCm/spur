@@ -1,0 +1,15 @@
+[package]
+name = "spur-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+spur-core = { path = "../spur-core" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+chrono = { workspace = true }

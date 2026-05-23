@@ -20,6 +20,7 @@ use spur_core::reservation::Reservation;
 use spur_core::resource::ResourceSet;
 use spur_core::step::{JobStep, StepState, STEP_BATCH};
 use spur_core::wal::WalOperation;
+use spur_metrics::job::JobMetricsSnapshot;
 
 use crate::accounting::AccountingNotifier;
 use crate::fairshare_cache::FairshareCache;
@@ -166,6 +167,34 @@ impl ClusterManager {
     /// Get a job by ID.
     pub fn get_job(&self, job_id: JobId) -> Option<Job> {
         self.jobs.read().get(&job_id).cloned()
+    }
+
+    /// Aggregated job metrics from the current in-memory job map (lazy scan).
+    ///
+    /// The `jobs` map is authoritative (WAL-backed); this scans it on each call.
+    /// Export (phase 14.1e) should call this when serving `/metrics/jobs`.
+    pub fn job_metrics(&self) -> JobMetricsSnapshot {
+        let jobs = self.jobs.read();
+        JobMetricsSnapshot::collect(jobs.values())
+    }
+
+    /// Log job metrics at `debug` level.
+    ///
+    /// **Temporary (remove when metrics export lands):** non-test caller of
+    /// [`job_metrics`](Self::job_metrics) for clippy and coarse operator visibility.
+    pub fn log_job_metrics_debug(&self) {
+        let m = self.job_metrics();
+        debug!(
+            total = m.total,
+            pending = m.count_state(JobState::Pending),
+            running = m.count_state(JobState::Running),
+            completing = m.count_state(JobState::Completing),
+            held_pending = m.held_pending,
+            running_cpus = m.running_cpus,
+            running_memory_bytes = m.running_memory_bytes,
+            running_gpus = m.running_gpus,
+            "cluster job metrics snapshot (OpenMetrics export not yet wired)"
+        );
     }
 
     /// Get jobs matching filters.
@@ -1369,6 +1398,7 @@ impl ClusterManager {
                                 *avail = avail.saturating_sub(*count);
                             }
                         }
+                        self.next_job_id.store(next_id, Ordering::Relaxed);
                         return;
                     }
                 }
@@ -1750,6 +1780,7 @@ mod tests {
     use super::*;
     use spur_core::job::JobSpec;
     use spur_core::resource::ResourceSet;
+    use spur_metrics::job::JobMetricsSnapshot;
     use tempfile::TempDir;
 
     fn test_config() -> SlurmConfig {
@@ -2108,6 +2139,46 @@ mod tests {
 
         let node = cm.get_node("worker1").unwrap();
         assert_eq!(node.alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_metrics_track_lifecycle() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        assert_eq!(cm.job_metrics(), JobMetricsSnapshot::default());
+
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = submit_and_wait(&cm, basic_spec("metrics-job"));
+
+        let m = cm.job_metrics();
+        assert_eq!(m.total, 1);
+        assert_eq!(m.count_state(JobState::Pending), 1);
+
+        let resources = ResourceSet {
+            cpus: 4,
+            memory_mb: 8192,
+            ..Default::default()
+        };
+        cm.start_job(job_id, vec!["worker1".into()], resources)
+            .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        let m = cm.job_metrics();
+        assert_eq!(m.count_state(JobState::Running), 1);
+        assert_eq!(m.running_cpus, 4);
+        assert_eq!(m.running_memory_bytes, 8192 * 1024 * 1024);
+
+        cm.complete_job(job_id, 0, JobState::Completed).unwrap();
+        settle(&cm, job_id, JobState::Completed);
+
+        let m = cm.job_metrics();
+        assert_eq!(m.count_state(JobState::Completed), 1);
+        assert_eq!(m.running_cpus, 0);
+
+        // Snapshot matches a full scan of the job map.
+        let expected = JobMetricsSnapshot::collect(cm.get_jobs(&[], None, None, None, &[]).iter());
+        assert_eq!(cm.job_metrics(), expected);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

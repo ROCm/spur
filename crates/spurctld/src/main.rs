@@ -165,7 +165,8 @@ async fn main() -> anyhow::Result<()> {
         scheduler_loop::run(sched_cluster, sched_raft).await;
     });
 
-    // Start node health checker (90s timeout, only on leader)
+    // Start node health checker (90s timeout, only on leader).
+    // Also logs job metrics at debug until OpenMetrics export replaces this path.
     let health_cluster = cluster.clone();
     let health_raft = raft_handle.clone();
     tokio::spawn(async move {
@@ -176,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
             health_cluster.check_node_health(90);
+            health_cluster.log_job_metrics_debug();
         }
     });
 
