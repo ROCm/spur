@@ -172,29 +172,9 @@ impl ClusterManager {
     /// Aggregated job metrics from the current in-memory job map (lazy scan).
     ///
     /// The `jobs` map is authoritative (WAL-backed); this scans it on each call.
-    /// Export (phase 14.1e) should call this when serving `/metrics/jobs`.
     pub fn job_metrics(&self) -> JobMetricsSnapshot {
         let jobs = self.jobs.read();
         JobMetricsSnapshot::collect(jobs.values())
-    }
-
-    /// Log job metrics at `debug` level.
-    ///
-    /// **Temporary (remove when metrics export lands):** non-test caller of
-    /// [`job_metrics`](Self::job_metrics) for clippy and coarse operator visibility.
-    pub fn log_job_metrics_debug(&self) {
-        let m = self.job_metrics();
-        debug!(
-            total = m.total,
-            pending = m.count_state(JobState::Pending),
-            running = m.count_state(JobState::Running),
-            completing = m.count_state(JobState::Completing),
-            held_pending = m.held_pending,
-            running_cpus = m.running_cpus,
-            running_memory_bytes = m.running_memory_bytes,
-            running_gpus = m.running_gpus,
-            "cluster job metrics snapshot (OpenMetrics export not yet wired)"
-        );
     }
 
     /// Get jobs matching filters.
@@ -1818,6 +1798,7 @@ mod tests {
             isolation: Default::default(),
             licenses: HashMap::new(),
             update: Default::default(),
+            metrics: Default::default(),
         }
     }
 

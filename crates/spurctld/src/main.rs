@@ -4,6 +4,7 @@
 mod accounting;
 mod cluster;
 mod fairshare_cache;
+mod metrics_server;
 mod raft;
 mod raft_server;
 mod scheduler_loop;
@@ -166,7 +167,6 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Start node health checker (90s timeout, only on leader).
-    // Also logs job metrics at debug until OpenMetrics export replaces this path.
     let health_cluster = cluster.clone();
     let health_raft = raft_handle.clone();
     tokio::spawn(async move {
@@ -177,9 +177,21 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
             health_cluster.check_node_health(90);
-            health_cluster.log_job_metrics_debug();
         }
     });
+
+    if config.metrics.enabled {
+        let metrics_addr: std::net::SocketAddr = config.metrics.effective_listen_addr().parse()?;
+        let metrics_cluster = cluster.clone();
+        let metrics_raft = raft_handle.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                metrics_server::serve(metrics_addr, metrics_cluster, metrics_raft).await
+            {
+                tracing::error!(error = %e, "OpenMetrics metrics server failed");
+            }
+        });
+    }
 
     // Start gRPC server
     let addr = listen_addr.parse()?;
@@ -222,5 +234,6 @@ fn default_config() -> spur_core::config::SlurmConfig {
         isolation: Default::default(),
         licenses: std::collections::HashMap::new(),
         update: Default::default(),
+        metrics: Default::default(),
     }
 }

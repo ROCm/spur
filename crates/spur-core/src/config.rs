@@ -79,6 +79,10 @@ pub struct SlurmConfig {
     /// Auto-update configuration.
     #[serde(default)]
     pub update: UpdateConfig,
+
+    /// OpenMetrics HTTP export (spurctld, default port 6822).
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 /// Configuration for auto-update checking and self-update.
@@ -116,6 +120,64 @@ impl Default for UpdateConfig {
             auto_update: false,
             channel: "stable".into(),
             cache_dir: "/var/cache/spur".into(),
+        }
+    }
+}
+
+/// OpenMetrics export settings for spurctld (separate listener from gRPC 6817).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetricsConfig {
+    /// When false, spurctld does not start the metrics HTTP server.
+    #[serde(default = "default_true_fn")]
+    pub enabled: bool,
+    /// Metrics HTTP listen address (port used when `bind = "loopback"`).
+    #[serde(default = "default_metrics_listen_addr")]
+    pub listen_addr: String,
+    /// `loopback` binds 127.0.0.1; `all` uses `listen_addr` as-is.
+    #[serde(default)]
+    pub bind: MetricsBind,
+    /// Enables `/metrics/jobs-users-accts` (high cardinality; off by default).
+    #[serde(default)]
+    pub high_cardinality: bool,
+}
+
+fn default_metrics_listen_addr() -> String {
+    "[::]:6822".into()
+}
+
+/// Metrics HTTP bind policy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricsBind {
+    #[default]
+    Loopback,
+    All,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            listen_addr: default_metrics_listen_addr(),
+            bind: MetricsBind::Loopback,
+            high_cardinality: false,
+        }
+    }
+}
+
+impl MetricsConfig {
+    /// Listen address after applying [`MetricsBind`].
+    pub fn effective_listen_addr(&self) -> String {
+        match self.bind {
+            MetricsBind::All => self.listen_addr.clone(),
+            MetricsBind::Loopback => {
+                let port = self
+                    .listen_addr
+                    .parse::<std::net::SocketAddr>()
+                    .map(|a| a.port())
+                    .unwrap_or(6822);
+                format!("127.0.0.1:{port}")
+            }
         }
     }
 }
@@ -728,6 +790,35 @@ mod tests {
         assert_eq!(format_time(Some(90)), "01:30:00");
         assert_eq!(format_time(Some(1500)), "1-01:00:00");
         assert_eq!(format_time(None), "UNLIMITED");
+    }
+
+    #[test]
+    fn test_load_metrics_config() {
+        let toml = r#"
+cluster_name = "test"
+
+[metrics]
+enabled = false
+listen_addr = "[::]:9999"
+bind = "all"
+high_cardinality = true
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert!(!config.metrics.enabled);
+        assert_eq!(config.metrics.listen_addr, "[::]:9999");
+        assert_eq!(config.metrics.bind, MetricsBind::All);
+        assert!(config.metrics.high_cardinality);
+        assert_eq!(config.metrics.effective_listen_addr(), "[::]:9999");
+    }
+
+    #[test]
+    fn test_metrics_defaults() {
+        let config = SlurmConfig::load_from_str(r#"cluster_name = "x""#).unwrap();
+        assert!(config.metrics.enabled);
+        assert_eq!(config.metrics.listen_addr, "[::]:6822");
+        assert_eq!(config.metrics.bind, MetricsBind::Loopback);
+        assert!(!config.metrics.high_cardinality);
+        assert_eq!(config.metrics.effective_listen_addr(), "127.0.0.1:6822");
     }
 
     #[test]

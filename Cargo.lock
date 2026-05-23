@@ -3612,6 +3612,7 @@ name = "spurctld"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "clap",
  "dashmap",
