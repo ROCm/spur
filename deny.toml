@@ -4,10 +4,6 @@ all-features = true
 [advisories]
 yanked = "warn"
 unmaintained = "workspace"
-ignore = [
-    { id = "RUSTSEC-2025-0012", reason = "backoff is used by spur-k8s via kube; migrate to backon with kube 0.99+ upgrade" },
-]
-
 [licenses]
 confidence-threshold = 0.8
 
