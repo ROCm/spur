@@ -3359,6 +3359,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "spur-metrics"
+version = "0.3.0"
+dependencies = [
+ "chrono",
+ "spur-core",
+]
+
+[[package]]
 name = "spur-net"
 version = "0.3.0"
 dependencies = [
@@ -3469,6 +3477,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spur-core",
+ "spur-metrics",
  "spur-proto",
  "spur-sched",
  "spur-update",

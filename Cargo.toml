@@ -5,6 +5,7 @@ members = [
     "crates/spur-core",
     "crates/spur-net",
     "crates/spur-sched",
+    "crates/spur-metrics",
 
     "crates/spurctld",
     "crates/spurd",
