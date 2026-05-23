@@ -39,10 +39,7 @@ pub async fn serve(
         .route("/metrics/nodes", get(metrics_not_implemented))
         .route("/metrics/partitions", get(metrics_not_implemented))
         .route("/metrics/scheduler", get(metrics_not_implemented))
-        .route(
-            "/metrics/jobs-users-accts",
-            get(metrics_jobs_users_accts),
-        )
+        .route("/metrics/jobs-users-accts", get(metrics_jobs_users_accts))
         .with_state(state);
 
     info!(%listen, "OpenMetrics metrics server listening");
@@ -57,10 +54,7 @@ async fn metrics_jobs(State(state): State<Arc<MetricsState>>) -> Response {
 }
 
 async fn metrics_not_implemented() -> impl IntoResponse {
-    (
-        StatusCode::NOT_FOUND,
-        "metric endpoint not implemented yet",
-    )
+    (StatusCode::NOT_FOUND, "metric endpoint not implemented yet")
 }
 
 async fn metrics_jobs_users_accts(State(state): State<Arc<MetricsState>>) -> Response {
@@ -82,11 +76,7 @@ async fn metrics_jobs_users_accts(State(state): State<Arc<MetricsState>>) -> Res
 }
 
 fn not_leader_response() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        "not the Raft leader",
-    )
-        .into_response()
+    (StatusCode::SERVICE_UNAVAILABLE, "not the Raft leader").into_response()
 }
 
 fn openmetrics_response(body: String) -> Response {

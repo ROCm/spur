@@ -185,8 +185,7 @@ async fn main() -> anyhow::Result<()> {
         let metrics_cluster = cluster.clone();
         let metrics_raft = raft_handle.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                metrics_server::serve(metrics_addr, metrics_cluster, metrics_raft).await
+            if let Err(e) = metrics_server::serve(metrics_addr, metrics_cluster, metrics_raft).await
             {
                 tracing::error!(error = %e, "OpenMetrics metrics server failed");
             }
