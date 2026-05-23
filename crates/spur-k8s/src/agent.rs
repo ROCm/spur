@@ -21,6 +21,8 @@ use crate::crd::SpurJob;
 use spur_proto::proto::slurm_agent_server::SlurmAgent;
 use spur_proto::proto::*;
 
+const NS_LOOKUP_BUDGET: Duration = Duration::from_secs(5);
+
 /// Virtual SlurmAgent that creates K8s Pods instead of fork/exec.
 pub struct VirtualAgent {
     client: Client,
@@ -37,32 +39,42 @@ impl VirtualAgent {
         let api: Api<SpurJob> = Api::all(self.client.clone());
         let lp = ListParams::default().labels(&format!("spur.ai/job-id={}", job_id));
 
-        (|| async {
-            let list = tokio::time::timeout(Duration::from_millis(300), api.list(&lp))
-                .await
-                .map_err(|_| Status::unavailable("k8s API timeout"))?
-                .map_err(|e| Status::internal(e.to_string()))?;
+        let result = tokio::time::timeout(
+            NS_LOOKUP_BUDGET,
+            (|| async {
+                let list = tokio::time::timeout(Duration::from_millis(300), api.list(&lp))
+                    .await
+                    .map_err(|_| Status::unavailable("k8s API timeout"))?
+                    .map_err(|e| Status::internal(e.to_string()))?;
 
-            list.items
-                .into_iter()
-                .next()
-                .and_then(|j| j.metadata.namespace)
-                .ok_or_else(|| {
-                    Status::not_found(format!("spur.ai/job-id={job_id} label not yet visible"))
-                })
-        })
-        .retry(
-            ExponentialBuilder::default()
-                .with_min_delay(Duration::from_millis(200))
-                .with_max_delay(Duration::from_secs(5)),
+                list.items
+                    .into_iter()
+                    .next()
+                    .and_then(|j| j.metadata.namespace)
+                    .ok_or_else(|| {
+                        Status::not_found(format!("spur.ai/job-id={job_id} label not yet visible"))
+                    })
+            })
+            .retry(
+                ExponentialBuilder::default()
+                    .with_min_delay(Duration::from_millis(200))
+                    .with_max_delay(Duration::from_secs(2))
+                    .without_max_times(),
+            )
+            .when(|e: &Status| {
+                matches!(e.code(), tonic::Code::Unavailable | tonic::Code::NotFound)
+            }),
         )
-        .when(|e: &Status| matches!(e.code(), tonic::Code::Unavailable | tonic::Code::NotFound))
-        .await
-        .map_err(|e| {
-            Status::not_found(format!(
-                "no SpurJob with label spur.ai/job-id={job_id} found: {e}"
-            ))
-        })
+        .await;
+
+        match result {
+            Ok(Ok(ns)) => Ok(ns),
+            Ok(Err(status)) => Err(status),
+            Err(_elapsed) => Err(Status::deadline_exceeded(format!(
+                "namespace lookup for spur.ai/job-id={job_id} timed out after {}s",
+                NS_LOOKUP_BUDGET.as_secs()
+            ))),
+        }
     }
 }
 
