@@ -42,15 +42,19 @@ pub async fn serve(
         .route("/metrics/jobs-users-accts", get(metrics_jobs_users_accts))
         .with_state(state);
 
-    info!(%listen, "OpenMetrics metrics server listening");
     let listener = tokio::net::TcpListener::bind(listen).await?;
+    let bound = listener.local_addr()?;
+    info!(%bound, "OpenMetrics metrics server listening");
     axum::serve(listener, app).await?;
     Ok(())
 }
 
 async fn metrics_jobs(State(state): State<Arc<MetricsState>>) -> Response {
+    if !state.raft.is_leader() {
+        return not_leader_response();
+    }
     let body = encode_job_metrics(&state.cluster.job_metrics());
-    respond_job_metrics(state.raft.is_leader(), body)
+    respond_job_metrics(true, body)
 }
 
 async fn metrics_not_implemented() -> impl IntoResponse {

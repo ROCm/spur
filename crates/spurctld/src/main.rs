@@ -181,7 +181,10 @@ async fn main() -> anyhow::Result<()> {
     });
 
     if config.metrics.enabled {
-        let metrics_addr: std::net::SocketAddr = config.metrics.effective_listen_addr().parse()?;
+        let metrics_addr = config
+            .metrics
+            .effective_listen_addr()
+            .map_err(|e| anyhow::anyhow!(e))?;
         let metrics_cluster = cluster.clone();
         let metrics_raft = raft_handle.clone();
         tokio::spawn(async move {

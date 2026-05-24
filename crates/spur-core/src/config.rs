@@ -166,19 +166,21 @@ impl Default for MetricsConfig {
 }
 
 impl MetricsConfig {
-    /// Listen address after applying [`MetricsBind`].
-    pub fn effective_listen_addr(&self) -> String {
-        match self.bind {
-            MetricsBind::All => self.listen_addr.clone(),
-            MetricsBind::Loopback => {
-                let port = self
-                    .listen_addr
-                    .parse::<std::net::SocketAddr>()
-                    .map(|a| a.port())
-                    .unwrap_or(6822);
-                format!("127.0.0.1:{port}")
-            }
-        }
+    /// Listen socket after applying [`MetricsBind`].
+    ///
+    /// Returns an error if `listen_addr` is not a valid `SocketAddr`.
+    pub fn effective_listen_addr(&self) -> Result<std::net::SocketAddr, ConfigError> {
+        let addr = self
+            .listen_addr
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| ConfigError::InvalidValue {
+                field: "metrics.listen_addr".into(),
+                value: e.to_string(),
+            })?;
+        Ok(match self.bind {
+            MetricsBind::All => addr,
+            MetricsBind::Loopback => std::net::SocketAddr::from(([127, 0, 0, 1], addr.port())),
+        })
     }
 }
 
@@ -808,7 +810,10 @@ high_cardinality = true
         assert_eq!(config.metrics.listen_addr, "[::]:9999");
         assert_eq!(config.metrics.bind, MetricsBind::All);
         assert!(config.metrics.high_cardinality);
-        assert_eq!(config.metrics.effective_listen_addr(), "[::]:9999");
+        assert_eq!(
+            config.metrics.effective_listen_addr().unwrap(),
+            "[::]:9999".parse().unwrap()
+        );
     }
 
     #[test]
@@ -818,7 +823,24 @@ high_cardinality = true
         assert_eq!(config.metrics.listen_addr, "[::]:6822");
         assert_eq!(config.metrics.bind, MetricsBind::Loopback);
         assert!(!config.metrics.high_cardinality);
-        assert_eq!(config.metrics.effective_listen_addr(), "127.0.0.1:6822");
+        assert_eq!(
+            config.metrics.effective_listen_addr().unwrap(),
+            "127.0.0.1:6822".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_metrics_invalid_listen_addr() {
+        let config = SlurmConfig::load_from_str(
+            r#"
+cluster_name = "x"
+
+[metrics]
+listen_addr = "not-a-socket"
+"#,
+        )
+        .unwrap();
+        assert!(config.metrics.effective_listen_addr().is_err());
     }
 
     #[test]
