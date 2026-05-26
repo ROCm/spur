@@ -18,7 +18,7 @@ chrono = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
 semver = "1"
-sha2 = "0.10"
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

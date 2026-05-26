@@ -3,11 +3,21 @@
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info};
 
 use crate::check::ReleaseInfo;
+
+fn sha256_hex(data: &[u8]) -> String {
+    let digest = Sha256::digest(data);
+    let mut hex = String::with_capacity(64);
+    for b in digest.iter() {
+        write!(hex, "{:02x}", b).unwrap();
+    }
+    hex
+}
 
 /// Download a release tarball and verify its SHA256 checksum.
 /// Returns the path to the verified tarball file.
@@ -75,12 +85,7 @@ pub async fn download_and_verify(release: &ReleaseInfo, tmp_dir: &Path) -> Resul
             .context("empty checksum file")?
             .to_lowercase();
 
-        // Compute actual hash
-        let actual_hash = {
-            let data = std::fs::read(&tarball_path)?;
-            let digest = Sha256::digest(&data);
-            format!("{:x}", digest)
-        };
+        let actual_hash = sha256_hex(&bytes);
 
         if actual_hash != expected_hash {
             // Delete the bad tarball
@@ -106,10 +111,7 @@ mod tests {
 
     #[test]
     fn sha256_verification_logic() {
-        let data = b"test data for hashing";
-        let digest = Sha256::digest(data);
-        let hex = format!("{:x}", digest);
-        // Just verify the hash is 64 hex chars
+        let hex = sha256_hex(b"test data for hashing");
         assert_eq!(hex.len(), 64);
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
     }

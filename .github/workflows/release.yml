@@ -20,13 +20,13 @@ jobs:
     name: Build release binaries
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build portable binaries (Ubuntu 22.04+ compatible)
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: deploy/Dockerfile.manylinux
@@ -61,7 +61,7 @@ jobs:
           echo "DIST=${DIST}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: spur-linux-amd64
           path: |
@@ -89,7 +89,7 @@ jobs:
             name: "RHEL 8 (AlmaLinux)"
     continue-on-error: ${{ matrix.experimental || false }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: spur-linux-amd64
 
@@ -113,9 +113,9 @@ jobs:
     needs: [build, verify]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: spur-linux-amd64
 

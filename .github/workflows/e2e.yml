@@ -44,7 +44,7 @@ jobs:
             });
 
       - name: Download release binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: release-binaries
           path: /tmp/release-binaries
@@ -52,7 +52,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download E2E test binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: k8s-test-binary
           path: /tmp/e2e-bin
@@ -60,7 +60,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Checkout trusted deploy assets and scripts from main
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
           sparse-checkout: |
@@ -232,7 +232,7 @@ jobs:
 
       - name: Upload cluster logs
         if: failure() && steps.scrub-logs.outcome == 'success'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bare-metal-logs
           path: /tmp/bm-logs/
@@ -314,7 +314,7 @@ jobs:
             return `ghcr.io/${repo}:${sha}`;
 
       - name: Download image artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: spur-image
           path: /tmp
@@ -322,7 +322,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -376,7 +376,7 @@ jobs:
             });
 
       - name: Download K8s test binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: k8s-test-binary
           path: /tmp/k8s-bin
@@ -384,7 +384,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Checkout K8s manifests from main
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
           sparse-checkout: deploy/k8s
