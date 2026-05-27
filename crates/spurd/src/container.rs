@@ -1803,6 +1803,10 @@ mod tests {
     fn test_close_inherited_fds_preserves_target() {
         use std::os::unix::io::AsRawFd;
 
+        fn fd_is_open(fd: RawFd) -> bool {
+            unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+        }
+
         // Run in a forked child so we don't close the test runner's fds
         match unsafe { nix::unistd::fork().unwrap() } {
             nix::unistd::ForkResult::Child => {
@@ -1819,10 +1823,9 @@ mod tests {
 
                 close_inherited_fds(preserve_fd);
 
-                let preserved_ok =
-                    nix::fcntl::fcntl(preserve_fd, nix::fcntl::FcntlArg::F_GETFD).is_ok();
-                let f1_closed = nix::fcntl::fcntl(f1_fd, nix::fcntl::FcntlArg::F_GETFD).is_err();
-                let f2_closed = nix::fcntl::fcntl(f2_fd, nix::fcntl::FcntlArg::F_GETFD).is_err();
+                let preserved_ok = fd_is_open(preserve_fd);
+                let f1_closed = !fd_is_open(f1_fd);
+                let f2_closed = !fd_is_open(f2_fd);
 
                 if preserved_ok && f1_closed && f2_closed {
                     std::process::exit(0);

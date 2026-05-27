@@ -685,14 +685,14 @@ async fn launch_container_job(
     // Sync pipe: child writes status, parent reads.
     // Convert OwnedFd to raw fds for manual lifecycle management across fork.
     let (pipe_r, pipe_w) = nix::unistd::pipe().context("create sync pipe")?;
-    let ready_r = pipe_r.as_raw_fd();
-    let ready_w = pipe_w.as_raw_fd();
     // Prevent read end from leaking into exec'd process
     nix::fcntl::fcntl(
-        ready_r,
+        &pipe_r,
         nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
     )
     .ok();
+    let ready_r = pipe_r.as_raw_fd();
+    let ready_w = pipe_w.as_raw_fd();
     // Keep OwnedFd alive so the fds aren't closed prematurely
     let _pipe_r_owner = pipe_r;
     let _pipe_w_owner = pipe_w;
@@ -724,10 +724,10 @@ async fn launch_container_job(
             let stdout_reopen = std::fs::File::options().append(true).open(stdout_path).ok();
             let stderr_reopen = std::fs::File::options().append(true).open(stderr_path).ok();
             if let Some(f) = stdout_reopen.as_ref() {
-                nix::unistd::dup2(f.as_raw_fd(), libc::STDOUT_FILENO).ok();
+                unsafe { libc::dup2(f.as_raw_fd(), libc::STDOUT_FILENO) };
             }
             if let Some(f) = stderr_reopen.as_ref() {
-                nix::unistd::dup2(f.as_raw_fd(), libc::STDERR_FILENO).ok();
+                unsafe { libc::dup2(f.as_raw_fd(), libc::STDERR_FILENO) };
             }
 
             // Close inherited fds (gRPC sockets, other jobs' files)
