@@ -1408,6 +1408,7 @@ fn node_complete_to_status(err: NodeCompleteError) -> Status {
     Status::new(code, message)
 }
 
+#[allow(clippy::result_large_err)]
 fn validate_completion_report_state_for_rpc(
     state: spur_core::job::JobState,
     exit_code: i32,

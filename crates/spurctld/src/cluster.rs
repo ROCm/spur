@@ -1379,8 +1379,6 @@ impl ClusterManager {
 
     /// Persist a mutation via Raft consensus. The apply callback
     /// (`StateMachineApply`) handles in-memory state on all nodes.
-    // openraft's RaftError exceeds clippy's 128-byte threshold in the intermediate Result
-    #[allow(clippy::result_large_err)]
     fn complete_job_steps_and_licenses(
         &self,
         job_id: &JobId,
@@ -1414,6 +1412,7 @@ impl ClusterManager {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     fn propose(&self, op: WalOperation) -> anyhow::Result<ClientResponse> {
         let raft = self
             .raft
