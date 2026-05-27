@@ -240,13 +240,18 @@ impl AgentService {
                     let drain = if drain_jobs.contains(&c.job_id) {
                         Some(DrainRequest {
                             reason: "epilog script failed".into(),
-                            node_name: local_hostname.clone(),
                         })
                     } else {
                         None
                     };
-                    report_completion(&controller_addr, c.job_id, c.exit_code, drain.as_ref())
-                        .await;
+                    report_completion(
+                        &controller_addr,
+                        c.job_id,
+                        c.exit_code,
+                        &local_hostname,
+                        drain.as_ref(),
+                    )
+                    .await;
                 }
             }
         });
@@ -255,22 +260,44 @@ impl AgentService {
 
 struct DrainRequest {
     reason: String,
-    node_name: String,
+}
+
+fn completion_report_retryable(status: &tonic::Status) -> bool {
+    use tonic::Code;
+    matches!(
+        status.code(),
+        Code::Unavailable | Code::Internal | Code::DeadlineExceeded | Code::Unknown
+    )
+}
+
+#[cfg(test)]
+mod completion_report_tests {
+    use super::completion_report_retryable;
+    use tonic::Status;
+
+    #[test]
+    fn permanent_errors_are_not_retryable() {
+        assert!(!completion_report_retryable(&Status::invalid_argument("x")));
+        assert!(!completion_report_retryable(&Status::not_found("x")));
+    }
+
+    #[test]
+    fn transient_errors_are_retryable() {
+        assert!(completion_report_retryable(&Status::unavailable("x")));
+        assert!(completion_report_retryable(&Status::internal("x")));
+    }
 }
 
 async fn report_completion(
     controller_addr: &str,
     job_id: u32,
     exit_code: i32,
+    reporting_node: &str,
     drain: Option<&DrainRequest>,
 ) {
     use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 
-    let state = if exit_code == 0 {
-        JobState::JobCompleted as i32
-    } else {
-        JobState::JobFailed as i32
-    };
+    let state = spur_core::job::JobState::completion_state_for_exit_code(exit_code).to_proto_i32();
 
     let url = if controller_addr.starts_with("http") {
         controller_addr.to_string()
@@ -290,10 +317,7 @@ async fn report_completion(
                     message: format!("exit_code={}", exit_code),
                     drain_node: drain.is_some(),
                     drain_reason: drain.as_ref().map(|d| d.reason.clone()).unwrap_or_default(),
-                    reporting_node: drain
-                        .as_ref()
-                        .map(|d| d.node_name.clone())
-                        .unwrap_or_default(),
+                    reporting_node: reporting_node.to_string(),
                 };
                 match client.report_job_status(req).await {
                     Ok(_) => {
@@ -301,6 +325,16 @@ async fn report_completion(
                         return;
                     }
                     Err(e) => {
+                        if !completion_report_retryable(&e) {
+                            error!(
+                                job_id,
+                                attempt,
+                                code = ?e.code(),
+                                error = %e,
+                                "ReportJobStatus failed with non-retryable error"
+                            );
+                            return;
+                        }
                         warn!(
                             job_id,
                             attempt,
@@ -752,10 +786,9 @@ impl SlurmAgent for AgentService {
                     let drain_reason = format!("prolog failed: {}", err_msg);
                     tokio::spawn(async move {
                         let drain = DrainRequest {
-                            reason: drain_reason,
-                            node_name,
+                            reason: drain_reason.clone(),
                         };
-                        report_completion(&controller, job_id, -1, Some(&drain)).await;
+                        report_completion(&controller, job_id, -1, &node_name, Some(&drain)).await;
                     });
                 }
 
