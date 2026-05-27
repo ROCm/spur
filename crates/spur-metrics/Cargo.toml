@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 spur-core = { path = "../spur-core" }
+prometheus-client = { workspace = true }
 
 [lints]
 workspace = true

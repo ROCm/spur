@@ -1,0 +1,43 @@
+# HELP spur_jobs Total number of jobs.
+# TYPE spur_jobs gauge
+spur_jobs 4
+# HELP spur_jobs_pending Number of jobs in Pending state (includes held jobs).
+# TYPE spur_jobs_pending gauge
+spur_jobs_pending 2
+# HELP spur_jobs_running Number of jobs in RUNNING state.
+# TYPE spur_jobs_running gauge
+spur_jobs_running 1
+# HELP spur_jobs_completing Number of jobs in COMPLETING state.
+# TYPE spur_jobs_completing gauge
+spur_jobs_completing 0
+# HELP spur_jobs_completed Number of jobs in COMPLETED state.
+# TYPE spur_jobs_completed gauge
+spur_jobs_completed 1
+# HELP spur_jobs_failed Number of jobs in FAILED state.
+# TYPE spur_jobs_failed gauge
+spur_jobs_failed 0
+# HELP spur_jobs_cancelled Number of jobs in CANCELLED state.
+# TYPE spur_jobs_cancelled gauge
+spur_jobs_cancelled 0
+# HELP spur_jobs_timeout Number of jobs in TIMEOUT state.
+# TYPE spur_jobs_timeout gauge
+spur_jobs_timeout 0
+# HELP spur_jobs_node_fail Number of jobs in NODE_FAIL state.
+# TYPE spur_jobs_node_fail gauge
+spur_jobs_node_fail 0
+# HELP spur_jobs_preempted Number of jobs in PREEMPTED state.
+# TYPE spur_jobs_preempted gauge
+spur_jobs_preempted 0
+# HELP spur_jobs_suspended Number of jobs in SUSPENDED state.
+# TYPE spur_jobs_suspended gauge
+spur_jobs_suspended 0
+# HELP spur_jobs_cpus_alloc Total CPUs allocated to jobs in Running or Completing state.
+# TYPE spur_jobs_cpus_alloc gauge
+spur_jobs_cpus_alloc 4
+# HELP spur_jobs_memory_alloc_bytes Total memory in bytes allocated to jobs in Running or Completing state.
+# TYPE spur_jobs_memory_alloc_bytes gauge
+spur_jobs_memory_alloc_bytes 8589934592
+# HELP spur_jobs_gpus_alloc Total GPUs allocated to jobs in Running or Completing state.
+# TYPE spur_jobs_gpus_alloc gauge
+spur_jobs_gpus_alloc 2
+# EOF

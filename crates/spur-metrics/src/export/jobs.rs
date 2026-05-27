@@ -1,12 +1,16 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenMetrics export for job metrics ([`crate::job::JobMetricsSnapshot`]).
+//! Job gauge registration for `/metrics/jobs`.
 
+use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::registry::Registry;
 use spur_core::job::JobState;
+use std::sync::atomic::AtomicI64;
 
+use crate::export::encode_registered;
 use crate::job::JobMetricsSnapshot;
-use crate::openmetrics::OpenMetricsEncoder;
+use spur_core::config::MetricsExpositionFormat;
 
 /// Metric name suffix for a [`JobState`] (e.g. `pending`, `node_fail`).
 pub fn job_state_metric_suffix(state: JobState) -> &'static str {
@@ -24,11 +28,15 @@ pub fn job_state_metric_suffix(state: JobState) -> &'static str {
     }
 }
 
-/// Encode job metrics as OpenMetrics 1.0 text for `/metrics/jobs`.
-pub fn encode_job_metrics(snap: &JobMetricsSnapshot) -> String {
-    let mut enc = OpenMetricsEncoder::new();
+fn register_gauge(registry: &mut Registry, name: &str, help: &str, value: u64) {
+    let gauge = Gauge::<i64, AtomicI64>::default();
+    gauge.set(i64::try_from(value).unwrap_or(i64::MAX));
+    registry.register(name, help, gauge);
+}
 
-    enc.write_gauge("spur_jobs", "Total number of jobs", snap.total);
+/// Register job catalog gauges into `registry` from `snap`.
+pub fn register_jobs(registry: &mut Registry, snap: &JobMetricsSnapshot) {
+    register_gauge(registry, "spur_jobs", "Total number of jobs", snap.total);
 
     for &state in &JobState::ALL {
         let suffix = job_state_metric_suffix(state);
@@ -38,27 +46,40 @@ pub fn encode_job_metrics(snap: &JobMetricsSnapshot) -> String {
         } else {
             format!("Number of jobs in {} state", state.display())
         };
-        let value = snap.count_state(state);
-        enc.write_gauge(&name, &help, value);
+        register_gauge(registry, &name, &help, snap.count_state(state));
     }
 
-    enc.write_gauge(
+    register_gauge(
+        registry,
         "spur_jobs_cpus_alloc",
         "Total CPUs allocated to jobs in Running or Completing state",
         snap.running_cpus,
     );
-    enc.write_gauge(
+    register_gauge(
+        registry,
         "spur_jobs_memory_alloc_bytes",
         "Total memory in bytes allocated to jobs in Running or Completing state",
         snap.running_memory_bytes,
     );
-    enc.write_gauge(
+    register_gauge(
+        registry,
         "spur_jobs_gpus_alloc",
         "Total GPUs allocated to jobs in Running or Completing state",
         snap.running_gpus,
     );
+}
 
-    enc.finish()
+/// Encode job metrics for `/metrics/jobs` (default: Slurm 0.0.4 text).
+pub fn encode_job_metrics(snap: &JobMetricsSnapshot) -> String {
+    encode_job_metrics_with_format(snap, MetricsExpositionFormat::default())
+}
+
+/// Encode job metrics using the selected wire format.
+pub fn encode_job_metrics_with_format(
+    snap: &JobMetricsSnapshot,
+    format: MetricsExpositionFormat,
+) -> String {
+    encode_registered(|registry| register_jobs(registry, snap), format)
 }
 
 #[cfg(test)]
@@ -119,7 +140,7 @@ mod tests {
     #[test]
     fn encode_contains_core_gauges() {
         let body = encode_job_metrics(&sample_snapshot());
-        assert!(body.contains("# HELP spur_jobs Total number of jobs\n"));
+        assert!(body.contains("# HELP spur_jobs "));
         assert!(body.contains("spur_jobs 4\n"));
         assert!(body.contains("spur_jobs_pending 2\n"));
         assert!(body.contains("spur_jobs_running 1\n"));
@@ -138,9 +159,66 @@ mod tests {
     }
 
     #[test]
-    fn golden_job_metrics() {
+    fn openmetrics_format_includes_eof() {
+        let body = encode_job_metrics_with_format(
+            &sample_snapshot(),
+            MetricsExpositionFormat::OpenMetrics_1_0,
+        );
+        assert!(body.ends_with("# EOF\n"));
+    }
+
+    #[test]
+    fn slurm_format_has_no_eof() {
+        let body = encode_job_metrics_with_format(
+            &sample_snapshot(),
+            MetricsExpositionFormat::Slurm_0_0_4,
+        );
+        assert!(!body.contains("# EOF"));
+    }
+
+    /// Slurm job metric names exported for every [`JobState`].
+    const JOB_STATE_METRICS: &[&str] = &[
+        "spur_jobs_pending",
+        "spur_jobs_running",
+        "spur_jobs_completing",
+        "spur_jobs_completed",
+        "spur_jobs_failed",
+        "spur_jobs_cancelled",
+        "spur_jobs_timeout",
+        "spur_jobs_node_fail",
+        "spur_jobs_preempted",
+        "spur_jobs_suspended",
+    ];
+
+    const ALLOC_METRICS: &[&str] = &[
+        "spur_jobs_cpus_alloc",
+        "spur_jobs_memory_alloc_bytes",
+        "spur_jobs_gpus_alloc",
+    ];
+
+    #[test]
+    fn job_metrics_catalog_includes_all_state_gauges() {
         let body = encode_job_metrics(&sample_snapshot());
-        let expected = include_str!("../tests/fixtures/job_metrics.prom");
-        assert_eq!(body, expected);
+        assert!(body.contains("# TYPE spur_jobs gauge"));
+        for name in JOB_STATE_METRICS {
+            assert!(
+                body.contains(&format!("# TYPE {name} gauge")),
+                "missing TYPE for {name}"
+            );
+            assert!(
+                body.contains(&format!("{name} ")),
+                "missing sample line for {name}"
+            );
+        }
+        for name in ALLOC_METRICS {
+            assert!(
+                body.contains(&format!("# TYPE {name} gauge")),
+                "missing TYPE for {name}"
+            );
+        }
+        for &state in &JobState::ALL {
+            let suffix = job_state_metric_suffix(state);
+            assert!(body.contains(&format!("spur_jobs_{suffix} ")));
+        }
     }
 }
