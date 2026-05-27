@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, QueryBuilder, Row};
 use tracing::{info, warn};
 
 /// Connect to PostgreSQL and return a connection pool.
@@ -276,63 +276,38 @@ pub async fn get_job_history(
     states: &[String],
     limit: u32,
 ) -> anyhow::Result<Vec<JobRecord>> {
-    // Build dynamic query
-    let mut query = String::from(
+    let mut qb = QueryBuilder::<sqlx::Postgres>::new(
         "SELECT job_id, name, user_name, account, partition_name, state, exit_code, \
          num_nodes, num_tasks, nodelist, submit_time, start_time, end_time \
          FROM jobs WHERE 1=1",
     );
-    let mut params: Vec<String> = Vec::new();
-    let mut idx = 1;
 
-    if let Some(u) = user {
-        if !u.is_empty() {
-            query.push_str(&format!(" AND user_name = ${}", idx));
-            params.push(u.to_string());
-            idx += 1;
-        }
+    if let Some(u) = user.filter(|u| !u.is_empty()) {
+        qb.push(" AND user_name = ").push_bind(u.to_string());
     }
-    if let Some(a) = account {
-        if !a.is_empty() {
-            query.push_str(&format!(" AND account = ${}", idx));
-            params.push(a.to_string());
-            idx += 1;
-        }
+    if let Some(a) = account.filter(|a| !a.is_empty()) {
+        qb.push(" AND account = ").push_bind(a.to_string());
     }
     if let Some(after) = start_after {
-        query.push_str(&format!(" AND start_time >= ${}", idx));
-        params.push(after.to_rfc3339());
-        idx += 1;
+        qb.push(" AND start_time >= ").push_bind(after);
     }
     if let Some(before) = start_before {
-        query.push_str(&format!(" AND start_time <= ${}", idx));
-        params.push(before.to_rfc3339());
-        idx += 1;
+        qb.push(" AND start_time <= ").push_bind(before);
     }
     if !states.is_empty() {
-        let placeholders: Vec<String> = states
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("${}", idx + i))
-            .collect();
-        query.push_str(&format!(" AND state IN ({})", placeholders.join(",")));
+        qb.push(" AND state IN (");
+        let mut sep = qb.separated(", ");
         for s in states {
-            params.push(s.clone());
+            sep.push_bind(s.clone());
         }
+        sep.push_unseparated(")");
     }
 
-    query.push_str(" ORDER BY submit_time DESC");
-    let effective_limit = if limit > 0 { limit } else { 1000 };
-    query.push_str(&format!(" LIMIT {}", effective_limit));
+    qb.push(" ORDER BY submit_time DESC");
+    let effective_limit: i64 = if limit > 0 { limit.into() } else { 1000 };
+    qb.push(" LIMIT ").push_bind(effective_limit);
 
-    // Execute with dynamic params — using raw query for simplicity
-    // In production, use sqlx query builder or sea-query
-    let mut q = sqlx::query(&query);
-    for p in &params {
-        q = q.bind(p);
-    }
-
-    let rows = q.fetch_all(pool).await?;
+    let rows = qb.build().fetch_all(pool).await?;
 
     let records = rows
         .iter()
