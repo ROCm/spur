@@ -8,9 +8,10 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 use tonic::metadata::MetadataValue;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 use tracing::warn;
 
+use spur_core::job::NodeCompleteError;
 use spur_core::reservation::Reservation;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::slurm_controller_server::{SlurmController, SlurmControllerServer};
@@ -520,60 +521,24 @@ impl SlurmController for ControllerService {
         let state = spur_core::job::JobState::from_proto_i32(req.state)
             .ok_or_else(|| Status::invalid_argument("invalid job state"))?;
 
-        if state.is_terminal() {
-            let exit_code = req.exit_code;
-            match self.cluster.complete_job(req.job_id, exit_code, state) {
-                Ok(()) => {
-                    // Run EpilogSlurmctld if configured (failure is logged, not fatal)
-                    if let Some(ref epilog_ctld) = self.cluster.config.hooks.epilog_slurmctld {
-                        let job = self.cluster.get_job(req.job_id);
-                        let ctx = spur_core::hooks::HookContext {
-                            job_id: req.job_id,
-                            work_dir: job
-                                .as_ref()
-                                .map(|j| j.spec.work_dir.clone())
-                                .unwrap_or_else(|| "/tmp".into()),
-                            uid: job.as_ref().map(|j| j.spec.uid).unwrap_or(0),
-                            gid: job.as_ref().map(|j| j.spec.gid).unwrap_or(0),
-                            partition: job
-                                .as_ref()
-                                .and_then(|j| j.spec.partition.clone())
-                                .unwrap_or_default(),
-                            nodelist: job
-                                .as_ref()
-                                .map(|j| j.allocated_nodes.join(","))
-                                .unwrap_or_default(),
-                            script_context: "epilog_slurmctld".into(),
-                            gpu_devices: Vec::new(),
-                            cpus: job.as_ref().map(|j| j.spec.cpus_per_task).unwrap_or(1),
-                            memory_mb: job
-                                .as_ref()
-                                .and_then(|j| j.spec.memory_per_node_mb)
-                                .unwrap_or(0),
-                        };
-                        if let Err(e) = spur_core::hooks::run_hook(epilog_ctld, &ctx).await {
-                            warn!(
-                                job_id = req.job_id,
-                                error = %e,
-                                "EpilogSlurmctld failed"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Multi-node jobs: non-first nodes may report after the job
-                    // is already terminal. Log and continue so drain requests
-                    // below are still processed.
-                    warn!(
-                        job_id = req.job_id,
-                        error = %e,
-                        "complete_job failed (likely duplicate report from multi-node job)"
-                    );
-                }
+        // `state` only gates whether this report enters the per-node completion
+        // path. The final job outcome is still derived from aggregated node
+        // exit codes in `Job::derived_completion`.
+        let completion_result = if state.is_terminal() {
+            validate_completion_report_state_for_rpc(state, req.exit_code)?;
+            if req.reporting_node.is_empty() {
+                return Err(Status::invalid_argument(
+                    "reporting_node is required for job completion reports",
+                ));
             }
-        }
+            Some(
+                self.cluster
+                    .node_complete(req.job_id, &req.reporting_node, req.exit_code),
+            )
+        } else {
+            None
+        };
 
-        // Process drain request regardless of whether complete_job succeeded
         if req.drain_node && !req.reporting_node.is_empty() {
             warn!(
                 node = %req.reporting_node,
@@ -594,7 +559,30 @@ impl SlurmController for ControllerService {
             }
         }
 
-        Ok(Response::new(()))
+        use crate::cluster::NodeCompleteResult;
+
+        match completion_result {
+            Some(Ok(NodeCompleteResult::AllDone { .. })) => Ok(Response::new(())),
+            Some(Ok(NodeCompleteResult::Completing)) => Ok(Response::new(())),
+            Some(Ok(NodeCompleteResult::AlreadyTerminal)) => {
+                warn!(
+                    job_id = req.job_id,
+                    node = %req.reporting_node,
+                    "duplicate completion report for terminal job"
+                );
+                Ok(Response::new(()))
+            }
+            Some(Err(e)) => {
+                warn!(
+                    job_id = req.job_id,
+                    node = %req.reporting_node,
+                    error = %e,
+                    "node_complete failed"
+                );
+                Err(node_complete_to_status(e))
+            }
+            None => Ok(Response::new(())),
+        }
     }
 
     async fn heartbeat(
@@ -1410,10 +1398,30 @@ fn annotate_nodes_with_reservations(
     }
 }
 
+fn node_complete_to_status(err: NodeCompleteError) -> Status {
+    let message = err.to_string();
+    let code = match err {
+        NodeCompleteError::JobNotFound { .. } => Code::NotFound,
+        NodeCompleteError::NodeNotAllocated { .. } => Code::InvalidArgument,
+        NodeCompleteError::RaftPropose { .. } => Code::Unavailable,
+    };
+    Status::new(code, message)
+}
+
+fn validate_completion_report_state_for_rpc(
+    state: spur_core::job::JobState,
+    exit_code: i32,
+) -> Result<(), Status> {
+    spur_core::job::JobState::validate_completion_report_state(state, exit_code)
+        .map_err(|e| Status::invalid_argument(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Duration;
+    use spur_core::job::{JobState, NodeCompleteError};
+    use tonic::Code;
 
     fn make_node_info(name: &str) -> NodeInfo {
         NodeInfo {
@@ -1495,5 +1503,67 @@ mod tests {
         ];
         annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now());
         assert_eq!(nodes[0].active_reservation, "first");
+    }
+
+    #[test]
+    fn node_complete_error_status_mapping_covers_all_variants() {
+        let cases: Vec<(NodeCompleteError, Code, bool)> = vec![
+            (
+                NodeCompleteError::JobNotFound { job_id: 1 },
+                Code::NotFound,
+                false,
+            ),
+            (
+                NodeCompleteError::NodeNotAllocated {
+                    job_id: 1,
+                    node: "n1".into(),
+                },
+                Code::InvalidArgument,
+                false,
+            ),
+            (
+                NodeCompleteError::RaftPropose {
+                    source: anyhow::anyhow!("test"),
+                },
+                Code::Unavailable,
+                true,
+            ),
+        ];
+
+        for (err, want_code, want_retry) in cases {
+            assert_eq!(err.retryable(), want_retry, "{err:?}");
+            let retry = err.retryable();
+            let status = node_complete_to_status(err);
+            assert_eq!(status.code(), want_code);
+            let agent_retryable = matches!(
+                status.code(),
+                Code::Unavailable | Code::Internal | Code::DeadlineExceeded | Code::Unknown
+            );
+            assert_eq!(retry, agent_retryable, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn completion_report_state_accepts_completed_zero() {
+        assert!(validate_completion_report_state_for_rpc(JobState::Completed, 0).is_ok());
+    }
+
+    #[test]
+    fn completion_report_state_accepts_failed_nonzero() {
+        assert!(validate_completion_report_state_for_rpc(JobState::Failed, 42).is_ok());
+    }
+
+    #[test]
+    fn completion_report_state_rejects_completed_nonzero() {
+        let err = validate_completion_report_state_for_rpc(JobState::Completed, 1).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("does not match exit_code"));
+    }
+
+    #[test]
+    fn completion_report_state_rejects_cancelled() {
+        let err = validate_completion_report_state_for_rpc(JobState::Cancelled, 0).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("invalid completion state"));
     }
 }

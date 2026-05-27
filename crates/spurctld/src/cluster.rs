@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use spur_core::accounting::{Qos, TresRecord, TresType};
 use spur_core::config::SlurmConfig;
-use spur_core::job::{Job, JobId, JobSpec, JobState, PendingReason};
+use spur_core::job::{Job, JobId, JobSpec, JobState, NodeCompleteError, PendingReason};
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::Partition;
 use spur_core::qos::{check_qos_limits, QosCheckResult};
@@ -24,7 +24,18 @@ use spur_metrics::job::JobMetricsSnapshot;
 
 use crate::accounting::AccountingNotifier;
 use crate::fairshare_cache::FairshareCache;
-use crate::raft::{SpurRaft, StateMachineApply};
+use crate::raft::{ClientResponse, JobFinalized, SpurRaft, StateMachineApply};
+
+/// Result of recording a per-node completion report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeCompleteResult {
+    /// Node recorded; waiting for remaining nodes.
+    Completing,
+    /// All allocated nodes have reported; job is now terminal.
+    AllDone { state: JobState, exit_code: i32 },
+    /// Job was already in a terminal state (duplicate or race with cancel/timeout).
+    AlreadyTerminal,
+}
 
 /// Central cluster state manager.
 ///
@@ -231,11 +242,14 @@ impl ClusterManager {
         // Use JobComplete (not JobStateChange) so that resource deallocation
         // fires for any allocated nodes. For pending jobs, allocated_nodes is empty
         // so the deallocation loop is a no-op.
-        self.propose(WalOperation::JobComplete {
+        let resp = self.propose(WalOperation::JobComplete {
             job_id,
             exit_code: -1,
             state: JobState::Cancelled,
         })?;
+        if let Some(f) = resp.job_finalized {
+            self.run_job_finalized_side_effects(f);
+        }
 
         info!(job_id, "job cancelled");
         Ok(())
@@ -326,7 +340,49 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Complete a job.
+    /// Record completion from one allocated node (multi-node COMPLETING flow).
+    pub fn node_complete(
+        &self,
+        job_id: JobId,
+        node_name: &str,
+        exit_code: i32,
+    ) -> Result<NodeCompleteResult, NodeCompleteError> {
+        {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or(NodeCompleteError::JobNotFound { job_id })?;
+            if job.state.is_terminal() {
+                return Ok(NodeCompleteResult::AlreadyTerminal);
+            }
+            if !job.allocated_nodes.iter().any(|n| n == node_name) {
+                return Err(NodeCompleteError::NodeNotAllocated {
+                    job_id,
+                    node: node_name.to_string(),
+                });
+            }
+        }
+
+        let resp = self
+            .propose(WalOperation::JobNodeComplete {
+                job_id,
+                node_name: node_name.to_string(),
+                exit_code,
+            })
+            .map_err(|source| NodeCompleteError::RaftPropose { source })?;
+
+        if let Some(f) = resp.job_finalized {
+            self.run_job_finalized_side_effects(f);
+            return Ok(NodeCompleteResult::AllDone {
+                state: f.state,
+                exit_code: f.exit_code,
+            });
+        }
+
+        Ok(NodeCompleteResult::Completing)
+    }
+
+    /// Complete a job (controller-initiated or force-finish from COMPLETING timeout).
     pub fn complete_job(
         &self,
         job_id: JobId,
@@ -346,13 +402,61 @@ impl ClusterManager {
 
         // propose() handles: state transition, exit_code, end_time,
         // resource deallocation, step completion, license return
-        self.propose(WalOperation::JobComplete {
+        let resp = self.propose(WalOperation::JobComplete {
             job_id,
             exit_code,
             state,
         })?;
+        if let Some(f) = resp.job_finalized {
+            self.run_job_finalized_side_effects(f);
+        }
 
-        // Notifications (side effects, not replicated)
+        debug!(job_id, exit_code, "job completed");
+        Ok(())
+    }
+
+    fn run_job_finalized_side_effects(&self, finalized: JobFinalized) {
+        self.run_epilog_slurmctld(finalized.job_id);
+        self.notify_job_finished(finalized.job_id, finalized.state, finalized.exit_code);
+    }
+
+    fn run_epilog_slurmctld(&self, job_id: JobId) {
+        let Some(epilog_ctld) = self.config.hooks.epilog_slurmctld.clone() else {
+            return;
+        };
+        let job = self.get_job(job_id);
+        let ctx = spur_core::hooks::HookContext {
+            job_id,
+            work_dir: job
+                .as_ref()
+                .map(|j| j.spec.work_dir.clone())
+                .unwrap_or_else(|| "/tmp".into()),
+            uid: job.as_ref().map(|j| j.spec.uid).unwrap_or(0),
+            gid: job.as_ref().map(|j| j.spec.gid).unwrap_or(0),
+            partition: job
+                .as_ref()
+                .and_then(|j| j.spec.partition.clone())
+                .unwrap_or_default(),
+            nodelist: job
+                .as_ref()
+                .map(|j| j.allocated_nodes.join(","))
+                .unwrap_or_default(),
+            script_context: "epilog_slurmctld".into(),
+            gpu_devices: Vec::new(),
+            cpus: job.as_ref().map(|j| j.spec.cpus_per_task).unwrap_or(1),
+            memory_mb: job
+                .as_ref()
+                .and_then(|j| j.spec.memory_per_node_mb)
+                .unwrap_or(0),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = spur_core::hooks::run_hook(&epilog_ctld, &ctx).await {
+                warn!(job_id, error = %e, "EpilogSlurmctld failed");
+            }
+        });
+    }
+
+    fn notify_job_finished(&self, job_id: JobId, state: JobState, exit_code: i32) {
         let spec_for_notify = self.jobs.read().get(&job_id).map(|j| j.spec.clone());
         if let Some(spec) = spec_for_notify {
             let is_success = state == JobState::Completed;
@@ -377,11 +481,10 @@ impl ClusterManager {
             JobState::Timeout | JobState::Preempted | JobState::NodeFail
         );
         if should_requeue {
-            self.maybe_requeue(job_id)?;
+            if let Err(e) = self.maybe_requeue(job_id) {
+                warn!(job_id, error = %e, "failed to requeue job");
+            }
         }
-
-        debug!(job_id, exit_code, "job completed");
-        Ok(())
     }
 
     /// Requeue a job if spec.requeue is set and attempt limit not exceeded.
@@ -1278,7 +1381,40 @@ impl ClusterManager {
     /// (`StateMachineApply`) handles in-memory state on all nodes.
     // openraft's RaftError exceeds clippy's 128-byte threshold in the intermediate Result
     #[allow(clippy::result_large_err)]
-    fn propose(&self, op: WalOperation) -> anyhow::Result<()> {
+    fn complete_job_steps_and_licenses(
+        &self,
+        job_id: &JobId,
+        exit_code: i32,
+        timestamp: DateTime<Utc>,
+    ) {
+        let mut steps = self.steps.write();
+        for step in steps.values_mut() {
+            if step.job_id == *job_id && !step.state.is_terminal() {
+                step.state = if exit_code == 0 {
+                    StepState::Completed
+                } else {
+                    StepState::Failed
+                };
+                step.exit_code = Some(exit_code);
+                step.end_time = Some(timestamp);
+            }
+        }
+        drop(steps);
+
+        let lic_req = if let Some(job) = self.jobs.read().get(job_id) {
+            extract_license_requirements(&job.spec)
+        } else {
+            HashMap::new()
+        };
+        if !lic_req.is_empty() {
+            let mut pool = self.license_pool.write();
+            for (lic, count) in &lic_req {
+                *pool.entry(lic.clone()).or_insert(0) += count;
+            }
+        }
+    }
+
+    fn propose(&self, op: WalOperation) -> anyhow::Result<ClientResponse> {
         let raft = self
             .raft
             .read()
@@ -1287,13 +1423,14 @@ impl ClusterManager {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async { raft.client_write(op).await })
         })
-        .map(|_| ())
+        .map(|res| res.data)
         .map_err(|e| anyhow::anyhow!("raft propose failed: {}", e))
     }
 
     /// Apply a WalOperation to in-memory state.
     /// Called by Raft's `apply_to_state_machine` on commit.
-    fn apply_operation(&self, op: &WalOperation) {
+    fn apply_operation(&self, op: &WalOperation) -> ClientResponse {
+        let mut response = ClientResponse::default();
         let mut jobs = self.jobs.write();
         let mut nodes = self.nodes.write();
         let mut next_id = self.next_job_id.load(Ordering::Relaxed);
@@ -1379,8 +1516,80 @@ impl ClusterManager {
                             }
                         }
                         self.next_job_id.store(next_id, Ordering::Relaxed);
-                        return;
+                        return ClientResponse::default();
                     }
+                }
+            }
+            WalOperation::JobNodeComplete {
+                job_id,
+                node_name,
+                exit_code,
+            } => {
+                let finalized = {
+                    let Some(job) = jobs.get_mut(job_id) else {
+                        return ClientResponse::default();
+                    };
+                    if job.state.is_terminal() {
+                        return ClientResponse::default();
+                    }
+
+                    let already_reported = job.node_completions.contains_key(node_name);
+                    job.node_completions.insert(node_name.clone(), *exit_code);
+
+                    if let Some(ref total) = job.allocated_resources {
+                        if !already_reported {
+                            deallocate_job_node(
+                                &mut nodes,
+                                total,
+                                job.allocated_nodes.len(),
+                                node_name,
+                            );
+                        }
+                    }
+
+                    if job.state == JobState::Running {
+                        if let Err(e) = job.transition(JobState::Completing) {
+                            warn!(job_id = *job_id, error = %e, "invalid transition to Completing");
+                        }
+                        job.end_time = Some(timestamp);
+                    }
+
+                    if job.all_nodes_completed() {
+                        let (final_state, final_exit) =
+                            Job::derived_completion(&job.node_completions);
+                        match job.transition(final_state) {
+                            Ok(()) => {
+                                job.exit_code = Some(final_exit);
+                                job.end_time = Some(timestamp);
+                                job.node_completions.clear();
+                                Some((final_state, final_exit))
+                            }
+                            Err(e) => {
+                                warn!(
+                                    job_id = *job_id,
+                                    error = %e,
+                                    "invalid final completion transition"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some((final_state, final_exit)) = finalized {
+                    drop(jobs);
+                    drop(nodes);
+                    self.complete_job_steps_and_licenses(job_id, final_exit, timestamp);
+                    self.next_job_id.store(next_id, Ordering::Relaxed);
+                    return ClientResponse {
+                        job_finalized: Some(JobFinalized {
+                            job_id: *job_id,
+                            state: final_state,
+                            exit_code: final_exit,
+                        }),
+                    };
                 }
             }
             WalOperation::JobComplete {
@@ -1390,70 +1599,46 @@ impl ClusterManager {
             } => {
                 let freed_nodes;
                 let allocated_resources;
+                let already_deallocated;
                 if let Some(job) = jobs.get_mut(job_id) {
-                    if let Err(e) = job.transition(*state) {
-                        warn!(job_id = *job_id, error = %e, "invalid state transition in WAL apply");
+                    match job.transition(*state) {
+                        Ok(()) if state.is_terminal() => {
+                            response.job_finalized = Some(JobFinalized {
+                                job_id: *job_id,
+                                state: *state,
+                                exit_code: *exit_code,
+                            });
+                        }
+                        Ok(()) => {}
+                        Err(e) => {
+                            warn!(
+                                job_id = *job_id,
+                                error = %e,
+                                "invalid state transition in WAL apply"
+                            );
+                        }
                     }
                     job.exit_code = Some(*exit_code);
                     job.end_time = Some(timestamp);
                     freed_nodes = job.allocated_nodes.clone();
                     allocated_resources = job.allocated_resources.clone();
+                    already_deallocated = job.node_completions.keys().cloned().collect::<Vec<_>>();
+                    job.node_completions.clear();
                 } else {
-                    return;
+                    return ClientResponse::default();
                 }
-                // Deallocate node resources
+                // Deallocate node resources not already freed during COMPLETING
                 if let Some(ref total) = allocated_resources {
-                    let node_count = freed_nodes.len().max(1) as u32;
-                    let per_node = ResourceSet {
-                        cpus: total.cpus / node_count,
-                        memory_mb: total.memory_mb / node_count as u64,
-                        gpus: total.gpus.clone(),
-                        generic: total
-                            .generic
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v / node_count as u64))
-                            .collect(),
-                    };
                     for name in &freed_nodes {
-                        if let Some(node) = nodes.get_mut(name) {
-                            node.alloc_resources = node.alloc_resources.subtract(&per_node);
-                            node.update_state_from_alloc();
-                            if node.state == NodeState::Draining
-                                && node.alloc_resources.cpus == 0
-                                && node.alloc_resources.gpus.is_empty()
-                            {
-                                node.state = NodeState::Drain;
-                            }
+                        if already_deallocated.iter().any(|n| n == name) {
+                            continue;
                         }
+                        deallocate_job_node(&mut nodes, total, freed_nodes.len(), name);
                     }
                 }
-                // Complete all steps
                 drop(jobs);
                 drop(nodes);
-                let mut steps = self.steps.write();
-                for step in steps.values_mut() {
-                    if step.job_id == *job_id && !step.state.is_terminal() {
-                        step.state = if *exit_code == 0 {
-                            StepState::Completed
-                        } else {
-                            StepState::Failed
-                        };
-                        step.exit_code = Some(*exit_code);
-                        step.end_time = Some(timestamp);
-                    }
-                }
-                // Return licenses
-                let lic_req = if let Some(job) = self.jobs.read().get(job_id) {
-                    extract_license_requirements(&job.spec)
-                } else {
-                    HashMap::new()
-                };
-                if !lic_req.is_empty() {
-                    let mut pool = self.license_pool.write();
-                    for (lic, count) in &lic_req {
-                        *pool.entry(lic.clone()).or_insert(0) += count;
-                    }
-                }
+                self.complete_job_steps_and_licenses(job_id, *exit_code, timestamp);
             }
             WalOperation::JobPriorityChange {
                 job_id,
@@ -1519,7 +1704,7 @@ impl ClusterManager {
                 let mut nodes = self.nodes.write();
                 nodes.insert(name.clone(), node);
                 self.next_job_id.store(next_id, Ordering::Relaxed);
-                return;
+                return ClientResponse::default();
             }
             WalOperation::NodeUpdate {
                 name,
@@ -1557,6 +1742,7 @@ impl ClusterManager {
             }
         }
         self.next_job_id.store(next_id, Ordering::Relaxed);
+        response
     }
 }
 
@@ -1573,8 +1759,8 @@ struct ClusterSnapshot {
 }
 
 impl StateMachineApply for ClusterManager {
-    fn apply_operation(&self, op: &WalOperation) {
-        self.apply_operation(op);
+    fn apply_operation(&self, op: &WalOperation) -> ClientResponse {
+        self.apply_operation(op)
     }
 
     fn snapshot_state(&self) -> Result<Vec<u8>, anyhow::Error> {
@@ -1628,6 +1814,39 @@ impl StateMachineApply for ClusterManager {
 
 /// Extract license requirements from a job's GRES list.
 /// License GRES entries are formatted as "license:<name>:<count>" or "license:<name>".
+fn per_node_resources(total: &ResourceSet, node_count: usize) -> ResourceSet {
+    let node_count = node_count.max(1) as u32;
+    ResourceSet {
+        cpus: total.cpus / node_count,
+        memory_mb: total.memory_mb / node_count as u64,
+        gpus: total.gpus.clone(),
+        generic: total
+            .generic
+            .iter()
+            .map(|(k, v)| (k.clone(), v / node_count as u64))
+            .collect(),
+    }
+}
+
+fn deallocate_job_node(
+    nodes: &mut HashMap<String, Node>,
+    total: &ResourceSet,
+    node_count: usize,
+    node_name: &str,
+) {
+    let per_node = per_node_resources(total, node_count);
+    if let Some(node) = nodes.get_mut(node_name) {
+        node.alloc_resources = node.alloc_resources.subtract(&per_node);
+        node.update_state_from_alloc();
+        if node.state == NodeState::Draining
+            && node.alloc_resources.cpus == 0
+            && node.alloc_resources.gpus.is_empty()
+        {
+            node.state = NodeState::Drain;
+        }
+    }
+}
+
 fn extract_license_requirements(spec: &JobSpec) -> HashMap<String, u64> {
     let mut licenses = HashMap::new();
     for gres in &spec.gres {
@@ -2121,6 +2340,291 @@ mod tests {
 
         let node = cm.get_node("worker1").unwrap();
         assert_eq!(node.alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_job_node_complete_single_node() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "worker1", 8, 16000);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("single-completing")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["worker1".into()],
+            resources: ResourceSet {
+                cpus: 2,
+                memory_mb: 4000,
+                ..Default::default()
+            },
+        });
+
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id: 1,
+            node_name: "worker1".into(),
+            exit_code: 0,
+        });
+
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Completed);
+        assert_eq!(job.exit_code, Some(0));
+        assert!(job.node_completions.is_empty());
+        assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_job_node_complete_multi_node() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        for name in ["n1", "n2", "n3"] {
+            register_node(&cm, name, 8, 16000);
+        }
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("multi-completing")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into(), "n2".into(), "n3".into()],
+            resources: ResourceSet {
+                cpus: 6,
+                memory_mb: 12000,
+                ..Default::default()
+            },
+        });
+
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id: 1,
+            node_name: "n1".into(),
+            exit_code: 0,
+        });
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        assert_eq!(job.node_completions.len(), 1);
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+        assert!(cm.get_node("n2").unwrap().alloc_resources.cpus > 0);
+
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id: 1,
+            node_name: "n2".into(),
+            exit_code: 0,
+        });
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
+
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id: 1,
+            node_name: "n3".into(),
+            exit_code: 42,
+        });
+
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.exit_code, Some(42));
+        for name in ["n1", "n2", "n3"] {
+            assert_eq!(cm.get_node(name).unwrap().alloc_resources.cpus, 0);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_job_node_complete_returns_finalized_once() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        for name in ["n1", "n2"] {
+            register_node(&cm, name, 8, 16000);
+        }
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("finalize-response")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into(), "n2".into()],
+            resources: ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+        });
+
+        let r1 = cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id: 1,
+            node_name: "n1".into(),
+            exit_code: 0,
+        });
+        assert!(r1.job_finalized.is_none());
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
+
+        let r2 = cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id: 1,
+            node_name: "n2".into(),
+            exit_code: 0,
+        });
+        let f = r2.job_finalized.expect("last node should finalize");
+        assert_eq!(f.job_id, 1);
+        assert_eq!(f.state, JobState::Completed);
+        assert_eq!(f.exit_code, 0);
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Completed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_job_complete_returns_finalized() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "worker1", 8, 16000);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("job-complete-response")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["worker1".into()],
+            resources: ResourceSet {
+                cpus: 2,
+                memory_mb: 4000,
+                ..Default::default()
+            },
+        });
+
+        let resp = cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Completed,
+        });
+        let f = resp.job_finalized.expect("JobComplete should finalize");
+        assert_eq!(f.job_id, 1);
+        assert_eq!(f.state, JobState::Completed);
+        assert_eq!(f.exit_code, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_complete_penultimate_returns_completing() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        for name in ["n1", "n2", "n3"] {
+            register_node(&cm, name, 8, 16000);
+        }
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("penultimate")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into(), "n2".into(), "n3".into()],
+            resources: ResourceSet {
+                cpus: 6,
+                memory_mb: 12000,
+                ..Default::default()
+            },
+        });
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id: 1,
+            node_name: "n1".into(),
+            exit_code: 0,
+        });
+
+        let result = cm.node_complete(1, "n2", 0).unwrap();
+        assert_eq!(result, NodeCompleteResult::Completing);
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_job_while_completing() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        for name in ["n1", "n2", "n3"] {
+            register_node(&cm, name, 8, 16000);
+        }
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("cancel-while-cg")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into(), "n2".into(), "n3".into()],
+            resources: ResourceSet {
+                cpus: 6,
+                memory_mb: 12000,
+                ..Default::default()
+            },
+        });
+
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id: 1,
+            node_name: "n1".into(),
+            exit_code: 0,
+        });
+
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        assert_eq!(job.node_completions.len(), 1);
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+        assert!(cm.get_node("n2").unwrap().alloc_resources.cpus > 0);
+
+        cm.cancel_job(1, "testuser").unwrap();
+        settle(&cm, 1, JobState::Cancelled);
+
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(job.exit_code, Some(-1));
+        assert!(job.node_completions.is_empty());
+        for name in ["n1", "n2", "n3"] {
+            assert_eq!(
+                cm.get_node(name).unwrap().alloc_resources.cpus,
+                0,
+                "node {name} should be deallocated after cancel"
+            );
+        }
+
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id: 1,
+            node_name: "n2".into(),
+            exit_code: 0,
+        });
+
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

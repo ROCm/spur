@@ -26,6 +26,11 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     tokio::spawn(async move {
         enforce_time_limits(enforcer_cluster, enforcer_raft).await;
     });
+    let completing_cluster = cluster.clone();
+    let completing_raft = raft.clone();
+    tokio::spawn(async move {
+        enforce_completing_timeout(completing_cluster, completing_raft).await;
+    });
     let power_cluster = cluster.clone();
     let power_raft = raft.clone();
     tokio::spawn(async move {
@@ -734,9 +739,22 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
             }
         }
 
-        let running = cluster.get_jobs(&[spur_core::job::JobState::Running], None, None, None, &[]);
+        let running = cluster.get_jobs(
+            &[
+                spur_core::job::JobState::Running,
+                spur_core::job::JobState::Completing,
+            ],
+            None,
+            None,
+            None,
+            &[],
+        );
 
         for job in &running {
+            if job.state == spur_core::job::JobState::Completing {
+                continue;
+            }
+
             let (Some(time_limit), Some(start_time)) = (job.spec.time_limit, job.start_time) else {
                 continue;
             };
@@ -792,6 +810,80 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
         let running_ids: HashSet<_> = running.iter().map(|j| j.job_id).collect();
         warned_jobs.retain(|id| running_ids.contains(id));
         warn_times.retain(|id, _| running_ids.contains(id));
+    }
+}
+
+/// Force-finish jobs stuck in COMPLETING past `complete_wait_secs`.
+async fn enforce_completing_timeout(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+
+    loop {
+        interval.tick().await;
+
+        if !raft.is_leader() {
+            continue;
+        }
+
+        let now = Utc::now();
+        let wait = chrono::Duration::seconds(cluster.config.scheduler.complete_wait_secs as i64);
+
+        let completing = cluster.get_jobs(
+            &[spur_core::job::JobState::Completing],
+            None,
+            None,
+            None,
+            &[],
+        );
+
+        for job in completing {
+            let Some(completing_since) = job.end_time else {
+                continue;
+            };
+            if now - completing_since < wait {
+                continue;
+            }
+
+            let missing: Vec<_> = job
+                .allocated_nodes
+                .iter()
+                .filter(|n| !job.node_completions.contains_key(*n))
+                .cloned()
+                .collect();
+
+            let (mut state, mut exit_code) =
+                spur_core::job::Job::derived_completion(&job.node_completions);
+            if job.node_completions.is_empty() {
+                state = spur_core::job::JobState::Failed;
+                exit_code = -1;
+            } else if !missing.is_empty() {
+                warn!(
+                    job_id = job.job_id,
+                    missing = ?missing,
+                    reported = job.node_completions.len(),
+                    expected = job.allocated_nodes.len(),
+                    "completing timeout — not all nodes reported"
+                );
+                state = spur_core::job::JobState::Failed;
+                if exit_code == 0 {
+                    exit_code = 1;
+                }
+            }
+
+            info!(
+                job_id = job.job_id,
+                state = ?state,
+                exit_code,
+                "completing timeout expired — force-finishing job"
+            );
+
+            if let Err(e) = cluster.complete_job(job.job_id, exit_code, state) {
+                warn!(
+                    job_id = job.job_id,
+                    error = %e,
+                    "failed to force-finish job after completing timeout"
+                );
+            }
+        }
     }
 }
 

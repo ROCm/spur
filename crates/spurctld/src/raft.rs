@@ -35,14 +35,24 @@ openraft::declare_raft_types!(
 
 pub type SpurRaft = Raft<SpurTypeConfig>;
 
+/// Set when a committed WAL entry transitions a job to a terminal state.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct JobFinalized {
+    pub job_id: u32,
+    pub state: spur_core::job::JobState,
+    pub exit_code: i32,
+}
+
 /// Response returned after a Raft write is committed.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ClientResponse;
+pub struct ClientResponse {
+    pub job_finalized: Option<JobFinalized>,
+}
 
 /// Trait for applying committed Raft entries to the cluster state.
 /// Implemented by ClusterManager to avoid a circular dependency with SpurStore.
 pub trait StateMachineApply: Send + Sync {
-    fn apply_operation(&self, op: &WalOperation);
+    fn apply_operation(&self, op: &WalOperation) -> ClientResponse;
     fn snapshot_state(&self) -> Result<Vec<u8>, anyhow::Error>;
     fn restore_from_snapshot(&self, data: &[u8]);
 }
@@ -339,14 +349,16 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
                 EntryPayload::Normal(op) => {
                     debug!(index = entry.log_id.index, "raft: applying WalOperation");
                     inner.applied_count += 1;
-                    self.applier.apply_operation(op);
+                    results.push(self.applier.apply_operation(op));
                 }
                 EntryPayload::Membership(mem) => {
                     inner.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
+                    results.push(ClientResponse::default());
                 }
-                EntryPayload::Blank => {}
+                EntryPayload::Blank => {
+                    results.push(ClientResponse::default());
+                }
             }
-            results.push(ClientResponse);
         }
         Ok(results)
     }
@@ -667,7 +679,9 @@ mod tests {
 
     struct NoopApplier;
     impl StateMachineApply for NoopApplier {
-        fn apply_operation(&self, _op: &WalOperation) {}
+        fn apply_operation(&self, _op: &WalOperation) -> ClientResponse {
+            ClientResponse::default()
+        }
         fn snapshot_state(&self) -> Result<Vec<u8>, anyhow::Error> {
             Ok(Vec::new())
         }
