@@ -75,13 +75,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     let fields = format_engine::parse_format(&fmt, &format_engine::squeue_header);
 
-    // Parse state filter — default to Pending+Running when no filter specified (Slurm default)
+    // Parse state filter — default to Pending+Running+Completing when no filter specified (Slurm default)
     let states = match args.states.as_deref() {
         Some(s) => parse_states_arg(s)?,
-        None => vec![
-            spur_proto::proto::JobState::JobPending,
-            spur_proto::proto::JobState::JobRunning,
-        ],
+        None => default_squeue_states(),
     };
 
     // Parse job ID filter
@@ -172,6 +169,15 @@ fn state_name(state: i32) -> String {
         .unwrap_or_else(|| "UNKNOWN".into())
 }
 
+/// Default `squeue` states when `-t` is omitted: PD, R, CG (Slurm parity).
+fn default_squeue_states() -> Vec<spur_proto::proto::JobState> {
+    vec![
+        spur_proto::proto::JobState::JobPending,
+        spur_proto::proto::JobState::JobRunning,
+        spur_proto::proto::JobState::JobCompleting,
+    ]
+}
+
 /// Parse `-t` / `--states` (comma-separated). Whole-string `all` means no state filter.
 /// Unknown tokens are rejected (Slurm exits with an error rather than showing all jobs).
 fn parse_states_arg(s: &str) -> Result<Vec<spur_proto::proto::JobState>> {
@@ -248,6 +254,15 @@ fn format_timestamp(ts: Option<&prost_types::Timestamp>) -> String {
 mod tests {
     use super::*;
     use spur_proto::proto::JobState as P;
+
+    #[test]
+    fn default_squeue_states_includes_completing() {
+        let states = default_squeue_states();
+        assert_eq!(states.len(), 3);
+        assert!(states.contains(&P::JobPending));
+        assert!(states.contains(&P::JobRunning));
+        assert!(states.contains(&P::JobCompleting));
+    }
 
     #[test]
     fn parse_states_arg_accepts_codes_and_names() {
