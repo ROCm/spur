@@ -590,6 +590,13 @@ message GetFairshareFactorsResponse {
 
 message ReportJobStatusRequest {
   uint32 job_id = 1;
+  // Completion gate for per-node reports. Must be JOB_COMPLETED when
+  // exit_code==0, or JOB_FAILED when exit_code!=0.
+  //
+  // spurctld aggregates all per-node exit codes via derived_completion and
+  // computes the final job state from those codes. This field does not set the
+  // final job state by itself. Other terminal states (CANCELLED, TIMEOUT,
+  // NODE_FAIL) are invalid on this RPC.
   JobState state = 2;
   int32 exit_code = 3;
   string message = 4;  // Pod status message or error
