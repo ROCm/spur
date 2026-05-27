@@ -117,6 +117,7 @@ fn metrics_exposition_response(format: MetricsExpositionFormat, body: String) ->
 }
 
 /// Leader-gated metrics response (testable without a live Raft node).
+#[cfg(test)]
 fn leader_metrics_response(
     is_leader: bool,
     format: MetricsExpositionFormat,
