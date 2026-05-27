@@ -32,7 +32,7 @@ jobs:
       BM_REMOTE_BASE: /tmp/spur-bm-${{ github.run_id }}
     steps:
       - name: Set pending status
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             await github.rest.repos.createCommitStatus({
@@ -286,7 +286,7 @@ jobs:
 
       - name: Report status
         if: always()
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             await github.rest.repos.createCommitStatus({
@@ -305,7 +305,7 @@ jobs:
     steps:
       - name: Compute GHCR image reference
         id: image
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           result-encoding: string
           script: |
@@ -350,7 +350,7 @@ jobs:
     steps:
       - name: Compute GHCR image reference
         id: image
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           result-encoding: string
           script: |
@@ -364,7 +364,7 @@ jobs:
           echo "SPUR_CI_IMAGE=${{ steps.image.outputs.result }}"
 
       - name: Set pending status
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             await github.rest.repos.createCommitStatus({
@@ -496,7 +496,7 @@ jobs:
 
       - name: Report status
         if: always()
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             await github.rest.repos.createCommitStatus({
