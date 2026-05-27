@@ -51,35 +51,38 @@ pub async fn serve(
 }
 
 async fn metrics_jobs(State(state): State<Arc<MetricsState>>) -> Response {
+    if !state.raft.is_leader() {
+        return not_leader_response();
+    }
     let format = state.cluster.config.metrics.exposition_format;
-    leader_metrics_response(
-        state.raft.is_leader(),
+    metrics_exposition_response(
         format,
         encode_job_metrics_with_format(&state.cluster.job_metrics(), format),
     )
 }
 
 async fn metrics_nodes(State(state): State<Arc<MetricsState>>) -> Response {
+    if !state.raft.is_leader() {
+        return not_leader_response();
+    }
     let format = state.cluster.config.metrics.exposition_format;
-    leader_metrics_response(state.raft.is_leader(), format, encode_nodes_metrics(format))
+    metrics_exposition_response(format, encode_nodes_metrics(format))
 }
 
 async fn metrics_partitions(State(state): State<Arc<MetricsState>>) -> Response {
+    if !state.raft.is_leader() {
+        return not_leader_response();
+    }
     let format = state.cluster.config.metrics.exposition_format;
-    leader_metrics_response(
-        state.raft.is_leader(),
-        format,
-        encode_partitions_metrics(format),
-    )
+    metrics_exposition_response(format, encode_partitions_metrics(format))
 }
 
 async fn metrics_scheduler(State(state): State<Arc<MetricsState>>) -> Response {
+    if !state.raft.is_leader() {
+        return not_leader_response();
+    }
     let format = state.cluster.config.metrics.exposition_format;
-    leader_metrics_response(
-        state.raft.is_leader(),
-        format,
-        encode_scheduler_metrics(format),
-    )
+    metrics_exposition_response(format, encode_scheduler_metrics(format))
 }
 
 async fn metrics_jobs_users_accts(State(state): State<Arc<MetricsState>>) -> Response {

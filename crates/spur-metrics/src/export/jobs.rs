@@ -6,7 +6,7 @@
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use spur_core::job::JobState;
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::AtomicU64;
 
 use crate::export::encode_registered;
 use crate::job::JobMetricsSnapshot;
@@ -29,8 +29,8 @@ pub fn job_state_metric_suffix(state: JobState) -> &'static str {
 }
 
 fn register_gauge(registry: &mut Registry, name: &str, help: &str, value: u64) {
-    let gauge = Gauge::<i64, AtomicI64>::default();
-    gauge.set(i64::try_from(value).unwrap_or(i64::MAX));
+    let gauge = Gauge::<u64, AtomicU64>::default();
+    gauge.set(value);
     registry.register(name, help, gauge);
 }
 
