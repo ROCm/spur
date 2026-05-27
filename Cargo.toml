@@ -35,7 +35,7 @@ backon = { version = "1", features = ["tokio-sleep"] }
 tonic = "0.12"
 prost = "0.13"
 prost-types = "0.13"
-tonic-build = "0.12"
+tonic-build = "0.14"
 
 # REST API
 axum = { version = "0.7", features = ["json"] }
