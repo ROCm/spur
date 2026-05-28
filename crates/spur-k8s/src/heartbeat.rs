@@ -14,7 +14,7 @@ const INTERVAL_SECS: u64 = 30;
 
 /// Tracks the set of active K8s nodes and sends periodic `Heartbeat` RPCs
 /// to spurctld on their behalf, mirroring what `spurd`'s `reporter::heartbeat_loop`
-/// does for bare-metal nodes.
+/// does for native-host nodes.
 ///
 /// `node_watcher` holds an `Arc<HeartbeatManager>` and calls `track`/`untrack`
 /// as nodes appear and disappear; the heartbeat task calls `run` under

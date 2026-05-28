@@ -7,9 +7,9 @@ mod tests {
 
     use serial_test::serial;
 
-    use crate::bare_metal::fixture::parse_job_id;
-    use crate::bare_metal::multi_node::fixture;
-    use crate::bare_metal::{job_state, wait_job};
+    use crate::native_host::fixture::parse_job_id;
+    use crate::native_host::multi_node::fixture;
+    use crate::native_host::{job_state, wait_job};
 
     #[tokio::test]
     #[ignore]

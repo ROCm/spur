@@ -29,10 +29,10 @@ All tests are self-contained. No external services needed (no database, no netwo
 
 .. important::
 
-   The E2E suites (both bare-metal and Kubernetes) do not support parallel test execution. Always pass ``--test-threads=1``.
+   The E2E suites (both native-host and Kubernetes) do not support parallel test execution. Always pass ``--test-threads=1``.
 
-End-to-End Tests (Bare-Metal)
------------------------------
+End-to-End Tests (Native-Host)
+------------------------------
 
 The E2E suite deploys Spur to real nodes over SSH and runs integration tests against a live cluster. Build the release binaries first (``cargo build --release``), as the suite copies them to the remote nodes. You can also run it on a single machine by SSH-ing into itself — just ensure ``ssh localhost`` works without a password prompt and leave ``SPUR_TEST_BM_NODES`` at its default (``localhost``).
 
@@ -60,8 +60,8 @@ Export these so the test process can read them:
      - Path to release binaries. Defaults to ``target/release``.
      - ``./target/release``
    * - ``SPUR_TEST_BM_DEPLOY_DIR`` *(optional)*
-     - Path to ``deploy/bare-metal/`` scripts. Auto-detected from the workspace if unset.
-     - ``./deploy/bare-metal``
+     - Path to ``deploy/native-host/`` scripts. Auto-detected from the workspace if unset.
+     - ``./deploy/native-host``
    * - ``SPUR_TEST_BM_REMOTE_DIR`` *(optional)*
      - Remote working directory on nodes. Defaults to ``/tmp/spur-bm-{pid}-{timestamp}``.
      - ``/tmp/spur-e2e``
@@ -113,25 +113,25 @@ The single-node and multi-node suites do not require GPU nodes:
 .. code-block:: bash
 
    # Single-node tests
-   cargo test -p spur-tests --lib bare_metal::single_node -- --ignored --test-threads=1
+   cargo test -p spur-tests --lib native_host::single_node -- --ignored --test-threads=1
 
    # Multi-node tests
-   cargo test -p spur-tests --lib bare_metal::multi_node -- --ignored --test-threads=1
+   cargo test -p spur-tests --lib native_host::multi_node -- --ignored --test-threads=1
 
 For GPU testing there is a separate suite with its own single-node and multi-node variants — these require nodes with actual GPUs:
 
 .. code-block:: bash
 
    # Single-node GPU tests
-   cargo test -p spur-tests --lib bare_metal::gpu::single_node -- --ignored --test-threads=1
+   cargo test -p spur-tests --lib native_host::gpu::single_node -- --ignored --test-threads=1
 
    # Multi-node GPU tests
-   cargo test -p spur-tests --lib bare_metal::gpu::multi_node -- --ignored --test-threads=1
+   cargo test -p spur-tests --lib native_host::gpu::multi_node -- --ignored --test-threads=1
 
 End-to-End Tests (Kubernetes)
 -----------------------------
 
-The K8s E2E suite deploys Spur's controller (StatefulSet), operator (Deployment), and SpurJob CRD into a Kubernetes cluster, then submits SpurJobs and verifies their lifecycle. Like the bare-metal suite, it is ignored by default.
+The K8s E2E suite deploys Spur's controller (StatefulSet), operator (Deployment), and SpurJob CRD into a Kubernetes cluster, then submits SpurJobs and verifies their lifecycle. Like the native-host suite, it is ignored by default.
 
 You need a running Kubernetes cluster with:
 
@@ -176,7 +176,7 @@ Setup
    # If running a local cluster (e.g. kind):
    kind load docker-image spur:ci
 
-   # If running on bare-metal K8s nodes, load via containerd:
+   # If running on native-host K8s nodes, load via containerd:
    docker save spur:ci -o /tmp/spur-ci.tar
    # On each node:
    sudo ctr -n k8s.io images import /tmp/spur-ci.tar

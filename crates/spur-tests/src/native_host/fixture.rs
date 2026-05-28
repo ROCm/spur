@@ -15,8 +15,8 @@ use super::ssh::SshNode;
 
 const BM_BINARIES: [&str; 3] = ["spurctld", "spurd", "spur"];
 
-/// Deployed bare-metal cluster for E2E tests.
-pub struct BareMetalFixture {
+/// Deployed native-host cluster for E2E tests.
+pub struct NativeHostFixture {
     pub config: TestConfig,
     pub nodes: Vec<SshNode>,
     pub node_names: Vec<String>,
@@ -29,7 +29,7 @@ pub struct BareMetalFixture {
     pub ssh_user: String,
 }
 
-impl BareMetalFixture {
+impl NativeHostFixture {
     pub async fn deploy(config: TestConfig) -> Result<Self> {
         config.validate_binaries()?;
         info!("deploy: validated binaries");
@@ -152,7 +152,7 @@ impl BareMetalFixture {
 
         info!("waiting for all nodes to become idle");
         fixture.wait_all_idle(Duration::from_secs(120)).await?;
-        info!(nodes = ?fixture.node_names, "bare-metal cluster ready");
+        info!(nodes = ?fixture.node_names, "native-host cluster ready");
         Ok(fixture)
     }
 
@@ -305,7 +305,7 @@ impl BareMetalFixture {
             node.kill_processes("spurd").await?;
             node.rm_rf(&self.remote_dir).await?;
         }
-        info!("bare-metal cluster torn down");
+        info!("native-host cluster torn down");
         Ok(())
     }
 
@@ -355,7 +355,7 @@ impl BareMetalFixture {
     /// compiled gpu_test binary, ephemeral venv with PyTorch, and generated
     /// job wrapper scripts that activate the venv.
     pub async fn ship_gpu_assets(&self) {
-        let deploy = bare_metal_deploy_dir();
+        let deploy = native_host_deploy_dir();
         let rd = &self.remote_dir;
         let venv_path = self.resolve_gpu_venv().await;
 
@@ -702,7 +702,7 @@ memory_mb = 262144
     }
 
     format!(
-        r#"cluster_name = "bare-metal-ci"
+        r#"cluster_name = "native-host-ci"
 
 [scheduler]
 interval_secs = 1
@@ -749,14 +749,14 @@ pub fn parse_job_id(sbatch_output: &str) -> Option<u32> {
         .and_then(|s| s.parse().ok())
 }
 
-/// Path to deploy/bare-metal scripts (respects `SPUR_TEST_BM_DEPLOY_DIR`).
-pub fn bare_metal_deploy_dir() -> std::path::PathBuf {
+/// Path to deploy/native-host scripts (respects `SPUR_TEST_BM_DEPLOY_DIR`).
+pub fn native_host_deploy_dir() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("SPUR_TEST_BM_DEPLOY_DIR") {
         return std::path::PathBuf::from(dir);
     }
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
-        .map(|p| p.join("deploy/bare-metal"))
-        .unwrap_or_else(|| std::path::PathBuf::from("deploy/bare-metal"))
+        .map(|p| p.join("deploy/native-host"))
+        .unwrap_or_else(|| std::path::PathBuf::from("deploy/native-host"))
 }

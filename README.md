@@ -31,7 +31,7 @@ spur run -- echo "hello from $(hostname)"        # run a command
 spur queue                                       # check the queue
 ```
 
-For production and multi-node deployments, see the [deployment guide](docs/deployment/bare-metal.rst).
+For production and multi-node deployments, see the [deployment guide](docs/deployment/native-host.rst).
 
 ## Documentation
 

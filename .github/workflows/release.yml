@@ -54,7 +54,7 @@ jobs:
 
           # Include config + deploy examples
           mkdir -p "${DIST}/etc"
-          cp deploy/bare-metal/spur.conf "${DIST}/etc/spur.conf.example"
+          cp deploy/native-host/spur.conf "${DIST}/etc/spur.conf.example"
 
           tar czf "${DIST}.tar.gz" "${DIST}"
           sha256sum "${DIST}.tar.gz" > "${DIST}.tar.gz.sha256"

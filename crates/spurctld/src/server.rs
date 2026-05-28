@@ -487,7 +487,7 @@ impl SlurmController for ControllerService {
                 agent_port,
                 req.wg_pubkey,
                 req.version,
-                spur_core::node::NodeSource::BareMetal,
+                spur_core::node::NodeSource::NativeHost,
             )
             .map_err(|e| Status::internal(e.to_string()))?;
 

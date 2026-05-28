@@ -62,15 +62,15 @@ jobs:
               });
             }
 
-  bare-metal:
-    name: Bare-Metal
+  native-host:
+    name: Native-Host
     runs-on: [self-hosted, amd-aac02-rocm]
     if: github.event.workflow_run.conclusion == 'success'
     concurrency:
-      group: bare-metal-cluster
+      group: native-host-cluster
       queue: max
     env:
-      STATUS_CONTEXT: "E2E / Bare-Metal"
+      STATUS_CONTEXT: "E2E / Native-Host"
       BM_NODES: ${{ secrets.BM_NODES }}
       BM_SSH_USER: ${{ secrets.BM_SSH_USER }}
       BM_REMOTE_BASE: /tmp/spur-bm-${{ github.run_id }}
@@ -108,7 +108,7 @@ jobs:
         with:
           persist-credentials: false
           sparse-checkout: |
-            deploy/bare-metal
+            deploy/native-host
             scripts
           sparse-checkout-cone-mode: false
           path: trusted-repo
@@ -196,49 +196,49 @@ jobs:
             done
           done
 
-      - name: Run single-node bare-metal tests
+      - name: Run single-node native-host tests
         env:
           SPUR_TEST_BM_NODES: ${{ env.BM_NODES }}
           SPUR_TEST_BM_SSH_USER: ${{ secrets.BM_SSH_USER }}
           SPUR_TEST_BM_BINARIES_DIR: /tmp/release-binaries
-          SPUR_TEST_BM_DEPLOY_DIR: trusted-repo/deploy/bare-metal
+          SPUR_TEST_BM_DEPLOY_DIR: trusted-repo/deploy/native-host
           SPUR_TEST_BM_REMOTE_DIR: ${{ env.BM_REMOTE_BASE }}/single-node
           RUST_LOG: info
         run: |
           chmod +x /tmp/e2e-bin/spur-k8s-tests
-          /tmp/e2e-bin/spur-k8s-tests bare_metal::single_node --ignored --test-threads=1
+          /tmp/e2e-bin/spur-k8s-tests native_host::single_node --ignored --test-threads=1
 
-      - name: Run multi-node bare-metal tests
+      - name: Run multi-node native-host tests
         env:
           SPUR_TEST_BM_NODES: ${{ env.BM_NODES }}
           SPUR_TEST_BM_SSH_USER: ${{ secrets.BM_SSH_USER }}
           SPUR_TEST_BM_BINARIES_DIR: /tmp/release-binaries
-          SPUR_TEST_BM_DEPLOY_DIR: trusted-repo/deploy/bare-metal
+          SPUR_TEST_BM_DEPLOY_DIR: trusted-repo/deploy/native-host
           SPUR_TEST_BM_REMOTE_DIR: ${{ env.BM_REMOTE_BASE }}/multi-node
           RUST_LOG: info
-        run: /tmp/e2e-bin/spur-k8s-tests bare_metal::multi_node --ignored --test-threads=1
+        run: /tmp/e2e-bin/spur-k8s-tests native_host::multi_node --ignored --test-threads=1
 
-      - name: Run single-node GPU bare-metal tests
+      - name: Run single-node GPU native-host tests
         env:
           SPUR_TEST_BM_NODES: ${{ env.BM_NODES }}
           SPUR_TEST_BM_SSH_USER: ${{ secrets.BM_SSH_USER }}
           SPUR_TEST_BM_BINARIES_DIR: /tmp/release-binaries
-          SPUR_TEST_BM_DEPLOY_DIR: trusted-repo/deploy/bare-metal
+          SPUR_TEST_BM_DEPLOY_DIR: trusted-repo/deploy/native-host
           SPUR_TEST_BM_REMOTE_DIR: ${{ env.BM_REMOTE_BASE }}/gpu-single-node
           SPUR_TEST_BM_GPU_VENV: /opt/spur-ci/gpu-venv
           RUST_LOG: info
-        run: /tmp/e2e-bin/spur-k8s-tests bare_metal::gpu::single_node --ignored --test-threads=1
+        run: /tmp/e2e-bin/spur-k8s-tests native_host::gpu::single_node --ignored --test-threads=1
 
-      - name: Run multi-node GPU bare-metal tests
+      - name: Run multi-node GPU native-host tests
         env:
           SPUR_TEST_BM_NODES: ${{ env.BM_NODES }}
           SPUR_TEST_BM_SSH_USER: ${{ secrets.BM_SSH_USER }}
           SPUR_TEST_BM_BINARIES_DIR: /tmp/release-binaries
-          SPUR_TEST_BM_DEPLOY_DIR: trusted-repo/deploy/bare-metal
+          SPUR_TEST_BM_DEPLOY_DIR: trusted-repo/deploy/native-host
           SPUR_TEST_BM_REMOTE_DIR: ${{ env.BM_REMOTE_BASE }}/gpu-multi-node
           SPUR_TEST_BM_GPU_VENV: /opt/spur-ci/gpu-venv
           RUST_LOG: info
-        run: /tmp/e2e-bin/spur-k8s-tests bare_metal::gpu::multi_node --ignored --test-threads=1
+        run: /tmp/e2e-bin/spur-k8s-tests native_host::gpu::multi_node --ignored --test-threads=1
 
       - name: Collect cluster logs
         if: failure()
@@ -278,7 +278,7 @@ jobs:
         if: failure() && steps.scrub-logs.outcome == 'success'
         uses: actions/upload-artifact@v7
         with:
-          name: bare-metal-logs
+          name: native-host-logs
           path: /tmp/bm-logs/
           retention-days: 3
           if-no-files-found: ignore

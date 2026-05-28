@@ -197,9 +197,9 @@ impl std::fmt::Display for NodeState {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum NodeSource {
-    /// Traditional bare-metal node running spurd.
+    /// Traditional native-host node running spurd.
     #[default]
-    BareMetal,
+    NativeHost,
     /// Kubernetes node managed by the spur-k8s operator.
     Kubernetes { namespace: String },
 }
@@ -217,7 +217,7 @@ pub struct Node {
     #[serde(default)]
     pub admin_locked: bool,
     pub partitions: Vec<String>,
-    /// Where this node comes from (bare-metal or K8s).
+    /// Where this node comes from (native-host or K8s).
     #[serde(default)]
     pub source: NodeSource,
 

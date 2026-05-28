@@ -8,9 +8,9 @@ mod tests {
     use serial_test::serial;
     use tokio::sync::OnceCell;
 
-    use crate::bare_metal::fixture::parse_job_id;
-    use crate::bare_metal::single_node::fixture;
-    use crate::bare_metal::wait_final_state;
+    use crate::native_host::fixture::parse_job_id;
+    use crate::native_host::single_node::fixture;
+    use crate::native_host::wait_final_state;
 
     static CONTAINER_IMG: OnceCell<String> = OnceCell::const_new();
 
@@ -118,7 +118,7 @@ mod tests {
         // Wait for it to start running
         for _ in 0..15 {
             let sq = f.squeue_all().await.unwrap_or_default();
-            if crate::bare_metal::job_state(&sq, job_id).as_deref() == Some("R") {
+            if crate::native_host::job_state(&sq, job_id).as_deref() == Some("R") {
                 break;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;

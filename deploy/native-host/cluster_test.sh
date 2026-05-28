@@ -22,7 +22,7 @@
 #   - squashfs-tools installed (mksquashfs) for container tests
 #
 # Usage: ssh mi300 'bash ~/spur/cluster_test.sh'
-#   or:  bash deploy/bare-metal/cluster_test.sh  (from shark-a)
+#   or:  bash deploy/native-host/cluster_test.sh  (from shark-a)
 
 set -euo pipefail
 

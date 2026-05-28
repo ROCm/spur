@@ -17,7 +17,7 @@ AI-native job scheduler. 314 tests passing, end-to-end job dispatch working, Wir
 
 | # | Item | Size | Description |
 |---|------|------|-------------|
-| 10.1 | HA controller failover | XL | openraft for bare-metal, K8s Lease for cloud |
+| 10.1 | HA controller failover | XL | openraft for native-host, K8s Lease for cloud |
 | 10.2 | Reservations | L | Admin time+node reservations |
 | 10.3 | REST API expansion | L | ~30 more endpoints for full slurmrestd compat |
 | 10.4 | sdiag/sprio/sshare | S | Scheduler diagnostics, priority breakdown, fair-share tree |
@@ -27,7 +27,7 @@ AI-native job scheduler. 314 tests passing, end-to-end job dispatch working, Wir
 
 ## Phase 11: Kubernetes Integration
 
-Spur becomes the scheduling brain for GPU workloads across both bare-metal and Kubernetes. The goal is NOT to replace the K8s scheduler for general workloads — it's to provide GPU-aware, topology-aware, gang-scheduling capabilities that K8s lacks natively.
+Spur becomes the scheduling brain for GPU workloads across both native-host and Kubernetes. The goal is NOT to replace the K8s scheduler for general workloads — it's to provide GPU-aware, topology-aware, gang-scheduling capabilities that K8s lacks natively.
 
 ### Architecture
 
@@ -39,11 +39,11 @@ Spur becomes the scheduling brain for GPU workloads across both bare-metal and K
                                │       │
               ┌────────────────┘       └────────────────┐
               ▼                                         ▼
-   ┌──────────────────┐                    ┌────────────────────┐
-   │  Bare-metal nodes │                    │  Kubernetes cluster │
-   │  spurd agents     │                    │  spur-k8s operator  │
-   │  WireGuard mesh   │                    │  CRDs + pod mgmt    │
-   └──────────────────┘                    └────────────────────┘
+   ┌─────────────────────┐                 ┌────────────────────┐
+   │  Native-host nodes  │                 │  Kubernetes cluster │
+   │  spurd agents       │                 │  spur-k8s operator  │
+   │  WireGuard mesh     │                 │  CRDs + pod mgmt    │
+   └─────────────────────┘                 └────────────────────┘
 ```
 
 ### 11.1 SpurJob CRD + Operator (L)
@@ -69,13 +69,13 @@ The operator watches SpurJob CRDs, translates them to Spur job submissions, and 
 
 ### 11.2 Virtual Kubelet Provider (XL)
 
-A virtual-kubelet implementation that registers bare-metal nodes as K8s nodes. GPU workloads scheduled by K8s land on Spur-managed bare-metal via the virtual kubelet, which translates pod specs to `LaunchJobRequest`.
+A virtual-kubelet implementation that registers native-host nodes as K8s nodes. GPU workloads scheduled by K8s land on Spur-managed native-host via the virtual kubelet, which translates pod specs to `LaunchJobRequest`.
 
-This bridges the gap: K8s clusters can burst to bare-metal GPU nodes managed by Spur, and bare-metal clusters can accept work from K8s.
+This bridges the gap: K8s clusters can burst to native-host GPU nodes managed by Spur, and native-host clusters can accept work from K8s.
 
 ### 11.3 Node Pool Unification (L)
 
-A single `spur nodes` view shows both bare-metal (spurd agents) and K8s nodes (operator-reported). The scheduler treats them uniformly — same priority, same fair-share, same topology awareness.
+A single `spur nodes` view shows both native-host (spurd agents) and K8s nodes (operator-reported). The scheduler treats them uniformly — same priority, same fair-share, same topology awareness.
 
 Config:
 ```toml
@@ -236,7 +236,7 @@ scale_down_cooldown = "300s"
 
 Spur monitors the metric (scraped from the service's health endpoint or a Prometheus-compatible endpoint), then submits/cancels replica jobs automatically.
 
-On bare-metal: replicas are additional Spur jobs on available nodes.
+On native-host: replicas are additional Spur jobs on available nodes.
 On K8s: replicas are additional pods via the operator.
 
 ### 13.4 Request Routing (L)
@@ -329,4 +329,4 @@ Configurable per-GPU-type rates. Feeds into accounting for budget enforcement.
 
 **Inference as a separate system (like KServe/Seldon):** Fragmenting GPU management across systems leads to utilization problems. A single scheduler that understands both training and inference can pack the cluster better (shift GPUs from idle inference to training overnight, etc).
 
-**Build on Ray/Dask instead of bare-metal agents:** These are good for distributed compute but don't provide the low-level node management (cgroups, WireGuard, GPU isolation) needed for multi-tenant clusters. Spur is lower in the stack.
+**Build on Ray/Dask instead of native-host agents:** These are good for distributed compute but don't provide the low-level node management (cgroups, WireGuard, GPU isolation) needed for multi-tenant clusters. Spur is lower in the stack.

@@ -7,18 +7,18 @@ pub mod lifecycle;
 
 use tokio::sync::OnceCell;
 
-use crate::bare_metal::config::TestConfig;
-use crate::bare_metal::fixture::BareMetalFixture;
+use crate::native_host::config::TestConfig;
+use crate::native_host::fixture::NativeHostFixture;
 
-static FIXTURE: OnceCell<BareMetalFixture> = OnceCell::const_new();
+static FIXTURE: OnceCell<NativeHostFixture> = OnceCell::const_new();
 
-pub async fn fixture() -> &'static BareMetalFixture {
+pub async fn fixture() -> &'static NativeHostFixture {
     FIXTURE
         .get_or_init(|| async {
             let config = TestConfig::from_env().expect("SPUR_TEST_BM_* config");
-            BareMetalFixture::deploy(config)
+            NativeHostFixture::deploy(config)
                 .await
-                .expect("failed to deploy bare-metal cluster for single_node tests")
+                .expect("failed to deploy native-host cluster for single_node tests")
         })
         .await
 }

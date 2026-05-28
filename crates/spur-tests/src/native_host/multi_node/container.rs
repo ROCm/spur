@@ -8,9 +8,9 @@ mod tests {
     use serial_test::serial;
     use tokio::sync::OnceCell;
 
-    use crate::bare_metal::fixture::parse_job_id;
-    use crate::bare_metal::multi_node::fixture;
-    use crate::bare_metal::{wait_final_state, wait_job};
+    use crate::native_host::fixture::parse_job_id;
+    use crate::native_host::multi_node::fixture;
+    use crate::native_host::{wait_final_state, wait_job};
 
     static CONTAINER_IMG: OnceCell<String> = OnceCell::const_new();
 

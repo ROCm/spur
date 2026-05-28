@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 
-use fixture::BareMetalFixture;
+use fixture::NativeHostFixture;
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -37,7 +37,7 @@ pub fn job_state(squeue_output: &str, job_id: u32) -> Option<String> {
     None
 }
 
-pub async fn wait_job(fixture: &BareMetalFixture, job_id: u32, timeout: Duration) -> Result<()> {
+pub async fn wait_job(fixture: &NativeHostFixture, job_id: u32, timeout: Duration) -> Result<()> {
     let start = std::time::Instant::now();
     loop {
         let sq = fixture.squeue_all().await.unwrap_or_default();
@@ -55,7 +55,7 @@ pub async fn wait_job(fixture: &BareMetalFixture, job_id: u32, timeout: Duration
 }
 
 pub async fn wait_final_state(
-    fixture: &BareMetalFixture,
+    fixture: &NativeHostFixture,
     job_id: u32,
     timeout: Duration,
 ) -> Result<String> {

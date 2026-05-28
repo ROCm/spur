@@ -580,7 +580,7 @@ pub struct NotificationConfig {
     pub from_address: Option<String>,
 }
 
-/// Job isolation configuration for bare-metal and container jobs.
+/// Job isolation configuration for native-host and container jobs.
 ///
 /// Each layer operates independently and degrades gracefully when the
 /// kernel doesn't support it or spurd isn't running as root.
@@ -604,7 +604,7 @@ pub struct IsolationConfig {
     /// seccomp-BPF syscall filter (kernel 3.5+).
     #[serde(default = "default_true_fn")]
     pub seccomp: bool,
-    /// Landlock filesystem access control (kernel 5.13+, bare-metal only).
+    /// Landlock filesystem access control (kernel 5.13+, native-host only).
     #[serde(default = "default_true_fn")]
     pub landlock: bool,
 }

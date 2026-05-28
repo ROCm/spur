@@ -6,24 +6,24 @@ pub mod single_node;
 
 use tokio::sync::OnceCell;
 
-use crate::bare_metal::config::TestConfig;
-use crate::bare_metal::fixture::BareMetalFixture;
+use crate::native_host::config::TestConfig;
+use crate::native_host::fixture::NativeHostFixture;
 
-static FIXTURE: OnceCell<BareMetalFixture> = OnceCell::const_new();
+static FIXTURE: OnceCell<NativeHostFixture> = OnceCell::const_new();
 
-pub async fn fixture() -> &'static BareMetalFixture {
+pub async fn fixture() -> &'static NativeHostFixture {
     FIXTURE
         .get_or_init(|| async {
             let config = TestConfig::from_env().expect("SPUR_TEST_BM_* config");
             if config.nodes.len() < 2 {
                 panic!(
-                    "bare_metal::gpu requires at least 2 nodes in SPUR_TEST_BM_NODES (got {})",
+                    "native_host::gpu requires at least 2 nodes in SPUR_TEST_BM_NODES (got {})",
                     config.nodes.len()
                 );
             }
-            BareMetalFixture::deploy(config)
+            NativeHostFixture::deploy(config)
                 .await
-                .expect("failed to deploy bare-metal cluster for gpu tests")
+                .expect("failed to deploy native-host cluster for gpu tests")
         })
         .await
 }

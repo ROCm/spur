@@ -1,4 +1,4 @@
-Bare-Metal Deployment
+Native-Host Deployment
 =====================
 
 Deploy Spur across physical or virtual machines.

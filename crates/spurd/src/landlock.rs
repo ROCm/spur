@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Landlock filesystem access control for bare-metal job isolation.
+//! Landlock filesystem access control for native-host job isolation.
 //!
 //! Restricts filesystem access to the job's working directory, GPU device
 //! files, and read-only system paths. Prevents jobs from reading other
@@ -71,7 +71,7 @@ struct LandlockPathBeneathAttr {
     parent_fd: i32,
 }
 
-/// Apply Landlock filesystem restrictions for a bare-metal job.
+/// Apply Landlock filesystem restrictions for a native-host job.
 ///
 /// - `work_dir`: read-write access (job's workspace)
 /// - System paths (`/usr`, `/lib`, `/opt/rocm`, etc.): read-only

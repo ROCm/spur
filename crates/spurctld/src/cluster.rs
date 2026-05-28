@@ -1860,7 +1860,7 @@ mod tests {
             6818,
             String::new(),
             String::new(),
-            spur_core::node::NodeSource::BareMetal,
+            spur_core::node::NodeSource::NativeHost,
         )
         .unwrap();
         let n = name.to_string();
@@ -2386,7 +2386,7 @@ mod tests {
             6818,
             String::new(),
             "1.0".into(),
-            NodeSource::BareMetal,
+            NodeSource::NativeHost,
         )
         .unwrap();
         let node = cm.get_node("locked").unwrap();

@@ -7,9 +7,9 @@ mod tests {
 
     use serial_test::serial;
 
-    use crate::bare_metal::fixture::parse_job_id;
-    use crate::bare_metal::single_node::fixture;
-    use crate::bare_metal::{wait_final_state, wait_job};
+    use crate::native_host::fixture::parse_job_id;
+    use crate::native_host::single_node::fixture;
+    use crate::native_host::{wait_final_state, wait_job};
 
     #[tokio::test]
     #[ignore]
@@ -59,7 +59,7 @@ mod tests {
             .await
             .expect("wait job");
 
-        let state = crate::bare_metal::wait_final_state(f, job_id, Duration::from_secs(30))
+        let state = crate::native_host::wait_final_state(f, job_id, Duration::from_secs(30))
             .await
             .expect("final state");
         assert!(

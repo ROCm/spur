@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 
-/// Bare-metal test configuration from environment variables.
+/// Native-host test configuration from environment variables.
 #[derive(Debug, Clone)]
 pub struct TestConfig {
     pub nodes: Vec<String>,
