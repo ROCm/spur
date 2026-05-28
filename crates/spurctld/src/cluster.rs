@@ -379,6 +379,11 @@ impl ClusterManager {
             });
         }
 
+        let jobs = self.jobs.read();
+        if jobs.get(&job_id).is_some_and(|job| job.state.is_terminal()) {
+            return Ok(NodeCompleteResult::AlreadyTerminal);
+        }
+
         Ok(NodeCompleteResult::Completing)
     }
 
@@ -2678,6 +2683,47 @@ mod tests {
 
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_complete_returns_already_terminal_after_cancel() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        for name in ["n1", "n2", "n3"] {
+            register_node(&cm, name, 8, 16000);
+        }
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("nc-after-cancel")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into(), "n2".into(), "n3".into()],
+            resources: ResourceSet {
+                cpus: 6,
+                memory_mb: 12000,
+                ..Default::default()
+            },
+        });
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id: 1,
+            node_name: "n1".into(),
+            exit_code: 0,
+        });
+
+        cm.cancel_job(1, "testuser").unwrap();
+        settle(&cm, 1, JobState::Cancelled);
+
+        let result = cm.node_complete(1, "n2", 0).unwrap();
+        assert_eq!(result, NodeCompleteResult::AlreadyTerminal);
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Cancelled);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
