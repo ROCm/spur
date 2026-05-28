@@ -12,17 +12,12 @@ use spur_core::node::NodeState;
 use std::sync::atomic::AtomicU64;
 
 use crate::export::encode_registered;
+use crate::export::register_gauge;
 use crate::node::{node_state_metric_suffix, NodeMetricsSnapshot};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct NodeLabel {
     node: String,
-}
-
-fn register_gauge(registry: &mut Registry, name: &str, help: &str, value: u64) {
-    let gauge = Gauge::<u64, AtomicU64>::default();
-    gauge.set(value);
-    registry.register(name, help, gauge);
 }
 
 fn set_family_gauge(family: &Family<NodeLabel, Gauge<u64, AtomicU64>>, node: &str, value: u64) {

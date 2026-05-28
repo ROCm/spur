@@ -6,13 +6,22 @@
 use prometheus_client::encoding::text::{
     encode as encode_openmetrics_strict, encode_eof, encode_registry,
 };
+use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use spur_core::config::MetricsExpositionFormat;
+use std::sync::atomic::AtomicU64;
 
 pub mod jobs;
 pub mod nodes;
 pub mod partitions;
 pub mod scheduler;
+
+/// Register a scalar `u64` gauge with an initial value.
+pub(crate) fn register_gauge(registry: &mut Registry, name: &str, help: &str, value: u64) {
+    let gauge = Gauge::<u64, AtomicU64>::default();
+    gauge.set(value);
+    registry.register(name, help, gauge);
+}
 
 /// Build a registry, run `register`, and encode with `format`.
 pub fn encode_registered<F>(register: F, format: MetricsExpositionFormat) -> String

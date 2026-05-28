@@ -3,12 +3,11 @@
 
 //! Job gauge registration for `/metrics/jobs`.
 
-use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use spur_core::job::JobState;
-use std::sync::atomic::AtomicU64;
 
 use crate::export::encode_registered;
+use crate::export::register_gauge;
 use crate::job::JobMetricsSnapshot;
 use spur_core::config::MetricsExpositionFormat;
 
@@ -26,12 +25,6 @@ pub fn job_state_metric_suffix(state: JobState) -> &'static str {
         JobState::Preempted => "preempted",
         JobState::Suspended => "suspended",
     }
-}
-
-fn register_gauge(registry: &mut Registry, name: &str, help: &str, value: u64) {
-    let gauge = Gauge::<u64, AtomicU64>::default();
-    gauge.set(value);
-    registry.register(name, help, gauge);
 }
 
 /// Register job catalog gauges into `registry` from `snap`.
