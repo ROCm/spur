@@ -206,7 +206,10 @@ mod tests {
         assert_eq!(snap.count_state(NodeState::Down), 1);
         assert_eq!(snap.total_cpus, 8 + 8 + 4);
         assert_eq!(snap.alloc_cpus, 8);
-        assert_eq!(snap.total_memory_bytes, memory_mb_to_bytes(16384 + 16384 + 8192));
+        assert_eq!(
+            snap.total_memory_bytes,
+            memory_mb_to_bytes(16384 + 16384 + 8192)
+        );
         assert_eq!(snap.alloc_memory_bytes, memory_mb_to_bytes(8192));
         assert_eq!(snap.total_gpus, 2);
         assert_eq!(snap.alloc_gpus, 2);

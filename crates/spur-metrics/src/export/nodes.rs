@@ -7,8 +7,8 @@ use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
-use spur_core::node::NodeState;
 use spur_core::config::MetricsExpositionFormat;
+use spur_core::node::NodeState;
 use std::sync::atomic::AtomicU64;
 
 use crate::export::encode_registered;
@@ -101,18 +101,10 @@ pub fn register_nodes(registry: &mut Registry, snap: &NodeMetricsSnapshot) {
         set_family_gauge(&node_gpus, &node.name, node.total_gpus);
         set_family_gauge(&node_gpus_alloc, &node.name, node.alloc_gpus);
         set_family_gauge(&node_cpu_load, &node.name, node.cpu_load);
-        set_family_gauge(
-            &node_free_memory_bytes,
-            &node.name,
-            node.free_memory_bytes,
-        );
+        set_family_gauge(&node_free_memory_bytes, &node.name, node.free_memory_bytes);
     }
 
-    registry.register(
-        "spur_node_cpus",
-        "CPUs on the specified node",
-        node_cpus,
-    );
+    registry.register("spur_node_cpus", "CPUs on the specified node", node_cpus);
     registry.register(
         "spur_node_cpus_alloc",
         "CPUs allocated on the specified node",
@@ -167,22 +159,24 @@ mod tests {
     use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
 
     #[test]
-    fn empty_nodes_export_slurm_has_no_samples() {
+    fn empty_nodes_export_slurm_exports_zeroes() {
         let body = encode_nodes_metrics_with_format(
             &NodeMetricsSnapshot::default(),
             MetricsExpositionFormat::Slurm_0_0_4,
         );
-        assert!(!body.contains("spur_"));
+        assert!(body.contains("spur_nodes 0\n"));
+        assert!(body.contains("spur_nodes_idle 0\n"));
         assert!(!body.contains("# EOF"));
     }
 
     #[test]
-    fn empty_nodes_export_openmetrics_has_eof_only() {
+    fn empty_nodes_export_openmetrics_exports_zeroes_and_eof() {
         let body = encode_nodes_metrics_with_format(
             &NodeMetricsSnapshot::default(),
             MetricsExpositionFormat::OpenMetrics_1_0,
         );
-        assert_eq!(body, "# EOF\n");
+        assert!(body.contains("spur_nodes 0\n"));
+        assert!(body.ends_with("# EOF\n"));
     }
 
     fn resources(cpus: u32, memory_mb: u64, gpu_count: u32) -> ResourceSet {

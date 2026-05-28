@@ -7,7 +7,9 @@ use spur_core::config::MetricsExpositionFormat;
 use spur_core::node::{Node, NodeState};
 use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
 use spur_metrics::node::NodeMetricsSnapshot;
-use spur_metrics::{encode_nodes_metrics, encode_nodes_metrics_with_format, node_state_metric_suffix};
+use spur_metrics::{
+    encode_nodes_metrics, encode_nodes_metrics_with_format, node_state_metric_suffix,
+};
 use std::path::PathBuf;
 
 fn fixtures_dir() -> PathBuf {
@@ -161,4 +163,3 @@ fn refresh_golden_fixtures() {
     )
     .expect("write openmetrics fixture");
 }
-
