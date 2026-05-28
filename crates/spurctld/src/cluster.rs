@@ -21,6 +21,7 @@ use spur_core::resource::ResourceSet;
 use spur_core::step::{JobStep, StepState, STEP_BATCH};
 use spur_core::wal::WalOperation;
 use spur_metrics::job::JobMetricsSnapshot;
+use spur_metrics::node::NodeMetricsSnapshot;
 
 use crate::accounting::AccountingNotifier;
 use crate::fairshare_cache::FairshareCache;
@@ -175,6 +176,15 @@ impl ClusterManager {
     pub fn job_metrics(&self) -> JobMetricsSnapshot {
         let jobs = self.jobs.read();
         JobMetricsSnapshot::collect(jobs.values())
+    }
+
+    /// Aggregated node metrics from the current in-memory node map (lazy scan).
+    ///
+    /// The `nodes` map is authoritative (WAL-backed for node catalog fields);
+    /// this scans it on each call.
+    pub fn node_metrics(&self) -> NodeMetricsSnapshot {
+        let nodes = self.nodes.read();
+        NodeMetricsSnapshot::collect(nodes.values())
     }
 
     /// Get jobs matching filters.
@@ -2161,6 +2171,50 @@ mod tests {
         // Snapshot matches a full scan of the job map.
         let expected = JobMetricsSnapshot::collect(cm.get_jobs(&[], None, None, None, &[]).iter());
         assert_eq!(cm.job_metrics(), expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_metrics_track_lifecycle() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        assert_eq!(cm.node_metrics(), NodeMetricsSnapshot::default());
+
+        register_node(&cm, "worker1", 8, 16000);
+        register_node(&cm, "worker2", 8, 16000);
+
+        let m = cm.node_metrics();
+        assert_eq!(m.total, 2);
+        assert_eq!(m.total_cpus, 16);
+        assert_eq!(m.alloc_cpus, 0);
+        assert_eq!(m.per_node.len(), 2);
+        assert_eq!(m.per_node[0].name, "worker1");
+        assert_eq!(m.per_node[1].name, "worker2");
+
+        let job_id = submit_and_wait(&cm, basic_spec("node-metrics-job"));
+        let resources = ResourceSet {
+            cpus: 4,
+            memory_mb: 8192,
+            ..Default::default()
+        };
+        cm.start_job(job_id, vec!["worker1".into()], resources)
+            .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        let m = cm.node_metrics();
+        assert_eq!(m.alloc_cpus, 4);
+        let w1 = m.per_node.iter().find(|n| n.name == "worker1").unwrap();
+        assert_eq!(w1.alloc_cpus, 4);
+
+        cm.complete_job(job_id, 0, JobState::Completed).unwrap();
+        settle(&cm, job_id, JobState::Completed);
+
+        let m = cm.node_metrics();
+        assert_eq!(m.alloc_cpus, 0);
+
+        // Snapshot matches a full scan of the node map.
+        let expected = NodeMetricsSnapshot::collect(cm.get_nodes().iter());
+        assert_eq!(cm.node_metrics(), expected);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,0 +1,18 @@
+---
+description: Require explicit approval of commit messages
+alwaysApply: true
+---
+
+# Git — commit message requires explicit approval
+
+Whenever running any command that creates or modifies a git commit (including `git commit`, `git commit --amend`, `git commit-tree`, rebases that rewrite commits, or anything that changes commit messages), you MUST do the following:
+
+- You MUST present the **exact proposed commit subject and body text** to the user first.
+- You MUST wait for the user to explicitly approve that exact text **in the same turn** before running the commit-rewriting command.
+- If the user asks to change the message, you MUST show the full revised message and get explicit approval again before proceeding.
+- If approval is not explicit and unambiguous, DO NOT create/amend/rewrite commits.
+
+Allowed without approval:
+
+- Drafting candidate commit messages in chat (no git side effects).
+- Read-only git commands (`git status`, `git diff`, `git log`, `git show`, etc.).

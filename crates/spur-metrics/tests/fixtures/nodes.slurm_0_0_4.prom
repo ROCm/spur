@@ -1,0 +1,80 @@
+# HELP spur_nodes Total number of nodes.
+# TYPE spur_nodes gauge
+spur_nodes 2
+# HELP spur_nodes_idle Number of nodes in idle state.
+# TYPE spur_nodes_idle gauge
+spur_nodes_idle 1
+# HELP spur_nodes_alloc Number of nodes in allocated state.
+# TYPE spur_nodes_alloc gauge
+spur_nodes_alloc 1
+# HELP spur_nodes_mixed Number of nodes in mixed state.
+# TYPE spur_nodes_mixed gauge
+spur_nodes_mixed 0
+# HELP spur_nodes_down Number of nodes in down state.
+# TYPE spur_nodes_down gauge
+spur_nodes_down 0
+# HELP spur_nodes_drain Number of nodes in drained state.
+# TYPE spur_nodes_drain gauge
+spur_nodes_drain 0
+# HELP spur_nodes_draining Number of nodes in draining state.
+# TYPE spur_nodes_draining gauge
+spur_nodes_draining 0
+# HELP spur_nodes_error Number of nodes in error state.
+# TYPE spur_nodes_error gauge
+spur_nodes_error 0
+# HELP spur_nodes_unknown Number of nodes in unknown state.
+# TYPE spur_nodes_unknown gauge
+spur_nodes_unknown 0
+# HELP spur_nodes_suspended Number of nodes in suspended state.
+# TYPE spur_nodes_suspended gauge
+spur_nodes_suspended 0
+# HELP spur_nodes_cpus Total CPUs across all nodes.
+# TYPE spur_nodes_cpus gauge
+spur_nodes_cpus 12
+# HELP spur_nodes_cpus_alloc Total CPUs allocated across all nodes.
+# TYPE spur_nodes_cpus_alloc gauge
+spur_nodes_cpus_alloc 2
+# HELP spur_nodes_memory_bytes Total memory in bytes across all nodes.
+# TYPE spur_nodes_memory_bytes gauge
+spur_nodes_memory_bytes 25769803776
+# HELP spur_nodes_memory_alloc_bytes Total memory in bytes allocated across all nodes.
+# TYPE spur_nodes_memory_alloc_bytes gauge
+spur_nodes_memory_alloc_bytes 4294967296
+# HELP spur_nodes_gpus Total GPUs across all nodes.
+# TYPE spur_nodes_gpus gauge
+spur_nodes_gpus 2
+# HELP spur_nodes_gpus_alloc Total GPUs allocated across all nodes.
+# TYPE spur_nodes_gpus_alloc gauge
+spur_nodes_gpus_alloc 0
+# HELP spur_node_cpus CPUs on the specified node.
+# TYPE spur_node_cpus gauge
+spur_node_cpus{node="node-a"} 8
+spur_node_cpus{node="node-b"} 4
+# HELP spur_node_cpus_alloc CPUs allocated on the specified node.
+# TYPE spur_node_cpus_alloc gauge
+spur_node_cpus_alloc{node="node-a"} 0
+spur_node_cpus_alloc{node="node-b"} 2
+# HELP spur_node_memory_bytes Memory in bytes on the specified node.
+# TYPE spur_node_memory_bytes gauge
+spur_node_memory_bytes{node="node-a"} 17179869184
+spur_node_memory_bytes{node="node-b"} 8589934592
+# HELP spur_node_memory_alloc_bytes Memory in bytes allocated on the specified node.
+# TYPE spur_node_memory_alloc_bytes gauge
+spur_node_memory_alloc_bytes{node="node-a"} 0
+spur_node_memory_alloc_bytes{node="node-b"} 4294967296
+# HELP spur_node_gpus GPUs on the specified node.
+# TYPE spur_node_gpus gauge
+spur_node_gpus{node="node-a"} 2
+spur_node_gpus{node="node-b"} 0
+# HELP spur_node_gpus_alloc GPUs allocated on the specified node.
+# TYPE spur_node_gpus_alloc gauge
+spur_node_gpus_alloc{node="node-a"} 0
+spur_node_gpus_alloc{node="node-b"} 0
+# HELP spur_node_cpu_load CPU load reported by the node agent.
+# TYPE spur_node_cpu_load gauge
+spur_node_cpu_load{node="node-a"} 12
+spur_node_cpu_load{node="node-b"} 0
+# HELP spur_node_free_memory_bytes Free memory in bytes reported by the node agent.
+# TYPE spur_node_free_memory_bytes gauge
+spur_node_free_memory_bytes{node="node-a"} 4294967296
+spur_node_free_memory_bytes{node="node-b"} 0

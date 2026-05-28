@@ -13,7 +13,7 @@ use axum::routing::get;
 use axum::Router;
 use spur_core::config::MetricsExpositionFormat;
 use spur_metrics::{
-    encode_job_metrics_with_format, encode_nodes_metrics, encode_partitions_metrics,
+    encode_job_metrics_with_format, encode_nodes_metrics_with_format, encode_partitions_metrics,
     encode_scheduler_metrics,
 };
 use tracing::info;
@@ -66,7 +66,10 @@ async fn metrics_nodes(State(state): State<Arc<MetricsState>>) -> Response {
         return not_leader_response();
     }
     let format = state.cluster.config.metrics.exposition_format;
-    metrics_exposition_response(format, encode_nodes_metrics(format))
+    metrics_exposition_response(
+        format,
+        encode_nodes_metrics_with_format(&state.cluster.node_metrics(), format),
+    )
 }
 
 async fn metrics_partitions(State(state): State<Arc<MetricsState>>) -> Response {
@@ -133,6 +136,7 @@ fn leader_metrics_response(
 mod tests {
     use super::*;
     use spur_metrics::job::JobMetricsSnapshot;
+    use spur_metrics::node::NodeMetricsSnapshot;
 
     #[test]
     fn leader_returns_slurm_content_type() {
@@ -161,7 +165,11 @@ mod tests {
     #[test]
     fn stub_nodes_endpoint_returns_200_on_leader() {
         let format = MetricsExpositionFormat::Slurm_0_0_4;
-        let response = leader_metrics_response(true, format, encode_nodes_metrics(format));
+        let response = leader_metrics_response(
+            true,
+            format,
+            encode_nodes_metrics_with_format(&NodeMetricsSnapshot::default(), format),
+        );
         assert_eq!(response.status(), StatusCode::OK);
     }
 
