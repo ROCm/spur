@@ -1600,22 +1600,23 @@ impl ClusterManager {
                 let allocated_resources;
                 let already_deallocated;
                 if let Some(job) = jobs.get_mut(job_id) {
-                    match job.transition(*state) {
-                        Ok(()) if state.is_terminal() => {
-                            response.job_finalized = Some(JobFinalized {
-                                job_id: *job_id,
-                                state: *state,
-                                exit_code: *exit_code,
-                            });
-                        }
-                        Ok(()) => {}
-                        Err(e) => {
-                            warn!(
-                                job_id = *job_id,
-                                error = %e,
-                                "invalid state transition in WAL apply"
-                            );
-                        }
+                    if job.state.is_terminal() {
+                        return ClientResponse::default();
+                    }
+                    if let Err(e) = job.transition(*state) {
+                        warn!(
+                            job_id = *job_id,
+                            error = %e,
+                            "invalid state transition in WAL apply"
+                        );
+                        return ClientResponse::default();
+                    }
+                    if state.is_terminal() {
+                        response.job_finalized = Some(JobFinalized {
+                            job_id: *job_id,
+                            state: *state,
+                            exit_code: *exit_code,
+                        });
                     }
                     job.exit_code = Some(*exit_code);
                     job.end_time = Some(timestamp);
@@ -2521,6 +2522,59 @@ mod tests {
         assert_eq!(f.job_id, 1);
         assert_eq!(f.state, JobState::Completed);
         assert_eq!(f.exit_code, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_job_complete_noop_when_already_terminal() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "worker1", 8, 16000);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("double-complete")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["worker1".into()],
+            resources: ResourceSet {
+                cpus: 2,
+                memory_mb: 4000,
+                ..Default::default()
+            },
+        });
+
+        let first = cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Completed,
+        });
+        first
+            .job_finalized
+            .expect("first JobComplete should finalize");
+        let node = cm.get_node("worker1").unwrap();
+        assert_eq!(node.alloc_resources.cpus, 0);
+        assert_eq!(node.alloc_resources.memory_mb, 0);
+
+        let second = cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: -1,
+            state: JobState::Cancelled,
+        });
+        assert!(second.job_finalized.is_none());
+
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Completed);
+        assert_eq!(job.exit_code, Some(0));
+
+        let node = cm.get_node("worker1").unwrap();
+        assert_eq!(node.alloc_resources.cpus, 0);
+        assert_eq!(node.alloc_resources.memory_mb, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
