@@ -106,8 +106,11 @@ jobs:
           sparse-checkout-cone-mode: false
           path: trusted-repo
 
-      - name: Install Python test dependencies
-        run: pip install -r trusted-repo/tests/e2e/requirements.txt
+      - name: Set up Python venv and install test deps
+        run: |
+          python3 -m venv /tmp/spur-e2e-venv
+          /tmp/spur-e2e-venv/bin/pip install -r trusted-repo/tests/e2e/requirements.txt
+          echo "/tmp/spur-e2e-venv/bin" >> "$GITHUB_PATH"
 
       - name: Load SSH key into agent
         run: |
@@ -282,6 +285,10 @@ jobs:
       - name: Kill SSH agent
         if: always()
         run: ssh-agent -k || true
+
+      - name: Cleanup venv
+        if: always()
+        run: rm -rf /tmp/spur-e2e-venv
 
       - name: Report status
         if: always()
