@@ -14,8 +14,6 @@ provision it (requires python3-venv + network access on nodes).
 import os
 from pathlib import Path
 
-import pytest
-
 from cluster import SpurCluster, parse_job_id, wait_job
 
 

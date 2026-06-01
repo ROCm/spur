@@ -10,6 +10,7 @@ and CLI wrappers for interacting with the running cluster.
 
 import os
 import shutil
+import subprocess
 import time
 import logging
 from pathlib import Path
@@ -307,8 +308,6 @@ class SpurCluster:
         Build a minimal squashfs container image locally, ship to all nodes.
         Returns the remote path to the .sqsh file.
         """
-        import subprocess
-
         remote_path = f"{self.remote_dir}/test-container.sqsh"
         rootfs = tmp_path / "rootfs"
         local_img = tmp_path / "test-container.sqsh"

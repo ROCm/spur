@@ -73,7 +73,7 @@ jobs:
       STATUS_CONTEXT: "E2E / Native-Host"
       BM_NODES: ${{ secrets.BM_NODES }}
       BM_SSH_USER: ${{ secrets.BM_SSH_USER }}
-      BM_REMOTE_BASE: /tmp/spur-bm-${{ github.run_id }}
+      BM_REMOTE_BIN_DIR: /tmp/spur-ci-bin
     steps:
       - name: Set pending status
         uses: actions/github-script@v9
@@ -95,23 +95,19 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Download E2E test binary
-        uses: actions/download-artifact@v8
-        with:
-          name: k8s-test-binary
-          path: /tmp/e2e-bin
-          run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Checkout trusted deploy assets and scripts from main
+      - name: Checkout test suite and deploy assets
         uses: actions/checkout@v6
         with:
           persist-credentials: false
           sparse-checkout: |
+            tests/e2e
             deploy/native-host
             scripts
           sparse-checkout-cone-mode: false
           path: trusted-repo
+
+      - name: Install Python test dependencies
+        run: pip install -r trusted-repo/tests/e2e/requirements.txt
 
       - name: Load SSH key into agent
         run: |
@@ -137,8 +133,8 @@ jobs:
           IFS=',' read -ra NODES <<< "$BM_NODES"
           FAILED=0
           for node in "${NODES[@]}"; do
-            if ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 \
-              "${BM_SSH_USER}@${node}" "echo ok" >/dev/null 2>&1; then
+            if ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+              -o ConnectTimeout=10 "${BM_SSH_USER}@${node}" "echo ok" >/dev/null 2>&1; then
               echo "PASS: ${node}"
             else
               echo "FAIL: ${node} unreachable"
@@ -175,70 +171,36 @@ jobs:
           ${IP} ${node}"
           done
           for node in "${NODES[@]}"; do
-            ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "${BM_SSH_USER}@${node}" "
+            ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+              "${BM_SSH_USER}@${node}" "
               grep -q '${MARKER}' /etc/hosts 2>/dev/null && exit 0
               echo '${HOSTS_BLOCK}' | sudo tee -a /etc/hosts >/dev/null
             "
           done
 
-      - name: Load AppArmor profiles for rootless containers
+      - name: Load AppArmor profile for rootless containers
         run: |
           IFS=',' read -ra NODES <<< "$BM_NODES"
-          for step in single-node multi-node gpu-single-node gpu-multi-node; do
-            SPURD="${BM_REMOTE_BASE}/${step}/bin/spurd"
-            PROF="abi <abi/4.0>,
-          profile spur-ci-${step} ${SPURD} flags=(unconfined) {
+          SPURD="${BM_REMOTE_BIN_DIR}/spurd"
+          PROF="abi <abi/4.0>,
+          profile spur-ci ${SPURD} flags=(unconfined) {
             userns,
           }"
-            for node in "${NODES[@]}"; do
-              ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "${BM_SSH_USER}@${node}" \
-                "echo '${PROF}' | sudo apparmor_parser -r 2>/dev/null || true"
-            done
+          for node in "${NODES[@]}"; do
+            ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+              "${BM_SSH_USER}@${node}" "echo '${PROF}' | sudo apparmor_parser -r 2>/dev/null || true"
           done
 
-      - name: Run single-node native-host tests
+      - name: Run native-host E2E tests
         env:
-          SPUR_TEST_BM_NODES: ${{ env.BM_NODES }}
-          SPUR_TEST_BM_SSH_USER: ${{ secrets.BM_SSH_USER }}
-          SPUR_TEST_BM_BINARIES_DIR: /tmp/release-binaries
-          SPUR_TEST_BM_DEPLOY_DIR: trusted-repo/deploy/native-host
-          SPUR_TEST_BM_REMOTE_DIR: ${{ env.BM_REMOTE_BASE }}/single-node
-          RUST_LOG: info
+          SPUR_TEST_NODES: ${{ env.BM_NODES }}
+          SPUR_TEST_SSH_USER: ${{ env.BM_SSH_USER }}
+          SPUR_TEST_BINARIES_DIR: /tmp/release-binaries
+          SPUR_TEST_REMOTE_BIN_DIR: ${{ env.BM_REMOTE_BIN_DIR }}
+          SPUR_TEST_GPU_VENV: /opt/spur-ci/gpu-venv
         run: |
-          chmod +x /tmp/e2e-bin/spur-k8s-tests
-          /tmp/e2e-bin/spur-k8s-tests native_host::single_node --ignored --test-threads=1
-
-      - name: Run multi-node native-host tests
-        env:
-          SPUR_TEST_BM_NODES: ${{ env.BM_NODES }}
-          SPUR_TEST_BM_SSH_USER: ${{ secrets.BM_SSH_USER }}
-          SPUR_TEST_BM_BINARIES_DIR: /tmp/release-binaries
-          SPUR_TEST_BM_DEPLOY_DIR: trusted-repo/deploy/native-host
-          SPUR_TEST_BM_REMOTE_DIR: ${{ env.BM_REMOTE_BASE }}/multi-node
-          RUST_LOG: info
-        run: /tmp/e2e-bin/spur-k8s-tests native_host::multi_node --ignored --test-threads=1
-
-      - name: Run single-node GPU native-host tests
-        env:
-          SPUR_TEST_BM_NODES: ${{ env.BM_NODES }}
-          SPUR_TEST_BM_SSH_USER: ${{ secrets.BM_SSH_USER }}
-          SPUR_TEST_BM_BINARIES_DIR: /tmp/release-binaries
-          SPUR_TEST_BM_DEPLOY_DIR: trusted-repo/deploy/native-host
-          SPUR_TEST_BM_REMOTE_DIR: ${{ env.BM_REMOTE_BASE }}/gpu-single-node
-          SPUR_TEST_BM_GPU_VENV: /opt/spur-ci/gpu-venv
-          RUST_LOG: info
-        run: /tmp/e2e-bin/spur-k8s-tests native_host::gpu::single_node --ignored --test-threads=1
-
-      - name: Run multi-node GPU native-host tests
-        env:
-          SPUR_TEST_BM_NODES: ${{ env.BM_NODES }}
-          SPUR_TEST_BM_SSH_USER: ${{ secrets.BM_SSH_USER }}
-          SPUR_TEST_BM_BINARIES_DIR: /tmp/release-binaries
-          SPUR_TEST_BM_DEPLOY_DIR: trusted-repo/deploy/native-host
-          SPUR_TEST_BM_REMOTE_DIR: ${{ env.BM_REMOTE_BASE }}/gpu-multi-node
-          SPUR_TEST_BM_GPU_VENV: /opt/spur-ci/gpu-venv
-          RUST_LOG: info
-        run: /tmp/e2e-bin/spur-k8s-tests native_host::gpu::multi_node --ignored --test-threads=1
+          chmod +x /tmp/release-binaries/*
+          pytest trusted-repo/tests/e2e/ -v
 
       - name: Collect cluster logs
         if: failure()
@@ -254,12 +216,12 @@ jobs:
             node_dir="/tmp/bm-logs/node-${idx}"
             idx=$((idx + 1))
             mkdir -p "$node_dir"
-            for step in single-node multi-node gpu-single-node gpu-multi-node; do
-              remote="${BM_REMOTE_BASE}/${step}/log"
-              local_step="${node_dir}/${step}"
-              mkdir -p "$local_step"
+            # Collect logs from any /tmp/spur-e2e-* dirs left by failed tests
+            ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+              "${BM_SSH_USER}@${node}" \
+              "find /tmp/spur-e2e-* -name '*.log' 2>/dev/null" | while read -r logfile; do
               scp -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
-                "${BM_SSH_USER}@${node}:${remote}/*.log" "$local_step/" 2>/dev/null || true
+                "${BM_SSH_USER}@${node}:${logfile}" "$node_dir/" 2>/dev/null || true
             done
           done
           echo "Collected logs:"
@@ -283,34 +245,28 @@ jobs:
           retention-days: 3
           if-no-files-found: ignore
 
-      - name: Cleanup remote processes
+      - name: Cleanup remote processes and dirs
         if: always()
         run: |
           IFS=',' read -ra NODES <<< "$BM_NODES"
           for node in "${NODES[@]}"; do
             ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
-              "${BM_SSH_USER}@${node}" \
-              "pkill -f spurctld 2>/dev/null; pkill -f spurd 2>/dev/null" || true
+              "${BM_SSH_USER}@${node}" "
+              pkill -f spurctld 2>/dev/null || true
+              pkill -f spurd 2>/dev/null || true
+              rm -rf /tmp/spur-e2e-* 2>/dev/null || true
+              rm -rf '${BM_REMOTE_BIN_DIR}' 2>/dev/null || true
+            " || true
           done
 
-      - name: Cleanup remote dirs
+      - name: Cleanup AppArmor profile
         if: always()
         run: |
           IFS=',' read -ra NODES <<< "$BM_NODES"
           for node in "${NODES[@]}"; do
             ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
-              "${BM_SSH_USER}@${node}" "rm -rf '${BM_REMOTE_BASE}'" || true
-          done
-
-      - name: Cleanup AppArmor profiles
-        if: always()
-        run: |
-          IFS=',' read -ra NODES <<< "$BM_NODES"
-          for node in "${NODES[@]}"; do
-            ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes "${BM_SSH_USER}@${node}" "
-              sudo aa-status 2>/dev/null | grep -o 'spur-ci-[^ ]*' | sort -u | while read -r prof; do
-                sudo apparmor_parser -R /dev/stdin 2>/dev/null <<< \"profile \$prof /dev/null {}\" || true
-              done
+              "${BM_SSH_USER}@${node}" "
+              sudo apparmor_parser -R /dev/stdin 2>/dev/null <<< 'profile spur-ci /dev/null {}' || true
             " || true
           done
 

@@ -36,8 +36,7 @@ pub mod harness;
 // K8s integration tests (require a live cluster, run with `-- --ignored`)
 pub mod k8s;
 
-// Native-host E2E tests (require SSH + nodes, run with `-- --ignored`)
-pub mod native_host;
+// Native-host E2E tests have been migrated to Python (tests/e2e/).
 
 // Unit / component tests (no running daemons needed)
 pub mod t01_run;

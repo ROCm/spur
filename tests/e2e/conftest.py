@@ -9,14 +9,11 @@ See docs/developer/building.rst for full environment variable reference.
 
 import os
 import time
-import logging
 from pathlib import Path
 
 import pytest
 
 from cluster import SshNode, SpurCluster, ensure_bins
-
-logger = logging.getLogger(__name__)
 
 
 def _repo_root() -> Path:

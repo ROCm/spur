@@ -93,8 +93,8 @@ scrub_file() {
     # Key-value secrets (password, token, secret, api_key).
     sed -i -E 's/(password|passwd|token|secret|api_key)=[^[:space:]"'\'']+/\1=[REDACTED]/gi' "$tmp"
 
-    # CI remote workdirs (correlate to GitHub run_id).
-    sed -i -E 's#/tmp/spur-bm-[0-9]+/[^[:space:]"'\'']*#[REDACTED-PATH]#g' "$tmp"
+    # CI remote workdirs.
+    sed -i -E 's#/tmp/spur-(bm|e2e|ci)-[^[:space:]"'\'']*#[REDACTED-PATH]#g' "$tmp"
 
     # User home prefix only — keep trailing path for debugging.
     sed -i -E 's#/home/[a-z][a-z0-9_-]*/#/home/[REDACTED-USER]/#g' "$tmp"
