@@ -40,7 +40,7 @@ Prerequisites
 ~~~~~~~~~~~~~
 
 - Python 3.11+ with ``pip install -r tests/e2e/requirements.txt``
-- Pre-provisioned nodes accessible via SSH (password or key)
+- Pre-provisioned nodes accessible via SSH (password, key, or ssh-agent)
 - Container tests require ``squashfs-tools`` on the runner and all nodes
 - GPU tests require GPU hardware (ROCm/CUDA) on the nodes, plus a Python venv with PyTorch (auto-provisioned if ``SPUR_TEST_GPU_VENV`` is unset)
 
@@ -60,10 +60,10 @@ Environment Variables
      - SSH username for all nodes.
      - ``vm``
    * - ``SPUR_TEST_SSH_PASSWORD`` *(optional)*
-     - SSH password. One of ``SPUR_TEST_SSH_PASSWORD`` or ``SPUR_TEST_SSH_KEY`` must be set.
+     - SSH password. If neither password nor key is set, ssh-agent is used.
      - ``vm``
    * - ``SPUR_TEST_SSH_KEY`` *(optional)*
-     - Path to SSH private key (alternative to password). One of ``SPUR_TEST_SSH_PASSWORD`` or ``SPUR_TEST_SSH_KEY`` must be set.
+     - Path to SSH private key. If neither password nor key is set, ssh-agent is used.
      - ``~/.ssh/id_ed25519``
    * - ``SPUR_TEST_BINARIES_DIR`` *(optional)*
      - Path to release binaries (local). Defaults to ``target/release``.

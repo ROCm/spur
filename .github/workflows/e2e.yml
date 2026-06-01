@@ -255,7 +255,6 @@ jobs:
               pkill -f spurctld 2>/dev/null || true
               pkill -f spurd 2>/dev/null || true
               rm -rf /tmp/spur-e2e-* 2>/dev/null || true
-              rm -rf '${BM_REMOTE_BIN_DIR}' 2>/dev/null || true
             " || true
           done
 

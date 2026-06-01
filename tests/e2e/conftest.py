@@ -24,14 +24,14 @@ def _get_nodes_config() -> list[str]:
     raw = os.environ.get("SPUR_TEST_NODES", "")
     nodes = [n.strip() for n in raw.split(",") if n.strip()]
     if not nodes:
-        pytest.exit("SPUR_TEST_NODES not set — cannot run E2E tests", returncode=0)
+        pytest.exit("SPUR_TEST_NODES not set — cannot run E2E tests", returncode=1)
     return nodes
 
 
 def _get_ssh_user() -> str:
     user = os.environ.get("SPUR_TEST_SSH_USER", "")
     if not user:
-        pytest.exit("SPUR_TEST_SSH_USER not set — cannot run E2E tests", returncode=0)
+        pytest.exit("SPUR_TEST_SSH_USER not set — cannot run E2E tests", returncode=1)
     return user
 
 
