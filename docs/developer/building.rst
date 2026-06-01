@@ -34,12 +34,18 @@ All tests are self-contained. No external services needed (no database, no netwo
 End-to-End Tests (Native-Host)
 ------------------------------
 
-The E2E suite deploys Spur to real nodes over SSH and runs integration tests against a live cluster. Build the release binaries first (``cargo build --release``), as the suite copies them to the remote nodes. You can also run it on a single machine by SSH-ing into itself — just ensure ``ssh localhost`` works without a password prompt and leave ``SPUR_TEST_BM_NODES`` at its default (``localhost``).
+The native-host E2E suite lives in ``tests/e2e/`` and uses pytest. It SSHes into pre-provisioned nodes, deploys Spur, runs tests, and tears down the cluster after each test. Build the release binaries first (``cargo build --release``).
+
+Prerequisites
+~~~~~~~~~~~~~
+
+- Python 3.11+ with ``pip install -r tests/e2e/requirements.txt``
+- Pre-provisioned nodes accessible via SSH (password or key)
+- Container tests require ``squashfs-tools`` on the runner and all nodes
+- GPU tests require GPU hardware (ROCm/CUDA) on the nodes, plus a Python venv with PyTorch (auto-provisioned if ``SPUR_TEST_GPU_VENV`` is unset)
 
 Environment Variables
 ~~~~~~~~~~~~~~~~~~~~~
-
-Export these so the test process can read them:
 
 .. list-table::
    :header-rows: 1
@@ -47,47 +53,49 @@ Export these so the test process can read them:
    * - Variable
      - Description
      - Example
-   * - ``SPUR_TEST_BM_NODES`` *(optional)*
-     - Comma-separated list of node hostnames or IPs. Defaults to ``localhost``.
+   * - ``SPUR_TEST_NODES`` *(required)*
+     - Comma-separated list of node IPs/hostnames. First node becomes the controller.
      - ``10.0.1.10,10.0.1.11,10.0.1.12``
-   * - ``SPUR_TEST_BM_SSH_USER`` *(optional)*
-     - SSH username. Defaults to current user (``$USER``).
+   * - ``SPUR_TEST_SSH_USER`` *(required)*
+     - SSH username for all nodes.
      - ``vm``
-   * - ``SPUR_TEST_BM_SSH_KEY`` *(optional)*
-     - Path to SSH private key. If unset, uses the default SSH agent or key.
+   * - ``SPUR_TEST_SSH_PASSWORD`` *(optional)*
+     - SSH password. One of ``SPUR_TEST_SSH_PASSWORD`` or ``SPUR_TEST_SSH_KEY`` must be set.
+     - ``vm``
+   * - ``SPUR_TEST_SSH_KEY`` *(optional)*
+     - Path to SSH private key (alternative to password). One of ``SPUR_TEST_SSH_PASSWORD`` or ``SPUR_TEST_SSH_KEY`` must be set.
      - ``~/.ssh/id_ed25519``
-   * - ``SPUR_TEST_BM_BINARIES_DIR`` *(optional)*
-     - Path to release binaries. Defaults to ``target/release``.
+   * - ``SPUR_TEST_BINARIES_DIR`` *(optional)*
+     - Path to release binaries (local). Defaults to ``target/release``.
      - ``./target/release``
-   * - ``SPUR_TEST_BM_DEPLOY_DIR`` *(optional)*
-     - Path to ``deploy/native-host/`` scripts. Auto-detected from the workspace if unset.
-     - ``./deploy/native-host``
-   * - ``SPUR_TEST_BM_REMOTE_DIR`` *(optional)*
-     - Remote working directory on nodes. Defaults to ``/tmp/spur-bm-{pid}-{timestamp}``.
-     - ``/tmp/spur-e2e``
-   * - ``SPUR_TEST_BM_GPU_VENV`` *(optional)*
-     - Path to a pre-existing Python venv with GPU test dependencies. If unset, the test harness auto-provisions a fresh venv with PyTorch on each node.
-     - ``/opt/spur-ci/gpu-venv``
+   * - ``SPUR_TEST_REMOTE_BIN_DIR`` *(optional)*
+     - Fixed remote path for binaries on nodes. If set, not cleaned up (useful for CI + AppArmor). If unset, an ephemeral temp path is used and cleaned up after the session.
+     - ``/tmp/spur-e2e-bin``
+   * - ``SPUR_TEST_CONTROLLER_PORT`` *(optional)*
+     - Port for spurctld. Defaults to ``6817``.
+     - ``6817``
+   * - ``SPUR_TEST_AGENT_PORT`` *(optional)*
+     - Port for spurd. Defaults to ``6818``.
+     - ``6818``
+   * - ``SPUR_TEST_GPU_VENV`` *(optional)*
+     - Path to a pre-existing Python venv (on nodes) with PyTorch. If unset, the GPU tests provision a fresh venv automatically.
+     - ``/opt/gpu-venv``
+   * - ``SPUR_TEST_TORCH_INDEX`` *(optional)*
+     - PyPI index URL for installing PyTorch (used when auto-provisioning the venv). Defaults to ``https://download.pytorch.org/whl/rocm6.3``.
+     - ``https://download.pytorch.org/whl/cu124``
 
 Node Setup
 ~~~~~~~~~~
 
-**Node packages** — Test nodes need ``python3`` (3.12+) and ``python3-venv`` for the GPU test suite's auto-provisioning. Ensure they are installed:
+**AppArmor (Ubuntu 24.04+)** — Container tests need unprivileged user namespaces, which AppArmor restricts by default. The recommended approach is to set ``SPUR_TEST_REMOTE_BIN_DIR`` to a fixed path and provision an AppArmor profile for ``spurd``:
 
 .. code-block:: bash
 
-   IFS=',' read -ra NODES <<< "$SPUR_TEST_BM_NODES"
-   for node in "${NODES[@]}"; do
-     ssh "${SPUR_TEST_BM_SSH_USER}@${node}" \
-       "sudo apt-get update -qq && sudo apt-get install -y -qq python3 python3-venv"
-   done
+   export SPUR_TEST_REMOTE_BIN_DIR=/tmp/spur-e2e-bin
 
-**AppArmor (Ubuntu 24.04+)** — AppArmor restricts unprivileged user namespaces by default. Since Spur uses namespaces for job isolation, ``spurd`` needs an AppArmor profile granting ``userns`` permission. The profile requires a predictable path to the binary — set ``SPUR_TEST_BM_REMOTE_DIR`` to a fixed path, then provision:
-
-.. code-block:: bash
-
-   IFS=',' read -ra NODES <<< "$SPUR_TEST_BM_NODES"
-   SPURD_PATH="${SPUR_TEST_BM_REMOTE_DIR}/bin/spurd"
+   # Provision AppArmor profile on each node:
+   IFS=',' read -ra NODES <<< "$SPUR_TEST_NODES"
+   SPURD_PATH="${SPUR_TEST_REMOTE_BIN_DIR}/spurd"
 
    PROFILE="abi <abi/4.0>,
    profile spur-e2e ${SPURD_PATH} flags=(unconfined) {
@@ -95,38 +103,34 @@ Node Setup
    }"
 
    for node in "${NODES[@]}"; do
-     ssh "${SPUR_TEST_BM_SSH_USER}@${node}" \
+     ssh "${SPUR_TEST_SSH_USER:-vm}@${node}" \
        "echo '${PROFILE}' | sudo apparmor_parser -r"
    done
 
-Alternatively, disable the restriction system-wide (less secure, not recommended for production):
+In CI, set ``SPUR_TEST_REMOTE_BIN_DIR`` to a fixed path and provision the profile once during node setup. The directory is not cleaned up when this variable is set, so binaries persist between runs.
+
+If you do **not** set ``SPUR_TEST_REMOTE_BIN_DIR``, binaries go into an ephemeral temp path (cleaned up after each pytest session). Since the path is unpredictable, you cannot provision an AppArmor profile for it. In that case, disable the restriction on test nodes instead:
 
 .. code-block:: bash
 
+   # On each node (persists across reboots):
    sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+   echo kernel.apparmor_restrict_unprivileged_userns=0 | sudo tee /etc/sysctl.d/99-spur-userns.conf
 
 Running the Tests
 ~~~~~~~~~~~~~~~~~
 
-The single-node and multi-node suites do not require GPU nodes:
-
 .. code-block:: bash
 
-   # Single-node tests
-   cargo test -p spur-tests --lib native_host::single_node -- --ignored --test-threads=1
+   export SPUR_TEST_NODES=10.0.1.10,10.0.1.11,10.0.1.12
 
-   # Multi-node tests
-   cargo test -p spur-tests --lib native_host::multi_node -- --ignored --test-threads=1
+   # Run the full suite
+   pytest tests/e2e/ -v
 
-For GPU testing there is a separate suite with its own single-node and multi-node variants — these require nodes with actual GPUs:
+   # Run a specific test
+   pytest tests/e2e/test_single_node.py::TestJobLifecycle::test_job_cancel -v
 
-.. code-block:: bash
-
-   # Single-node GPU tests
-   cargo test -p spur-tests --lib native_host::gpu::single_node -- --ignored --test-threads=1
-
-   # Multi-node GPU tests
-   cargo test -p spur-tests --lib native_host::gpu::multi_node -- --ignored --test-threads=1
+Tests that require more nodes than provided, or missing GPU/container prerequisites, are automatically skipped.
 
 End-to-End Tests (Kubernetes)
 -----------------------------
