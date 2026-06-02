@@ -17,6 +17,7 @@ from pathlib import Path
 
 import paramiko
 import pytest
+import tomli_w
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,25 @@ CLI_SYMLINKS = ["sbatch", "srun", "squeue", "scancel", "sinfo", "scontrol"]
 
 CONTROLLER_PORT = int(os.environ.get("SPUR_TEST_CONTROLLER_PORT", "6817"))
 AGENT_PORT = int(os.environ.get("SPUR_TEST_AGENT_PORT", "6818"))
+
+
+def make_remote_dir() -> str:
+    """Generate a unique remote working directory path."""
+    return f"/tmp/spur-e2e-{os.getpid()}-{time.time_ns()}"
+
+
+def deep_merge(base: dict, overrides: dict) -> dict:
+    """Deep-merge *overrides* into *base* (mutates and returns *base*).
+
+    - Dicts are merged recursively.
+    - Everything else (scalars, lists) is replaced outright.
+    """
+    for key, value in overrides.items():
+        if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+            deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
 
 
 class SshNode:
@@ -79,10 +99,12 @@ class SshNode:
         """Upload a local file to the remote node."""
         self.sftp.put(local_path, remote_path)
 
-    def write_file(self, remote_path: str, content: str):
-        """Write string content to a remote file."""
+    def write_file(self, remote_path: str, content: str, mode: int | None = None):
+        """Write string content to a remote file, optionally setting permissions."""
         with self.sftp.open(remote_path, "w") as f:
             f.write(content)
+        if mode is not None:
+            self.sftp.chmod(remote_path, mode)
 
     def read_file(self, remote_path: str) -> str:
         """Read a remote file. Returns empty string if file doesn't exist."""
@@ -156,14 +178,35 @@ class SpurCluster:
         self.state_dir = f"{remote_dir}/state"
         self.log_dir = f"{remote_dir}/log"
         self.controller_addr = f"http://{nodes[0].host}:{CONTROLLER_PORT}"
+        self.config_overrides: dict = {}
 
-    def deploy(self):
-        """Start cluster processes, write config, wait for ready."""
-        for node in self.nodes:
-            node.kill_processes("spurctld")
-            node.kill_processes("spurd")
+    # --- Lifecycle ---
+
+    def provision(self):
+        """Create remote dirs and resolve hostnames.
+
+        After this call the cluster infrastructure is ready (dirs exist,
+        hostnames known) but no daemons are running.  Call :meth:`start`
+        to bring up the cluster with a specific configuration.
+        """
         self._create_dirs()
         self._resolve_hostnames()
+        logger.info("Cluster provisioned: %s", self.node_names)
+
+    def start(self, config_overrides: dict | None = None, kill_stale: bool = True):
+        """Write config and start all daemons.
+
+        *config_overrides* is deep-merged into the default config.
+        Requires :meth:`provision` to have been called first.
+
+        When *kill_stale* is True (default), any lingering spurctld/spurd
+        processes on the nodes are killed before starting fresh.
+        """
+        if not self.node_names:
+            raise RuntimeError("provision() must be called before start()")
+        if kill_stale:
+            self.stop()
+        self.config_overrides = config_overrides or {}
         self._write_config()
         self._start_controller()
         time.sleep(2)
@@ -171,11 +214,21 @@ class SpurCluster:
         self._wait_all_idle(timeout=120)
         logger.info("Cluster ready: %s", self.node_names)
 
-    def teardown(self):
-        """Kill all spur processes and remove the working directory."""
+    def stop(self):
+        """Kill all daemons but keep the working directory intact."""
         for node in self.nodes:
             node.kill_processes("spurctld")
             node.kill_processes("spurd")
+
+    def deploy(self, config_overrides: dict | None = None):
+        """Provision + start in one call."""
+        self.provision()
+        self.start(config_overrides)
+
+    def teardown(self):
+        """Kill all daemons and remove the working directory."""
+        self.stop()
+        for node in self.nodes:
             node.exec_allow_fail(f"rm -rf '{self.remote_dir}'")
         logger.info("Cluster torn down")
 
@@ -206,11 +259,21 @@ class SpurCluster:
     def scontrol(self, *args: str) -> str:
         return self.cli(["scontrol"] + list(args))
 
-    def write_script(self, name: str, body: str) -> str:
-        """Write an executable script on the controller. Returns remote path."""
+    def write_file(self, name: str, body: str, *,
+                   all_nodes: bool = False, executable: bool = True) -> str:
+        """Write a file under remote_dir. Returns the absolute remote path.
+
+        By default the file is written to the controller node only and
+        made executable.  Set *all_nodes=True* to write on every node,
+        and *executable=False* for non-script files.
+        """
         path = f"{self.remote_dir}/{name}"
-        self.nodes[0].write_file(path, body)
-        self.nodes[0].exec(f"chmod +x '{path}'")
+        mode = 0o755 if executable else None
+        targets = self.nodes if all_nodes else self.nodes[:1]
+        parent = path.rsplit("/", 1)[0]
+        for node in targets:
+            node.exec(f"mkdir -p '{parent}'")
+            node.write_file(path, body, mode=mode)
         return path
 
     def read_output_on_any_node(self, path: str) -> str:
@@ -369,25 +432,36 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
                 name = node.host
             self.node_names.append(name)
 
-    def _write_config(self):
+    def _default_config(self) -> dict:
         nodes_list = ",".join(self.node_names)
-        nodes_toml = ""
-        for name in self.node_names:
-            nodes_toml += f'\n[[nodes]]\nnames = "{name}"\ncpus = 64\nmemory_mb = 262144\n'
+        return {
+            "cluster_name": "e2e-test",
+            "scheduler": {"interval_secs": 1, "plugin": "backfill"},
+            "auth": {"plugin": "none"},
+            "network": {"wg_enabled": False, "agent_port": AGENT_PORT},
+            "partitions": [
+                {
+                    "name": "default",
+                    "state": "UP",
+                    "default": True,
+                    "nodes": nodes_list,
+                    "max_time": "24:00:00",
+                    "default_time": "10:00",
+                }
+            ],
+            "nodes": [
+                {"names": name, "cpus": 64, "memory_mb": 262144}
+                for name in self.node_names
+            ],
+        }
 
-        config = (
-            f'cluster_name = "e2e-test"\n\n'
-            f"[scheduler]\n"
-            f'interval_secs = 1\nplugin = "backfill"\n\n'
-            f"[auth]\n"
-            f'plugin = "none"\n\n'
-            f"[[partitions]]\n"
-            f'name = "default"\nstate = "UP"\ndefault = true\n'
-            f'nodes = "{nodes_list}"\nmax_time = "24:00:00"\ndefault_time = "10:00"\n\n'
-            f"[network]\nwg_enabled = false\nagent_port = {AGENT_PORT}\n"
-            f"{nodes_toml}"
-        )
-        self.nodes[0].write_file(f"{self.etc_dir}/spur.conf", config)
+    def _write_config(self):
+        cfg = self._default_config()
+        deep_merge(cfg, self.config_overrides)
+        config = tomli_w.dumps(cfg)
+
+        for node in self.nodes:
+            node.write_file(f"{self.etc_dir}/spur.conf", config)
 
     def _start_controller(self):
         listen = f"[::]:{CONTROLLER_PORT}"
@@ -407,6 +481,7 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
             agent_listen = f"0.0.0.0:{AGENT_PORT}"
             cmd = (
                 f"nohup '{self.bin_dir}/spurd' "
+                f"-f '{self.etc_dir}/spur.conf' "
                 f"--controller '{self.controller_addr}' "
                 f"--listen '{agent_listen}' "
                 f"--hostname '{hostname}' --address '{address}' --log-level info -D "

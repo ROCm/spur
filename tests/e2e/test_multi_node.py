@@ -16,7 +16,7 @@ class TestMultiNodeDispatch:
     def test_two_node_job_completes(self, multi_node_cluster):
         cluster = multi_node_cluster
         out_path = f"{cluster.remote_dir}/two-node.out"
-        script = cluster.write_script(
+        script = cluster.write_file(
             "two-node.sh",
             "#!/bin/bash\n"
             'echo "node=$(hostname)"\n'
@@ -43,7 +43,7 @@ class TestMultiNodeDispatch:
     def test_distributed_env_vars(self, multi_node_cluster):
         cluster = multi_node_cluster
         out_path = f"{cluster.remote_dir}/dist-env.out"
-        script = cluster.write_script(
+        script = cluster.write_file(
             "dist-env.sh",
             "#!/bin/bash\n"
             'echo "RANK=${RANK}"\n'
@@ -76,7 +76,7 @@ class TestMultiNodeScheduling:
         cluster = multi_node_cluster
         target = cluster.node_names[0]
         out_path = f"{cluster.remote_dir}/nodelist-{target}.out"
-        script = cluster.write_script(
+        script = cluster.write_file(
             "nodename.sh",
             '#!/bin/bash\necho "RAN_ON=${SPUR_TARGET_NODE:-$(hostname)}"\n',
         )
@@ -92,7 +92,7 @@ class TestMultiNodeScheduling:
         cluster = multi_node_cluster
         target = cluster.node_names[1]
         out_path = f"{cluster.remote_dir}/nodelist-{target}.out"
-        script = cluster.write_script(
+        script = cluster.write_file(
             "nodename2.sh",
             '#!/bin/bash\necho "RAN_ON=${SPUR_TARGET_NODE:-$(hostname)}"\n',
         )
@@ -108,7 +108,7 @@ class TestMultiNodeScheduling:
         cluster = multi_node_cluster
         excluded = cluster.node_names[0]
         out_path = f"{cluster.remote_dir}/exclude.out"
-        script = cluster.write_script(
+        script = cluster.write_file(
             "nodename-ex.sh",
             '#!/bin/bash\necho "RAN_ON=${SPUR_TARGET_NODE:-$(hostname)}"\n',
         )
@@ -130,7 +130,7 @@ class TestMultiNodeScheduling:
         cluster = multi_node_cluster
         out1 = f"{cluster.remote_dir}/con1.out"
         out2 = f"{cluster.remote_dir}/con2.out"
-        script = cluster.write_script(
+        script = cluster.write_file(
             "concurrent.sh",
             "#!/bin/bash\necho CONCURRENT_START\nsleep 5\necho CONCURRENT_DONE\n",
         )

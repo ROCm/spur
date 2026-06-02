@@ -41,7 +41,7 @@ class TestContainerSingleNode:
     def test_container_launch_and_exit(self, container_cluster):
         cluster = container_cluster
         img = cluster.container_image
-        script = cluster.write_script(
+        script = cluster.write_file(
             "c1.sh",
             "#!/bin/bash\nhostname >/dev/null || exit 1\nid >/dev/null || exit 1\n",
         )
@@ -56,7 +56,7 @@ class TestContainerSingleNode:
     def test_container_exit_code_propagation(self, container_cluster):
         cluster = container_cluster
         img = cluster.container_image
-        script = cluster.write_script("c2.sh", "#!/bin/bash\nexit 42\n")
+        script = cluster.write_file("c2.sh", "#!/bin/bash\nexit 42\n")
 
         sb = cluster.sbatch(["-J", "c2-exit", "-N", "1", f"--container-image={img}", script])
         job_id = parse_job_id(sb)
@@ -68,7 +68,7 @@ class TestContainerSingleNode:
     def test_container_cancel(self, container_cluster):
         cluster = container_cluster
         img = cluster.container_image
-        script = cluster.write_script("c3.sh", "#!/bin/bash\nsleep 3600\n")
+        script = cluster.write_file("c3.sh", "#!/bin/bash\nsleep 3600\n")
 
         sb = cluster.sbatch(["-J", "c3-cancel", "-N", "1", f"--container-image={img}", script])
         job_id = parse_job_id(sb)
@@ -93,7 +93,7 @@ class TestContainerSingleNode:
         cluster = container_cluster
         img = cluster.container_image
         out_path = f"{cluster.remote_dir}/c4.out"
-        script = cluster.write_script(
+        script = cluster.write_file(
             "c4.sh",
             "#!/bin/bash\n"
             "grep -q '127.0.0.53' /etc/resolv.conf && exit 1\n"
@@ -117,7 +117,7 @@ class TestContainerSingleNode:
     def test_container_dev_shm(self, container_cluster):
         cluster = container_cluster
         img = cluster.container_image
-        script = cluster.write_script(
+        script = cluster.write_file(
             "c5.sh",
             "#!/bin/bash\n"
             "echo shm_test > /dev/shm/spur_ctest || exit 1\n"
@@ -137,7 +137,7 @@ class TestContainerSingleNode:
     def test_container_pid_namespace(self, container_cluster):
         cluster = container_cluster
         img = cluster.container_image
-        script = cluster.write_script(
+        script = cluster.write_file(
             "c6.sh",
             '#!/bin/bash\n[ "$$" = "1" ] || exit 1\n[ -r /proc/self/status ] || exit 2\n',
         )
@@ -154,7 +154,7 @@ class TestContainerSingleNode:
     def test_container_env_vars(self, container_cluster):
         cluster = container_cluster
         img = cluster.container_image
-        script = cluster.write_script(
+        script = cluster.write_file(
             "c7.sh",
             '#!/bin/bash\n[ -n "$SPUR_JOB_ID" ] || exit 1\n[ -n "$OMP_NUM_THREADS" ] || exit 2\n',
         )
@@ -177,7 +177,7 @@ class TestContainerSingleNode:
         for node in cluster.nodes:
             node.exec(f"mkdir -p '{bind_dir}' && echo bind_mount_ci_test > '{bind_dir}/data.txt'")
 
-        script = cluster.write_script(
+        script = cluster.write_file(
             "c8.sh",
             "#!/bin/bash\n"
             '[ "$(cat /mnt/data/data.txt 2>/dev/null)" = "bind_mount_ci_test" ] || exit 1\n'
@@ -207,7 +207,7 @@ class TestContainerMultiNode:
         cluster = multi_container_cluster
         img = cluster.container_image
         out_path = f"{cluster.remote_dir}/ct-2n.out"
-        script = cluster.write_script(
+        script = cluster.write_file(
             "ct-2n.sh",
             "#!/bin/bash\n"
             'echo "CONTAINER_NODE=$(hostname)"\n'
@@ -234,7 +234,7 @@ class TestContainerMultiNode:
         cluster = multi_container_cluster
         img = cluster.container_image
         out_path = f"{cluster.remote_dir}/ct-2n-env.out"
-        script = cluster.write_script(
+        script = cluster.write_file(
             "ct-2n-env.sh",
             "#!/bin/bash\n"
             'echo "RANK=${RANK}"\n'
@@ -265,7 +265,7 @@ class TestContainerMultiNode:
         cluster = multi_container_cluster
         img = cluster.container_image
         out_path = f"{cluster.remote_dir}/ct-2n-dns.out"
-        script = cluster.write_script(
+        script = cluster.write_file(
             "ct-2n-dns.sh",
             "#!/bin/bash\n"
             "getent hosts google.com >/dev/null 2>&1 || exit 1\n"

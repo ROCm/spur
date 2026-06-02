@@ -64,7 +64,7 @@ class TestGpuSingleNode:
                 )
 
         gpu_bin = f"{cluster.remote_dir}/gpu_test"
-        script = cluster.write_script("gpu-1n.sh", f"#!/bin/bash\n'{gpu_bin}'\n")
+        script = cluster.write_file("gpu-1n.sh", f"#!/bin/bash\n'{gpu_bin}'\n")
         out_path = f"{cluster.remote_dir}/hip-1n.out"
 
         sb = cluster.sbatch(["-J", "hip-1n", "-N", "1", "-o", out_path, script])
@@ -97,7 +97,7 @@ class TestGpuMultiNode:
                 )
 
         gpu_bin = f"{cluster.remote_dir}/gpu_test"
-        script = cluster.write_script("gpu-2n.sh", f"#!/bin/bash\n'{gpu_bin}'\n")
+        script = cluster.write_file("gpu-2n.sh", f"#!/bin/bash\n'{gpu_bin}'\n")
         out_path = f"{cluster.remote_dir}/hip-2n.out"
 
         sb = cluster.sbatch(["-J", "hip-2n", "-N", "2", "-o", out_path, script])
@@ -125,7 +125,7 @@ class TestGpuMultiNode:
             cluster.ship_file_to_all(src, "distributed_test.py")
 
         # Generate a wrapper that activates the venv and runs the script
-        job_sh = cluster.write_script(
+        job_sh = cluster.write_file(
             "distributed_job.sh",
             f"#!/bin/bash\nsource '{venv_path}/bin/activate'\n"
             f"exec python3 '{rd}/distributed_test.py'\n",
@@ -160,7 +160,7 @@ class TestGpuMultiNode:
             cluster.ship_file_to_all(src, "inference_test.py")
 
         # Generate a wrapper that activates the venv and runs the script
-        job_sh = cluster.write_script(
+        job_sh = cluster.write_file(
             "inference_job.sh",
             f"#!/bin/bash\nsource '{venv_path}/bin/activate'\n"
             f"exec python3 '{rd}/inference_test.py'\n",

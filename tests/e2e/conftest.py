@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from cluster import SshNode, SpurCluster, ensure_bins
+from cluster import SshNode, SpurCluster, ensure_bins, make_remote_dir
 
 
 def _repo_root() -> Path:
@@ -107,30 +107,50 @@ def _ensure_bins(ssh_nodes, remote_bin_dir):
     ensure_bins(ssh_nodes, _get_binaries_dir(), remote_bin_dir)
 
 
-def _make_remote_dir() -> str:
-    """Generate a unique remote working directory path per test."""
-    return f"/tmp/spur-e2e-{os.getpid()}-{int(time.time() * 1000)}"
-
-
 def _deploy_cluster(ssh_nodes, remote_bin_dir):
     """Helper: create, deploy, and return a SpurCluster. Tears down on deploy failure."""
-    remote_dir = _make_remote_dir()
-    spur_cluster = SpurCluster(ssh_nodes, remote_dir, remote_bin_dir)
+    c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     try:
-        spur_cluster.deploy()
+        c.deploy()
     except Exception:
-        spur_cluster.teardown()
+        c.teardown()
         raise
-    return spur_cluster
+    return c
+
+
+def _provision_cluster(ssh_nodes, remote_bin_dir):
+    """Helper: create and provision (but do not start) a SpurCluster."""
+    c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
+    try:
+        c.provision()
+    except Exception:
+        c.teardown()
+        raise
+    return c
 
 
 @pytest.fixture
 def cluster(ssh_nodes, remote_bin_dir):
     """
-    Per-test fixture: starts a fresh Spur cluster in a unique remote dir,
-    yields it, then kills processes and removes the dir.
+    Per-test fixture: a fully running Spur cluster with default config.
+    Torn down (processes killed, dirs removed) after the test.
     """
     spur_cluster = _deploy_cluster(ssh_nodes, remote_bin_dir)
+    yield spur_cluster
+    spur_cluster.teardown()
+
+
+@pytest.fixture
+def unstarted_cluster(ssh_nodes, remote_bin_dir):
+    """
+    Per-test fixture: a provisioned cluster (dirs created, hostnames
+    resolved) but **not started**.
+
+    The test should write any scripts or files it needs, then call
+    ``cluster.start(config_overrides)`` to bring up the daemons with
+    the desired configuration.
+    """
+    spur_cluster = _provision_cluster(ssh_nodes, remote_bin_dir)
     yield spur_cluster
     spur_cluster.teardown()
 

@@ -25,7 +25,7 @@ class TestClusterHealth:
 class TestJobBasics:
     def test_single_node_job_completes_with_output(self, cluster):
         out_path = f"{cluster.remote_dir}/basic.out"
-        script = cluster.write_script(
+        script = cluster.write_file(
             "test-basic.sh",
             '#!/bin/bash\necho "hostname=$(hostname)"\n'
             'echo "SPUR_JOB_ID=${SPUR_JOB_ID}"\necho SUCCESS\n',
@@ -43,7 +43,7 @@ class TestJobBasics:
 
     def test_failed_job_state(self, cluster):
         out_path = f"{cluster.remote_dir}/fail.out"
-        script = cluster.write_script(
+        script = cluster.write_file(
             "test-fail.sh",
             "#!/bin/bash\necho before-failure\nexit 42\n",
         )
@@ -60,7 +60,7 @@ class TestJobBasics:
     def test_custom_output_and_error_paths(self, cluster):
         out_path = f"{cluster.remote_dir}/custom-out.txt"
         err_path = f"{cluster.remote_dir}/custom-err.txt"
-        script = cluster.write_script(
+        script = cluster.write_file(
             "test-io.sh",
             "#!/bin/bash\necho stdout-line\necho stderr-line >&2\necho CUSTOM_IO_OK\n",
         )
@@ -75,7 +75,7 @@ class TestJobBasics:
         assert "stderr-line" in stderr
 
     def test_percent_j_output_substitution(self, cluster):
-        script = cluster.write_script("test-j.sh", "#!/bin/bash\necho J_OK\n")
+        script = cluster.write_file("test-j.sh", "#!/bin/bash\necho J_OK\n")
         pattern = f"{cluster.remote_dir}/spur-subst-%j.out"
         sb = cluster.sbatch(["-J", "test-subst", "-N", "1", "-o", pattern, script])
         job_id = parse_job_id(sb)
@@ -89,7 +89,7 @@ class TestJobBasics:
 
 class TestJobLifecycle:
     def test_job_cancel(self, cluster):
-        script = cluster.write_script("test-long.sh", "#!/bin/bash\nsleep 300\n")
+        script = cluster.write_file("test-long.sh", "#!/bin/bash\nsleep 300\n")
         sb = cluster.sbatch(["-J", "test-cancel", "-N", "1", script])
         job_id = parse_job_id(sb)
         assert job_id is not None
@@ -103,7 +103,7 @@ class TestJobLifecycle:
         assert state in ("CA", "F", None), f"expected cancelled, got {state}"
 
     def test_job_cancel_releases_resources(self, cluster):
-        script = cluster.write_script(
+        script = cluster.write_file(
             "test-cancel-res.sh",
             "#!/bin/bash\ntrap '' TERM\nsleep 300\n",
         )
@@ -124,7 +124,7 @@ class TestJobLifecycle:
 
     def test_job_hold_and_release(self, cluster):
         out_path = f"{cluster.remote_dir}/hold.out"
-        script = cluster.write_script("test-hold.sh", "#!/bin/bash\necho HOLD_OK\n")
+        script = cluster.write_file("test-hold.sh", "#!/bin/bash\necho HOLD_OK\n")
         sb = cluster.sbatch(["-J", "test-hold", "-N", "1", "-H", "-o", out_path, script])
         job_id = parse_job_id(sb)
         assert job_id is not None
@@ -141,11 +141,11 @@ class TestJobLifecycle:
 
     def test_job_dependency_afterok(self, cluster):
         out_b = f"{cluster.remote_dir}/dep-b.out"
-        script_a = cluster.write_script(
+        script_a = cluster.write_file(
             "dep-a.sh",
             "#!/bin/bash\necho DEP_A_START\nsleep 6\necho DEP_A_DONE\n",
         )
-        script_b = cluster.write_script("dep-b.sh", "#!/bin/bash\necho DEP_B_RAN\n")
+        script_b = cluster.write_file("dep-b.sh", "#!/bin/bash\necho DEP_B_RAN\n")
 
         sb_a = cluster.sbatch(["-J", "dep-a", "-N", "1", script_a])
         job_a = parse_job_id(sb_a)
@@ -172,7 +172,7 @@ class TestJobLifecycle:
 
     def test_time_limit_enforced(self, cluster):
         out_path = f"{cluster.remote_dir}/walltime.out"
-        script = cluster.write_script(
+        script = cluster.write_file(
             "walltime.sh",
             "#!/bin/bash\necho WALLTIME_STARTED\nsleep 300\necho WALLTIME_SHOULD_NOT_REACH\n",
         )
@@ -189,7 +189,7 @@ class TestJobLifecycle:
 
     def test_env_passthrough_export(self, cluster):
         out_path = f"{cluster.remote_dir}/env.out"
-        script = cluster.write_script(
+        script = cluster.write_file(
             "test-env.sh",
             '#!/bin/bash\necho "MYVAR=${MYVAR}"\necho "MULTIVAR=${MULTIVAR}"\necho ENV_OK\n',
         )
