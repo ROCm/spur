@@ -83,7 +83,7 @@ Config:
 enabled = true
 kubeconfig = "/etc/spur/kubeconfig"
 namespace = "spur-jobs"
-node_selector = { "spur.amd.com/managed": "true" }
+node_label_selector = "spur.amd.com/managed=true"
 ```
 
 ### 11.4 GPU Topology Scheduling (L)
