@@ -75,7 +75,7 @@ impl SuiteContext {
 
         let crds: Api<k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition> =
             Api::all(self.client.clone());
-        let _ = crds.delete("spurjobs.spur.ai", &dp).await;
+        let _ = crds.delete("spurjobs.spur.amd.com", &dp).await;
 
         let ns_api: Api<Namespace> = Api::all(self.client.clone());
         let _ = ns_api.delete(&self.namespace, &dp).await;
@@ -112,7 +112,7 @@ impl SuiteContext {
         let crds: Api<k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition> =
             Api::all(self.client.clone());
         crds.patch(
-            "spurjobs.spur.ai",
+            "spurjobs.spur.amd.com",
             &PatchParams::apply(APPLY_MANAGER).force(),
             &Patch::Apply(crd),
         )

@@ -129,7 +129,7 @@ mod tests {
             || {
                 let pods = pods.clone();
                 async move {
-                    pods.list(&ListParams::default().labels("spur.ai/job-name=it-cancel"))
+                    pods.list(&ListParams::default().labels("spur.amd.com/job-name=it-cancel"))
                         .await
                         .map(|list| list.items.is_empty())
                         .unwrap_or(false)

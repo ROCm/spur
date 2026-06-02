@@ -7,11 +7,11 @@ use serde::{Deserialize, Serialize};
 
 /// SpurJob CRD spec — Kubernetes-native way to submit GPU jobs to Spur.
 ///
-/// apiVersion: spur.ai/v1alpha1
+/// apiVersion: spur.amd.com/v1alpha1
 /// kind: SpurJob
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[kube(
-    group = "spur.ai",
+    group = "spur.amd.com",
     version = "v1alpha1",
     kind = "SpurJob",
     namespaced,
@@ -586,10 +586,10 @@ mod tests {
     #[test]
     fn test_toleration_spec_serde_default_operator() {
         // When deserialized from JSON without an "operator" field, it should default to "Equal"
-        let json = r#"{"key": "spur.ai/gpu-node"}"#;
+        let json = r#"{"key": "spur.amd.com/gpu-node"}"#;
         let t: TolerationSpec = serde_json::from_str(json).unwrap();
         assert_eq!(t.operator, "Equal");
-        assert_eq!(t.key.as_deref(), Some("spur.ai/gpu-node"));
+        assert_eq!(t.key.as_deref(), Some("spur.amd.com/gpu-node"));
     }
 
     // --- SpurJobStatus ---
@@ -611,7 +611,7 @@ mod tests {
         use kube::CustomResourceExt;
         let crd = SpurJob::crd();
         let json = serde_json::to_string(&crd).unwrap();
-        assert!(json.contains("spur.ai"));
+        assert!(json.contains("spur.amd.com"));
         assert!(json.contains("SpurJob"));
         assert!(json.contains("v1alpha1"));
     }
@@ -645,7 +645,7 @@ mod tests {
             extra_resources: std::collections::HashMap::new(),
             secret_env: std::collections::HashMap::new(),
             tolerations: vec![TolerationSpec {
-                key: Some("spur.ai/gpu-node".into()),
+                key: Some("spur.amd.com/gpu-node".into()),
                 operator: "Exists".into(),
                 value: None,
                 effect: Some("NoSchedule".into()),
@@ -668,7 +668,7 @@ mod tests {
         assert_eq!(parsed.tolerations.len(), 1);
         assert_eq!(
             parsed.tolerations[0].key.as_deref(),
-            Some("spur.ai/gpu-node")
+            Some("spur.amd.com/gpu-node")
         );
         assert_eq!(parsed.tolerations[0].operator, "Exists");
         assert_eq!(parsed.node_selector.get("zone").unwrap(), "us-east");
@@ -715,7 +715,7 @@ mod tests {
             extra_resources: std::collections::HashMap::new(),
             secret_env: std::collections::HashMap::new(),
             tolerations: vec![TolerationSpec {
-                key: Some("spur.ai/gpu-node".into()),
+                key: Some("spur.amd.com/gpu-node".into()),
                 operator: "Exists".into(),
                 value: None,
                 effect: Some("NoSchedule".into()),

@@ -33,11 +33,11 @@ impl VirtualAgent {
         Self { client }
     }
 
-    /// Look up the namespace of the SpurJob labeled `spur.ai/job-id=<id>`.
+    /// Look up the namespace of the SpurJob labeled `spur.amd.com/job-id=<id>`.
     /// Fails loudly if not found so pods are never placed in the wrong namespace.
     async fn resolve_namespace(&self, job_id: u32) -> Result<String, Status> {
         let api: Api<SpurJob> = Api::all(self.client.clone());
-        let lp = ListParams::default().labels(&format!("spur.ai/job-id={}", job_id));
+        let lp = ListParams::default().labels(&format!("spur.amd.com/job-id={}", job_id));
 
         let result = tokio::time::timeout(
             NS_LOOKUP_BUDGET,
@@ -52,7 +52,9 @@ impl VirtualAgent {
                     .next()
                     .and_then(|j| j.metadata.namespace)
                     .ok_or_else(|| {
-                        Status::not_found(format!("spur.ai/job-id={job_id} label not yet visible"))
+                        Status::not_found(format!(
+                            "spur.amd.com/job-id={job_id} label not yet visible"
+                        ))
                     })
             })
             .retry(
@@ -71,7 +73,7 @@ impl VirtualAgent {
             Ok(Ok(ns)) => Ok(ns),
             Ok(Err(status)) => Err(status),
             Err(_elapsed) => Err(Status::deadline_exceeded(format!(
-                "namespace lookup for spur.ai/job-id={job_id} timed out after {}s",
+                "namespace lookup for spur.amd.com/job-id={job_id} timed out after {}s",
                 NS_LOOKUP_BUDGET.as_secs()
             ))),
         }
@@ -248,7 +250,8 @@ impl SlurmAgent for VirtualAgent {
         // secret values out of the SpurJob spec and Raft log.
         {
             let api: kube::Api<crate::crd::SpurJob> = kube::Api::all(self.client.clone());
-            let lp = kube::api::ListParams::default().labels(&format!("spur.ai/job-id={}", job_id));
+            let lp =
+                kube::api::ListParams::default().labels(&format!("spur.amd.com/job-id={}", job_id));
             if let Ok(list) = api.list(&lp).await {
                 if let Some(spurjob) = list.items.into_iter().next() {
                     for (env_name, secret_ref) in &spurjob.spec.secret_env {
@@ -342,16 +345,16 @@ impl SlurmAgent for VirtualAgent {
 
         // Build labels
         let mut labels = BTreeMap::new();
-        labels.insert("spur.ai/job-id".to_string(), job_id.to_string());
+        labels.insert("spur.amd.com/job-id".to_string(), job_id.to_string());
         labels.insert(
-            "spur.ai/managed-by".to_string(),
+            "spur.amd.com/managed-by".to_string(),
             "spur-k8s-operator".to_string(),
         );
         if !spec.name.is_empty() {
-            labels.insert("spur.ai/job-name".to_string(), spec.name.clone());
+            labels.insert("spur.amd.com/job-name".to_string(), spec.name.clone());
         }
         if !target_node.is_empty() {
-            labels.insert("spur.ai/target-node".to_string(), target_node.clone());
+            labels.insert("spur.amd.com/target-node".to_string(), target_node.clone());
         }
 
         // For multi-node jobs, create headless Service for DNS discovery
@@ -455,7 +458,7 @@ impl SlurmAgent for VirtualAgent {
 
         // Delete all pods for this job by label selector
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), &ns);
-        let lp = ListParams::default().labels(&format!("spur.ai/job-id={}", job_id));
+        let lp = ListParams::default().labels(&format!("spur.amd.com/job-id={}", job_id));
 
         match pods.list(&lp).await {
             Ok(pod_list) => {
@@ -662,7 +665,7 @@ impl VirtualAgent {
         let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
         let svc_name = format!("spur-job-{}", job_id);
 
-        let selector = BTreeMap::from([("spur.ai/job-id".to_string(), job_id.to_string())]);
+        let selector = BTreeMap::from([("spur.amd.com/job-id".to_string(), job_id.to_string())]);
 
         let svc = Service {
             metadata: ObjectMeta {

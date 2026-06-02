@@ -13,9 +13,9 @@ spec:
         app: spurd
     spec:
       nodeSelector:
-        spur.ai/compute: "true"
+        spur.amd.com/compute: "true"
       tolerations:
-        - key: spur.ai/gpu-node
+        - key: spur.amd.com/gpu-node
           operator: Exists
           effect: NoSchedule
       hostPID: true

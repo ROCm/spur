@@ -88,7 +88,7 @@ Jobs are submitted as ``SpurJob`` custom resources:
 
 .. code-block:: yaml
 
-   apiVersion: spur.ai/v1alpha1
+   apiVersion: spur.amd.com/v1alpha1
    kind: SpurJob
    metadata:
      name: training-run

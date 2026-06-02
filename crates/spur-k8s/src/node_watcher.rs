@@ -240,7 +240,7 @@ fn extract_resources(node: &K8sNode) -> ResourceSet {
 
     // Use explicit label if set, otherwise default based on detected vendor
     let gpu_type = labels
-        .and_then(|l| l.get("spur.ai/gpu-type"))
+        .and_then(|l| l.get("spur.amd.com/gpu-type"))
         .cloned()
         .unwrap_or_else(|| match gpu_vendor {
             "amd" => "amd-gpu".into(),
@@ -250,13 +250,13 @@ fn extract_resources(node: &K8sNode) -> ResourceSet {
 
     // Read GPU memory from label if available
     let gpu_memory_mb: u64 = labels
-        .and_then(|l| l.get("spur.ai/gpu-memory-mb"))
+        .and_then(|l| l.get("spur.amd.com/gpu-memory-mb"))
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
     // Read link type from label
     let link_type: i32 = labels
-        .and_then(|l| l.get("spur.ai/gpu-link"))
+        .and_then(|l| l.get("spur.amd.com/gpu-link"))
         .map(|v| match v.as_str() {
             "xgmi" | "XGMI" => 1,     // GPU_LINK_XGMI
             "nvlink" | "NVLink" => 2, // GPU_LINK_NVLINK
@@ -387,7 +387,7 @@ mod tests {
             BTreeMap::new(),
             vec![
                 Taint {
-                    key: "spur.ai/gpu-node".into(),
+                    key: "spur.amd.com/gpu-node".into(),
                     effect: "NoSchedule".into(),
                     ..Default::default()
                 },
@@ -473,7 +473,7 @@ mod tests {
         alloc.insert("amd.com/gpu".into(), Quantity("8".into()));
 
         let mut labels = BTreeMap::new();
-        labels.insert("spur.ai/gpu-type".into(), "mi300x".into());
+        labels.insert("spur.amd.com/gpu-type".into(), "mi300x".into());
 
         let node = make_node("gpu-node", labels, alloc, vec![]);
         let res = extract_resources(&node);
@@ -492,7 +492,7 @@ mod tests {
         alloc.insert("nvidia.com/gpu".into(), Quantity("4".into()));
 
         let mut labels = BTreeMap::new();
-        labels.insert("spur.ai/gpu-type".into(), "h100".into());
+        labels.insert("spur.amd.com/gpu-type".into(), "h100".into());
 
         let node = make_node("nvidia-node", labels, alloc, vec![]);
         let res = extract_resources(&node);
@@ -530,8 +530,8 @@ mod tests {
         alloc.insert("amd.com/gpu".into(), Quantity("4".into()));
 
         let mut labels = BTreeMap::new();
-        labels.insert("spur.ai/gpu-type".into(), "mi300x".into());
-        labels.insert("spur.ai/gpu-memory-mb".into(), "196608".into()); // 192Gi
+        labels.insert("spur.amd.com/gpu-type".into(), "mi300x".into());
+        labels.insert("spur.amd.com/gpu-memory-mb".into(), "196608".into()); // 192Gi
 
         let node = make_node("gpu-node", labels, alloc, vec![]);
         let res = extract_resources(&node);
@@ -557,7 +557,7 @@ mod tests {
         alloc.insert("amd.com/gpu".into(), Quantity("2".into()));
 
         let mut labels = BTreeMap::new();
-        labels.insert("spur.ai/gpu-link".into(), "xgmi".into());
+        labels.insert("spur.amd.com/gpu-link".into(), "xgmi".into());
 
         let node = make_node("node", labels, alloc, vec![]);
         let res = extract_resources(&node);
@@ -570,7 +570,7 @@ mod tests {
         alloc.insert("nvidia.com/gpu".into(), Quantity("2".into()));
 
         let mut labels = BTreeMap::new();
-        labels.insert("spur.ai/gpu-link".into(), "NVLink".into());
+        labels.insert("spur.amd.com/gpu-link".into(), "NVLink".into());
 
         let node = make_node("node", labels, alloc, vec![]);
         let res = extract_resources(&node);
@@ -593,7 +593,7 @@ mod tests {
         alloc.insert("amd.com/gpu".into(), Quantity("1".into()));
 
         let mut labels = BTreeMap::new();
-        labels.insert("spur.ai/gpu-link".into(), "something-else".into());
+        labels.insert("spur.amd.com/gpu-link".into(), "something-else".into());
 
         let node = make_node("node", labels, alloc, vec![]);
         let res = extract_resources(&node);
@@ -666,9 +666,9 @@ mod tests {
         alloc.insert("amd.com/gpu".into(), Quantity("8".into()));
 
         let mut labels = BTreeMap::new();
-        labels.insert("spur.ai/gpu-type".into(), "mi300x".into());
-        labels.insert("spur.ai/gpu-memory-mb".into(), "196608".into());
-        labels.insert("spur.ai/gpu-link".into(), "xgmi".into());
+        labels.insert("spur.amd.com/gpu-type".into(), "mi300x".into());
+        labels.insert("spur.amd.com/gpu-memory-mb".into(), "196608".into());
+        labels.insert("spur.amd.com/gpu-link".into(), "xgmi".into());
 
         let node = make_node("mi300x-node", labels, alloc, vec![]);
         let res = extract_resources(&node);
@@ -688,9 +688,9 @@ mod tests {
         alloc.insert("amd.com/gpu".into(), Quantity("4".into()));
 
         let mut labels = BTreeMap::new();
-        labels.insert("spur.ai/gpu-type".into(), "mi250x".into());
-        labels.insert("spur.ai/gpu-memory-mb".into(), "131072".into());
-        labels.insert("spur.ai/gpu-link".into(), "xgmi".into());
+        labels.insert("spur.amd.com/gpu-type".into(), "mi250x".into());
+        labels.insert("spur.amd.com/gpu-memory-mb".into(), "131072".into());
+        labels.insert("spur.amd.com/gpu-link".into(), "xgmi".into());
 
         let node = make_node("mi250x-node", labels, alloc, vec![]);
         let res = extract_resources(&node);

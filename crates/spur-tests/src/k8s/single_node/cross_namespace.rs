@@ -42,7 +42,7 @@ mod tests {
         if let Some(job_id) = completed.status.as_ref().and_then(|s| s.spur_job_id) {
             let spur_pods: Api<Pod> = Api::namespaced(client.clone(), f.namespace());
             let leaked = spur_pods
-                .list(&ListParams::default().labels(&format!("spur.ai/job-id={job_id}")))
+                .list(&ListParams::default().labels(&format!("spur.amd.com/job-id={job_id}")))
                 .await
                 .unwrap();
             assert!(

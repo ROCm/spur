@@ -499,7 +499,7 @@ jobs:
           kubectl delete namespace "$SPUR_TEST_NS" --ignore-not-found --timeout=120s || true
           kubectl delete clusterrolebinding spur-operator --ignore-not-found
           kubectl delete clusterrole spur-operator --ignore-not-found
-          kubectl delete crd spurjobs.spur.ai --ignore-not-found --timeout=120s || true
+          kubectl delete crd spurjobs.spur.amd.com --ignore-not-found --timeout=120s || true
 
       - name: Report status
         if: always()

@@ -24,7 +24,7 @@ rules:
     resources: [events]
     verbs: [create, patch]
   # SpurJob CRD
-  - apiGroups: [spur.ai]
+  - apiGroups: [spur.amd.com]
     resources: [spurjobs, spurjobs/status, spurjobs/finalizers]
     verbs: [get, list, watch, create, update, patch, delete]
   # PodDisruptionBudgets

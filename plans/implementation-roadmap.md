@@ -51,7 +51,7 @@ Spur becomes the scheduling brain for GPU workloads across both native-host and 
 Custom Resource Definition that maps Spur jobs to K8s resources:
 
 ```yaml
-apiVersion: spur.ai/v1
+apiVersion: spur.amd.com/v1
 kind: SpurJob
 metadata:
   name: training-run-42
@@ -83,7 +83,7 @@ Config:
 enabled = true
 kubeconfig = "/etc/spur/kubeconfig"
 namespace = "spur-jobs"
-node_selector = { "spur.ai/managed": "true" }
+node_selector = { "spur.amd.com/managed": "true" }
 ```
 
 ### 11.4 GPU Topology Scheduling (L)

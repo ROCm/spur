@@ -25,7 +25,7 @@ use spur_proto::proto::{
     CancelJobRequest, GetJobRequest, ReportJobStatusRequest, SubmitJobRequest,
 };
 
-const FINALIZER: &str = "spur.ai/cleanup";
+const FINALIZER: &str = "spur.amd.com/cleanup";
 const MAX_BACKOFF_SECS: u64 = 60;
 const LABEL_PATCH_BUDGET: Duration = Duration::from_secs(3);
 
@@ -129,7 +129,7 @@ async fn submit_to_controller(
         .metadata
         .annotations
         .as_ref()
-        .and_then(|a| a.get("spur.ai/user"))
+        .and_then(|a| a.get("spur.amd.com/user"))
         .cloned()
         .unwrap_or_else(|| "k8s".to_string());
 
@@ -235,7 +235,7 @@ async fn handle_job(
 }
 
 /// Handle SpurJob deletion: cancel Spur job, clean up Pods/Services.
-/// kube::runtime::finalizer removes spur.ai/cleanup automatically after this returns Ok.
+/// kube::runtime::finalizer removes spur.amd.com/cleanup automatically after this returns Ok.
 async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action, ReconcileError> {
     let name = job.metadata.name.clone().unwrap_or_default();
     let ns = job
@@ -262,7 +262,7 @@ async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action
 
         // Delete all Pods by label
         let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &ns);
-        let lp = ListParams::default().labels(&format!("spur.ai/job-id={}", job_id));
+        let lp = ListParams::default().labels(&format!("spur.amd.com/job-id={}", job_id));
         if let Ok(pod_list) = pods.list(&lp).await {
             for pod in pod_list {
                 let pod_name = pod.metadata.name.unwrap_or_default();
@@ -326,7 +326,7 @@ pub async fn run(
     Controller::new(spurjobs, WatcherConfig::default())
         .owns(
             pods,
-            WatcherConfig::default().labels("spur.ai/managed-by=spur-k8s-operator"),
+            WatcherConfig::default().labels("spur.amd.com/managed-by=spur-k8s-operator"),
         )
         .run(reconcile, error_policy, ctx)
         .for_each(|res| async move {
@@ -340,13 +340,14 @@ pub async fn run(
     Ok(())
 }
 
-/// Watch Pods labeled with spur.ai/job-id and report terminal states back to spurctld.
+/// Watch Pods labeled with spur.amd.com/job-id and report terminal states back to spurctld.
 async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
     let pods: Api<Pod> = Api::all(ctx.client.clone());
 
     let stream = kube::runtime::watcher::watcher(
         pods,
-        kube::runtime::watcher::Config::default().labels("spur.ai/managed-by=spur-k8s-operator"),
+        kube::runtime::watcher::Config::default()
+            .labels("spur.amd.com/managed-by=spur-k8s-operator"),
     );
     let mut stream = pin!(stream);
 
@@ -356,7 +357,7 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
         {
             let labels = pod.metadata.labels.as_ref();
             let job_id_str = labels
-                .and_then(|l| l.get("spur.ai/job-id"))
+                .and_then(|l| l.get("spur.amd.com/job-id"))
                 .cloned()
                 .unwrap_or_default();
             let job_id: u32 = match job_id_str.parse() {
@@ -552,7 +553,7 @@ async fn cleanup_orphan_pods(client: Client) {
     let pods: Api<Pod> = Api::all(client.clone());
     let spurjobs: Api<SpurJob> = Api::all(client.clone());
 
-    let lp = ListParams::default().labels("spur.ai/managed-by=spur-k8s-operator");
+    let lp = ListParams::default().labels("spur.amd.com/managed-by=spur-k8s-operator");
     let pod_list = match pods.list(&lp).await {
         Ok(list) => list,
         Err(e) => {
@@ -589,7 +590,7 @@ async fn cleanup_orphan_pods(client: Client) {
             .metadata
             .labels
             .as_ref()
-            .and_then(|l| l.get("spur.ai/job-id"))
+            .and_then(|l| l.get("spur.amd.com/job-id"))
             .cloned()
             .unwrap_or_default();
 
@@ -614,11 +615,11 @@ fn has_job_id_label(job: &SpurJob) -> bool {
     job.metadata
         .labels
         .as_ref()
-        .and_then(|l| l.get("spur.ai/job-id"))
+        .and_then(|l| l.get("spur.amd.com/job-id"))
         .is_some()
 }
 
-/// Ensure `spur.ai/job-id` is set on the SpurJob, retrying on transient API errors.
+/// Ensure `spur.amd.com/job-id` is set on the SpurJob, retrying on transient API errors.
 /// Returns Ok if the label is already present or was applied successfully.
 async fn ensure_job_id_label(
     job: &SpurJob,
@@ -631,7 +632,7 @@ async fn ensure_job_id_label(
     }
 
     let patch = serde_json::json!({
-        "metadata": { "labels": { "spur.ai/job-id": job_id.to_string() } }
+        "metadata": { "labels": { "spur.amd.com/job-id": job_id.to_string() } }
     });
 
     let result = tokio::time::timeout(
@@ -1231,7 +1232,7 @@ mod tests {
 
     #[test]
     fn test_has_job_id_label_present() {
-        let labels = BTreeMap::from([("spur.ai/job-id".into(), "42".into())]);
+        let labels = BTreeMap::from([("spur.amd.com/job-id".into(), "42".into())]);
         let job = make_spurjob(Some(labels), Some("default"));
         assert!(has_job_id_label(&job));
     }
@@ -1251,7 +1252,7 @@ mod tests {
     #[test]
     fn test_has_job_id_label_other_labels_only() {
         let labels = BTreeMap::from([
-            ("spur.ai/managed-by".into(), "spur-k8s-operator".into()),
+            ("spur.amd.com/managed-by".into(), "spur-k8s-operator".into()),
             ("app".into(), "training".into()),
         ]);
         let job = make_spurjob(Some(labels), Some("default"));
@@ -1261,8 +1262,8 @@ mod tests {
     #[test]
     fn test_has_job_id_label_among_others() {
         let labels = BTreeMap::from([
-            ("spur.ai/managed-by".into(), "spur-k8s-operator".into()),
-            ("spur.ai/job-id".into(), "99".into()),
+            ("spur.amd.com/managed-by".into(), "spur-k8s-operator".into()),
+            ("spur.amd.com/job-id".into(), "99".into()),
         ]);
         let job = make_spurjob(Some(labels), Some("default"));
         assert!(has_job_id_label(&job));

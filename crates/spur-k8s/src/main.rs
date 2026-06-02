@@ -43,7 +43,7 @@ struct Args {
     address: Option<String>,
 
     /// K8s node label selector
-    #[arg(long, default_value = "spur.ai/managed=true")]
+    #[arg(long, default_value = "spur.amd.com/managed=true")]
     node_selector: String,
 
     /// HTTP health/metrics server address

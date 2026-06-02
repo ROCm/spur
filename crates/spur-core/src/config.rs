@@ -544,7 +544,7 @@ fn default_k8s_namespace() -> String {
 }
 
 fn default_k8s_node_selector() -> String {
-    "spur.ai/managed=true".into()
+    "spur.amd.com/managed=true".into()
 }
 
 impl Default for KubernetesConfig {
@@ -553,7 +553,7 @@ impl Default for KubernetesConfig {
             enabled: false,
             kubeconfig: None,
             namespace: "spur".into(),
-            node_label_selector: "spur.ai/managed=true".into(),
+            node_label_selector: "spur.amd.com/managed=true".into(),
         }
     }
 }
