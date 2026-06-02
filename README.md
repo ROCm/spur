@@ -39,7 +39,8 @@ The [full documentation](docs/index.rst) covers quickstart, deployment, and deve
 
 ## Getting Help
 
-If you are stuck on anything or have found a bug, please feel free to [open an issue](https://github.com/ROCm/spur/issues) and we'll do our best to help.
+- 💬 **Questions & discussions** — head over to [GitHub Discussions](https://github.com/ROCm/spur/discussions). Whether you're stuck, have a suggestion, or just want to chat about how you're using Spur, that's the place.
+- 🐛 **Bug reports** — if you've found a confirmed bug, [open an issue](https://github.com/ROCm/spur/issues) with steps to reproduce.
 
 ## Building & Contributing
 
