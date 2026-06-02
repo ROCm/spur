@@ -6,11 +6,11 @@ use tonic::transport::Channel;
 use tracing::warn;
 
 use spur_core::job::{JobId, JobState};
-use spur_core::resource::ResourceSet;
+use spur_core::resource::ResourceAllocations;
 use spur_proto::proto::slurm_accounting_client::SlurmAccountingClient;
 use spur_proto::proto::{RecordJobEndRequest, RecordJobStartRequest};
 
-use crate::server::{datetime_to_proto, resource_to_proto};
+use crate::server::{allocations_to_proto, datetime_to_proto};
 
 pub struct AccountingNotifier {
     client: SlurmAccountingClient<Channel>,
@@ -33,7 +33,7 @@ impl AccountingNotifier {
         user: String,
         account: String,
         partition: String,
-        resources: &ResourceSet,
+        resources: &ResourceAllocations,
         start_time: DateTime<Utc>,
     ) {
         let req = RecordJobStartRequest {
@@ -41,7 +41,7 @@ impl AccountingNotifier {
             user,
             account,
             partition,
-            resources: Some(resource_to_proto(resources)),
+            resources: Some(allocations_to_proto(resources)),
             start_time: Some(datetime_to_proto(start_time)),
         };
         let mut client = self.client.clone();

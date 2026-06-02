@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::job::JobId;
-use crate::resource::ResourceSet;
+use crate::resource::ResourceAllocations;
 
 /// Job step identifier.
 pub type StepId = u32;
@@ -33,7 +33,7 @@ pub struct JobStep {
 
     pub num_tasks: u32,
     pub cpus_per_task: u32,
-    pub resources: ResourceSet,
+    pub resources: ResourceAllocations,
     pub nodes: Vec<String>,
 
     /// Task distribution across nodes.
@@ -347,7 +347,7 @@ mod tests {
 
     #[test]
     fn test_step_state_transitions() {
-        use crate::resource::ResourceSet;
+        use crate::resource::ResourceAllocations;
 
         let mut step = JobStep {
             job_id: 1,
@@ -356,7 +356,7 @@ mod tests {
             state: StepState::Pending,
             num_tasks: 4,
             cpus_per_task: 2,
-            resources: ResourceSet::default(),
+            resources: ResourceAllocations::default(),
             nodes: vec!["node001".into()],
             distribution: TaskDistribution::Block,
             start_time: None,

@@ -153,6 +153,8 @@ pub struct ContainerConfig {
     pub gid: u32,
     pub username: String,
     pub home_dir: String,
+    /// Registry-based device injection plan (replaces mount_hw_devices when present).
+    pub device_plan: Option<spur_devices::inject::ContainerInjectionPlan>,
 }
 
 /// Resolve image reference to a rootfs path.
@@ -431,7 +433,10 @@ pub fn cleanup_rootfs(job_id: u32, mode: &RootfsMode) {
 /// source type — bind mounts require the target to already exist.
 pub fn create_mount_target(rootfs: &Path, target: &str, source: &Path) -> anyhow::Result<()> {
     let dest = rootfs.join(target.trim_start_matches('/'));
-    if source.is_file() {
+    if source.is_dir() {
+        std::fs::create_dir_all(&dest)
+            .with_context(|| format!("creating mount target dir {}", dest.display()))?;
+    } else {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating parent dirs for {}", dest.display()))?;
@@ -440,9 +445,6 @@ pub fn create_mount_target(rootfs: &Path, target: &str, source: &Path) -> anyhow
             std::fs::File::create(&dest)
                 .with_context(|| format!("creating mount target file {}", dest.display()))?;
         }
-    } else if source.is_dir() {
-        std::fs::create_dir_all(&dest)
-            .with_context(|| format!("creating mount target dir {}", dest.display()))?;
     }
     Ok(())
 }
@@ -578,137 +580,37 @@ pub fn mount_filesystems(rootfs: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Expose host GPU and RDMA devices inside the container rootfs.
-pub fn mount_hw_devices(rootfs: &Path, gpu_devices: &[u32]) {
-    mount_dri_devices(rootfs, gpu_devices);
-    mount_amd_devices(rootfs);
-    mount_nvidia_devices(rootfs);
-    mount_infiniband_devices(rootfs);
-}
+/// Apply a registry-based container device injection plan.
+fn apply_container_device_plan(rootfs: &Path, plan: &spur_devices::inject::ContainerInjectionPlan) {
+    // Device nodes: bind-mount from host into container rootfs
+    for dn in &plan.device_nodes {
+        let host = Path::new(&dn.host_path);
+        if !host.exists() {
+            warn!(path = %dn.host_path, "injected device node does not exist on host, skipping");
+            continue;
+        }
+        if let Err(e) = bind_mount(rootfs, host, &dn.container_path, false) {
+            warn!(
+                device = %dn.container_path,
+                error = %e,
+                "failed to bind mount injected device node"
+            );
+        }
+    }
 
-/// DRI render/card nodes — either all of /dev/dri or only the allocated subset.
-fn mount_dri_devices(rootfs: &Path, gpu_devices: &[u32]) {
-    let host_dri = Path::new("/dev/dri");
-    if !host_dri.is_dir() {
-        return;
-    }
-    if gpu_devices.is_empty() {
-        if let Err(e) = bind_mount(rootfs, host_dri, "/dev/dri", false) {
-            warn!(error = %e, "failed to bind mount /dev/dri");
+    // Mounts: bind-mount library paths etc.
+    for m in &plan.mounts {
+        let source = Path::new(&m.source);
+        if !source.exists() {
+            debug!(path = %m.source, "injected mount source does not exist, skipping");
+            continue;
         }
-        return;
-    }
-    for &id in gpu_devices {
-        let render = format!("/dev/dri/renderD{}", 128 + id);
-        let card = format!("/dev/dri/card{}", id);
-        let render_p = Path::new(&render);
-        let card_p = Path::new(&card);
-        if render_p.exists() {
-            if let Err(e) = bind_mount(rootfs, render_p, &render, false) {
-                warn!(device = %render, error = %e, "failed to bind mount GPU render node");
-            }
-        }
-        if card_p.exists() {
-            if let Err(e) = bind_mount(rootfs, card_p, &card, false) {
-                warn!(device = %card, error = %e, "failed to bind mount GPU card node");
-            }
-        }
-    }
-}
-
-/// AMD ROCm: /dev/kfd + userspace libraries.
-fn mount_amd_devices(rootfs: &Path) {
-    let kfd = Path::new("/dev/kfd");
-    if kfd.exists() {
-        if let Err(e) = bind_mount(rootfs, kfd, "/dev/kfd", false) {
-            warn!(error = %e, "failed to bind mount /dev/kfd");
-        }
-    }
-    for rocm in &["/opt/rocm", "/opt/rocm/lib", "/opt/rocm/lib64"] {
-        let p = Path::new(rocm);
-        if p.is_dir() {
-            if let Err(e) = bind_mount(rootfs, p, rocm, false) {
-                warn!(path = %rocm, error = %e, "failed to bind mount ROCm path");
-            }
-        }
-    }
-}
-
-/// NVIDIA: /dev/nvidia* devices + driver/CUDA libraries.
-fn mount_nvidia_devices(rootfs: &Path) {
-    mount_dev_matching(rootfs, "nvidia");
-    for libdir in &["/usr/lib/x86_64-linux-gnu", "/usr/lib64"] {
-        mount_libs_matching(rootfs, libdir, |name| {
-            name.starts_with("libnvidia")
-                || name.starts_with("libcuda")
-                || name.starts_with("libnvoptix")
-        });
-    }
-}
-
-/// InfiniBand / Mellanox (MOFED): verbs devices + userspace libraries.
-fn mount_infiniband_devices(rootfs: &Path) {
-    let ib = Path::new("/dev/infiniband");
-    if ib.is_dir() {
-        if let Err(e) = bind_mount(rootfs, ib, "/dev/infiniband", false) {
-            warn!(error = %e, "failed to bind mount /dev/infiniband");
-        }
-    }
-    mount_dev_matching(rootfs, "uverbs");
-    let rdma = Path::new("/dev/rdma_cm");
-    if rdma.exists() {
-        if let Err(e) = bind_mount(rootfs, rdma, "/dev/rdma_cm", false) {
-            warn!(error = %e, "failed to bind mount /dev/rdma_cm");
-        }
-    }
-    for mofed in &[
-        "/etc/libibverbs.d",
-        "/usr/lib/x86_64-linux-gnu/libibverbs",
-        "/usr/lib64/libibverbs",
-    ] {
-        let p = Path::new(mofed);
-        if p.is_dir() {
-            if let Err(e) = bind_mount(rootfs, p, mofed, false) {
-                warn!(path = %mofed, error = %e, "failed to bind mount MOFED path");
-            }
-        }
-    }
-}
-
-/// Bind-mount each /dev entry whose name starts with `prefix` into rootfs.
-fn mount_dev_matching(rootfs: &Path, prefix: &str) {
-    if let Ok(entries) = std::fs::read_dir("/dev") {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with(prefix) {
-                let host = entry.path();
-                let target = format!("/dev/{}", name_str);
-                if let Err(e) = bind_mount(rootfs, &host, &target, false) {
-                    warn!(device = %target, error = %e, "failed to bind mount device");
-                }
-            }
-        }
-    }
-}
-
-/// Bind-mount matching library files from a host directory into rootfs.
-fn mount_libs_matching(rootfs: &Path, libdir: &str, predicate: impl Fn(&str) -> bool) {
-    let dir = Path::new(libdir);
-    if !dir.is_dir() {
-        return;
-    }
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if predicate(&name_str) {
-                let host = entry.path();
-                let target = format!("{}/{}", libdir, name_str);
-                if let Err(e) = bind_mount(rootfs, &host, &target, false) {
-                    warn!(path = %target, error = %e, "failed to bind mount library");
-                }
-            }
+        if let Err(e) = bind_mount(rootfs, source, &m.target, m.readonly) {
+            warn!(
+                mount = %m.target,
+                error = %e,
+                "failed to bind mount injected mount"
+            );
         }
     }
 }
@@ -1035,6 +937,17 @@ pub fn drop_privileges(uid: u32, gid: u32, supplementary_gids: &[u32]) -> anyhow
     Ok(())
 }
 
+fn merge_supplementary_gids(mut gids: Vec<u32>, extra: &[u32]) -> Vec<u32> {
+    for &g in extra {
+        if g > 0 && !gids.contains(&g) {
+            gids.push(g);
+        }
+    }
+    gids.sort_unstable();
+    gids.dedup();
+    gids
+}
+
 /// Collect the user's supplementary group IDs (e.g. video, render) from the
 /// host. Must be called before fork while host /etc/group is still accessible.
 pub fn resolve_supplementary_gids(uid: u32, gid: u32) -> Vec<u32> {
@@ -1066,16 +979,20 @@ pub fn resolve_supplementary_gids(uid: u32, gid: u32) -> Vec<u32> {
 /// Set up a user namespace for non-root container operation.
 ///
 /// Maps the calling user to root inside the namespace, giving
-/// CAP_SYS_ADMIN for mounts and pivot_root.
+/// CAP_SYS_ADMIN for mounts and pivot_root. Supplementary groups are
+/// inherited from the parent process by writing `"deny"` to
+/// `/proc/self/setgroups` (the crun/podman `keep-groups` approach).
+/// The groups show as `nobody` inside the container but the kernel
+/// still honours them for permission checks on device nodes.
 fn setup_user_namespace(uid: u32, gid: u32) -> anyhow::Result<()> {
     nix::sched::unshare(
         CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID,
     )
     .context("unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID)")?;
 
-    std::fs::write("/proc/self/uid_map", format!("0 {} 1", uid)).context("write uid_map")?;
+    std::fs::write("/proc/self/uid_map", format!("0 {} 1\n", uid)).context("write uid_map")?;
     std::fs::write("/proc/self/setgroups", "deny").context("write setgroups deny")?;
-    std::fs::write("/proc/self/gid_map", format!("0 {} 1", gid)).context("write gid_map")?;
+    std::fs::write("/proc/self/gid_map", format!("0 {} 1\n", gid)).context("write gid_map")?;
 
     Ok(())
 }
@@ -1139,11 +1056,13 @@ pub fn container_init(
     let is_root = nix::unistd::geteuid().is_root();
 
     // Resolve supplementary GIDs while host /etc/group is still accessible.
-    let supplementary_gids = if is_root {
-        resolve_supplementary_gids(config.uid, config.gid)
-    } else {
-        vec![]
-    };
+    let mut supplementary_gids = resolve_supplementary_gids(config.uid, config.gid);
+    if is_root {
+        if let Some(ref plan) = config.device_plan {
+            supplementary_gids =
+                merge_supplementary_gids(supplementary_gids, &plan.additional_gids);
+        }
+    }
 
     if is_root {
         nix::sched::unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID)
@@ -1157,7 +1076,12 @@ pub fn container_init(
     fork_into_pid_namespace()?;
 
     mount_filesystems(rootfs)?;
-    mount_hw_devices(rootfs, &config.gpu_devices);
+
+    // Registry-based device injection
+    if let Some(ref plan) = config.device_plan {
+        apply_container_device_plan(rootfs, plan);
+    }
+
     setup_shadow(rootfs, config)?;
     mount_user_binds(rootfs, &config.mounts)?;
     mount_dns(rootfs, &config.mounts)?;
@@ -1601,6 +1525,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_create_mount_target_fifo() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("pipe");
+        nix::unistd::mkfifo(
+            &source,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+
+        create_mount_target(rootfs.path(), "/dev/pipe", &source).unwrap();
+        let target = rootfs.path().join("dev/pipe");
+        assert!(target.exists(), "target file must exist for fifo source");
+        assert!(target.is_file(), "target must be a file, not directory");
+    }
+
+    #[test]
+    fn test_create_mount_target_symlink() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let source_dir = tempfile::tempdir().unwrap();
+        let target_file = source_dir.path().join("real");
+        std::fs::write(&target_file, "data").unwrap();
+        let source = source_dir.path().join("link");
+        std::os::unix::fs::symlink(&target_file, &source).unwrap();
+
+        create_mount_target(rootfs.path(), "/dev/link", &source).unwrap();
+        let target = rootfs.path().join("dev/link");
+        assert!(target.exists(), "target file must exist for symlink source");
+        assert!(target.is_file(), "target must be a file, not directory");
+    }
+
     // --- setup_shadow ---
 
     #[test]
@@ -1627,6 +1583,7 @@ mod tests {
             gid: 1000,
             username: "alice".into(),
             home_dir: "/home/alice".into(),
+            device_plan: None,
         };
         setup_shadow(rootfs.path(), &config).unwrap();
 
@@ -1667,6 +1624,7 @@ mod tests {
             gid: 1000,
             username: "alice".into(),
             home_dir: "/home/alice".into(),
+            device_plan: None,
         };
         setup_shadow(rootfs.path(), &config).unwrap();
 
@@ -1695,6 +1653,18 @@ mod tests {
         assert!(!is_loopback_nameserver("8.8.8.8"));
         assert!(!is_loopback_nameserver("1.1.1.1"));
         assert!(!is_loopback_nameserver("192.168.1.1"));
+    }
+
+    #[test]
+    fn test_merge_supplementary_gids() {
+        assert_eq!(
+            merge_supplementary_gids(vec![1000], &[44, 109]),
+            vec![44, 109, 1000]
+        );
+        assert_eq!(
+            merge_supplementary_gids(vec![1000, 44], &[44, 109]),
+            vec![44, 109, 1000]
+        );
     }
 
     // --- resolve_supplementary_gids ---

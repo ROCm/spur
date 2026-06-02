@@ -62,7 +62,6 @@ mod tests {
 
     #[test]
     fn t17_4_job_gets_unique_id() {
-        reset_job_ids();
         let j1 = make_job("a");
         let j2 = make_job("b");
         let j3 = make_job("c");
@@ -72,7 +71,6 @@ mod tests {
 
     #[test]
     fn t17_5_job_submit_time_set() {
-        reset_job_ids();
         let job = make_job("test");
         let now = chrono::Utc::now();
         let diff = (now - job.submit_time).num_seconds().abs();
@@ -81,7 +79,6 @@ mod tests {
 
     #[test]
     fn t17_6_job_initial_priority() {
-        reset_job_ids();
         let job = make_job("test");
         assert_eq!(job.priority, 1000); // Default priority
     }

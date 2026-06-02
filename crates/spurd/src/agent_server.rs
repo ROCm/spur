@@ -21,6 +21,7 @@ use spur_sched::cons_tres::{AllocationResult, NodeAllocation};
 use spur_spank::{SpankHook, SpankHost};
 
 use spur_core::config::HooksConfig;
+use spur_devices::DeviceRegistry;
 
 use crate::executor;
 use crate::pmi::PmiServer;
@@ -66,10 +67,16 @@ pub struct AgentService {
     spank: Arc<Option<SpankHost>>,
     pmi_servers: Arc<Mutex<HashMap<u32, Arc<PmiServer>>>>,
     hooks: Arc<HooksConfig>,
+    #[allow(dead_code)]
+    device_registry: Arc<Mutex<DeviceRegistry>>,
 }
 
 impl AgentService {
-    pub fn new(reporter: Arc<NodeReporter>, hooks: HooksConfig) -> Self {
+    pub fn new(
+        reporter: Arc<NodeReporter>,
+        hooks: HooksConfig,
+        device_registry: Arc<Mutex<DeviceRegistry>>,
+    ) -> Self {
         let allocation = NodeAllocation::new(
             hostname::get()
                 .map(|h| h.to_string_lossy().to_string())
@@ -128,6 +135,7 @@ impl AgentService {
             spank: Arc::new(spank),
             pmi_servers: Arc::new(Mutex::new(HashMap::new())),
             hooks: Arc::new(hooks),
+            device_registry,
         }
     }
 
@@ -536,6 +544,7 @@ impl SlurmAgent for AgentService {
                     username
                 },
                 home_dir,
+                device_plan: None, // set after GRES allocation
             };
 
             let image_path = crate::container::resolve_image(
@@ -654,41 +663,23 @@ impl SlurmAgent for AgentService {
             launch_script
         };
 
-        // Allocate GPU devices from the node's pool
-        let mut gpu_count = 0u32;
-        let mut gpu_type: Option<String> = None;
-        for gres in &spec.gres {
-            if let Some((name, gtype, count)) = spur_core::resource::parse_gres(gres) {
-                if name == "gpu" {
-                    gpu_count += count;
-                    if let Some(t) = gtype {
-                        gpu_type = Some(t);
-                    }
-                }
-            }
-        }
+        let (alloc_result, allocated_device_ids) = self
+            .allocate_local_resources(&spec, req.allocated.as_ref())
+            .await?;
 
-        let alloc_result = if gpu_count > 0 || spec.cpus_per_task > 0 {
-            let mut alloc = self.allocation.lock().await;
-            alloc.try_allocate(
-                spec.cpus_per_task.max(1),
-                spec.memory_per_node_mb,
-                gpu_count,
-                gpu_type.as_deref(),
-            )
-        } else {
-            None
+        let (host_device_plan, container_device_plan) = {
+            let reg = self.device_registry.lock().await;
+            reg.build_job_injection_plans("gpu", &allocated_device_ids, spec.uid, spec.gid)
+                .map_err(|e| {
+                    error!(job_id, error = %e, "device registry resolution failed");
+                    Status::failed_precondition(format!("device resolution failed: {}", e))
+                })?
         };
 
-        let gpu_devices: Vec<u32> = alloc_result
-            .as_ref()
-            .map(|a| a.gpu_ids.clone())
-            .unwrap_or_default();
-
-        // Wire allocated GPU IDs into container config so mount_hw_devices
-        // can selectively expose only the allocated GPUs.
+        // Wire allocated device IDs and injection plan into container config.
         if let Some(ref mut cfg) = container_config {
-            cfg.gpu_devices = gpu_devices.clone();
+            cfg.gpu_devices = allocated_device_ids.clone();
+            cfg.device_plan = Some(container_device_plan);
         }
 
         let cpu_ids: Vec<u32> = alloc_result
@@ -727,7 +718,7 @@ impl SlurmAgent for AgentService {
             stderr_path,
             cpus: spec.cpus_per_task.max(1),
             memory_mb: spec.memory_per_node_mb,
-            gpu_devices,
+            gpu_devices: allocated_device_ids,
             cpu_ids,
             open_mode: if spec.open_mode.is_empty() {
                 None
@@ -740,6 +731,7 @@ impl SlurmAgent for AgentService {
             prolog_script: self.hooks.prolog.clone(),
             partition: spec.partition.clone(),
             nodelist: spec.nodelist.clone(),
+            host_device_plan: Some(host_device_plan),
         };
 
         match executor::launch_job(&launch_cfg, (*self.spank).as_ref()).await {
@@ -823,7 +815,9 @@ impl SlurmAgent for AgentService {
         let resources = &self.reporter.resources;
         Ok(Response::new(NodeResourcesResponse {
             total: Some(crate::reporter::resource_to_proto(resources)),
-            used: Some(ResourceSet::default()),
+            used: Some(crate::reporter::allocations_to_proto(
+                &spur_core::resource::ResourceAllocations::default(),
+            )),
         }))
     }
 
@@ -899,9 +893,52 @@ impl SlurmAgent for AgentService {
             req.work_dir
         };
 
+        let job_id = req.job_id;
+        if job_id == 0 {
+            return Err(Status::invalid_argument("job_id is required"));
+        }
+
+        let (gpu_devices, partition, cpus, memory_mb, nodelist) = {
+            let jobs = self.running.lock().await;
+            let tracked = jobs.get(&job_id).ok_or_else(|| {
+                Status::not_found(format!("job {} not running on this node", job_id))
+            })?;
+            let nodelist = if tracked.nodelist.is_empty() {
+                hostname::get()
+                    .map(|h| h.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| "localhost".into())
+            } else {
+                tracked.nodelist.clone()
+            };
+            (
+                tracked.gpu_devices.clone(),
+                tracked.partition.clone(),
+                tracked.cpus,
+                tracked.memory_mb,
+                nodelist,
+            )
+        };
+
+        let gpu_env = if gpu_devices.is_empty() {
+            HashMap::new()
+        } else {
+            self.device_registry
+                .lock()
+                .await
+                .build_job_injection_plans("gpu", &gpu_devices, req.uid, req.gid)
+                .map_err(|e| {
+                    Status::failed_precondition(format!("GPU injection plan failed: {}", e))
+                })?
+                .0
+                .env
+        };
+
         let mut cmd = tokio::process::Command::new(&req.command[0]);
         cmd.args(&req.command[1..]).current_dir(&work_dir);
         for (k, v) in &req.environment {
+            cmd.env(k, v);
+        }
+        for (k, v) in &gpu_env {
             cmd.env(k, v);
         }
 
@@ -930,24 +967,17 @@ impl SlurmAgent for AgentService {
 
         // TaskProlog: run before the step command
         if let Some(ref task_prolog) = self.hooks.task_prolog {
-            let job_id = req
-                .environment
-                .get("SPUR_JOB_ID")
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(0);
             let ctx = spur_core::hooks::HookContext {
                 job_id,
                 work_dir: work_dir.clone(),
                 uid: req.uid,
                 gid: req.gid,
-                partition: String::new(),
-                nodelist: hostname::get()
-                    .map(|h| h.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| "localhost".into()),
+                partition: partition.clone(),
+                nodelist: nodelist.clone(),
                 script_context: "prolog_task".into(),
-                gpu_devices: Vec::new(),
-                cpus: 1,
-                memory_mb: 0,
+                gpu_devices: gpu_devices.clone(),
+                cpus,
+                memory_mb,
             };
             if let Err(e) = spur_core::hooks::run_hook(task_prolog, &ctx).await {
                 return Err(Status::aborted(format!("TaskProlog failed: {}", e)));
@@ -961,24 +991,17 @@ impl SlurmAgent for AgentService {
 
         // TaskEpilog: run after the step command (failure logged, not fatal)
         if let Some(ref task_epilog) = self.hooks.task_epilog {
-            let job_id = req
-                .environment
-                .get("SPUR_JOB_ID")
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(0);
             let ctx = spur_core::hooks::HookContext {
                 job_id,
                 work_dir: work_dir.clone(),
                 uid: req.uid,
                 gid: req.gid,
-                partition: String::new(),
-                nodelist: hostname::get()
-                    .map(|h| h.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| "localhost".into()),
+                partition,
+                nodelist,
                 script_context: "epilog_task".into(),
-                gpu_devices: Vec::new(),
-                cpus: 1,
-                memory_mb: 0,
+                gpu_devices,
+                cpus,
+                memory_mb,
             };
             if let Err(e) = spur_core::hooks::run_hook(task_epilog, &ctx).await {
                 warn!(error = %e, "TaskEpilog failed");
@@ -1276,6 +1299,67 @@ impl SlurmAgent for AgentService {
 }
 
 impl AgentService {
+    /// Record controller-allocated GPUs and allocate local CPU/memory resources.
+    async fn allocate_local_resources(
+        &self,
+        spec: &JobSpec,
+        allocated: Option<&ResourceAllocations>,
+    ) -> Result<(Option<AllocationResult>, Vec<u32>), Status> {
+        let controller_gpu_ids: Vec<u32> = allocated
+            .and_then(|a| a.devices.get("gpu"))
+            .map(|d| d.devices.iter().map(|dev| dev.device_id).collect())
+            .unwrap_or_default();
+
+        let (gres_gpu_count, gres_gpu_type) = Self::parse_gpu_gres(&spec.gres);
+
+        if controller_gpu_ids.is_empty() && gres_gpu_count > 0 {
+            return Err(Status::internal(format!(
+                "job requests {} GPUs (type: {}) but controller sent no device IDs",
+                gres_gpu_count,
+                gres_gpu_type.as_deref().unwrap_or("any"),
+            )));
+        }
+
+        let mut alloc = self.allocation.lock().await;
+
+        if !controller_gpu_ids.is_empty() && !alloc.record_gpus(&controller_gpu_ids) {
+            return Err(Status::resource_exhausted(
+                "controller-allocated GPUs unavailable on this node",
+            ));
+        }
+
+        let cpu_alloc = if spec.cpus_per_task > 0 {
+            alloc.try_allocate(spec.cpus_per_task.max(1), spec.memory_per_node_mb, 0, None)
+        } else {
+            None
+        };
+
+        let gpu_ids = controller_gpu_ids.clone();
+        let result = AllocationResult {
+            cpu_ids: cpu_alloc.map(|a| a.cpu_ids).unwrap_or_default(),
+            gpu_ids: controller_gpu_ids,
+            memory_mb: spec.memory_per_node_mb,
+        };
+
+        Ok((Some(result), gpu_ids))
+    }
+
+    fn parse_gpu_gres(gres: &[String]) -> (u32, Option<String>) {
+        let mut count = 0;
+        let mut gpu_type = None;
+        for g in gres {
+            if let Some((name, gtype, n)) = spur_core::resource::parse_gres(g) {
+                if name == "gpu" {
+                    count += n;
+                    if gtype.is_some() {
+                        gpu_type = gtype;
+                    }
+                }
+            }
+        }
+        (count, gpu_type)
+    }
+
     /// Send a user-specified signal to a running job.
     async fn send_explicit_signal(&self, job_id: u32, signal: i32) {
         let jobs = self.running.lock().await;
@@ -1370,6 +1454,35 @@ mod tests {
     use spur_core::resource::ResourceSet;
     use tonic::Request;
 
+    async fn run_command_test_setup() -> (AgentService, u32) {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+        );
+        let job_id = 100;
+        svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
+        (svc, job_id)
+    }
+
+    fn test_gpu_registry() -> DeviceRegistry {
+        use spur_devices::cdi::cache::CdiCache;
+        use spur_devices::{GresCache, GresEntry};
+
+        let gres = vec![GresEntry {
+            name: "gpu".into(),
+            r#type: Some("mi300x".into()),
+            file: Some("/dev/dri/renderD[128-129]".into()),
+            count: Some(2),
+            flags: vec!["amd_gpu_env".into()],
+            ..Default::default()
+        }];
+        let gres_cache = GresCache::from_entries(&gres);
+        let mut reg = DeviceRegistry::new();
+        reg.populate(&CdiCache::new(), &gres_cache);
+        reg
+    }
+
     fn test_reporter() -> Arc<NodeReporter> {
         Arc::new(NodeReporter::new(
             "test-node".into(),
@@ -1390,7 +1503,11 @@ mod tests {
 
     #[tokio::test]
     async fn exec_in_job_returns_without_deadlock() {
-        let svc = AgentService::new(test_reporter(), HooksConfig::default());
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+        );
         let pid = std::process::id();
         svc.insert_test_job(42, TrackedJob::dummy(pid)).await;
 
@@ -1405,7 +1522,11 @@ mod tests {
 
     #[tokio::test]
     async fn exec_in_job_not_found() {
-        let svc = AgentService::new(test_reporter(), HooksConfig::default());
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+        );
 
         let req = Request::new(ExecInJobRequest {
             job_id: 999,
@@ -1430,13 +1551,14 @@ mod tests {
 
     #[tokio::test]
     async fn run_command_executes_simple_command() {
-        let svc = AgentService::new(test_reporter(), HooksConfig::default());
+        let (svc, job_id) = run_command_test_setup().await;
         let req = Request::new(RunCommandRequest {
             command: vec!["echo".into(), "hello-from-agent".into()],
             uid: 0,
             gid: 0,
             work_dir: String::new(),
             environment: HashMap::new(),
+            job_id,
         });
         let resp = svc.run_command(req).await.unwrap().into_inner();
         assert_eq!(resp.exit_code, 0);
@@ -1446,13 +1568,14 @@ mod tests {
 
     #[tokio::test]
     async fn run_command_propagates_nonzero_exit_code() {
-        let svc = AgentService::new(test_reporter(), HooksConfig::default());
+        let (svc, job_id) = run_command_test_setup().await;
         let req = Request::new(RunCommandRequest {
             command: vec!["false".into()],
             uid: 0,
             gid: 0,
             work_dir: String::new(),
             environment: HashMap::new(),
+            job_id,
         });
         let resp = svc.run_command(req).await.unwrap().into_inner();
         assert_eq!(resp.exit_code, 1, "false exits 1");
@@ -1460,7 +1583,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_command_passes_environment() {
-        let svc = AgentService::new(test_reporter(), HooksConfig::default());
+        let (svc, job_id) = run_command_test_setup().await;
         let mut env = HashMap::new();
         env.insert("SPUR_TEST_VAR".into(), "step-dispatched".into());
         let req = Request::new(RunCommandRequest {
@@ -1469,6 +1592,7 @@ mod tests {
             gid: 0,
             work_dir: String::new(),
             environment: env,
+            job_id,
         });
         let resp = svc.run_command(req).await.unwrap().into_inner();
         assert_eq!(resp.exit_code, 0);
@@ -1477,16 +1601,59 @@ mod tests {
 
     #[tokio::test]
     async fn run_command_empty_command_is_rejected() {
-        let svc = AgentService::new(test_reporter(), HooksConfig::default());
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+        );
         let req = Request::new(RunCommandRequest {
             command: vec![],
             uid: 0,
             gid: 0,
             work_dir: String::new(),
             environment: HashMap::new(),
+            job_id: 0,
         });
         let err = svc.run_command(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn run_command_requires_job_id() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+        );
+        let req = Request::new(RunCommandRequest {
+            command: vec!["echo".into(), "hi".into()],
+            uid: 0,
+            gid: 0,
+            work_dir: String::new(),
+            environment: HashMap::new(),
+            job_id: 0,
+        });
+        let err = svc.run_command(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn run_command_not_found_without_tracked_job() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+        );
+        let req = Request::new(RunCommandRequest {
+            command: vec!["echo".into(), "hi".into()],
+            uid: 0,
+            gid: 0,
+            work_dir: String::new(),
+            environment: HashMap::new(),
+            job_id: 999,
+        });
+        let err = svc.run_command(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]
@@ -1496,7 +1663,7 @@ mod tests {
         // assert it's a specific directory without mounting a tempdir as
         // the agent's cwd. Instead use `pwd` and assert it matches the
         // dir we passed.
-        let svc = AgentService::new(test_reporter(), HooksConfig::default());
+        let (svc, job_id) = run_command_test_setup().await;
         let tmp = std::env::temp_dir();
         // Resolve symlinks (e.g., macOS /tmp -> /private/tmp).
         let tmp_canonical = std::fs::canonicalize(&tmp).unwrap_or(tmp.clone());
@@ -1506,11 +1673,54 @@ mod tests {
             gid: 0,
             work_dir: tmp_canonical.to_string_lossy().into_owned(),
             environment: HashMap::new(),
+            job_id,
         });
         let resp = svc.run_command(req).await.unwrap().into_inner();
         assert_eq!(resp.exit_code, 0);
         let observed_canonical = std::fs::canonicalize(resp.stdout.trim()).unwrap();
         assert_eq!(observed_canonical, tmp_canonical);
+    }
+
+    #[tokio::test]
+    async fn run_command_injects_gpu_env_from_tracked_job() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(test_gpu_registry())),
+        );
+
+        let job_id = 700;
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.gpu_devices = vec![0, 1];
+        tracked.partition = "gpu".into();
+        tracked.cpus = 8;
+        tracked.memory_mb = 16384;
+        svc.insert_test_job(job_id, tracked).await;
+
+        let req = Request::new(RunCommandRequest {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo ROCR=$ROCR_VISIBLE_DEVICES CUDA=$CUDA_VISIBLE_DEVICES".into(),
+            ],
+            uid: 0,
+            gid: 0,
+            work_dir: String::new(),
+            environment: HashMap::new(),
+            job_id,
+        });
+        let resp = svc.run_command(req).await.unwrap().into_inner();
+        assert_eq!(resp.exit_code, 0);
+        assert!(
+            resp.stdout.contains("ROCR=0,1"),
+            "expected ROCR_VISIBLE_DEVICES=0,1 in stdout, got: {}",
+            resp.stdout
+        );
+        assert!(
+            !resp.stdout.contains("CUDA=0,1"),
+            "AMD registry should not set CUDA_VISIBLE_DEVICES, got: {}",
+            resp.stdout
+        );
     }
 
     /// Helper: poll until the job is removed from `running` (by the monitor).
@@ -1527,7 +1737,11 @@ mod tests {
 
     #[tokio::test]
     async fn graceful_cancel_sigterm_responsive() {
-        let svc = AgentService::new(test_reporter(), HooksConfig::default());
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+        );
         svc.start_monitor("http://127.0.0.1:1".into());
 
         let job_id = 900;
@@ -1543,7 +1757,11 @@ mod tests {
 
     #[tokio::test]
     async fn graceful_cancel_escalates_to_sigkill() {
-        let svc = AgentService::new(test_reporter(), HooksConfig::default());
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+        );
         svc.start_monitor("http://127.0.0.1:1".into());
 
         let job_id = 901;
@@ -1586,7 +1804,11 @@ mod tests {
 
     #[tokio::test]
     async fn send_explicit_signal_kills_job() {
-        let svc = AgentService::new(test_reporter(), HooksConfig::default());
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+        );
         svc.start_monitor("http://127.0.0.1:1".into());
 
         let job_id = 902;

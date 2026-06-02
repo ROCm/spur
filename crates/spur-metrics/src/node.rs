@@ -90,7 +90,7 @@ impl NodeMetricsSnapshot {
             let total_memory_bytes = memory_mb_to_bytes(node.total_resources.memory_mb);
             let alloc_memory_bytes = memory_mb_to_bytes(node.alloc_resources.memory_mb);
             let total_gpus = u64::from(node.total_resources.total_gpus());
-            let alloc_gpus = u64::from(node.alloc_resources.total_gpus());
+            let alloc_gpus = node.alloc_resources.total_device_count("gpu");
 
             snap.total_cpus += total_cpus;
             snap.alloc_cpus += alloc_cpus;
@@ -126,7 +126,9 @@ impl NodeMetricsSnapshot {
 #[cfg(test)]
 mod tests {
     use spur_core::node::{Node, NodeState};
-    use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
+    use spur_core::resource::{
+        AllocatedDevice, GpuLinkType, GpuResource, ResourceAllocations, ResourceSet,
+    };
 
     use super::*;
 
@@ -134,7 +136,7 @@ mod tests {
         name: &str,
         state: NodeState,
         total: ResourceSet,
-        alloc: ResourceSet,
+        alloc: ResourceAllocations,
         cpu_load: u32,
         free_memory_mb: u64,
     ) -> Node {
@@ -144,6 +146,17 @@ mod tests {
         node.cpu_load = cpu_load;
         node.free_memory_mb = free_memory_mb;
         node
+    }
+
+    fn alloc_resources(cpus: u32, memory_mb: u64, gpu_count: u32) -> ResourceAllocations {
+        let mut alloc = ResourceAllocations::with_scalar(cpus, memory_mb);
+        if gpu_count > 0 {
+            alloc.devices.insert(
+                "gpu".into(),
+                (0..gpu_count).map(AllocatedDevice::injectable).collect(),
+            );
+        }
+        alloc
     }
 
     fn resources(cpus: u32, memory_mb: u64, gpu_count: u32) -> ResourceSet {
@@ -178,7 +191,7 @@ mod tests {
                 "b",
                 NodeState::Idle,
                 resources(8, 16384, 0),
-                ResourceSet::default(),
+                ResourceAllocations::default(),
                 0,
                 0,
             ),
@@ -186,7 +199,7 @@ mod tests {
                 "a",
                 NodeState::Allocated,
                 resources(8, 16384, 2),
-                resources(8, 8192, 2),
+                alloc_resources(8, 8192, 2),
                 10,
                 4096,
             ),
@@ -194,7 +207,7 @@ mod tests {
                 "c",
                 NodeState::Down,
                 resources(4, 8192, 0),
-                ResourceSet::default(),
+                ResourceAllocations::default(),
                 0,
                 0,
             ),

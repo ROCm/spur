@@ -131,12 +131,19 @@ impl SlurmAgent for VirtualAgent {
                 resource_requests.insert("memory".to_string(), Quantity(mem_str.clone()));
                 resource_limits.insert("memory".to_string(), Quantity(mem_str));
             }
-            let gpu_count = alloc.gpus.len() as u32;
+            let gpu_count = alloc
+                .devices
+                .get("gpu")
+                .map(|d| d.devices.len() as u32)
+                .unwrap_or(0);
             if gpu_count > 0 {
                 let gpu_str = gpu_count.to_string();
-                // Determine GPU vendor from allocated GPU type
-                let gpu_resource_key =
-                    gpu_vendor_resource_key(alloc.gpus.first().map(|g| g.gpu_type.as_str()));
+                let gpu_type = spec
+                    .gres
+                    .iter()
+                    .find_map(|g| spur_core::resource::parse_gres(g))
+                    .and_then(|(_, t, _)| t);
+                let gpu_resource_key = gpu_vendor_resource_key(gpu_type.as_deref());
                 resource_limits.insert(gpu_resource_key.to_string(), Quantity(gpu_str.clone()));
                 resource_requests.insert(gpu_resource_key.to_string(), Quantity(gpu_str));
             }
@@ -206,34 +213,37 @@ impl SlurmAgent for VirtualAgent {
         }
 
         // Set GPU vendor-specific env vars for the runtime
-        if let Some(ref alloc) = req.allocated {
-            if !alloc.gpus.is_empty() {
-                let gpu_type = alloc.gpus.first().map(|g| g.gpu_type.as_str());
-                if gpu_type.is_none_or(|t| !is_nvidia_gpu(t)) {
-                    // AMD/ROCm: set HIP and RCCL env vars
+        let gpu_count = req
+            .allocated
+            .as_ref()
+            .and_then(|a| a.devices.get("gpu"))
+            .map(|d| d.devices.len())
+            .unwrap_or(0);
+        if gpu_count > 0 {
+            let gpu_type = spec
+                .gres
+                .iter()
+                .find_map(|g| spur_core::resource::parse_gres(g))
+                .and_then(|(_, t, _)| t);
+            if gpu_type.as_deref().is_none_or(|t| !is_nvidia_gpu(t)) {
+                env_vars.push(EnvVar {
+                    name: "GPU_ENABLE_PAL".into(),
+                    value: Some("0".into()),
+                    ..Default::default()
+                });
+                if num_peers > 1 {
                     env_vars.push(EnvVar {
-                        name: "GPU_ENABLE_PAL".into(),
-                        value: Some("0".into()),
+                        name: "NCCL_SOCKET_IFNAME".into(),
+                        value: Some("eth0".into()),
                         ..Default::default()
                     });
-                    // RCCL (ROCm NCCL) uses the same env var names as NCCL
-                    if num_peers > 1 {
-                        env_vars.push(EnvVar {
-                            name: "NCCL_SOCKET_IFNAME".into(),
-                            value: Some("eth0".into()),
-                            ..Default::default()
-                        });
-                    }
-                } else {
-                    // NVIDIA: set CUDA-specific env vars
-                    if num_peers > 1 {
-                        env_vars.push(EnvVar {
-                            name: "NCCL_SOCKET_IFNAME".into(),
-                            value: Some("eth0".into()),
-                            ..Default::default()
-                        });
-                    }
                 }
+            } else if num_peers > 1 {
+                env_vars.push(EnvVar {
+                    name: "NCCL_SOCKET_IFNAME".into(),
+                    value: Some("eth0".into()),
+                    ..Default::default()
+                });
             }
         }
 
@@ -500,7 +510,7 @@ impl SlurmAgent for VirtualAgent {
     ) -> Result<Response<NodeResourcesResponse>, Status> {
         Ok(Response::new(NodeResourcesResponse {
             total: Some(ResourceSet::default()),
-            used: Some(ResourceSet::default()),
+            used: Some(spur_proto::proto::ResourceAllocations::default()),
         }))
     }
 

@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::job::{JobId, JobSpec, JobState};
 use crate::node::NodeState;
-use crate::resource::ResourceSet;
+use std::collections::HashMap;
+
+use crate::resource::{ResourceAllocations, ResourceSet};
 
 fn default_port() -> u16 {
     6818
@@ -27,7 +29,10 @@ pub enum WalOperation {
     JobStart {
         job_id: JobId,
         nodes: Vec<String>,
-        resources: ResourceSet,
+        resources: ResourceAllocations,
+        /// Per-node allocation slices (device IDs are node-local).
+        #[serde(default)]
+        per_node_alloc: HashMap<String, ResourceAllocations>,
     },
     JobComplete {
         job_id: JobId,

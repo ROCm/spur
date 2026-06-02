@@ -16,11 +16,6 @@ use spur_core::resource::ResourceSet;
 
 static NEXT_JOB_ID: AtomicU32 = AtomicU32::new(1);
 
-/// Reset the job ID counter (call at start of each test).
-pub fn reset_job_ids() {
-    NEXT_JOB_ID.store(1, Ordering::SeqCst);
-}
-
 /// Create a job with sensible defaults and auto-incrementing ID.
 pub fn make_job(name: &str) -> Job {
     let id = NEXT_JOB_ID.fetch_add(1, Ordering::SeqCst);

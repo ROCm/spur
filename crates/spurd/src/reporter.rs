@@ -1,15 +1,15 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
-use spur_core::resource::{GpuLinkType, ResourceSet};
+use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
+use spur_devices::{resolve_link_type, DeviceRegistry, LinkType};
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{RegisterAgentRequest, ResourceSet as ProtoResourceSet};
 use tracing::{debug, info, warn};
-
-use crate::gpu;
 
 /// Discovers and reports node resources to the controller.
 pub struct NodeReporter {
@@ -98,17 +98,79 @@ impl NodeReporter {
     }
 }
 
-/// Discover local node resources from sysfs / /proc.
-pub fn discover_resources() -> ResourceSet {
+/// Discover local node resources from sysfs / /proc + device registry.
+pub fn discover_resources(registry: &DeviceRegistry) -> ResourceSet {
     let cpus = discover_cpus();
     let memory_mb = discover_memory_mb();
-    let gpus = gpu::discover_gpus();
+    let gpus = gpus_from_registry(registry);
 
     ResourceSet {
         cpus,
         memory_mb,
         gpus,
-        ..Default::default()
+        generic: generic_from_registry(registry),
+    }
+}
+
+fn build_peer_gpus(links: Option<&[i32]>, gpu_device_ids: &[u32]) -> Vec<u32> {
+    let Some(links) = links else {
+        return Vec::new();
+    };
+    links
+        .iter()
+        .enumerate()
+        .filter_map(|(j, &w)| {
+            if w > 0 && j < gpu_device_ids.len() {
+                Some(gpu_device_ids[j])
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Convert injectable GPU registry entries to `GpuResource` for the scheduler.
+fn gpus_from_registry(registry: &DeviceRegistry) -> Vec<GpuResource> {
+    let gpu_entries: Vec<_> = registry
+        .list()
+        .iter()
+        .filter(|e| e.is_injectable() && e.gres_name == "gpu")
+        .collect();
+
+    let gpu_device_ids: Vec<u32> = gpu_entries.iter().map(|e| e.device_id).collect();
+
+    gpu_entries
+        .iter()
+        .map(|entry| GpuResource {
+            device_id: entry.device_id,
+            gpu_type: entry.resource_type.clone().unwrap_or_default(),
+            memory_mb: entry.memory_mb,
+            peer_gpus: build_peer_gpus(entry.links.as_deref(), &gpu_device_ids),
+            link_type: link_type_to_gpu(resolve_link_type(entry)),
+        })
+        .collect()
+}
+
+fn generic_from_registry(registry: &DeviceRegistry) -> HashMap<String, u64> {
+    let mut generic = HashMap::new();
+    for entry in registry.list() {
+        if !entry.is_countable_pool() {
+            continue;
+        }
+        let key = match &entry.resource_type {
+            Some(t) if !t.is_empty() => format!("{}:{}", entry.gres_name, t),
+            _ => entry.gres_name.clone(),
+        };
+        *generic.entry(key).or_insert(0) += entry.capacity;
+    }
+    generic
+}
+
+fn link_type_to_gpu(lt: LinkType) -> GpuLinkType {
+    match lt {
+        LinkType::Xgmi => GpuLinkType::XGMI,
+        LinkType::Nvlink => GpuLinkType::NVLink,
+        LinkType::Pcie => GpuLinkType::PCIe,
     }
 }
 
@@ -207,6 +269,34 @@ fn read_free_memory_mb() -> u64 {
     0
 }
 
+pub fn allocations_to_proto(
+    r: &spur_core::resource::ResourceAllocations,
+) -> spur_proto::proto::ResourceAllocations {
+    use std::collections::HashMap;
+    spur_proto::proto::ResourceAllocations {
+        cpus: r.cpus,
+        memory_mb: r.memory_mb,
+        devices: r
+            .devices
+            .iter()
+            .map(|(name, devs)| {
+                (
+                    name.clone(),
+                    spur_proto::proto::DeviceAllocations {
+                        devices: devs
+                            .iter()
+                            .map(|d| spur_proto::proto::AllocatedDevice {
+                                device_id: d.device_id,
+                                count: d.count,
+                            })
+                            .collect(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>(),
+    }
+}
+
 pub fn resource_to_proto(r: &ResourceSet) -> ProtoResourceSet {
     ProtoResourceSet {
         cpus: r.cpus,
@@ -233,6 +323,101 @@ pub fn resource_to_proto(r: &ResourceSet) -> ProtoResourceSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spur_devices::cdi::annotations;
+    use spur_devices::cdi::cache::CdiCache;
+    use spur_devices::cdi::spec::{CdiDevice, CdiSpec, ContainerEdits, DeviceNode};
+    use spur_devices::{DeviceRegistry, GresCache, GresEntry};
+
+    #[test]
+    fn test_gpus_from_registry_link_type() {
+        let spec = CdiSpec {
+            cdi_version: "0.6.0".into(),
+            kind: "amd.com/gpu".into(),
+            annotations: Default::default(),
+            devices: vec![CdiDevice {
+                name: "0".into(),
+                annotations: [
+                    (annotations::GPU_TYPE.into(), "mi300x".into()),
+                    (annotations::LINK_TYPE.into(), "xgmi".into()),
+                ]
+                .into(),
+                container_edits: Some(ContainerEdits {
+                    device_nodes: vec![DeviceNode {
+                        path: "/dev/dri/renderD128".into(),
+                        host_path: None,
+                        r#type: None,
+                        major: None,
+                        minor: None,
+                        file_mode: None,
+                        permissions: None,
+                        uid: None,
+                        gid: None,
+                    }],
+                    ..Default::default()
+                }),
+            }],
+            container_edits: None,
+        };
+
+        let mut cache = CdiCache::new();
+        cache.add_specs(&[spec]);
+        let mut reg = DeviceRegistry::new();
+        reg.populate(&cache, &GresCache::from_entries(&[]));
+
+        let gpus = gpus_from_registry(&reg);
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].link_type, GpuLinkType::XGMI);
+    }
+
+    #[test]
+    fn test_build_peer_gpus_from_links() {
+        let gpu_device_ids = [0, 1, 2, 3];
+        let links = [-1, 4, 4, 0];
+        assert_eq!(build_peer_gpus(Some(&links), &gpu_device_ids), vec![1, 2]);
+    }
+
+    #[test]
+    fn test_build_peer_gpus_none_links() {
+        let gpu_device_ids = [0, 1, 2];
+        assert!(build_peer_gpus(None, &gpu_device_ids).is_empty());
+    }
+
+    #[test]
+    fn test_gpus_from_registry_populates_peer_gpus() {
+        let mut reg = DeviceRegistry::new();
+        let gres_cache = GresCache::from_entries(&[GresEntry {
+            name: "gpu".into(),
+            file: Some("/dev/dri/renderD[128-130]".into()),
+            links: Some("-1,4,4,0".into()),
+            flags: vec!["amd_gpu_env".into()],
+            ..Default::default()
+        }]);
+        reg.populate(&CdiCache::new(), &gres_cache);
+
+        let gpus = gpus_from_registry(&reg);
+        assert_eq!(gpus.len(), 3);
+        for gpu in &gpus {
+            assert_eq!(gpu.peer_gpus, vec![1, 2]);
+        }
+    }
+
+    #[test]
+    fn test_gpus_from_registry_link_type_inferred_from_gres_links() {
+        let mut reg = DeviceRegistry::new();
+        let gres_cache = GresCache::from_entries(&[GresEntry {
+            name: "gpu".into(),
+            file: Some("/dev/dri/renderD[128-129]".into()),
+            links: Some("-1,4,4,0".into()),
+            flags: vec!["amd_gpu_env".into()],
+            ..Default::default()
+        }]);
+        reg.populate(&CdiCache::new(), &gres_cache);
+
+        let gpus = gpus_from_registry(&reg);
+        assert_eq!(gpus.len(), 2);
+        assert_eq!(gpus[0].link_type, GpuLinkType::XGMI);
+        assert_eq!(gpus[1].link_type, GpuLinkType::XGMI);
+    }
 
     #[test]
     fn test_parse_cpu_range() {
@@ -252,5 +437,21 @@ mod tests {
     fn test_discover_memory() {
         let mem = discover_memory_mb();
         assert!(mem > 0);
+    }
+
+    #[test]
+    fn test_discover_resources_includes_countable_gres() {
+        let mut reg = DeviceRegistry::new();
+        let gres_cache = GresCache::from_entries(&[GresEntry {
+            name: "bandwidth".into(),
+            r#type: Some("lustre".into()),
+            count: Some(4096),
+            flags: vec!["count_only".into()],
+            ..Default::default()
+        }]);
+        reg.populate(&CdiCache::new(), &gres_cache);
+
+        let resources = discover_resources(&reg);
+        assert_eq!(resources.generic.get("bandwidth:lustre"), Some(&4096));
     }
 }

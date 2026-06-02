@@ -20,6 +20,21 @@ message ResourceSet {
   map<string, uint64> generic = 4;  // licenses, etc.
 }
 
+message AllocatedDevice {
+  uint32 device_id = 1;
+  uint64 count = 2;
+}
+
+message DeviceAllocations {
+  repeated AllocatedDevice devices = 1;
+}
+
+message ResourceAllocations {
+  uint32 cpus = 1;
+  uint64 memory_mb = 2;
+  map<string, DeviceAllocations> devices = 3;
+}
+
 message GpuResource {
   uint32 device_id = 1;
   string gpu_type = 2;       // "mi300x", "h100"
@@ -170,7 +185,7 @@ message JobInfo {
   string stdout_path = 31;
   string stderr_path = 32;
 
-  ResourceSet resources = 40;
+  ResourceAllocations resources = 40;
   uint32 priority = 41;
   string qos = 42;
 
@@ -186,7 +201,7 @@ message NodeInfo {
   string partition = 4;
 
   ResourceSet total_resources = 10;
-  ResourceSet alloc_resources = 11;
+  ResourceAllocations alloc_resources = 11;
 
   string arch = 20;
   string os = 21;
@@ -434,7 +449,7 @@ message HeartbeatResponse {}
 message LaunchJobRequest {
   uint32 job_id = 1;
   JobSpec spec = 2;
-  ResourceSet allocated = 3;
+  ResourceAllocations allocated = 3;
   repeated string peer_nodes = 4;  // All nodes in this job's allocation
   uint32 task_offset = 5;          // This node's starting task index
   string target_node = 6;          // Which K8s/Spur node this dispatch targets
@@ -452,7 +467,7 @@ message AgentCancelJobRequest {
 
 message NodeResourcesResponse {
   ResourceSet total = 1;
-  ResourceSet used = 2;
+  ResourceAllocations used = 2;
 }
 
 message ExecInJobRequest {
@@ -495,6 +510,7 @@ message RunCommandRequest {
   uint32 gid = 3;
   string work_dir = 4;
   map<string, string> environment = 5;
+  uint32 job_id = 6;
 }
 
 message RunCommandResponse {
@@ -530,7 +546,7 @@ message RecordJobStartRequest {
   string user = 2;
   string account = 3;
   string partition = 4;
-  ResourceSet resources = 5;
+  ResourceAllocations resources = 5;
   google.protobuf.Timestamp start_time = 6;
 }
 

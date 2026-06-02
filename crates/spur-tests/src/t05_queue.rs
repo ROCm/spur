@@ -39,7 +39,6 @@ mod tests {
 
     #[test]
     fn t05_4_filter_by_state() {
-        reset_job_ids();
         let mut jobs = [
             make_job("pending1"),
             make_job("pending2"),
@@ -62,7 +61,6 @@ mod tests {
 
     #[test]
     fn t05_5_filter_by_user() {
-        reset_job_ids();
         let mut j1 = make_job("a");
         j1.spec.user = "alice".into();
         let mut j2 = make_job("b");
@@ -77,7 +75,6 @@ mod tests {
 
     #[test]
     fn t05_6_filter_by_partition() {
-        reset_job_ids();
         let mut j1 = make_job("a");
         j1.spec.partition = Some("gpu".into());
         let mut j2 = make_job("b");
@@ -99,7 +96,6 @@ mod tests {
     fn t05_7_pending_reason_displayed() {
         // Issue #90: initial pending reason is now None (not Priority).
         // The scheduler sets the actual reason after evaluating the job.
-        reset_job_ids();
         let job = make_job("test");
         assert_eq!(job.pending_reason.display(), "None");
     }
@@ -108,7 +104,6 @@ mod tests {
 
     #[test]
     fn t05_8_sort_by_priority() {
-        reset_job_ids();
         let mut j1 = make_job("low");
         j1.priority = 100;
         let mut j2 = make_job("high");
@@ -130,7 +125,6 @@ mod tests {
     fn t05_9_queue_excludes_terminal_jobs() {
         // Regression: spur queue showed completed/failed/cancelled jobs (#10 #22).
         // squeue should only show Pending and Running (not terminal states).
-        reset_job_ids();
         let mut jobs = [
             make_job("pending"),
             make_job("running"),
@@ -156,7 +150,6 @@ mod tests {
     #[test]
     fn t05_10_queue_all_flag_includes_terminal() {
         // With --all / -a flag, completed and failed jobs are also shown.
-        reset_job_ids();
         let mut jobs = [make_job("pending"), make_job("done")];
         jobs[1].transition(JobState::Running).unwrap();
         jobs[1].transition(JobState::Completed).unwrap();
@@ -168,7 +161,6 @@ mod tests {
     #[test]
     fn t05_11_cancelled_is_terminal_not_shown_by_default() {
         // Cancelled jobs must not appear in the default queue view.
-        reset_job_ids();
         let mut job = make_job("cancelled-job");
         job.transition(JobState::Cancelled).unwrap();
 

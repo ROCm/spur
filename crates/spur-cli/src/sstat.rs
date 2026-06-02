@@ -212,11 +212,10 @@ fn resolve_field(job: &spur_proto::proto::JobInfo, field: &StatField) -> String 
         }
         StatField::GpuAlloc => {
             if let Some(ref res) = job.resources {
-                if res.gpus.is_empty() {
-                    "0".into()
-                } else {
-                    res.gpus.len().to_string()
-                }
+                res.devices
+                    .get("gpu")
+                    .map(|d| d.devices.len().to_string())
+                    .unwrap_or_else(|| "0".into())
             } else {
                 "0".into()
             }

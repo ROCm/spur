@@ -4,7 +4,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::resource::ResourceSet;
+use crate::resource::{ResourceAllocations, ResourceSet};
 
 /// Node states matching Slurm's model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -222,7 +222,7 @@ pub struct Node {
     pub source: NodeSource,
 
     pub total_resources: ResourceSet,
-    pub alloc_resources: ResourceSet,
+    pub alloc_resources: ResourceAllocations,
 
     /// Node feature tags (e.g., "gpu", "nvme", "rack1") for --constraint matching.
     #[serde(default)]
@@ -268,7 +268,7 @@ impl Node {
             partitions: Vec::new(),
             source: NodeSource::default(),
             total_resources: resources,
-            alloc_resources: ResourceSet::default(),
+            alloc_resources: ResourceAllocations::default(),
             features: Vec::new(),
             arch: String::new(),
             os: String::new(),
@@ -287,9 +287,10 @@ impl Node {
         }
     }
 
-    /// Available (unallocated) resources.
-    pub fn available_resources(&self) -> ResourceSet {
-        self.total_resources.subtract(&self.alloc_resources)
+    /// Whether available inventory can satisfy a count-based request.
+    pub fn can_satisfy_request(&self, request: &ResourceSet) -> bool {
+        self.total_resources
+            .can_satisfy_with_allocated(&self.alloc_resources, request)
     }
 
     /// Whether this node can accept new work.
@@ -303,7 +304,7 @@ impl Node {
             return;
         }
 
-        if self.alloc_resources.cpus == 0 && self.alloc_resources.gpus.is_empty() {
+        if self.alloc_resources.cpus == 0 && !self.alloc_resources.has_devices() {
             self.state = NodeState::Idle;
         } else if self.alloc_resources.cpus >= self.total_resources.cpus {
             self.state = NodeState::Allocated;

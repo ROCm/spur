@@ -1,10 +1,13 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
+
 use spur_core::job::{Job, JobId};
 use spur_core::node::Node;
 use spur_core::partition::Partition;
 use spur_core::reservation::Reservation;
+use spur_core::resource::ResourceAllocations;
 use spur_core::topology::TopologyTree;
 
 /// An assignment of a job to one or more nodes.
@@ -12,6 +15,8 @@ use spur_core::topology::TopologyTree;
 pub struct Assignment {
     pub job_id: JobId,
     pub nodes: Vec<String>,
+    /// Controller-selected per-node resource allocation (real device IDs).
+    pub per_node_alloc: HashMap<String, ResourceAllocations>,
 }
 
 /// Cluster state visible to the scheduler.

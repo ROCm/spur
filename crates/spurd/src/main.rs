@@ -4,7 +4,6 @@
 mod agent_server;
 pub mod container;
 mod executor;
-mod gpu;
 mod landlock;
 pub mod pmi;
 mod reporter;
@@ -13,9 +12,12 @@ mod seccomp;
 use std::sync::Arc;
 
 use clap::Parser;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use spur_core::config::HooksConfig;
+use spur_core::config::SlurmConfig;
+use spur_devices::cdi::cache::CdiCache;
+use spur_devices::DeviceRegistry;
 
 use reporter::NodeReporter;
 
@@ -89,21 +91,22 @@ async fn main() -> anyhow::Result<()> {
         "spurd starting"
     );
 
-    // Load hooks config from spur.conf (best-effort: missing file is fine)
-    let hooks_config = match spur_core::config::SlurmConfig::load_from_file(&args.config) {
+    // Load config from spur.conf (best-effort: missing file is fine)
+    let config = match SlurmConfig::load_from_file(&args.config) {
         Ok(config) => {
             info!(path = %args.config.display(), "loaded spur.conf");
-            config.hooks
+            Some(config)
         }
         Err(e) => {
             warn!(
                 path = %args.config.display(),
                 error = %e,
-                "failed to load spur.conf, using default hooks config"
+                "failed to load spur.conf, using default config"
             );
-            HooksConfig::default()
+            None
         }
     };
+    let hooks_config = config.as_ref().map(|c| c.hooks.clone()).unwrap_or_default();
 
     // Background update check (non-blocking)
     spur_update::spawn_startup_check(
@@ -136,8 +139,15 @@ async fn main() -> anyhow::Result<()> {
         "node address detected"
     );
 
-    // Discover local resources
-    let resources = reporter::discover_resources();
+    // Initialize device registry (CDI cache, GRES config, and discovery).
+    let registry = init_device_registry(config.as_ref());
+    let registry = Arc::new(Mutex::new(registry));
+
+    // Discover local resources (CPU/memory from sysfs, GPUs from device registry)
+    let resources = {
+        let reg = registry.lock().await;
+        reporter::discover_resources(&reg)
+    };
     info!(
         cpus = resources.cpus,
         memory_mb = resources.memory_mb,
@@ -163,7 +173,8 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Start agent gRPC server (receives job launches from spurctld)
-    let agent_service = agent_server::AgentService::new(reporter.clone(), hooks_config);
+    let agent_service =
+        agent_server::AgentService::new(reporter.clone(), hooks_config, registry.clone());
     agent_service.start_monitor(args.controller.clone());
 
     let addr = args.listen.parse()?;
@@ -175,4 +186,38 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     Ok(())
+}
+
+fn init_device_registry(config: Option<&SlurmConfig>) -> DeviceRegistry {
+    let default_devices = spur_core::config::DevicesConfig::default();
+    let devices_config = config.map(|c| &c.devices).unwrap_or(&default_devices);
+
+    let cdi_cache = CdiCache::load(&devices_config.cdi_spec_dirs, devices_config.auto_detect);
+
+    let gres_entries: Vec<spur_devices::GresEntry> = devices_config
+        .gres
+        .iter()
+        .map(|g| spur_devices::GresEntry {
+            name: g.name.clone(),
+            r#type: g.r#type.clone(),
+            file: g.file.clone(),
+            multiple_files: g.multiple_files.clone(),
+            count: g.count,
+            cores: g.cores.clone(),
+            links: g.links.clone(),
+            flags: g.flags.clone(),
+        })
+        .collect();
+    let gres_cache = spur_devices::GresCache::from_entries(&gres_entries);
+
+    let mut registry = DeviceRegistry::new();
+    registry.populate(&cdi_cache, &gres_cache);
+
+    info!(
+        injectable_devices = registry.injectable_count(),
+        countable = registry.countable_count(),
+        "device registry initialized"
+    );
+
+    registry
 }

@@ -16,6 +16,7 @@ spur-update = { path = "../spur-update" }
 spur-net = { path = "../spur-net" }
 spur-sched = { path = "../spur-sched" }
 spur-spank = { path = "../spur-spank" }
+spur-devices = { path = "../spur-devices" }
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost-types = { workspace = true }

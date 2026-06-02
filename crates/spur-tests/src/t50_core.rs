@@ -18,14 +18,12 @@ mod tests {
 
     #[test]
     fn t50_1_job_initial_state_is_pending() {
-        reset_job_ids();
         let job = make_job("test");
         assert_job_state(&job, JobState::Pending);
     }
 
     #[test]
     fn t50_2_job_pending_to_running() {
-        reset_job_ids();
         let mut job = make_job("test");
         assert_transition_ok(&mut job, JobState::Running);
         assert_job_state(&job, JobState::Running);
@@ -33,7 +31,6 @@ mod tests {
 
     #[test]
     fn t50_3_job_running_to_completed() {
-        reset_job_ids();
         let mut job = make_job("test");
         assert_transition_ok(&mut job, JobState::Running);
         assert_transition_ok(&mut job, JobState::Completed);
@@ -43,7 +40,6 @@ mod tests {
 
     #[test]
     fn t50_4_job_running_to_failed() {
-        reset_job_ids();
         let mut job = make_job("test");
         assert_transition_ok(&mut job, JobState::Running);
         assert_transition_ok(&mut job, JobState::Failed);
@@ -52,7 +48,6 @@ mod tests {
 
     #[test]
     fn t50_5_job_pending_to_cancelled() {
-        reset_job_ids();
         let mut job = make_job("test");
         assert_transition_ok(&mut job, JobState::Cancelled);
         assert!(job.state.is_terminal());
@@ -60,7 +55,6 @@ mod tests {
 
     #[test]
     fn t50_6_job_running_to_timeout() {
-        reset_job_ids();
         let mut job = make_job("test");
         assert_transition_ok(&mut job, JobState::Running);
         assert_transition_ok(&mut job, JobState::Timeout);
@@ -69,7 +63,6 @@ mod tests {
 
     #[test]
     fn t50_7_job_running_to_node_fail() {
-        reset_job_ids();
         let mut job = make_job("test");
         assert_transition_ok(&mut job, JobState::Running);
         assert_transition_ok(&mut job, JobState::NodeFail);
@@ -78,7 +71,6 @@ mod tests {
 
     #[test]
     fn t50_8_job_running_to_preempted() {
-        reset_job_ids();
         let mut job = make_job("test");
         assert_transition_ok(&mut job, JobState::Running);
         assert_transition_ok(&mut job, JobState::Preempted);
@@ -87,7 +79,6 @@ mod tests {
 
     #[test]
     fn t50_9_job_running_to_suspended_and_back() {
-        reset_job_ids();
         let mut job = make_job("test");
         assert_transition_ok(&mut job, JobState::Running);
         assert_transition_ok(&mut job, JobState::Suspended);
@@ -97,14 +88,12 @@ mod tests {
 
     #[test]
     fn t50_10_invalid_pending_to_completed() {
-        reset_job_ids();
         let mut job = make_job("test");
         assert_transition_err(&mut job, JobState::Completed);
     }
 
     #[test]
     fn t50_11_invalid_completed_to_running() {
-        reset_job_ids();
         let mut job = make_job("test");
         assert_transition_ok(&mut job, JobState::Running);
         assert_transition_ok(&mut job, JobState::Completed);
@@ -113,7 +102,6 @@ mod tests {
 
     #[test]
     fn t50_12_invalid_pending_to_failed() {
-        reset_job_ids();
         let mut job = make_job("test");
         assert_transition_err(&mut job, JobState::Failed);
     }
@@ -122,7 +110,6 @@ mod tests {
 
     #[test]
     fn t50_15_path_resolve_job_id() {
-        reset_job_ids();
         let mut job = make_job("train");
         job.job_id = 42;
         assert_eq!(job.resolved_stdout(), "spur-42.out");
@@ -130,7 +117,6 @@ mod tests {
 
     #[test]
     fn t50_16_path_resolve_custom_pattern() {
-        reset_job_ids();
         let mut job = make_job("train");
         job.job_id = 42;
         job.spec.user = "bob".into();
@@ -140,7 +126,6 @@ mod tests {
 
     #[test]
     fn t50_17_path_resolve_node_pattern() {
-        reset_job_ids();
         let mut job = make_job("test");
         job.job_id = 10;
         job.allocated_nodes = vec!["gpu001".into()];
@@ -260,20 +245,27 @@ mod tests {
     }
 
     #[test]
-    fn t50_27_resource_subtract() {
+    fn t50_27_resource_alloc_subtract() {
+        use spur_core::resource::ResourceAllocations;
+
         let total = ResourceSet {
             cpus: 64,
             memory_mb: 256_000,
             ..Default::default()
         };
-        let used = ResourceSet {
-            cpus: 24,
-            memory_mb: 100_000,
+        let used = ResourceAllocations::with_scalar(24, 100_000);
+        let req = ResourceSet {
+            cpus: 40,
+            memory_mb: 156_000,
             ..Default::default()
         };
-        let avail = total.subtract(&used);
-        assert_eq!(avail.cpus, 40);
-        assert_eq!(avail.memory_mb, 156_000);
+        assert!(total.can_satisfy_with_allocated(&used, &req));
+        let too_much = ResourceSet {
+            cpus: 41,
+            memory_mb: 156_000,
+            ..Default::default()
+        };
+        assert!(!total.can_satisfy_with_allocated(&used, &too_much));
     }
 
     // ── T50.28: GRES parsing ──────────────────────────────────────
@@ -316,7 +308,6 @@ mod tests {
 
     #[test]
     fn t50_32_held_job_starts_pending() {
-        reset_job_ids();
         let job = Job::new(
             99,
             JobSpec {
@@ -335,7 +326,6 @@ mod tests {
 
     #[test]
     fn t50_33_requeue_from_timeout() {
-        reset_job_ids();
         let mut job = make_job("requeue-timeout");
         assert_transition_ok(&mut job, JobState::Running);
         assert_transition_ok(&mut job, JobState::Timeout);
@@ -351,7 +341,6 @@ mod tests {
 
     #[test]
     fn t50_34_requeue_from_preempted() {
-        reset_job_ids();
         let mut job = make_job("requeue-preempted");
         assert_transition_ok(&mut job, JobState::Running);
         assert_transition_ok(&mut job, JobState::Preempted);
@@ -366,7 +355,6 @@ mod tests {
 
     #[test]
     fn t50_35_requeue_from_node_fail() {
-        reset_job_ids();
         let mut job = make_job("requeue-nodefail");
         assert_transition_ok(&mut job, JobState::Running);
         assert_transition_ok(&mut job, JobState::NodeFail);
@@ -377,7 +365,6 @@ mod tests {
 
     #[test]
     fn t50_36_requeue_from_failed() {
-        reset_job_ids();
         let mut job = make_job("requeue-failed");
         assert_transition_ok(&mut job, JobState::Running);
         assert_transition_ok(&mut job, JobState::Failed);
@@ -388,7 +375,6 @@ mod tests {
 
     #[test]
     fn t50_37_requeue_from_completed_fails() {
-        reset_job_ids();
         let mut job = make_job("requeue-completed");
         assert_transition_ok(&mut job, JobState::Running);
         assert_transition_ok(&mut job, JobState::Completed);
@@ -468,7 +454,6 @@ mod tests {
 
     #[test]
     fn t50_42_requeue_from_cancelled_fails() {
-        reset_job_ids();
         let mut job = make_job("requeue-cancelled");
         assert_transition_ok(&mut job, JobState::Cancelled);
         // Cancelled → Pending should fail
@@ -546,7 +531,6 @@ mod tests {
 
     #[test]
     fn t50_50_het_job_fields_default_none() {
-        reset_job_ids();
         let job = make_job("het-test");
         assert!(job.het_job_id.is_none());
         assert!(job.het_group.is_none());
@@ -554,7 +538,6 @@ mod tests {
 
     #[test]
     fn t50_51_het_job_fields_set() {
-        reset_job_ids();
         let mut job = make_job("het-test");
         job.het_job_id = Some(100);
         job.het_group = Some(1);
@@ -1353,7 +1336,7 @@ address = "http://peer-a:6817"
         // which always returned true for nodes with enough total capacity,
         // even when alloc_resources consumed most of the node. Should use
         // available = total - alloc.
-        use spur_core::resource::ResourceSet;
+        use spur_core::resource::{ResourceAllocations, ResourceSet};
 
         let total = ResourceSet {
             cpus: 64,
@@ -1361,12 +1344,7 @@ address = "http://peer-a:6817"
             gpus: vec![],
             generic: std::collections::HashMap::new(),
         };
-        let alloc = ResourceSet {
-            cpus: 60,
-            memory_mb: 200000,
-            gpus: vec![],
-            generic: std::collections::HashMap::new(),
-        };
+        let alloc = ResourceAllocations::with_scalar(60, 200000);
         let required = ResourceSet {
             cpus: 32,
             memory_mb: 128000,
@@ -1374,14 +1352,10 @@ address = "http://peer-a:6817"
             generic: std::collections::HashMap::new(),
         };
 
-        // Total CAN satisfy (64 >= 32) — old buggy check would say "capable"
         assert!(total.can_satisfy(&required));
 
-        // Available = total - alloc = 4 cpus, 56000 MB — CANNOT satisfy
-        let available = total.subtract(&alloc);
-        assert_eq!(available.cpus, 4);
         assert!(
-            !available.can_satisfy(&required),
+            !total.can_satisfy_with_allocated(&alloc, &required),
             "available resources (4 cpus) should NOT satisfy requirement (32 cpus)"
         );
     }

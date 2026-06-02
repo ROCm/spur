@@ -87,6 +87,10 @@ pub struct SlurmConfig {
     /// Prolog/epilog hook scripts.
     #[serde(default)]
     pub hooks: HooksConfig,
+
+    /// Device discovery, CDI, and GRES configuration.
+    #[serde(default)]
+    pub devices: DevicesConfig,
 }
 
 /// Configuration for auto-update checking and self-update.
@@ -645,6 +649,73 @@ pub struct ClusterPeer {
     pub name: String,
     /// gRPC address of the peer controller (e.g., "http://peer-ctrl:6817").
     pub address: String,
+}
+
+/// Device discovery and CDI configuration.
+///
+/// `auto_detect` is AMD KFD sysfs only; other vendors need on-disk CDI specs or GRES
+/// `file` entries.
+///
+/// ```toml
+/// [devices]
+/// auto_detect = true
+/// cdi_spec_dirs = ["/opt/vendor/cdi"]
+///
+/// [[devices.gres]]
+/// name = "gpu"
+/// file = "/dev/dri/renderD[128-129]"
+/// flags = ["amd_gpu_env"]
+///
+/// [[devices.gres]]
+/// name = "bandwidth"
+/// type = "lustre"
+/// count = 4096
+/// flags = ["count_only"]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DevicesConfig {
+    /// Discover GPUs from KFD when the CDI cache is empty. AMD only for now.
+    #[serde(default = "default_true_fn")]
+    pub auto_detect: bool,
+
+    /// Additional directories to scan for CDI spec files, beyond the
+    /// defaults (`/etc/cdi`, `/var/run/cdi`).
+    #[serde(default)]
+    pub cdi_spec_dirs: Vec<String>,
+
+    /// File-based or countable GRES pools alongside CDI-discovered devices.
+    #[serde(default)]
+    pub gres: Vec<DevicesGresEntry>,
+}
+
+impl Default for DevicesConfig {
+    fn default() -> Self {
+        Self {
+            auto_detect: true,
+            cdi_spec_dirs: Vec::new(),
+            gres: Vec::new(),
+        }
+    }
+}
+
+/// A `[[devices.gres]]` entry (Slurm-compatible syntax).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DevicesGresEntry {
+    pub name: String,
+    #[serde(default)]
+    pub r#type: Option<String>,
+    #[serde(default)]
+    pub file: Option<String>,
+    #[serde(default)]
+    pub multiple_files: Option<String>,
+    #[serde(default)]
+    pub count: Option<u64>,
+    #[serde(default)]
+    pub cores: Option<String>,
+    #[serde(default)]
+    pub links: Option<String>,
+    #[serde(default)]
+    pub flags: Vec<String>,
 }
 
 impl SlurmConfig {

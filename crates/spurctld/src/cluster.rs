@@ -17,7 +17,7 @@ use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::Partition;
 use spur_core::qos::{check_qos_limits, QosCheckResult};
 use spur_core::reservation::Reservation;
-use spur_core::resource::ResourceSet;
+use spur_core::resource::{ResourceAllocations, ResourceSet};
 use spur_core::step::{JobStep, StepState, STEP_BATCH};
 use spur_core::wal::WalOperation;
 use spur_metrics::job::JobMetricsSnapshot;
@@ -270,8 +270,19 @@ impl ClusterManager {
         &self,
         job_id: JobId,
         node_names: Vec<String>,
-        resources: ResourceSet,
+        resources: ResourceAllocations,
+        per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
     ) -> anyhow::Result<()> {
+        for name in &node_names {
+            if !per_node_alloc.contains_key(name) {
+                anyhow::bail!(
+                    "job {}: per_node_alloc missing entry for node '{}'",
+                    job_id,
+                    name
+                );
+            }
+        }
+
         // Validate job exists and can transition
         let old_state;
         let spec_for_notify;
@@ -297,20 +308,19 @@ impl ClusterManager {
             job_id,
             nodes: node_names.clone(),
             resources: resources.clone(),
+            per_node_alloc: per_node_alloc.clone(),
         })?;
 
-        // Batch step creation (not WAL-tracked, recreated on apply)
         let node_count = node_names.len().max(1) as u32;
-        let per_node = ResourceSet {
-            cpus: resources.cpus / node_count,
-            memory_mb: resources.memory_mb / node_count as u64,
-            gpus: resources.gpus.clone(),
-            generic: resources
-                .generic
-                .iter()
-                .map(|(k, v)| (k.clone(), v / node_count as u64))
-                .collect(),
-        };
+        let per_node = node_names
+            .first()
+            .and_then(|n| per_node_alloc.get(n).cloned())
+            .unwrap_or_else(|| {
+                ResourceAllocations::with_scalar(
+                    resources.cpus / node_count,
+                    resources.memory_mb / node_count as u64,
+                )
+            });
         let batch_step = JobStep {
             job_id,
             step_id: STEP_BATCH,
@@ -841,7 +851,7 @@ impl ClusterManager {
                 .unwrap_or(state);
             // Drain with active allocations becomes Draining
             let effective = if requested == NodeState::Drain
-                && (node.alloc_resources.cpus > 0 || !node.alloc_resources.gpus.is_empty())
+                && (node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices())
             {
                 NodeState::Draining
             } else {
@@ -1255,7 +1265,7 @@ impl ClusterManager {
                 }
                 // Exclusive job needs an idle node (no current allocations)
                 if job.spec.exclusive
-                    && (n.alloc_resources.cpus > 0 || !n.alloc_resources.gpus.is_empty())
+                    && (n.alloc_resources.cpus > 0 || n.alloc_resources.has_devices())
                 {
                     return false;
                 }
@@ -1276,8 +1286,7 @@ impl ClusterManager {
                 // Check AVAILABLE resources (total minus already allocated),
                 // not just total capacity. This matches what the backfill
                 // scheduler actually does when trying to place a job.
-                let available = n.total_resources.subtract(&n.alloc_resources);
-                available.can_satisfy(&required)
+                n.can_satisfy_request(&required)
             });
 
             if !has_capable_node {
@@ -1484,6 +1493,7 @@ impl ClusterManager {
                         job.exit_code = None;
                         job.allocated_nodes.clear();
                         job.allocated_resources = None;
+                        job.per_node_alloc.clear();
                         job.pending_reason = PendingReason::None;
                     }
                 }
@@ -1492,28 +1502,27 @@ impl ClusterManager {
                 job_id,
                 nodes: node_names,
                 resources,
+                per_node_alloc,
             } => {
                 let spec = jobs.get(job_id).map(|j| j.spec.clone());
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.start_time = Some(timestamp);
                     job.allocated_nodes = node_names.clone();
                     job.allocated_resources = Some(resources.clone());
+                    job.per_node_alloc = per_node_alloc.clone();
                     job.pending_reason = PendingReason::None;
                 }
                 let node_count = node_names.len().max(1) as u32;
-                let per_node = ResourceSet {
-                    cpus: resources.cpus / node_count,
-                    memory_mb: resources.memory_mb / node_count as u64,
-                    gpus: resources.gpus.clone(),
-                    generic: resources
-                        .generic
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v / node_count as u64))
-                        .collect(),
-                };
                 for name in node_names {
                     if let Some(node) = nodes.get_mut(name) {
-                        node.alloc_resources = node.alloc_resources.add(&per_node);
+                        let slice = per_node_alloc.get(name).cloned().unwrap_or_else(|| {
+                            warn!(job_id = *job_id, node = %name, "per_node_alloc missing at allocation, using scalar fallback");
+                            ResourceAllocations::with_scalar(
+                                resources.cpus / node_count,
+                                resources.memory_mb / node_count as u64,
+                            )
+                        });
+                        node.alloc_resources.add(&slice);
                         node.update_state_from_alloc();
                     }
                 }
@@ -1552,12 +1561,24 @@ impl ClusterManager {
 
                     if let Some(ref total) = job.allocated_resources {
                         if !already_reported {
-                            deallocate_job_node(
-                                &mut nodes,
-                                total,
-                                job.allocated_nodes.len(),
-                                node_name,
-                            );
+                            let node_count = job.allocated_nodes.len().max(1) as u32;
+                            if let Some(node) = nodes.get_mut(node_name) {
+                                let slice = job.per_node_alloc.get(node_name).cloned().unwrap_or_else(|| {
+                                    warn!(job_id = *job_id, node = %node_name, "per_node_alloc missing at node deallocation, using scalar fallback");
+                                    ResourceAllocations::with_scalar(
+                                        total.cpus / node_count,
+                                        total.memory_mb / node_count as u64,
+                                    )
+                                });
+                                node.alloc_resources.subtract(&slice);
+                                node.update_state_from_alloc();
+                                if node.state == NodeState::Draining
+                                    && node.alloc_resources.cpus == 0
+                                    && !node.alloc_resources.has_devices()
+                                {
+                                    node.state = NodeState::Drain;
+                                }
+                            }
                         }
                     }
 
@@ -1643,12 +1664,33 @@ impl ClusterManager {
                     return ClientResponse::default();
                 }
                 // Deallocate node resources not already freed during COMPLETING
+                let per_node_map = jobs
+                    .get(job_id)
+                    .map(|j| j.per_node_alloc.clone())
+                    .unwrap_or_default();
                 if let Some(ref total) = allocated_resources {
+                    let node_count = freed_nodes.len().max(1) as u32;
                     for name in &freed_nodes {
                         if already_deallocated.iter().any(|n| n == name) {
                             continue;
                         }
-                        deallocate_job_node(&mut nodes, total, freed_nodes.len(), name);
+                        if let Some(node) = nodes.get_mut(name) {
+                            let slice = per_node_map.get(name).cloned().unwrap_or_else(|| {
+                                warn!(job_id = *job_id, node = %name, "per_node_alloc missing at deallocation, using scalar fallback");
+                                ResourceAllocations::with_scalar(
+                                    total.cpus / node_count,
+                                    total.memory_mb / node_count as u64,
+                                )
+                            });
+                            node.alloc_resources.subtract(&slice);
+                            node.update_state_from_alloc();
+                            if node.state == NodeState::Draining
+                                && node.alloc_resources.cpus == 0
+                                && !node.alloc_resources.has_devices()
+                            {
+                                node.state = NodeState::Drain;
+                            }
+                        }
                     }
                 }
                 drop(jobs);
@@ -1827,41 +1869,6 @@ impl StateMachineApply for ClusterManager {
     }
 }
 
-/// Extract license requirements from a job's GRES list.
-/// License GRES entries are formatted as "license:<name>:<count>" or "license:<name>".
-fn per_node_resources(total: &ResourceSet, node_count: usize) -> ResourceSet {
-    let node_count = node_count.max(1) as u32;
-    ResourceSet {
-        cpus: total.cpus / node_count,
-        memory_mb: total.memory_mb / node_count as u64,
-        gpus: total.gpus.clone(),
-        generic: total
-            .generic
-            .iter()
-            .map(|(k, v)| (k.clone(), v / node_count as u64))
-            .collect(),
-    }
-}
-
-fn deallocate_job_node(
-    nodes: &mut HashMap<String, Node>,
-    total: &ResourceSet,
-    node_count: usize,
-    node_name: &str,
-) {
-    let per_node = per_node_resources(total, node_count);
-    if let Some(node) = nodes.get_mut(node_name) {
-        node.alloc_resources = node.alloc_resources.subtract(&per_node);
-        node.update_state_from_alloc();
-        if node.state == NodeState::Draining
-            && node.alloc_resources.cpus == 0
-            && node.alloc_resources.gpus.is_empty()
-        {
-            node.state = NodeState::Drain;
-        }
-    }
-}
-
 fn extract_license_requirements(spec: &JobSpec) -> HashMap<String, u64> {
     let mut licenses = HashMap::new();
     for gres in &spec.gres {
@@ -1993,7 +2000,7 @@ mod tests {
 
     use super::*;
     use spur_core::job::JobSpec;
-    use spur_core::resource::ResourceSet;
+    use spur_core::resource::{ResourceAllocations, ResourceSet};
     use spur_metrics::job::JobMetricsSnapshot;
     use tempfile::TempDir;
 
@@ -2034,6 +2041,7 @@ mod tests {
             update: Default::default(),
             metrics: Default::default(),
             hooks: Default::default(),
+            devices: Default::default(),
         }
     }
 
@@ -2065,6 +2073,20 @@ mod tests {
             work_dir: "/tmp".into(),
             ..Default::default()
         }
+    }
+
+    fn scalar_alloc(cpus: u32, memory_mb: u64) -> ResourceAllocations {
+        ResourceAllocations::with_scalar(cpus, memory_mb)
+    }
+
+    fn per_node_for(
+        nodes: &[&str],
+        alloc: ResourceAllocations,
+    ) -> HashMap<String, ResourceAllocations> {
+        nodes
+            .iter()
+            .map(|n| ((*n).to_string(), alloc.clone()))
+            .collect()
     }
 
     /// Spin until a Raft-proposed mutation is visible in memory.
@@ -2166,15 +2188,12 @@ mod tests {
             spec: Box::new(basic_spec("j")),
         });
 
-        let resources = ResourceSet {
-            cpus: 4,
-            memory_mb: 8000,
-            ..Default::default()
-        };
+        let resources = scalar_alloc(4, 8000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["node1".into()],
             resources: resources.clone(),
+            per_node_alloc: per_node_for(&["node1"], resources),
         });
 
         let job = cm.get_job(1).unwrap();
@@ -2201,14 +2220,12 @@ mod tests {
             old_state: JobState::Pending,
             new_state: JobState::Running,
         });
+        let alloc = scalar_alloc(4, 8000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["node1".into()],
-            resources: ResourceSet {
-                cpus: 4,
-                memory_mb: 8000,
-                ..Default::default()
-            },
+            resources: alloc.clone(),
+            per_node_alloc: per_node_for(&["node1"], alloc),
         });
 
         cm.apply_operation(&WalOperation::JobComplete {
@@ -2330,13 +2347,14 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
         let job_id = submit_and_wait(&cm, basic_spec("lifecycle"));
 
-        let resources = ResourceSet {
-            cpus: 2,
-            memory_mb: 4000,
-            ..Default::default()
-        };
-        cm.start_job(job_id, vec!["worker1".into()], resources)
-            .unwrap();
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            resources.clone(),
+            per_node_for(&["worker1"], resources),
+        )
+        .unwrap();
         settle(&cm, job_id, JobState::Running);
 
         let job = cm.get_job(job_id).unwrap();
@@ -2372,14 +2390,12 @@ mod tests {
             old_state: JobState::Pending,
             new_state: JobState::Running,
         });
+        let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["worker1".into()],
-            resources: ResourceSet {
-                cpus: 2,
-                memory_mb: 4000,
-                ..Default::default()
-            },
+            resources: alloc.clone(),
+            per_node_alloc: per_node_for(&["worker1"], alloc),
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -2413,14 +2429,12 @@ mod tests {
             old_state: JobState::Pending,
             new_state: JobState::Running,
         });
+        let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
-            resources: ResourceSet {
-                cpus: 6,
-                memory_mb: 12000,
-                ..Default::default()
-            },
+            resources: scalar_alloc(6, 12000),
+            per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -2473,14 +2487,12 @@ mod tests {
             old_state: JobState::Pending,
             new_state: JobState::Running,
         });
+        let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into()],
-            resources: ResourceSet {
-                cpus: 4,
-                memory_mb: 8000,
-                ..Default::default()
-            },
+            resources: scalar_alloc(4, 8000),
+            per_node_alloc: per_node_for(&["n1", "n2"], alloc),
         });
 
         let r1 = cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -2518,14 +2530,12 @@ mod tests {
             old_state: JobState::Pending,
             new_state: JobState::Running,
         });
+        let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["worker1".into()],
-            resources: ResourceSet {
-                cpus: 2,
-                memory_mb: 4000,
-                ..Default::default()
-            },
+            resources: alloc.clone(),
+            per_node_alloc: per_node_for(&["worker1"], alloc),
         });
 
         let resp = cm.apply_operation(&WalOperation::JobComplete {
@@ -2554,14 +2564,12 @@ mod tests {
             old_state: JobState::Pending,
             new_state: JobState::Running,
         });
+        let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["worker1".into()],
-            resources: ResourceSet {
-                cpus: 2,
-                memory_mb: 4000,
-                ..Default::default()
-            },
+            resources: alloc.clone(),
+            per_node_alloc: per_node_for(&["worker1"], alloc),
         });
 
         let first = cm.apply_operation(&WalOperation::JobComplete {
@@ -2610,14 +2618,12 @@ mod tests {
             old_state: JobState::Pending,
             new_state: JobState::Running,
         });
+        let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
-            resources: ResourceSet {
-                cpus: 6,
-                memory_mb: 12000,
-                ..Default::default()
-            },
+            resources: scalar_alloc(6, 12000),
+            per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
@@ -2648,14 +2654,12 @@ mod tests {
             old_state: JobState::Pending,
             new_state: JobState::Running,
         });
+        let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
-            resources: ResourceSet {
-                cpus: 6,
-                memory_mb: 12000,
-                ..Default::default()
-            },
+            resources: scalar_alloc(6, 12000),
+            per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -2713,14 +2717,12 @@ mod tests {
             old_state: JobState::Pending,
             new_state: JobState::Running,
         });
+        let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
-            resources: ResourceSet {
-                cpus: 6,
-                memory_mb: 12000,
-                ..Default::default()
-            },
+            resources: scalar_alloc(6, 12000),
+            per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
@@ -2750,13 +2752,14 @@ mod tests {
         assert_eq!(m.total, 1);
         assert_eq!(m.count_state(JobState::Pending), 1);
 
-        let resources = ResourceSet {
-            cpus: 4,
-            memory_mb: 8192,
-            ..Default::default()
-        };
-        cm.start_job(job_id, vec!["worker1".into()], resources)
-            .unwrap();
+        let resources = scalar_alloc(4, 8192);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            resources.clone(),
+            per_node_for(&["worker1"], resources),
+        )
+        .unwrap();
         settle(&cm, job_id, JobState::Running);
 
         let m = cm.job_metrics();
@@ -2795,13 +2798,14 @@ mod tests {
         assert_eq!(m.per_node[1].name, "worker2");
 
         let job_id = submit_and_wait(&cm, basic_spec("node-metrics-job"));
-        let resources = ResourceSet {
-            cpus: 4,
-            memory_mb: 8192,
-            ..Default::default()
-        };
-        cm.start_job(job_id, vec!["worker1".into()], resources)
-            .unwrap();
+        let resources = scalar_alloc(4, 8192);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            resources.clone(),
+            per_node_for(&["worker1"], resources),
+        )
+        .unwrap();
         settle(&cm, job_id, JobState::Running);
 
         let m = cm.node_metrics();
@@ -2854,13 +2858,14 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
         let job_id = submit_and_wait(&cm, basic_spec("cancel-alloc"));
 
-        let resources = ResourceSet {
-            cpus: 2,
-            memory_mb: 4000,
-            ..Default::default()
-        };
-        cm.start_job(job_id, vec!["worker1".into()], resources)
-            .unwrap();
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            resources.clone(),
+            per_node_for(&["worker1"], resources),
+        )
+        .unwrap();
         settle(&cm, job_id, JobState::Running);
 
         let node = cm.get_node("worker1").unwrap();
@@ -2994,14 +2999,12 @@ mod tests {
 
         // Give the node an allocation so Drain becomes Draining
         let id = submit_and_wait(&cm, basic_spec("hold-job"));
+        let alloc = scalar_alloc(2, 4000);
         cm.start_job(
             id,
             vec!["locked".into()],
-            ResourceSet {
-                cpus: 2,
-                memory_mb: 4000,
-                ..Default::default()
-            },
+            alloc.clone(),
+            per_node_for(&["locked"], alloc),
         )
         .unwrap();
         settle(&cm, id, JobState::Running);
@@ -3062,14 +3065,12 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         let id = submit_and_wait(&cm, basic_spec("requeue-me"));
 
+        let alloc = scalar_alloc(2, 4000);
         cm.start_job(
             id,
             vec!["n1".into()],
-            ResourceSet {
-                cpus: 2,
-                memory_mb: 4000,
-                ..Default::default()
-            },
+            alloc.clone(),
+            per_node_for(&["n1"], alloc),
         )
         .unwrap();
         settle(&cm, id, JobState::Running);
@@ -3113,14 +3114,12 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         let id = submit_and_wait(&cm, basic_spec("dispatch-fail"));
 
+        let alloc = scalar_alloc(2, 4000);
         cm.start_job(
             id,
             vec!["n1".into()],
-            ResourceSet {
-                cpus: 2,
-                memory_mb: 4000,
-                ..Default::default()
-            },
+            alloc.clone(),
+            per_node_for(&["n1"], alloc),
         )
         .unwrap();
         settle(&cm, id, JobState::Running);
@@ -3154,8 +3153,8 @@ mod tests {
             "node CPUs must be freed after requeue"
         );
         assert!(
-            node.alloc_resources.gpus.is_empty(),
-            "node GPUs must be freed after requeue"
+            !node.alloc_resources.has_devices(),
+            "node devices must be freed after requeue"
         );
         assert_eq!(node.state, NodeState::Idle, "node should return to Idle");
     }

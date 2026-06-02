@@ -123,6 +123,20 @@ impl NodeAllocation {
         })
     }
 
+    /// Record controller-assigned device IDs as in-use.
+    pub fn record_gpus(&mut self, device_ids: &[u32]) -> bool {
+        for &id in device_ids {
+            let Some(idx) = self.gpus.iter().position(|g| g.device_id == id) else {
+                return false;
+            };
+            if self.gpu_allocated[idx] {
+                return false;
+            }
+            self.gpu_allocated[idx] = true;
+        }
+        true
+    }
+
     /// Release previously allocated resources.
     pub fn release(&mut self, alloc: &AllocationResult) {
         for &cpu in &alloc.cpu_ids {

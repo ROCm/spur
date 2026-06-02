@@ -689,7 +689,7 @@ impl SlurmController for ControllerService {
             state: spur_core::step::StepState::Running,
             num_tasks: req.num_tasks.max(1),
             cpus_per_task: req.cpus_per_task.max(1),
-            resources: spur_core::resource::ResourceSet::default(),
+            resources: spur_core::resource::ResourceAllocations::default(),
             nodes: job.allocated_nodes.clone(),
             distribution: spur_core::step::TaskDistribution::Block,
             start_time: Some(chrono::Utc::now()),
@@ -961,6 +961,7 @@ impl SlurmController for ControllerService {
                 gid: req.gid,
                 work_dir: req.work_dir,
                 environment: req.environment,
+                job_id: req.job_id,
             })
             .await
             .map_err(|e| Status::internal(format!("run_command failed: {}", e)))?
@@ -1284,7 +1285,7 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         exit_code: job.exit_code.unwrap_or(0),
         stdout_path: job.resolved_stdout(),
         stderr_path: job.resolved_stderr(),
-        resources: job.allocated_resources.as_ref().map(resource_to_proto),
+        resources: job.allocated_resources.as_ref().map(allocations_to_proto),
         priority: job.priority,
         qos: job.spec.qos.clone().unwrap_or_default(),
         array_job_id: job.spec.array_job_id.unwrap_or(0),
@@ -1299,7 +1300,7 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         state_reason: node.state_reason.clone().unwrap_or_default(),
         partition: node.partitions.first().cloned().unwrap_or_default(),
         total_resources: Some(resource_to_proto(&node.total_resources)),
-        alloc_resources: Some(resource_to_proto(&node.alloc_resources)),
+        alloc_resources: Some(allocations_to_proto(&node.alloc_resources)),
         arch: node.arch.clone(),
         os: node.os.clone(),
         cpu_load: node.cpu_load,
@@ -1337,6 +1338,61 @@ fn partition_to_proto(part: &spur_core::partition::Partition) -> PartitionInfo {
         allow_qos: part.allow_qos.join(","),
         preempt_mode: format!("{:?}", part.preempt_mode),
         priority_tier: part.priority_tier,
+    }
+}
+
+pub(crate) fn allocations_to_proto(
+    r: &spur_core::resource::ResourceAllocations,
+) -> spur_proto::proto::ResourceAllocations {
+    use std::collections::HashMap;
+    spur_proto::proto::ResourceAllocations {
+        cpus: r.cpus,
+        memory_mb: r.memory_mb,
+        devices: r
+            .devices
+            .iter()
+            .map(|(name, devs)| {
+                (
+                    name.clone(),
+                    spur_proto::proto::DeviceAllocations {
+                        devices: devs
+                            .iter()
+                            .map(|d| spur_proto::proto::AllocatedDevice {
+                                device_id: d.device_id,
+                                count: d.count,
+                            })
+                            .collect(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>(),
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn proto_to_allocations(
+    r: spur_proto::proto::ResourceAllocations,
+) -> spur_core::resource::ResourceAllocations {
+    use std::collections::HashMap;
+    spur_core::resource::ResourceAllocations {
+        cpus: r.cpus,
+        memory_mb: r.memory_mb,
+        devices: r
+            .devices
+            .into_iter()
+            .map(|(name, devs)| {
+                (
+                    name,
+                    devs.devices
+                        .into_iter()
+                        .map(|d| spur_core::resource::AllocatedDevice {
+                            device_id: d.device_id,
+                            count: d.count,
+                        })
+                        .collect(),
+                )
+            })
+            .collect::<HashMap<_, _>>(),
     }
 }
 

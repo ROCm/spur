@@ -9,7 +9,7 @@ use tracing::debug;
 use spur_core::job::{Job, JobId};
 use spur_core::node::Node;
 use spur_core::reservation::Reservation;
-use spur_core::resource::ResourceSet;
+use spur_core::resource::{build_exclusive_allocation, build_node_allocation, ResourceSet};
 
 use crate::timeline::NodeTimeline;
 use crate::traits::{Assignment, ClusterState, Scheduler};
@@ -100,7 +100,7 @@ impl BackfillScheduler {
                 }
                 // Exclusive job needs an idle node (no current allocations)
                 if job.spec.exclusive
-                    && (node.alloc_resources.cpus > 0 || !node.alloc_resources.gpus.is_empty())
+                    && (node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices())
                 {
                     return false;
                 }
@@ -169,21 +169,17 @@ impl Scheduler for BackfillScheduler {
 
         // Add current allocations to timelines
         for (i, node) in cluster.nodes.iter().enumerate() {
-            if node.alloc_resources.cpus > 0 || !node.alloc_resources.gpus.is_empty() {
-                // Existing allocations — we don't know their end time,
-                // so we use a conservative estimate. In practice, running jobs
-                // are tracked with actual time limits.
+            if node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices() {
                 self.timelines[i].reserve(
                     now,
-                    now + Duration::hours(24), // Conservative
+                    now + Duration::hours(24),
                     node.alloc_resources.clone(),
                 );
             }
-            // Debug: log alloc_resources.gpus for each node
             debug!(
                 node = %node.name,
                 alloc_cpus = node.alloc_resources.cpus,
-                alloc_gpus = node.alloc_resources.gpus.len(),
+                alloc_gpus = node.alloc_resources.total_device_count("gpu"),
                 "node allocation state"
             );
         }
@@ -317,16 +313,30 @@ impl Scheduler for BackfillScheduler {
 
             let earliest = assigned_nodes.iter().map(|(_, t)| *t).max().unwrap();
 
+            let mut per_node_alloc = HashMap::new();
+            for (ni, _) in &assigned_nodes {
+                let node = &cluster.nodes[*ni];
+                let node_alloc = if job.spec.exclusive {
+                    build_exclusive_allocation(&node.total_resources, required.memory_mb)
+                } else {
+                    let current = self.timelines[*ni].accumulated_at(now);
+                    build_node_allocation(&node.total_resources, &current, &required)
+                };
+                per_node_alloc.insert(node.name.clone(), node_alloc);
+            }
+
             if earliest <= now {
-                // Can start immediately
                 let node_names: Vec<String> = assigned_nodes
                     .iter()
                     .map(|(ni, _)| cluster.nodes[*ni].name.clone())
                     .collect();
 
-                // Reserve on timelines
                 for (ni, _) in &assigned_nodes {
-                    self.timelines[*ni].reserve(now, now + duration, required.clone());
+                    let node_alloc = per_node_alloc
+                        .get(&cluster.nodes[*ni].name)
+                        .cloned()
+                        .unwrap_or_default();
+                    self.timelines[*ni].reserve(now, now + duration, node_alloc);
                 }
 
                 debug!(
@@ -338,11 +348,15 @@ impl Scheduler for BackfillScheduler {
                 assignments.push(Assignment {
                     job_id: job.job_id,
                     nodes: node_names,
+                    per_node_alloc,
                 });
             } else {
-                // Create shadow reservation (blocks lower-priority backfill)
                 for (ni, _) in &assigned_nodes {
-                    self.timelines[*ni].reserve(earliest, earliest + duration, required.clone());
+                    let node_alloc = per_node_alloc
+                        .get(&cluster.nodes[*ni].name)
+                        .cloned()
+                        .unwrap_or_default();
+                    self.timelines[*ni].reserve(earliest, earliest + duration, node_alloc);
                 }
             }
         }
@@ -369,9 +383,10 @@ pub fn job_resource_request(job: &Job) -> ResourceSet {
         .or_else(|| job.spec.memory_per_cpu_mb.map(|m| m * cpus as u64))
         .unwrap_or(0);
 
-    // Parse GRES into GPU count for scheduling
+    // Parse GRES into GPU count and countable resources for scheduling
     let mut gpu_count = 0u32;
     let mut gpu_type = String::new();
+    let mut generic = HashMap::new();
     for gres in &job.spec.gres {
         if let Some((name, gtype, count)) = spur_core::resource::parse_gres(gres) {
             if name == "gpu" {
@@ -379,6 +394,17 @@ pub fn job_resource_request(job: &Job) -> ResourceSet {
                 if let Some(t) = gtype {
                     gpu_type = t;
                 }
+            } else if name == "license" {
+                // Cluster-wide licenses are enforced in spurctld (license_pool +
+                // extract_license_requirements), not per-node generic GRES. Putting
+                // them here would require every candidate node to carry license capacity.
+                continue;
+            } else {
+                let key = match gtype {
+                    Some(t) => format!("{}:{}", name, t),
+                    None => name,
+                };
+                *generic.entry(key).or_insert(0) += count as u64;
             }
         }
     }
@@ -402,7 +428,7 @@ pub fn job_resource_request(job: &Job) -> ResourceSet {
         cpus,
         memory_mb: memory,
         gpus,
-        ..Default::default()
+        generic,
     }
 }
 
@@ -412,6 +438,8 @@ mod tests {
     use spur_core::job::JobSpec;
     use spur_core::node::NodeState;
     use spur_core::partition::Partition;
+    use spur_core::resource::{GpuLinkType, GpuResource, ResourceAllocations};
+    use std::collections::HashSet;
 
     fn make_nodes(count: usize) -> Vec<Node> {
         (0..count)
@@ -489,6 +517,85 @@ mod tests {
 
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 2);
+    }
+
+    fn make_gpu_node(num_gpus: u32) -> Node {
+        let gpus = (0..num_gpus)
+            .map(|i| GpuResource {
+                device_id: i,
+                gpu_type: "mi300x".into(),
+                memory_mb: 192_000,
+                peer_gpus: vec![],
+                link_type: GpuLinkType::XGMI,
+            })
+            .collect();
+        let mut node = Node::new(
+            "gpu-node".into(),
+            ResourceSet {
+                cpus: 64,
+                memory_mb: 256_000,
+                gpus,
+                ..Default::default()
+            },
+        );
+        node.state = NodeState::Idle;
+        node.partitions = vec!["default".into()];
+        node
+    }
+
+    fn make_gpu_job(id: u32, gpu_count: u32) -> Job {
+        Job::new(
+            id,
+            JobSpec {
+                name: format!("job{}", id),
+                partition: Some("default".into()),
+                user: "test".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 4,
+                gres: vec![format!("gpu:{}", gpu_count)],
+                time_limit: Some(Duration::hours(1)),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn gpu_ids_from_assignment(assignment: &Assignment) -> HashSet<u32> {
+        assignment
+            .per_node_alloc
+            .values()
+            .flat_map(|alloc| alloc.device_ids("gpu"))
+            .collect()
+    }
+
+    #[test]
+    fn test_same_cycle_gpu_jobs_get_disjoint_device_ids() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = vec![make_gpu_node(8)];
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let pending = vec![make_gpu_job(1, 4), make_gpu_job(2, 4)];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 2);
+
+        let ids_a = gpu_ids_from_assignment(&assignments[0]);
+        let ids_b = gpu_ids_from_assignment(&assignments[1]);
+        assert_eq!(ids_a.len(), 4);
+        assert_eq!(ids_b.len(), 4);
+        assert!(
+            ids_a.is_disjoint(&ids_b),
+            "GPU IDs overlap: {ids_a:?} vs {ids_b:?}"
+        );
     }
 
     #[test]
@@ -896,15 +1003,9 @@ mod tests {
         let mut sched = BackfillScheduler::new(100);
         let mut nodes = make_nodes(3);
         // node001 heavily loaded, node002 medium, node003 empty
-        nodes[0].alloc_resources = ResourceSet {
-            cpus: 60,
-            ..Default::default()
-        };
+        nodes[0].alloc_resources = ResourceAllocations::with_scalar(60, 0);
         nodes[0].state = NodeState::Mixed;
-        nodes[1].alloc_resources = ResourceSet {
-            cpus: 30,
-            ..Default::default()
-        };
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(30, 0);
         nodes[1].state = NodeState::Mixed;
         // node003 is idle (default)
 
@@ -1102,5 +1203,25 @@ mod tests {
         assert_eq!(assignments.len(), 1);
         // node001 should be available since the reservation hasn't started
         // (scheduler picks by weight/time, node001 is a valid target)
+    }
+
+    #[test]
+    fn test_job_resource_request_includes_countable_gres() {
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "bandwidth-job".into(),
+                partition: Some("default".into()),
+                user: "test".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                gres: vec!["bandwidth:lustre:100".into()],
+                ..Default::default()
+            },
+        );
+
+        let request = job_resource_request(&job);
+        assert_eq!(request.generic.get("bandwidth:lustre"), Some(&100));
     }
 }

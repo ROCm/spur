@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 
-use crate::resource::ResourceSet;
+use crate::resource::ResourceAllocations;
 
 /// Unique job identifier assigned by the controller.
 pub type JobId = u32;
@@ -422,7 +422,10 @@ pub struct Job {
     pub end_time: Option<DateTime<Utc>>,
 
     pub allocated_nodes: Vec<String>,
-    pub allocated_resources: Option<ResourceSet>,
+    pub allocated_resources: Option<ResourceAllocations>,
+    /// Per-node allocation slices (for deallocation on job complete).
+    #[serde(default)]
+    pub per_node_alloc: HashMap<String, ResourceAllocations>,
 
     pub exit_code: Option<i32>,
 
@@ -471,6 +474,7 @@ impl Job {
             end_time: None,
             allocated_nodes: Vec::new(),
             allocated_resources: None,
+            per_node_alloc: HashMap::new(),
             exit_code: None,
             requeue_count: 0,
             het_job_id: None,

@@ -21,7 +21,6 @@ mod tests {
 
     #[test]
     fn t07_1_schedule_single_job() {
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(4, 64, 256_000);
         let partitions = vec![make_partition("default", 4)];
@@ -43,7 +42,6 @@ mod tests {
 
     #[test]
     fn t07_2_schedule_multiple_jobs() {
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(4, 64, 256_000);
         let partitions = vec![make_partition("default", 4)];
@@ -70,7 +68,6 @@ mod tests {
 
     #[test]
     fn t07_3_insufficient_nodes() {
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(2, 64, 256_000);
         let partitions = vec![make_partition("default", 2)];
@@ -89,7 +86,6 @@ mod tests {
 
     #[test]
     fn t07_4_insufficient_cpus() {
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(4, 32, 256_000); // Only 32 CPUs per node
         let partitions = vec![make_partition("default", 4)];
@@ -111,7 +107,6 @@ mod tests {
 
     #[test]
     fn t07_5_skip_down_nodes() {
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let mut nodes = make_nodes(4, 64, 256_000);
         nodes[0].state = NodeState::Down;
@@ -138,7 +133,6 @@ mod tests {
 
     #[test]
     fn t07_6_skip_drained_nodes() {
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let mut nodes = make_nodes(3, 64, 256_000);
         nodes[0].state = NodeState::Drain;
@@ -161,7 +155,6 @@ mod tests {
 
     #[test]
     fn t07_7_partition_filtering() {
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let mut nodes = make_nodes(4, 64, 256_000);
         // Only first 2 nodes in "gpu" partition
@@ -202,8 +195,12 @@ mod tests {
             },
         );
         let now = Utc::now();
-        let avail = tl.available_at(now);
-        assert_eq!(avail.cpus, 64);
+        let req = ResourceSet {
+            cpus: 64,
+            memory_mb: 256_000,
+            ..Default::default()
+        };
+        assert!(tl.can_satisfy_at(now, &req));
     }
 
     #[test]
@@ -220,18 +217,21 @@ mod tests {
         tl.reserve(
             now,
             now + Duration::hours(4),
-            ResourceSet {
-                cpus: 32,
-                memory_mb: 128_000,
-                ..Default::default()
-            },
+            spur_core::resource::ResourceAllocations::with_scalar(32, 128_000),
         );
 
-        let avail = tl.available_at(now + Duration::hours(1));
-        assert_eq!(avail.cpus, 32);
-
-        let avail = tl.available_at(now + Duration::hours(5));
-        assert_eq!(avail.cpus, 64);
+        let req32 = ResourceSet {
+            cpus: 32,
+            memory_mb: 128_000,
+            ..Default::default()
+        };
+        let req64 = ResourceSet {
+            cpus: 64,
+            memory_mb: 256_000,
+            ..Default::default()
+        };
+        assert!(tl.can_satisfy_at(now + Duration::hours(1), &req32));
+        assert!(tl.can_satisfy_at(now + Duration::hours(5), &req64));
     }
 
     #[test]
@@ -249,10 +249,7 @@ mod tests {
         tl.reserve(
             now,
             now + Duration::hours(4),
-            ResourceSet {
-                cpus: 48,
-                ..Default::default()
-            },
+            spur_core::resource::ResourceAllocations::with_scalar(48, 0),
         );
 
         let req = ResourceSet {
@@ -277,18 +274,12 @@ mod tests {
         tl.reserve(
             now - Duration::hours(2),
             now - Duration::hours(1),
-            ResourceSet {
-                cpus: 32,
-                ..Default::default()
-            },
+            spur_core::resource::ResourceAllocations::with_scalar(32, 0),
         );
         tl.reserve(
             now,
             now + Duration::hours(1),
-            ResourceSet {
-                cpus: 16,
-                ..Default::default()
-            },
+            spur_core::resource::ResourceAllocations::with_scalar(16, 0),
         );
 
         assert_eq!(tl.intervals.len(), 2);
@@ -308,7 +299,6 @@ mod tests {
 
     #[test]
     fn t07_13_exclusive_blocks_coscheduling() {
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let mut nodes = make_nodes(2, 64, 256_000);
         // Simulate node001 already having an allocation (partially used)
@@ -334,7 +324,6 @@ mod tests {
 
     #[test]
     fn t07_14_exclusive_no_idle_nodes() {
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let mut nodes = make_nodes(2, 64, 256_000);
         // Both nodes have allocations
@@ -361,7 +350,6 @@ mod tests {
 
     #[test]
     fn t07_15_non_exclusive_allows_mixed() {
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let mut nodes = make_nodes(2, 64, 256_000);
         // node001 partially allocated
@@ -387,7 +375,6 @@ mod tests {
 
     #[test]
     fn t07_16_constraint_filters_nodes() {
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let mut nodes = make_nodes(3, 64, 256_000);
         nodes[0].features = vec!["gpu".into(), "nvme".into()];
@@ -418,7 +405,6 @@ mod tests {
 
     #[test]
     fn t07_17_constraint_no_match() {
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let mut nodes = make_nodes(2, 64, 256_000);
         nodes[0].features = vec!["cpu_only".into()];
@@ -487,7 +473,6 @@ mod tests {
 
     #[test]
     fn t07_21_suspended_node_not_schedulable() {
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let mut nodes = make_nodes(2, 64, 256_000);
         // Suspend one node.
@@ -508,7 +493,6 @@ mod tests {
 
     #[test]
     fn t07_22_all_suspended_yields_no_assignments() {
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let mut nodes = make_nodes(2, 64, 256_000);
         nodes[0].state = NodeState::Suspended;
@@ -555,7 +539,6 @@ mod tests {
     #[test]
     fn t07_24_unreserved_job_skips_reserved_nodes() {
         // Regression: reserved nodes were allocated to non-reservation jobs (#27).
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(2, 64, 256_000);
         let partitions = vec![make_partition("default", 2)];
@@ -590,7 +573,6 @@ mod tests {
     #[test]
     fn t07_25_reserved_job_lands_on_reserved_node() {
         // A job that targets a reservation should be placed on reserved nodes.
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(2, 64, 256_000);
         let partitions = vec![make_partition("default", 2)];
@@ -626,7 +608,6 @@ mod tests {
     #[test]
     fn t07_26_no_reservations_all_nodes_available() {
         // Without any reservations all nodes are schedulable (baseline sanity).
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(4, 64, 256_000);
         let partitions = vec![make_partition("default", 4)];
@@ -647,7 +628,6 @@ mod tests {
     fn t07_27_num_nodes_zero_does_not_panic() {
         // Issue #56: A job with num_nodes=0 should be handled safely
         // instead of panicking on .max().unwrap() with empty iterator.
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(2, 64, 256_000);
         let partitions = vec![make_partition("default", 2)];
@@ -670,7 +650,6 @@ mod tests {
     fn t07_28_single_idle_node_schedules_immediately() {
         // Issue #56 regression: A single idle node with a single pending
         // job should result in immediate scheduling (no Reason=Priority).
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(1, 64, 256_000);
         let partitions = vec![make_partition("default", 1)];
@@ -695,7 +674,6 @@ mod tests {
     fn t07_29_constraint_mismatch_not_scheduled() {
         // Issue #56: A job with --constraint=gpu should NOT be scheduled
         // on a node without the "gpu" feature.
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(2, 64, 256_000); // nodes have NO features
         let partitions = vec![make_partition("default", 2)];
@@ -720,7 +698,6 @@ mod tests {
     fn t07_30_exclusive_job_needs_idle_node() {
         // Issue #56: An exclusive job should only schedule on a node
         // with zero current allocations.
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let mut nodes = make_nodes(2, 64, 256_000);
         // Node 1 has partial allocations
@@ -746,7 +723,6 @@ mod tests {
         // Issue #65: Jobs stuck PENDING with Reason=Priority when nodes
         // are fully allocated. Verify that a job requiring more resources
         // than available (total - alloc) is NOT scheduled.
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let mut nodes = make_nodes(1, 64, 256_000);
         // Node is nearly fully allocated (60 of 64 CPUs consumed)
@@ -776,7 +752,6 @@ mod tests {
     fn t07_32_partially_allocated_node_accepts_fitting_job() {
         // Issue #65 counterpart: a job that fits in the remaining resources
         // should still schedule.
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let mut nodes = make_nodes(1, 64, 256_000);
         // 32 CPUs already allocated, 32 still free
@@ -807,7 +782,6 @@ mod tests {
     fn t07_40_topology_block_keeps_nodes_in_same_switch() {
         // 8 nodes split across 2 racks (4 per rack).
         // A 4-node job with topology=block should get all nodes from one rack.
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let mut nodes = make_nodes(8, 64, 256_000);
         // Assign switch names to simulate two racks
@@ -874,7 +848,6 @@ mod tests {
     fn t07_41_topology_tree_prefers_same_switch() {
         // 8 nodes across 2 racks. A 2-node job with topology=tree
         // should prefer nodes from the same rack.
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(8, 64, 256_000);
         let partitions = vec![make_partition("default", 8)];
@@ -922,7 +895,6 @@ mod tests {
     fn t07_42_no_topology_ignores_switch_grouping() {
         // Without topology preference, nodes are selected by time/weight
         // regardless of switch grouping.
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(8, 64, 256_000);
         let partitions = vec![make_partition("default", 8)];
@@ -960,7 +932,6 @@ mod tests {
     #[test]
     fn t07_43_topology_spans_switches_when_needed() {
         // 4 nodes per rack, need 6 nodes — must span both racks.
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(8, 64, 256_000);
         let partitions = vec![make_partition("default", 8)];
@@ -1016,7 +987,6 @@ mod tests {
     #[test]
     fn t07_51_issue90_held_job_keeps_held_reason() {
         // Held jobs should still get PendingReason::Held
-        reset_job_ids();
         let id = 1;
         let job = Job::new(
             id,
@@ -1034,7 +1004,6 @@ mod tests {
     fn t07_52_issue90_job_schedules_on_idle_nodes() {
         // A simple job should schedule immediately on idle nodes,
         // not stay stuck in PENDING.
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(2, 64, 256_000);
         let partitions = vec![make_partition("default", 2)];
@@ -1056,7 +1025,6 @@ mod tests {
         // Container jobs should pass scheduling (resource check) the
         // same as non-container jobs — container_image doesn't affect
         // resource requirements.
-        reset_job_ids();
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(2, 64, 256_000);
         let partitions = vec![make_partition("default", 2)];

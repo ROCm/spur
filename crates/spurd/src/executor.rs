@@ -70,6 +70,8 @@ pub struct JobLaunchConfig {
     pub prolog_script: Option<String>,
     pub partition: String,
     pub nodelist: String,
+    /// Registry-based device injection plan for host (non-container) jobs.
+    pub host_device_plan: Option<spur_devices::inject::HostInjectionPlan>,
 }
 
 /// A running job process — either a tokio-managed child or a raw-forked container.
@@ -215,7 +217,7 @@ async fn spawn_job_process(
         ref stderr_path,
         cpus,
         memory_mb,
-        ref gpu_devices,
+        gpu_devices: _,
         ref cpu_ids,
         ref open_mode,
         uid,
@@ -334,38 +336,11 @@ async fn spawn_job_process(
     );
     env.insert("SPUR_CPUS_ON_NODE".into(), cpus.to_string());
 
-    // GPU isolation
-    if !gpu_devices.is_empty() {
-        let gpu_list: String = gpu_devices
-            .iter()
-            .map(|d| d.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        // Set for both AMD and NVIDIA
-        env.insert("ROCR_VISIBLE_DEVICES".into(), gpu_list.clone());
-        env.insert("CUDA_VISIBLE_DEVICES".into(), gpu_list.clone());
-        env.insert("GPU_DEVICE_ORDINAL".into(), gpu_list);
-        env.insert(
-            "SPUR_JOB_GPUS".into(),
-            gpu_devices
-                .iter()
-                .map(|d| d.to_string())
-                .collect::<Vec<_>>()
-                .join(","),
-        );
-    }
-    // When no GPUs are allocated but GRES was explicitly requested (gpu:0 or
-    // other GRES without gpu), hide all GPUs. When no GRES was requested at
-    // all, leave GPU visibility unchanged for backward compatibility.
-    // The caller (agent_server) should set SPUR_GRES_REQUESTED=1 when GRES is specified.
-    if gpu_devices.is_empty()
-        && env
-            .get("SPUR_GRES_REQUESTED")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    {
-        env.insert("ROCR_VISIBLE_DEVICES".into(), String::new());
-        env.insert("CUDA_VISIBLE_DEVICES".into(), String::new());
+    // GPU isolation via registry-based device injection plan.
+    if let Some(ref plan) = cfg.host_device_plan {
+        for (key, value) in &plan.env {
+            env.insert(key.clone(), value.clone());
+        }
     }
 
     // Environment-based CPU/thread limiting — works even without cgroups.
@@ -395,7 +370,12 @@ async fn spawn_job_process(
     let use_namespaces = nix::unistd::geteuid().is_root();
     let (launch_cmd, launch_args) = if use_namespaces {
         let wrapper_path = PathBuf::from(work_dir).join(format!(".spur_ns_{}.sh", job_id));
-        let wrapper = build_namespace_wrapper(uid, gid, gpu_devices, &script_path);
+        let visible_devices = cfg
+            .host_device_plan
+            .as_ref()
+            .map(|p| p.visible_devices.as_slice())
+            .unwrap_or(&[]);
+        let wrapper = build_namespace_wrapper(uid, gid, visible_devices, &script_path);
         tokio::fs::write(&wrapper_path, &wrapper).await?;
         #[cfg(unix)]
         {
@@ -868,13 +848,20 @@ async fn launch_container_job(
 /// the mounts silently no-op. Doing the drop inside the wrapper (after the
 /// mounts) keeps the unshare and mounts privileged while still landing the
 /// user payload as the unprivileged uid.
-fn build_namespace_wrapper(uid: u32, gid: u32, gpu_devices: &[u32], script_path: &Path) -> String {
-    let gpu_mounts = gpu_devices
+fn build_namespace_wrapper(
+    uid: u32,
+    gid: u32,
+    visible_device_paths: &[String],
+    script_path: &Path,
+) -> String {
+    let gpu_mounts = visible_device_paths
         .iter()
-        .map(|id| {
+        .filter(|p| p.starts_with("/dev/dri/"))
+        .map(|path| {
+            let basename = path.rsplit('/').next().unwrap_or("");
             format!(
-                "  if [ -e $SPUR_HOST_DRI/renderD{r} ]; then\n    cp -a $SPUR_HOST_DRI/renderD{r} /dev/dri/renderD{r} 2>/dev/null || true\n  fi\n",
-                r = 128 + id,
+                "  if [ -e $SPUR_HOST_DRI/{b} ]; then\n    cp -a $SPUR_HOST_DRI/{b} /dev/dri/{b} 2>/dev/null || true\n  fi\n",
+                b = basename,
             )
         })
         .collect::<Vec<_>>()
@@ -1058,18 +1045,33 @@ mod tests {
         );
     }
 
-    /// GPU device restriction lines are emitted for each allocated device.
+    /// GPU device restriction lines are emitted for each allocated DRI device.
     #[test]
     fn test_namespace_wrapper_gpu_mounts() {
         let script = PathBuf::from("/work/.spur_job_1.sh");
-        let wrapper = build_namespace_wrapper(1000, 1000, &[0, 2], &script);
+        let paths = vec!["/dev/dri/renderD128".into(), "/dev/dri/renderD130".into()];
+        let wrapper = build_namespace_wrapper(1000, 1000, &paths, &script);
 
-        // Only allocated GPUs (renderD128 for id 0, renderD130 for id 2) get
-        // copied back into the tmpfs-masked /dev/dri.
         assert!(wrapper.contains("renderD128"));
         assert!(wrapper.contains("renderD130"));
-        // Must not include unallocated devices.
         assert!(!wrapper.contains("renderD129"));
         assert!(!wrapper.contains("renderD131"));
+    }
+
+    /// Non-DRI paths (e.g. /dev/nvidia*) are skipped — they can't be isolated
+    /// via the /dev/dri tmpfs trick; env vars handle visibility instead.
+    #[test]
+    fn test_namespace_wrapper_ignores_non_dri_paths() {
+        let script = PathBuf::from("/work/.spur_job_5.sh");
+        let paths = vec![
+            "/dev/nvidia0".into(),
+            "/dev/nvidiactl".into(),
+            "/dev/nvidia-uvm".into(),
+            "/dev/dri/renderD128".into(),
+        ];
+        let wrapper = build_namespace_wrapper(1000, 1000, &paths, &script);
+
+        assert!(wrapper.contains("renderD128"));
+        assert!(!wrapper.contains("nvidia"));
     }
 }

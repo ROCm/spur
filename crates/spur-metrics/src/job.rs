@@ -54,7 +54,7 @@ impl JobMetricsSnapshot {
                 if let Some(ref alloc) = job.allocated_resources {
                     snap.running_cpus += u64::from(alloc.cpus);
                     snap.running_memory_bytes += alloc.memory_mb.saturating_mul(1024 * 1024);
-                    snap.running_gpus += u64::from(alloc.total_gpus());
+                    snap.running_gpus += alloc.total_device_count("gpu");
                 }
             }
         }
@@ -71,7 +71,7 @@ impl JobMetricsSnapshot {
 mod tests {
     use chrono::Utc;
     use spur_core::job::{Job, JobSpec, JobState, PendingReason};
-    use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
+    use spur_core::resource::{AllocatedDevice, ResourceAllocations};
 
     use super::*;
 
@@ -88,22 +88,14 @@ mod tests {
         let mut job = Job::new(id, JobSpec::default());
         job.state = JobState::Running;
         job.start_time = Some(Utc::now());
-        let mut gpus = Vec::new();
-        for i in 0..gpu_count {
-            gpus.push(GpuResource {
-                device_id: i,
-                gpu_type: "mi300x".into(),
-                memory_mb: 0,
-                peer_gpus: vec![],
-                link_type: GpuLinkType::XGMI,
-            });
+        let mut alloc = ResourceAllocations::with_scalar(cpus, memory_mb);
+        if gpu_count > 0 {
+            alloc.devices.insert(
+                "gpu".into(),
+                (0..gpu_count).map(AllocatedDevice::injectable).collect(),
+            );
         }
-        job.allocated_resources = Some(ResourceSet {
-            cpus,
-            memory_mb,
-            gpus,
-            generic: Default::default(),
-        });
+        job.allocated_resources = Some(alloc);
         job
     }
 

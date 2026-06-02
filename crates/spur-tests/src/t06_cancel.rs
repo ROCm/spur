@@ -15,7 +15,6 @@ mod tests {
 
     #[test]
     fn t06_1_cancel_pending() {
-        reset_job_ids();
         let mut job = make_job("test");
         assert_transition_ok(&mut job, JobState::Cancelled);
         assert!(job.state.is_terminal());
@@ -25,7 +24,6 @@ mod tests {
 
     #[test]
     fn t06_2_cancel_running() {
-        reset_job_ids();
         let mut job = make_job("test");
         assert_transition_ok(&mut job, JobState::Running);
         assert_transition_ok(&mut job, JobState::Cancelled);
@@ -36,7 +34,6 @@ mod tests {
 
     #[test]
     fn t06_3_cannot_cancel_completed() {
-        reset_job_ids();
         let mut job = make_job("test");
         assert_transition_ok(&mut job, JobState::Running);
         assert_transition_ok(&mut job, JobState::Completed);
@@ -65,7 +62,6 @@ mod tests {
 
     #[test]
     fn t06_5_held_not_schedulable() {
-        reset_job_ids();
         let mut held = make_job("held");
         held.pending_reason = PendingReason::Held;
         held.priority = 0;

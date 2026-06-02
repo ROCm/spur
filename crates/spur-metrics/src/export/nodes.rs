@@ -202,7 +202,7 @@ mod tests {
 
         let mut n2 = Node::new("node-b".into(), resources(4, 8192, 0));
         n2.state = NodeState::Allocated;
-        n2.alloc_resources = resources(2, 4096, 0);
+        n2.alloc_resources = spur_core::resource::ResourceAllocations::with_scalar(2, 4096);
 
         let snap = NodeMetricsSnapshot::collect([&n1, &n2]);
         let body = encode_nodes_metrics_with_format(&snap, MetricsExpositionFormat::Slurm_0_0_4);

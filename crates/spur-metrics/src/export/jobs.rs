@@ -80,7 +80,7 @@ mod tests {
     use super::*;
     use crate::job::JobMetricsSnapshot;
     use spur_core::job::{Job, JobSpec, JobState, PendingReason};
-    use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
+    use spur_core::resource::{AllocatedDevice, ResourceAllocations};
 
     fn sample_snapshot() -> JobMetricsSnapshot {
         let jobs = [
@@ -98,27 +98,15 @@ mod tests {
             {
                 let mut j = Job::new(3, JobSpec::default());
                 j.state = JobState::Running;
-                j.allocated_resources = Some(ResourceSet {
-                    cpus: 4,
-                    memory_mb: 8192,
-                    gpus: vec![
-                        GpuResource {
-                            device_id: 0,
-                            gpu_type: "mi300x".into(),
-                            memory_mb: 0,
-                            peer_gpus: vec![],
-                            link_type: GpuLinkType::XGMI,
-                        },
-                        GpuResource {
-                            device_id: 1,
-                            gpu_type: "mi300x".into(),
-                            memory_mb: 0,
-                            peer_gpus: vec![],
-                            link_type: GpuLinkType::XGMI,
-                        },
+                let mut alloc = ResourceAllocations::with_scalar(4, 8192);
+                alloc.devices.insert(
+                    "gpu".into(),
+                    vec![
+                        AllocatedDevice::injectable(0),
+                        AllocatedDevice::injectable(1),
                     ],
-                    generic: Default::default(),
-                });
+                );
+                j.allocated_resources = Some(alloc);
                 j
             },
             {

@@ -5,7 +5,7 @@
 
 use spur_core::config::MetricsExpositionFormat;
 use spur_core::node::{Node, NodeState};
-use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
+use spur_core::resource::{GpuLinkType, GpuResource, ResourceAllocations, ResourceSet};
 use spur_metrics::node::NodeMetricsSnapshot;
 use spur_metrics::{
     encode_nodes_metrics, encode_nodes_metrics_with_format, node_state_metric_suffix,
@@ -94,7 +94,7 @@ fn sample_snapshot() -> NodeMetricsSnapshot {
 
     let mut n2 = Node::new("node-b".into(), resources(4, 8192, 0));
     n2.state = NodeState::Allocated;
-    n2.alloc_resources = resources(2, 4096, 0);
+    n2.alloc_resources = ResourceAllocations::with_scalar(2, 4096);
 
     NodeMetricsSnapshot::collect([&n1, &n2])
 }

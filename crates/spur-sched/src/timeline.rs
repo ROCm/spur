@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use chrono::{DateTime, Duration, Utc};
-use spur_core::resource::ResourceSet;
+use spur_core::resource::{ResourceAllocations, ResourceSet};
 
 /// Per-node resource timeline for backfill scheduling.
 ///
@@ -20,7 +20,7 @@ pub struct NodeTimeline {
 pub struct Interval {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
-    pub resources: ResourceSet,
+    pub resources: ResourceAllocations,
 }
 
 impl NodeTimeline {
@@ -32,22 +32,20 @@ impl NodeTimeline {
         }
     }
 
-    /// Get available resources at a specific time.
-    pub fn available_at(&self, time: DateTime<Utc>) -> ResourceSet {
-        let mut used = ResourceSet::default();
+    pub fn accumulated_at(&self, time: DateTime<Utc>) -> ResourceAllocations {
+        let mut used = ResourceAllocations::default();
         for interval in &self.intervals {
             if interval.start <= time && time < interval.end {
-                used.cpus += interval.resources.cpus;
-                used.memory_mb += interval.resources.memory_mb;
-                // Accumulate GPU allocations so subtract() can remove them by device_id.
-                for gpu in &interval.resources.gpus {
-                    if !used.gpus.iter().any(|g| g.device_id == gpu.device_id) {
-                        used.gpus.push(gpu.clone());
-                    }
-                }
+                used.add(&interval.resources);
             }
         }
-        self.total.subtract(&used)
+        used
+    }
+
+    /// Whether the request can be satisfied at a specific time.
+    pub fn can_satisfy_at(&self, time: DateTime<Utc>, request: &ResourceSet) -> bool {
+        let used = self.accumulated_at(time);
+        self.total.can_satisfy_with_allocated(&used, request)
     }
 
     /// Find the earliest time at which `request` resources are available
@@ -59,32 +57,21 @@ impl NodeTimeline {
         after: DateTime<Utc>,
     ) -> DateTime<Utc> {
         let mut candidate = after;
-        let max_check = after + Duration::days(365); // Safety bound
+        let max_check = after + Duration::days(365);
 
         loop {
             if candidate > max_check {
                 return max_check;
             }
 
-            let available = self.available_at(candidate);
-            if available.can_satisfy(request) {
-                // Check that resources remain available for the full duration
+            if self.can_satisfy_at(candidate, request) {
                 let end = candidate + duration;
                 let mut ok = true;
                 for interval in &self.intervals {
                     if interval.start < end && interval.end > candidate {
-                        // This interval overlaps our proposed window
-                        let mut total_used = ResourceSet::default();
-                        total_used.cpus += interval.resources.cpus;
-                        total_used.memory_mb += interval.resources.memory_mb;
-                        for gpu in &interval.resources.gpus {
-                            if !total_used.gpus.iter().any(|g| g.device_id == gpu.device_id) {
-                                total_used.gpus.push(gpu.clone());
-                            }
-                        }
-                        let avail = self.total.subtract(&total_used);
-                        if !avail.can_satisfy(request) {
-                            // Move candidate past this interval
+                        let mut used = ResourceAllocations::default();
+                        used.add(&interval.resources);
+                        if !self.total.can_satisfy_with_allocated(&used, request) {
                             candidate = interval.end;
                             ok = false;
                             break;
@@ -95,7 +82,6 @@ impl NodeTimeline {
                     return candidate;
                 }
             } else {
-                // Find the next interval end time to try
                 let next_end = self
                     .intervals
                     .iter()
@@ -104,20 +90,24 @@ impl NodeTimeline {
                     .min();
                 match next_end {
                     Some(t) => candidate = t,
-                    None => return candidate, // No more intervals, resources should be free
+                    None => return candidate,
                 }
             }
         }
     }
 
     /// Reserve resources on this node for a time window.
-    pub fn reserve(&mut self, start: DateTime<Utc>, end: DateTime<Utc>, resources: ResourceSet) {
+    pub fn reserve(
+        &mut self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        resources: ResourceAllocations,
+    ) {
         self.intervals.push(Interval {
             start,
             end,
             resources,
         });
-        // Keep sorted by start time
         self.intervals.sort_by_key(|i| i.start);
     }
 
@@ -137,7 +127,7 @@ impl NodeTimeline {
 mod tests {
     use super::*;
     use chrono::Duration;
-    use spur_core::resource::GpuResource;
+    use spur_core::resource::{AllocatedDevice, GpuResource};
 
     fn make_timeline() -> NodeTimeline {
         NodeTimeline::new(
@@ -175,9 +165,12 @@ mod tests {
     fn test_empty_timeline() {
         let tl = make_timeline();
         let now = Utc::now();
-        let avail = tl.available_at(now);
-        assert_eq!(avail.cpus, 64);
-        assert_eq!(avail.memory_mb, 256_000);
+        let req = ResourceSet {
+            cpus: 64,
+            memory_mb: 256_000,
+            ..Default::default()
+        };
+        assert!(tl.can_satisfy_at(now, &req));
     }
 
     #[test]
@@ -187,20 +180,23 @@ mod tests {
         tl.reserve(
             now,
             now + Duration::hours(4),
-            ResourceSet {
-                cpus: 32,
-                memory_mb: 128_000,
-                ..Default::default()
-            },
+            ResourceAllocations::with_scalar(32, 128_000),
         );
 
-        let avail = tl.available_at(now + Duration::hours(1));
-        assert_eq!(avail.cpus, 32);
-        assert_eq!(avail.memory_mb, 128_000);
+        let req_full = ResourceSet {
+            cpus: 64,
+            memory_mb: 256_000,
+            ..Default::default()
+        };
+        assert!(!tl.can_satisfy_at(now + Duration::hours(1), &req_full));
 
-        // After reservation ends
-        let avail = tl.available_at(now + Duration::hours(5));
-        assert_eq!(avail.cpus, 64);
+        let req_partial = ResourceSet {
+            cpus: 32,
+            memory_mb: 128_000,
+            ..Default::default()
+        };
+        assert!(tl.can_satisfy_at(now + Duration::hours(1), &req_partial));
+        assert!(tl.can_satisfy_at(now + Duration::hours(5), &req_full));
     }
 
     #[test]
@@ -208,25 +204,18 @@ mod tests {
         let mut tl = make_timeline();
         let now = Utc::now();
 
-        // Reserve 48 CPUs for 4 hours
         tl.reserve(
             now,
             now + Duration::hours(4),
-            ResourceSet {
-                cpus: 48,
-                memory_mb: 0,
-                ..Default::default()
-            },
+            ResourceAllocations::with_scalar(48, 0),
         );
 
-        // Request 32 CPUs for 2 hours - should fit now (64-48=16 < 32, so must wait)
         let req = ResourceSet {
             cpus: 32,
             memory_mb: 0,
             ..Default::default()
         };
         let start = tl.earliest_start(&req, Duration::hours(2), now);
-        // Should start after the reservation ends
         assert!(start >= now + Duration::hours(4));
     }
 
@@ -235,32 +224,13 @@ mod tests {
         let mut tl = make_gpu_timeline(8);
         let now = Utc::now();
 
-        // Reserve all 8 GPUs (simulating job 13 with 8 GPUs on gpu-2)
-        let all_gpus: Vec<GpuResource> = (0..8)
-            .map(|i| GpuResource {
-                device_id: i as u32,
-                gpu_type: "mi355x".into(),
-                memory_mb: 192_000,
-                peer_gpus: vec![],
-                link_type: spur_core::resource::GpuLinkType::PCIe,
-            })
-            .collect();
-        tl.reserve(
-            now,
-            now + Duration::hours(4),
-            ResourceSet {
-                cpus: 8,
-                memory_mb: 0,
-                gpus: all_gpus,
-                ..Default::default()
-            },
+        let mut alloc = ResourceAllocations::with_scalar(8, 0);
+        alloc.devices.insert(
+            "gpu".into(),
+            (0u32..8).map(AllocatedDevice::injectable).collect(),
         );
+        tl.reserve(now, now + Duration::hours(4), alloc);
 
-        // Now try to schedule a job needing 4 GPUs - should see 0 available
-        let avail = tl.available_at(now + Duration::minutes(1));
-        assert_eq!(avail.gpus.len(), 0, "all GPUs should be allocated");
-
-        // Request 4 GPUs - should not be satisfiable now
         let req = ResourceSet {
             cpus: 4,
             memory_mb: 0,
@@ -275,10 +245,7 @@ mod tests {
                 .collect(),
             ..Default::default()
         };
-        assert!(
-            !avail.can_satisfy(&req),
-            "should not schedule when GPUs are full"
-        );
+        assert!(!tl.can_satisfy_at(now + Duration::minutes(1), &req));
     }
 
     #[test]
@@ -286,28 +253,27 @@ mod tests {
         let mut tl = make_gpu_timeline(8);
         let now = Utc::now();
 
-        // Reserve 4 GPUs (devices 0-3)
-        let half_gpus: Vec<GpuResource> = (0..4)
-            .map(|i| GpuResource {
-                device_id: i as u32,
-                gpu_type: "mi355x".into(),
-                memory_mb: 192_000,
-                peer_gpus: vec![],
-                link_type: spur_core::resource::GpuLinkType::PCIe,
-            })
-            .collect();
-        tl.reserve(
-            now,
-            now + Duration::hours(4),
-            ResourceSet {
-                cpus: 4,
-                memory_mb: 0,
-                gpus: half_gpus,
-                ..Default::default()
-            },
+        let mut alloc = ResourceAllocations::with_scalar(4, 0);
+        alloc.devices.insert(
+            "gpu".into(),
+            (0u32..4).map(AllocatedDevice::injectable).collect(),
         );
+        tl.reserve(now, now + Duration::hours(4), alloc);
 
-        let avail = tl.available_at(now + Duration::minutes(1));
-        assert_eq!(avail.gpus.len(), 4, "4 GPUs should still be available");
+        let req = ResourceSet {
+            cpus: 4,
+            memory_mb: 0,
+            gpus: (0..4)
+                .map(|i| GpuResource {
+                    device_id: i as u32,
+                    gpu_type: "mi355x".into(),
+                    memory_mb: 0,
+                    peer_gpus: vec![],
+                    link_type: spur_core::resource::GpuLinkType::PCIe,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(tl.can_satisfy_at(now + Duration::minutes(1), &req));
     }
 }
