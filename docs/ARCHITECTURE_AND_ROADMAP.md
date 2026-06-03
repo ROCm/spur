@@ -5,14 +5,30 @@
 
 ## What is Spur?
 
-Spur is an AI-native job scheduler written in Rust, designed as a drop-in replacement for Slurm with first-class GPU support. It maintains full compatibility with Slurm's CLI (`sbatch`, `squeue`, etc.), REST API, and C FFI while adding modern features like WireGuard mesh networking, GPU-first scheduling, and Raft-based high availability.
+Spur is a modern job scheduler built from the ground up for AI/ML workloads across both bare-metal GPU clusters and Kubernetes. Written in Rust, it solves problems that traditional HPC schedulers like Slurm were never designed for: inference serving, elastic training, and unified scheduling across deployment modes.
 
-**Key Differentiators:**
-- GPU-aware scheduling with topology optimization
-- Built-in encrypted mesh networking (WireGuard)
-- No external database required (Raft-based state)
-- Single static binary per component
-- Dual deployment: bare-metal and Kubernetes
+**Why Move to Spur?**
+
+Traditional HPC schedulers (Slurm, PBS, LSF) were built for batch scientific computing in the 2000s. They handle training jobs well, but AI/ML infrastructure in 2026 needs more:
+
+1. **Unified Bare-Metal + Kubernetes Scheduling**  
+   Run one scheduler for both native-host GPU clusters and Kubernetes. Submit jobs as `sbatch` scripts or K8s CRDs — same queue, same fair-share, same topology awareness. No more "Slurm for training, K8s for inference" split that fragments your GPU utilization.
+
+2. **Native Inference Serving**  
+   Long-running service jobs with health checks, autoscaling (scale replicas based on request load), fractional GPU sharing (MIG slices, time-slicing), and request routing. Slurm requires Kubernetes for this; Spur does it natively on bare-metal too.
+
+3. **Elastic Training**  
+   Scale running jobs up/down as nodes become available. Add 4 more nodes to a running 8-node training job without restarting. Slurm can burst cluster capacity but can't resize running jobs — elastic training requires research extensions like Invasive MPI.
+
+4. **Zero External Dependencies**  
+   Raft-based state replication means no MySQL/PostgreSQL database to maintain. WireGuard mesh networking means no separate VPN infrastructure. Single static Rust binary per component. Slurm needs a database, manual networking setup, and a complex build process.
+
+5. **Modern Codebase**  
+   Rust (not C from 2003), async gRPC APIs (not RPC from the '90s), structured logging, Prometheus metrics. Fast builds (30s), safe concurrency, easy to extend.
+
+**Slurm Compatibility is the Migration Path, Not the Reason to Switch**
+
+Your existing `sbatch` scripts, `squeue` muscle memory, REST API clients, and C FFI integrations work unchanged. This removes migration friction — but the reason to move is the features Slurm can't provide: unified bare-metal/K8s scheduling, native inference serving, and elastic training as first-class primitives.
 
 ---
 
