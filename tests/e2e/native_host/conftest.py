@@ -176,13 +176,10 @@ def multi_node_cluster(ssh_nodes, remote_bin_dir):
 def gpu_cluster(ssh_nodes, remote_bin_dir):
     """
     Per-test fixture for GPU tests.
-    Skips if fewer than 2 nodes are configured.
+    Node/GPU requirements are enforced per test via gpu_preflight().
     """
-    if len(ssh_nodes) < 2:
-        pytest.skip(
-            f"GPU tests require at least 2 nodes in SPUR_TEST_NODES "
-            f"(got {len(ssh_nodes)})"
-        )
+    if len(ssh_nodes) < 1:
+        pytest.skip("GPU tests require at least one node in SPUR_TEST_NODES")
 
     spur_cluster = _deploy_cluster(ssh_nodes, remote_bin_dir)
     yield spur_cluster
