@@ -9,6 +9,10 @@ publish.workspace = true
 name = "spur-k8s-operator"
 path = "src/main.rs"
 
+[[example]]
+name = "export-crd"
+path = "examples/export_crd.rs"
+
 [dependencies]
 spur-core = { path = "../spur-core" }
 spur-proto = { path = "../spur-proto" }

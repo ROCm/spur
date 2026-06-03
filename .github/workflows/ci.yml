@@ -89,20 +89,6 @@ jobs:
       - name: Build all targets
         run: cargo build --all-targets --locked
 
-      - name: Prepare K8s test binary
-        run: |
-          BIN=$(cargo test -p spur-tests --lib --no-run --message-format=json 2>/dev/null \
-            | jq -r 'select(.executable != null) | .executable' | head -1)
-          mkdir -p artifacts
-          cp "$BIN" artifacts/spur-k8s-tests
-
-      - name: Upload K8s test binary
-        uses: actions/upload-artifact@v7
-        with:
-          name: k8s-test-binary
-          path: artifacts/spur-k8s-tests
-          retention-days: 1
-
   test:
     runs-on: ubuntu-latest
     steps:
@@ -171,4 +157,21 @@ jobs:
         with:
           name: release-binaries
           path: /tmp/release-binaries/
+          retention-days: 1
+
+      - name: Pack E2E test and deploy assets
+        run: |
+          set -euo pipefail
+          root=/tmp/e2e-assets/trusted-repo
+          mkdir -p "$root/tests" "$root/deploy"
+          cp -r tests/e2e "$root/tests/"
+          cp -r deploy/k8s "$root/deploy/"
+          cp -r deploy/native-host "$root/deploy/"
+          cp -r scripts "$root/"
+
+      - name: Upload E2E assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-assets
+          path: /tmp/e2e-assets/trusted-repo
           retention-days: 1

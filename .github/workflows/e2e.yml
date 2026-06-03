@@ -2,9 +2,9 @@
 # and secrets are never exposed to untrusted fork code.  Triggers after
 # the CI workflow completes successfully.
 #
-# No untrusted code is checked out or compiled here.  All binaries and
-# scripts are pre-built artifacts uploaded by the CI workflow. K8s
-# manifests and test scripts are checked out from the default branch.
+# No untrusted code is checked out or compiled here.  Binaries, container
+# image, and E2E assets (tests/e2e, deploy/k8s, deploy/native-host, scripts)
+# are uploaded by the CI workflow for the same commit and downloaded here.
 name: E2E
 
 on:
@@ -95,16 +95,13 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Checkout test suite and deploy assets
-        uses: actions/checkout@v6
+      - name: Download E2E assets from CI
+        uses: actions/download-artifact@v8
         with:
-          persist-credentials: false
-          sparse-checkout: |
-            tests/e2e
-            deploy/native-host
-            scripts
-          sparse-checkout-cone-mode: false
+          name: e2e-assets
           path: trusted-repo
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python venv and install test deps
         run: |
@@ -203,7 +200,7 @@ jobs:
           SPUR_TEST_GPU_VENV: /opt/spur-ci/gpu-venv
         run: |
           chmod +x /tmp/release-binaries/*
-          pytest trusted-repo/tests/e2e/ -v
+          pytest trusted-repo/tests/e2e/native_host/ -v
 
       - name: Collect cluster logs
         if: failure()
@@ -382,21 +379,19 @@ jobs:
               context: '${{ env.STATUS_CONTEXT }}'
             });
 
-      - name: Download K8s test binary
+      - name: Download E2E assets from CI
         uses: actions/download-artifact@v8
         with:
-          name: k8s-test-binary
-          path: /tmp/k8s-bin
+          name: e2e-assets
+          path: trusted-repo
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Checkout K8s manifests from main
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          sparse-checkout: deploy/k8s
-          sparse-checkout-cone-mode: false
-          path: trusted-repo
+      - name: Set up Python venv and install test deps
+        run: |
+          python3 -m venv /tmp/spur-k8s-e2e-venv
+          /tmp/spur-k8s-e2e-venv/bin/pip install -r trusted-repo/tests/e2e/requirements.txt
+          echo "/tmp/spur-k8s-e2e-venv/bin" >> "$GITHUB_PATH"
 
       - name: Select kubectl context
         run: kubectl config use-context kubernetes-admin@kubernetes
@@ -479,23 +474,40 @@ jobs:
           fi
           kubectl delete pod image-pull-check -n "$SPUR_TEST_NS" --ignore-not-found --wait=true
 
-      - name: Run single-node K8s tests
+      - name: Run K8s E2E tests
         env:
           SPUR_DEPLOY_DIR: trusted-repo/deploy/k8s
         run: |
-          chmod +x /tmp/k8s-bin/spur-k8s-tests
-          /tmp/k8s-bin/spur-k8s-tests k8s::single_node --ignored --test-threads=1
+          pytest trusted-repo/tests/e2e/k8s/ -v
 
-      - name: Run multi-node K8s tests
-        env:
-          SPUR_DEPLOY_DIR: trusted-repo/deploy/k8s
+      - name: Collect K8s test logs
+        if: failure()
         run: |
-          /tmp/k8s-bin/spur-k8s-tests k8s::multi_node --ignored --test-threads=1
+          set -euo pipefail
+          mkdir -p /tmp/k8s-logs
+          kubectl get events -n "$SPUR_TEST_NS" --sort-by='.lastTimestamp' \
+            > /tmp/k8s-logs/events.txt 2>&1 || true
+          for pod in $(kubectl get pods -n "$SPUR_TEST_NS" -o name 2>/dev/null || true); do
+            kubectl logs -n "$SPUR_TEST_NS" "$pod" --all-containers \
+              > "/tmp/k8s-logs/${pod}.log" 2>&1 || true
+          done
+          echo "Collected K8s logs:"
+          find /tmp/k8s-logs -type f | head -20
+
+      - name: Upload K8s test logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: k8s-logs
+          path: /tmp/k8s-logs/
+          retention-days: 3
+          if-no-files-found: ignore
 
       - name: Cleanup test resources
         if: always()
         run: |
           set -euo pipefail
+          kubectl delete namespace "${SPUR_TEST_NS}-user1" --ignore-not-found --timeout=120s || true
           kubectl delete namespace "$SPUR_TEST_NS" --ignore-not-found --timeout=120s || true
           kubectl delete clusterrolebinding spur-operator --ignore-not-found
           kubectl delete clusterrole spur-operator --ignore-not-found

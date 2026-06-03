@@ -29,12 +29,17 @@ All tests are self-contained. No external services needed (no database, no netwo
 
 .. important::
 
-   The E2E suites (both native-host and Kubernetes) do not support parallel test execution. Always pass ``--test-threads=1``.
+   The E2E suites do not support parallel test execution. Do not use ``pytest-xdist``.
+
+CI integration
+~~~~~~~~~~~~~~
+
+The ``E2E`` workflow (after ``CI`` succeeds) downloads artifacts from that CI run: release binaries, the container image, and an ``e2e-assets`` bundle with ``tests/e2e``, ``deploy/k8s``, ``deploy/native-host``, and ``scripts`` from the **same commit** as the build. You can add or change E2E tests and deploy manifests in the same PR as the feature.
 
 End-to-End Tests (Native-Host)
 ------------------------------
 
-The native-host E2E suite lives in ``tests/e2e/`` and uses pytest. It SSHes into pre-provisioned nodes, deploys Spur, runs tests, and tears down the cluster after each test. Build the release binaries first (``cargo build --release``).
+The native-host E2E suite lives in ``tests/e2e/native_host/`` and uses pytest. It SSHes into pre-provisioned nodes, deploys Spur, runs tests, and tears down the cluster after each test. Build the release binaries first (``cargo build --release``).
 
 Prerequisites
 ~~~~~~~~~~~~~
@@ -124,24 +129,31 @@ Running the Tests
 
    export SPUR_TEST_NODES=10.0.1.10,10.0.1.11,10.0.1.12
 
-   # Run the full suite
-   pytest tests/e2e/ -v
+   # Run the full native-host suite
+   pytest tests/e2e/native_host/ -v
 
    # Run a specific test
-   pytest tests/e2e/test_single_node.py::TestJobLifecycle::test_job_cancel -v
+   pytest tests/e2e/native_host/test_single_node.py::TestJobLifecycle::test_job_cancel -v
 
 Tests that require more nodes than provided, or missing GPU/container prerequisites, are automatically skipped.
 
 End-to-End Tests (Kubernetes)
 -----------------------------
 
-The K8s E2E suite deploys Spur's controller (StatefulSet), operator (Deployment), and SpurJob CRD into a Kubernetes cluster, then submits SpurJobs and verifies their lifecycle. Like the native-host suite, it is ignored by default.
+The K8s E2E suite lives in ``tests/e2e/k8s/`` and uses pytest with the Kubernetes Python client. It deploys Spur's controller (StatefulSet), operator (Deployment), and SpurJob CRD into a Kubernetes cluster, then submits SpurJobs and verifies their lifecycle.
 
 You need a running Kubernetes cluster with:
 
 1. **kubectl access** — a valid ``KUBECONFIG`` pointing to the cluster
 2. **A Spur container image** available to the cluster (either in a registry or pre-loaded via ``ctr -n k8s.io images import``)
 3. **RBAC permissions** to create namespaces, CRDs, StatefulSets, Deployments, and Pods
+
+Prerequisites
+~~~~~~~~~~~~~
+
+- Python 3.11+ with ``pip install -r tests/e2e/requirements.txt``
+- ``kubectl`` access to the cluster
+- A Spur container image available to the cluster
 
 Environment Variables
 ~~~~~~~~~~~~~~~~~~~~~
@@ -161,8 +173,8 @@ Export these so the test process can read them:
      - Container image for the controller and operator. Defaults to ``spur:ci``.
      - ``ghcr.io/rocm/spur:abc123``
    * - ``SPUR_TEST_NS`` *(optional)*
-     - Kubernetes namespace for the test run. Defaults to ``spur-ci-{pid}-{timestamp}``. Strongly recommended to set explicitly when running locally so that the namespace is predictable and RBAC can be provisioned once.
-     - ``spur-test-local``
+     - Kubernetes namespace for the test run. Defaults to ``spur-ci-{pid}-{timestamp}``. Set explicitly for local runs so cleanup and log inspection are predictable.
+     - ``spur-ci-local``
    * - ``SPUR_DEPLOY_DIR`` *(optional)*
      - Path to ``deploy/k8s/`` manifests. Auto-detected from the workspace if unset.
      - ``./deploy/k8s``
@@ -185,33 +197,38 @@ Setup
    # On each node:
    sudo ctr -n k8s.io images import /tmp/spur-ci.tar
 
-**Apply RBAC** — the test suite needs cluster-wide permissions for CRDs and pod management. The default manifest binds to namespace ``spur``, so patch it to match your ``SPUR_TEST_NS``:
-
-.. code-block:: bash
-
-   sed "s/namespace: spur/namespace: $SPUR_TEST_NS/" deploy/k8s/rbac.yaml | kubectl apply -f -
+The harness applies ``deploy/k8s/rbac.yaml``. You do not need a separate ``kubectl apply`` before ``pytest`` unless you are debugging RBAC outside the suite.
 
 Running the Tests
 ~~~~~~~~~~~~~~~~~
 
 .. code-block:: bash
 
-   # Single-node tests
-   cargo test -p spur-tests --lib k8s::single_node -- --ignored --test-threads=1
+   export SPUR_CI_IMAGE=spur:ci
+   export SPUR_TEST_NS=spur-ci-local
 
-   # Multi-node tests
-   cargo test -p spur-tests --lib k8s::multi_node -- --ignored --test-threads=1
+   # Run the full K8s suite
+   pytest tests/e2e/k8s/ -v
+
+   # Run SpurJob lifecycle tests only
+   pytest tests/e2e/k8s/test_spurjob.py -v
+
+   # Run Raft HA tests only
+   pytest tests/e2e/k8s/test_raft_ha.py -v
 
 Cleanup
 ~~~~~~~
 
-The test harness creates a namespace per run but does not delete it automatically. Clean up after local runs:
+The session ``k8s_suite`` fixture creates one namespace per pytest run. Class-scoped fixtures deploy the controller and operator once per test class (SpurJob lifecycle vs Raft HA); an autouse fixture removes SpurJobs between tests. Session teardown deletes the cross-namespace auxiliary namespace (``{SPUR_TEST_NS}-user1``) first, then the primary namespace and the SpurJob CRD.
+
+If pytest exits abnormally (SIGKILL, node reboot, etc.), namespaces may be left behind. Clean up stale namespaces manually:
 
 .. code-block:: bash
 
-   # List test namespaces
+   # List test namespaces (includes cross-ns suffix -user1)
    kubectl get ns | grep spur-ci
 
-   # Delete a specific one
+   # Delete auxiliary namespace first if both exist
+   kubectl delete ns "${SPUR_TEST_NS}-user1" --ignore-not-found
    kubectl delete ns <namespace-name>
 
