@@ -18,7 +18,7 @@ fi
 
 # Check SPDX license headers on staged source files
 mapfile -t staged < <(
-    git diff --cached --name-only --diff-filter=d -- '*.rs' '*.proto' '*.py' '*.sh' 'Dockerfile' '*/Dockerfile' '*/Dockerfile.*'
+    git diff --cached --name-only --diff-filter=d -- '*.rs' '*.proto' '*.py' '*.sh' '**/Dockerfile*'
 )
 
 if [ ${#staged[@]} -gt 0 ]; then

@@ -28,7 +28,7 @@ check_file() {
 if [ $# -gt 0 ]; then
     files=("$@")
 else
-    mapfile -t files < <(git ls-files -- '*.rs' '*.proto' '*.py' '*.sh' 'Dockerfile' '*/Dockerfile' '*/Dockerfile.*')
+    mapfile -t files < <(git ls-files -- '*.rs' '*.proto' '*.py' '*.sh' '**/Dockerfile*')
 fi
 
 failed=0
