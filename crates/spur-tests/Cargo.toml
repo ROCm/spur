@@ -33,7 +33,7 @@ jsonwebtoken.workspace = true
 openssh = { version = "0.11", default-features = false, features = ["process-mux"] }
 
 [dev-dependencies]
-serial_test = "3.4.0"
+serial_test = "3.5.0"
 
 [lints]
 workspace = true
