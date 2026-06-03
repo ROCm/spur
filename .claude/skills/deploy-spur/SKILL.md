@@ -194,7 +194,7 @@ End the run with:
 
 | Date | Mode | Hosts | Transport | Notes |
 |---|---|---|---|---|
-| 2026-06-03 | single-node | `smc300x-...f268` | direct | end-to-end pass |
-| 2026-06-03 | multi-node (1 ctl + 2 agents) | `smc300x-...f268,9b0e` | direct | `-N 2` fan-out OK |
-| 2026-06-03 | **HA (2 ctl, hyperconverged)** | `smc300x-...f268,9b0e` | direct | leader=node_id 2, leader-forwarding via follower verified. N=2 = zero fault tolerance (code-path only) |
+| 2026-06-03 | single-node | 1× Ubuntu 22.04 MI300X node | direct | end-to-end pass |
+| 2026-06-03 | multi-node (1 ctl + 2 agents) | 2× Ubuntu 22.04 MI300X nodes on a `/24` | direct | `-N 2` fan-out OK |
+| 2026-06-03 | **HA (2 ctl, hyperconverged)** | 2× Ubuntu 22.04 MI300X nodes on a `/24` | direct | leader=`node_id` 2, leader-forwarding via follower verified. N=2 = zero fault tolerance (code-path only) |
 | pending | any | — | wireguard | role exists, **not validated end-to-end** |

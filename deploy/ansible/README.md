@@ -166,6 +166,6 @@ If you hit a new gotcha, please add it here and (where applicable) encode the fi
 - **2-node, direct LAN, single controller**: fresh deploy → both nodes idle, `-N 2` job produced distinct `$SPUR_TASK_OFFSET` 0/1.
 - **Idempotent re-run** (`-e spur_wipe_state=false`): daemons restarted cleanly, tests passed again.
 - **Single-node** (same host in both groups): multi-node test correctly skipped, single-node test passed.
-- **HA — 2 controllers + 2 agents, hyperconverged**: both `spurctld` started, openraft elected `node_id=2` (gpu9b0e) as leader, `-N 2` job dispatched cleanly. Confirmed leader forwarding by submitting via the follower (f268) — submission succeeded, job scheduled and ran. Note: `N=2` has zero fault tolerance; this test exercised the code path, not real fault tolerance.
+- **HA — 2 controllers + 2 agents, hyperconverged**: both `spurctld` started, openraft elected one as leader (`node_id=2`), `-N 2` job dispatched cleanly. Confirmed leader forwarding by submitting via the follower — submission succeeded, job scheduled and ran. Note: `N=2` has zero fault tolerance; this test exercised the code path, not real fault tolerance.
 
 WireGuard transport is implemented in `roles/spur_wireguard` but was not validated end-to-end because both test hosts shared a `/24`. Review before relying on it in production.
