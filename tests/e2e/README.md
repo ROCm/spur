@@ -7,8 +7,6 @@ End-to-end test suites for Spur, organized by deployment target:
 | `native_host/` | Native-Host / SSH | Deploys spurctld + spurd on remote nodes via SSH |
 | `k8s/` | Kubernetes | Deploys controller + operator into a K8s cluster, submits SpurJob CRDs |
 
-Both suites use pytest and share this directory's `pytest.ini`, `requirements.txt`, and top-level `conftest.py`.
-
 For setup instructions, environment variables, and how to run the tests, see the [Building guide](../../docs/developer/building.rst).
 
 ```bash

@@ -20,6 +20,8 @@ from kubernetes.client.rest import ApiException
 from kubernetes.stream import stream
 from kubernetes.utils import create_from_dict
 
+from paths import k8s_deploy_dir
+
 logger = logging.getLogger(__name__)
 
 SPUR_JOB_GROUP = "spur.amd.com"
@@ -46,14 +48,8 @@ def wait_until(
     raise TimeoutError(f"timed out after {timeout}s: {msg}")
 
 
-def repo_root() -> Path:
-    return Path(__file__).resolve().parent.parent.parent.parent
-
-
 def deploy_root() -> Path:
-    if env := os.environ.get("SPUR_DEPLOY_DIR"):
-        return Path(env)
-    return repo_root() / "deploy" / "k8s"
+    return k8s_deploy_dir()
 
 
 def spur_namespace() -> str:

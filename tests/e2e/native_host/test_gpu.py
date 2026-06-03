@@ -12,14 +12,9 @@ provision it (requires python3-venv + network access on nodes).
 """
 
 import os
-from pathlib import Path
 
 from cluster import SpurCluster, parse_job_id, wait_job
-
-
-def _deploy_dir() -> Path:
-    """Path to deploy/native-host with GPU test scripts."""
-    return Path(__file__).resolve().parent.parent.parent / "deploy" / "native-host"
+from paths import native_host_deploy_dir
 
 
 def _resolve_gpu_venv(cluster: SpurCluster) -> str:
@@ -52,7 +47,7 @@ class TestGpuSingleNode:
         cluster.gpu_preflight(1)
 
         # Compile HIP gpu_test on the node if source and hipcc are available
-        deploy = _deploy_dir()
+        deploy = native_host_deploy_dir()
         hip_src = deploy / "gpu_test.hip"
         if hip_src.is_file():
             cluster.ship_file_to_all(hip_src, "gpu_test.hip")
@@ -85,7 +80,7 @@ class TestGpuMultiNode:
         cluster = gpu_cluster
         cluster.gpu_preflight(2)
 
-        deploy = _deploy_dir()
+        deploy = native_host_deploy_dir()
         hip_src = deploy / "gpu_test.hip"
         if hip_src.is_file():
             cluster.ship_file_to_all(hip_src, "gpu_test.hip")
@@ -117,7 +112,7 @@ class TestGpuMultiNode:
 
         venv_path = _resolve_gpu_venv(cluster)
         rd = cluster.remote_dir
-        deploy = _deploy_dir()
+        deploy = native_host_deploy_dir()
 
         # Ship the test script
         src = deploy / "distributed_test.py"
@@ -152,7 +147,7 @@ class TestGpuMultiNode:
 
         venv_path = _resolve_gpu_venv(cluster)
         rd = cluster.remote_dir
-        deploy = _deploy_dir()
+        deploy = native_host_deploy_dir()
 
         # Ship the test script
         src = deploy / "inference_test.py"

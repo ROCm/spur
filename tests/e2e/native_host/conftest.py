@@ -9,15 +9,11 @@ See docs/developer/building.rst for full environment variable reference.
 
 import os
 import time
-from pathlib import Path
 
 import pytest
 
 from cluster import SshNode, SpurCluster, ensure_bins, make_remote_dir
-
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parent.parent.parent.parent
+from paths import repo_root
 
 
 def _get_nodes_config() -> list[str]:
@@ -47,7 +43,7 @@ def _get_ssh_key() -> str | None:
 def _get_binaries_dir() -> str:
     return os.environ.get(
         "SPUR_TEST_BINARIES_DIR",
-        str(_repo_root() / "target" / "release"),
+        str(repo_root() / "target" / "release"),
     )
 
 

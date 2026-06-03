@@ -31,11 +31,6 @@ All tests are self-contained. No external services needed (no database, no netwo
 
    The E2E suites do not support parallel test execution. Do not use ``pytest-xdist``.
 
-CI integration
-~~~~~~~~~~~~~~
-
-The ``E2E`` workflow (after ``CI`` succeeds) downloads artifacts from that CI run: release binaries, the container image, and an ``e2e-assets`` bundle with ``tests/e2e``, ``deploy/k8s``, ``deploy/native-host``, and ``scripts`` from the **same commit** as the build. You can add or change E2E tests and deploy manifests in the same PR as the feature.
-
 End-to-End Tests (Native-Host)
 ------------------------------
 
@@ -71,8 +66,11 @@ Environment Variables
      - Path to SSH private key. If neither password nor key is set, ssh-agent is used.
      - ``~/.ssh/id_ed25519``
    * - ``SPUR_TEST_BINARIES_DIR`` *(optional)*
-     - Path to release binaries (local). Defaults to ``target/release``.
-     - ``./target/release``
+     - Path to release binaries on the test runner. Defaults to ``{repo}/target/release`` (repo root is derived from the test layout, not the shell working directory).
+     - ``/home/user/spur/target/release``
+   * - ``SPUR_DEPLOY_DIR`` *(optional)*
+     - Path to the ``deploy/`` directory (not a suite subdirectory). This suite loads assets from ``{SPUR_DEPLOY_DIR}/native-host/``. Defaults to ``{repo}/deploy`` when unset. If set manually, use an absolute path.
+     - ``/home/user/spur/deploy``
    * - ``SPUR_TEST_REMOTE_BIN_DIR`` *(optional)*
      - Fixed remote path for binaries on nodes. If set, not cleaned up (useful for CI + AppArmor). If unset, an ephemeral temp path is used and cleaned up after the session.
      - ``/tmp/spur-e2e-bin``
@@ -176,8 +174,8 @@ Export these so the test process can read them:
      - Kubernetes namespace for the test run. Defaults to ``spur-ci-{pid}-{timestamp}``. Set explicitly for local runs so cleanup and log inspection are predictable.
      - ``spur-ci-local``
    * - ``SPUR_DEPLOY_DIR`` *(optional)*
-     - Path to ``deploy/k8s/`` manifests. Auto-detected from the workspace if unset.
-     - ``./deploy/k8s``
+     - Path to the ``deploy/`` directory (not a suite subdirectory). This suite loads manifests from ``{SPUR_DEPLOY_DIR}/k8s/``. Defaults to ``{repo}/deploy`` when unset. If set manually, use an absolute path.
+     - ``/home/user/spur/deploy``
 
 Setup
 ~~~~~
