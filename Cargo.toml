@@ -34,7 +34,7 @@ backon = { version = "1", features = ["tokio-sleep"] }
 # gRPC + protobuf
 tonic = "0.12"
 prost = "0.13"
-prost-types = "0.13"
+prost-types = "0.14"
 tonic-build = "0.12"
 
 # REST API
