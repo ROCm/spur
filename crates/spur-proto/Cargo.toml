@@ -7,11 +7,12 @@ publish.workspace = true
 
 [dependencies]
 tonic = { workspace = true }
+tonic-prost = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 
 [build-dependencies]
-tonic-build = { workspace = true }
+tonic-prost-build = { workspace = true }
 
 [lints]
 workspace = true
