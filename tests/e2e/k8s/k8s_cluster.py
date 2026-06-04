@@ -743,7 +743,12 @@ def wait_pod_ready(namespace: str, pod_name: str, timeout: int = 120) -> None:
     core = client.CoreV1Api()
 
     def ready() -> bool:
-        pod = core.read_namespaced_pod(pod_name, namespace)
+        try:
+            pod = core.read_namespaced_pod(pod_name, namespace)
+        except ApiException as exc:
+            if _is_not_found(exc):
+                return False
+            raise
         return any(
             c.type == "Ready" and c.status == "True"
             for c in (pod.status.conditions or [])
