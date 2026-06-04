@@ -1,0 +1,46 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spur-operator
+rules:
+  # Pod management
+  - apiGroups: [""]
+    resources: [pods, pods/status, pods/log]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Service management (headless services for inter-pod networking)
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Node watching
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
+  # ConfigMaps
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Events
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+  # SpurJob CRD
+  - apiGroups: [spur.amd.com]
+    resources: [spurjobs, spurjobs/status, spurjobs/finalizers]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # PodDisruptionBudgets
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spur-operator
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: spur
+roleRef:
+  kind: ClusterRole
+  name: spur-operator
+  apiGroup: rbac.authorization.k8s.io

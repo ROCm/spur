@@ -29,7 +29,7 @@ PRs are squash-merged, so the PR title becomes the commit message on ``main``. U
 
 **type** — one of: ``feat``, ``fix``, ``refactor``, ``test``, ``docs``, ``style``, ``perf``, ``build``, ``ci``, ``chore``, ``revert``
 
-**scope** — the crate name (e.g. ``spur-cli``, ``spurctld``, ``spur-core``, ``spur-k8s``). If no single crate applies, use a concise scope reflecting the area of change (``proto``, ``deploy``, ``config``).
+**scope** — the crate name (e.g. ``spur-cli``, ``spurctld``, ``spur-core``, ``spur-k8s``). If no single crate applies, use a concise scope reflecting the area of change (``proto``, ``examples``, ``config``).
 
 **description** — imperative mood, lowercase, no trailing period. Summarize the user-visible change, not the implementation detail.
 

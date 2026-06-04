@@ -13,7 +13,7 @@ Build and load container images:
 .. code-block:: bash
 
    # Build
-   docker build -f deploy/Dockerfile -t spur:<tag> .
+   docker build --target runtime -t spur:<tag> .
 
    # Load onto each node (if not using a registry)
    docker save spur:<tag> -o spur.tar
@@ -29,7 +29,7 @@ Components
 - **spurrestd** — REST API. Exposes the Slurm-compatible REST interface.
 - **spur-k8s-operator** — Watches ``SpurJob`` custom resources and submits them to the controller.
 
-All manifests live in ``deploy/k8s/``.
+Example manifests for production-style deployment live in ``examples/k8s/``.
 
 Deploy
 ------
@@ -42,20 +42,21 @@ Apply manifests in order:
 
 .. code-block:: bash
 
-   kubectl apply -f deploy/k8s/namespace.yaml
-   kubectl apply -f deploy/k8s/configmap.yaml
-   kubectl apply -f deploy/k8s/rbac.yaml
-   kubectl apply -f deploy/k8s/spurctld.yaml
-   kubectl apply -f deploy/k8s/spurd.yaml
-   kubectl apply -f deploy/k8s/spurdbd.yaml
-   kubectl apply -f deploy/k8s/spurrestd.yaml
-   kubectl apply -f deploy/k8s/operator.yaml
-   kubectl apply -f deploy/k8s/pdb.yaml
+   kubectl apply -f examples/k8s/namespace.yaml
+   kubectl apply -f examples/k8s/configmap.yaml
+   kubectl apply -f examples/k8s/rbac.yaml
+   kubectl apply -f examples/k8s/spurjob-crd.yaml
+   kubectl apply -f examples/k8s/spurctld.yaml
+   kubectl apply -f examples/k8s/spurd.yaml
+   kubectl apply -f examples/k8s/spurdbd.yaml
+   kubectl apply -f examples/k8s/spurrestd.yaml
+   kubectl apply -f examples/k8s/operator.yaml
+   kubectl apply -f examples/k8s/pdb.yaml
 
 Configuration
 -------------
 
-The ConfigMap (``deploy/k8s/configmap.yaml``) embeds ``spur.conf``:
+The ConfigMap (``examples/k8s/configmap.yaml``) embeds ``spur.conf``:
 
 .. code-block:: toml
 

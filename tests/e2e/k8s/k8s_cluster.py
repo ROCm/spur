@@ -20,9 +20,9 @@ from kubernetes.client.rest import ApiException
 from kubernetes.stream import stream
 from kubernetes.utils import create_from_dict
 
-from paths import k8s_deploy_dir
-
 logger = logging.getLogger(__name__)
+
+_MANIFESTS_DIR = Path(__file__).resolve().parent / "manifests"
 
 SPUR_JOB_GROUP = "spur.amd.com"
 SPUR_JOB_VERSION = "v1alpha1"
@@ -46,10 +46,6 @@ def wait_until(
             return
         time.sleep(interval)
     raise TimeoutError(f"timed out after {timeout}s: {msg}")
-
-
-def deploy_root() -> Path:
-    return k8s_deploy_dir()
 
 
 def spur_namespace() -> str:
@@ -226,7 +222,7 @@ class SuiteContext:
         logger.info("namespace ensured: %s", self.namespace)
 
     def apply_crd(self) -> None:
-        crd_path = deploy_root() / "spurjob-crd.yaml"
+        crd_path = _MANIFESTS_DIR / "spurjob-crd.yaml"
         with crd_path.open() as f:
             crd_body = yaml.safe_load(f)
         try:
@@ -366,7 +362,7 @@ class ClusterFixture:
             create_from_dict(api_client, value, namespace=self.namespace)
 
     def apply_rbac(self) -> None:
-        content = (deploy_root() / "rbac.yaml").read_text()
+        content = (_MANIFESTS_DIR / "rbac.yaml").read_text()
         api_client = client.ApiClient()
         rbac_api = client.RbacAuthorizationV1Api()
         for doc in content.split("\n---"):
@@ -393,7 +389,7 @@ class ClusterFixture:
         logger.info("RBAC applied for namespace %s", self.namespace)
 
     def apply_controller(self) -> None:
-        self._apply_yaml_docs(deploy_root() / "spurctld.yaml", self.config.replicas)
+        self._apply_yaml_docs(_MANIFESTS_DIR / "spurctld.yaml", self.config.replicas)
         logger.info(
             "controller StatefulSet applied (replicas=%s, image=%s)",
             self.config.replicas,
@@ -401,7 +397,7 @@ class ClusterFixture:
         )
 
     def apply_operator(self) -> None:
-        self._apply_yaml_docs(deploy_root() / "operator.yaml", None)
+        self._apply_yaml_docs(_MANIFESTS_DIR / "operator.yaml", None)
         logger.info("operator Deployment applied (image=%s)", self.config.image)
 
     def wait_ready(self, timeout: int = 120) -> None:

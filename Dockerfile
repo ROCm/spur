@@ -1,49 +1,78 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Minimal Spur runtime image — downloads pre-built release binaries.
+# Build portable Spur binaries on AlmaLinux 8 (glibc 2.28).
+# cargo-chef caches dependency builds across source changes.
 #
-# Build:
-#   docker build -t spur .
-#   docker build --build-arg VERSION=nightly -t spur:nightly .
-#   docker build --build-arg VERSION=v0.1.0 -t spur:v0.1.0 .
+# Container image (CI, K8s):
+#   docker build --target runtime -t spur:<tag> .
 #
-# Run:
-#   docker run --rm spur sinfo
-#   docker run -d --name spurctld -p 6817:6817 spur spurctld --listen=[::]:6817
+# Extract portable binaries to disk (nightly, release):
+#   DOCKER_BUILDKIT=1 docker build --target dist --output type=local,dest=./dist .
 
-FROM ubuntu:22.04
+FROM almalinux:8 AS chef
 
-ARG VERSION=latest
-ARG REPO=ROCm/spur
+ARG PROTOC_VERSION=25.1
+RUN dnf install -y unzip curl gcc make binutils && dnf clean all && \
+    curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" \
+        -o /tmp/protoc.zip && \
+    unzip -o /tmp/protoc.zip -d /usr/local && \
+    rm /tmp/protoc.zip
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl util-linux \
-    && rm -rf /var/lib/apt/lists/*
+COPY rust-toolchain.toml .
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN rustup show
 
-RUN set -eux; \
-    if [ "$VERSION" = "latest" ]; then \
-        TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-            | grep '"tag_name"' | head -1 | cut -d'"' -f4); \
-        TARBALL="spur-${TAG}-linux-amd64.tar.gz"; \
-    elif [ "$VERSION" = "nightly" ]; then \
-        TAG=nightly; \
-        TARBALL=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/tags/nightly" \
-            | grep '"name"' | grep '\.tar\.gz"' | grep -v sha256 | head -1 | cut -d'"' -f4); \
-    else \
-        TAG="$VERSION"; \
-        TARBALL="spur-${TAG}-linux-amd64.tar.gz"; \
-    fi; \
-    curl -fsSL "https://github.com/${REPO}/releases/download/${TAG}/${TARBALL}" -o /tmp/spur.tar.gz; \
-    tar xzf /tmp/spur.tar.gz -C /tmp; \
-    cp /tmp/spur-*/bin/spur /tmp/spur-*/bin/spurctld /tmp/spur-*/bin/spurd \
-       /tmp/spur-*/bin/spurdbd /tmp/spur-*/bin/spurrestd /usr/local/bin/; \
-    rm -rf /tmp/spur*; \
-    spur --help >/dev/null 2>&1 || true
+RUN cargo install cargo-chef --locked --version 0.1.77
 
-# Slurm-compat symlinks
-RUN for cmd in sbatch srun squeue scancel sinfo sacct scontrol; do \
-        ln -s /usr/local/bin/spur /usr/local/bin/$cmd; \
+WORKDIR /build
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --locked --recipe-path recipe.json
+
+COPY . .
+RUN cargo build --release --locked \
+    --bin spur \
+    --bin spurctld \
+    --bin spurd \
+    --bin spurdbd \
+    --bin spurrestd \
+    --bin spur-k8s-operator
+
+RUN echo "=== Required GLIBC versions ===" && \
+    for bin in spur spurctld spurd spurdbd spurrestd spur-k8s-operator; do \
+        MAX=$(objdump -T target/release/${bin} 2>/dev/null \
+            | grep -oP 'GLIBC_\d+\.\d+' | sort -uV | tail -1); \
+        echo "  ${bin}: requires ${MAX:-none}"; \
     done
 
-ENTRYPOINT ["spur"]
+FROM ubuntu:22.04 AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/spur /usr/local/bin/
+COPY --from=builder /build/target/release/spurctld /usr/local/bin/
+COPY --from=builder /build/target/release/spurd /usr/local/bin/
+COPY --from=builder /build/target/release/spurdbd /usr/local/bin/
+COPY --from=builder /build/target/release/spurrestd /usr/local/bin/
+COPY --from=builder /build/target/release/spur-k8s-operator /usr/local/bin/
+
+# Multi-binary image: Kubernetes manifests must set container command per workload
+# (e.g. spurctld, spur-k8s-operator, spurd). No default ENTRYPOINT.
+
+FROM scratch AS dist
+COPY --from=builder /build/target/release/spur /bin/
+COPY --from=builder /build/target/release/spurctld /bin/
+COPY --from=builder /build/target/release/spurd /bin/
+COPY --from=builder /build/target/release/spurdbd /bin/
+COPY --from=builder /build/target/release/spurrestd /bin/
+COPY --from=builder /build/target/release/spur-k8s-operator /bin/

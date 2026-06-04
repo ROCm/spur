@@ -31,7 +31,7 @@ spur run -- echo "hello from $(hostname)"        # run a command
 spur queue                                       # check the queue
 ```
 
-For production and multi-node deployments, see the [deployment guide](docs/deployment/native-host.rst).
+For production and multi-node deployments, see the [deployment guide](docs/deployment/native-host.rst). Sample config and Kubernetes manifests are in [`examples/`](examples/).
 
 ## Documentation
 

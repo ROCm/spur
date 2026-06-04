@@ -26,7 +26,7 @@ Initialize the network for encrypted node-to-node communication:
 
 This sets up a WireGuard mesh, prints the server public key, and outputs a join command template for workers.
 
-Create ``/etc/spur/spur.conf``, e.g.:
+Create ``/etc/spur/spur.conf``. The repository includes ``examples/spur.conf``. A minimal example:
 
 .. code-block:: toml
 

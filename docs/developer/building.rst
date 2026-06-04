@@ -43,6 +43,7 @@ Prerequisites
 - Pre-provisioned nodes accessible via SSH (password, key, or ssh-agent)
 - Container tests require ``squashfs-tools`` on the runner and all nodes
 - GPU tests require GPU hardware (ROCm/CUDA) on the nodes, plus a Python venv with PyTorch (auto-provisioned if ``SPUR_TEST_GPU_VENV`` is unset)
+- GPU test scripts (``gpu_test.hip``, ``distributed_test.py``, ``inference_test.py``) live in ``tests/e2e/native_host/fixtures/`` and are shipped to nodes by the harness
 
 Environment Variables
 ~~~~~~~~~~~~~~~~~~~~~
@@ -68,9 +69,6 @@ Environment Variables
    * - ``SPUR_TEST_BINARIES_DIR`` *(optional)*
      - Path to release binaries on the test runner. Defaults to ``{repo}/target/release`` (repo root is derived from the test layout, not the shell working directory).
      - ``/home/user/spur/target/release``
-   * - ``SPUR_DEPLOY_DIR`` *(optional)*
-     - Path to the ``deploy/`` directory (not a suite subdirectory). This suite loads assets from ``{SPUR_DEPLOY_DIR}/native-host/``. Defaults to ``{repo}/deploy`` when unset. If set manually, use an absolute path.
-     - ``/home/user/spur/deploy``
    * - ``SPUR_TEST_REMOTE_BIN_DIR`` *(optional)*
      - Fixed remote path for binaries on nodes. If set, not cleaned up (useful for CI + AppArmor). If unset, an ephemeral temp path is used and cleaned up after the session.
      - ``/tmp/spur-e2e-bin``
@@ -173,9 +171,6 @@ Export these so the test process can read them:
    * - ``SPUR_TEST_NS`` *(optional)*
      - Kubernetes namespace for the test run. Defaults to ``spur-ci-{pid}-{timestamp}``. Set explicitly for local runs so cleanup and log inspection are predictable.
      - ``spur-ci-local``
-   * - ``SPUR_DEPLOY_DIR`` *(optional)*
-     - Path to the ``deploy/`` directory (not a suite subdirectory). This suite loads manifests from ``{SPUR_DEPLOY_DIR}/k8s/``. Defaults to ``{repo}/deploy`` when unset. If set manually, use an absolute path.
-     - ``/home/user/spur/deploy``
 
 Setup
 ~~~~~
@@ -185,7 +180,7 @@ Setup
 .. code-block:: bash
 
    # Build the Spur container image
-   docker build -f deploy/Dockerfile -t spur:ci .
+   docker build --target runtime -t spur:ci .
 
    # If running a local cluster (e.g. kind):
    kind load docker-image spur:ci
@@ -195,7 +190,7 @@ Setup
    # On each node:
    sudo ctr -n k8s.io images import /tmp/spur-ci.tar
 
-The harness applies ``deploy/k8s/rbac.yaml``. You do not need a separate ``kubectl apply`` before ``pytest`` unless you are debugging RBAC outside the suite.
+The harness applies manifests from ``tests/e2e/k8s/manifests/`` (CRD, RBAC, controller, operator). Production-oriented samples live under ``examples/k8s/``. You do not need a separate ``kubectl apply`` before ``pytest`` unless you are debugging RBAC outside the suite.
 
 Running the Tests
 ~~~~~~~~~~~~~~~~~

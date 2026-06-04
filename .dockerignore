@@ -5,6 +5,7 @@ target/
 .cursor/
 .claude/
 tests/
+examples/
 plans/
 scripts/
 docs/

@@ -58,7 +58,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: deploy/Dockerfile.manylinux
+          file: Dockerfile
           target: dist
           push: false
           outputs: type=local,dest=./dist
@@ -84,7 +84,7 @@ jobs:
           cd ../..
 
           mkdir -p "${DIST}/etc"
-          cp deploy/native-host/spur.conf "${DIST}/etc/spur.conf.example"
+          cp examples/spur.conf "${DIST}/etc/spur.conf.example"
 
           tar czf "${DIST}.tar.gz" "${DIST}"
           sha256sum "${DIST}.tar.gz" > "${DIST}.tar.gz.sha256"

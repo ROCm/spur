@@ -3,8 +3,8 @@
 # the CI workflow completes successfully.
 #
 # No untrusted code is checked out or compiled here.  Binaries, container
-# image, and E2E assets (tests/e2e, deploy/, scripts) from the same commit
-# are uploaded by CI and downloaded here.  Jobs set SPUR_DEPLOY_DIR=trusted-repo/deploy.
+# image, and E2E assets (tests/e2e, scripts) from the same commit are uploaded by CI
+# and downloaded here.
 name: E2E
 
 on:
@@ -193,7 +193,6 @@ jobs:
 
       - name: Run native-host E2E tests
         env:
-          SPUR_DEPLOY_DIR: trusted-repo/deploy
           SPUR_TEST_NODES: ${{ env.BM_NODES }}
           SPUR_TEST_SSH_USER: ${{ env.BM_SSH_USER }}
           SPUR_TEST_BINARIES_DIR: /tmp/release-binaries
@@ -351,7 +350,6 @@ jobs:
       STATUS_CONTEXT: "E2E / K8s"
       KUBECONFIG: /home/amd/.kube/config
       SPUR_TEST_NS: spur-ci-${{ github.event.workflow_run.id }}
-      SPUR_DEPLOY_DIR: trusted-repo/deploy
       RUST_LOG: info
     steps:
       - name: Compute GHCR image reference
@@ -457,7 +455,7 @@ jobs:
         run: |
           set -euo pipefail
           sed "s/namespace: spur/namespace: $SPUR_TEST_NS/g" \
-            "${SPUR_DEPLOY_DIR}/k8s/rbac.yaml" | kubectl apply -f -
+            trusted-repo/tests/e2e/k8s/manifests/rbac.yaml | kubectl apply -f -
 
       - name: Verify cluster can pull CI image
         run: |

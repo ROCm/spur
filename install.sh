@@ -102,7 +102,7 @@ ARCH=$(uname -m)
 [ "$OS" = "Linux" ] || err "Spur currently supports Linux only (got ${OS})"
 [ "$ARCH" = "x86_64" ] || err "Spur currently supports x86_64 only (got ${ARCH})"
 
-# --- glibc check (binaries built on manylinux_2_28, require glibc >= 2.28) ---
+# --- glibc check (binaries built on AlmaLinux 8, require glibc >= 2.28) ---
 GLIBC_VER=$(ldd --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+$' || echo "0")
 if [ "$(printf '%s\n' "2.28" "${GLIBC_VER}" | sort -V | head -1)" != "2.28" ]; then
     err "Spur requires glibc >= 2.28 (found ${GLIBC_VER}). Supported: Ubuntu 20.04+, Debian 10+, RHEL 8+, Fedora 28+"
@@ -169,6 +169,9 @@ fi
 log "Installed to ${INSTALL_DIR}/"
 log "Binaries: ${BINARIES}"
 log "Symlinks: ${SYMLINKS}"
+if [ -f "${EXTRACTED}/etc/spur.conf.example" ]; then
+    log "Example config in tarball: etc/spur.conf.example (copy to /etc/spur/spur.conf)"
+fi
 
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "${INSTALL_DIR}"; then
     echo ""

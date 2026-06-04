@@ -128,7 +128,8 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: deploy/Dockerfile
+          file: Dockerfile
+          target: runtime
           push: false
           tags: spur:ci
           outputs: type=docker,dest=/tmp/spur-image.tar
@@ -159,14 +160,12 @@ jobs:
           path: /tmp/release-binaries/
           retention-days: 1
 
-      - name: Pack E2E test and deploy assets
+      - name: Pack E2E test assets
         run: |
           set -euo pipefail
           root=/tmp/e2e-assets/trusted-repo
-          mkdir -p "$root/tests" "$root/deploy"
+          mkdir -p "$root/tests"
           cp -r tests/e2e "$root/tests/"
-          cp -r deploy/k8s "$root/deploy/"
-          cp -r deploy/native-host "$root/deploy/"
           cp -r scripts "$root/"
 
       - name: Upload E2E assets

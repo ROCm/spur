@@ -12,9 +12,11 @@ provision it (requires python3-venv + network access on nodes).
 """
 
 import os
+from pathlib import Path
 
 from cluster import SpurCluster, parse_job_id, wait_job
-from paths import native_host_deploy_dir
+
+_FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 
 def _resolve_gpu_venv(cluster: SpurCluster) -> str:
@@ -47,8 +49,8 @@ class TestGpuSingleNode:
         cluster.gpu_preflight(1)
 
         # Compile HIP gpu_test on the node if source and hipcc are available
-        deploy = native_host_deploy_dir()
-        hip_src = deploy / "gpu_test.hip"
+        fixtures = _FIXTURES_DIR
+        hip_src = fixtures / "gpu_test.hip"
         if hip_src.is_file():
             cluster.ship_file_to_all(hip_src, "gpu_test.hip")
             for node in cluster.nodes:
@@ -80,8 +82,8 @@ class TestGpuMultiNode:
         cluster = gpu_cluster
         cluster.gpu_preflight(2)
 
-        deploy = native_host_deploy_dir()
-        hip_src = deploy / "gpu_test.hip"
+        fixtures = _FIXTURES_DIR
+        hip_src = fixtures / "gpu_test.hip"
         if hip_src.is_file():
             cluster.ship_file_to_all(hip_src, "gpu_test.hip")
             for node in cluster.nodes:
@@ -112,10 +114,10 @@ class TestGpuMultiNode:
 
         venv_path = _resolve_gpu_venv(cluster)
         rd = cluster.remote_dir
-        deploy = native_host_deploy_dir()
+        fixtures = _FIXTURES_DIR
 
         # Ship the test script
-        src = deploy / "distributed_test.py"
+        src = fixtures / "distributed_test.py"
         if src.is_file():
             cluster.ship_file_to_all(src, "distributed_test.py")
 
@@ -147,10 +149,10 @@ class TestGpuMultiNode:
 
         venv_path = _resolve_gpu_venv(cluster)
         rd = cluster.remote_dir
-        deploy = native_host_deploy_dir()
+        fixtures = _FIXTURES_DIR
 
         # Ship the test script
-        src = deploy / "inference_test.py"
+        src = fixtures / "inference_test.py"
         if src.is_file():
             cluster.ship_file_to_all(src, "inference_test.py")
 
