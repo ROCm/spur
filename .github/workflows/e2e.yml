@@ -64,7 +64,7 @@ jobs:
 
   native-host:
     name: Native-Host
-    runs-on: [self-hosted, amd-aac02-rocm]
+    runs-on: [self-hosted, bare-metal-cluster]
     if: github.event.workflow_run.conclusion == 'success'
     concurrency:
       group: native-host-cluster
@@ -341,7 +341,7 @@ jobs:
 
   k8s:
     name: K8s
-    runs-on: [self-hosted, amd-aac02-rocm]
+    runs-on: [self-hosted, k8s-cluster]
     needs: push-image
     concurrency:
       group: k8s-integration
