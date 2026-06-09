@@ -313,8 +313,8 @@ jobs:
           result-encoding: string
           script: |
             const sha = '${{ github.event.workflow_run.head_sha }}';
-            const repo = '${{ github.repository }}'.toLowerCase();
-            return `ghcr.io/${repo}:${sha}`;
+            const owner = '${{ github.repository_owner }}'.toLowerCase();
+            return `ghcr.io/${owner}/spur-ci:${sha}`;
 
       - name: Download image artifact
         uses: actions/download-artifact@v8
@@ -359,8 +359,8 @@ jobs:
           result-encoding: string
           script: |
             const sha = '${{ github.event.workflow_run.head_sha }}';
-            const repo = '${{ github.repository }}'.toLowerCase();
-            return `ghcr.io/${repo}:${sha}`;
+            const owner = '${{ github.repository_owner }}'.toLowerCase();
+            return `ghcr.io/${owner}/spur-ci:${sha}`;
 
       - name: Set SPUR_CI_IMAGE
         run: |

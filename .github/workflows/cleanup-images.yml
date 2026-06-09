@@ -16,7 +16,7 @@ jobs:
       - name: Delete old CI images
         uses: actions/delete-package-versions@v5
         with:
-          package-name: spur
+          package-name: spur-ci
           package-type: container
           min-versions-to-keep: 20
           ignore-versions: "^(latest|v\\d+)"
