@@ -9,6 +9,7 @@ and CLI wrappers for interacting with the running cluster.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -110,9 +111,6 @@ class SshNode:
         """Read a remote file. Returns empty string if file doesn't exist."""
         return self.exec(f"cat '{remote_path}' 2>/dev/null || true", check=False)
 
-    def kill_processes(self, pattern: str):
-        self.exec_allow_fail(f"pkill -f '{pattern}' 2>/dev/null || true")
-
     def close(self):
         if self._sftp:
             self._sftp.close()
@@ -179,6 +177,7 @@ class SpurCluster:
         self.log_dir = f"{remote_dir}/log"
         self.controller_addr = f"http://{nodes[0].host}:{CONTROLLER_PORT}"
         self.config_overrides: dict = {}
+        self.agent_as_root: bool = False
 
     # --- Lifecycle ---
 
@@ -193,7 +192,12 @@ class SpurCluster:
         self._resolve_hostnames()
         logger.info("Cluster provisioned: %s", self.node_names)
 
-    def start(self, config_overrides: dict | None = None, kill_stale: bool = True):
+    def start(
+        self,
+        config_overrides: dict | None = None,
+        kill_stale: bool = True,
+        agent_as_root: bool = False,
+    ):
         """Write config and start all daemons.
 
         *config_overrides* is deep-merged into the default config.
@@ -201,35 +205,49 @@ class SpurCluster:
 
         When *kill_stale* is True (default), any lingering spurctld/spurd
         processes on the nodes are killed before starting fresh.
+
+        When *agent_as_root* is True, spurd is launched via sudo on each
+        node (rootful agent). spurctld always runs as the SSH user.
         """
         if not self.node_names:
             raise RuntimeError("provision() must be called before start()")
         if kill_stale:
-            self.stop()
+            self._kill_daemons(use_sudo=False)
+            self._kill_daemons(use_sudo=True)
+        self.agent_as_root = agent_as_root
         self.config_overrides = config_overrides or {}
         self._write_config()
         self._start_controller()
         time.sleep(2)
         self._start_agents()
         self._wait_all_idle(timeout=120)
-        logger.info("Cluster ready: %s", self.node_names)
+        logger.info(
+            "Cluster ready: %s (agent_as_root=%s)",
+            self.node_names,
+            self.agent_as_root,
+        )
 
     def stop(self):
         """Kill all daemons but keep the working directory intact."""
-        for node in self.nodes:
-            node.kill_processes("spurctld")
-            node.kill_processes("spurd")
+        self._kill_daemons(use_sudo=self.agent_as_root)
 
-    def deploy(self, config_overrides: dict | None = None):
+    def deploy(
+        self,
+        config_overrides: dict | None = None,
+        agent_as_root: bool = False,
+    ):
         """Provision + start in one call."""
         self.provision()
-        self.start(config_overrides)
+        if agent_as_root:
+            self.root_agent_preflight()
+        self.start(config_overrides, agent_as_root=agent_as_root)
 
     def teardown(self):
         """Kill all daemons and remove the working directory."""
         self.stop()
+        rm_prefix = self._sudo_prefix() if self.agent_as_root else ""
         for node in self.nodes:
-            node.exec_allow_fail(f"rm -rf '{self.remote_dir}'")
+            node.exec_allow_fail(f"{rm_prefix}rm -rf '{self.remote_dir}'")
         logger.info("Cluster torn down")
 
     # --- CLI wrappers ---
@@ -351,6 +369,134 @@ class SpurCluster:
                 f"found {len(gpu_nodes)} ({gpu_nodes})"
             )
 
+    def root_agent_preflight(self):
+        """Verify passwordless (or password-backed) sudo for rootful spurd. Skips if not."""
+        for i, node in enumerate(self.nodes):
+            try:
+                node.exec(f"{self._sudo_prefix()}true")
+            except RuntimeError:
+                pytest.skip(
+                    f"rootful spurd requires sudo on {self.node_names[i]} "
+                    f"(set SPUR_TEST_SSH_PASSWORD or configure NOPASSWD sudo)"
+                )
+
+    def require_nodes(self, min_nodes: int):
+        """Skip the test if fewer than min_nodes are configured."""
+        if len(self.nodes) < min_nodes:
+            pytest.skip(
+                f"Need at least {min_nodes} nodes in SPUR_TEST_NODES "
+                f"(got {len(self.nodes)})"
+            )
+
+    @staticmethod
+    def devices_config(auto_detect: bool = True, **extra) -> dict:
+        """Return config_overrides for spur-devices CDI auto-detect."""
+        devices = {"auto_detect": auto_detect, **extra}
+        return {"devices": devices}
+
+    def spurd_log(self, node_index: int = 0) -> str:
+        raw = self.nodes[node_index].read_file(f"{self.log_dir}/spurd.log")
+        return re.sub(r"\x1b\[[0-9;]*m", "", raw)
+
+    def spurd_registry_gpu_count(self, node_index: int = 0) -> int | None:
+        """Parse cdi_devices count from spurd startup log."""
+        log = self.spurd_log(node_index)
+        match = re.search(r"cdi_devices=(\d+)", log)
+        if match:
+            return int(match.group(1))
+        match = re.search(r"resources discovered.*?gpus=(\d+)", log)
+        if match:
+            return int(match.group(1))
+        return None
+
+    def assert_spurd_registry(self, node_index: int = 0, min_gpus: int = 1):
+        log = self.spurd_log(node_index)
+        assert "device registry initialized" in log, (
+            f"spurd on {self.node_names[node_index]} must initialize device registry\n"
+            f"log tail:\n{log[-2000:]}"
+        )
+        count = self.spurd_registry_gpu_count(node_index)
+        assert count is not None and count >= min_gpus, (
+            f"expected >= {min_gpus} CDI GPUs on {self.node_names[node_index]}, "
+            f"got {count}\nlog tail:\n{log[-2000:]}"
+        )
+
+    def scontrol_show_node(self, node_name: str) -> str:
+        return self.scontrol("show", "node", node_name)
+
+    def node_gpu_count(self, node_name: str) -> int:
+        """Return schedulable GPU count from scontrol show node."""
+        out = self.scontrol_show_node(node_name)
+        for line in out.splitlines():
+            if "Gres=" not in line:
+                continue
+            gres = line.split("Gres=", 1)[1].strip()
+            if not gres:
+                return 0
+            return len(re.findall(r"gpu:[^,]+", gres))
+        return 0
+
+    def assert_sinfo_gpus(self, min_per_node: int = 1):
+        for name in self.node_names:
+            count = self.node_gpu_count(name)
+            assert count >= min_per_node, (
+                f"node {name} must expose >= {min_per_node} GPU(s) in scontrol, "
+                f"got {count}\n{self.scontrol_show_node(name)}"
+            )
+
+    def ship_fixture(self, fixture_name: str) -> str:
+        """Ship a file from native_host/fixtures/ to remote_dir on all nodes."""
+        fixtures_dir = Path(__file__).resolve().parent / "fixtures"
+        local_path = fixtures_dir / fixture_name
+        if not local_path.is_file():
+            raise FileNotFoundError(f"Missing fixture: {local_path}")
+        self.ship_file_to_all(local_path, fixture_name)
+        return f"{self.remote_dir}/{fixture_name}"
+
+    def compile_hip_fixture(self, hip_filename: str) -> str:
+        """Ship and compile a HIP fixture on all nodes. Returns remote binary path."""
+        self.ship_fixture(hip_filename)
+        bin_name = hip_filename.rsplit(".", 1)[0]
+        remote_bin = f"{self.remote_dir}/{bin_name}"
+        remote_hip = f"{self.remote_dir}/{hip_filename}"
+        for node in self.nodes:
+            node.exec_allow_fail(
+                f"export PATH=/opt/rocm/bin:$PATH; "
+                f"command -v hipcc >/dev/null && "
+                f"hipcc -o '{remote_bin}' '{remote_hip}' 2>/dev/null || true"
+            )
+            if not node.exec_allow_fail(f"test -x '{remote_bin}' && echo OK").strip():
+                pytest.skip(f"hipcc could not build {hip_filename} on {node.host}")
+        return remote_bin
+
+    def restart_agent(self, node_index: int = 0):
+        """Restart spurd on one node without touching the controller."""
+        node = self.nodes[node_index]
+        self._pkill(node, f"{self.bin_dir}/spurd", use_sudo=self.agent_as_root)
+        time.sleep(1)
+        node.exec(self._spurd_start_cmd(node_index))
+        time.sleep(5)
+
+    def spurd_agent_user(self, node_index: int = 0) -> str:
+        """Return the user owning the spurd process on a node."""
+        node = self.nodes[node_index]
+        return node.exec_allow_fail(
+            f"ps -o user= -p $(pgrep -f '{self.bin_dir}/spurd' | head -1) "
+            f"2>/dev/null || echo unknown"
+        ).strip()
+
+    def wait_output(self, path: str, marker: str, timeout: int = 120) -> str:
+        """Poll job output file until marker appears or timeout."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            content = self.read_output_on_any_node(path)
+            if marker in content:
+                return content
+            if "MISSING" in content or "HIP error" in content:
+                return content
+            time.sleep(2)
+        return self.read_output_on_any_node(path)
+
     def container_preflight(self):
         """Check container prerequisites. Skips test if anything is missing."""
         if not shutil.which("mksquashfs"):
@@ -425,9 +571,13 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
             node.exec(f"mkdir -p '{self.remote_dir}' '{self.etc_dir}' '{self.state_dir}' '{self.log_dir}'")
 
     def _resolve_hostnames(self):
+        style = os.environ.get("SPUR_TEST_HOSTNAME_STYLE", "short")
         self.node_names = []
         for node in self.nodes:
-            name = node.exec("hostname -s").strip()
+            if style == "short":
+                name = node.exec("hostname -s").strip()
+            else:
+                name = node.exec("hostname -f").strip()
             if not name:
                 name = node.host
             self.node_names.append(name)
@@ -474,21 +624,51 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
         pid = self.nodes[0].exec(cmd).strip()
         logger.info("spurctld started on %s (pid %s)", self.node_names[0], pid)
 
+    def _sudo_prefix(self) -> str:
+        pw = os.environ.get("SPUR_TEST_SSH_PASSWORD", "")
+        if pw:
+            escaped = pw.replace("'", "'\"'\"'")
+            return f"echo '{escaped}' | sudo -S "
+        return "sudo -n "
+
+    def _pkill(self, node: SshNode, pattern: str, *, use_sudo: bool = False):
+        prefix = self._sudo_prefix() if use_sudo else ""
+        node.exec_allow_fail(f"{prefix}pkill -f '{pattern}' 2>/dev/null || true")
+
+    def _kill_daemons(self, *, use_sudo: bool):
+        for node in self.nodes:
+            self._pkill(node, f"{self.bin_dir}/spurctld", use_sudo=use_sudo)
+            self._pkill(node, f"{self.bin_dir}/spurd", use_sudo=use_sudo)
+
+    def _spurd_start_cmd(self, node_index: int) -> str:
+        node = self.nodes[node_index]
+        hostname = self.node_names[node_index]
+        address = node.host
+        agent_listen = f"0.0.0.0:{AGENT_PORT}"
+        spurd_bin = (
+            f"{self._sudo_prefix()}'{self.bin_dir}/spurd'"
+            if self.agent_as_root
+            else f"'{self.bin_dir}/spurd'"
+        )
+        return (
+            f"nohup {spurd_bin} "
+            f"-f '{self.etc_dir}/spur.conf' "
+            f"--controller '{self.controller_addr}' "
+            f"--listen '{agent_listen}' "
+            f"--hostname '{hostname}' --address '{address}' --log-level info -D "
+            f"> '{self.log_dir}/spurd.log' 2>&1 & echo $!"
+        )
+
     def _start_agents(self):
         for i, node in enumerate(self.nodes):
-            address = node.host
-            hostname = self.node_names[i]
-            agent_listen = f"0.0.0.0:{AGENT_PORT}"
-            cmd = (
-                f"nohup '{self.bin_dir}/spurd' "
-                f"-f '{self.etc_dir}/spur.conf' "
-                f"--controller '{self.controller_addr}' "
-                f"--listen '{agent_listen}' "
-                f"--hostname '{hostname}' --address '{address}' --log-level info -D "
-                f"> '{self.log_dir}/spurd.log' 2>&1 & echo $!"
-            )
+            cmd = self._spurd_start_cmd(i)
             pid = node.exec(cmd).strip()
-            logger.info("spurd started on %s (pid %s)", hostname, pid)
+            logger.info(
+                "spurd started on %s (pid %s, root=%s)",
+                self.node_names[i],
+                pid,
+                self.agent_as_root,
+            )
 
     def _wait_all_idle(self, timeout: int):
         deadline = time.time() + timeout

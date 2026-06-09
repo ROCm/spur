@@ -105,11 +105,11 @@ def _ensure_bins(ssh_nodes, remote_bin_dir):
     ensure_bins(ssh_nodes, _get_binaries_dir(), remote_bin_dir)
 
 
-def _deploy_cluster(ssh_nodes, remote_bin_dir):
+def _deploy_cluster(ssh_nodes, remote_bin_dir, *, agent_as_root: bool = False):
     """Helper: create, deploy, and return a SpurCluster. Tears down on deploy failure."""
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     try:
-        c.deploy()
+        c.deploy(agent_as_root=agent_as_root)
     except Exception:
         c.teardown()
         raise
@@ -170,15 +170,30 @@ def multi_node_cluster(ssh_nodes, remote_bin_dir):
     spur_cluster.teardown()
 
 
+def _any_node_has_gpu(nodes: list[SshNode]) -> bool:
+    for node in nodes:
+        probe = node.exec_allow_fail(
+            "ls /dev/kfd /dev/dri/card* /dev/dri/renderD* 2>/dev/null | head -1"
+        )
+        if probe.strip():
+            return True
+    return False
+
+
 @pytest.fixture
-def gpu_cluster(ssh_nodes, remote_bin_dir):
+def gpu_cluster(request, ssh_nodes, remote_bin_dir):
     """
     Per-test fixture for GPU tests.
-    Node/GPU requirements are enforced per test via gpu_preflight().
+
+    Skips the entire test if no node has GPU device nodes.
+    Decorate a test with ``@pytest.mark.rootful`` to launch spurd via sudo.
     """
     if len(ssh_nodes) < 1:
         pytest.skip("GPU tests require at least one node in SPUR_TEST_NODES")
+    if not _any_node_has_gpu(ssh_nodes):
+        pytest.skip("no GPU device nodes (/dev/kfd, /dev/dri/card*, /dev/dri/renderD*) on any node")
 
-    spur_cluster = _deploy_cluster(ssh_nodes, remote_bin_dir)
-    yield spur_cluster
-    spur_cluster.teardown()
+    as_root = request.node.get_closest_marker("rootful") is not None
+    c = _deploy_cluster(ssh_nodes, remote_bin_dir, agent_as_root=as_root)
+    yield c
+    c.teardown()

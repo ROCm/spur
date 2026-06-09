@@ -252,9 +252,9 @@ jobs:
           for node in "${NODES[@]}"; do
             ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
               "${BM_SSH_USER}@${node}" "
-              pkill -f spurctld 2>/dev/null || true
-              pkill -f spurd 2>/dev/null || true
-              rm -rf /tmp/spur-e2e-* 2>/dev/null || true
+              sudo pkill -f '${BM_REMOTE_BIN_DIR}/spurctld' 2>/dev/null || true
+              sudo pkill -f '${BM_REMOTE_BIN_DIR}/spurd' 2>/dev/null || true
+              sudo rm -rf /tmp/spur-e2e-* 2>/dev/null || true
             " || true
           done
 

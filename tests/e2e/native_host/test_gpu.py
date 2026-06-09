@@ -64,7 +64,7 @@ class TestGpuSingleNode:
         script = cluster.write_file("gpu-1n.sh", f"#!/bin/bash\n'{gpu_bin}'\n")
         out_path = f"{cluster.remote_dir}/hip-1n.out"
 
-        sb = cluster.sbatch(["-J", "hip-1n", "-N", "1", "-o", out_path, script])
+        sb = cluster.sbatch(["-J", "hip-1n", "-N", "1", "--gres=gpu:1", "-o", out_path, script])
         job_id = parse_job_id(sb)
         assert job_id is not None
 
@@ -97,7 +97,7 @@ class TestGpuMultiNode:
         script = cluster.write_file("gpu-2n.sh", f"#!/bin/bash\n'{gpu_bin}'\n")
         out_path = f"{cluster.remote_dir}/hip-2n.out"
 
-        sb = cluster.sbatch(["-J", "hip-2n", "-N", "2", "-o", out_path, script])
+        sb = cluster.sbatch(["-J", "hip-2n", "-N", "2", "--gres=gpu:1", "-o", out_path, script])
         job_id = parse_job_id(sb)
         assert job_id is not None
 
@@ -164,7 +164,7 @@ class TestGpuMultiNode:
         )
         out_path = f"{rd}/infer.out"
 
-        sb = cluster.sbatch(["-J", "infer-2n", "-N", "2", "-o", out_path, job_sh])
+        sb = cluster.sbatch(["-J", "infer-2n", "-N", "2", "--gres=gpu:1", "-o", out_path, job_sh])
         job_id = parse_job_id(sb)
         assert job_id is not None
 
