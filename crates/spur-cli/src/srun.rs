@@ -314,7 +314,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                         | JobState::JobFailed
                         | JobState::JobCancelled
                         | JobState::JobTimeout
-                        | JobState::JobNodeFail),
+                        | JobState::JobNodeFail
+                        | JobState::JobDeadline),
                     ) => {
                         handle_terminal_state(
                             state,
@@ -429,7 +430,8 @@ async fn poll_for_completion(
                         | JobState::JobFailed
                         | JobState::JobCancelled
                         | JobState::JobTimeout
-                        | JobState::JobNodeFail),
+                        | JobState::JobNodeFail
+                        | JobState::JobDeadline),
                     ) => {
                         handle_terminal_state(
                             state,
@@ -500,6 +502,10 @@ async fn handle_terminal_state(
         }
         JobState::JobNodeFail => {
             eprintln!("srun: job {} failed (node failure)", job_id);
+            std::process::exit(1);
+        }
+        JobState::JobDeadline => {
+            eprintln!("srun: job {} hit its --deadline", job_id);
             std::process::exit(1);
         }
         _ => {

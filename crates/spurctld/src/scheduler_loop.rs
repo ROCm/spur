@@ -729,10 +729,10 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
                     if now > deadline {
                         info!(
                             job_id = job.job_id,
-                            "job deadline passed while still pending — cancelling"
+                            "job deadline passed while still pending — transitioning to DEADLINE"
                         );
-                        if let Err(e) = cluster.cancel_job(job.job_id, "system") {
-                            warn!(job_id = job.job_id, error = %e, "failed to cancel deadline-expired job");
+                        if let Err(e) = cluster.deadline_job(job.job_id) {
+                            warn!(job_id = job.job_id, error = %e, "failed to mark job DEADLINE");
                         }
                     }
                 }

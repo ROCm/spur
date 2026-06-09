@@ -43,6 +43,38 @@ mod tests {
         assert_transition_err(&mut job, JobState::Cancelled);
     }
 
+    // ── T06.6: Deadline from pending ─────────────────────────────
+
+    #[test]
+    fn t06_6_deadline_from_pending() {
+        reset_job_ids();
+        let mut job = make_job("test");
+        assert_transition_ok(&mut job, JobState::Deadline);
+        assert!(job.state.is_terminal());
+        assert!(!job.state.is_active());
+    }
+
+    // ── T06.7: Cannot deadline a running job ─────────────────────
+
+    #[test]
+    fn t06_7_cannot_deadline_running() {
+        reset_job_ids();
+        let mut job = make_job("test");
+        assert_transition_ok(&mut job, JobState::Running);
+        assert_transition_err(&mut job, JobState::Deadline);
+    }
+
+    // ── T06.8: Cannot deadline a completed job ───────────────────
+
+    #[test]
+    fn t06_8_cannot_deadline_completed() {
+        reset_job_ids();
+        let mut job = make_job("test");
+        assert_transition_ok(&mut job, JobState::Running);
+        assert_transition_ok(&mut job, JobState::Completed);
+        assert_transition_err(&mut job, JobState::Deadline);
+    }
+
     // ── T06.4: Hold sets pending reason ──────────────────────────
 
     #[test]

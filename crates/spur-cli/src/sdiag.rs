@@ -53,6 +53,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 JobState::JobNodeFail as i32,
                 JobState::JobPreempted as i32,
                 JobState::JobSuspended as i32,
+                JobState::JobDeadline as i32,
             ],
             user: String::new(),
             partition: String::new(),
@@ -71,6 +72,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let mut failed = 0u32;
     let mut cancelled = 0u32;
     let mut timeout = 0u32;
+    let mut deadline = 0u32;
     let total = jobs.len() as u32;
 
     for job in &jobs {
@@ -81,6 +83,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             s if s == JobState::JobFailed as i32 => failed += 1,
             s if s == JobState::JobCancelled as i32 => cancelled += 1,
             s if s == JobState::JobTimeout as i32 => timeout += 1,
+            s if s == JobState::JobDeadline as i32 => deadline += 1,
             _ => {}
         }
     }
@@ -119,9 +122,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     println!("  Failed            : {}", failed);
     println!("  Cancelled         : {}", cancelled);
     println!("  Timeout           : {}", timeout);
+    println!("  Deadline          : {}", deadline);
 
     // Compute some derived stats
-    let finished = completed + failed + cancelled + timeout;
+    let finished = completed + failed + cancelled + timeout + deadline;
     let success_rate = if finished > 0 {
         (completed as f64 / finished as f64) * 100.0
     } else {

@@ -45,6 +45,7 @@ enum JobState {
   JOB_NODE_FAIL = 7;
   JOB_PREEMPTED = 8;
   JOB_SUSPENDED = 9;
+  JOB_DEADLINE = 10;
 }
 
 enum NodeState {

@@ -70,6 +70,7 @@ impl SlurmAccounting for AccountingService {
             5 => "CANCELLED",
             6 => "TIMEOUT",
             7 => "NODE_FAIL",
+            10 => "DEADLINE",
             _ => "UNKNOWN",
         };
 
@@ -107,6 +108,7 @@ impl SlurmAccounting for AccountingService {
                 4 => Some("FAILED".into()),
                 5 => Some("CANCELLED".into()),
                 6 => Some("TIMEOUT".into()),
+                10 => Some("DEADLINE".into()),
                 _ => None,
             })
             .collect();
@@ -148,6 +150,7 @@ impl SlurmAccounting for AccountingService {
                     "FAILED" => JobState::JobFailed as i32,
                     "CANCELLED" => JobState::JobCancelled as i32,
                     "TIMEOUT" => JobState::JobTimeout as i32,
+                    "DEADLINE" => JobState::JobDeadline as i32,
                     "RUNNING" => JobState::JobRunning as i32,
                     "PENDING" => JobState::JobPending as i32,
                     _ => JobState::JobCompleted as i32,

@@ -204,6 +204,7 @@ fn parse_acct_state(s: &str) -> Option<i32> {
         "CA" | "CANCELLED" => Some(5),
         "TO" | "TIMEOUT" => Some(6),
         "NF" | "NODE_FAIL" => Some(7),
+        "DL" | "DEADLINE" => Some(10),
         "R" | "RUNNING" => Some(1),
         "PD" | "PENDING" => Some(0),
         _ => None,
@@ -293,5 +294,35 @@ fn datetime_to_proto(dt: chrono::DateTime<chrono::Utc>) -> prost_types::Timestam
     prost_types::Timestamp {
         seconds: dt.timestamp(),
         nanos: dt.timestamp_subsec_nanos() as i32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spur_proto::proto::JobState;
+
+    #[test]
+    fn parse_acct_state_maps_deadline() {
+        // Both the long form and the squeue short code resolve to the proto
+        // JobDeadline discriminant, so `sacct --state=DEADLINE` filters work.
+        assert_eq!(parse_acct_state("DEADLINE"), Some(JobState::JobDeadline as i32));
+        assert_eq!(parse_acct_state("DL"), Some(JobState::JobDeadline as i32));
+        assert_eq!(parse_acct_state("deadline"), Some(JobState::JobDeadline as i32));
+    }
+
+    #[test]
+    fn parse_acct_state_round_trips_known_states() {
+        let cases = [
+            ("COMPLETED", JobState::JobCompleted),
+            ("FAILED", JobState::JobFailed),
+            ("CANCELLED", JobState::JobCancelled),
+            ("TIMEOUT", JobState::JobTimeout),
+            ("NODE_FAIL", JobState::JobNodeFail),
+            ("DEADLINE", JobState::JobDeadline),
+        ];
+        for (s, expected) in cases {
+            assert_eq!(parse_acct_state(s), Some(expected as i32), "state {s}");
+        }
     }
 }

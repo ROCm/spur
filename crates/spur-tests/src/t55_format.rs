@@ -63,6 +63,7 @@ mod tests {
             ("NF", "NODE_FAIL"),
             ("PR", "PREEMPTED"),
             ("S", "SUSPENDED"),
+            ("DL", "DEADLINE"),
         ];
         assert_eq!(JobState::ALL.len(), expected.len());
         for (i, state) in JobState::ALL.iter().enumerate() {

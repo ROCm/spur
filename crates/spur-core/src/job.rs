@@ -25,6 +25,10 @@ pub enum JobState {
     NodeFail,
     Preempted,
     Suspended,
+    /// Job's `--deadline` passed while still pending. Terminal state.
+    /// Distinct from `Cancelled` so users can tell timed-out submissions
+    /// apart from user/admin cancellations.
+    Deadline,
 }
 
 impl JobState {
@@ -41,6 +45,7 @@ impl JobState {
             Self::NodeFail => "NF",
             Self::Preempted => "PR",
             Self::Suspended => "S",
+            Self::Deadline => "DL",
         }
     }
 
@@ -57,13 +62,19 @@ impl JobState {
             Self::NodeFail => "NODE_FAIL",
             Self::Preempted => "PREEMPTED",
             Self::Suspended => "SUSPENDED",
+            Self::Deadline => "DEADLINE",
         }
     }
 
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::Completed | Self::Failed | Self::Cancelled | Self::Timeout | Self::NodeFail
+            Self::Completed
+                | Self::Failed
+                | Self::Cancelled
+                | Self::Timeout
+                | Self::NodeFail
+                | Self::Deadline
         )
     }
 
@@ -105,7 +116,7 @@ impl JobState {
     }
 
     /// Every core variant, in proto discriminant order for iteration only.
-    pub const ALL: [JobState; 10] = [
+    pub const ALL: [JobState; 11] = [
         Self::Pending,
         Self::Running,
         Self::Completing,
@@ -116,6 +127,7 @@ impl JobState {
         Self::NodeFail,
         Self::Preempted,
         Self::Suspended,
+        Self::Deadline,
     ];
 
     pub const COUNT: usize = Self::ALL.len();
@@ -133,6 +145,7 @@ impl JobState {
             spur_proto::proto::JobState::JobNodeFail => Self::NodeFail,
             spur_proto::proto::JobState::JobPreempted => Self::Preempted,
             spur_proto::proto::JobState::JobSuspended => Self::Suspended,
+            spur_proto::proto::JobState::JobDeadline => Self::Deadline,
         }
     }
 
@@ -149,6 +162,7 @@ impl JobState {
             Self::NodeFail => spur_proto::proto::JobState::JobNodeFail,
             Self::Preempted => spur_proto::proto::JobState::JobPreempted,
             Self::Suspended => spur_proto::proto::JobState::JobSuspended,
+            Self::Deadline => spur_proto::proto::JobState::JobDeadline,
         }
     }
 
@@ -196,7 +210,9 @@ pub enum PendingReason {
     QoSMaxJobsPerUser,
     ReqNodeNotAvail,
     BeginTime,
-    DeadlineReached,
+    /// Job's `--deadline` passed. Matches Slurm's `DeadLine` reason string
+    /// (note the capitalisation).
+    DeadLine,
     Licenses,
 }
 
@@ -215,7 +231,7 @@ impl PendingReason {
             Self::QoSMaxJobsPerUser => "QOSMaxJobsPerUserLimit",
             Self::ReqNodeNotAvail => "ReqNodeNotAvail",
             Self::BeginTime => "BeginTime",
-            Self::DeadlineReached => "DeadlineReached",
+            Self::DeadLine => "DeadLine",
             Self::Licenses => "Licenses",
         }
     }
@@ -587,6 +603,7 @@ impl Job {
         let valid = match (self.state, to) {
             (JobState::Pending, JobState::Running) => true,
             (JobState::Pending, JobState::Cancelled) => true,
+            (JobState::Pending, JobState::Deadline) => true,
             (JobState::Running, JobState::Completing) => true,
             (JobState::Running, JobState::Completed) => true,
             (JobState::Running, JobState::Failed) => true,
@@ -770,6 +787,41 @@ mod tests {
     }
 
     #[test]
+    fn deadline_state_is_terminal_and_reachable_only_from_pending() {
+        // Terminal flag is what tells the dep engine and the requeue logic
+        // that this state can never come back to Pending.
+        assert!(JobState::Deadline.is_terminal());
+        assert!(!JobState::Deadline.is_active());
+        assert_eq!(JobState::Deadline.code(), "DL");
+        assert_eq!(JobState::Deadline.display(), "DEADLINE");
+
+        // Pending -> Deadline is the only legal entry. Running/Suspended/
+        // already-terminal jobs must NOT silently fall into DEADLINE — those
+        // would mask the real reason the job ended.
+        let mut p = make_job();
+        assert_eq!(p.state, JobState::Pending);
+        p.transition(JobState::Deadline).unwrap();
+        assert_eq!(p.state, JobState::Deadline);
+        assert!(p.end_time.is_some());
+
+        let mut r = make_job();
+        r.transition(JobState::Running).unwrap();
+        assert!(r.transition(JobState::Deadline).is_err());
+
+        let mut done = make_job();
+        done.transition(JobState::Running).unwrap();
+        done.transition(JobState::Completed).unwrap();
+        assert!(done.transition(JobState::Deadline).is_err());
+    }
+
+    #[test]
+    fn deadline_reason_displays_slurm_string() {
+        // Slurm reports this exact string ("DeadLine", note the cap D and L).
+        // squeue scrapers and Slurm-compat clients pattern-match on it.
+        assert_eq!(PendingReason::DeadLine.display(), "DeadLine");
+    }
+
+    #[test]
     fn test_path_resolution() {
         let mut job = make_job();
         job.job_id = 42;
@@ -805,6 +857,7 @@ mod tests {
             (P::JobNodeFail, JobState::NodeFail),
             (P::JobPreempted, JobState::Preempted),
             (P::JobSuspended, JobState::Suspended),
+            (P::JobDeadline, JobState::Deadline),
         ];
 
         assert_eq!(TABLE.len(), JobState::COUNT);

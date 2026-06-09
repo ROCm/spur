@@ -19,10 +19,18 @@ mod tests {
                 ..Default::default()
             },
         );
-        if state != JobState::Pending {
-            let _ = job.transition(JobState::Running);
-            if state != JobState::Running {
-                let _ = job.transition(state);
+        match state {
+            JobState::Pending => {}
+            // Deadline is only reachable directly from Pending; it must not
+            // pass through Running like the other terminal states.
+            JobState::Deadline => {
+                let _ = job.transition(JobState::Deadline);
+            }
+            _ => {
+                let _ = job.transition(JobState::Running);
+                if state != JobState::Running {
+                    let _ = job.transition(state);
+                }
             }
         }
         job
@@ -295,6 +303,90 @@ mod tests {
             },
         );
         let result = check_dependencies(&job, &|_| None, &|_, _| Vec::new());
+        assert_eq!(result, DependencyResult::Satisfied);
+    }
+
+    // ── T56.17: afterok failed when dependency hit deadline ──────
+
+    #[test]
+    fn t56_17_afterok_dep_deadline() {
+        let dep = make_job_state(100, JobState::Deadline);
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "test".into(),
+                user: "alice".into(),
+                dependency: vec!["afterok:100".into()],
+                ..Default::default()
+            },
+        );
+        let result = check_dependencies(
+            &job,
+            &|id| {
+                if id == 100 {
+                    Some(dep.clone())
+                } else {
+                    None
+                }
+            },
+            &|_, _| Vec::new(),
+        );
+        assert_eq!(result, DependencyResult::Failed);
+    }
+
+    // ── T56.18: afternotok satisfied when dependency hit deadline ─
+
+    #[test]
+    fn t56_18_afternotok_dep_deadline() {
+        let dep = make_job_state(100, JobState::Deadline);
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "test".into(),
+                user: "alice".into(),
+                dependency: vec!["afternotok:100".into()],
+                ..Default::default()
+            },
+        );
+        let result = check_dependencies(
+            &job,
+            &|id| {
+                if id == 100 {
+                    Some(dep.clone())
+                } else {
+                    None
+                }
+            },
+            &|_, _| Vec::new(),
+        );
+        assert_eq!(result, DependencyResult::Satisfied);
+    }
+
+    // ── T56.19: afterany satisfied when dependency hit deadline ───
+
+    #[test]
+    fn t56_19_afterany_dep_deadline() {
+        let dep = make_job_state(100, JobState::Deadline);
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "test".into(),
+                user: "alice".into(),
+                dependency: vec!["afterany:100".into()],
+                ..Default::default()
+            },
+        );
+        let result = check_dependencies(
+            &job,
+            &|id| {
+                if id == 100 {
+                    Some(dep.clone())
+                } else {
+                    None
+                }
+            },
+            &|_, _| Vec::new(),
+        );
         assert_eq!(result, DependencyResult::Satisfied);
     }
 

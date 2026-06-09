@@ -31,6 +31,9 @@ spur_jobs_preempted 0
 # HELP spur_jobs_suspended Number of jobs in SUSPENDED state.
 # TYPE spur_jobs_suspended gauge
 spur_jobs_suspended 0
+# HELP spur_jobs_deadline Number of jobs in DEADLINE state.
+# TYPE spur_jobs_deadline gauge
+spur_jobs_deadline 0
 # HELP spur_jobs_cpus_alloc Total CPUs allocated to jobs in Running or Completing state.
 # TYPE spur_jobs_cpus_alloc gauge
 spur_jobs_cpus_alloc 4

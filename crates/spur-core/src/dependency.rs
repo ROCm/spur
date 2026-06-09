@@ -76,7 +76,8 @@ pub fn check_dependencies(
                         JobState::Failed
                         | JobState::Cancelled
                         | JobState::Timeout
-                        | JobState::NodeFail => {
+                        | JobState::NodeFail
+                        | JobState::Deadline => {
                             return DependencyResult::Failed; // Dependency failed
                         }
                         _ => return DependencyResult::Waiting, // Still running/pending
@@ -97,7 +98,8 @@ pub fn check_dependencies(
                         JobState::Failed
                         | JobState::Cancelled
                         | JobState::Timeout
-                        | JobState::NodeFail => {} // Satisfied
+                        | JobState::NodeFail
+                        | JobState::Deadline => {} // Satisfied
                         JobState::Completed => return DependencyResult::Failed,
                         _ => return DependencyResult::Waiting,
                     },

@@ -24,6 +24,7 @@ pub fn job_state_metric_suffix(state: JobState) -> &'static str {
         JobState::NodeFail => "node_fail",
         JobState::Preempted => "preempted",
         JobState::Suspended => "suspended",
+        JobState::Deadline => "deadline",
     }
 }
 

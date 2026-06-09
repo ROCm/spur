@@ -237,6 +237,47 @@ impl ClusterManager {
             .collect()
     }
 
+    /// Mark a pending job as DEADLINE (Slurm parity for `--deadline`).
+    ///
+    /// Distinct from `cancel_job` so the terminal state and audit trail show
+    /// `JobState::Deadline / Reason=DeadLine` instead of `Cancelled / NodeDown`.
+    /// Only valid from `Pending`; if the job has already started or terminated
+    /// this is a no-op.
+    pub fn deadline_job(&self, job_id: JobId) -> anyhow::Result<()> {
+        {
+            let mut jobs = self.jobs.write();
+            let job = jobs
+                .get_mut(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            if job.state.is_terminal() {
+                anyhow::bail!("job {} is already {:?}", job_id, job.state);
+            }
+            if job.state != JobState::Pending {
+                anyhow::bail!(
+                    "job {} not eligible for DEADLINE from state {:?}",
+                    job_id,
+                    job.state
+                );
+            }
+            // Record the reason before the terminal transition so any
+            // observer (history, audit log, late `squeue` poll) sees DeadLine
+            // instead of whatever update_pending_reasons last wrote.
+            job.pending_reason = PendingReason::DeadLine;
+        }
+
+        let resp = self.propose(WalOperation::JobComplete {
+            job_id,
+            exit_code: -1,
+            state: JobState::Deadline,
+        })?;
+        if let Some(f) = resp.job_finalized {
+            self.run_job_finalized_side_effects(f);
+        }
+
+        info!(job_id, "job deadline passed — transitioned to DEADLINE");
+        Ok(())
+    }
+
     /// Cancel a job.
     pub fn cancel_job(&self, job_id: JobId, _user: &str) -> anyhow::Result<()> {
         {
@@ -477,7 +518,7 @@ impl ClusterManager {
             let is_success = state == JobState::Completed;
             let is_failure = matches!(
                 state,
-                JobState::Failed | JobState::Timeout | JobState::NodeFail
+                JobState::Failed | JobState::Timeout | JobState::NodeFail | JobState::Deadline
             );
             if is_success && spec.mail_type.iter().any(|t| t == "END" || t == "ALL") {
                 self.send_notification(job_id, "END", &spec);
@@ -1205,6 +1246,13 @@ impl ClusterManager {
 
             // Don't overwrite held jobs
             if job_entry.pending_reason == PendingReason::Held {
+                continue;
+            }
+            // Don't overwrite a DeadLine reason set by the deadline-enforcement
+            // path — the job is about to transition to JobState::Deadline this
+            // tick; clobbering with Resources/NodeDown would mislead any
+            // observer that polls in between.
+            if job_entry.pending_reason == PendingReason::DeadLine {
                 continue;
             }
 
@@ -2831,6 +2879,79 @@ mod tests {
 
         let job = cm.get_job(job_id).unwrap();
         assert_eq!(job.state, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deadline_job_transitions_pending_to_deadline_with_deadline_reason() {
+        // Mirrors the Slurm `JobState=DEADLINE Reason=DeadLine` parity check
+        // from issue #258 — a `--deadline` that passes while the job is still
+        // pending must produce a DEADLINE terminal state, not CANCELLED, and
+        // the surfaced reason must be `DeadLine`, not whatever
+        // `update_pending_reasons` last wrote (e.g. NodeDown, Resources).
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let job_id = submit_and_wait(&cm, basic_spec("dl"));
+        cm.deadline_job(job_id).unwrap();
+        settle(&cm, job_id, JobState::Deadline);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Deadline);
+        assert_eq!(job.pending_reason, PendingReason::DeadLine);
+        assert_eq!(job.exit_code, Some(-1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deadline_job_rejects_non_pending_states() {
+        // DEADLINE is a pending-time concept; once a job has actually started
+        // running, hitting the wall time is a Timeout, and hitting the
+        // deadline mid-run shouldn't silently rewrite Running → Deadline.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 4, 8000);
+
+        let job_id = submit_and_wait(&cm, basic_spec("running"));
+        let resources = ResourceSet {
+            cpus: 1,
+            memory_mb: 1000,
+            ..Default::default()
+        };
+        cm.start_job(job_id, vec!["worker1".into()], resources)
+            .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        assert!(cm.deadline_job(job_id).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deadline_reason_survives_update_pending_reasons() {
+        // Regression guard for the field bug: scheduler_loop fires the
+        // deadline path while update_pending_reasons is also running each
+        // tick. If the guard in update_pending_reasons regresses, the reason
+        // gets clobbered to NodeDown/Resources just before the WAL apply,
+        // and the user sees the wrong cause in any audit log.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let job_id = submit_and_wait(&cm, basic_spec("dl-race"));
+
+        // Manually mark DeadLine, then run update_pending_reasons over an
+        // empty cluster_state (which would otherwise force Resources/NodeDown).
+        {
+            let mut jobs = cm.jobs.write();
+            jobs.get_mut(&job_id).unwrap().pending_reason = PendingReason::DeadLine;
+        }
+        let empty_state = spur_sched::traits::ClusterState {
+            nodes: &[],
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        let snapshot = cm.get_job(job_id).unwrap();
+        cm.update_pending_reasons(&[&snapshot], &empty_state);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::DeadLine);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
