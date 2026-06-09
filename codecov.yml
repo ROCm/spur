@@ -1,0 +1,18 @@
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+        target: 70%
+
+comment:
+  layout: "condensed_header, diff, flags"
+  behavior: default
+  require_changes: true
+
+ignore:
+  - "crates/spur-ffi/**"
+  - "crates/spur-proto/src/**"
