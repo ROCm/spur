@@ -241,8 +241,11 @@ impl ClusterManager {
     ///
     /// Distinct from `cancel_job` so the terminal state and audit trail show
     /// `JobState::Deadline / Reason=DeadLine` instead of `Cancelled / NodeDown`.
-    /// Only valid from `Pending`; if the job has already started or terminated
-    /// this is a no-op.
+    /// Only valid from `Pending`: returns `Err` if the job is unknown, already
+    /// terminal, or has started running (those must not be relabelled DEADLINE).
+    /// Callers treat the error as non-fatal — the deadline enforcer logs and
+    /// moves on, since a job that left `Pending` between the scan and this call
+    /// no longer needs the deadline transition.
     pub fn deadline_job(&self, job_id: JobId) -> anyhow::Result<()> {
         {
             let mut jobs = self.jobs.write();

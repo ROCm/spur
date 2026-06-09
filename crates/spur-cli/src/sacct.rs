@@ -306,9 +306,15 @@ mod tests {
     fn parse_acct_state_maps_deadline() {
         // Both the long form and the squeue short code resolve to the proto
         // JobDeadline discriminant, so `sacct --state=DEADLINE` filters work.
-        assert_eq!(parse_acct_state("DEADLINE"), Some(JobState::JobDeadline as i32));
+        assert_eq!(
+            parse_acct_state("DEADLINE"),
+            Some(JobState::JobDeadline as i32)
+        );
         assert_eq!(parse_acct_state("DL"), Some(JobState::JobDeadline as i32));
-        assert_eq!(parse_acct_state("deadline"), Some(JobState::JobDeadline as i32));
+        assert_eq!(
+            parse_acct_state("deadline"),
+            Some(JobState::JobDeadline as i32)
+        );
     }
 
     #[test]
