@@ -38,7 +38,7 @@ jobs:
 
       - name: Package binaries
         run: |
-          VERSION="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
           DIST="spur-${VERSION}-linux-amd64"
           mkdir -p "${DIST}/bin"
           for bin in spur spurctld spurd spurdbd spurrestd; do
@@ -119,7 +119,7 @@ jobs:
 
       - name: Determine tag
         id: tag
-        run: echo "tag=${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}" >> "$GITHUB_OUTPUT"
+        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v4
@@ -135,7 +135,6 @@ jobs:
           tags: |
             type=semver,pattern={{version}},value=${{ steps.tag.outputs.tag }}
             type=semver,pattern={{major}}.{{minor}},value=${{ steps.tag.outputs.tag }}
-            type=raw,value=latest
 
       - name: Build and push
         uses: docker/build-push-action@v7
@@ -162,7 +161,7 @@ jobs:
 
       - name: Determine tag
         id: tag
-        run: echo "tag=${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}" >> "$GITHUB_OUTPUT"
+        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
 
       - name: Create release
         env:
