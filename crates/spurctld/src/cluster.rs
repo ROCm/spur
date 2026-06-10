@@ -239,13 +239,8 @@ impl ClusterManager {
 
     /// Mark a pending job as DEADLINE (Slurm parity for `--deadline`).
     ///
-    /// Distinct from `cancel_job` so the terminal state and audit trail show
-    /// `JobState::Deadline / Reason=DeadLine` instead of `Cancelled / NodeDown`.
     /// Only valid from `Pending`: returns `Err` if the job is unknown, already
-    /// terminal, or has started running (those must not be relabelled DEADLINE).
-    /// Callers treat the error as non-fatal — the deadline enforcer logs and
-    /// moves on, since a job that left `Pending` between the scan and this call
-    /// no longer needs the deadline transition.
+    /// terminal, or has started running. Callers treat the error as non-fatal.
     pub fn deadline_job(&self, job_id: JobId) -> anyhow::Result<()> {
         {
             let mut jobs = self.jobs.write();
@@ -2886,11 +2881,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deadline_job_transitions_pending_to_deadline_with_deadline_reason() {
-        // Mirrors the Slurm `JobState=DEADLINE Reason=DeadLine` parity check
-        // from issue #258 — a `--deadline` that passes while the job is still
-        // pending must produce a DEADLINE terminal state, not CANCELLED, and
-        // the surfaced reason must be `DeadLine`, not whatever
-        // `update_pending_reasons` last wrote (e.g. NodeDown, Resources).
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
@@ -2906,9 +2896,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deadline_job_rejects_non_pending_states() {
-        // DEADLINE is a pending-time concept; once a job has actually started
-        // running, hitting the wall time is a Timeout, and hitting the
-        // deadline mid-run shouldn't silently rewrite Running → Deadline.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "worker1", 4, 8000);

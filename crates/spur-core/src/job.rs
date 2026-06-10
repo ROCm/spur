@@ -25,9 +25,6 @@ pub enum JobState {
     NodeFail,
     Preempted,
     Suspended,
-    /// Job's `--deadline` passed while still pending. Terminal state.
-    /// Distinct from `Cancelled` so users can tell timed-out submissions
-    /// apart from user/admin cancellations.
     Deadline,
 }
 
@@ -210,10 +207,6 @@ pub enum PendingReason {
     QoSMaxJobsPerUser,
     ReqNodeNotAvail,
     BeginTime,
-    /// Job's `--deadline` passed. Matches Slurm's `DeadLine` reason string
-    /// (note the capitalisation). The serde alias keeps Raft snapshots/log
-    /// entries written before the rename (`DeadlineReached`) deserializable.
-    #[serde(alias = "DeadlineReached")]
     DeadLine,
     Licenses,
 }
@@ -821,22 +814,6 @@ mod tests {
         // Slurm reports this exact string ("DeadLine", note the cap D and L).
         // squeue scrapers and Slurm-compat clients pattern-match on it.
         assert_eq!(PendingReason::DeadLine.display(), "DeadLine");
-    }
-
-    #[test]
-    fn deadline_reason_deserializes_pre_rename_snapshots() {
-        // PendingReason is persisted in Raft snapshots/log entries. Snapshots
-        // written before the DeadlineReached -> DeadLine rename must still load
-        // via the serde alias, or a controller restart on old state would fail.
-        let old: PendingReason = serde_json::from_str("\"DeadlineReached\"").unwrap();
-        assert_eq!(old, PendingReason::DeadLine);
-        // New name round-trips as the canonical form.
-        let new: PendingReason = serde_json::from_str("\"DeadLine\"").unwrap();
-        assert_eq!(new, PendingReason::DeadLine);
-        assert_eq!(
-            serde_json::to_string(&PendingReason::DeadLine).unwrap(),
-            "\"DeadLine\""
-        );
     }
 
     #[test]

@@ -720,17 +720,13 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
 
         let now = Utc::now();
 
-        // Deadline enforcement: cancel pending jobs whose deadline has passed
+        // Deadline enforcement: mark pending jobs whose deadline has passed
         {
             let pending =
                 cluster.get_jobs(&[spur_core::job::JobState::Pending], None, None, None, &[]);
             for job in &pending {
                 if let Some(deadline) = job.spec.deadline {
                     if now > deadline {
-                        info!(
-                            job_id = job.job_id,
-                            "job deadline passed while still pending — transitioning to DEADLINE"
-                        );
                         if let Err(e) = cluster.deadline_job(job.job_id) {
                             warn!(job_id = job.job_id, error = %e, "failed to mark job DEADLINE");
                         }
