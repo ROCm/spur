@@ -103,7 +103,10 @@ ARCH=$(uname -m)
 [ "$ARCH" = "x86_64" ] || err "Spur currently supports x86_64 only (got ${ARCH})"
 
 # --- glibc check (binaries built on AlmaLinux 8, require glibc >= 2.28) ---
-GLIBC_VER=$(ldd --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+$' || echo "0")
+# Two-step extraction avoids pipefail + SIGPIPE interaction (head -1 closes
+# early, ldd gets SIGPIPE, pipeline exit != 0, fallback echo "0" appends).
+_ldd_line=$(ldd --version 2>&1 | head -1 || true)
+GLIBC_VER=$(echo "$_ldd_line" | grep -oE '[0-9]+\.[0-9]+$' || echo "0")
 if [ "$(printf '%s\n' "2.28" "${GLIBC_VER}" | sort -V | head -1)" != "2.28" ]; then
     err "Spur requires glibc >= 2.28 (found ${GLIBC_VER}). Supported: Ubuntu 20.04+, Debian 10+, RHEL 8+, Fedora 28+"
 fi
