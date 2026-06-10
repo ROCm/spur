@@ -74,6 +74,7 @@ jobs:
       BM_NODES: ${{ secrets.BM_NODES }}
       BM_SSH_USER: ${{ secrets.BM_SSH_USER }}
       BM_REMOTE_BIN_DIR: /tmp/spur-ci-bin
+      E2E_ASSETS_DIR: /tmp/spur-e2e-assets-${{ github.run_id }}
     steps:
       - name: Set pending status
         uses: actions/github-script@v9
@@ -99,14 +100,14 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: e2e-assets
-          path: trusted-repo
+          path: ${{ env.E2E_ASSETS_DIR }}
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python venv and install test deps
         run: |
           python3 -m venv /tmp/spur-e2e-venv
-          /tmp/spur-e2e-venv/bin/pip install -r trusted-repo/tests/e2e/requirements.txt
+          /tmp/spur-e2e-venv/bin/pip install -r "$E2E_ASSETS_DIR/tests/e2e/requirements.txt"
           echo "/tmp/spur-e2e-venv/bin" >> "$GITHUB_PATH"
 
       - name: Load SSH key into agent
@@ -200,7 +201,7 @@ jobs:
           SPUR_TEST_GPU_VENV: /opt/spur-ci/gpu-venv
         run: |
           chmod +x /tmp/release-binaries/*
-          pytest trusted-repo/tests/e2e/native_host/ -v
+          pytest "$E2E_ASSETS_DIR/tests/e2e/native_host/" -v
 
       - name: Collect cluster logs
         if: failure()
@@ -231,8 +232,8 @@ jobs:
         id: scrub-logs
         if: failure()
         run: |
-          chmod +x trusted-repo/scripts/scrub-ci-logs.sh
-          trusted-repo/scripts/scrub-ci-logs.sh /tmp/bm-logs \
+          chmod +x "$E2E_ASSETS_DIR/scripts/scrub-ci-logs.sh"
+          "$E2E_ASSETS_DIR/scripts/scrub-ci-logs.sh" /tmp/bm-logs \
             --hostnames "$BM_NODES" \
             --ssh-user "$BM_SSH_USER"
 
@@ -283,9 +284,13 @@ jobs:
         if: always()
         run: ssh-agent -k || true
 
-      - name: Cleanup venv
+      - name: Cleanup local artifacts
         if: always()
-        run: rm -rf /tmp/spur-e2e-venv
+        run: |
+          rm -rf /tmp/spur-e2e-venv
+          rm -rf "$E2E_ASSETS_DIR"
+          rm -rf /tmp/release-binaries
+          rm -rf /tmp/bm-logs
 
       - name: Report status
         if: always()
@@ -351,6 +356,7 @@ jobs:
       KUBECONFIG: /home/amd/.kube/config
       SPUR_TEST_NS: spur-ci-${{ github.event.workflow_run.id }}
       RUST_LOG: info
+      E2E_ASSETS_DIR: /tmp/spur-k8s-e2e-assets-${{ github.run_id }}
     steps:
       - name: Compute GHCR image reference
         id: image
@@ -383,14 +389,14 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: e2e-assets
-          path: trusted-repo
+          path: ${{ env.E2E_ASSETS_DIR }}
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python venv and install test deps
         run: |
           python3 -m venv /tmp/spur-k8s-e2e-venv
-          /tmp/spur-k8s-e2e-venv/bin/pip install -r trusted-repo/tests/e2e/requirements.txt
+          /tmp/spur-k8s-e2e-venv/bin/pip install -r "$E2E_ASSETS_DIR/tests/e2e/requirements.txt"
           echo "/tmp/spur-k8s-e2e-venv/bin" >> "$GITHUB_PATH"
 
       - name: Select kubectl context
@@ -455,7 +461,7 @@ jobs:
         run: |
           set -euo pipefail
           sed "s/namespace: spur/namespace: $SPUR_TEST_NS/g" \
-            trusted-repo/tests/e2e/k8s/manifests/rbac.yaml | kubectl apply -f -
+            "$E2E_ASSETS_DIR/tests/e2e/k8s/manifests/rbac.yaml" | kubectl apply -f -
 
       - name: Verify cluster can pull CI image
         run: |
@@ -476,7 +482,7 @@ jobs:
 
       - name: Run K8s E2E tests
         run: |
-          pytest trusted-repo/tests/e2e/k8s/ -v
+          pytest "$E2E_ASSETS_DIR/tests/e2e/k8s/" -v
 
       - name: Collect K8s test logs
         if: failure()
@@ -510,6 +516,13 @@ jobs:
           kubectl delete clusterrolebinding spur-operator --ignore-not-found
           kubectl delete clusterrole spur-operator --ignore-not-found
           kubectl delete crd spurjobs.spur.amd.com --ignore-not-found --timeout=120s || true
+
+      - name: Cleanup local artifacts
+        if: always()
+        run: |
+          rm -rf /tmp/spur-k8s-e2e-venv
+          rm -rf "$E2E_ASSETS_DIR"
+          rm -rf /tmp/k8s-logs
 
       - name: Report status
         if: always()
