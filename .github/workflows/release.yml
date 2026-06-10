@@ -150,7 +150,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [build, verify]
+    needs: [build, verify, push-image]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

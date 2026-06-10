@@ -170,7 +170,7 @@ jobs:
 
   release:
     name: Publish nightly
-    needs: [build, verify]
+    needs: [build, verify, push-image]
     if: needs.build.outputs.skip != 'true'
     runs-on: ubuntu-latest
     steps:
