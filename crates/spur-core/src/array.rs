@@ -37,12 +37,23 @@ pub fn aggregate_array_state(task_states: &[JobState]) -> Option<JobState> {
     }
     // Worst-state precedence (Slurm orders failure above the others for the
     // purpose of array exit status). Pick the highest-precedence terminal state.
+    // Exhaustive match — no catch-all — so a newly added JobState can't be
+    // silently swallowed at rank 0 (which would mask a real failure).
     let rank = |s: &JobState| match s {
-        JobState::Failed => 4,
+        JobState::Failed => 5,
+        JobState::Deadline => 4,
         JobState::NodeFail => 3,
         JobState::Timeout => 2,
         JobState::Cancelled => 1,
-        _ => 0, // Completed (or, defensively, anything else)
+        // Non-failure / non-terminal states: lowest precedence. (Completed is
+        // already filtered out below; the rest can't reach here because the
+        // array is known fully terminal.)
+        JobState::Completed
+        | JobState::Pending
+        | JobState::Running
+        | JobState::Completing
+        | JobState::Suspended
+        | JobState::Preempted => 0,
     };
     task_states
         .iter()
@@ -267,6 +278,24 @@ mod tests {
         assert_eq!(
             aggregate_array_state(&[JobState::Cancelled, JobState::Cancelled]),
             Some(JobState::Cancelled)
+        );
+    }
+
+    #[test]
+    fn test_aggregate_deadline_outranks_cancellation() {
+        // A deadline-failed task must not be masked by a Cancelled sibling.
+        // Failed > Deadline > NodeFail > Timeout > Cancelled.
+        assert_eq!(
+            aggregate_array_state(&[JobState::Cancelled, JobState::Deadline]),
+            Some(JobState::Deadline)
+        );
+        assert_eq!(
+            aggregate_array_state(&[JobState::Completed, JobState::Deadline]),
+            Some(JobState::Deadline)
+        );
+        assert_eq!(
+            aggregate_array_state(&[JobState::Deadline, JobState::Failed]),
+            Some(JobState::Failed)
         );
     }
 }
