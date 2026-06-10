@@ -1294,7 +1294,13 @@ impl ClusterManager {
             let mut jobs = self.jobs.write();
             for id in &to_wait {
                 if let Some(j) = jobs.get_mut(id) {
-                    if j.state == JobState::Pending && j.pending_reason != PendingReason::Held {
+                    // Don't clobber Held, or a DeadLine reason set by the
+                    // deadline-enforcement path (the job is about to transition
+                    // to JobState::Deadline) — matches update_pending_reasons().
+                    if j.state == JobState::Pending
+                        && j.pending_reason != PendingReason::Held
+                        && j.pending_reason != PendingReason::DeadLine
+                    {
                         j.pending_reason = PendingReason::Dependency;
                     }
                 }

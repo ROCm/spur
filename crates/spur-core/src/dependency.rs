@@ -64,14 +64,31 @@ pub fn try_parse_dependencies(specs: &[String]) -> Result<Vec<Dependency>, Depen
                 .split_once(':')
                 .ok_or_else(|| DependencyParseError::InvalidSyntax(part.to_string()))?;
             let dtype = dtype.to_lowercase();
+
+            // Reject unknown types up front, before the id loop — otherwise an
+            // id-less unknown type (e.g. `expand:`) would slip through because
+            // the loop body never runs.
+            let is_after = dtype == "after";
+            match dtype.as_str() {
+                "after" | "afterok" | "after_ok" | "afterany" | "after_any" | "afternotok"
+                | "after_not_ok" | "aftercorr" | "after_corr" => {}
+                other => return Err(DependencyParseError::UnknownType(other.to_string())),
+            }
+
+            // A known type with no parseable ids (e.g. `afterok:`) is malformed.
+            let mut saw_id = false;
             for id_str in ids.split(':') {
                 let id_str = id_str.trim();
                 if id_str.is_empty() {
                     continue;
                 }
-                // `after` allows an optional `+M` minute delay suffix.
+                // Only `after` accepts an optional `+M` minute delay suffix;
+                // any other type carrying `+M` is invalid syntax.
                 let (id_part, delay_minutes) = match id_str.split_once('+') {
                     Some((id, delay)) => {
+                        if !is_after {
+                            return Err(DependencyParseError::InvalidSyntax(id_str.to_string()));
+                        }
                         let delay = delay
                             .trim()
                             .parse::<u32>()
@@ -83,6 +100,7 @@ pub fn try_parse_dependencies(specs: &[String]) -> Result<Vec<Dependency>, Depen
                 let id = id_part
                     .parse::<JobId>()
                     .map_err(|_| DependencyParseError::InvalidJobId(id_part.to_string()))?;
+                saw_id = true;
                 match dtype.as_str() {
                     "after" => deps.push(Dependency::After {
                         job_id: id,
@@ -92,10 +110,11 @@ pub fn try_parse_dependencies(specs: &[String]) -> Result<Vec<Dependency>, Depen
                     "afterany" | "after_any" => deps.push(Dependency::AfterAny(id)),
                     "afternotok" | "after_not_ok" => deps.push(Dependency::AfterNotOk(id)),
                     "aftercorr" | "after_corr" => deps.push(Dependency::AfterCorr(id)),
-                    other => {
-                        return Err(DependencyParseError::UnknownType(other.to_string()));
-                    }
+                    _ => unreachable!("dtype validated above"),
                 }
+            }
+            if !saw_id {
+                return Err(DependencyParseError::InvalidSyntax(part.to_string()));
             }
         }
     }
@@ -130,9 +149,10 @@ pub fn parse_dependencies(specs: &[String]) -> Vec<Dependency> {
 ///   the per-task jobs). In that case we aggregate the task states.
 ///
 /// Returns `None` when the target is unknown (neither a scalar job nor an array
-/// with any tasks). Returns `Some(None)` when the array exists but has not
-/// finished. Returns `Some(Some(state))` for a resolved terminal/aggregate
-/// state, or the live scalar state.
+/// with any tasks). Otherwise returns `Some(state)`: the live scalar state, or
+/// the array's aggregate. An array that exists but has not finished aggregating
+/// is reported as the non-terminal sentinel `JobState::Running`, so callers
+/// treat it as still-waiting.
 fn resolve_target_state(
     dep_id: JobId,
     get_job: &dyn Fn(JobId) -> Option<Job>,

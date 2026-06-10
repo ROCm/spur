@@ -450,6 +450,24 @@ mod tests {
     }
 
     #[test]
+    fn t56_18b_parse_rejects_idless_and_unknown_idless() {
+        // Known type with no ids must error, not return Ok([]).
+        assert!(try_parse_dependencies(&["afterok:".into()]).is_err());
+        // Unknown type with no ids must also error (regression: the id loop
+        // never ran, so UnknownType went undetected).
+        assert!(try_parse_dependencies(&["expand:".into()]).is_err());
+    }
+
+    #[test]
+    fn t56_18c_parse_rejects_delay_on_non_after() {
+        // `+M` delay suffix is only valid for `after`; other types must reject
+        // it instead of silently dropping the delay.
+        assert!(try_parse_dependencies(&["afterok:123+5".into()]).is_err());
+        // `after` still accepts it.
+        assert!(try_parse_dependencies(&["after:123+5".into()]).is_ok());
+    }
+
+    #[test]
     fn t56_19_after_unknown_parent_satisfied() {
         let job = Job::new(
             1,
