@@ -212,7 +212,7 @@ impl SlurmController for ControllerService {
         let job_id = request.into_inner().job_id;
         let job = self
             .cluster
-            .get_job(job_id)
+            .get_job_for_display(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
 
         Ok(Response::new(job_to_proto(&job)))

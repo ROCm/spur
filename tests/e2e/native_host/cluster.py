@@ -244,6 +244,17 @@ class SpurCluster:
         cmd_parts.extend(f"'{a}'" for a in args[1:])
         return self.nodes[0].exec(" ".join(cmd_parts))
 
+    def cli_allow_fail(self, args: list[str]) -> str:
+        """Run a spur CLI command, returning stdout+stderr regardless of exit
+        code. Use to assert on expected submission rejections."""
+        cmd_parts = [
+            f"SPUR_CONTROLLER_ADDR='{self.controller_addr}'",
+            f"PATH='{self.bin_dir}':$PATH",
+            f"'{self.bin_dir}/{args[0]}'",
+        ]
+        cmd_parts.extend(f"'{a}'" for a in args[1:])
+        return self.nodes[0].exec_allow_fail(" ".join(cmd_parts))
+
     def sbatch(self, args: list[str]) -> str:
         return self.cli(["sbatch"] + args)
 

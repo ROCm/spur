@@ -98,6 +98,7 @@ mod tests {
                     None
                 }
             },
+            &|_| Vec::new(),
             &|_, _| Vec::new(),
         );
         assert_eq!(result, DependencyResult::Satisfied);
@@ -126,6 +127,7 @@ mod tests {
                     None
                 }
             },
+            &|_| Vec::new(),
             &|_, _| Vec::new(),
         );
         assert_eq!(result, DependencyResult::Waiting);
@@ -154,6 +156,7 @@ mod tests {
                     None
                 }
             },
+            &|_| Vec::new(),
             &|_, _| Vec::new(),
         );
         assert_eq!(result, DependencyResult::Failed);
@@ -182,6 +185,7 @@ mod tests {
                     None
                 }
             },
+            &|_| Vec::new(),
             &|_, _| Vec::new(),
         );
         assert_eq!(result, DependencyResult::Satisfied);
@@ -210,6 +214,7 @@ mod tests {
                     None
                 }
             },
+            &|_| Vec::new(),
             &|_, _| Vec::new(),
         );
         assert_eq!(result, DependencyResult::Satisfied);
@@ -238,6 +243,7 @@ mod tests {
                     None
                 }
             },
+            &|_| Vec::new(),
             &|_, _| Vec::new(),
         );
         assert_eq!(result, DependencyResult::Failed);
@@ -262,7 +268,7 @@ mod tests {
             },
         );
 
-        let result = check_dependencies(&job, &|_| None, &|name, user| {
+        let result = check_dependencies(&job, &|_| None, &|_| Vec::new(), &|name, user| {
             if name == "train" && user == "alice" {
                 vec![running_named.clone()]
             } else {
@@ -286,7 +292,7 @@ mod tests {
             },
         );
 
-        let result = check_dependencies(&job, &|_| None, &|_, _| Vec::new());
+        let result = check_dependencies(&job, &|_| None, &|_| Vec::new(), &|_, _| Vec::new());
         assert_eq!(result, DependencyResult::Satisfied);
     }
 
@@ -302,7 +308,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = check_dependencies(&job, &|_| None, &|_, _| Vec::new());
+        let result = check_dependencies(&job, &|_| None, &|_| Vec::new(), &|_, _| Vec::new());
         assert_eq!(result, DependencyResult::Satisfied);
     }
 
@@ -329,6 +335,7 @@ mod tests {
                     None
                 }
             },
+            &|_| Vec::new(),
             &|_, _| Vec::new(),
         );
         assert_eq!(result, DependencyResult::Failed);
@@ -357,6 +364,7 @@ mod tests {
                     None
                 }
             },
+            &|_| Vec::new(),
             &|_, _| Vec::new(),
         );
         assert_eq!(result, DependencyResult::Satisfied);
@@ -385,6 +393,7 @@ mod tests {
                     None
                 }
             },
+            &|_| Vec::new(),
             &|_, _| Vec::new(),
         );
         assert_eq!(result, DependencyResult::Satisfied);
@@ -412,8 +421,46 @@ mod tests {
                 200 => Some(running.clone()),
                 _ => None,
             },
+            &|_| Vec::new(),
             &|_, _| Vec::new(),
         );
         assert_eq!(result, DependencyResult::Waiting);
+    }
+
+    // ── T56.17+: new dependency types / parsing (issue #259) ──────
+    // (Array-parent *resolution* tests live in t28_arrays.rs alongside the
+    // other array coverage.)
+
+    #[test]
+    fn t56_17_parse_after_with_delay() {
+        let deps = try_parse_dependencies(&["after:100+5".into()]).unwrap();
+        assert_eq!(
+            deps,
+            vec![Dependency::After {
+                job_id: 100,
+                delay_minutes: 5
+            }]
+        );
+    }
+
+    #[test]
+    fn t56_18_parse_rejects_unknown_type() {
+        // The defect: `expand:N` was silently accepted, deadlocking the job.
+        assert!(try_parse_dependencies(&["expand:100".into()]).is_err());
+    }
+
+    #[test]
+    fn t56_19_after_unknown_parent_satisfied() {
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "child".into(),
+                user: "alice".into(),
+                dependency: vec!["after:9999".into()],
+                ..Default::default()
+            },
+        );
+        let result = check_dependencies(&job, &|_| None, &|_| Vec::new(), &|_, _| Vec::new());
+        assert_eq!(result, DependencyResult::Satisfied);
     }
 }

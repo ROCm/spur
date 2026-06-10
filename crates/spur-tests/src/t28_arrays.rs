@@ -170,4 +170,120 @@ mod tests {
         job.spec.array_max_concurrent = Some(5);
         assert_eq!(job.spec.array_max_concurrent, Some(5));
     }
+
+    // ── T28.11+: dependencies against an array parent (issue #259) ─
+
+    use spur_core::dependency::{check_dependencies, DependencyResult};
+
+    fn make_array_task(parent: JobId, task: u32, state: JobState) -> Job {
+        let mut job = Job::new(
+            parent + 1 + task as JobId,
+            JobSpec {
+                name: "arr".into(),
+                user: "alice".into(),
+                array_job_id: Some(parent),
+                array_task_id: Some(task),
+                ..Default::default()
+            },
+        );
+        if state != JobState::Pending {
+            let _ = job.transition(JobState::Running);
+            if state != JobState::Running {
+                let _ = job.transition(state);
+            }
+        }
+        job
+    }
+
+    #[test]
+    fn t28_11_afterok_array_parent_all_completed() {
+        // The core repro: afterok against an array parent (whose own job record
+        // never exists) must resolve via task aggregation, not deadlock.
+        let tasks = vec![
+            make_array_task(100, 0, JobState::Completed),
+            make_array_task(100, 1, JobState::Completed),
+            make_array_task(100, 2, JobState::Completed),
+        ];
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "child".into(),
+                user: "alice".into(),
+                dependency: vec!["afterok:100".into()],
+                ..Default::default()
+            },
+        );
+        let result = check_dependencies(
+            &job,
+            &|_| None,
+            &|id| if id == 100 { tasks.clone() } else { Vec::new() },
+            &|_, _| Vec::new(),
+        );
+        assert_eq!(result, DependencyResult::Satisfied);
+    }
+
+    #[test]
+    fn t28_12_afterok_array_parent_one_failed_fails() {
+        let tasks = vec![
+            make_array_task(100, 0, JobState::Completed),
+            make_array_task(100, 1, JobState::Failed),
+        ];
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "child".into(),
+                user: "alice".into(),
+                dependency: vec!["afterok:100".into()],
+                ..Default::default()
+            },
+        );
+        let result = check_dependencies(
+            &job,
+            &|_| None,
+            &|id| if id == 100 { tasks.clone() } else { Vec::new() },
+            &|_, _| Vec::new(),
+        );
+        assert_eq!(result, DependencyResult::Failed);
+    }
+
+    #[test]
+    fn t28_13_aftercorr_per_task_correspondence() {
+        // Parent task 1 failed; tasks 0 and 2 completed. Child task[N] releases
+        // iff parent task[N] completed successfully.
+        let tasks = vec![
+            make_array_task(100, 0, JobState::Completed),
+            make_array_task(100, 1, JobState::Failed),
+            make_array_task(100, 2, JobState::Completed),
+        ];
+        let get_tasks = |id: JobId| if id == 100 { tasks.clone() } else { Vec::new() };
+
+        let mut child = Job::new(
+            10,
+            JobSpec {
+                name: "child".into(),
+                user: "alice".into(),
+                dependency: vec!["aftercorr:100".into()],
+                array_job_id: Some(9),
+                array_task_id: Some(0),
+                ..Default::default()
+            },
+        );
+        // task 0 ↔ parent task 0 (Completed) → Satisfied
+        assert_eq!(
+            check_dependencies(&child, &|_| None, &get_tasks, &|_, _| Vec::new()),
+            DependencyResult::Satisfied
+        );
+        // task 1 ↔ parent task 1 (Failed) → Failed
+        child.spec.array_task_id = Some(1);
+        assert_eq!(
+            check_dependencies(&child, &|_| None, &get_tasks, &|_, _| Vec::new()),
+            DependencyResult::Failed
+        );
+        // task 2 ↔ parent task 2 (Completed) → Satisfied
+        child.spec.array_task_id = Some(2);
+        assert_eq!(
+            check_dependencies(&child, &|_| None, &get_tasks, &|_, _| Vec::new()),
+            DependencyResult::Satisfied
+        );
+    }
 }

@@ -208,3 +208,94 @@ class TestJobLifecycle:
         content = cluster.read_output_on_any_node(out_path)
         assert "MYVAR=hello123" in content, f"output:\n{content}"
         assert "MULTIVAR=world456" in content, f"output:\n{content}"
+
+
+class TestArrayDependencies:
+    """Regression tests for issue #259: dependencies against array parents.
+
+    Array submission returns a parent placeholder id P; the individual task
+    jobs get ids P+1, P+2, ... each carrying array_job_id=P. These tests assert
+    that dependencies resolved against P (the array parent) no longer deadlock.
+    """
+
+    def test_array_tasks_run_and_export_task_id(self, cluster):
+        # Each task writes its SLURM_ARRAY_TASK_ID to a per-task file.
+        out_pattern = f"{cluster.remote_dir}/arr-task"
+        script = cluster.write_file(
+            "arr-task.sh",
+            "#!/bin/bash\n"
+            f'echo "TID=${{SLURM_ARRAY_TASK_ID}} JID=${{SLURM_ARRAY_JOB_ID}}" '
+            f'> {out_pattern}-${{SLURM_ARRAY_TASK_ID}}.out\n',
+            all_nodes=True,
+        )
+        sb = cluster.sbatch(["-J", "arr", "-N", "1", "-a", "0-2", script])
+        parent = parse_job_id(sb)
+        assert parent is not None
+
+        # Wait for the three task jobs (parent+1 .. parent+3).
+        for tid in range(3):
+            wait_job(cluster, parent + 1 + tid, timeout=60)
+
+        # SLURM_ARRAY_TASK_ID must be exported and distinct per task.
+        for tid in range(3):
+            content = cluster.read_output_on_any_node(f"{out_pattern}-{tid}.out")
+            assert f"TID={tid}" in content, f"task {tid} env output:\n{content}"
+            assert f"JID={parent}" in content, f"task {tid} env output:\n{content}"
+
+    def test_afterok_on_array_parent_releases_child(self, cluster):
+        # THE core repro: afterok against an array parent must not deadlock.
+        out_c = f"{cluster.remote_dir}/arr-dep-c.out"
+        script_a = cluster.write_file(
+            "arr-ok.sh", "#!/bin/bash\nsleep 4\necho TASK_OK\n", all_nodes=True
+        )
+        script_c = cluster.write_file(
+            "arr-child.sh", "#!/bin/bash\necho CHILD_RAN\n", all_nodes=True
+        )
+
+        sb = cluster.sbatch(["-J", "arr-ok", "-N", "1", "-a", "0-2", script_a])
+        parent = parse_job_id(sb)
+        assert parent is not None
+
+        sb_c = cluster.sbatch([
+            "-J", "arr-c", "-N", "1", "-o", out_c,
+            f"--dependency=afterok:{parent}", script_c,
+        ])
+        child = parse_job_id(sb_c)
+        assert child is not None
+
+        # All parent tasks complete, then the child must run (not hang).
+        for tid in range(3):
+            wait_job(cluster, parent + 1 + tid, timeout=60)
+        state = wait_job(cluster, child, timeout=60)
+        assert state in ("CD", "GONE"), f"child should have run, got {state}"
+        content = cluster.read_output_on_any_node(out_c)
+        assert "CHILD_RAN" in content, f"child output:\n{content}"
+
+    def test_show_array_parent_reports_aggregate(self, cluster):
+        # `scontrol show job <array_parent>` must not be empty (Slurm parity).
+        script = cluster.write_file(
+            "arr-show.sh", "#!/bin/bash\necho SHOW_OK\n", all_nodes=True
+        )
+        sb = cluster.sbatch(["-J", "arr-show", "-N", "1", "-a", "0-1", script])
+        parent = parse_job_id(sb)
+        assert parent is not None
+        for tid in range(2):
+            wait_job(cluster, parent + 1 + tid, timeout=60)
+
+        out = cluster.scontrol("show", "job", str(parent))
+        assert out.strip(), "show job <array_parent> produced no output"
+
+    def test_unknown_dependency_type_rejected_at_submit(self, cluster):
+        # `expand:N` (and other unknown types) must be rejected, not silently
+        # accepted and deadlocked.
+        script = cluster.write_file(
+            "arr-rej.sh", "#!/bin/bash\necho REJ\n", all_nodes=True
+        )
+        out = cluster.cli_allow_fail([
+            "sbatch", "-J", "rej", "-N", "1",
+            "--dependency=expand:1", script,
+        ])
+        assert parse_job_id(out) is None, f"expected rejection, got:\n{out}"
+        assert "depend" in out.lower() or "invalid" in out.lower(), (
+            f"expected a dependency error, got:\n{out}"
+        )

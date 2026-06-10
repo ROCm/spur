@@ -10,7 +10,46 @@
 //! - `0-10:2` — tasks 0,2,4,6,8,10 (step of 2)
 //! - `1-5,10-15` — combination
 
+use crate::job::JobState;
 use thiserror::Error;
+
+/// Aggregate the terminal state of an array job from its task states, following
+/// Slurm semantics for `scontrol show job <array_job_id>` and dependency
+/// resolution against an array parent.
+///
+/// Returns `None` while any task is still non-terminal (the array as a whole has
+/// not finished). Once every task is terminal, returns the aggregate:
+/// `Completed` iff all tasks `Completed`, otherwise the "worst" terminal state
+/// observed, with failure outranking cancellation/timeout/node-failure.
+///
+/// `task_states` must contain one entry per array task. An empty slice returns
+/// `None` (no tasks known yet — treat as not-finished).
+pub fn aggregate_array_state(task_states: &[JobState]) -> Option<JobState> {
+    if task_states.is_empty() {
+        return None;
+    }
+    // Still running/pending/etc. — array not finished.
+    if task_states.iter().any(|s| !s.is_terminal()) {
+        return None;
+    }
+    if task_states.iter().all(|s| *s == JobState::Completed) {
+        return Some(JobState::Completed);
+    }
+    // Worst-state precedence (Slurm orders failure above the others for the
+    // purpose of array exit status). Pick the highest-precedence terminal state.
+    let rank = |s: &JobState| match s {
+        JobState::Failed => 4,
+        JobState::NodeFail => 3,
+        JobState::Timeout => 2,
+        JobState::Cancelled => 1,
+        _ => 0, // Completed (or, defensively, anything else)
+    };
+    task_states
+        .iter()
+        .filter(|s| **s != JobState::Completed)
+        .max_by_key(|s| rank(s))
+        .copied()
+}
 
 #[derive(Debug, Clone)]
 pub struct ArraySpec {
@@ -162,5 +201,72 @@ mod tests {
     #[test]
     fn test_zero_step_fails() {
         assert!(parse_array_spec("0-10:0").is_err());
+    }
+
+    // ── aggregate_array_state ────────────────────────────────────
+
+    #[test]
+    fn test_aggregate_empty_is_none() {
+        assert_eq!(aggregate_array_state(&[]), None);
+    }
+
+    #[test]
+    fn test_aggregate_unfinished_is_none() {
+        // Any non-terminal task means the array is not finished.
+        assert_eq!(
+            aggregate_array_state(&[JobState::Completed, JobState::Running]),
+            None
+        );
+        assert_eq!(
+            aggregate_array_state(&[JobState::Pending, JobState::Completed]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_aggregate_all_completed() {
+        assert_eq!(
+            aggregate_array_state(&[
+                JobState::Completed,
+                JobState::Completed,
+                JobState::Completed
+            ]),
+            Some(JobState::Completed)
+        );
+    }
+
+    #[test]
+    fn test_aggregate_mixed_failure_wins() {
+        // Failure outranks completion.
+        assert_eq!(
+            aggregate_array_state(&[JobState::Completed, JobState::Failed]),
+            Some(JobState::Failed)
+        );
+    }
+
+    #[test]
+    fn test_aggregate_precedence_failed_over_others() {
+        // Failed > NodeFail > Timeout > Cancelled.
+        assert_eq!(
+            aggregate_array_state(&[
+                JobState::Cancelled,
+                JobState::Timeout,
+                JobState::NodeFail,
+                JobState::Failed,
+            ]),
+            Some(JobState::Failed)
+        );
+        assert_eq!(
+            aggregate_array_state(&[JobState::Cancelled, JobState::Timeout, JobState::NodeFail]),
+            Some(JobState::NodeFail)
+        );
+        assert_eq!(
+            aggregate_array_state(&[JobState::Cancelled, JobState::Timeout]),
+            Some(JobState::Timeout)
+        );
+        assert_eq!(
+            aggregate_array_state(&[JobState::Cancelled, JobState::Cancelled]),
+            Some(JobState::Cancelled)
+        );
     }
 }

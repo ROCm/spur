@@ -88,6 +88,16 @@ impl ClusterManager {
         apply_default_partition(&mut spec, &self.partitions.read());
         self.validate_partition(&spec)?;
 
+        // Reject unknown/malformed dependency types up front so users get a
+        // clear error instead of a silently-deadlocked job (e.g. `expand:N`).
+        // This validates syntax only — the dependency *target* is intentionally
+        // not checked for existence here (matching Slurm), so e.g. `after:9999`
+        // against a nonexistent job is accepted and resolves as satisfiable.
+        if !spec.dependency.is_empty() {
+            spur_core::dependency::try_parse_dependencies(&spec.dependency)
+                .map_err(|e| anyhow::anyhow!("invalid dependency: {}", e))?;
+        }
+
         let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
         let specs = expand_job_specs(spec, job_id)?;
 
@@ -179,6 +189,62 @@ impl ClusterManager {
     /// Get a job by ID.
     pub fn get_job(&self, job_id: JobId) -> Option<Job> {
         self.jobs.read().get(&job_id).cloned()
+    }
+
+    /// Get a job by ID for display, synthesizing an aggregate record when the id
+    /// is an array *parent* (whose own job record never exists — Spur stores
+    /// only per-task jobs). This makes `spur show job <array_parent_id>` return
+    /// the array's aggregate state instead of empty output, matching Slurm's
+    /// `scontrol show job <array_job_id>`.
+    ///
+    /// The synthesized job borrows the first task's spec, reports the aggregate
+    /// state (PENDING while unfinished), and uses the earliest task start / latest
+    /// task end for timing. It is never stored or scheduled.
+    pub fn get_job_for_display(&self, job_id: JobId) -> Option<Job> {
+        let jobs = self.jobs.read();
+        if let Some(j) = jobs.get(&job_id) {
+            return Some(j.clone());
+        }
+        // Maybe it's an array parent id.
+        let mut tasks: Vec<&Job> = jobs
+            .values()
+            .filter(|j| j.spec.array_job_id == Some(job_id))
+            .collect();
+        if tasks.is_empty() {
+            return None;
+        }
+        tasks.sort_by_key(|t| t.spec.array_task_id);
+
+        let first = tasks[0];
+        let mut synth = (*first).clone();
+        synth.job_id = job_id;
+        // Present as the parent: clear the per-task id, keep array_job_id so the
+        // proto carries the array linkage.
+        synth.spec.array_task_id = None;
+        synth.spec.array_job_id = Some(job_id);
+
+        let states: Vec<JobState> = tasks.iter().map(|t| t.state).collect();
+        synth.state = spur_core::array::aggregate_array_state(&states).unwrap_or(JobState::Pending);
+        synth.start_time = tasks.iter().filter_map(|t| t.start_time).min();
+        synth.end_time = if synth.state.is_terminal() {
+            tasks.iter().filter_map(|t| t.end_time).max()
+        } else {
+            None
+        };
+        // Worst exit code across tasks (mirrors derived_completion semantics).
+        // Only meaningful once the array is terminal; leave None while running so
+        // a still-pending aggregate doesn't read as "0 / success".
+        synth.exit_code = if synth.state.is_terminal() {
+            tasks
+                .iter()
+                .filter_map(|t| t.exit_code)
+                .filter(|c| *c != 0)
+                .max()
+                .or(Some(0))
+        } else {
+            None
+        };
+        Some(synth)
     }
 
     /// Aggregated job metrics from the current in-memory job map (lazy scan).
@@ -979,6 +1045,12 @@ impl ClusterManager {
 
         // Check dependencies
         let get_job = |id: JobId| -> Option<Job> { jobs.get(&id).cloned() };
+        let get_array_tasks = |id: JobId| -> Vec<Job> {
+            jobs.values()
+                .filter(|j| j.spec.array_job_id == Some(id))
+                .cloned()
+                .collect()
+        };
         let get_jobs_by_name_user = |name: &str, user: &str| -> Vec<Job> {
             jobs.values()
                 .filter(|j| j.spec.name == name && j.spec.user == user)
@@ -991,14 +1063,13 @@ impl ClusterManager {
                 return true;
             }
             use spur_core::dependency::{check_dependencies, DependencyResult};
-            match check_dependencies(job, &get_job, &get_jobs_by_name_user) {
+            match check_dependencies(job, &get_job, &get_array_tasks, &get_jobs_by_name_user) {
                 DependencyResult::Satisfied => true,
-                DependencyResult::Waiting => false,
-                DependencyResult::Failed => {
-                    // Dependency can never be satisfied — cancel the job
-                    // (can't mutate here since we hold a read lock; mark for later)
-                    false
-                }
+                // Waiting and Failed are both filtered out of scheduling here.
+                // Failed jobs are separately cancelled by
+                // cancel_unsatisfiable_dependency_jobs() in the scheduler loop,
+                // which can take the write lock this read-locked scan cannot.
+                DependencyResult::Waiting | DependencyResult::Failed => false,
             }
         });
 
@@ -1142,6 +1213,90 @@ impl ClusterManager {
 
         pending.sort_by_key(|j| std::cmp::Reverse(j.priority));
         pending
+    }
+
+    /// Cancel pending jobs whose dependencies can never be satisfied, and tag
+    /// still-waiting dependency jobs with `PendingReason::Dependency`.
+    ///
+    /// Returns the ids of jobs that were cancelled. Run from the scheduler loop
+    /// (leader only); takes the write lock that `pending_jobs()` cannot.
+    ///
+    /// This is what closes the silent-deadlock gap: previously a `Failed`
+    /// dependency was merely filtered out of scheduling and the job sat PENDING
+    /// forever. Now it is finalized as Cancelled, matching Slurm's
+    /// `DependencyNeverSatisfied`.
+    pub fn cancel_unsatisfiable_dependency_jobs(&self) -> Vec<JobId> {
+        use spur_core::dependency::{check_dependencies, DependencyResult};
+        use spur_core::job::PendingReason;
+
+        // Snapshot under a read lock to evaluate dependencies.
+        let (to_cancel, to_wait): (Vec<JobId>, Vec<JobId>) = {
+            let jobs = self.jobs.read();
+            let get_job = |id: JobId| -> Option<Job> { jobs.get(&id).cloned() };
+            let get_array_tasks = |id: JobId| -> Vec<Job> {
+                jobs.values()
+                    .filter(|j| j.spec.array_job_id == Some(id))
+                    .cloned()
+                    .collect()
+            };
+            let get_jobs_by_name_user = |name: &str, user: &str| -> Vec<Job> {
+                jobs.values()
+                    .filter(|j| j.spec.name == name && j.spec.user == user)
+                    .cloned()
+                    .collect()
+            };
+
+            let mut cancel = Vec::new();
+            let mut wait = Vec::new();
+            for job in jobs.values() {
+                if job.state != JobState::Pending
+                    || job.spec.dependency.is_empty()
+                    || job.pending_reason == PendingReason::Held
+                {
+                    continue;
+                }
+                match check_dependencies(job, &get_job, &get_array_tasks, &get_jobs_by_name_user) {
+                    DependencyResult::Failed => cancel.push(job.job_id),
+                    DependencyResult::Waiting => wait.push(job.job_id),
+                    DependencyResult::Satisfied => {}
+                }
+            }
+            (cancel, wait)
+        };
+
+        // Tag waiting jobs (write lock).
+        if !to_wait.is_empty() {
+            let mut jobs = self.jobs.write();
+            for id in &to_wait {
+                if let Some(j) = jobs.get_mut(id) {
+                    if j.state == JobState::Pending && j.pending_reason != PendingReason::Held {
+                        j.pending_reason = PendingReason::Dependency;
+                    }
+                }
+            }
+        }
+
+        // Finalize unsatisfiable jobs via the WAL so resources/accounting fire.
+        let mut cancelled = Vec::new();
+        for id in to_cancel {
+            match self.propose(WalOperation::JobComplete {
+                job_id: id,
+                exit_code: -1,
+                state: JobState::Cancelled,
+            }) {
+                Ok(resp) => {
+                    if let Some(f) = resp.job_finalized {
+                        self.run_job_finalized_side_effects(f);
+                    }
+                    info!(job_id = id, "job cancelled: dependency never satisfied");
+                    cancelled.push(id);
+                }
+                Err(e) => {
+                    warn!(job_id = id, error = %e, "failed to cancel unsatisfiable-dependency job");
+                }
+            }
+        }
+        cancelled
     }
 
     /// Create a new reservation.
@@ -3557,5 +3712,184 @@ mod tests {
         }];
         super::apply_default_partition(&mut spec, &partitions);
         assert_eq!(spec.partition.as_deref(), Some("mypart"));
+    }
+
+    // ── array-parent dependency: cancel + display synthesis ──────
+
+    /// Submit an array task job directly via the WAL (bypassing expansion) so
+    /// tests can construct specific parent/task topologies.
+    fn submit_array_task(cm: &ClusterManager, id: JobId, parent: JobId, task: u32) {
+        let mut spec = basic_spec("arr");
+        spec.array_job_id = Some(parent);
+        spec.array_task_id = Some(task);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: id,
+            spec: Box::new(spec),
+        });
+    }
+
+    fn set_terminal(cm: &ClusterManager, id: JobId, state: JobState, exit_code: i32) {
+        // Jobs may only reach Completed/Failed/etc. via Running; cancel is the
+        // only legal direct transition out of Pending.
+        if state != JobState::Cancelled {
+            cm.apply_operation(&WalOperation::JobStateChange {
+                job_id: id,
+                old_state: JobState::Pending,
+                new_state: JobState::Running,
+            });
+        }
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: id,
+            exit_code,
+            state,
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_unsatisfiable_dep_cancels_failed_afterok() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        // Parent scalar job that fails.
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("parent")),
+        });
+        set_terminal(&cm, 1, JobState::Failed, 1);
+
+        // Child depends on afterok:1 — can never be satisfied.
+        let mut child = basic_spec("child");
+        child.dependency = vec!["afterok:1".into()];
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 2,
+            spec: Box::new(child),
+        });
+
+        let cancelled = cm.cancel_unsatisfiable_dependency_jobs();
+        assert_eq!(cancelled, vec![2]);
+        assert_eq!(cm.get_job(2).unwrap().state, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_unsatisfiable_dep_tags_waiting_jobs() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        // Parent still running; child waits, not cancelled.
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("parent")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+
+        let mut child = basic_spec("child");
+        child.dependency = vec!["afterok:1".into()];
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 2,
+            spec: Box::new(child),
+        });
+
+        let cancelled = cm.cancel_unsatisfiable_dependency_jobs();
+        assert!(cancelled.is_empty());
+        let child = cm.get_job(2).unwrap();
+        assert_eq!(child.state, JobState::Pending);
+        assert_eq!(child.pending_reason, PendingReason::Dependency);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_unsatisfiable_dep_array_parent_all_completed_releases() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        // Array parent id 10, tasks 11/12/13 all completed.
+        submit_array_task(&cm, 11, 10, 0);
+        submit_array_task(&cm, 12, 10, 1);
+        submit_array_task(&cm, 13, 10, 2);
+        for id in [11, 12, 13] {
+            set_terminal(&cm, id, JobState::Completed, 0);
+        }
+
+        // Child depends on afterok:10 (the array parent) — should be satisfied,
+        // so neither cancelled nor tagged.
+        let mut child = basic_spec("child");
+        child.dependency = vec!["afterok:10".into()];
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 20,
+            spec: Box::new(child),
+        });
+
+        let cancelled = cm.cancel_unsatisfiable_dependency_jobs();
+        assert!(cancelled.is_empty());
+        let child = cm.get_job(20).unwrap();
+        assert_eq!(child.state, JobState::Pending);
+        assert_ne!(child.pending_reason, PendingReason::Dependency);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_unsatisfiable_dep_array_parent_one_failed_cancels() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        submit_array_task(&cm, 11, 10, 0);
+        submit_array_task(&cm, 12, 10, 1);
+        set_terminal(&cm, 11, JobState::Completed, 0);
+        set_terminal(&cm, 12, JobState::Failed, 1);
+
+        let mut child = basic_spec("child");
+        child.dependency = vec!["afterok:10".into()];
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 20,
+            spec: Box::new(child),
+        });
+
+        let cancelled = cm.cancel_unsatisfiable_dependency_jobs();
+        assert_eq!(cancelled, vec![20]);
+        assert_eq!(cm.get_job(20).unwrap().state, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_job_for_display_synthesizes_array_parent() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        // No stored job with id 10; tasks 11/12 carry array_job_id=10.
+        submit_array_task(&cm, 11, 10, 0);
+        submit_array_task(&cm, 12, 10, 1);
+
+        // Unfinished → aggregate Pending, no exit_code.
+        let synth = cm
+            .get_job_for_display(10)
+            .expect("array parent should synthesize");
+        assert_eq!(synth.job_id, 10);
+        assert_eq!(synth.state, JobState::Pending);
+        assert_eq!(synth.spec.array_job_id, Some(10));
+        assert_eq!(synth.spec.array_task_id, None);
+        assert_eq!(synth.exit_code, None);
+
+        // Complete both → aggregate Completed, exit_code 0.
+        set_terminal(&cm, 11, JobState::Completed, 0);
+        set_terminal(&cm, 12, JobState::Completed, 0);
+        let synth = cm.get_job_for_display(10).unwrap();
+        assert_eq!(synth.state, JobState::Completed);
+        assert_eq!(synth.exit_code, Some(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_job_for_display_scalar_and_unknown() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("scalar")),
+        });
+        // Stored scalar job returned as-is.
+        assert_eq!(cm.get_job_for_display(1).unwrap().job_id, 1);
+        // Unknown id → None.
+        assert!(cm.get_job_for_display(999).is_none());
     }
 }

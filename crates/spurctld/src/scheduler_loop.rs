@@ -86,6 +86,11 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             continue;
         }
 
+        // Finalize jobs whose dependencies can never be satisfied (so they don't
+        // sit PENDING forever) and tag still-waiting dependency jobs. Must run
+        // before pending_jobs() so cancelled jobs drop out of this cycle.
+        cluster.cancel_unsatisfiable_dependency_jobs();
+
         let pending = cluster.pending_jobs();
         if pending.is_empty() {
             continue;
@@ -516,6 +521,8 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
         distribution: s.distribution.clone().unwrap_or_default(),
         het_group: s.het_group.unwrap_or(0),
         array_spec: s.array_spec.clone().unwrap_or_default(),
+        array_job_id: s.array_job_id.unwrap_or(0),
+        array_task_id: s.array_task_id.unwrap_or(0),
         requeue: s.requeue,
         exclusive: s.exclusive,
         hold: s.hold,
@@ -608,6 +615,8 @@ async fn dispatch_to_agent(
         distribution: spec.distribution.clone().unwrap_or_default(),
         het_group: spec.het_group.unwrap_or(0),
         array_spec: spec.array_spec.clone().unwrap_or_default(),
+        array_job_id: spec.array_job_id.unwrap_or(0),
+        array_task_id: spec.array_task_id.unwrap_or(0),
         requeue: spec.requeue,
         exclusive: spec.exclusive,
         hold: spec.hold,
