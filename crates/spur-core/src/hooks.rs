@@ -109,6 +109,7 @@ fn resolve_username(uid: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -141,6 +142,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(run_hooks)]
     async fn hook_success() {
         let script = make_script("exit 0");
         let ctx = test_ctx();
@@ -149,6 +151,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(run_hooks)]
     async fn hook_failure_returns_error() {
         let script = make_script("exit 1");
         let ctx = test_ctx();
@@ -158,6 +161,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(run_hooks)]
     async fn hook_nonexistent_script() {
         let ctx = test_ctx();
         let result = run_hook("/nonexistent/hook.sh", &ctx).await;
@@ -165,6 +169,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(run_hooks)]
     async fn hook_receives_env_vars() {
         let marker = tempfile::NamedTempFile::new().unwrap();
         let marker_path = marker.path().to_str().unwrap().to_string();
@@ -187,6 +192,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(run_hooks)]
     async fn hook_stderr_does_not_prevent_success() {
         let script = make_script("echo 'warning message' >&2\nexit 0");
         let ctx = test_ctx();
