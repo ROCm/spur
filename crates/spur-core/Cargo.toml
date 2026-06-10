@@ -24,6 +24,7 @@ nix = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+serial_test = { workspace = true }
 
 [lints]
 workspace = true
