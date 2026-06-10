@@ -273,34 +273,59 @@ impl ClusterManager {
         account: Option<&str>,
         job_ids: &[JobId],
     ) -> Vec<Job> {
-        let jobs = self.jobs.read();
-        jobs.values()
-            .filter(|j| {
-                if !states.is_empty() && !states.contains(&j.state) {
+        let matches = |j: &Job| -> bool {
+            if !states.is_empty() && !states.contains(&j.state) {
+                return false;
+            }
+            if let Some(u) = user {
+                if !u.is_empty() && j.spec.user != u {
                     return false;
                 }
-                if let Some(u) = user {
-                    if !u.is_empty() && j.spec.user != u {
-                        return false;
-                    }
-                }
-                if let Some(p) = partition {
-                    if !p.is_empty() && j.spec.partition.as_deref() != Some(p) {
-                        return false;
-                    }
-                }
-                if let Some(a) = account {
-                    if !a.is_empty() && j.spec.account.as_deref() != Some(a) {
-                        return false;
-                    }
-                }
-                if !job_ids.is_empty() && !job_ids.contains(&j.job_id) {
+            }
+            if let Some(p) = partition {
+                if !p.is_empty() && j.spec.partition.as_deref() != Some(p) {
                     return false;
                 }
-                true
-            })
-            .cloned()
-            .collect()
+            }
+            if let Some(a) = account {
+                if !a.is_empty() && j.spec.account.as_deref() != Some(a) {
+                    return false;
+                }
+            }
+            true
+        };
+
+        let mut result: Vec<Job> = {
+            let jobs = self.jobs.read();
+            jobs.values()
+                .filter(|j| {
+                    if !job_ids.is_empty() && !job_ids.contains(&j.job_id) {
+                        return false;
+                    }
+                    matches(j)
+                })
+                .cloned()
+                .collect()
+        };
+
+        // For explicitly-requested ids that matched no stored job, synthesize an
+        // array-parent aggregate (Spur stores only per-task jobs, so a query for
+        // the parent id would otherwise return nothing). The read lock above is
+        // released before get_job_for_display, which takes its own lock.
+        if !job_ids.is_empty() {
+            for &id in job_ids {
+                if result.iter().any(|j| j.job_id == id) {
+                    continue;
+                }
+                if let Some(parent) = self.get_job_for_display(id) {
+                    if matches(&parent) {
+                        result.push(parent);
+                    }
+                }
+            }
+        }
+
+        result
     }
 
     /// Mark a pending job as DEADLINE (Slurm parity for `--deadline`).
@@ -3891,5 +3916,32 @@ mod tests {
         assert_eq!(cm.get_job_for_display(1).unwrap().job_id, 1);
         // Unknown id → None.
         assert!(cm.get_job_for_display(999).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_jobs_by_id_synthesizes_array_parent() {
+        // `scontrol show job <parent>` / squeue go through the get_jobs list
+        // RPC, not get_job. A query for the array parent id must return the
+        // synthesized aggregate, not an empty list.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        submit_array_task(&cm, 11, 10, 0);
+        submit_array_task(&cm, 12, 10, 1);
+
+        // Query the parent id explicitly.
+        let got = cm.get_jobs(&[], None, None, None, &[10]);
+        assert_eq!(got.len(), 1, "parent id should synthesize one record");
+        assert_eq!(got[0].job_id, 10);
+        assert_eq!(got[0].state, JobState::Pending);
+        assert_eq!(got[0].spec.array_job_id, Some(10));
+
+        // Querying a real task id still returns that task, not the parent.
+        let got_task = cm.get_jobs(&[], None, None, None, &[11]);
+        assert_eq!(got_task.len(), 1);
+        assert_eq!(got_task[0].job_id, 11);
+
+        // Unknown id → empty.
+        assert!(cm.get_jobs(&[], None, None, None, &[999]).is_empty());
     }
 }
