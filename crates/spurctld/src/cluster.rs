@@ -1310,6 +1310,15 @@ impl ClusterManager {
         // Finalize unsatisfiable jobs via the WAL so resources/accounting fire.
         let mut cancelled = Vec::new();
         for id in to_cancel {
+            // Re-check under a fresh lock: the dependency snapshot above was
+            // taken with the read lock released, so a job classified Failed
+            // could have legitimately started (or already finalized) via a
+            // concurrent path (gRPC, requeue) before we get here. Only cancel
+            // jobs that are still Pending — Running -> Cancelled is a valid
+            // transition the WAL would otherwise apply, destroying live work.
+            if self.jobs.read().get(&id).map(|j| j.state) != Some(JobState::Pending) {
+                continue;
+            }
             match self.propose(WalOperation::JobComplete {
                 job_id: id,
                 exit_code: -1,
@@ -3799,6 +3808,40 @@ mod tests {
         let cancelled = cm.cancel_unsatisfiable_dependency_jobs();
         assert_eq!(cancelled, vec![2]);
         assert_eq!(cm.get_job(2).unwrap().state, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_unsatisfiable_dep_skips_running_job() {
+        // Invariant: cancel_unsatisfiable_dependency_jobs only ever finalizes
+        // Pending jobs. A Running job with an unsatisfiable dependency must be
+        // left alone (Running -> Cancelled would destroy live work). Enforced
+        // by the snapshot filter and re-checked under the write lock to also
+        // cover the snapshot->propose race a sequential test can't reproduce.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("parent")),
+        });
+        set_terminal(&cm, 1, JobState::Failed, 1);
+
+        let mut child = basic_spec("child");
+        child.dependency = vec!["afterok:1".into()];
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 2,
+            spec: Box::new(child),
+        });
+        // Child is already Running by the time the cancel pass fires.
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 2,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+
+        let cancelled = cm.cancel_unsatisfiable_dependency_jobs();
+        assert!(cancelled.is_empty(), "running job must not be cancelled");
+        assert_eq!(cm.get_job(2).unwrap().state, JobState::Running);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
