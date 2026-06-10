@@ -86,9 +86,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             continue;
         }
 
-        // Finalize jobs whose dependencies can never be satisfied (so they don't
-        // sit PENDING forever) and tag still-waiting dependency jobs. Must run
-        // before pending_jobs() so cancelled jobs drop out of this cycle.
+        // Finalize never-satisfiable deps before pending_jobs() so they drop
+        // out of this cycle instead of sitting PENDING forever.
         cluster.cancel_unsatisfiable_dependency_jobs();
 
         let pending = cluster.pending_jobs();

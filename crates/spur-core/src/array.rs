@@ -13,17 +13,12 @@
 use crate::job::JobState;
 use thiserror::Error;
 
-/// Aggregate the terminal state of an array job from its task states, following
-/// Slurm semantics for `scontrol show job <array_job_id>` and dependency
-/// resolution against an array parent.
+/// Aggregate an array job's state from its task states (Slurm parity for
+/// `scontrol show job <array_job_id>` and array-parent dependency resolution).
 ///
-/// Returns `None` while any task is still non-terminal (the array as a whole has
-/// not finished). Once every task is terminal, returns the aggregate:
-/// `Completed` iff all tasks `Completed`, otherwise the "worst" terminal state
-/// observed, with failure outranking cancellation/timeout/node-failure.
-///
-/// `task_states` must contain one entry per array task. An empty slice returns
-/// `None` (no tasks known yet — treat as not-finished).
+/// `None` while any task is non-terminal (or the slice is empty). Once all
+/// tasks are terminal: `Completed` iff all completed, else the worst terminal
+/// state by [`Failed > Deadline > NodeFail > Timeout > Cancelled`].
 pub fn aggregate_array_state(task_states: &[JobState]) -> Option<JobState> {
     if task_states.is_empty() {
         return None;
@@ -35,19 +30,14 @@ pub fn aggregate_array_state(task_states: &[JobState]) -> Option<JobState> {
     if task_states.iter().all(|s| *s == JobState::Completed) {
         return Some(JobState::Completed);
     }
-    // Worst-state precedence (Slurm orders failure above the others for the
-    // purpose of array exit status). Pick the highest-precedence terminal state.
-    // Exhaustive match — no catch-all — so a newly added JobState can't be
-    // silently swallowed at rank 0 (which would mask a real failure).
+    // Worst-state precedence. Exhaustive (no catch-all) so a new JobState can't
+    // be silently swallowed at rank 0, masking a failure.
     let rank = |s: &JobState| match s {
         JobState::Failed => 5,
         JobState::Deadline => 4,
         JobState::NodeFail => 3,
         JobState::Timeout => 2,
         JobState::Cancelled => 1,
-        // Non-failure / non-terminal states: lowest precedence. (Completed is
-        // already filtered out below; the rest can't reach here because the
-        // array is known fully terminal.)
         JobState::Completed
         | JobState::Pending
         | JobState::Running

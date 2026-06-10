@@ -423,11 +423,8 @@ impl SlurmAgent for AgentService {
             env.insert("SPUR_TARGET_NODE".into(), req.target_node.clone());
         }
 
-        // Array task identity — exported so scripts can branch on task index.
-        // Slurm scripts read SLURM_ARRAY_TASK_ID / SLURM_ARRAY_JOB_ID; we set
-        // both the SLURM_* aliases and SPUR_* equivalents. The proto encodes an
-        // absent array parent as 0 (valid job ids start at 1); task index 0 is
-        // legitimate, so we gate on array_job_id rather than array_task_id.
+        // Array task identity for scripts. Gate on array_job_id (0 = not an
+        // array; job ids start at 1) since task index 0 is legitimate.
         if spec.array_job_id != 0 {
             env.insert("SLURM_ARRAY_TASK_ID".into(), spec.array_task_id.to_string());
             env.insert("SLURM_ARRAY_JOB_ID".into(), spec.array_job_id.to_string());

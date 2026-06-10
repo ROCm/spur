@@ -105,10 +105,8 @@ message JobSpec {
 
   // Array
   string array_spec = 50;  // "0-99%10"
-  // Per-task array identity, populated by the controller when dispatching an
-  // expanded array task. array_job_id is the array parent id (0 = not an array
-  // task); array_task_id is this task's index. Exported to the job environment
-  // as SLURM_ARRAY_JOB_ID / SLURM_ARRAY_TASK_ID.
+  // Per-task array identity set by the controller on expansion. array_job_id
+  // is the parent id (0 = not an array task); exported as SLURM_ARRAY_*.
   uint32 array_job_id = 81;
   uint32 array_task_id = 82;
 

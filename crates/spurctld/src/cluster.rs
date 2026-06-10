@@ -191,15 +191,11 @@ impl ClusterManager {
         self.jobs.read().get(&job_id).cloned()
     }
 
-    /// Get a job by ID for display, synthesizing an aggregate record when the id
-    /// is an array *parent* (whose own job record never exists — Spur stores
-    /// only per-task jobs). This makes `spur show job <array_parent_id>` return
-    /// the array's aggregate state instead of empty output, matching Slurm's
-    /// `scontrol show job <array_job_id>`.
-    ///
-    /// The synthesized job borrows the first task's spec, reports the aggregate
-    /// state (PENDING while unfinished), and uses the earliest task start / latest
-    /// task end for timing. It is never stored or scheduled.
+    /// Get a job by ID, synthesizing an aggregate record for an array *parent*
+    /// id (which has no stored job — Spur stores only per-task jobs) so
+    /// `scontrol show job <array_parent>` matches Slurm instead of returning
+    /// empty. The synthesized job borrows the first task's spec, reports the
+    /// aggregate state, earliest start / latest end; it is never stored.
     pub fn get_job_for_display(&self, job_id: JobId) -> Option<Job> {
         let jobs = self.jobs.read();
         if let Some(j) = jobs.get(&job_id) {
@@ -218,8 +214,7 @@ impl ClusterManager {
         let first = tasks[0];
         let mut synth = (*first).clone();
         synth.job_id = job_id;
-        // Present as the parent: clear the per-task id, keep array_job_id so the
-        // proto carries the array linkage.
+        // Present as the parent: drop per-task id, keep array linkage.
         synth.spec.array_task_id = None;
         synth.spec.array_job_id = Some(job_id);
 
@@ -231,9 +226,8 @@ impl ClusterManager {
         } else {
             None
         };
-        // Worst exit code across tasks (mirrors derived_completion semantics).
-        // Only meaningful once the array is terminal; leave None while running so
-        // a still-pending aggregate doesn't read as "0 / success".
+        // Worst non-zero exit across tasks; None while non-terminal so a
+        // pending aggregate doesn't read as "0 / success".
         synth.exit_code = if synth.state.is_terminal() {
             tasks
                 .iter()
@@ -308,10 +302,8 @@ impl ClusterManager {
                 .collect()
         };
 
-        // For explicitly-requested ids that matched no stored job, synthesize an
-        // array-parent aggregate (Spur stores only per-task jobs, so a query for
-        // the parent id would otherwise return nothing). The read lock above is
-        // released before get_job_for_display, which takes its own lock.
+        // Requested ids with no stored job may be array parents — synthesize
+        // their aggregate. Read lock above is released before get_job_for_display.
         if !job_ids.is_empty() {
             for &id in job_ids {
                 if result.iter().any(|j| j.job_id == id) {
@@ -1240,16 +1232,11 @@ impl ClusterManager {
         pending
     }
 
-    /// Cancel pending jobs whose dependencies can never be satisfied, and tag
-    /// still-waiting dependency jobs with `PendingReason::Dependency`.
-    ///
-    /// Returns the ids of jobs that were cancelled. Run from the scheduler loop
-    /// (leader only); takes the write lock that `pending_jobs()` cannot.
-    ///
-    /// This is what closes the silent-deadlock gap: previously a `Failed`
-    /// dependency was merely filtered out of scheduling and the job sat PENDING
-    /// forever. Now it is finalized as Cancelled, matching Slurm's
-    /// `DependencyNeverSatisfied`.
+    /// Cancel pending jobs whose dependencies can never be satisfied (Slurm's
+    /// `DependencyNeverSatisfied`) and tag still-waiting ones with
+    /// `PendingReason::Dependency`. Returns the cancelled ids. Leader-only; takes
+    /// the write lock `pending_jobs()` cannot. Closes the silent-deadlock gap
+    /// where a `Failed` dependency left the job PENDING forever.
     pub fn cancel_unsatisfiable_dependency_jobs(&self) -> Vec<JobId> {
         use spur_core::dependency::{check_dependencies, DependencyResult};
         use spur_core::job::PendingReason;
@@ -1294,9 +1281,8 @@ impl ClusterManager {
             let mut jobs = self.jobs.write();
             for id in &to_wait {
                 if let Some(j) = jobs.get_mut(id) {
-                    // Don't clobber Held, or a DeadLine reason set by the
-                    // deadline-enforcement path (the job is about to transition
-                    // to JobState::Deadline) — matches update_pending_reasons().
+                    // Don't clobber Held or DeadLine — matches
+                    // update_pending_reasons().
                     if j.state == JobState::Pending
                         && j.pending_reason != PendingReason::Held
                         && j.pending_reason != PendingReason::DeadLine
@@ -1310,12 +1296,9 @@ impl ClusterManager {
         // Finalize unsatisfiable jobs via the WAL so resources/accounting fire.
         let mut cancelled = Vec::new();
         for id in to_cancel {
-            // Re-check under a fresh lock: the dependency snapshot above was
-            // taken with the read lock released, so a job classified Failed
-            // could have legitimately started (or already finalized) via a
-            // concurrent path (gRPC, requeue) before we get here. Only cancel
-            // jobs that are still Pending — Running -> Cancelled is a valid
-            // transition the WAL would otherwise apply, destroying live work.
+            // Re-check Pending: the snapshot's read lock was released, so the
+            // job may have started concurrently. Running -> Cancelled is a valid
+            // WAL transition that would otherwise destroy live work.
             if self.jobs.read().get(&id).map(|j| j.state) != Some(JobState::Pending) {
                 continue;
             }
@@ -3812,11 +3795,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancel_unsatisfiable_dep_skips_running_job() {
-        // Invariant: cancel_unsatisfiable_dependency_jobs only ever finalizes
-        // Pending jobs. A Running job with an unsatisfiable dependency must be
-        // left alone (Running -> Cancelled would destroy live work). Enforced
-        // by the snapshot filter and re-checked under the write lock to also
-        // cover the snapshot->propose race a sequential test can't reproduce.
+        // A Running job with an unsatisfiable dep must not be cancelled
+        // (Running -> Cancelled would destroy live work).
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 

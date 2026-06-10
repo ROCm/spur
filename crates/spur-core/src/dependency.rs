@@ -29,9 +29,8 @@ pub enum Dependency {
     Singleton,
 }
 
-/// Error returned when a dependency string cannot be parsed or names an
-/// unknown dependency type. Surfaced at submit time so users get a clear
-/// rejection instead of a silently-deadlocked job.
+/// Dependency string parse failure, surfaced at submit time so users get a
+/// clear rejection instead of a silently-deadlocked job.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DependencyParseError {
     #[error("unknown dependency type: '{0}'")]
@@ -42,12 +41,9 @@ pub enum DependencyParseError {
     InvalidSyntax(String),
 }
 
-/// Parse dependency strings, rejecting unknown types and malformed ids.
-///
-/// Accepts forms like `afterok:100`, `afterany:200:300`, `after:100+5`,
-/// `aftercorr:42`, `singleton`. Multiple entries may be comma-separated within
-/// one string. Returns an error on the first unrecognized type or unparseable
-/// id so the caller can reject the submission.
+/// Strict parse: rejects unknown types and malformed ids. Accepts `afterok:100`,
+/// `afterany:200:300`, `after:100+5`, `aftercorr:42`, `singleton`; entries
+/// comma-separated. Errors on the first bad type/id so the caller can reject.
 pub fn try_parse_dependencies(specs: &[String]) -> Result<Vec<Dependency>, DependencyParseError> {
     let mut deps = Vec::new();
     for spec in specs {
@@ -121,13 +117,11 @@ pub fn try_parse_dependencies(specs: &[String]) -> Result<Vec<Dependency>, Depen
     Ok(deps)
 }
 
-/// Lenient parse used on the resolution path, where the spec was already
-/// validated at submit time. Unknown/malformed entries are dropped rather than
-/// erroring so a single bad entry can't wedge the scheduler loop.
+/// Lenient parse for the resolution path (spec already validated at submit).
+/// Drops bad entries instead of erroring so one can't wedge the scheduler loop.
 pub fn parse_dependencies(specs: &[String]) -> Vec<Dependency> {
     try_parse_dependencies(specs).unwrap_or_else(|_| {
-        // Fall back to best-effort: parse each entry independently, skipping
-        // any that fail. This preserves behavior for callers that pre-validated.
+        // Best-effort: parse each entry alone, skipping failures.
         let mut deps = Vec::new();
         for spec in specs {
             for part in spec.split(',') {
@@ -140,19 +134,13 @@ pub fn parse_dependencies(specs: &[String]) -> Vec<Dependency> {
     })
 }
 
-/// Resolve a dependency target to its effective state, transparently handling
-/// array parents.
+/// Resolve a dependency target to its effective state, handling array parents
+/// (whose own job record never exists — Spur stores only per-task jobs) by
+/// aggregating task states.
 ///
-/// A dependency target id `P` may refer to:
-/// - a scalar job (returned directly by `get_job`), or
-/// - an array *parent* id whose own job record never exists (Spur stores only
-///   the per-task jobs). In that case we aggregate the task states.
-///
-/// Returns `None` when the target is unknown (neither a scalar job nor an array
-/// with any tasks). Otherwise returns `Some(state)`: the live scalar state, or
-/// the array's aggregate. An array that exists but has not finished aggregating
-/// is reported as the non-terminal sentinel `JobState::Running`, so callers
-/// treat it as still-waiting.
+/// `None` if the target is unknown. Otherwise `Some(state)`: the scalar state,
+/// or the array aggregate — an unfinished array reports the non-terminal
+/// sentinel `JobState::Running` so callers treat it as still-waiting.
 fn resolve_target_state(
     dep_id: JobId,
     get_job: &dyn Fn(JobId) -> Option<Job>,
@@ -165,8 +153,7 @@ fn resolve_target_state(
     if tasks.is_empty() {
         return None; // Genuinely unknown id.
     }
-    // Array parent: aggregate. `None` here means "not finished yet" — we encode
-    // that as a non-terminal sentinel (Running) so callers treat it as Waiting.
+    // Array parent: aggregate; unfinished -> Running sentinel (see doc).
     Some(
         aggregate_array_state(&tasks.iter().map(|t| t.state).collect::<Vec<_>>())
             .unwrap_or(JobState::Running),
@@ -195,9 +182,7 @@ pub fn check_dependencies(
                 job_id: dep_id,
                 delay_minutes,
             } => {
-                // Find the parent's start time. For an array parent, use the
-                // earliest task start. Eligible `delay_minutes` after start,
-                // regardless of outcome.
+                // Earliest start across the target (array parent: earliest task).
                 let start = get_job(*dep_id).and_then(|j| j.start_time).or_else(|| {
                     get_array_tasks(*dep_id)
                         .iter()
@@ -212,17 +197,12 @@ pub fn check_dependencies(
                         }
                     }
                     None => {
-                        // No recorded start time. Either the parent never
-                        // existed, or it reached a terminal state without ever
-                        // running (e.g. cancelled/failed while Pending —
-                        // start_time is only set on JobStart). In both cases the
-                        // parent will never start, so `after` can no longer
-                        // block: Slurm releases `after` dependents once the
-                        // parent leaves the pending/eligible set. Only a
-                        // known-but-still-non-terminal parent keeps us waiting.
+                        // No start time: a parent that never ran will never
+                        // start, so `after` releases (Slurm parity). Only a
+                        // still-non-terminal parent keeps us waiting.
                         match resolve_target_state(*dep_id, get_job, get_array_tasks) {
                             Some(s) if !s.is_terminal() => return DependencyResult::Waiting,
-                            _ => {} // Terminal, or unknown — satisfied.
+                            _ => {}
                         }
                     }
                 }
