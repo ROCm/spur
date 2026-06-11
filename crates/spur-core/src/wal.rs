@@ -37,6 +37,7 @@ pub enum WalOperation {
     JobComplete {
         job_id: JobId,
         exit_code: i32,
+        // reserved; JobComplete paths carry no process signal (cancel/deadline/timeout)
         #[serde(default)]
         signal: i32,
         state: JobState,

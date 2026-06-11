@@ -2936,6 +2936,57 @@ mod tests {
         assert_eq!(job.pending_reason, PendingReason::RaisedSignal);
     }
 
+    // Drives the exact code path of the `report_job_status` RPC for a signaled
+    // completion. We cannot construct the full `ControllerService` here (it needs a
+    // `LeaderProxy` + serving stack), so we reproduce the two steps the RPC handler
+    // performs in `server.rs::report_job_status`: (1) it validates the wire report
+    // with `validate_completion_report_state` before accepting it, then (2) it calls
+    // `cluster.node_complete(job_id, node, exit_code, signal)`. The agent reports a
+    // signal-killed job as (state=Completed, exit_code=0, signal=9) — see the NOTE in
+    // spurd/agent_server.rs. This test locks in that such a report is ACCEPTED by the
+    // validator and then rederived to a Failed job with exit_signal=9 / RaisedSignal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_path_signaled_completion_accepted_and_rederived_failed() {
+        // Step 1: the agent's wire report for a signaled job is (Completed, exit_code=0).
+        // The controller validates this before touching the cluster; it must pass.
+        JobState::validate_completion_report_state(JobState::Completed, 0)
+            .expect("agent (Completed, exit_code=0) signaled report must pass RPC validation");
+
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("rpc-signal-job")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: ResourceSet {
+                cpus: 6,
+                memory_mb: 12000,
+                ..Default::default()
+            },
+        });
+
+        // Step 2: the same call the RPC handler makes after validation — note the
+        // wire state (Completed) is dropped; only exit_code=0 and signal=9 flow in.
+        cm.node_complete(1, "n1", 0, 9).unwrap();
+
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.exit_code, Some(0));
+        assert_eq!(job.exit_signal, Some(9));
+        assert_eq!(job.pending_reason, PendingReason::RaisedSignal);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn node_complete_sets_nonzero_exit_reason() {
         let dir = TempDir::new().unwrap();

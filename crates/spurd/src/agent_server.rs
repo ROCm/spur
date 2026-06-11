@@ -309,6 +309,14 @@ async fn report_completion(
 ) {
     use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 
+    // NOTE: the per-node completion report's `state` is derived from `exit_code`
+    // alone, so a signal-killed job (exit_code=0, signal!=0) reports `Completed`
+    // here. This is intentional and required: the controller validates the report
+    // with `validate_completion_report_state` (Completed<->0, Failed<->nonzero),
+    // which would REJECT a `Failed` state paired with exit_code=0. The controller
+    // rederives the true terminal state (Failed, exit_signal, RaisedSignal) from
+    // the reported `signal` in `Job::derived_completion`, so the wire `state` is
+    // advisory only and the signal carries the real outcome.
     let state = spur_core::job::JobState::completion_state_for_exit_code(exit_code).to_proto_i32();
 
     let url = if controller_addr.starts_with("http") {

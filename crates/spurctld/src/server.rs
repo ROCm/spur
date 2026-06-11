@@ -1609,6 +1609,16 @@ mod tests {
         assert!(validate_completion_report_state_for_rpc(JobState::Failed, 42).is_ok());
     }
 
+    // A signal-killed job is reported by the agent as (state=Completed, exit_code=0,
+    // signal!=0) — see the NOTE in spurd/agent_server.rs. The RPC validator only sees
+    // (state, exit_code) and MUST accept it; the controller rederives Failed from the
+    // signal afterward (covered end-to-end by cluster.rs::
+    // rpc_path_signaled_completion_accepted_and_rederived_failed).
+    #[test]
+    fn completion_report_state_accepts_signaled_completed_zero() {
+        assert!(validate_completion_report_state_for_rpc(JobState::Completed, 0).is_ok());
+    }
+
     #[test]
     fn completion_report_state_rejects_completed_nonzero() {
         let err = validate_completion_report_state_for_rpc(JobState::Completed, 1).unwrap_err();
