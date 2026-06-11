@@ -2933,19 +2933,13 @@ mod tests {
         assert_eq!(job.pending_reason, PendingReason::RaisedSignal);
     }
 
-    // Drives the exact code path of the `report_job_status` RPC for a signaled
-    // completion. We cannot construct the full `ControllerService` here (it needs a
-    // `LeaderProxy` + serving stack), so we reproduce the two steps the RPC handler
-    // performs in `server.rs::report_job_status`: (1) it validates the wire report
-    // with `validate_completion_report_state` before accepting it, then (2) it calls
-    // `cluster.node_complete(job_id, node, exit_code, signal)`. The agent reports a
-    // signal-killed job as (state=Completed, exit_code=0, signal=9) — see the NOTE in
-    // spurd/agent_server.rs. This test locks in that such a report is ACCEPTED by the
-    // validator and then rederived to a Failed job with exit_signal=9 / RaisedSignal.
+    // Reproduces the two steps report_job_status performs (validate the wire
+    // report, then node_complete) since ControllerService can't be built here.
+    // A signaled job's report (Completed, exit_code=0, signal=9) must be accepted
+    // and rederived to Failed / exit_signal=9 / RaisedSignal.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rpc_path_signaled_completion_accepted_and_rederived_failed() {
-        // Step 1: the agent's wire report for a signaled job is (Completed, exit_code=0).
-        // The controller validates this before touching the cluster; it must pass.
+        // Step 1: validate the wire report (Completed, exit_code=0) — must pass.
         JobState::validate_completion_report_state(JobState::Completed, 0)
             .expect("agent (Completed, exit_code=0) signaled report must pass RPC validation");
 
@@ -2970,8 +2964,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
         });
 
-        // Step 2: the same call the RPC handler makes after validation — note the
-        // wire state (Completed) is dropped; only exit_code=0 and signal=9 flow in.
+        // Step 2: the call the RPC makes after validation (wire state dropped).
         cm.node_complete(1, "n1", 0, 9).unwrap();
 
         let job = cm.get_job(1).unwrap();

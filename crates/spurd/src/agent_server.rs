@@ -309,14 +309,10 @@ async fn report_completion(
 ) {
     use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 
-    // NOTE: the per-node completion report's `state` is derived from `exit_code`
-    // alone, so a signal-killed job (exit_code=0, signal!=0) reports `Completed`
-    // here. This is intentional and required: the controller validates the report
-    // with `validate_completion_report_state` (Completed<->0, Failed<->nonzero),
-    // which would REJECT a `Failed` state paired with exit_code=0. The controller
-    // rederives the true terminal state (Failed, exit_signal, RaisedSignal) from
-    // the reported `signal` in `Job::derived_completion`, so the wire `state` is
-    // advisory only and the signal carries the real outcome.
+    // Wire `state` is derived from `exit_code` alone (advisory): a signaled job
+    // reports Completed/0 because the controller's validator requires
+    // state<->exit_code agreement. The controller rederives the true Failed /
+    // RaisedSignal outcome from the reported `signal`.
     let state = spur_core::job::JobState::completion_state_for_exit_code(exit_code).to_proto_i32();
 
     let url = if controller_addr.starts_with("http") {
@@ -434,6 +430,25 @@ impl SlurmAgent for AgentService {
 
         // Inject peer node info as environment variables for MPI/distributed apps
         let mut env = spec.environment.clone();
+
+        // Ensure the Spur CLI binaries (srun/sbatch/... symlinks to `spur`) are
+        // on the job's PATH so `srun` works inside batch scripts. They live next
+        // to this agent binary, so derive the dir from the agent's own path
+        // (deployment-independent — no assumption about the install location).
+        if let Some(bin_dir) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        {
+            let bin_dir = bin_dir.to_string_lossy().to_string();
+            let base = env
+                .get("PATH")
+                .cloned()
+                .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".to_string());
+            if !base.split(':').any(|p| p == bin_dir) {
+                env.insert("PATH".into(), format!("{}:{}", bin_dir, base));
+            }
+        }
+
         env.insert("SPUR_JOB_ID".into(), job_id.to_string());
         env.insert("SPUR_TASK_OFFSET".into(), task_offset.to_string());
         env.insert("SPUR_NUM_NODES".into(), peer_nodes.len().to_string());
