@@ -520,8 +520,6 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
         distribution: s.distribution.clone().unwrap_or_default(),
         het_group: s.het_group.unwrap_or(0),
         array_spec: s.array_spec.clone().unwrap_or_default(),
-        array_job_id: s.array_job_id.unwrap_or(0),
-        array_task_id: s.array_task_id.unwrap_or(0),
         requeue: s.requeue,
         exclusive: s.exclusive,
         hold: s.hold,
@@ -614,8 +612,6 @@ async fn dispatch_to_agent(
         distribution: spec.distribution.clone().unwrap_or_default(),
         het_group: spec.het_group.unwrap_or(0),
         array_spec: spec.array_spec.clone().unwrap_or_default(),
-        array_job_id: spec.array_job_id.unwrap_or(0),
-        array_task_id: spec.array_task_id.unwrap_or(0),
         requeue: spec.requeue,
         exclusive: spec.exclusive,
         hold: spec.hold,
@@ -661,6 +657,9 @@ async fn dispatch_to_agent(
             peer_nodes: params.peer_nodes.to_vec(),
             task_offset: params.task_offset,
             target_node: params.target_node.to_string(),
+            // Controller-assigned at array expansion; consumed agent-side.
+            array_job_id: spec.array_job_id.unwrap_or(0),
+            array_task_id: spec.array_task_id.unwrap_or(0),
         })
         .await?;
 

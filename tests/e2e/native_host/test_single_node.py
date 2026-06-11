@@ -211,9 +211,7 @@ class TestJobLifecycle:
 
 
 class TestArrayDependencies:
-    """Regression tests for issue #259: dependencies against array parents.
-
-    Array submission returns a parent placeholder id P; the individual task
+    """Array submission returns a parent placeholder id P; the individual task
     jobs get ids P+1, P+2, ... each carrying array_job_id=P. These tests assert
     that dependencies resolved against P (the array parent) no longer deadlock.
     """

@@ -105,10 +105,6 @@ message JobSpec {
 
   // Array
   string array_spec = 50;  // "0-99%10"
-  // Per-task array identity set by the controller on expansion. array_job_id
-  // is the parent id (0 = not an array task); exported as SLURM_ARRAY_*.
-  uint32 array_job_id = 81;
-  uint32 array_task_id = 82;
 
   // MPI
   string mpi = 51;            // MPI type: "none", "pmix", "pmi2"
@@ -443,6 +439,10 @@ message LaunchJobRequest {
   repeated string peer_nodes = 4;  // All nodes in this job's allocation
   uint32 task_offset = 5;          // This node's starting task index
   string target_node = 6;          // Which K8s/Spur node this dispatch targets
+  // Per-task array identity, controller-assigned at expansion (not user-supplied).
+  // array_job_id is the parent id (0 = not an array task); exported as SLURM_ARRAY_*.
+  uint32 array_job_id = 7;
+  uint32 array_task_id = 8;
 }
 
 message LaunchJobResponse {

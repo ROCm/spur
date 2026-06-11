@@ -591,9 +591,6 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         distribution: args.distribution.unwrap_or_default(),
         het_group: args.het_group.unwrap_or(0),
         array_spec: args.array.unwrap_or_default(),
-        // Per-task identity is assigned by the controller during array expansion.
-        array_job_id: 0,
-        array_task_id: 0,
         requeue: args.requeue,
         exclusive: args.exclusive,
         hold: args.hold,
