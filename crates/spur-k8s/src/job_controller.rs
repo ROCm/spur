@@ -498,6 +498,7 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                     job_id,
                     state: report_state.to_proto_i32(),
                     exit_code: final_exit_code,
+                    signal: 0,
                     message: final_message,
                     drain_node: false,
                     drain_reason: String::new(),

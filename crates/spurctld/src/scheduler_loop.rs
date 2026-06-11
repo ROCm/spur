@@ -815,8 +815,10 @@ async fn enforce_completing_timeout(cluster: Arc<ClusterManager>, raft: Arc<Raft
                 .cloned()
                 .collect();
 
-            let (mut state, mut exit_code) =
-                spur_core::job::Job::derived_completion(&job.node_completions);
+            // Empty when no nodes allocated; derived_completion falls back to worst completion.
+            let primary = job.allocated_nodes.first().cloned().unwrap_or_default();
+            let (mut state, mut exit_code, _signal, _derived) =
+                spur_core::job::Job::derived_completion(&job.node_completions, &primary);
             if job.node_completions.is_empty() {
                 state = spur_core::job::JobState::Failed;
                 exit_code = -1;

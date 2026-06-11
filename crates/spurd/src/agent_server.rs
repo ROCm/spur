@@ -47,6 +47,7 @@ struct TrackedJob {
 struct CompletedJob {
     job_id: u32,
     exit_code: i32,
+    signal: i32,
     rootfs_mode: crate::container::RootfsMode,
     allocation: Option<AllocationResult>,
     cgroup: Option<std::path::PathBuf>,
@@ -155,11 +156,12 @@ impl AgentService {
 
                 for (job_id, tracked) in jobs.iter_mut() {
                     match tracked.job.try_wait() {
-                        Ok(Some(exit_code)) => {
-                            info!(job_id, exit_code, "job finished");
+                        Ok(Some((exit_code, signal))) => {
+                            info!(job_id, exit_code, signal, "job finished");
                             completed.push(CompletedJob {
                                 job_id: *job_id,
                                 exit_code,
+                                signal,
                                 rootfs_mode: tracked.rootfs_mode.clone(),
                                 allocation: tracked.allocation.take(),
                                 cgroup: tracked.job.take_cgroup(),
@@ -256,6 +258,7 @@ impl AgentService {
                         &controller_addr,
                         c.job_id,
                         c.exit_code,
+                        c.signal,
                         &local_hostname,
                         drain.as_ref(),
                     )
@@ -300,11 +303,16 @@ async fn report_completion(
     controller_addr: &str,
     job_id: u32,
     exit_code: i32,
+    signal: i32,
     reporting_node: &str,
     drain: Option<&DrainRequest>,
 ) {
     use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 
+    // Wire `state` is derived from `exit_code` alone (advisory): a signaled job
+    // reports Completed/0 because the controller's validator requires
+    // state<->exit_code agreement. The controller rederives the true Failed /
+    // RaisedSignal outcome from the reported `signal`.
     let state = spur_core::job::JobState::completion_state_for_exit_code(exit_code).to_proto_i32();
 
     let url = if controller_addr.starts_with("http") {
@@ -322,6 +330,7 @@ async fn report_completion(
                     job_id,
                     state,
                     exit_code,
+                    signal,
                     message: format!("exit_code={}", exit_code),
                     drain_node: drain.is_some(),
                     drain_reason: drain.as_ref().map(|d| d.reason.clone()).unwrap_or_default(),
@@ -421,6 +430,25 @@ impl SlurmAgent for AgentService {
 
         // Inject peer node info as environment variables for MPI/distributed apps
         let mut env = spec.environment.clone();
+
+        // Ensure the Spur CLI binaries (srun/sbatch/... symlinks to `spur`) are
+        // on the job's PATH so `srun` works inside batch scripts. They live next
+        // to this agent binary, so derive the dir from the agent's own path
+        // (deployment-independent — no assumption about the install location).
+        if let Some(bin_dir) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        {
+            let bin_dir = bin_dir.to_string_lossy().to_string();
+            let base = env
+                .get("PATH")
+                .cloned()
+                .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".to_string());
+            if !base.split(':').any(|p| p == bin_dir) {
+                env.insert("PATH".into(), format!("{}:{}", bin_dir, base));
+            }
+        }
+
         env.insert("SPUR_JOB_ID".into(), job_id.to_string());
         env.insert("SPUR_TASK_OFFSET".into(), task_offset.to_string());
         env.insert("SPUR_NUM_NODES".into(), peer_nodes.len().to_string());
@@ -793,7 +821,8 @@ impl SlurmAgent for AgentService {
                         let drain = DrainRequest {
                             reason: drain_reason.clone(),
                         };
-                        report_completion(&controller, job_id, -1, &node_name, Some(&drain)).await;
+                        report_completion(&controller, job_id, -1, 0, &node_name, Some(&drain))
+                            .await;
                     });
                 }
 

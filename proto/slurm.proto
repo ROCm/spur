@@ -183,6 +183,8 @@ message JobInfo {
   string command = 25;
 
   int32 exit_code = 30;
+  int32 exit_signal = 33;       // Terminating signal of primary node (0 = none)
+  int32 derived_exit_code = 34; // Running max over srun step exit codes (0 if no steps)
   string stdout_path = 31;
   string stderr_path = 32;
 
@@ -497,6 +499,7 @@ message RunStepRequest {
   uint32 gid = 4;
   string work_dir = 5;
   map<string, string> environment = 6;
+  uint32 step_id = 7;  // Step id from CreateJobStep, for recording completion
 }
 
 message RunStepResponse {
@@ -624,6 +627,7 @@ message ReportJobStatusRequest {
   bool drain_node = 5;     // Agent requests its node be drained (e.g. prolog/epilog failure)
   string drain_reason = 6; // Reason for drain request
   string reporting_node = 7; // Hostname of the reporting agent (for drain targeting)
+  int32 signal = 8;  // Terminating signal of the reporting node's process (0 = none)
 }
 
 // ============================================================

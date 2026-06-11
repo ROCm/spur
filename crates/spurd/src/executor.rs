@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{bail, Context};
-use nix::sys::signal::{self, Signal};
+use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use nix::unistd::Pid;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
@@ -91,6 +91,16 @@ pub enum RunningJob {
     },
 }
 
+/// Split a finished process's wait status into (exit_code, signal).
+/// Slurm parity: WIFEXITED -> (code, 0); WIFSIGNALED -> (0, sig).
+pub fn decode_wait_status(status: nix::sys::wait::WaitStatus) -> (i32, i32) {
+    match status {
+        nix::sys::wait::WaitStatus::Exited(_, code) => (code, 0),
+        nix::sys::wait::WaitStatus::Signaled(_, sig, _) => (0, sig as i32),
+        _ => (-1, 0), // unreachable from try_wait (only Exited/Signaled reach here); -1 = shouldn't-happen sentinel
+    }
+}
+
 fn pidfd_open(pid: i32) -> std::io::Result<OwnedFd> {
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as RawFd;
     if fd < 0 {
@@ -107,11 +117,17 @@ impl RunningJob {
         }
     }
 
-    /// Non-blocking check for process exit. Returns exit code if done.
-    pub fn try_wait(&mut self) -> anyhow::Result<Option<i32>> {
+    /// Non-blocking check for process exit. Returns (exit_code, signal) if done.
+    pub fn try_wait(&mut self) -> anyhow::Result<Option<(i32, i32)>> {
         match self {
             RunningJob::Managed { child, .. } => match child.try_wait() {
-                Ok(Some(status)) => Ok(Some(status.code().unwrap_or(-1))),
+                Ok(Some(status)) => {
+                    use std::os::unix::process::ExitStatusExt;
+                    Ok(Some((
+                        status.code().unwrap_or(0),
+                        status.signal().unwrap_or(0),
+                    )))
+                }
                 Ok(None) => Ok(None),
                 Err(e) => Err(e.into()),
             },
@@ -123,15 +139,12 @@ impl RunningJob {
                     Pid::from_raw(*pid),
                     Some(nix::sys::wait::WaitPidFlag::WNOHANG),
                 ) {
-                    Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
-                        *reaped = true;
-                        Ok(Some(code))
-                    }
-                    Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => {
-                        *reaped = true;
-                        Ok(Some(128 + sig as i32))
-                    }
                     Ok(nix::sys::wait::WaitStatus::StillAlive) => Ok(None),
+                    Ok(status @ nix::sys::wait::WaitStatus::Exited(_, _))
+                    | Ok(status @ nix::sys::wait::WaitStatus::Signaled(_, _, _)) => {
+                        *reaped = true;
+                        Ok(Some(decode_wait_status(status)))
+                    }
                     Ok(_) => Ok(None),
                     Err(e) => Err(e.into()),
                 }
@@ -408,6 +421,28 @@ async fn spawn_job_process(
         .stdout(stdout_file.into_std().await)
         .stderr(stderr_file.into_std().await)
         .stdin(Stdio::null());
+
+    // Reset signal dispositions to default before exec. spurd is launched in the
+    // background (SIGINT/SIGQUIT/SIGHUP set to SIG_IGN), and a child inherits that
+    // ignore mask — which would make a job's own `kill -INT $$` a no-op and break
+    // Slurm-parity signal reporting (e.g. SIGINT -> RaisedSignal:2). The job must
+    // start with default handlers.
+    unsafe {
+        cmd.pre_exec(|| {
+            // Use sigaction (async-signal-safe) rather than signal() to reset
+            // dispositions; pre_exec runs post-fork in a multi-threaded process.
+            let dfl = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+            for sig in [
+                Signal::SIGINT,
+                Signal::SIGQUIT,
+                Signal::SIGHUP,
+                Signal::SIGPIPE,
+            ] {
+                let _ = signal::sigaction(sig, &dfl);
+            }
+            Ok(())
+        });
+    }
 
     // Issue #99, #107: Run job as the submitting user (not root).
     // Must set supplementary groups (video, render) via initgroups()
@@ -945,6 +980,31 @@ fn wrap_with_burst_buffer(script: &str, bb: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_wait_status_splits_exit_and_signal() {
+        use nix::sys::wait::WaitStatus;
+        use nix::unistd::Pid;
+        let p = Pid::from_raw(1);
+        assert_eq!(decode_wait_status(WaitStatus::Exited(p, 7)), (7, 0));
+        assert_eq!(
+            decode_wait_status(WaitStatus::Signaled(
+                p,
+                nix::sys::signal::Signal::SIGKILL,
+                false
+            )),
+            (0, 9)
+        );
+        assert_eq!(
+            decode_wait_status(WaitStatus::Signaled(
+                p,
+                nix::sys::signal::Signal::SIGTERM,
+                false
+            )),
+            (0, 15)
+        );
+        assert_eq!(decode_wait_status(WaitStatus::StillAlive), (-1, 0));
+    }
 
     #[test]
     fn test_resolve_output_path() {

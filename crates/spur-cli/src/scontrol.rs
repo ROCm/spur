@@ -255,7 +255,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 println!(
                     "   JobState={} Reason={}",
                     state_name(job.state),
-                    job.state_reason
+                    render_reason(&job.state_reason, job.exit_signal),
                 );
                 println!(
                     "   NumNodes={} NumTasks={} CPUs/Task={}",
@@ -272,7 +272,12 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 );
                 println!("   WorkDir={}", job.work_dir);
                 println!("   StdOut={} StdErr={}", job.stdout_path, job.stderr_path);
-                println!("   ExitCode={} Priority={}", job.exit_code, job.priority);
+                println!(
+                    "   ExitCode={} DerivedExitCode={} Priority={}",
+                    format_exit(job.exit_code, job.exit_signal),
+                    format_exit(job.derived_exit_code, 0),
+                    job.priority
+                );
                 println!();
             }
         }
@@ -475,6 +480,34 @@ fn format_ts(ts: Option<&prost_types::Timestamp>) -> String {
     }
 }
 
+fn format_exit(code: i32, signal: i32) -> String {
+    format!("{}:{}", code, signal)
+}
+
+fn signal_name(sig: i32) -> String {
+    let name = match sig {
+        1 => "Hangup",
+        2 => "Interrupt",
+        6 => "Aborted",
+        9 => "Killed",
+        11 => "Segmentation fault",
+        13 => "Broken pipe",
+        15 => "Terminated",
+        _ => return format!("Signal {}", sig),
+    };
+    name.to_string()
+}
+
+/// Compose the displayed reason. For RaisedSignal, append `:N(name)` from the
+/// job's terminating signal, matching Slurm (`RaisedSignal:9(Killed)`).
+fn render_reason(reason: &str, signal: i32) -> String {
+    if reason == "RaisedSignal" && signal != 0 {
+        format!("RaisedSignal:{}({})", signal, signal_name(signal))
+    } else {
+        reason.to_string()
+    }
+}
+
 async fn send_job_update(controller: &str, req: spur_proto::proto::UpdateJobRequest) -> Result<()> {
     let hold = req.hold;
     let job_id = req.job_id;
@@ -656,4 +689,30 @@ async fn delete_reservation(controller: &str, name: &str) -> Result<()> {
 
     println!("Reservation {} deleted", name);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_exit_code_pairs() {
+        assert_eq!(format_exit(2, 0), "2:0");
+        assert_eq!(format_exit(0, 9), "0:9");
+    }
+
+    #[test]
+    fn signal_name_lookup() {
+        assert_eq!(signal_name(9), "Killed");
+        assert_eq!(signal_name(15), "Terminated");
+        assert_eq!(signal_name(11), "Segmentation fault");
+        assert_eq!(signal_name(99), "Signal 99");
+    }
+
+    #[test]
+    fn reason_with_signal_composes_raisedsignal() {
+        assert_eq!(render_reason("RaisedSignal", 9), "RaisedSignal:9(Killed)");
+        assert_eq!(render_reason("NonZeroExitCode", 0), "NonZeroExitCode");
+        assert_eq!(render_reason("None", 0), "None");
+    }
 }

@@ -23,6 +23,10 @@ pub const STEP_BATCH: StepId = 0xFFFF_FFFE;
 pub const STEP_EXTERN: StepId = 0xFFFF_FFFD;
 pub const STEP_INTERACTIVE: StepId = 0xFFFF_FFFC;
 
+/// Step IDs at or above this are reserved (batch/extern/interactive); real
+/// user `srun` steps are numbered below it (0, 1, 2, ...).
+pub const STEP_RESERVED_MIN: StepId = 0xFFFF_FFF0;
+
 /// A step within a job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobStep {
