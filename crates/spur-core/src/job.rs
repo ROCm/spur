@@ -209,6 +209,17 @@ pub enum PendingReason {
     BeginTime,
     DeadLine,
     Licenses,
+    NonZeroExitCode,
+    RaisedSignal,
+    JobLaunchFailure,
+    JobHeldAdmin,
+    BadConstraints,
+    PartitionInactive,
+    DependencyNeverSatisfied,
+    InvalidAccount,
+    InvalidQOS,
+    BootFail,
+    OutOfMemory,
 }
 
 impl PendingReason {
@@ -228,6 +239,17 @@ impl PendingReason {
             Self::BeginTime => "BeginTime",
             Self::DeadLine => "DeadLine",
             Self::Licenses => "Licenses",
+            Self::NonZeroExitCode => "NonZeroExitCode",
+            Self::RaisedSignal => "RaisedSignal",
+            Self::JobLaunchFailure => "JobLaunchFailure",
+            Self::JobHeldAdmin => "JobHeldAdmin",
+            Self::BadConstraints => "BadConstraints",
+            Self::PartitionInactive => "PartitionInactive",
+            Self::DependencyNeverSatisfied => "DependencyNeverSatisfied",
+            Self::InvalidAccount => "InvalidAccount",
+            Self::InvalidQOS => "InvalidQOS",
+            Self::BootFail => "BootFailure",
+            Self::OutOfMemory => "OutOfMemory",
         }
     }
 }
@@ -941,6 +963,18 @@ mod tests {
         // Slurm reports this exact string ("DeadLine", note the cap D and L).
         // squeue scrapers and Slurm-compat clients pattern-match on it.
         assert_eq!(PendingReason::DeadLine.display(), "DeadLine");
+    }
+
+    #[test]
+    fn pending_reason_exit_vocabulary_display() {
+        assert_eq!(PendingReason::NonZeroExitCode.display(), "NonZeroExitCode");
+        assert_eq!(PendingReason::RaisedSignal.display(), "RaisedSignal");
+        assert_eq!(
+            PendingReason::JobLaunchFailure.display(),
+            "JobLaunchFailure"
+        );
+        assert_eq!(PendingReason::OutOfMemory.display(), "OutOfMemory");
+        assert_eq!(PendingReason::BootFail.display(), "BootFailure");
     }
 
     #[test]
