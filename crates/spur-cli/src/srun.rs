@@ -544,9 +544,9 @@ async fn run_as_step(
         .await
         .context("failed to connect to spurctld")?;
 
-    // Create a step on the controller for tracking. The controller doesn't
-    // currently use this for dispatch — it's just bookkeeping.
-    let _ = client
+    // Create a step on the controller for tracking; capture the assigned
+    // step_id so the completion (and thus DerivedExitCode) records against it.
+    let step_id = client
         .create_job_step(CreateJobStepRequest {
             job_id,
             command: args.command.clone(),
@@ -554,7 +554,9 @@ async fn run_as_step(
             cpus_per_task: args.cpus_per_task,
         })
         .await
-        .context("failed to create job step")?;
+        .context("failed to create job step")?
+        .into_inner()
+        .step_id;
 
     let env: std::collections::HashMap<String, String> = std::env::vars().collect();
 
@@ -566,6 +568,7 @@ async fn run_as_step(
             gid: nix::unistd::getegid().as_raw(),
             work_dir: work_dir.to_string(),
             environment: env,
+            step_id,
         })
         .await
         .context("RunStep dispatch failed")?

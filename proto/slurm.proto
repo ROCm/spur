@@ -499,6 +499,7 @@ message RunStepRequest {
   uint32 gid = 4;
   string work_dir = 5;
   map<string, string> environment = 6;
+  uint32 step_id = 7;  // Step id from CreateJobStep, for recording completion
 }
 
 message RunStepResponse {

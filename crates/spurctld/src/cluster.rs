@@ -18,7 +18,7 @@ use spur_core::partition::Partition;
 use spur_core::qos::{check_qos_limits, QosCheckResult};
 use spur_core::reservation::Reservation;
 use spur_core::resource::{ResourceAllocations, ResourceSet};
-use spur_core::step::{JobStep, StepState, STEP_BATCH};
+use spur_core::step::{JobStep, StepState, STEP_BATCH, STEP_RESERVED_MIN};
 use spur_core::wal::WalOperation;
 use spur_metrics::job::JobMetricsSnapshot;
 use spur_metrics::node::NodeMetricsSnapshot;
@@ -1056,6 +1056,23 @@ impl ClusterManager {
         debug!(job_id, step_id, "step created");
     }
 
+    /// Record an srun step's completion via Raft so the step exit code and the
+    /// job's running-max DerivedExitCode are durable and replay-consistent.
+    #[allow(clippy::result_large_err)]
+    pub fn record_step_complete(
+        &self,
+        job_id: JobId,
+        step_id: u32,
+        exit_code: i32,
+    ) -> anyhow::Result<()> {
+        self.propose(WalOperation::JobStepComplete {
+            job_id,
+            step_id,
+            exit_code,
+        })?;
+        Ok(())
+    }
+
     /// Get all steps for a job.
     pub fn get_steps(&self, job_id: JobId) -> Vec<JobStep> {
         self.steps
@@ -1830,13 +1847,17 @@ impl ClusterManager {
                     if job.all_nodes_completed() {
                         // Primary = batch node (allocated_nodes[0]). Empty string when none allocated; derived_completion then falls back to the worst completion.
                         let primary = job.allocated_nodes.first().cloned().unwrap_or_default();
-                        let (final_state, final_exit, final_signal, derived) =
+                        let (final_state, final_exit, final_signal, _node_derived) =
                             Job::derived_completion(&job.node_completions, &primary);
                         match job.transition(final_state) {
                             Ok(()) => {
                                 job.exit_code = Some(final_exit);
                                 job.exit_signal = Some(final_signal);
-                                job.derived_exit_code = Some(derived);
+                                // DerivedExitCode is the running max over srun
+                                // steps, accumulated live by JobStepComplete.
+                                // Preserve it; a job with no srun steps keeps
+                                // 0:0 (Slurm parity), not the batch exit.
+                                job.derived_exit_code = Some(job.derived_exit_code.unwrap_or(0));
                                 job.pending_reason = if final_signal != 0 {
                                     PendingReason::RaisedSignal
                                 } else if final_exit != 0 {
@@ -1946,6 +1967,35 @@ impl ClusterManager {
                 drop(jobs);
                 drop(nodes);
                 self.complete_job_steps_and_licenses(job_id, *exit_code, timestamp);
+            }
+            WalOperation::JobStepComplete {
+                job_id,
+                step_id,
+                exit_code,
+            } => {
+                // Record the step's own exit code/state.
+                {
+                    let mut steps = self.steps.write();
+                    if let Some(step) = steps.get_mut(&(*job_id, *step_id)) {
+                        step.state = if *exit_code == 0 {
+                            StepState::Completed
+                        } else {
+                            StepState::Failed
+                        };
+                        step.exit_code = Some(*exit_code);
+                        step.end_time = Some(timestamp);
+                    }
+                }
+                // DerivedExitCode is the running max over srun steps (the batch
+                // step is excluded — it carries the job's own exit, not a step
+                // result). Maintained live so `scontrol show job` reflects it
+                // mid-run, matching Slurm.
+                if *step_id < STEP_RESERVED_MIN {
+                    if let Some(job) = jobs.get_mut(job_id) {
+                        let cur = job.derived_exit_code.unwrap_or(0);
+                        job.derived_exit_code = Some(cur.max(*exit_code));
+                    }
+                }
             }
             WalOperation::JobPriorityChange {
                 job_id,
@@ -2719,13 +2769,99 @@ mod tests {
         let job = cm.get_job(1).unwrap();
         // ExitCode follows the primary (batch) node n1 = allocated_nodes[0],
         // which exited 0 — so the job state/exit_code reflect a clean primary.
-        // The non-zero exit on n3 surfaces only via DerivedExitCode.
         assert_eq!(job.state, JobState::Completed);
         assert_eq!(job.exit_code, Some(0));
-        assert_eq!(job.derived_exit_code, Some(42));
+        // DerivedExitCode is the max over srun *steps* (Slurm parity), not node
+        // completions. This job ran no srun steps, so it is 0 — the non-primary
+        // node's exit 42 does not surface here.
+        assert_eq!(job.derived_exit_code, Some(0));
         for name in ["n1", "n2", "n3"] {
             assert_eq!(cm.get_node(name).unwrap().alloc_resources.cpus, 0);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn step_complete_accumulates_derived_exit_code_running_max() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("steps")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: scalar_alloc(4, 8000),
+            per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
+        });
+
+        // Three srun steps exit 7, 3, 2 (in that order). DerivedExitCode tracks
+        // the running max live; ExitCode is unaffected (it is the batch exit).
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: 0,
+            exit_code: 7,
+        });
+        assert_eq!(cm.get_job(1).unwrap().derived_exit_code, Some(7));
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: 1,
+            exit_code: 3,
+        });
+        // 3 < 7, running max stays 7.
+        assert_eq!(cm.get_job(1).unwrap().derived_exit_code, Some(7));
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: 2,
+            exit_code: 2,
+        });
+        assert_eq!(cm.get_job(1).unwrap().derived_exit_code, Some(7));
+
+        // Batch script exits 2 -> ExitCode=2:0, DerivedExitCode preserved at 7.
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id: 1,
+            node_name: "n1".into(),
+            exit_code: 2,
+            signal: 0,
+        });
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.exit_code, Some(2));
+        assert_eq!(job.derived_exit_code, Some(7));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn step_complete_batch_step_excluded_from_derived() {
+        // The reserved batch step carries the job's own exit, not a step result,
+        // so it must NOT contribute to DerivedExitCode.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("batch-only")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: STEP_BATCH,
+            exit_code: 9,
+        });
+        // Reserved step id -> derived untouched.
+        assert_eq!(cm.get_job(1).unwrap().derived_exit_code, None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3002,7 +3138,9 @@ mod tests {
         assert_eq!(job.state, JobState::Failed);
         assert_eq!(job.exit_code, Some(42));
         assert_eq!(job.exit_signal, Some(0));
-        assert_eq!(job.derived_exit_code, Some(42));
+        // No srun steps ran, so DerivedExitCode is 0 (Slurm parity) — the batch
+        // exit (42) surfaces as ExitCode, not DerivedExitCode.
+        assert_eq!(job.derived_exit_code, Some(0));
         assert_eq!(job.pending_reason, PendingReason::NonZeroExitCode);
     }
 

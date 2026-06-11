@@ -969,6 +969,21 @@ impl SlurmController for ControllerService {
             .map_err(|e| Status::internal(format!("run_command failed: {}", e)))?
             .into_inner();
 
+        // Record the step's exit code durably (Raft) so the job's live
+        // DerivedExitCode (running max over steps) is consistent and survives
+        // restart. Best-effort: a failure here doesn't fail the step itself.
+        if let Err(e) =
+            self.cluster
+                .record_step_complete(req.job_id, req.step_id, agent_resp.exit_code)
+        {
+            warn!(
+                job_id = req.job_id,
+                step_id = req.step_id,
+                error = %e,
+                "failed to record step completion"
+            );
+        }
+
         Ok(Response::new(RunStepResponse {
             exit_code: agent_resp.exit_code,
             stdout: agent_resp.stdout,

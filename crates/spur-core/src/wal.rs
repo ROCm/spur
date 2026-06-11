@@ -49,6 +49,13 @@ pub enum WalOperation {
         #[serde(default)]
         signal: i32,
     },
+    /// An srun job step finished. Records the step's exit code durably so the
+    /// job's DerivedExitCode (running max over steps) survives restart/replay.
+    JobStepComplete {
+        job_id: JobId,
+        step_id: u32,
+        exit_code: i32,
+    },
     JobPriorityChange {
         job_id: JobId,
         old_priority: u32,
