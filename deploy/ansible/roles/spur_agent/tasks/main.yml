@@ -1,0 +1,57 @@
+---
+- name: Resolve agent's advertised address
+  ansible.builtin.set_fact:
+    spur_agent_listen_ip: >-
+      {{ spur_wg_address if spur_transport == 'wireguard'
+         else (ansible_host | default(ansible_default_ipv4.address)) }}
+    spur_node_name: "{{ spur_node_name | default(ansible_hostname) }}"
+
+- name: Resolve controller address agents will talk to
+  # NOTE: spurd --controller takes a single URL in Spur 0.3.0. In HA mode we still
+  # point at the first controller — non-leader controllers forward writes via the
+  # Raft cluster. Real failover when ctl[0] dies needs a VIP / DNS in front of 6817.
+  ansible.builtin.set_fact:
+    spur_controller_addr: >-
+      {{ hostvars[groups['spur_controllers'][0]]['spur_wg_address']
+         if spur_transport == 'wireguard'
+         else hostvars[groups['spur_controllers'][0]]['ansible_host']
+              | default(hostvars[groups['spur_controllers'][0]]['ansible_default_ipv4']['address']) }}
+
+- name: Stop existing spurd (exact-name match)
+  ansible.builtin.shell: |
+    pkill -x spurd 2>/dev/null || true
+    for i in $(seq 1 10); do
+      pgrep -x spurd >/dev/null || exit 0
+      sleep 0.5
+    done
+    exit 1
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Start spurd
+  # -D means FOREGROUND (verified in crates/spurctld/src/main.rs:34). Do NOT pass -D.
+  # < /dev/null + disown is mandatory or SSH wrapper can kill the daemon on disconnect.
+  # `cd {{ spur_home }}` makes spurd's cwd predictable so job stdout (spur-<N>.out)
+  # always lands in {{ spur_home }} regardless of where Ansible launched the playbook.
+  ansible.builtin.shell: |
+    cd {{ spur_home }}
+    nohup {{ spur_install_dir }}/spurd \
+        --controller http://{{ spur_controller_addr }}:{{ spur_controller_port }} \
+        --hostname {{ spur_node_name }} \
+        --address {{ spur_agent_listen_ip }} \
+        --listen 0.0.0.0:{{ spur_agent_port }} \
+        --log-level {{ spur_log_level }} \
+        > {{ spur_home }}/log/spurd.log 2>&1 < /dev/null &
+    disown
+    echo $!
+  args:
+    executable: /bin/bash
+  register: spurd_start
+  changed_when: true
+
+- name: Wait for spurd to listen on {{ spur_agent_port }}
+  ansible.builtin.wait_for:
+    port: "{{ spur_agent_port }}"
+    host: "127.0.0.1"
+    timeout: 30

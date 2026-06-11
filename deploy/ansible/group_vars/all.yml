@@ -1,0 +1,41 @@
+---
+# Cluster identity
+spur_cluster_name: spur-cluster
+
+# Install
+spur_version: latest                # latest | nightly | vX.Y.Z
+spur_install_dir: /root/.local/bin
+spur_home: /root/spur
+
+# Transport: direct (LAN, no encryption) | wireguard (encrypted mesh)
+spur_transport: direct
+
+# WireGuard mesh settings (only used when spur_transport == wireguard)
+spur_wg_cidr: 10.44.0.0/16
+spur_wg_port: 51820
+spur_wg_interface: spur0
+
+# Ports
+spur_controller_port: 6817
+spur_agent_port: 6818
+spur_raft_port: 6821
+
+# Logging
+spur_log_level: info
+
+# Wipe Raft state on (re)deploy. Safe for fresh installs and dev clusters; set false in prod.
+spur_wipe_state: true
+
+# HA mode is enabled automatically when groups['spur_controllers'] has more than one host.
+# In HA mode:
+#   - every controller is given a node_id (its 1-based position in groups['spur_controllers'])
+#   - spur.conf gets `peers = ["ctl1:6821", "ctl2:6821", ...]` (same order on every host)
+#   - agents are pointed at the FIRST controller; openraft forwards writes to the leader,
+#     but agents do not yet fail over to a different controller if the first one dies
+#     (Spur 0.3.0 limitation — `spurd --controller` takes a single URL). Put an L4 VIP /
+#     DNS round-robin in front of port 6817 for real failover. See README.
+spur_ha_enabled: "{{ (groups.get('spur_controllers', []) | length) > 1 }}"
+
+# Whether the controller node also runs spurd (lets controller be a compute target).
+# Auto: true if a host is in BOTH controller and agent groups.
+spur_controller_runs_agent: "{{ inventory_hostname in groups.get('spur_agents', []) and inventory_hostname in groups.get('spur_controllers', []) }}"

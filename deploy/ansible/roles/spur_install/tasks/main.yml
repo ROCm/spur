@@ -1,0 +1,94 @@
+---
+- name: Preflight — check required commands
+  ansible.builtin.shell: "command -v {{ item }}"
+  args:
+    executable: /bin/bash
+  register: pf_cmd
+  changed_when: false
+  failed_when: pf_cmd.rc != 0
+  loop:
+    - curl
+    - tar
+    - bash
+
+- name: Preflight — detect existing Spur daemons (informational)
+  ansible.builtin.shell: |
+    set +e
+    for p in spurctld spurd spurrestd; do
+      pid=$(pgrep -x "$p" 2>/dev/null | head -1)
+      [ -n "$pid" ] && echo "$p running (PID $pid)"
+    done
+    exit 0
+  register: pf_running
+  changed_when: false
+
+- name: Preflight — note any running daemons
+  ansible.builtin.debug:
+    msg: "{{ pf_running.stdout_lines | default(['no spur daemons running']) }}"
+
+- name: Preflight — fail if Spur ports are held by a non-Spur process
+  ansible.builtin.shell: |
+    set +e
+    # ss -p prints "users:((\"<name>\",pid=...))" as the last column when run as root.
+    # Any owner that is NOT spurctld/spurd/spurrestd on our ports is a conflict.
+    bad=$(ss -tlnpH "( sport = :{{ spur_controller_port }} or sport = :{{ spur_agent_port }} or sport = :{{ spur_raft_port }} )" 2>/dev/null \
+          | grep -oE 'users:\(\("[^"]+"' \
+          | sed -E 's|.*"([^"]+)".*|\1|' \
+          | grep -v -E '^(spurctld|spurd|spurrestd)$')
+    if [ -n "$bad" ]; then
+      echo "non-spur process(es) on spur ports: $bad"
+      exit 1
+    fi
+    exit 0
+  args:
+    executable: /bin/bash
+  register: pf_ports
+  changed_when: false
+  failed_when: pf_ports.rc != 0
+
+- name: Create Spur directory layout
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ spur_home }}"
+    - "{{ spur_home }}/state"
+    - "{{ spur_home }}/log"
+    - "{{ spur_home }}/etc"
+    - "{{ spur_install_dir }}"
+
+- name: Check installed Spur version
+  ansible.builtin.command: "{{ spur_install_dir }}/spur --version"
+  register: spur_ver_check
+  changed_when: false
+  failed_when: false
+
+- name: Install Spur via upstream installer
+  ansible.builtin.shell: |
+    set -euo pipefail
+    curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh \
+      | INSTALL_DIR={{ spur_install_dir }} bash -s -- {{ spur_version }}
+  args:
+    executable: /bin/bash
+  when: spur_ver_check.rc != 0 or spur_ver_check.stdout == ""
+  register: install_run
+  changed_when: install_run.rc == 0
+
+- name: Verify spur binary is present
+  ansible.builtin.command: "{{ spur_install_dir }}/spur --version"
+  register: spur_ver
+  changed_when: false
+
+- name: Show installed version
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: {{ spur_ver.stdout }}"
+
+- name: Ensure ~/.local/bin is on PATH for non-interactive SSH sessions
+  ansible.builtin.lineinfile:
+    path: /etc/environment
+    backrefs: yes
+    regexp: '^PATH="(?!.*{{ spur_install_dir | regex_escape }})(.*)"$'
+    line: 'PATH="{{ spur_install_dir }}:\1"'
+  when: spur_install_dir not in (lookup('ansible.builtin.file', '/etc/environment', errors='ignore') | default(''))
+  ignore_errors: yes

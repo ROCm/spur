@@ -1,0 +1,48 @@
+---
+# Spur deployment — works for single-node, multi-node-direct, multi-node-wireguard.
+#
+# Run:
+#   cd deploy/ansible
+#   ansible-playbook deploy.yml -i inventory/hosts.ini
+#
+# Subset to specific hosts:
+#   ansible-playbook deploy.yml -i inventory/hosts.ini --limit gpu-1
+#
+# Tear down (keeps installed binaries):
+#   ansible-playbook deploy.yml -i inventory/hosts.ini --tags teardown
+
+- name: Preflight + install Spur on all hosts
+  hosts: spur_controllers:spur_agents
+  gather_facts: yes
+  any_errors_fatal: true
+  roles:
+    - role: spur_install
+
+- name: Configure WireGuard mesh (when spur_transport == wireguard)
+  hosts: spur_controllers:spur_agents
+  gather_facts: no
+  any_errors_fatal: true
+  roles:
+    - role: spur_wireguard
+      when: spur_transport == 'wireguard'
+
+- name: Start controller
+  hosts: spur_controllers
+  gather_facts: no
+  any_errors_fatal: true
+  roles:
+    - role: spur_controller
+
+- name: Start agents
+  hosts: spur_agents
+  gather_facts: no
+  any_errors_fatal: true
+  serial: 0      # parallel
+  roles:
+    - role: spur_agent
+
+- name: Verify with test jobs
+  hosts: spur_controllers[0]
+  gather_facts: no
+  roles:
+    - role: spur_verify

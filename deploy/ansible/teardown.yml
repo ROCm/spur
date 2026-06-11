@@ -1,0 +1,40 @@
+---
+# Stop all Spur daemons. Leaves binaries and state in place.
+#   ansible-playbook teardown.yml -i inventory/hosts.ini
+#
+# Add -e wipe=true to also wipe ~/spur and /etc/wireguard/spur0.* (destructive).
+
+- name: Stop Spur daemons
+  hosts: spur_controllers:spur_agents
+  gather_facts: no
+  tasks:
+    - name: Stop spurd / spurctld / spurrestd (exact-name match)
+      ansible.builtin.shell: |
+        pkill -x spurd 2>/dev/null || true
+        pkill -x spurctld 2>/dev/null || true
+        pkill -x spurrestd 2>/dev/null || true
+        sleep 1
+        pgrep -x spurd || true
+        pgrep -x spurctld || true
+        pgrep -x spurrestd || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Tear down WireGuard interface
+      ansible.builtin.shell: |
+        if ip link show {{ spur_wg_interface }} >/dev/null 2>&1; then
+          {{ spur_install_dir }}/spur net down 2>/dev/null || wg-quick down {{ spur_wg_interface }} || ip link del {{ spur_wg_interface }}
+        fi
+      args:
+        executable: /bin/bash
+      when: spur_transport == 'wireguard'
+      changed_when: false
+
+    - name: Wipe state (only when -e wipe=true)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ spur_home }}"
+      when: wipe | default(false) | bool
