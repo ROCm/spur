@@ -490,6 +490,7 @@ impl ClusterManager {
         job_id: JobId,
         node_name: &str,
         exit_code: i32,
+        signal: i32,
     ) -> Result<NodeCompleteResult, NodeCompleteError> {
         {
             let jobs = self.jobs.read();
@@ -512,7 +513,7 @@ impl ClusterManager {
                 job_id,
                 node_name: node_name.to_string(),
                 exit_code,
-                signal: 0,
+                signal,
             })
             .map_err(|source| NodeCompleteError::RaftPropose { source })?;
 
@@ -1777,7 +1778,7 @@ impl ClusterManager {
                 job_id,
                 node_name,
                 exit_code,
-                signal: _,
+                signal,
             } => {
                 let finalized = {
                     let Some(job) = jobs.get_mut(job_id) else {
@@ -1788,7 +1789,13 @@ impl ClusterManager {
                     }
 
                     let already_reported = job.node_completions.contains_key(node_name);
-                    job.node_completions.insert(node_name.clone(), *exit_code);
+                    job.node_completions.insert(
+                        node_name.clone(),
+                        spur_core::job::NodeCompletion {
+                            code: *exit_code,
+                            signal: *signal,
+                        },
+                    );
 
                     if let Some(ref total) = job.allocated_resources {
                         if !already_reported {
@@ -1821,11 +1828,21 @@ impl ClusterManager {
                     }
 
                     if job.all_nodes_completed() {
-                        let (final_state, final_exit) =
-                            Job::derived_completion(&job.node_completions);
+                        let primary = job.allocated_nodes.first().cloned().unwrap_or_default();
+                        let (final_state, final_exit, final_signal, derived) =
+                            Job::derived_completion(&job.node_completions, &primary);
                         match job.transition(final_state) {
                             Ok(()) => {
                                 job.exit_code = Some(final_exit);
+                                job.exit_signal = Some(final_signal);
+                                job.derived_exit_code = Some(derived);
+                                job.pending_reason = if final_signal != 0 {
+                                    PendingReason::RaisedSignal
+                                } else if final_exit != 0 {
+                                    PendingReason::NonZeroExitCode
+                                } else {
+                                    PendingReason::None
+                                };
                                 job.end_time = Some(timestamp);
                                 job.node_completions.clear();
                                 Some((final_state, final_exit))
@@ -2699,8 +2716,12 @@ mod tests {
         });
 
         let job = cm.get_job(1).unwrap();
-        assert_eq!(job.state, JobState::Failed);
-        assert_eq!(job.exit_code, Some(42));
+        // ExitCode follows the primary (batch) node n1 = allocated_nodes[0],
+        // which exited 0 — so the job state/exit_code reflect a clean primary.
+        // The non-zero exit on n3 surfaces only via DerivedExitCode.
+        assert_eq!(job.state, JobState::Completed);
+        assert_eq!(job.exit_code, Some(0));
+        assert_eq!(job.derived_exit_code, Some(42));
         for name in ["n1", "n2", "n3"] {
             assert_eq!(cm.get_node(name).unwrap().alloc_resources.cpus, 0);
         }
@@ -2874,9 +2895,79 @@ mod tests {
             signal: 0,
         });
 
-        let result = cm.node_complete(1, "n2", 0).unwrap();
+        let result = cm.node_complete(1, "n2", 0, 0).unwrap();
         assert_eq!(result, NodeCompleteResult::Completing);
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_complete_sets_signal_reason_and_derived() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("signal-job")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: ResourceSet {
+                cpus: 6,
+                memory_mb: 12000,
+                ..Default::default()
+            },
+        });
+
+        let _ = cm.node_complete(1, "n1", 0, 9);
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.exit_code, Some(0));
+        assert_eq!(job.exit_signal, Some(9));
+        assert_eq!(job.derived_exit_code, Some(0));
+        assert_eq!(job.pending_reason, PendingReason::RaisedSignal);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_complete_sets_nonzero_exit_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("exit-job")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: ResourceSet {
+                cpus: 6,
+                memory_mb: 12000,
+                ..Default::default()
+            },
+        });
+
+        let _ = cm.node_complete(1, "n1", 42, 0);
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.exit_code, Some(42));
+        assert_eq!(job.exit_signal, Some(0));
+        assert_eq!(job.derived_exit_code, Some(42));
+        assert_eq!(job.pending_reason, PendingReason::NonZeroExitCode);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2979,7 +3070,7 @@ mod tests {
         cm.cancel_job(1, "testuser").unwrap();
         settle(&cm, 1, JobState::Cancelled);
 
-        let result = cm.node_complete(1, "n2", 0).unwrap();
+        let result = cm.node_complete(1, "n2", 0, 0).unwrap();
         assert_eq!(result, NodeCompleteResult::AlreadyTerminal);
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Cancelled);
     }

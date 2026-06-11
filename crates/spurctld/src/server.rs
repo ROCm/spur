@@ -526,10 +526,12 @@ impl SlurmController for ControllerService {
         // `Job::derived_completion`.
         let completion_result = if !req.reporting_node.is_empty() {
             validate_completion_report_state_for_rpc(state, req.exit_code)?;
-            Some(
-                self.cluster
-                    .node_complete(req.job_id, &req.reporting_node, req.exit_code),
-            )
+            Some(self.cluster.node_complete(
+                req.job_id,
+                &req.reporting_node,
+                req.exit_code,
+                req.signal,
+            ))
         } else {
             None
         };
@@ -1283,6 +1285,8 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
             })
             .unwrap_or_default(),
         exit_code: job.exit_code.unwrap_or(0),
+        exit_signal: job.exit_signal.unwrap_or(0),
+        derived_exit_code: job.derived_exit_code.unwrap_or(0),
         stdout_path: job.resolved_stdout(),
         stderr_path: job.resolved_stderr(),
         resources: job.allocated_resources.as_ref().map(allocations_to_proto),

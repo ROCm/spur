@@ -322,6 +322,7 @@ async fn report_completion(
                     job_id,
                     state,
                     exit_code,
+                    signal: 0,
                     message: format!("exit_code={}", exit_code),
                     drain_node: drain.is_some(),
                     drain_reason: drain.as_ref().map(|d| d.reason.clone()).unwrap_or_default(),

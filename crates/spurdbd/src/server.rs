@@ -174,6 +174,8 @@ impl SlurmAccounting for AccountingService {
                 work_dir: String::new(),
                 command: String::new(),
                 exit_code: r.exit_code,
+                exit_signal: 0,
+                derived_exit_code: 0,
                 stdout_path: String::new(),
                 stderr_path: String::new(),
                 resources: None,
