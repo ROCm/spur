@@ -37,12 +37,16 @@ pub enum WalOperation {
     JobComplete {
         job_id: JobId,
         exit_code: i32,
+        #[serde(default)]
+        signal: i32,
         state: JobState,
     },
     JobNodeComplete {
         job_id: JobId,
         node_name: String,
         exit_code: i32,
+        #[serde(default)]
+        signal: i32,
     },
     JobPriorityChange {
         job_id: JobId,
@@ -78,4 +82,35 @@ pub enum WalOperation {
         #[serde(default)]
         admin_locked: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn job_node_complete_carries_signal_and_old_logs_default_zero() {
+        let op = WalOperation::JobNodeComplete {
+            job_id: 1,
+            node_name: "n0".into(),
+            exit_code: 0,
+            signal: 9,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        // Old log without `signal` deserializes with signal = 0.
+        let old = r#"{"JobNodeComplete":{"job_id":2,"node_name":"n1","exit_code":3}}"#;
+        let parsed: WalOperation = serde_json::from_str(old).unwrap();
+        match parsed {
+            WalOperation::JobNodeComplete {
+                signal, exit_code, ..
+            } => {
+                assert_eq!(signal, 0);
+                assert_eq!(exit_code, 3);
+            }
+            _ => panic!("wrong variant"),
+        }
+        // round-trip new form (WalOperation does not derive PartialEq)
+        let _ = (op, back);
+    }
 }

@@ -349,6 +349,7 @@ impl ClusterManager {
         let resp = self.propose(WalOperation::JobComplete {
             job_id,
             exit_code: -1,
+            signal: 0,
             state: JobState::Deadline,
         })?;
         if let Some(f) = resp.job_finalized {
@@ -377,6 +378,7 @@ impl ClusterManager {
         let resp = self.propose(WalOperation::JobComplete {
             job_id,
             exit_code: -1,
+            signal: 0,
             state: JobState::Cancelled,
         })?;
         if let Some(f) = resp.job_finalized {
@@ -510,6 +512,7 @@ impl ClusterManager {
                 job_id,
                 node_name: node_name.to_string(),
                 exit_code,
+                signal: 0,
             })
             .map_err(|source| NodeCompleteError::RaftPropose { source })?;
 
@@ -552,6 +555,7 @@ impl ClusterManager {
         let resp = self.propose(WalOperation::JobComplete {
             job_id,
             exit_code,
+            signal: 0,
             state,
         })?;
         if let Some(f) = resp.job_finalized {
@@ -683,6 +687,7 @@ impl ClusterManager {
         self.propose(WalOperation::JobComplete {
             job_id,
             exit_code: -1,
+            signal: 0,
             state: JobState::Failed,
         })?;
 
@@ -1315,6 +1320,7 @@ impl ClusterManager {
             match self.propose(WalOperation::JobComplete {
                 job_id: id,
                 exit_code: -1,
+                signal: 0,
                 state: JobState::Cancelled,
             }) {
                 Ok(resp) => {
@@ -1771,6 +1777,7 @@ impl ClusterManager {
                 job_id,
                 node_name,
                 exit_code,
+                signal: _,
             } => {
                 let finalized = {
                     let Some(job) = jobs.get_mut(job_id) else {
@@ -1854,6 +1861,7 @@ impl ClusterManager {
             WalOperation::JobComplete {
                 job_id,
                 exit_code,
+                signal: _,
                 state,
             } => {
                 let freed_nodes;
@@ -2455,6 +2463,7 @@ mod tests {
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
             exit_code: 0,
+            signal: 0,
             state: JobState::Completed,
         });
 
@@ -2626,6 +2635,7 @@ mod tests {
             job_id: 1,
             node_name: "worker1".into(),
             exit_code: 0,
+            signal: 0,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -2665,6 +2675,7 @@ mod tests {
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
+            signal: 0,
         });
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Completing);
@@ -2676,6 +2687,7 @@ mod tests {
             job_id: 1,
             node_name: "n2".into(),
             exit_code: 0,
+            signal: 0,
         });
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
 
@@ -2683,6 +2695,7 @@ mod tests {
             job_id: 1,
             node_name: "n3".into(),
             exit_code: 42,
+            signal: 0,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -2723,6 +2736,7 @@ mod tests {
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
+            signal: 0,
         });
         assert!(r1.job_finalized.is_none());
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
@@ -2731,6 +2745,7 @@ mod tests {
             job_id: 1,
             node_name: "n2".into(),
             exit_code: 0,
+            signal: 0,
         });
         let f = r2.job_finalized.expect("last node should finalize");
         assert_eq!(f.job_id, 1);
@@ -2765,6 +2780,7 @@ mod tests {
         let resp = cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
             exit_code: 0,
+            signal: 0,
             state: JobState::Completed,
         });
         let f = resp.job_finalized.expect("JobComplete should finalize");
@@ -2799,6 +2815,7 @@ mod tests {
         let first = cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
             exit_code: 0,
+            signal: 0,
             state: JobState::Completed,
         });
         first
@@ -2811,6 +2828,7 @@ mod tests {
         let second = cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
             exit_code: -1,
+            signal: 0,
             state: JobState::Cancelled,
         });
         assert!(second.job_finalized.is_none());
@@ -2853,6 +2871,7 @@ mod tests {
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
+            signal: 0,
         });
 
         let result = cm.node_complete(1, "n2", 0).unwrap();
@@ -2890,6 +2909,7 @@ mod tests {
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
+            signal: 0,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -2917,6 +2937,7 @@ mod tests {
             job_id: 1,
             node_name: "n2".into(),
             exit_code: 0,
+            signal: 0,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -2952,6 +2973,7 @@ mod tests {
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
+            signal: 0,
         });
 
         cm.cancel_job(1, "testuser").unwrap();
@@ -3368,6 +3390,7 @@ mod tests {
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: id,
             exit_code: -1,
+            signal: 0,
             state: JobState::Timeout,
         });
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Timeout);
