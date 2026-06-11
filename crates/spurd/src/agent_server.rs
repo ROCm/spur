@@ -47,6 +47,7 @@ struct TrackedJob {
 struct CompletedJob {
     job_id: u32,
     exit_code: i32,
+    signal: i32,
     rootfs_mode: crate::container::RootfsMode,
     allocation: Option<AllocationResult>,
     cgroup: Option<std::path::PathBuf>,
@@ -155,11 +156,12 @@ impl AgentService {
 
                 for (job_id, tracked) in jobs.iter_mut() {
                     match tracked.job.try_wait() {
-                        Ok(Some(exit_code)) => {
-                            info!(job_id, exit_code, "job finished");
+                        Ok(Some((exit_code, signal))) => {
+                            info!(job_id, exit_code, signal, "job finished");
                             completed.push(CompletedJob {
                                 job_id: *job_id,
                                 exit_code,
+                                signal,
                                 rootfs_mode: tracked.rootfs_mode.clone(),
                                 allocation: tracked.allocation.take(),
                                 cgroup: tracked.job.take_cgroup(),
@@ -256,6 +258,7 @@ impl AgentService {
                         &controller_addr,
                         c.job_id,
                         c.exit_code,
+                        c.signal,
                         &local_hostname,
                         drain.as_ref(),
                     )
@@ -300,6 +303,7 @@ async fn report_completion(
     controller_addr: &str,
     job_id: u32,
     exit_code: i32,
+    signal: i32,
     reporting_node: &str,
     drain: Option<&DrainRequest>,
 ) {
@@ -322,7 +326,7 @@ async fn report_completion(
                     job_id,
                     state,
                     exit_code,
-                    signal: 0,
+                    signal,
                     message: format!("exit_code={}", exit_code),
                     drain_node: drain.is_some(),
                     drain_reason: drain.as_ref().map(|d| d.reason.clone()).unwrap_or_default(),
@@ -794,7 +798,8 @@ impl SlurmAgent for AgentService {
                         let drain = DrainRequest {
                             reason: drain_reason.clone(),
                         };
-                        report_completion(&controller, job_id, -1, &node_name, Some(&drain)).await;
+                        report_completion(&controller, job_id, -1, 0, &node_name, Some(&drain))
+                            .await;
                     });
                 }
 
