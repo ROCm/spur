@@ -1828,6 +1828,7 @@ impl ClusterManager {
                     }
 
                     if job.all_nodes_completed() {
+                        // Primary = batch node (allocated_nodes[0]). Empty string when none allocated; derived_completion then falls back to the worst completion.
                         let primary = job.allocated_nodes.first().cloned().unwrap_or_default();
                         let (final_state, final_exit, final_signal, derived) =
                             Job::derived_completion(&job.node_completions, &primary);
@@ -2926,7 +2927,7 @@ mod tests {
             },
         });
 
-        let _ = cm.node_complete(1, "n1", 0, 9);
+        cm.node_complete(1, "n1", 0, 9).unwrap();
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Failed);
         assert_eq!(job.exit_code, Some(0));
@@ -2961,7 +2962,7 @@ mod tests {
             },
         });
 
-        let _ = cm.node_complete(1, "n1", 42, 0);
+        cm.node_complete(1, "n1", 42, 0).unwrap();
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Failed);
         assert_eq!(job.exit_code, Some(42));
