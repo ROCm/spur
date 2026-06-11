@@ -1845,7 +1845,9 @@ impl ClusterManager {
                     }
 
                     if job.all_nodes_completed() {
-                        // Primary = batch node (allocated_nodes[0]). Empty string when none allocated; derived_completion then falls back to the worst completion.
+                        // Primary = batch node (allocated_nodes[0]); empty when
+                        // none allocated, where derived_completion falls back to
+                        // the worst completion.
                         let primary = job.allocated_nodes.first().cloned().unwrap_or_default();
                         let (final_state, final_exit, final_signal, _node_derived) =
                             Job::derived_completion(&job.node_completions, &primary);
