@@ -44,7 +44,6 @@ mod tests {
 
     #[test]
     fn t06_6_deadline_from_pending() {
-        reset_job_ids();
         let mut job = make_job("test");
         assert_transition_ok(&mut job, JobState::Deadline);
         assert!(job.state.is_terminal());
@@ -55,7 +54,6 @@ mod tests {
 
     #[test]
     fn t06_7_cannot_deadline_running() {
-        reset_job_ids();
         let mut job = make_job("test");
         assert_transition_ok(&mut job, JobState::Running);
         assert_transition_err(&mut job, JobState::Deadline);
@@ -65,7 +63,6 @@ mod tests {
 
     #[test]
     fn t06_8_cannot_deadline_completed() {
-        reset_job_ids();
         let mut job = make_job("test");
         assert_transition_ok(&mut job, JobState::Running);
         assert_transition_ok(&mut job, JobState::Completed);

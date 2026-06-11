@@ -2905,13 +2905,14 @@ mod tests {
         register_node(&cm, "worker1", 4, 8000);
 
         let job_id = submit_and_wait(&cm, basic_spec("running"));
-        let resources = ResourceSet {
-            cpus: 1,
-            memory_mb: 1000,
-            ..Default::default()
-        };
-        cm.start_job(job_id, vec!["worker1".into()], resources)
-            .unwrap();
+        let resources = scalar_alloc(1, 1000);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            resources.clone(),
+            per_node_for(&["worker1"], resources),
+        )
+        .unwrap();
         settle(&cm, job_id, JobState::Running);
 
         assert!(cm.deadline_job(job_id).is_err());
