@@ -455,6 +455,13 @@ pub struct Job {
     /// Per-node exit codes reported while the job is in Completing.
     #[serde(default)]
     pub node_completions: HashMap<String, i32>,
+
+    /// Wall-clock instant the job entered Suspended (None unless currently suspended).
+    #[serde(default)]
+    pub suspended_at: Option<DateTime<Utc>>,
+    /// Total seconds spent suspended across all suspend/resume cycles.
+    #[serde(default)]
+    pub suspended_secs: i64,
 }
 
 impl Job {
@@ -491,6 +498,8 @@ impl Job {
             het_job_id: None,
             het_group: None,
             node_completions: HashMap::new(),
+            suspended_at: None,
+            suspended_secs: 0,
         }
     }
 
@@ -515,7 +524,25 @@ impl Job {
     pub fn run_time(&self) -> Option<chrono::Duration> {
         let start = self.start_time?;
         let end = self.end_time.unwrap_or_else(Utc::now);
-        Some(end - start)
+        let mut suspended = self.suspended_secs;
+        if let Some(since) = self.suspended_at {
+            suspended += (end - since).num_seconds().max(0);
+        }
+        Some((end - start) - chrono::Duration::seconds(suspended))
+    }
+
+    /// Wall-clock deadline for time-limit enforcement, pushed out by time spent
+    /// suspended so a job regains its full budget after resume (Slurm parity).
+    pub fn effective_deadline(
+        &self,
+        start: DateTime<Utc>,
+        time_limit: chrono::Duration,
+    ) -> DateTime<Utc> {
+        let mut suspended = self.suspended_secs;
+        if let Some(since) = self.suspended_at {
+            suspended += (Utc::now() - since).num_seconds().max(0);
+        }
+        start + time_limit + chrono::Duration::seconds(suspended)
     }
 
     /// Resolve stdout path, substituting %j/%N patterns.
@@ -656,6 +683,35 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[test]
+    fn suspended_time_excluded_from_run_time() {
+        let mut job = make_job();
+        job.start_time = Some(Utc::now() - chrono::Duration::seconds(100));
+        job.end_time = Some(Utc::now());
+        job.suspended_secs = 30;
+        let rt = job.run_time().unwrap().num_seconds();
+        assert!((68..=72).contains(&rt), "expected ~70s, got {rt}");
+    }
+
+    #[test]
+    fn in_progress_suspension_excluded_from_run_time() {
+        let mut job = make_job();
+        job.start_time = Some(Utc::now() - chrono::Duration::seconds(100));
+        job.end_time = None;
+        job.suspended_at = Some(Utc::now() - chrono::Duration::seconds(40));
+        let rt = job.run_time().unwrap().num_seconds();
+        assert!((58..=62).contains(&rt), "expected ~60s, got {rt}");
+    }
+
+    #[test]
+    fn effective_deadline_extends_by_suspended_time() {
+        let mut job = make_job();
+        let start = Utc::now();
+        job.suspended_secs = 50;
+        let dl = job.effective_deadline(start, chrono::Duration::seconds(100));
+        assert_eq!((dl - start).num_seconds(), 150);
     }
 
     #[test]
