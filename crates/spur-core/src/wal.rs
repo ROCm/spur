@@ -61,6 +61,8 @@ pub enum WalOperation {
         wg_pubkey: String,
         #[serde(default)]
         version: String,
+        #[serde(default)]
+        labels: HashMap<String, String>,
     },
     NodeUpdate {
         name: String,
@@ -77,5 +79,10 @@ pub enum WalOperation {
         reason: Option<String>,
         #[serde(default)]
         admin_locked: bool,
+    },
+    NodeLabelsUpdate {
+        name: String,
+        set: HashMap<String, String>,
+        remove: Vec<String>,
     },
 }
