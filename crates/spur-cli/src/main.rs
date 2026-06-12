@@ -5,6 +5,7 @@ mod exec;
 mod format_engine;
 mod image;
 mod net;
+mod node;
 mod sacct;
 mod sacctmgr;
 mod salloc;
@@ -98,6 +99,7 @@ fn main() -> anyhow::Result<()> {
         "scrontab" => return runtime.block_on(scrontab::main()),
         "smd" => return runtime.block_on(smd::main()),
         "net" => return runtime.block_on(net::main()),
+        "node" => return runtime.block_on(node::main()),
         "image" => return runtime.block_on(image::main()),
         "exec" => return runtime.block_on(exec::main()),
         _ => {}
@@ -136,7 +138,7 @@ fn main() -> anyhow::Result<()> {
         "sbatch" | "srun" | "squeue" | "scancel" | "sinfo" | "sacct" | "sacctmgr" | "scontrol"
         | "sprio" | "sshare" | "sstat" | "sdiag" | "sreport" | "strigger" | "sattach"
         | "scrontab" | "smd" => Some(args[1].as_str()),
-        "net" | "image" | "exec" => Some(args[1].as_str()),
+        "net" | "node" | "image" | "exec" => Some(args[1].as_str()),
         _ => None,
     };
 
@@ -185,6 +187,7 @@ fn main() -> anyhow::Result<()> {
             }
             "smd" | "health" | "monitor" => runtime.block_on(smd::main_with_args(rewritten)),
             "net" => runtime.block_on(net::main_with_args(rewritten)),
+            "node" => runtime.block_on(node::main_with_args(rewritten)),
             "image" => runtime.block_on(image::main_with_args(rewritten)),
             "exec" => runtime.block_on(exec::main_with_args(rewritten)),
             _ => unreachable!(),
