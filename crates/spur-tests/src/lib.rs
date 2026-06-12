@@ -53,3 +53,4 @@ pub mod t55_format;
 pub mod t56_deps;
 pub mod t57_auth;
 pub mod t58_spank;
+pub mod t60_suspend;
