@@ -116,10 +116,8 @@ mod tests {
     }
 
     // ── T60.10: Cannot resume (reach Running from) a terminal job (B7)
-    //
-    // Note: resume-of-pending (B6) is guarded at the cluster method layer
-    // (resume_job checks state == Suspended), since Pending->Running is itself
-    // a valid *start* transition. See cluster.rs resume_*_rejects_* tests.
+    // resume-of-pending (B6) is guarded at the cluster method layer instead,
+    // since Pending->Running is itself a valid start transition.
 
     #[test]
     fn t60_10_cannot_resume_terminal() {
@@ -127,7 +125,6 @@ mod tests {
             let mut job = make_job("test");
             assert_transition_ok(&mut job, JobState::Running);
             assert_transition_ok(&mut job, terminal);
-            // Resume == reach Running; a terminal job must not return to Running.
             assert_transition_err(&mut job, JobState::Running);
         }
     }
@@ -146,17 +143,13 @@ mod tests {
 
     #[test]
     fn t60_12_cancel_while_suspended_folds_open_window() {
-        // A job suspended-but-never-resumed, then cancelled, must still account
-        // run_time correctly: the open suspension window (suspended_at .. end)
-        // is excluded even though suspended_secs was never accumulated.
+        // Open suspension window (suspended_at..end) is excluded even when
+        // suspended_secs was never accumulated (never resumed).
         let mut job = make_job("test");
         let start = chrono::Utc::now() - chrono::Duration::seconds(100);
         job.start_time = Some(start);
-        // Ran 60s, then suspended at start+60, never resumed.
         job.suspended_at = Some(start + chrono::Duration::seconds(60));
-        // Cancel "now" (== start+100): end_time set by transition.
         job.end_time = Some(start + chrono::Duration::seconds(100));
-        // run_time = 100s span - 40s open suspension = 60s.
         let rt = job.run_time().unwrap().num_seconds();
         assert_eq!(rt, 60, "expected 60s effective run time, got {rt}");
     }
