@@ -10,7 +10,8 @@ use tracing::{debug, error, info, warn};
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
-    AgentCancelJobRequest, JobSpec as ProtoJobSpec, LaunchJobRequest, SubmitJobRequest,
+    AgentCancelJobRequest, AgentSuspendJobRequest, JobSpec as ProtoJobSpec, LaunchJobRequest,
+    SubmitJobRequest,
 };
 use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::traits::{ClusterState, Scheduler};
@@ -976,6 +977,45 @@ pub async fn send_cancel_to_agents(
                         error = %e,
                         "failed to connect to agent for cancel"
                     );
+                }
+            }
+        });
+    }
+}
+
+/// Dispatch suspend (SIGSTOP) or resume (SIGCONT) to every allocated node.
+pub async fn send_suspend_to_agents(
+    cluster: &Arc<ClusterManager>,
+    job: &spur_core::job::Job,
+    resume: bool,
+) {
+    for node_name in &job.allocated_nodes {
+        let node_info = cluster.get_node(node_name);
+        let (addr, port) = match node_info {
+            Some(ref n) if n.address.is_some() => (n.address.clone().unwrap(), n.port),
+            _ => {
+                warn!(job_id = job.job_id, node = %node_name,
+                    "no agent address — cannot suspend/resume job on node");
+                continue;
+            }
+        };
+        let agent_addr = format!("http://{}:{}", addr, port);
+        let job_id = job.job_id;
+        tokio::spawn(async move {
+            match SlurmAgentClient::connect(agent_addr.clone()).await {
+                Ok(mut client) => {
+                    if let Err(e) = client
+                        .suspend_job(AgentSuspendJobRequest { job_id, resume })
+                        .await
+                    {
+                        warn!(job_id, resume, agent = %agent_addr, error = %e, "SuspendJob RPC failed");
+                    } else {
+                        info!(job_id, resume, agent = %agent_addr, "sent SuspendJob");
+                    }
+                }
+                Err(e) => {
+                    warn!(job_id, agent = %agent_addr, error = %e,
+                        "failed to connect to agent for suspend/resume");
                 }
             }
         });
