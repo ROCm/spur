@@ -724,7 +724,7 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
             let (Some(time_limit), Some(start_time)) = (job.spec.time_limit, job.start_time) else {
                 continue;
             };
-            let deadline = start_time + time_limit;
+            let deadline = job.effective_deadline(start_time, time_limit);
             if now < deadline {
                 continue;
             }
