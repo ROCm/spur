@@ -311,7 +311,8 @@ impl SlurmController for ControllerService {
         self.cluster
             .resume_job(job_id, &req.user)
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
-        // Re-snapshot AFTER the state flip so allocated_nodes reflect the resumed job.
+        // Allocation is retained across resume, so allocated_nodes is unchanged;
+        // snapshot timing is not significant here.
         if let Some(job) = self.cluster.get_job(job_id) {
             let cluster = self.cluster.clone();
             tokio::spawn(async move {
