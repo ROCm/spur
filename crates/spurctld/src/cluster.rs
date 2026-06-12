@@ -387,6 +387,44 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Suspend a running job: validate state, record through Raft. Allocation is retained.
+    pub fn suspend_job(&self, job_id: JobId, _user: &str) -> anyhow::Result<()> {
+        {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            if job.state != JobState::Running {
+                anyhow::bail!("job {} is not running (state {:?})", job_id, job.state);
+            }
+        }
+        self.propose(WalOperation::JobSuspend {
+            job_id,
+            at: chrono::Utc::now(),
+        })?;
+        info!(job_id, "job suspended");
+        Ok(())
+    }
+
+    /// Resume a suspended job: validate state, record through Raft, fold suspended time.
+    pub fn resume_job(&self, job_id: JobId, _user: &str) -> anyhow::Result<()> {
+        {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            if job.state != JobState::Suspended {
+                anyhow::bail!("job {} is not suspended (state {:?})", job_id, job.state);
+            }
+        }
+        self.propose(WalOperation::JobResume {
+            job_id,
+            at: chrono::Utc::now(),
+        })?;
+        info!(job_id, "job resumed");
+        Ok(())
+    }
+
     /// Start a job on specific nodes.
     pub fn start_job(
         &self,
@@ -1722,6 +1760,25 @@ impl ClusterManager {
                     }
                 }
             }
+            WalOperation::JobSuspend { job_id, at } => {
+                if let Some(job) = jobs.get_mut(job_id) {
+                    if let Err(e) = job.transition(JobState::Suspended) {
+                        warn!(job_id = *job_id, error = %e, "invalid suspend transition in WAL apply");
+                    } else {
+                        job.suspended_at = Some(*at);
+                    }
+                }
+            }
+            WalOperation::JobResume { job_id, at } => {
+                if let Some(job) = jobs.get_mut(job_id) {
+                    if let Some(since) = job.suspended_at.take() {
+                        job.suspended_secs += (*at - since).num_seconds().max(0);
+                    }
+                    if let Err(e) = job.transition(JobState::Running) {
+                        warn!(job_id = *job_id, error = %e, "invalid resume transition in WAL apply");
+                    }
+                }
+            }
             WalOperation::JobStart {
                 job_id,
                 nodes: node_names,
@@ -2466,6 +2523,33 @@ mod tests {
         let node = cm.get_node("node1").unwrap();
         assert_eq!(node.alloc_resources.cpus, 0);
         assert_eq!(node.alloc_resources.memory_mb, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_suspend_then_resume_accumulates_suspended_secs() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("s")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        let t0 = chrono::Utc::now();
+        cm.apply_operation(&WalOperation::JobSuspend { job_id: 1, at: t0 });
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Suspended);
+        cm.apply_operation(&WalOperation::JobResume {
+            job_id: 1,
+            at: t0 + chrono::Duration::seconds(25),
+        });
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert_eq!(job.suspended_secs, 25);
+        assert!(job.suspended_at.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
