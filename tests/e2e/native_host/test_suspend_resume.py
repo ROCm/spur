@@ -74,7 +74,7 @@ def _job_sleep_pids_cmd(sleep_secs):
     return (
         "for p in $(pgrep -x sleep); do "
         f"tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null "
-        f"| grep -q 'sleep {sleep_secs} ' && echo $p; done"
+        f"| grep -qE 'sleep {sleep_secs}( |$)' && echo $p; done"
     )
 
 
@@ -85,6 +85,33 @@ def _sleep_states(node, sleep_secs):
         "awk '{print $3}' /proc/$p/stat 2>/dev/null; done"
     )
     return out.split()
+
+
+def _wait_sleep_states(node, sleep_secs, timeout=15):
+    """Poll until the job's sleep process appears, then return its state chars.
+
+    The agent may spawn the sleep child a moment after the job flips to RUNNING,
+    so callers must wait rather than assume it is already up."""
+    deadline = time.time() + timeout
+    states = []
+    while time.time() < deadline:
+        states = _sleep_states(node, sleep_secs)
+        if states:
+            return states
+        time.sleep(1)
+    return states
+
+
+def _wait_sleep_all(node, sleep_secs, pred, timeout=10):
+    """Poll until the job's sleep procs exist and all satisfy `pred` (a state
+    char -> bool). Signal delivery + scheduler state change is not instant."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        states = _sleep_states(node, sleep_secs)
+        if states and all(pred(s) for s in states):
+            return True
+        time.sleep(1)
+    return False
 
 
 class TestSuspendResumeBasics:
@@ -133,22 +160,19 @@ class TestSuspendProcessSemantics:
         try:
             job_id = _submit_sleep(cluster, "sr-tree", sleep_secs=secs)
             node = cluster.nodes[0]
-            assert _sleep_states(node, secs), "no sleep process found for this job"
+            assert _wait_sleep_states(node, secs), "no sleep process found for this job"
 
             cluster.scontrol("suspend", str(job_id))
             assert _wait_state(cluster, job_id, "S")
-            time.sleep(1)
-            states = _sleep_states(node, secs)
-            assert states and all(s.startswith("T") for s in states), (
-                f"expected this job's sleep stopped (T), got {states}"
+            assert _wait_sleep_all(node, secs, lambda s: s.startswith("T")), (
+                f"expected this job's sleep stopped (T), got {_sleep_states(node, secs)}"
             )
 
             cluster.scontrol("resume", str(job_id))
             assert _wait_state(cluster, job_id, "R")
-            time.sleep(1)
-            states = _sleep_states(node, secs)
-            assert states and all(not s.startswith("T") for s in states), (
-                f"expected this job's sleep running after resume, got {states}"
+            assert _wait_sleep_all(node, secs, lambda s: not s.startswith("T")), (
+                f"expected this job's sleep running after resume, "
+                f"got {_sleep_states(node, secs)}"
             )
         finally:
             _cleanup(cluster, job_id)
@@ -304,6 +328,8 @@ class TestSuspendMultiNode:
             show = cluster.scontrol("show", "job", str(job_id))
             assert f"NumNodes={n_nodes}" in show, f"expected {n_nodes}-node alloc:\n{show}"
 
+            assert _wait_sleep_states(cluster.nodes[0], secs), "no sleep process found"
+
             cluster.scontrol("suspend", str(job_id))
             assert _wait_state(cluster, job_id, "S")
             time.sleep(2)
@@ -321,9 +347,9 @@ class TestSuspendMultiNode:
                 f"got {dispatched}"
             )
 
-            states = _sleep_states(cluster.nodes[0], secs)
-            assert states and all(s.startswith("T") for s in states), (
-                f"primary node: expected stopped sleep, got {states}"
+            assert _wait_sleep_all(cluster.nodes[0], secs, lambda s: s.startswith("T")), (
+                f"primary node: expected stopped sleep, "
+                f"got {_sleep_states(cluster.nodes[0], secs)}"
             )
         finally:
             _cleanup(cluster, job_id)
