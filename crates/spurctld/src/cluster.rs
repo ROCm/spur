@@ -2271,7 +2271,7 @@ pub(crate) fn partition_matches_node(
         true
     } else {
         spur_core::hostlist::expand(&partition.nodes)
-            .map(|hosts| hosts.contains(&node_name.to_string()))
+            .map(|hosts| hosts.iter().any(|h| h == node_name))
             .unwrap_or(false)
     };
 
@@ -2291,7 +2291,7 @@ pub(crate) fn node_config_matches(
         true
     } else {
         spur_core::hostlist::expand(&nc.names)
-            .map(|hosts| hosts.contains(&node_name.to_string()))
+            .map(|hosts| hosts.iter().any(|h| h == node_name))
             .unwrap_or(false)
     };
 

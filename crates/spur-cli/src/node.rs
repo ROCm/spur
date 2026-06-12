@@ -60,16 +60,16 @@ fn parse_label_args(label_args: &[String]) -> Result<(HashMap<String, String>, V
     let mut remove_labels: Vec<String> = Vec::new();
 
     for arg in label_args {
-        if let Some(key) = arg.strip_suffix('-') {
-            if key.is_empty() {
-                bail!("invalid label removal: '{arg}'");
-            }
-            remove_labels.push(key.to_string());
-        } else if let Some((k, v)) = arg.split_once('=') {
+        if let Some((k, v)) = arg.split_once('=') {
             if k.is_empty() {
                 bail!("invalid label: '{arg}', key cannot be empty");
             }
             set_labels.insert(k.to_string(), v.to_string());
+        } else if let Some(key) = arg.strip_suffix('-') {
+            if key.is_empty() {
+                bail!("invalid label removal: '{arg}'");
+            }
+            remove_labels.push(key.to_string());
         } else {
             bail!("invalid label format: '{arg}', expected key=value or key-");
         }
@@ -147,5 +147,13 @@ mod tests {
     fn test_parse_label_invalid_format() {
         let args = vec!["noequalsnodash".to_string()];
         assert!(parse_label_args(&args).is_err());
+    }
+
+    #[test]
+    fn test_parse_label_value_ending_in_dash() {
+        let args = vec!["env=prod-".to_string()];
+        let (set, remove) = parse_label_args(&args).unwrap();
+        assert_eq!(set.get("env").unwrap(), "prod-");
+        assert!(remove.is_empty());
     }
 }
