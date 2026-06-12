@@ -52,6 +52,16 @@ pub enum ScontrolCommand {
         /// Job ID
         job_id: u32,
     },
+    /// Suspend a running job (SIGSTOP, retains allocation)
+    Suspend {
+        /// Job ID
+        job_id: u32,
+    },
+    /// Resume a suspended job (SIGCONT)
+    Resume {
+        /// Job ID
+        job_id: u32,
+    },
     /// Create a reservation
     #[command(name = "create-reservation")]
     CreateReservation {
@@ -166,6 +176,34 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 .await
                 .context("requeue failed")?;
             println!("job {} requeued (cancelled for resubmission)", job_id);
+            Ok(())
+        }
+        ScontrolCommand::Suspend { job_id } => {
+            let mut client = SlurmControllerClient::connect(args.controller.to_string())
+                .await
+                .context("failed to connect to spurctld")?;
+            client
+                .suspend_job(spur_proto::proto::SuspendJobRequest {
+                    job_id,
+                    user: String::new(),
+                })
+                .await
+                .context("suspend failed")?;
+            println!("job {} suspended", job_id);
+            Ok(())
+        }
+        ScontrolCommand::Resume { job_id } => {
+            let mut client = SlurmControllerClient::connect(args.controller.to_string())
+                .await
+                .context("failed to connect to spurctld")?;
+            client
+                .resume_job(spur_proto::proto::ResumeJobRequest {
+                    job_id,
+                    user: String::new(),
+                })
+                .await
+                .context("resume failed")?;
+            println!("job {} resumed", job_id);
             Ok(())
         }
         ScontrolCommand::Update { params } => parse_and_update(&args.controller, &params).await,
