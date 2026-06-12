@@ -1,0 +1,27 @@
+apiVersion: v2
+name: spur
+description: |
+  Spur — AI-native job scheduler. Drop-in Slurm-compatible scheduler
+  with always-on Raft, GPU-first scheduling, and a Kubernetes operator
+  that reconciles SpurJob CRs into pods.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.25.0-0"
+home: https://github.com/ROCm/spur
+sources:
+  - https://github.com/ROCm/spur
+maintainers:
+  - name: ROCm/spur maintainers
+    url: https://github.com/ROCm/spur
+keywords:
+  - hpc
+  - slurm
+  - scheduler
+  - gpu
+  - rocm
+  - ai
+icon: https://raw.githubusercontent.com/ROCm/spur/main/docs/_static/logo.png
+annotations:
+  artifacthub.io/category: skip-prediction
+  artifacthub.io/containsSecurityUpdates: "false"
