@@ -154,6 +154,9 @@ impl RunningJob {
 
     /// Send a signal to the running process.
     ///
+    /// Managed jobs are spawned as their own process-group leader, so we signal
+    /// the whole group (negative pid) to reach the batch shell and its children
+    /// (e.g. an inner `sleep`), not just the tracked process.
     /// For container (Forked) jobs, signals the entire process subtree
     /// since the tracked PID is the intermediate parent and the actual
     /// workload runs as a grandchild inside a PID namespace.
@@ -161,7 +164,8 @@ impl RunningJob {
         match self {
             RunningJob::Managed { child, .. } => {
                 if let Some(pid) = child.id() {
-                    signal::kill(Pid::from_raw(pid as i32), sig)?;
+                    // Negative pid targets the process group led by the batch process.
+                    signal::kill(Pid::from_raw(-(pid as i32)), sig)?;
                 }
                 Ok(())
             }
@@ -420,7 +424,10 @@ async fn spawn_job_process(
         .envs(&env)
         .stdout(stdout_file.into_std().await)
         .stderr(stderr_file.into_std().await)
-        .stdin(Stdio::null());
+        .stdin(Stdio::null())
+        // Run the batch process in its own process group (pgid == its pid) so
+        // signals can target the whole job tree without touching spurd's group.
+        .process_group(0);
 
     // Reset signal dispositions to default before exec. spurd is launched in the
     // background (SIGINT/SIGQUIT/SIGHUP set to SIG_IGN), and a child inherits that

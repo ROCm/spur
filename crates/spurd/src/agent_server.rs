@@ -1481,8 +1481,11 @@ impl AgentService {
 #[cfg(test)]
 impl TrackedJob {
     fn dummy(_pid: u32) -> Self {
+        // Spawn in its own process group, matching how real managed jobs are
+        // launched, so group-targeted signals (kill_signal) land correctly.
         let child = tokio::process::Command::new("sleep")
             .arg("3600")
+            .process_group(0)
             .spawn()
             .expect("failed to spawn dummy process");
         Self {
@@ -1837,6 +1840,9 @@ mod tests {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            // Match how real managed jobs spawn (own process group) so
+            // group-targeted signals land.
+            .process_group(0)
             .spawn()
             .expect("failed to spawn SIGTERM-trapping process");
         let tracked = TrackedJob {
