@@ -850,6 +850,15 @@ impl SlurmAgent for AgentService {
         Ok(Response::new(()))
     }
 
+    async fn suspend_job(
+        &self,
+        request: Request<AgentSuspendJobRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        self.suspend_signal(req.job_id, req.resume).await;
+        Ok(Response::new(()))
+    }
+
     async fn get_node_resources(
         &self,
         _request: Request<()>,
@@ -1414,6 +1423,21 @@ impl AgentService {
         let _ = tracked.job.kill_signal(sig);
     }
 
+    /// Freeze (SIGSTOP) or thaw (SIGCONT) a running job's process(es).
+    async fn suspend_signal(&self, job_id: u32, resume: bool) {
+        let jobs = self.running.lock().await;
+        let Some(tracked) = jobs.get(&job_id) else {
+            return;
+        };
+        let sig = if resume {
+            nix::sys::signal::Signal::SIGCONT
+        } else {
+            nix::sys::signal::Signal::SIGSTOP
+        };
+        info!(job_id, resume, "sending suspend/resume signal to job");
+        let _ = tracked.job.kill_signal(sig);
+    }
+
     /// SIGTERM now, escalate to SIGKILL after a 5-second grace period.
     async fn graceful_cancel(&self, job_id: u32) {
         {
@@ -1843,6 +1867,51 @@ mod tests {
             wait_job_reaped(&svc, job_id, 10_000).await,
             "monitor should reap job after SIGKILL escalation"
         );
+    }
+
+    #[cfg(test)]
+    fn proc_state(pid: i32) -> char {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let after = stat.rsplit(')').next().unwrap();
+        after
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .chars()
+            .next()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn suspend_then_resume_toggles_process_state() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+        );
+        svc.start_monitor("http://127.0.0.1:1".into());
+
+        let job_id = 903;
+        let tracked = TrackedJob::dummy(0);
+        let pid = tracked.job.pid().expect("dummy child should have a pid") as i32;
+        svc.insert_test_job(job_id, tracked).await;
+
+        svc.suspend_signal(job_id, false).await; // SIGSTOP
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            proc_state(pid),
+            'T',
+            "process should be stopped after SIGSTOP"
+        );
+
+        svc.suspend_signal(job_id, true).await; // SIGCONT
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            matches!(proc_state(pid), 'R' | 'S'),
+            "process should run after SIGCONT"
+        );
+
+        svc.send_explicit_signal(job_id, 9).await; // cleanup
     }
 
     #[tokio::test]
