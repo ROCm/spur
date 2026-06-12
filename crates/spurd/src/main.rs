@@ -9,6 +9,7 @@ pub mod pmi;
 mod reporter;
 mod seccomp;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -20,6 +21,15 @@ use spur_devices::cdi::cache::CdiCache;
 use spur_devices::DeviceRegistry;
 
 use reporter::NodeReporter;
+
+/// Parse a "key=value" string into a validated label.
+fn parse_label(s: &str) -> Result<String, String> {
+    if s.contains('=') && s.split('=').next().map_or(false, |k| !k.is_empty()) {
+        Ok(s.to_string())
+    } else {
+        Err(format!("invalid label format '{s}', expected key=value"))
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "spurd", about = "Spur node agent daemon")]
@@ -48,6 +58,11 @@ struct Args {
     /// If not set, auto-detected from WireGuard interface or hostname resolution.
     #[arg(long, env = "SPUR_NODE_ADDRESS")]
     address: Option<String>,
+
+    /// Node labels for partition routing (key=value pairs).
+    /// Can be specified multiple times: --label pool=gpu --label rack=a
+    #[arg(long = "label", value_parser = parse_label, env = "SPUR_NODE_LABELS", value_delimiter = ',')]
+    labels: Vec<String>,
 
     /// Foreground mode
     #[arg(short = 'D', long)]
@@ -155,12 +170,23 @@ async fn main() -> anyhow::Result<()> {
         "resources discovered"
     );
 
+    // Parse node labels from CLI/env
+    let labels: HashMap<String, String> = args
+        .labels
+        .iter()
+        .filter_map(|s| {
+            let (k, v) = s.split_once('=')?;
+            Some((k.to_string(), v.to_string()))
+        })
+        .collect();
+
     // Create the node reporter
     let reporter = Arc::new(NodeReporter::new(
         hostname.clone(),
         args.controller.clone(),
         resources,
         node_address,
+        labels,
     ));
 
     // Register with controller

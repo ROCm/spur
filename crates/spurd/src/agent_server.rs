@@ -1511,6 +1511,7 @@ mod tests {
                 port: 6818,
                 source: spur_net::AddressSource::Static,
             },
+            std::collections::HashMap::new(),
         ))
     }
 
