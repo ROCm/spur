@@ -199,7 +199,7 @@ message NodeInfo {
   string name = 1;
   NodeState state = 2;
   string state_reason = 3;
-  string partition = 4;
+  repeated string partitions = 4;
 
   ResourceSet total_resources = 10;
   ResourceAllocations alloc_resources = 11;

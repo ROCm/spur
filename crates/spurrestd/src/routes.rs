@@ -422,7 +422,7 @@ fn node_info_to_json(n: &spur_proto::proto::NodeInfo) -> serde_json::Value {
         "name": n.name,
         "state": node_state_name(n.state),
         "reason": n.state_reason,
-        "partitions": [n.partition],
+        "partitions": n.partitions,
         "cpus": n.total_resources.as_ref().map(|r| r.cpus).unwrap_or(0),
         "alloc_cpus": n.alloc_resources.as_ref().map(|r| r.cpus).unwrap_or(0),
         "real_memory": n.total_resources.as_ref().map(|r| r.memory_mb).unwrap_or(0),

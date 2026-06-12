@@ -126,14 +126,25 @@ fn render_sinfo_output(
 
     if node_oriented {
         for node in nodes {
-            let row = format_engine::format_row(fields, &|spec| {
-                resolve_node_field(node, partitions, spec)
-            });
-            lines.push(row);
+            let no_partition = String::new();
+            let parts: &[String] = if node.partitions.is_empty() {
+                std::slice::from_ref(&no_partition)
+            } else {
+                &node.partitions
+            };
+            for part_name in parts {
+                let row = format_engine::format_row(fields, &|spec| {
+                    resolve_node_field(node, part_name, partitions, spec)
+                });
+                lines.push(row);
+            }
         }
     } else {
         for part in partitions {
-            let part_nodes: Vec<_> = nodes.iter().filter(|n| n.partition == part.name).collect();
+            let part_nodes: Vec<_> = nodes
+                .iter()
+                .filter(|n| n.partitions.contains(&part.name))
+                .collect();
             let state_groups = group_nodes_by_display_state(&part_nodes);
 
             if state_groups.is_empty() {
@@ -157,12 +168,13 @@ fn render_sinfo_output(
 
 fn resolve_node_field(
     node: &spur_proto::proto::NodeInfo,
+    partition_name: &str,
     _partitions: &[spur_proto::proto::PartitionInfo],
     spec: char,
 ) -> String {
     match spec {
         'N' | 'n' => node.name.clone(),
-        'P' | 'R' => node.partition.clone(),
+        'P' | 'R' => partition_name.to_string(),
         't' | 'T' => effective_state_str(node),
         'c' => {
             if let Some(ref r) = node.total_resources {
@@ -292,7 +304,7 @@ mod tests {
         NodeInfo {
             name: name.into(),
             state: state as i32,
-            partition: partition.into(),
+            partitions: vec![partition.into()],
             ..Default::default()
         }
     }

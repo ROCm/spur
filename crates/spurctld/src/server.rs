@@ -1304,7 +1304,7 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         name: node.name.clone(),
         state: node.state.to_proto_i32(),
         state_reason: node.state_reason.clone().unwrap_or_default(),
-        partition: node.partitions.first().cloned().unwrap_or_default(),
+        partitions: node.partitions.clone(),
         total_resources: Some(resource_to_proto(&node.total_resources)),
         alloc_resources: Some(allocations_to_proto(&node.alloc_resources)),
         arch: node.arch.clone(),

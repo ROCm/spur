@@ -296,6 +296,9 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                     node_state_name(node.state),
                     node.state_reason
                 );
+                if !node.partitions.is_empty() {
+                    println!("   Partitions={}", node.partitions.join(","));
+                }
                 println!(
                     "   CPUTot={} CPUAlloc={} RealMemory={} FreeMem={}",
                     total.map(|r| r.cpus).unwrap_or(0),
