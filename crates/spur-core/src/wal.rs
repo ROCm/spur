@@ -104,11 +104,29 @@ mod suspend_wal_tests {
             let json = serde_json::to_string(&op).unwrap();
             let back: WalOperation = serde_json::from_str(&json).unwrap();
             match (op, back) {
-                (WalOperation::JobSuspend { job_id: a, at: at_a }, WalOperation::JobSuspend { job_id: b, at: at_b }) => {
+                (
+                    WalOperation::JobSuspend {
+                        job_id: a,
+                        at: at_a,
+                    },
+                    WalOperation::JobSuspend {
+                        job_id: b,
+                        at: at_b,
+                    },
+                ) => {
                     assert_eq!(a, b);
                     assert_eq!(at_a, at_b);
                 }
-                (WalOperation::JobResume { job_id: a, at: at_a }, WalOperation::JobResume { job_id: b, at: at_b }) => {
+                (
+                    WalOperation::JobResume {
+                        job_id: a,
+                        at: at_a,
+                    },
+                    WalOperation::JobResume {
+                        job_id: b,
+                        at: at_b,
+                    },
+                ) => {
                     assert_eq!(a, b);
                     assert_eq!(at_a, at_b);
                 }

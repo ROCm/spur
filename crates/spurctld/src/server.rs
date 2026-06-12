@@ -288,10 +288,7 @@ impl SlurmController for ControllerService {
         Ok(Response::new(()))
     }
 
-    async fn resume_job(
-        &self,
-        request: Request<ResumeJobRequest>,
-    ) -> Result<Response<()>, Status> {
+    async fn resume_job(&self, request: Request<ResumeJobRequest>) -> Result<Response<()>, Status> {
         if let Err(status) = self.check_leader(&request) {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
