@@ -254,6 +254,8 @@ service SlurmController {
   rpc GetJobs(GetJobsRequest) returns (GetJobsResponse);
   rpc GetJob(GetJobRequest) returns (JobInfo);
   rpc CancelJob(CancelJobRequest) returns (google.protobuf.Empty);
+  rpc SuspendJob(SuspendJobRequest) returns (google.protobuf.Empty);
+  rpc ResumeJob(ResumeJobRequest) returns (google.protobuf.Empty);
   rpc UpdateJob(UpdateJobRequest) returns (google.protobuf.Empty);
 
   // Node management
@@ -298,6 +300,7 @@ service SlurmController {
 service SlurmAgent {
   rpc LaunchJob(LaunchJobRequest) returns (LaunchJobResponse);
   rpc CancelJob(AgentCancelJobRequest) returns (google.protobuf.Empty);
+  rpc SuspendJob(AgentSuspendJobRequest) returns (google.protobuf.Empty);
   rpc GetNodeResources(google.protobuf.Empty) returns (NodeResourcesResponse);
   rpc ExecInJob(ExecInJobRequest) returns (ExecInJobResponse);
   // Run a one-shot command on this node (for srun-in-salloc step dispatch, #146)
@@ -368,6 +371,16 @@ message CancelJobRequest {
   uint32 job_id = 1;
   int32 signal = 2;  // 0 = cancel, else signal number
   string user = 3;   // For authorization
+}
+
+message SuspendJobRequest {
+  uint32 job_id = 1;
+  string user = 2;   // Advisory (parity/forward-compat), not enforced.
+}
+
+message ResumeJobRequest {
+  uint32 job_id = 1;
+  string user = 2;
 }
 
 message UpdateJobRequest {
@@ -468,6 +481,11 @@ message LaunchJobResponse {
 message AgentCancelJobRequest {
   uint32 job_id = 1;
   int32 signal = 2;
+}
+
+message AgentSuspendJobRequest {
+  uint32 job_id = 1;
+  bool resume = 2;   // false = SIGSTOP (suspend), true = SIGCONT (resume)
 }
 
 message NodeResourcesResponse {

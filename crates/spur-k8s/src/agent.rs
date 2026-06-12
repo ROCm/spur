@@ -504,6 +504,21 @@ impl SlurmAgent for VirtualAgent {
         Ok(Response::new(()))
     }
 
+    async fn suspend_job(
+        &self,
+        request: Request<AgentSuspendJobRequest>,
+    ) -> Result<Response<()>, Status> {
+        // Pod-level SIGSTOP/SIGCONT is not modeled for the k8s backend; the
+        // controller-side state change still applies. Accept as a no-op.
+        let req = request.into_inner();
+        debug!(
+            job_id = req.job_id,
+            resume = req.resume,
+            "k8s backend: suspend/resume is a no-op"
+        );
+        Ok(Response::new(()))
+    }
+
     async fn get_node_resources(
         &self,
         _request: Request<()>,

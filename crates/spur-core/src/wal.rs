@@ -49,6 +49,16 @@ pub enum WalOperation {
         old_priority: u32,
         new_priority: u32,
     },
+    JobSuspend {
+        job_id: JobId,
+        /// Controller-stamped instant of suspension (for replay-deterministic accounting).
+        at: chrono::DateTime<chrono::Utc>,
+    },
+    JobResume {
+        job_id: JobId,
+        /// Controller-stamped instant of resume.
+        at: chrono::DateTime<chrono::Utc>,
+    },
 
     // Node operations
     NodeRegister {
@@ -78,4 +88,50 @@ pub enum WalOperation {
         #[serde(default)]
         admin_locked: bool,
     },
+}
+
+#[cfg(test)]
+mod suspend_wal_tests {
+    use super::*;
+
+    #[test]
+    fn suspend_resume_ops_round_trip() {
+        let at = chrono::Utc::now();
+        for op in [
+            WalOperation::JobSuspend { job_id: 7, at },
+            WalOperation::JobResume { job_id: 7, at },
+        ] {
+            let json = serde_json::to_string(&op).unwrap();
+            let back: WalOperation = serde_json::from_str(&json).unwrap();
+            match (op, back) {
+                (
+                    WalOperation::JobSuspend {
+                        job_id: a,
+                        at: at_a,
+                    },
+                    WalOperation::JobSuspend {
+                        job_id: b,
+                        at: at_b,
+                    },
+                ) => {
+                    assert_eq!(a, b);
+                    assert_eq!(at_a, at_b);
+                }
+                (
+                    WalOperation::JobResume {
+                        job_id: a,
+                        at: at_a,
+                    },
+                    WalOperation::JobResume {
+                        job_id: b,
+                        at: at_b,
+                    },
+                ) => {
+                    assert_eq!(a, b);
+                    assert_eq!(at_a, at_b);
+                }
+                _ => panic!("variant mismatch after round-trip"),
+            }
+        }
+    }
 }

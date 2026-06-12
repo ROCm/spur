@@ -169,11 +169,13 @@ fn state_name(state: i32) -> String {
         .unwrap_or_else(|| "UNKNOWN".into())
 }
 
-/// Default `squeue` states when `-t` is omitted: PD, R, CG (Slurm parity).
+/// Default `squeue` states when `-t` is omitted: PD, R, S, CG (Slurm parity —
+/// suspended jobs remain visible in the default view).
 fn default_squeue_states() -> Vec<spur_proto::proto::JobState> {
     vec![
         spur_proto::proto::JobState::JobPending,
         spur_proto::proto::JobState::JobRunning,
+        spur_proto::proto::JobState::JobSuspended,
         spur_proto::proto::JobState::JobCompleting,
     ]
 }
@@ -258,9 +260,10 @@ mod tests {
     #[test]
     fn default_squeue_states_includes_completing() {
         let states = default_squeue_states();
-        assert_eq!(states.len(), 3);
+        assert_eq!(states.len(), 4);
         assert!(states.contains(&P::JobPending));
         assert!(states.contains(&P::JobRunning));
+        assert!(states.contains(&P::JobSuspended));
         assert!(states.contains(&P::JobCompleting));
     }
 
