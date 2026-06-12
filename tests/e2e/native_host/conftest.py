@@ -105,11 +105,14 @@ def _ensure_bins(ssh_nodes, remote_bin_dir):
     ensure_bins(ssh_nodes, _get_binaries_dir(), remote_bin_dir)
 
 
-def _deploy_cluster(ssh_nodes, remote_bin_dir, *, agent_as_root: bool = False):
+def _deploy_cluster(ssh_nodes, remote_bin_dir, *, agent_as_root: bool = False,
+                    config_overrides: dict | None = None,
+                    agent_labels: dict[int, dict[str, str]] | None = None):
     """Helper: create, deploy, and return a SpurCluster. Tears down on deploy failure."""
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     try:
-        c.deploy(agent_as_root=agent_as_root)
+        c.deploy(config_overrides=config_overrides, agent_as_root=agent_as_root,
+                 agent_labels=agent_labels)
     except Exception:
         c.teardown()
         raise
@@ -195,5 +198,40 @@ def gpu_cluster(request, ssh_nodes, remote_bin_dir):
 
     as_root = request.node.get_closest_marker("rootful") is not None
     c = _deploy_cluster(ssh_nodes, remote_bin_dir, agent_as_root=as_root)
+    yield c
+    c.teardown()
+
+
+@pytest.fixture(scope="class")
+def label_cluster(ssh_nodes, remote_bin_dir):
+    """Class-scoped cluster for node label and partition selector tests."""
+    if len(ssh_nodes) < 2:
+        pytest.skip(
+            f"Label cluster requires at least 2 nodes in SPUR_TEST_NODES "
+            f"(got {len(ssh_nodes)})"
+        )
+
+    c = _deploy_cluster(
+        ssh_nodes,
+        remote_bin_dir,
+        config_overrides={
+            "partitions": [
+                {
+                    "name": "gpu",
+                    "state": "UP",
+                    "selector": {"gpu": "mi300x"},
+                    "max_time": "1:00:00",
+                },
+                {
+                    "name": "catchall",
+                    "state": "UP",
+                    "default": True,
+                    "nodes": "ALL",
+                    "max_time": "1:00:00",
+                },
+            ],
+        },
+        agent_labels={0: {"gpu": "mi300x"}},
+    )
     yield c
     c.teardown()
