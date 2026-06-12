@@ -24,7 +24,7 @@ use reporter::NodeReporter;
 
 /// Parse a "key=value" string into a validated label.
 fn parse_label(s: &str) -> Result<String, String> {
-    if s.contains('=') && s.split('=').next().map_or(false, |k| !k.is_empty()) {
+    if s.contains('=') && s.split('=').next().is_some_and(|k| !k.is_empty()) {
         Ok(s.to_string())
     } else {
         Err(format!("invalid label format '{s}', expected key=value"))
