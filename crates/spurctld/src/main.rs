@@ -216,6 +216,7 @@ fn default_config() -> spur_core::config::SlurmConfig {
             default: true,
             state: "UP".into(),
             nodes: "localhost".into(),
+            selector: Default::default(),
             max_time: None,
             default_time: None,
             max_nodes: None,
