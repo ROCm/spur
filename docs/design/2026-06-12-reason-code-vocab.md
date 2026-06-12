@@ -187,3 +187,29 @@ task is vocabulary completeness, not new limit enforcement).
 `cargo build`, `cargo test` (full workspace: 29 test binaries ok, 1229 tests passed, 0 failed),
 `cargo clippy --all-targets` (0 warnings), `cargo fmt --all --check` (clean).
 </content>
+
+## Update — emission wiring (follow-up commit)
+
+Review + live testbed comparison (Slurm 25.11.6 on .145 vs Spur on .147) found the
+vocabulary above was almost entirely **decorative**: Spur emitted none of it, and the
+`qos.rs` emission fix was inert because the scheduler discarded the reason. Corrected in a
+follow-up commit on this branch:
+
+- **Reservation / Licenses / QoS now surface.** `pending_jobs()` drops jobs blocked by these
+  limits *before* `update_pending_reasons()` runs, so their reason was never set. Added
+  `tag_blocked_pending_reasons()` (write-locked scheduler pass, mirrors
+  `cancel_unsatisfiable_dependency_jobs()`) that sets `Reservation`/`Licenses`/QoS reasons, and
+  extracted the eligibility checks into shared helpers (`reservation_block`, `license_block`,
+  `qos_block_for`) so the drop decision and the displayed reason cannot diverge.
+- **QoS caveat (corrected over-claim).** QoS limits are still not sourced from the accounting DB
+  (`Qos::default()` is limitless), so the QoS reasons remain wired-but-inert until QoS loading is
+  implemented — the path now carries the specific `QOS*` reason the moment real configs exist.
+  Earlier text in this note implied user-visible QoS parity today; that was inaccurate.
+- **NodeDown/Resources parity bug fixed.** `update_pending_reasons()` flagged a fully-allocated
+  (busy-but-up) cluster as `NodeDown` (it used `is_available()` = Idle|Mixed only). Added
+  `NodeState::is_up()` (Idle|Mixed|Allocated); a saturated cluster now reports `Resources`,
+  matching Slurm (live-confirmed: Slurm reports `Resources`, old Spur reported `NodeDown`).
+
+Tests added in `crates/spurctld/src/cluster.rs`:
+`fully_allocated_cluster_reports_resources_not_nodedown`, `tag_blocked_sets_reservation_reason`,
+`tag_blocked_sets_licenses_reason`, `tag_blocked_preserves_held_reason`.
