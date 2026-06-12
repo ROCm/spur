@@ -528,7 +528,7 @@ impl Job {
         if let Some(since) = self.suspended_at {
             suspended += (end - since).num_seconds().max(0);
         }
-        Some((end - start) - chrono::Duration::seconds(suspended))
+        Some(((end - start) - chrono::Duration::seconds(suspended)).max(chrono::Duration::zero()))
     }
 
     /// Wall-clock deadline for time-limit enforcement, pushed out by time spent
