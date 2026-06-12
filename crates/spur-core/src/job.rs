@@ -643,6 +643,13 @@ impl Job {
             (JobState::Completing, JobState::Cancelled) => true,
             (JobState::Suspended, JobState::Running) => true,
             (JobState::Suspended, JobState::Cancelled) => true,
+            // A suspended job whose process dies out-of-band (OOM, external
+            // kill, node loss) must still finalize rather than strand in
+            // SUSPENDED. Mirrors Slurm finalizing a suspended job that exits.
+            (JobState::Suspended, JobState::Completed) => true,
+            (JobState::Suspended, JobState::Failed) => true,
+            (JobState::Suspended, JobState::Timeout) => true,
+            (JobState::Suspended, JobState::NodeFail) => true,
             // Requeue transitions: terminal → Pending (for --requeue jobs)
             (JobState::Timeout, JobState::Pending) => true,
             (JobState::Preempted, JobState::Pending) => true,
