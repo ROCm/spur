@@ -1869,7 +1869,6 @@ mod tests {
         );
     }
 
-    #[cfg(test)]
     fn proc_state(pid: i32) -> char {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
         let after = stat.rsplit(')').next().unwrap();
@@ -1880,6 +1879,18 @@ mod tests {
             .chars()
             .next()
             .unwrap()
+    }
+
+    /// Poll the process state until it matches `want` (or any char in it), up to ~2s.
+    async fn await_proc_state(pid: i32, want: &[char]) -> char {
+        for _ in 0..200 {
+            let s = proc_state(pid);
+            if want.contains(&s) {
+                return s;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        proc_state(pid)
     }
 
     #[tokio::test]
@@ -1897,18 +1908,17 @@ mod tests {
         svc.insert_test_job(job_id, tracked).await;
 
         svc.suspend_signal(job_id, false).await; // SIGSTOP
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(
-            proc_state(pid),
+            await_proc_state(pid, &['T']).await,
             'T',
             "process should be stopped after SIGSTOP"
         );
 
         svc.suspend_signal(job_id, true).await; // SIGCONT
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let state = await_proc_state(pid, &['R', 'S']).await;
         assert!(
-            matches!(proc_state(pid), 'R' | 'S'),
-            "process should run after SIGCONT"
+            matches!(state, 'R' | 'S'),
+            "process should run after SIGCONT, got {state}"
         );
 
         svc.send_explicit_signal(job_id, 9).await; // cleanup
