@@ -94,4 +94,85 @@ mod tests {
             assert!(job.state.is_terminal());
         }
     }
+
+    // ── T60.8: Cannot suspend a cancelled job (B3) ───────────────
+
+    #[test]
+    fn t60_8_cannot_suspend_cancelled() {
+        let mut job = make_job("test");
+        assert_transition_ok(&mut job, JobState::Running);
+        assert_transition_ok(&mut job, JobState::Cancelled);
+        assert_transition_err(&mut job, JobState::Suspended);
+    }
+
+    // ── T60.9: Cannot suspend a failed job (B4) ──────────────────
+
+    #[test]
+    fn t60_9_cannot_suspend_failed() {
+        let mut job = make_job("test");
+        assert_transition_ok(&mut job, JobState::Running);
+        assert_transition_ok(&mut job, JobState::Failed);
+        assert_transition_err(&mut job, JobState::Suspended);
+    }
+
+    // ── T60.10: Cannot resume (reach Running from) a terminal job (B7)
+    //
+    // Note: resume-of-pending (B6) is guarded at the cluster method layer
+    // (resume_job checks state == Suspended), since Pending->Running is itself
+    // a valid *start* transition. See cluster.rs resume_*_rejects_* tests.
+
+    #[test]
+    fn t60_10_cannot_resume_terminal() {
+        for terminal in [JobState::Completed, JobState::Failed, JobState::Cancelled] {
+            let mut job = make_job("test");
+            assert_transition_ok(&mut job, JobState::Running);
+            assert_transition_ok(&mut job, terminal);
+            // Resume == reach Running; a terminal job must not return to Running.
+            assert_transition_err(&mut job, JobState::Running);
+        }
+    }
+
+    // ── T60.11: Cannot suspend a completing job (L4) ─────────────
+
+    #[test]
+    fn t60_11_cannot_suspend_completing() {
+        let mut job = make_job("test");
+        assert_transition_ok(&mut job, JobState::Running);
+        assert_transition_ok(&mut job, JobState::Completing);
+        assert_transition_err(&mut job, JobState::Suspended);
+    }
+
+    // ── T60.12: Cancel while suspended folds the open window (D7) ─
+
+    #[test]
+    fn t60_12_cancel_while_suspended_folds_open_window() {
+        // A job suspended-but-never-resumed, then cancelled, must still account
+        // run_time correctly: the open suspension window (suspended_at .. end)
+        // is excluded even though suspended_secs was never accumulated.
+        let mut job = make_job("test");
+        let start = chrono::Utc::now() - chrono::Duration::seconds(100);
+        job.start_time = Some(start);
+        // Ran 60s, then suspended at start+60, never resumed.
+        job.suspended_at = Some(start + chrono::Duration::seconds(60));
+        // Cancel "now" (== start+100): end_time set by transition.
+        job.end_time = Some(start + chrono::Duration::seconds(100));
+        // run_time = 100s span - 40s open suspension = 60s.
+        let rt = job.run_time().unwrap().num_seconds();
+        assert_eq!(rt, 60, "expected 60s effective run time, got {rt}");
+    }
+
+    // ── T60.13: Multiple suspensions accumulate (D4) ─────────────
+
+    #[test]
+    fn t60_13_multiple_suspensions_accumulate() {
+        // suspended_secs is the running total across cycles; run_time excludes
+        // the full accumulated amount.
+        let mut job = make_job("test");
+        let start = chrono::Utc::now();
+        job.start_time = Some(start);
+        job.end_time = Some(start + chrono::Duration::seconds(100));
+        job.suspended_secs = 15 + 25; // two prior suspend/resume cycles
+        let rt = job.run_time().unwrap().num_seconds();
+        assert_eq!(rt, 60, "expected 100 - 40 = 60s, got {rt}");
+    }
 }

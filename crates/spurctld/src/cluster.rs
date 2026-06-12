@@ -2800,6 +2800,211 @@ mod tests {
         assert!(job.suspended_at.is_none());
     }
 
+    // ── suspend_job / resume_job method guards ───────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspend_job_rejects_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("p"));
+        // Job is Pending (never started).
+        let err = cm.suspend_job(id, "u").unwrap_err();
+        assert!(
+            err.to_string().contains("not running"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Pending);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_job_rejects_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("p"));
+        let err = cm.resume_job(id, "u").unwrap_err();
+        assert!(
+            err.to_string().contains("not suspended"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_job_rejects_running() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("r"));
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+        // Resuming a running (not suspended) job is rejected.
+        assert!(cm.resume_job(id, "u").is_err());
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspend_resume_unknown_job_errors() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        assert!(cm
+            .suspend_job(9999, "u")
+            .unwrap_err()
+            .to_string()
+            .contains("not found"));
+        assert!(cm
+            .resume_job(9999, "u")
+            .unwrap_err()
+            .to_string()
+            .contains("not found"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn double_suspend_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("d"));
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+        cm.suspend_job(id, "u").unwrap();
+        settle(&cm, id, JobState::Suspended);
+        // Second suspend on an already-suspended job is rejected (not Running).
+        assert!(cm.suspend_job(id, "u").is_err());
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Suspended);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn double_resume_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("d"));
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+        cm.suspend_job(id, "u").unwrap();
+        settle(&cm, id, JobState::Suspended);
+        cm.resume_job(id, "u").unwrap();
+        settle(&cm, id, JobState::Running);
+        // Second resume on an already-running job is rejected.
+        assert!(cm.resume_job(id, "u").is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspend_retains_node_allocation() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("a"));
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 2);
+
+        cm.suspend_job(id, "u").unwrap();
+        settle(&cm, id, JobState::Suspended);
+        // Allocation is retained while suspended (plain scontrol suspend parity).
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.allocated_nodes, vec!["n1".to_string()]);
+        assert_eq!(
+            cm.get_node("n1").unwrap().alloc_resources.cpus,
+            2,
+            "node resources must stay allocated while job is suspended"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_suspend_cycles_accumulate_seconds() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("acc")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        let t0 = chrono::Utc::now();
+        // Cycle 1: 10s suspended.
+        cm.apply_operation(&WalOperation::JobSuspend { job_id: 1, at: t0 });
+        cm.apply_operation(&WalOperation::JobResume {
+            job_id: 1,
+            at: t0 + chrono::Duration::seconds(10),
+        });
+        // Cycle 2: 15s suspended.
+        let t1 = t0 + chrono::Duration::seconds(40);
+        cm.apply_operation(&WalOperation::JobSuspend { job_id: 1, at: t1 });
+        cm.apply_operation(&WalOperation::JobResume {
+            job_id: 1,
+            at: t1 + chrono::Duration::seconds(15),
+        });
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert_eq!(job.suspended_secs, 25, "10 + 15 accumulated");
+        assert!(job.suspended_at.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspended_job_excluded_from_timelimit_scan() {
+        // The time-limit enforcer scans only [Running, Completing] jobs, so a
+        // suspended job is never warned/killed while frozen. Assert the exact
+        // query the enforcer uses does not return a suspended job.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("t"));
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+        cm.suspend_job(id, "u").unwrap();
+        settle(&cm, id, JobState::Suspended);
+
+        let scanned = cm.get_jobs(
+            &[JobState::Running, JobState::Completing],
+            None,
+            None,
+            None,
+            &[],
+        );
+        assert!(
+            !scanned.iter().any(|j| j.job_id == id),
+            "suspended job must not appear in the enforcer's Running/Completing scan"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_node_register() {
         let dir = TempDir::new().unwrap();
