@@ -95,6 +95,7 @@ mod tests {
             address: "127.0.0.1".into(),
             port: 6818,
             wg_pubkey: String::new(),
+            labels: std::collections::HashMap::new(),
         }
     }
 
