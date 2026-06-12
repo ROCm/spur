@@ -151,7 +151,7 @@ impl RunningJob {
         match self {
             RunningJob::Managed { child, .. } => {
                 if let Some(pid) = child.id() {
-                    // Negative pid targets the process group led by the batch process.
+                    // Negative pid = the job's process group.
                     signal::kill(Pid::from_raw(-(pid as i32)), sig)?;
                 }
                 Ok(())
