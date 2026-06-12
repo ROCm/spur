@@ -573,4 +573,69 @@ mod tests {
         assert!(lines[1].contains("n2"));
         assert!(lines[1].contains("resv"));
     }
+
+    #[test]
+    fn test_node_oriented_multi_partition_fanout() {
+        let fields =
+            format_engine::parse_format("%#N %.6D %#P %.11T", &format_engine::sinfo_header);
+        let partitions = vec![
+            make_partition("gpu", false),
+            make_partition("catchall", true),
+        ];
+        let nodes = vec![NodeInfo {
+            name: "n1".into(),
+            state: NodeState::NodeIdle as i32,
+            partitions: vec!["gpu".into(), "catchall".into()],
+            ..Default::default()
+        }];
+
+        let lines = render_sinfo_output(&fields, &partitions, &nodes, true);
+        assert_eq!(
+            lines.len(),
+            2,
+            "one line per node-partition pair: {lines:?}"
+        );
+        assert!(lines[0].contains("gpu"));
+        assert!(lines[1].contains("catchall"));
+        assert!(lines[0].contains("n1"));
+        assert!(lines[1].contains("n1"));
+    }
+
+    #[test]
+    fn test_partition_oriented_multi_partition_node() {
+        let fields = default_fields();
+        let partitions = vec![make_partition("gpu", false), make_partition("batch", true)];
+        let nodes = vec![NodeInfo {
+            name: "n1".into(),
+            state: NodeState::NodeIdle as i32,
+            partitions: vec!["gpu".into(), "batch".into()],
+            ..Default::default()
+        }];
+
+        let lines = render_sinfo_output(&fields, &partitions, &nodes, false);
+        assert_eq!(
+            lines.len(),
+            2,
+            "node appears under each partition: {lines:?}"
+        );
+        assert!(lines[0].contains("gpu"));
+        assert!(lines[1].contains("batch"));
+    }
+
+    #[test]
+    fn test_node_oriented_empty_partitions_fallback() {
+        let fields =
+            format_engine::parse_format("%#N %.6D %#P %.11T", &format_engine::sinfo_header);
+        let partitions = vec![make_partition("batch", true)];
+        let nodes = vec![NodeInfo {
+            name: "orphan".into(),
+            state: NodeState::NodeIdle as i32,
+            partitions: vec![],
+            ..Default::default()
+        }];
+
+        let lines = render_sinfo_output(&fields, &partitions, &nodes, true);
+        assert_eq!(lines.len(), 1, "orphan node still gets one row");
+        assert!(lines[0].contains("orphan"));
+    }
 }

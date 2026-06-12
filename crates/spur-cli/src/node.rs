@@ -55,13 +55,11 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     }
 }
 
-async fn cmd_label(controller: &str, node: String, label_args: Vec<String>) -> Result<()> {
-    let mut client = SlurmControllerClient::connect(controller.to_string()).await?;
-
+fn parse_label_args(label_args: &[String]) -> Result<(HashMap<String, String>, Vec<String>)> {
     let mut set_labels: HashMap<String, String> = HashMap::new();
     let mut remove_labels: Vec<String> = Vec::new();
 
-    for arg in &label_args {
+    for arg in label_args {
         if let Some(key) = arg.strip_suffix('-') {
             if key.is_empty() {
                 bail!("invalid label removal: '{arg}'");
@@ -76,6 +74,13 @@ async fn cmd_label(controller: &str, node: String, label_args: Vec<String>) -> R
             bail!("invalid label format: '{arg}', expected key=value or key-");
         }
     }
+
+    Ok((set_labels, remove_labels))
+}
+
+async fn cmd_label(controller: &str, node: String, label_args: Vec<String>) -> Result<()> {
+    let mut client = SlurmControllerClient::connect(controller.to_string()).await?;
+    let (set_labels, remove_labels) = parse_label_args(&label_args)?;
 
     client
         .update_node(UpdateNodeRequest {
@@ -95,4 +100,52 @@ async fn cmd_label(controller: &str, node: String, label_args: Vec<String>) -> R
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_label_set() {
+        let args = vec!["pool=gpu".to_string(), "tier=high".to_string()];
+        let (set, remove) = parse_label_args(&args).unwrap();
+        assert_eq!(set.get("pool").unwrap(), "gpu");
+        assert_eq!(set.get("tier").unwrap(), "high");
+        assert!(remove.is_empty());
+    }
+
+    #[test]
+    fn test_parse_label_remove() {
+        let args = vec!["pool-".to_string()];
+        let (set, remove) = parse_label_args(&args).unwrap();
+        assert!(set.is_empty());
+        assert_eq!(remove, vec!["pool"]);
+    }
+
+    #[test]
+    fn test_parse_label_mixed() {
+        let args = vec!["env=prod".to_string(), "old_tag-".to_string()];
+        let (set, remove) = parse_label_args(&args).unwrap();
+        assert_eq!(set.get("env").unwrap(), "prod");
+        assert_eq!(remove, vec!["old_tag"]);
+    }
+
+    #[test]
+    fn test_parse_label_empty_key_set() {
+        let args = vec!["=value".to_string()];
+        assert!(parse_label_args(&args).is_err());
+    }
+
+    #[test]
+    fn test_parse_label_empty_key_remove() {
+        let args = vec!["-".to_string()];
+        assert!(parse_label_args(&args).is_err());
+    }
+
+    #[test]
+    fn test_parse_label_invalid_format() {
+        let args = vec!["noequalsnodash".to_string()];
+        assert!(parse_label_args(&args).is_err());
+    }
 }

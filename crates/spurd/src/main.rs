@@ -247,3 +247,30 @@ fn init_device_registry(config: Option<&SlurmConfig>) -> DeviceRegistry {
 
     registry
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_label_valid() {
+        assert_eq!(parse_label("pool=gpu").unwrap(), "pool=gpu");
+        assert_eq!(parse_label("tier=").unwrap(), "tier=");
+        assert_eq!(parse_label("a=b=c").unwrap(), "a=b=c");
+    }
+
+    #[test]
+    fn parse_label_missing_equals() {
+        assert!(parse_label("noequalssign").is_err());
+    }
+
+    #[test]
+    fn parse_label_empty_key() {
+        assert!(parse_label("=value").is_err());
+    }
+
+    #[test]
+    fn parse_label_just_equals() {
+        assert!(parse_label("=").is_err());
+    }
+}
