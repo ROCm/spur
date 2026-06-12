@@ -74,4 +74,24 @@ mod tests {
         let rt = job.run_time().unwrap().num_seconds();
         assert!((68..=72).contains(&rt), "expected ~70s, got {rt}");
     }
+
+    // ── T60.7: Suspended process dying out-of-band can finalize ──
+
+    #[test]
+    fn t60_7_suspended_can_finalize_on_death() {
+        // A suspended job whose process dies (OOM, external kill, node loss)
+        // must finalize rather than strand in SUSPENDED.
+        for terminal in [
+            JobState::Completed,
+            JobState::Failed,
+            JobState::NodeFail,
+            JobState::Timeout,
+        ] {
+            let mut job = make_job("test");
+            assert_transition_ok(&mut job, JobState::Running);
+            assert_transition_ok(&mut job, JobState::Suspended);
+            assert_transition_ok(&mut job, terminal);
+            assert!(job.state.is_terminal());
+        }
+    }
 }
