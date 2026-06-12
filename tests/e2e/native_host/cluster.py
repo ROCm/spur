@@ -488,6 +488,24 @@ class SpurCluster:
         node.exec(self._spurd_start_cmd(node_index))
         time.sleep(5)
 
+    def restart_controller(self):
+        """Restart spurctld without touching the agents. State is recovered
+        from the Raft log on the existing state-dir. Waits for the controller
+        to answer queries again (does not require nodes to be idle, since a
+        suspended job keeps its allocation)."""
+        self._pkill(self.nodes[0], f"{self.bin_dir}/spurctld", use_sudo=False)
+        time.sleep(1)
+        self._start_controller()
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            try:
+                if all(n in self.sinfo() for n in self.node_names):
+                    return
+            except Exception:
+                pass
+            time.sleep(2)
+        raise TimeoutError("controller did not recover after restart")
+
     def spurd_agent_user(self, node_index: int = 0) -> str:
         """Return the user owning the spurd process on a node."""
         node = self.nodes[node_index]
