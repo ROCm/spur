@@ -1771,11 +1771,15 @@ impl ClusterManager {
             }
             WalOperation::JobResume { job_id, at } => {
                 if let Some(job) = jobs.get_mut(job_id) {
-                    if let Some(since) = job.suspended_at.take() {
-                        job.suspended_secs += (*at - since).num_seconds().max(0);
-                    }
-                    if let Err(e) = job.transition(JobState::Running) {
-                        warn!(job_id = *job_id, error = %e, "invalid resume transition in WAL apply");
+                    match job.transition(JobState::Running) {
+                        Ok(()) => {
+                            if let Some(since) = job.suspended_at.take() {
+                                job.suspended_secs += (*at - since).num_seconds().max(0);
+                            }
+                        }
+                        Err(e) => {
+                            warn!(job_id = *job_id, error = %e, "invalid resume transition in WAL apply")
+                        }
                     }
                 }
             }
