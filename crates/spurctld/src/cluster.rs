@@ -770,22 +770,7 @@ impl ClusterManager {
         match action {
             RegistrationAction::Skip => {
                 debug!(node = %effective_name, "node unchanged, skipping");
-                if let Some(existing) = self.get_node(&effective_name) {
-                    if existing.labels != labels {
-                        let remove: Vec<String> = existing
-                            .labels
-                            .keys()
-                            .filter(|k| !labels.contains_key(*k))
-                            .cloned()
-                            .collect();
-                        self.propose(WalOperation::NodeLabelsUpdate {
-                            name: effective_name.clone(),
-                            set: labels,
-                            remove,
-                        })?;
-                        info!(node = %effective_name, "node labels synced on re-registration");
-                    }
-                }
+                self.sync_node_labels(&effective_name, labels)?;
             }
             RegistrationAction::Update => {
                 self.propose(WalOperation::NodeUpdate {
@@ -796,21 +781,7 @@ impl ClusterManager {
                     wg_pubkey,
                     version,
                 })?;
-                if let Some(existing) = self.get_node(&effective_name) {
-                    if existing.labels != labels {
-                        let remove: Vec<String> = existing
-                            .labels
-                            .keys()
-                            .filter(|k| !labels.contains_key(*k))
-                            .cloned()
-                            .collect();
-                        self.propose(WalOperation::NodeLabelsUpdate {
-                            name: effective_name.clone(),
-                            set: labels,
-                            remove,
-                        })?;
-                    }
-                }
+                self.sync_node_labels(&effective_name, labels)?;
                 if let Some(node) = self.nodes.write().get_mut(&effective_name) {
                     node.source = source;
                 }
@@ -831,6 +802,32 @@ impl ClusterManager {
                     node.agent_start_time = Some(Utc::now());
                 }
                 info!(node = %effective_name, "node registered");
+            }
+        }
+        Ok(())
+    }
+
+    /// Sync node labels if they differ from the expected set.
+    /// Proposes a `NodeLabelsUpdate` WAL operation when there's a mismatch.
+    fn sync_node_labels(
+        &self,
+        node_name: &str,
+        new_labels: HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        if let Some(existing) = self.get_node(node_name) {
+            if existing.labels != new_labels {
+                let remove: Vec<String> = existing
+                    .labels
+                    .keys()
+                    .filter(|k| !new_labels.contains_key(*k))
+                    .cloned()
+                    .collect();
+                self.propose(WalOperation::NodeLabelsUpdate {
+                    name: node_name.to_string(),
+                    set: new_labels,
+                    remove,
+                })?;
+                info!(node = %node_name, "node labels synced on re-registration");
             }
         }
         Ok(())
@@ -2103,9 +2100,7 @@ impl ClusterManager {
                     for nc in &self.config.nodes {
                         if node_config_matches(nc, &node.name, &node.labels) {
                             node.features = nc.features.clone();
-                            if nc.weight > 0 {
-                                node.weight = nc.weight;
-                            }
+                            node.weight = nc.weight;
                             break;
                         }
                     }

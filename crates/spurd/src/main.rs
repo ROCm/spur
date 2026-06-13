@@ -61,7 +61,7 @@ struct Args {
 
     /// Node labels for partition routing (key=value pairs).
     /// Can be specified multiple times: --label pool=gpu --label rack=a
-    #[arg(long = "label", value_parser = parse_label, env = "SPUR_NODE_LABELS", value_delimiter = ',')]
+    #[arg(long = "label", value_parser = parse_label, env = "SPUR_NODE_LABELS")]
     labels: Vec<String>,
 
     /// Foreground mode

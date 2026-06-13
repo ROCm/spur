@@ -6,6 +6,21 @@
 import time
 
 
+def _wait_node_in_partition(cluster, node_name, partition, present=True, timeout=10):
+    """Poll sinfo until node appears/disappears in partition."""
+    deadline = time.time() + timeout
+    out = ""
+    while time.time() < deadline:
+        out = cluster.sinfo()
+        lines = [l for l in out.splitlines() if partition in l.split()[0:1]]
+        found = node_name in "\n".join(lines)
+        if found == present:
+            return out
+        time.sleep(0.5)
+    verb = "appear in" if present else "disappear from"
+    assert False, f"{node_name} did not {verb} {partition} within {timeout}s:\n{out}"
+
+
 class TestNodeLabels:
     """Node label registration, selector routing, and admin mutation."""
 
@@ -63,26 +78,13 @@ class TestNodeLabels:
 
         # Add label → node joins gpu partition
         label_cluster.cli(["spur", "node", "label", node1, "gpu=mi300x"])
-        time.sleep(2)
+        _wait_node_in_partition(label_cluster, node1, "gpu", present=True)
 
         out = label_cluster.scontrol("show", "node", node1)
         assert "Labels=gpu=mi300x" in out, (
             f"after adding label, expected Labels=gpu=mi300x:\n{out}"
         )
-        out = label_cluster.sinfo()
-        gpu_lines = [l for l in out.splitlines() if "gpu" in l.split()[0:1]]
-        gpu_text = "\n".join(gpu_lines)
-        assert node1 in gpu_text, (
-            f"after adding label, expected {node1} in gpu partition:\n{out}"
-        )
 
         # Remove label → node leaves gpu partition
         label_cluster.cli(["spur", "node", "label", node1, "gpu-"])
-        time.sleep(2)
-
-        out = label_cluster.sinfo()
-        gpu_lines = [l for l in out.splitlines() if "gpu" in l.split()[0:1]]
-        gpu_text = "\n".join(gpu_lines)
-        assert node1 not in gpu_text, (
-            f"after removing label, expected {node1} NOT in gpu partition:\n{out}"
-        )
+        _wait_node_in_partition(label_cluster, node1, "gpu", present=False)
