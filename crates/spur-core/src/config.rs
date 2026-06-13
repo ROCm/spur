@@ -431,7 +431,10 @@ pub struct PartitionConfig {
     pub default: bool,
     #[serde(default = "default_partition_state")]
     pub state: String,
+    #[serde(default)]
     pub nodes: String,
+    #[serde(default)]
+    pub selector: HashMap<String, String>,
     pub max_time: Option<String>,
     pub default_time: Option<String>,
     pub max_nodes: Option<u32>,
@@ -456,9 +459,15 @@ fn default_one() -> u32 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
-    /// Hostlist pattern for this node definition.
+    /// Hostlist pattern for this node definition. Optional when selector is used.
+    #[serde(default)]
     pub names: String,
+    /// Label selector: apply this config to nodes matching ALL key-value pairs.
+    #[serde(default)]
+    pub selector: HashMap<String, String>,
+    #[serde(default)]
     pub cpus: u32,
+    #[serde(default)]
     pub memory_mb: u64,
     #[serde(default)]
     pub gres: Vec<String>,
@@ -755,6 +764,7 @@ impl SlurmConfig {
                 },
                 is_default: pc.default,
                 nodes: pc.nodes.clone(),
+                selector: pc.selector.clone(),
                 max_time_minutes: pc.max_time.as_ref().and_then(|t| parse_time_minutes(t)),
                 default_time_minutes: pc.default_time.as_ref().and_then(|t| parse_time_minutes(t)),
                 max_nodes: pc.max_nodes,

@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Partition (queue) configuration.
@@ -12,6 +14,10 @@ pub struct Partition {
 
     /// Nodes belonging to this partition (hostlist pattern).
     pub nodes: String,
+
+    /// Label selector: node joins this partition if ALL key-value pairs match.
+    #[serde(default)]
+    pub selector: HashMap<String, String>,
 
     /// Limits
     pub max_time_minutes: Option<u32>,
@@ -74,6 +80,7 @@ impl Default for Partition {
             state: PartitionState::Up,
             is_default: false,
             nodes: String::new(),
+            selector: HashMap::new(),
             max_time_minutes: None,
             default_time_minutes: None,
             max_nodes: None,

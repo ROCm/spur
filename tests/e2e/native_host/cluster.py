@@ -178,6 +178,7 @@ class SpurCluster:
         self.controller_addr = f"http://{nodes[0].host}:{CONTROLLER_PORT}"
         self.config_overrides: dict = {}
         self.agent_as_root: bool = False
+        self.agent_labels: dict[int, dict[str, str]] = {}
 
     # --- Lifecycle ---
 
@@ -197,6 +198,7 @@ class SpurCluster:
         config_overrides: dict | None = None,
         kill_stale: bool = True,
         agent_as_root: bool = False,
+        agent_labels: dict[int, dict[str, str]] | None = None,
     ):
         """Write config and start all daemons.
 
@@ -208,6 +210,9 @@ class SpurCluster:
 
         When *agent_as_root* is True, spurd is launched via sudo on each
         node (rootful agent). spurctld always runs as the SSH user.
+
+        *agent_labels* maps node index to a dict of labels that will be
+        passed as ``--label key=value`` args to spurd on that node.
         """
         if not self.node_names:
             raise RuntimeError("provision() must be called before start()")
@@ -215,6 +220,7 @@ class SpurCluster:
             self._kill_daemons(use_sudo=False)
             self._kill_daemons(use_sudo=True)
         self.agent_as_root = agent_as_root
+        self.agent_labels = agent_labels or {}
         self.config_overrides = config_overrides or {}
         self._write_config()
         self._start_controller()
@@ -235,12 +241,13 @@ class SpurCluster:
         self,
         config_overrides: dict | None = None,
         agent_as_root: bool = False,
+        agent_labels: dict[int, dict[str, str]] | None = None,
     ):
         """Provision + start in one call."""
         self.provision()
         if agent_as_root:
             self.root_agent_preflight()
-        self.start(config_overrides, agent_as_root=agent_as_root)
+        self.start(config_overrides, agent_as_root=agent_as_root, agent_labels=agent_labels)
 
     def teardown(self):
         """Kill all daemons and remove the working directory."""
@@ -661,12 +668,18 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
             if self.agent_as_root
             else f"'{self.bin_dir}/spurd'"
         )
+        label_args = ""
+        labels = self.agent_labels.get(node_index, {})
+        if labels:
+            label_args = " ".join(f"--label '{k}={v}'" for k, v in labels.items())
+            label_args = f" {label_args}"
         return (
             f"nohup {spurd_bin} "
             f"-f '{self.etc_dir}/spur.conf' "
             f"--controller '{self.controller_addr}' "
             f"--listen '{agent_listen}' "
-            f"--hostname '{hostname}' --address '{address}' --log-level info -D "
+            f"--hostname '{hostname}' --address '{address}' --log-level info -D"
+            f"{label_args} "
             f"> '{self.log_dir}/spurd.log' 2>&1 & echo $!"
         )
 
@@ -701,6 +714,7 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
         for name in self.node_names:
             if name not in sinfo_output:
                 return False
+        total_idle = 0
         for line in sinfo_output.splitlines():
             if "idle" not in line:
                 continue
@@ -708,12 +722,10 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
             for j, field in enumerate(fields):
                 if field == "idle" and j > 0:
                     try:
-                        n = int(fields[j - 1])
-                        if n >= len(self.node_names):
-                            return True
+                        total_idle += int(fields[j - 1])
                     except ValueError:
                         pass
-        return False
+        return total_idle >= len(self.node_names)
 
 
 # --- Job helpers ---

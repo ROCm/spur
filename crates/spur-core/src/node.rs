@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -228,6 +230,10 @@ pub struct Node {
     #[serde(default)]
     pub features: Vec<String>,
 
+    /// Key-value labels for partition routing and policy application.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+
     pub arch: String,
     pub os: String,
     pub cpu_load: u32,
@@ -270,6 +276,7 @@ impl Node {
             total_resources: resources,
             alloc_resources: ResourceAllocations::default(),
             features: Vec::new(),
+            labels: HashMap::new(),
             arch: String::new(),
             os: String::new(),
             cpu_load: 0,

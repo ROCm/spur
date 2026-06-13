@@ -71,6 +71,8 @@ async fn sync_taint_state(
         name: name.into(),
         state: Some(state),
         reason,
+        labels: HashMap::new(),
+        remove_labels: Vec::new(),
     };
 
     match client.update_node(req).await {
@@ -131,6 +133,7 @@ pub async fn run(
                         address: operator_grpc_addr.clone(),
                         port: operator_grpc_port,
                         wg_pubkey: String::new(),
+                        labels: std::collections::HashMap::new(),
                     };
 
                     match ctrl_client.register_agent(req.clone()).await {
@@ -169,6 +172,8 @@ pub async fn run(
                     name: name.clone(),
                     state: Some(NodeState::NodeDown as i32),
                     reason: Some("K8s node removed".into()),
+                    labels: HashMap::new(),
+                    remove_labels: Vec::new(),
                 };
 
                 if let Err(e) = ctrl_client.update_node(req).await {

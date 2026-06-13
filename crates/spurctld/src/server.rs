@@ -382,6 +382,11 @@ impl SlurmController for ControllerService {
                 .update_node_state(&req.name, node_state, req.reason)
                 .map_err(|e| Status::internal(e.to_string()))?;
         }
+        if !req.labels.is_empty() || !req.remove_labels.is_empty() {
+            self.cluster
+                .update_node_labels(&req.name, req.labels, &req.remove_labels)
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
         Ok(Response::new(()))
     }
 
@@ -489,6 +494,7 @@ impl SlurmController for ControllerService {
                 req.wg_pubkey,
                 req.version,
                 spur_core::node::NodeSource::NativeHost,
+                req.labels,
             )
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -1298,7 +1304,7 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         name: node.name.clone(),
         state: node.state.to_proto_i32(),
         state_reason: node.state_reason.clone().unwrap_or_default(),
-        partition: node.partitions.first().cloned().unwrap_or_default(),
+        partitions: node.partitions.clone(),
         total_resources: Some(resource_to_proto(&node.total_resources)),
         alloc_resources: Some(allocations_to_proto(&node.alloc_resources)),
         arch: node.arch.clone(),
@@ -1310,6 +1316,7 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         slurmd_start_time: node.agent_start_time.map(datetime_to_proto),
         switch_name: node.switch_name.clone().unwrap_or_default(),
         active_reservation: String::new(),
+        labels: node.labels.clone(),
     }
 }
 

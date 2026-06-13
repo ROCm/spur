@@ -9,6 +9,7 @@ pub mod pmi;
 mod reporter;
 mod seccomp;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -20,6 +21,15 @@ use spur_devices::cdi::cache::CdiCache;
 use spur_devices::DeviceRegistry;
 
 use reporter::NodeReporter;
+
+/// Parse a "key=value" string into a validated label.
+fn parse_label(s: &str) -> Result<String, String> {
+    if s.contains('=') && s.split('=').next().is_some_and(|k| !k.is_empty()) {
+        Ok(s.to_string())
+    } else {
+        Err(format!("invalid label format '{s}', expected key=value"))
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "spurd", about = "Spur node agent daemon")]
@@ -48,6 +58,11 @@ struct Args {
     /// If not set, auto-detected from WireGuard interface or hostname resolution.
     #[arg(long, env = "SPUR_NODE_ADDRESS")]
     address: Option<String>,
+
+    /// Node labels for partition routing (key=value pairs).
+    /// Can be specified multiple times: --label pool=gpu --label rack=a
+    #[arg(long = "label", value_parser = parse_label, env = "SPUR_NODE_LABELS")]
+    labels: Vec<String>,
 
     /// Foreground mode
     #[arg(short = 'D', long)]
@@ -155,12 +170,23 @@ async fn main() -> anyhow::Result<()> {
         "resources discovered"
     );
 
+    // Parse node labels from CLI/env
+    let labels: HashMap<String, String> = args
+        .labels
+        .iter()
+        .filter_map(|s| {
+            let (k, v) = s.split_once('=')?;
+            Some((k.to_string(), v.to_string()))
+        })
+        .collect();
+
     // Create the node reporter
     let reporter = Arc::new(NodeReporter::new(
         hostname.clone(),
         args.controller.clone(),
         resources,
         node_address,
+        labels,
     ));
 
     // Register with controller
@@ -220,4 +246,31 @@ fn init_device_registry(config: Option<&SlurmConfig>) -> DeviceRegistry {
     );
 
     registry
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_label_valid() {
+        assert_eq!(parse_label("pool=gpu").unwrap(), "pool=gpu");
+        assert_eq!(parse_label("tier=").unwrap(), "tier=");
+        assert_eq!(parse_label("a=b=c").unwrap(), "a=b=c");
+    }
+
+    #[test]
+    fn parse_label_missing_equals() {
+        assert!(parse_label("noequalssign").is_err());
+    }
+
+    #[test]
+    fn parse_label_empty_key() {
+        assert!(parse_label("=value").is_err());
+    }
+
+    #[test]
+    fn parse_label_just_equals() {
+        assert!(parse_label("=").is_err());
+    }
 }

@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
@@ -294,6 +296,9 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                     node_state_name(node.state),
                     node.state_reason
                 );
+                if !node.partitions.is_empty() {
+                    println!("   Partitions={}", node.partitions.join(","));
+                }
                 println!(
                     "   CPUTot={} CPUAlloc={} RealMemory={} FreeMem={}",
                     total.map(|r| r.cpus).unwrap_or(0),
@@ -312,6 +317,15 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                     println!("   Gres={}", gpu_types.join(","));
                 }
                 println!("   Arch={} OS={}", node.arch, node.os);
+                if !node.labels.is_empty() {
+                    let mut label_str: Vec<String> = node
+                        .labels
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect();
+                    label_str.sort();
+                    println!("   Labels={}", label_str.join(","));
+                }
                 println!("   CpuLoad={}", node.cpu_load as f64 / 100.0);
                 println!();
             }
@@ -587,6 +601,8 @@ async fn update_node(
             name: name.to_string(),
             state: proto_state,
             reason,
+            labels: HashMap::new(),
+            remove_labels: Vec::new(),
         })
         .await
         .context("node update failed")?;

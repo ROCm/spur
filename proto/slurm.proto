@@ -199,7 +199,7 @@ message NodeInfo {
   string name = 1;
   NodeState state = 2;
   string state_reason = 3;
-  string partition = 4;
+  repeated string partitions = 4;
 
   ResourceSet total_resources = 10;
   ResourceAllocations alloc_resources = 11;
@@ -216,6 +216,7 @@ message NodeInfo {
   string switch_name = 40;   // Leaf switch from topology config
 
   string active_reservation = 50;
+  map<string, string> labels = 51;
 }
 
 message PartitionInfo {
@@ -399,6 +400,8 @@ message UpdateNodeRequest {
   string name = 1;
   optional NodeState state = 2;
   optional string reason = 3;
+  map<string, string> labels = 4;
+  repeated string remove_labels = 5;
 }
 
 message GetPartitionsRequest {
@@ -423,6 +426,7 @@ message RegisterAgentRequest {
   string address = 4;        // Agent's preferred IP (e.g. WireGuard 10.44.x.y)
   uint32 port = 5;           // Agent gRPC listen port
   string wg_pubkey = 6;      // WireGuard public key (for mesh setup)
+  map<string, string> labels = 7;  // Node labels for partition routing (pool, rack, etc.)
 }
 
 message RegisterAgentResponse {

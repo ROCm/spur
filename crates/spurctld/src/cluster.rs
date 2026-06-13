@@ -709,6 +709,7 @@ impl ClusterManager {
         wg_pubkey: String,
         version: String,
         source: NodeSource,
+        labels: HashMap<String, String>,
     ) -> anyhow::Result<()> {
         // Normalize node name: if the agent's hostname doesn't match any config
         // entry, check if there's an unmatched config node it could be aliased to.
@@ -769,6 +770,7 @@ impl ClusterManager {
         match action {
             RegistrationAction::Skip => {
                 debug!(node = %effective_name, "node unchanged, skipping");
+                self.sync_node_labels(&effective_name, labels)?;
             }
             RegistrationAction::Update => {
                 self.propose(WalOperation::NodeUpdate {
@@ -779,6 +781,7 @@ impl ClusterManager {
                     wg_pubkey,
                     version,
                 })?;
+                self.sync_node_labels(&effective_name, labels)?;
                 if let Some(node) = self.nodes.write().get_mut(&effective_name) {
                     node.source = source;
                 }
@@ -792,12 +795,39 @@ impl ClusterManager {
                     port,
                     wg_pubkey,
                     version,
+                    labels,
                 })?;
                 if let Some(node) = self.nodes.write().get_mut(&effective_name) {
                     node.source = source;
                     node.agent_start_time = Some(Utc::now());
                 }
                 info!(node = %effective_name, "node registered");
+            }
+        }
+        Ok(())
+    }
+
+    /// Sync node labels if they differ from the expected set.
+    /// Proposes a `NodeLabelsUpdate` WAL operation when there's a mismatch.
+    fn sync_node_labels(
+        &self,
+        node_name: &str,
+        new_labels: HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        if let Some(existing) = self.get_node(node_name) {
+            if existing.labels != new_labels {
+                let remove: Vec<String> = existing
+                    .labels
+                    .keys()
+                    .filter(|k| !new_labels.contains_key(*k))
+                    .cloned()
+                    .collect();
+                self.propose(WalOperation::NodeLabelsUpdate {
+                    name: node_name.to_string(),
+                    set: new_labels,
+                    remove,
+                })?;
+                info!(node = %node_name, "node labels synced on re-registration");
             }
         }
         Ok(())
@@ -995,6 +1025,27 @@ impl ClusterManager {
             admin_locked,
         })?;
         info!(node = %name, old = ?old_state, new = ?effective_state, "node state updated");
+        Ok(())
+    }
+
+    pub fn update_node_labels(
+        &self,
+        name: &str,
+        set: HashMap<String, String>,
+        remove: &[String],
+    ) -> anyhow::Result<()> {
+        {
+            let nodes = self.nodes.read();
+            if !nodes.contains_key(name) {
+                anyhow::bail!("node {} not found", name);
+            }
+        }
+        self.propose(WalOperation::NodeLabelsUpdate {
+            name: name.to_string(),
+            set: set.clone(),
+            remove: remove.to_vec(),
+        })?;
+        info!(node = %name, "node labels updated");
         Ok(())
     }
 
@@ -1937,10 +1988,12 @@ impl ClusterManager {
                 port,
                 wg_pubkey,
                 version,
+                labels,
             } => {
                 let mut node = Node::new(name.clone(), resources.clone());
                 node.address = Some(address.clone());
                 node.port = *port;
+                node.labels = labels.clone();
                 if !wg_pubkey.is_empty() {
                     node.wg_pubkey = Some(wg_pubkey.clone());
                 }
@@ -1953,14 +2006,12 @@ impl ClusterManager {
                     .transition(&NodeEvent::Register, false)
                     .unwrap_or(NodeState::Idle);
 
-                // Assign partitions from config
+                // Assign partitions: match by hostlist OR label selector (union)
                 drop(nodes);
                 let partitions = self.partitions.read();
                 for part in partitions.iter() {
-                    if let Ok(hosts) = spur_core::hostlist::expand(&part.nodes) {
-                        if hosts.contains(name) {
-                            node.partitions.push(part.name.clone());
-                        }
+                    if partition_matches_node(part, name, labels) {
+                        node.partitions.push(part.name.clone());
                     }
                 }
                 if node.partitions.is_empty() {
@@ -1972,13 +2023,12 @@ impl ClusterManager {
                 }
                 drop(partitions);
 
+                // Apply features/weight from matching NodeConfig (by hostname OR selector)
                 for nc in &self.config.nodes {
-                    if let Ok(hosts) = spur_core::hostlist::expand(&nc.names) {
-                        if hosts.contains(name) {
-                            node.features = nc.features.clone();
-                            node.weight = nc.weight;
-                            break;
-                        }
+                    if node_config_matches(nc, name, labels) {
+                        node.features = nc.features.clone();
+                        node.weight = nc.weight;
+                        break;
                     }
                 }
 
@@ -2021,6 +2071,41 @@ impl ClusterManager {
                     node.admin_locked = *admin_locked;
                 }
             }
+            WalOperation::NodeLabelsUpdate { name, set, remove } => {
+                if let Some(node) = nodes.get_mut(name) {
+                    for (k, v) in set {
+                        node.labels.insert(k.clone(), v.clone());
+                    }
+                    for k in remove {
+                        node.labels.remove(k);
+                    }
+                    // Re-evaluate partition membership after label change
+                    let partitions = self.partitions.read();
+                    let mut matched = Vec::new();
+                    for part in partitions.iter() {
+                        if partition_matches_node(part, &node.name, &node.labels) {
+                            matched.push(part.name.clone());
+                        }
+                    }
+                    if matched.is_empty() {
+                        if let Some(dp) = partitions.iter().find(|p| p.is_default) {
+                            matched.push(dp.name.clone());
+                        } else if let Some(first) = partitions.first() {
+                            matched.push(first.name.clone());
+                        }
+                    }
+                    node.partitions = matched;
+
+                    // Re-apply NodeConfig features/weight
+                    for nc in &self.config.nodes {
+                        if node_config_matches(nc, &node.name, &node.labels) {
+                            node.features = nc.features.clone();
+                            node.weight = nc.weight;
+                            break;
+                        }
+                    }
+                }
+            }
         }
         self.next_job_id.store(next_id, Ordering::Relaxed);
         response
@@ -2037,6 +2122,39 @@ struct ClusterSnapshot {
     steps: Vec<JobStep>,
     license_pool: HashMap<String, u64>,
     hostname_aliases: HashMap<String, String>,
+}
+
+impl ClusterManager {
+    /// Re-evaluate partition membership and NodeConfig policy (features, weight)
+    /// for all nodes against the current config. Called after snapshot restore to
+    /// handle config changes that occurred between snapshot creation and restart.
+    fn reconcile_partitions(&self, nodes: &mut HashMap<String, Node>) {
+        let partitions = self.partitions.read();
+        for node in nodes.values_mut() {
+            let mut matched = Vec::new();
+            for part in partitions.iter() {
+                if partition_matches_node(part, &node.name, &node.labels) {
+                    matched.push(part.name.clone());
+                }
+            }
+            if matched.is_empty() {
+                if let Some(dp) = partitions.iter().find(|p| p.is_default) {
+                    matched.push(dp.name.clone());
+                } else if let Some(first) = partitions.first() {
+                    matched.push(first.name.clone());
+                }
+            }
+            node.partitions = matched;
+
+            for nc in &self.config.nodes {
+                if node_config_matches(nc, &node.name, &node.labels) {
+                    node.features = nc.features.clone();
+                    node.weight = nc.weight;
+                    break;
+                }
+            }
+        }
+    }
 }
 
 impl StateMachineApply for ClusterManager {
@@ -2084,6 +2202,11 @@ impl StateMachineApply for ClusterManager {
             *self.hostname_aliases.write() = snap.hostname_aliases;
 
             self.next_job_id.store(next_id, Ordering::Relaxed);
+
+            // Re-evaluate partition membership and NodeConfig policy
+            // for all nodes against the current config.
+            self.reconcile_partitions(&mut nodes);
+
             info!(
                 jobs = jobs.len(),
                 nodes = nodes.len(),
@@ -2122,6 +2245,55 @@ pub(crate) fn evaluate_registration(
         Some(node) if node.total_resources != *incoming_resources => RegistrationAction::Update,
         Some(_) => RegistrationAction::Skip,
     }
+}
+
+/// Returns true if a node matches a partition's membership criteria.
+/// Match occurs if the node satisfies EITHER the hostlist OR the label selector.
+pub(crate) fn partition_matches_node(
+    partition: &spur_core::partition::Partition,
+    node_name: &str,
+    labels: &HashMap<String, String>,
+) -> bool {
+    let matches_selector = !partition.selector.is_empty()
+        && partition
+            .selector
+            .iter()
+            .all(|(k, v)| labels.get(k) == Some(v));
+
+    let matches_hostlist = if partition.nodes.is_empty() {
+        false
+    } else if partition.nodes.eq_ignore_ascii_case("ALL") {
+        true
+    } else {
+        spur_core::hostlist::expand(&partition.nodes)
+            .map(|hosts| hosts.iter().any(|h| h == node_name))
+            .unwrap_or(false)
+    };
+
+    matches_selector || matches_hostlist
+}
+
+/// Returns true if a NodeConfig entry applies to a node (by hostname pattern OR
+/// label selector).
+pub(crate) fn node_config_matches(
+    nc: &spur_core::config::NodeConfig,
+    node_name: &str,
+    labels: &HashMap<String, String>,
+) -> bool {
+    let matches_names = if nc.names.is_empty() {
+        false
+    } else if nc.names.eq_ignore_ascii_case("ALL") {
+        true
+    } else {
+        spur_core::hostlist::expand(&nc.names)
+            .map(|hosts| hosts.iter().any(|h| h == node_name))
+            .unwrap_or(false)
+    };
+
+    let matches_selector =
+        !nc.selector.is_empty() && nc.selector.iter().all(|(k, v)| labels.get(k) == Some(v));
+
+    matches_names || matches_selector
 }
 
 #[derive(Debug, PartialEq)]
@@ -2243,6 +2415,7 @@ mod tests {
                 default: true,
                 state: "UP".into(),
                 nodes: "ALL".into(),
+                selector: Default::default(),
                 max_time: None,
                 default_time: None,
                 max_nodes: None,
@@ -2341,6 +2514,7 @@ mod tests {
             String::new(),
             String::new(),
             spur_core::node::NodeSource::NativeHost,
+            HashMap::new(),
         )
         .unwrap();
         let n = name.to_string();
@@ -2484,6 +2658,7 @@ mod tests {
             port: 6818,
             wg_pubkey: String::new(),
             version: "1.0".into(),
+            labels: HashMap::new(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -3337,6 +3512,7 @@ mod tests {
             String::new(),
             "1.0".into(),
             NodeSource::NativeHost,
+            HashMap::new(),
         )
         .unwrap();
         let node = cm.get_node("locked").unwrap();
@@ -3972,5 +4148,363 @@ mod tests {
 
         // Unknown id → empty.
         assert!(cm.get_jobs(&[], None, None, None, &[999]).is_empty());
+    }
+
+    // --- Partition matching tests ---
+
+    #[test]
+    fn partition_matches_node_by_hostlist() {
+        let part = Partition {
+            name: "gpu".into(),
+            nodes: "node[1-3]".into(),
+            ..Default::default()
+        };
+        let empty_labels = HashMap::new();
+        assert!(super::partition_matches_node(&part, "node1", &empty_labels));
+        assert!(super::partition_matches_node(&part, "node3", &empty_labels));
+        assert!(!super::partition_matches_node(
+            &part,
+            "node4",
+            &empty_labels
+        ));
+    }
+
+    #[test]
+    fn partition_matches_node_by_selector() {
+        let mut selector = HashMap::new();
+        selector.insert("pool".into(), "train".into());
+        let part = Partition {
+            name: "train".into(),
+            selector,
+            ..Default::default()
+        };
+        let mut labels = HashMap::new();
+        labels.insert("pool".into(), "train".into());
+        labels.insert("gpu".into(), "mi300x".into());
+        assert!(super::partition_matches_node(
+            &part,
+            "arbitrary-host",
+            &labels
+        ));
+
+        let wrong_labels = HashMap::from([("pool".into(), "infer".into())]);
+        assert!(!super::partition_matches_node(
+            &part,
+            "arbitrary-host",
+            &wrong_labels
+        ));
+    }
+
+    #[test]
+    fn partition_matches_node_union_of_both() {
+        let mut selector = HashMap::new();
+        selector.insert("pool".into(), "train".into());
+        let part = Partition {
+            name: "gpu".into(),
+            nodes: "node1".into(),
+            selector,
+            ..Default::default()
+        };
+        // Matches by hostlist alone
+        assert!(super::partition_matches_node(
+            &part,
+            "node1",
+            &HashMap::new()
+        ));
+        // Matches by selector alone
+        let labels = HashMap::from([("pool".into(), "train".into())]);
+        assert!(super::partition_matches_node(&part, "other-host", &labels));
+        // Matches neither
+        assert!(!super::partition_matches_node(
+            &part,
+            "other-host",
+            &HashMap::new()
+        ));
+    }
+
+    #[test]
+    fn node_config_matches_by_selector() {
+        let nc = spur_core::config::NodeConfig {
+            names: String::new(),
+            selector: HashMap::from([("gpu".into(), "mi300x".into())]),
+            cpus: 0,
+            memory_mb: 0,
+            gres: Vec::new(),
+            features: Vec::new(),
+            address: None,
+            weight: 1,
+        };
+        let labels = HashMap::from([("gpu".into(), "mi300x".into())]);
+        assert!(super::node_config_matches(&nc, "any-host", &labels));
+        assert!(!super::node_config_matches(
+            &nc,
+            "any-host",
+            &HashMap::new()
+        ));
+    }
+
+    // --- Label update + partition re-routing ---
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_labels_reroutes_partition() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.partitions = vec![
+            spur_core::config::PartitionConfig {
+                name: "default".into(),
+                default: true,
+                state: "UP".into(),
+                nodes: "ALL".into(),
+                selector: HashMap::new(),
+                max_time: None,
+                default_time: None,
+                max_nodes: None,
+                min_nodes: 1,
+                allow_accounts: Vec::new(),
+                allow_groups: Vec::new(),
+                priority_tier: 1,
+                preempt_mode: String::new(),
+            },
+            spur_core::config::PartitionConfig {
+                name: "train".into(),
+                default: false,
+                state: "UP".into(),
+                nodes: String::new(),
+                selector: HashMap::from([("pool".into(), "train".into())]),
+                max_time: None,
+                default_time: None,
+                max_nodes: None,
+                min_nodes: 1,
+                allow_accounts: Vec::new(),
+                allow_groups: Vec::new(),
+                priority_tier: 1,
+                preempt_mode: String::new(),
+            },
+        ];
+        let cm = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .unwrap();
+        cm.set_raft(handle.raft);
+
+        register_node(&cm, "worker1", 4, 8000);
+        let node = cm.get_node("worker1").unwrap();
+        // Initially only in "default" (ALL matches everything)
+        assert!(node.partitions.contains(&"default".into()));
+        assert!(!node.partitions.contains(&"train".into()));
+
+        // Add label that matches "train" partition selector
+        cm.update_node_labels(
+            "worker1",
+            HashMap::from([("pool".into(), "train".into())]),
+            &[],
+        )
+        .unwrap();
+        wait_for("label applied", || {
+            cm.get_node("worker1")
+                .map(|n| !n.labels.is_empty())
+                .unwrap_or(false)
+        });
+
+        let node = cm.get_node("worker1").unwrap();
+        assert!(node.partitions.contains(&"train".into()));
+        assert_eq!(node.labels.get("pool"), Some(&"train".into()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_node_with_labels_gets_selector_partition() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.partitions = vec![spur_core::config::PartitionConfig {
+            name: "inference".into(),
+            default: false,
+            state: "UP".into(),
+            nodes: String::new(),
+            selector: HashMap::from([("role".into(), "infer".into())]),
+            max_time: None,
+            default_time: None,
+            max_nodes: None,
+            min_nodes: 1,
+            allow_accounts: Vec::new(),
+            allow_groups: Vec::new(),
+            priority_tier: 1,
+            preempt_mode: String::new(),
+        }];
+        let cm = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .unwrap();
+        cm.set_raft(handle.raft);
+
+        cm.register_node(
+            "dyn-node".into(),
+            ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            "127.0.0.1".into(),
+            6818,
+            String::new(),
+            String::new(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::from([("role".into(), "infer".into())]),
+        )
+        .unwrap();
+        wait_for("node registered", || cm.get_node("dyn-node").is_some());
+
+        let node = cm.get_node("dyn-node").unwrap();
+        assert!(node.partitions.contains(&"inference".into()));
+    }
+
+    #[test]
+    fn partition_all_matches_any_node() {
+        let part = Partition {
+            name: "everything".into(),
+            nodes: "ALL".into(),
+            ..Default::default()
+        };
+        assert!(super::partition_matches_node(
+            &part,
+            "random-host-xyz",
+            &HashMap::new()
+        ));
+        assert!(super::partition_matches_node(
+            &part,
+            "node1",
+            &HashMap::new()
+        ));
+    }
+
+    #[test]
+    fn node_config_all_matches_any_node() {
+        let nc = spur_core::config::NodeConfig {
+            names: "ALL".into(),
+            selector: HashMap::new(),
+            cpus: 0,
+            memory_mb: 0,
+            gres: Vec::new(),
+            features: vec!["common".into()],
+            address: None,
+            weight: 1,
+        };
+        assert!(super::node_config_matches(&nc, "any-host", &HashMap::new()));
+        assert!(super::node_config_matches(
+            &nc,
+            "another",
+            &HashMap::from([("x".into(), "y".into())])
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reregistration_syncs_labels() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        // First registration with labels
+        cm.register_node(
+            "worker1".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            "127.0.0.1".into(),
+            6818,
+            String::new(),
+            String::new(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::from([("pool".into(), "train".into())]),
+        )
+        .unwrap();
+        wait_for("node registered", || cm.get_node("worker1").is_some());
+        assert_eq!(
+            cm.get_node("worker1").unwrap().labels.get("pool"),
+            Some(&"train".into())
+        );
+
+        // Re-register with same resources but different labels
+        cm.register_node(
+            "worker1".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            "127.0.0.1".into(),
+            6818,
+            String::new(),
+            String::new(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::from([("pool".into(), "infer".into()), ("tier".into(), "1".into())]),
+        )
+        .unwrap();
+        wait_for("labels synced", || {
+            cm.get_node("worker1")
+                .map(|n| n.labels.get("pool") == Some(&"infer".into()))
+                .unwrap_or(false)
+        });
+
+        let node = cm.get_node("worker1").unwrap();
+        assert_eq!(node.labels.get("pool"), Some(&"infer".into()));
+        assert_eq!(node.labels.get("tier"), Some(&"1".into()));
+    }
+
+    #[test]
+    fn label_update_applies_nodeconfig_features() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.nodes = vec![spur_core::config::NodeConfig {
+            names: String::new(),
+            selector: HashMap::from([("gpu".into(), "mi300x".into())]),
+            cpus: 0,
+            memory_mb: 0,
+            gres: Vec::new(),
+            features: vec!["mi300x".into(), "rocm6".into()],
+            address: None,
+            weight: 10,
+        }];
+        let cm = ClusterManager::new(cfg, dir.path()).unwrap();
+
+        // Register a node directly via WAL apply
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "gpu-node".into(),
+            resources: ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+        });
+
+        let node = cm.get_node("gpu-node").unwrap();
+        assert!(node.features.is_empty());
+
+        // Apply label update that matches the NodeConfig selector
+        cm.apply_operation(&WalOperation::NodeLabelsUpdate {
+            name: "gpu-node".into(),
+            set: HashMap::from([("gpu".into(), "mi300x".into())]),
+            remove: Vec::new(),
+        });
+
+        let node = cm.get_node("gpu-node").unwrap();
+        assert_eq!(node.features, vec!["mi300x", "rocm6"]);
+        assert_eq!(node.weight, 10);
     }
 }
