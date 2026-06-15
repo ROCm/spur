@@ -1,23 +1,12 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2E tests for job suspend/resume (issue #270).
+"""E2E tests for job suspend/resume.
 
-Minimal set chosen to cover each distinct scenario once:
-  - happy-path state transitions (RUNNING -> SUSPENDED -> RUNNING)
-  - whole process-tree freeze/thaw (batch shell AND its children)
-  - run-time accounting excludes the suspended interval
-  - time-limit is not consumed while suspended
-  - node allocation is retained while suspended
-  - squeue/scontrol display
-  - CLI guard/error behavior (suspend pending, bad id)
-  - cancel of a suspended job leaves no orphaned processes
-  - suspend state survives a controller restart
-  - multi-node suspend reaches every allocated node
-
-Every test cancels its job in a finally block. A suspended job left behind
-would hold its node allocation and wedge later tests sharing the cluster, so
-cleanup must run even when an assertion fails.
+Covers RUNNING<->SUSPENDED transitions, whole process-tree freeze/thaw,
+run-time/time-limit accounting while suspended, allocation retention, display,
+CLI guards, cancel-of-suspended cleanup, restart persistence, and multi-node
+dispatch. Each test cancels its job in a finally block.
 """
 
 import time

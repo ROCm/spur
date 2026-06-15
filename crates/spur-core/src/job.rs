@@ -711,6 +711,8 @@ impl Job {
             (JobState::Completing, JobState::Cancelled) => true,
             (JobState::Suspended, JobState::Running) => true,
             (JobState::Suspended, JobState::Cancelled) => true,
+            // Completion routes through Completing like a running job (Slurm JOB_COMPLETING).
+            (JobState::Suspended, JobState::Completing) => true,
             // A suspended job whose process dies out-of-band (OOM, external
             // kill, node loss) must still finalize rather than strand in
             // SUSPENDED. Mirrors Slurm finalizing a suspended job that exits.
@@ -1001,6 +1003,17 @@ mod tests {
     fn test_invalid_transition() {
         let mut job = make_job();
         assert!(job.transition(JobState::Completed).is_err());
+    }
+
+    #[test]
+    fn suspended_routes_through_completing() {
+        // A suspended job's completion can route through Completing (Slurm JOB_COMPLETING).
+        let mut job = make_job();
+        job.transition(JobState::Running).unwrap();
+        job.transition(JobState::Suspended).unwrap();
+        job.transition(JobState::Completing).unwrap();
+        job.transition(JobState::Completed).unwrap();
+        assert_eq!(job.state, JobState::Completed);
     }
 
     #[test]

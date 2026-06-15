@@ -1944,7 +1944,9 @@ impl ClusterManager {
                         }
                     }
 
-                    if job.state == JobState::Running {
+                    // Suspended jobs route through Completing too, so an
+                    // out-of-band task death finalizes instead of stranding.
+                    if matches!(job.state, JobState::Running | JobState::Suspended) {
                         if let Err(e) = job.transition(JobState::Completing) {
                             warn!(job_id = *job_id, error = %e, "invalid transition to Completing");
                         }
@@ -2034,13 +2036,8 @@ impl ClusterManager {
                     }
                     job.exit_code = Some(*exit_code);
                     job.end_time = Some(timestamp);
-                    // If the job was suspended at termination (Suspended ->
-                    // Cancelled/Completed/...), fold the final suspended
-                    // interval into suspended_secs and clear suspended_at, so it
-                    // never lingers on a terminal job. Keeps the invariant
-                    // "suspended_at.is_some() == currently suspended" and the
-                    // run_time/accounting math correct. No-op for a job resumed
-                    // before completing (suspended_at already taken).
+                    // Suspended -> terminal: fold the final suspended interval in
+                    // and clear suspended_at so it never lingers on a terminal job.
                     if let Some(since) = job.suspended_at.take() {
                         job.suspended_secs += (timestamp - since).num_seconds().max(0);
                     }
