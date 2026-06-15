@@ -84,12 +84,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // This eliminates the up-to-`interval_secs` polling delay for new submissions while
         // preserving a periodic wake for resource-freed events and node state changes.
         tokio::select! {
-            _ = scheduler_notify.notified() => {
-                // Immediate wake on job submission
-            }
-            _ = interval.tick() => {
-                // Periodic wake for resource-freed events
-            }
+            _ = scheduler_notify.notified() => {}
+            _ = interval.tick() => {}
         }
 
         if !raft.is_leader() {
