@@ -73,13 +73,24 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         max_jobs,
         plugin = scheduler.name(),
         topology = topology.is_some(),
-        "scheduler loop started"
+        "scheduler loop started (event-driven wake enabled)"
     );
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+    let scheduler_notify = cluster.scheduler_notify.clone();
 
     loop {
-        interval.tick().await;
+        // Event-driven wake: sleep until EITHER a job is submitted OR periodic tick fires.
+        // This eliminates 0-1000ms (avg 500ms) poll-based wait while preserving periodic
+        // wake for resource-freed events and node state changes.
+        tokio::select! {
+            _ = scheduler_notify.notified() => {
+                // Immediate wake on job submission
+            }
+            _ = interval.tick() => {
+                // Periodic wake for resource-freed events
+            }
+        }
 
         if !raft.is_leader() {
             continue;

@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use spur_core::accounting::{Qos, TresRecord, TresType};
@@ -55,6 +56,9 @@ pub struct ClusterManager {
     raft: RwLock<Option<SpurRaft>>,
     accounting: RwLock<Option<AccountingNotifier>>,
     fairshare_cache: Arc<FairshareCache>,
+    /// Scheduler wake notification: signals the scheduler loop when jobs are submitted.
+    /// Enables event-driven scheduling instead of poll-based delays.
+    pub scheduler_notify: Arc<Notify>,
 }
 
 impl ClusterManager {
@@ -76,6 +80,7 @@ impl ClusterManager {
             raft: RwLock::new(None),
             accounting: RwLock::new(None),
             fairshare_cache,
+            scheduler_notify: Arc::new(Notify::new()),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -112,6 +117,9 @@ impl ClusterManager {
                 spec: Box::new(task_spec),
             })?;
         }
+
+        // Wake the scheduler immediately to process newly submitted jobs
+        self.scheduler_notify.notify_one();
 
         info!(job_id, "job submitted");
         Ok(job_id)
@@ -4506,5 +4514,48 @@ mod tests {
         let node = cm.get_node("gpu-node").unwrap();
         assert_eq!(node.features, vec!["mi300x", "rocm6"]);
         assert_eq!(node.weight, 10);
+
+    // --- scheduler_notify tests ---
+
+    #[test]
+    fn cluster_manager_initializes_scheduler_notify() {
+        let cluster = ClusterManager::new(test_config(), Path::new("/tmp")).unwrap();
+
+        // Verify notify is initialized and can be cloned (Arc<Notify>)
+        let notify1 = cluster.scheduler_notify.clone();
+        let notify2 = cluster.scheduler_notify.clone();
+
+        // Both clones should point to the same Notify instance
+        assert!(Arc::ptr_eq(&notify1, &notify2));
+    }
+
+    #[tokio::test]
+    async fn scheduler_notify_signals_correctly() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let cluster = Arc::new(ClusterManager::new(test_config(), Path::new("/tmp")).unwrap());
+
+        let notify = cluster.scheduler_notify.clone();
+
+        // Spawn a task that waits for notification
+        let waiter = tokio::spawn(async move {
+            notify.notified().await;
+            true
+        });
+
+        // Give the waiter a moment to enter the notified() state
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Signal the notify
+        cluster.scheduler_notify.notify_one();
+
+        // Verify notification was received within 100ms
+        let result = timeout(Duration::from_millis(100), waiter).await;
+        assert!(
+            result.is_ok(),
+            "notify_one should wake the waiting task"
+        );
+        assert_eq!(result.unwrap().unwrap(), true);
     }
 }
