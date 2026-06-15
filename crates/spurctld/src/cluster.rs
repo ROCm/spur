@@ -2034,6 +2034,16 @@ impl ClusterManager {
                     }
                     job.exit_code = Some(*exit_code);
                     job.end_time = Some(timestamp);
+                    // If the job was suspended at termination (Suspended ->
+                    // Cancelled/Completed/...), fold the final suspended
+                    // interval into suspended_secs and clear suspended_at, so it
+                    // never lingers on a terminal job. Keeps the invariant
+                    // "suspended_at.is_some() == currently suspended" and the
+                    // run_time/accounting math correct. No-op for a job resumed
+                    // before completing (suspended_at already taken).
+                    if let Some(since) = job.suspended_at.take() {
+                        job.suspended_secs += (timestamp - since).num_seconds().max(0);
+                    }
                     freed_nodes = job.allocated_nodes.clone();
                     allocated_resources = job.allocated_resources.clone();
                     already_deallocated = job.node_completions.keys().cloned().collect::<Vec<_>>();
@@ -2969,6 +2979,47 @@ mod tests {
         assert_eq!(job.state, JobState::Running);
         assert_eq!(job.suspended_secs, 25, "10 + 15 accumulated");
         assert!(job.suspended_at.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_while_suspended_finalizes_suspended_at() {
+        // Copilot review: a Suspended -> terminal transition must clear
+        // suspended_at (so it never lingers on a terminal job and
+        // `suspended_at.is_some()` keeps meaning "currently suspended") and fold
+        // the final suspended interval into suspended_secs.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("cancel-susp")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        // Suspended 30s ago, then cancelled now (JobComplete stamps Utc::now()).
+        let since = chrono::Utc::now() - chrono::Duration::seconds(30);
+        cm.apply_operation(&WalOperation::JobSuspend {
+            job_id: 1,
+            at: since,
+        });
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Cancelled,
+        });
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert!(
+            job.suspended_at.is_none(),
+            "suspended_at must be cleared on a Suspended -> terminal transition"
+        );
+        assert!(
+            job.suspended_secs >= 30,
+            "final suspended interval folded into suspended_secs (got {})",
+            job.suspended_secs
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

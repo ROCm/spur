@@ -275,16 +275,19 @@ impl SlurmController for ControllerService {
         }
         let req = request.into_inner();
         let job_id = req.job_id;
-        let job = self.cluster.get_job(job_id);
+        // Unknown job ids are NOT_FOUND (consistent with get_job), not a
+        // precondition failure. Snapshot up-front for agent dispatch.
+        let job = self
+            .cluster
+            .get_job(job_id)
+            .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
         self.cluster
             .suspend_job(job_id, &req.user)
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
-        if let Some(job) = job {
-            let cluster = self.cluster.clone();
-            tokio::spawn(async move {
-                crate::scheduler_loop::send_suspend_to_agents(&cluster, &job, false).await;
-            });
-        }
+        let cluster = self.cluster.clone();
+        tokio::spawn(async move {
+            crate::scheduler_loop::send_suspend_to_agents(&cluster, &job, false).await;
+        });
         Ok(Response::new(()))
     }
 
@@ -305,17 +308,20 @@ impl SlurmController for ControllerService {
         }
         let req = request.into_inner();
         let job_id = req.job_id;
+        // Unknown job ids are NOT_FOUND (consistent with get_job), not a
+        // precondition failure. Allocation is retained across resume, so this
+        // up-front snapshot's allocated_nodes is still valid for agent dispatch.
+        let job = self
+            .cluster
+            .get_job(job_id)
+            .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
         self.cluster
             .resume_job(job_id, &req.user)
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
-        // Allocation is retained across resume, so allocated_nodes is unchanged;
-        // snapshot timing is not significant here.
-        if let Some(job) = self.cluster.get_job(job_id) {
-            let cluster = self.cluster.clone();
-            tokio::spawn(async move {
-                crate::scheduler_loop::send_suspend_to_agents(&cluster, &job, true).await;
-            });
-        }
+        let cluster = self.cluster.clone();
+        tokio::spawn(async move {
+            crate::scheduler_loop::send_suspend_to_agents(&cluster, &job, true).await;
+        });
         Ok(Response::new(()))
     }
 
