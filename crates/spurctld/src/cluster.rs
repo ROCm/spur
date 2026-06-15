@@ -58,7 +58,7 @@ pub struct ClusterManager {
     fairshare_cache: Arc<FairshareCache>,
     /// Scheduler wake notification: signals the scheduler loop when jobs are submitted.
     /// Enables event-driven scheduling instead of poll-based delays.
-    pub scheduler_notify: Arc<Notify>,
+    pub(crate) scheduler_notify: Arc<Notify>,
 }
 
 impl ClusterManager {
@@ -4514,12 +4514,14 @@ mod tests {
         let node = cm.get_node("gpu-node").unwrap();
         assert_eq!(node.features, vec!["mi300x", "rocm6"]);
         assert_eq!(node.weight, 10);
+    }
 
     // --- scheduler_notify tests ---
 
     #[test]
     fn cluster_manager_initializes_scheduler_notify() {
-        let cluster = ClusterManager::new(test_config(), Path::new("/tmp")).unwrap();
+        let dir = TempDir::new().unwrap();
+        let cluster = ClusterManager::new(test_config(), dir.path()).unwrap();
 
         // Verify notify is initialized and can be cloned (Arc<Notify>)
         let notify1 = cluster.scheduler_notify.clone();
@@ -4534,7 +4536,8 @@ mod tests {
         use std::time::Duration;
         use tokio::time::timeout;
 
-        let cluster = Arc::new(ClusterManager::new(test_config(), Path::new("/tmp")).unwrap());
+        let dir = TempDir::new().unwrap();
+        let cluster = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
 
         let notify = cluster.scheduler_notify.clone();
 
@@ -4544,18 +4547,129 @@ mod tests {
             true
         });
 
-        // Give the waiter a moment to enter the notified() state
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Yield to allow the spawned task to start
+        tokio::task::yield_now().await;
 
         // Signal the notify
         cluster.scheduler_notify.notify_one();
 
-        // Verify notification was received within 100ms
-        let result = timeout(Duration::from_millis(100), waiter).await;
+        // Verify notification was received within a reasonable time
+        let result = timeout(Duration::from_secs(1), waiter).await;
+        assert!(result.is_ok(), "notify_one should wake the waiting task");
+        assert!(result.unwrap().unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_triggers_scheduler_notify() {
+        // Verify that submit_job() actually calls notify_one() in production code path.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        // Set up a listener before submitting
+        let notify = cm.scheduler_notify.clone();
+        let listener = tokio::spawn(async move {
+            notify.notified().await;
+        });
+
+        // Give listener time to register
+        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+
+        // Submit a job - this should trigger notify_one()
+        let spec = basic_spec("test");
+        let _ = submit_and_wait(&cm, spec);
+
+        // Verify notification was received (with timeout to prevent hanging)
+        let result = tokio::time::timeout(tokio::time::Duration::from_millis(100), listener).await;
+
         assert!(
             result.is_ok(),
-            "notify_one should wake the waiting task"
+            "submit_job should call notify_one() to wake scheduler"
         );
-        assert_eq!(result.unwrap().unwrap(), true);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_notifies_even_with_array_expansion() {
+        // Array jobs expand into multiple tasks; verify notify is called during expansion.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        // Set up a listener before submitting
+        let notify = cm.scheduler_notify.clone();
+        let listener = tokio::spawn(async move {
+            notify.notified().await;
+        });
+
+        // Submit an array job (expands to multiple tasks). `submit_job` returns the
+        // array parent id, which is not stored — only per-task ids exist in `jobs`.
+        let mut spec = basic_spec("array");
+        spec.array_spec = Some("0-2".into()); // Creates 3 tasks
+        let parent_id = cm.submit_job(spec).unwrap();
+        let first_task_id = parent_id + 1;
+        wait_for(&format!("array task {first_task_id} applied"), || {
+            cm.get_job(first_task_id).is_some()
+        });
+
+        // Verify notification was received (with timeout to prevent hanging)
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(1), listener).await;
+        assert!(
+            result.is_ok(),
+            "array job submission should trigger scheduler notification"
+        );
+    }
+
+    #[test]
+    fn scheduler_notify_multiple_clones_share_same_instance() {
+        // Verify Arc sharing works correctly for multiple consumers
+        let dir = TempDir::new().unwrap();
+        let cluster = ClusterManager::new(test_config(), dir.path()).unwrap();
+
+        let notify1 = cluster.scheduler_notify.clone();
+        let notify2 = cluster.scheduler_notify.clone();
+        let notify3 = cluster.scheduler_notify.clone();
+
+        // All should point to the same Arc'd Notify
+        assert!(Arc::ptr_eq(&notify1, &notify2));
+        assert!(Arc::ptr_eq(&notify2, &notify3));
+        assert!(Arc::ptr_eq(&notify1, &notify3));
+
+        // Arc::strong_count should show multiple references
+        assert!(Arc::strong_count(&notify1) >= 3);
+    }
+
+    #[tokio::test]
+    async fn scheduler_notify_wakes_multiple_waiters() {
+        // Verify that notify_one() wakes at least one waiter when multiple are waiting
+        let dir = TempDir::new().unwrap();
+        let cluster = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+
+        let notify = cluster.scheduler_notify.clone();
+
+        // Spawn multiple waiters
+        let waiter1 = {
+            let n = notify.clone();
+            tokio::spawn(async move { n.notified().await })
+        };
+
+        let waiter2 = {
+            let n = notify.clone();
+            tokio::spawn(async move { n.notified().await })
+        };
+
+        // Give waiters time to register
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // Single notify_one() call
+        cluster.scheduler_notify.notify_one();
+
+        // At least one waiter should be notified
+        let result1 = tokio::time::timeout(tokio::time::Duration::from_millis(50), waiter1).await;
+
+        let result2 = tokio::time::timeout(tokio::time::Duration::from_millis(50), waiter2).await;
+
+        // At least one should succeed
+        assert!(
+            result1.is_ok() || result2.is_ok(),
+            "notify_one should wake at least one waiter"
+        );
     }
 }
