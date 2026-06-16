@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use spur_core::spur_env::SpurEnv;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{CancelJobRequest, GetJobRequest, JobSpec, SubmitJobRequest};
 use std::collections::HashMap;
@@ -165,10 +166,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     });
 
     // Wait for the job to start running (with timeout and progress)
-    #[allow(unused_assignments)]
-    let mut nodelist = String::new();
+    let job_info;
     let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(300); // 5 minute timeout
+    let timeout = std::time::Duration::from_secs(300);
     let mut last_reason = String::new();
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -194,7 +194,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 match job.state {
                     1 => {
                         // RUNNING
-                        nodelist = job.nodelist.clone();
+                        job_info = job;
                         break;
                     }
                     3..=7 => {
@@ -203,7 +203,6 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                         std::process::exit(1);
                     }
                     _ => {
-                        // Still pending — show reason
                         let reason = job.state_reason.clone();
                         if reason != last_reason && !reason.is_empty() && reason != "None" {
                             eprintln!("salloc: job {} pending ({})", job_id, reason);
@@ -218,15 +217,32 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         }
     }
 
+    let nodelist = &job_info.nodelist;
     eprintln!("salloc: Nodes {} are ready for job {}", nodelist, job_id);
     eprintln!("salloc: Granted job allocation {}", job_id);
 
-    // Spawn interactive shell with allocation env vars
+    let mut env = SpurEnv::new();
+    env.set_prefixed("JOB_ID", job_id);
+    env.set_prefixed("JOBID", job_id);
+    env.set_prefixed("JOB_NAME", &job_info.name);
+    env.set_prefixed("JOB_PARTITION", &job_info.partition);
+    env.set_prefixed("JOB_ACCOUNT", &job_info.account);
+    env.set_prefixed("JOB_QOS", &job_info.qos);
+    env.set_prefixed("NODELIST", nodelist);
+    env.set_prefixed("JOB_NODELIST", nodelist);
+    env.set_prefixed("NNODES", job_info.num_nodes);
+    env.set_prefixed("JOB_NUM_NODES", job_info.num_nodes);
+    env.set_prefixed("NTASKS", job_info.num_tasks);
+    env.set_prefixed("NPROCS", job_info.num_tasks);
+    env.set_prefixed("CPUS_PER_TASK", job_info.cpus_per_task);
+    env.set_prefixed("SUBMIT_DIR", &job_info.work_dir);
+
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let status = tokio::process::Command::new(&shell)
-        .env("SPUR_JOB_ID", job_id.to_string())
-        .env("SPUR_NODELIST", &nodelist)
-        .env("SPUR_NNODES", nodes.to_string())
+    let mut cmd = tokio::process::Command::new(&shell);
+    for (k, v) in env.into_map() {
+        cmd.env(k, v);
+    }
+    let status = cmd
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())

@@ -339,19 +339,7 @@ async fn spawn_job_process(
             .context("failed to create stderr file")?
     };
 
-    // Build environment
     let mut env = environment.clone();
-
-    // Set SLURM environment variables
-    env.insert("SPUR_JOB_ID".into(), job_id.to_string());
-    env.insert("SPUR_JOBID".into(), job_id.to_string());
-    env.insert(
-        "SPUR_JOB_NODELIST".into(),
-        hostname::get()
-            .map(|h| h.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "localhost".into()),
-    );
-    env.insert("SPUR_CPUS_ON_NODE".into(), cpus.to_string());
 
     // GPU isolation via registry-based device injection plan.
     if let Some(ref plan) = cfg.host_device_plan {

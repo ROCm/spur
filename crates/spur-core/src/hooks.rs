@@ -7,6 +7,8 @@ use anyhow::Context;
 use tokio::process::Command;
 use tracing::{info, warn};
 
+use crate::spur_env::SpurEnv;
+
 pub type JobId = u32;
 
 /// Context passed to prolog/epilog hook scripts via environment variables.
@@ -47,18 +49,24 @@ pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()
         .collect::<Vec<_>>()
         .join(",");
 
-    let child = Command::new(script_path)
-        .env("SPUR_JOB_ID", ctx.job_id.to_string())
-        .env("SPUR_JOB_USER", &username)
-        .env("SPUR_JOB_UID", ctx.uid.to_string())
-        .env("SPUR_JOB_GID", ctx.gid.to_string())
-        .env("SPUR_JOB_WORK_DIR", &ctx.work_dir)
-        .env("SPUR_JOB_PARTITION", &ctx.partition)
-        .env("SPUR_JOB_NODELIST", &ctx.nodelist)
-        .env("SPUR_JOB_GPUS", &gpu_list)
-        .env("SPUR_CPUS_ON_NODE", ctx.cpus.to_string())
-        .env("SPUR_JOB_MEMORY_MB", ctx.memory_mb.to_string())
-        .env("SPUR_SCRIPT_CONTEXT", &ctx.script_context)
+    let mut env = SpurEnv::new();
+    env.set_prefixed("JOB_ID", ctx.job_id);
+    env.set_prefixed("JOB_PARTITION", &ctx.partition);
+    env.set_prefixed("JOB_NODELIST", &ctx.nodelist);
+    env.set_prefixed("CPUS_ON_NODE", ctx.cpus);
+    env.set_spur_prefixed("JOB_USER", &username);
+    env.set_spur_prefixed("JOB_UID", ctx.uid);
+    env.set_spur_prefixed("JOB_GID", ctx.gid);
+    env.set_spur_prefixed("JOB_WORK_DIR", &ctx.work_dir);
+    env.set_spur_prefixed("JOB_GPUS", &gpu_list);
+    env.set_spur_prefixed("JOB_MEMORY_MB", ctx.memory_mb);
+    env.set_spur_prefixed("SCRIPT_CONTEXT", &ctx.script_context);
+
+    let mut cmd = Command::new(script_path);
+    for (k, v) in env.into_map() {
+        cmd.env(k, v);
+    }
+    let child = cmd
         .current_dir(&ctx.work_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -189,6 +197,27 @@ mod tests {
         assert_eq!(parts[3], "prolog_slurmd");
         assert_eq!(parts[4], "0,1");
         assert_eq!(parts[5], "8");
+    }
+
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn hook_receives_slurm_twins() {
+        let marker = tempfile::NamedTempFile::new().unwrap();
+        let marker_path = marker.path().to_str().unwrap().to_string();
+        let body = format!(
+            "echo \"$SLURM_JOB_ID|$SLURM_JOB_PARTITION|$SLURM_JOB_NODELIST|$SLURM_CPUS_ON_NODE\" > {}",
+            marker_path
+        );
+        let script = make_script(&body);
+        let ctx = test_ctx();
+        run_hook(script.to_str().unwrap(), &ctx).await.unwrap();
+
+        let content = std::fs::read_to_string(&marker_path).unwrap();
+        let parts: Vec<&str> = content.trim().split('|').collect();
+        assert_eq!(parts[0], "42");
+        assert_eq!(parts[1], "gpu");
+        assert_eq!(parts[2], "node01");
+        assert_eq!(parts[3], "8");
     }
 
     #[tokio::test]

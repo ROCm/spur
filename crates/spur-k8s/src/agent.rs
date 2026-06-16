@@ -18,6 +18,7 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, warn};
 
 use crate::crd::SpurJob;
+use spur_core::spur_env::SpurEnv;
 use spur_proto::proto::slurm_agent_server::SlurmAgent;
 use spur_proto::proto::*;
 
@@ -157,60 +158,55 @@ impl SlurmAgent for VirtualAgent {
         let tasks_per_node = spec.tasks_per_node.max(1);
         let node_rank = req.task_offset / tasks_per_node;
 
-        // Build env vars
-        let mut env_vars: Vec<EnvVar> = vec![
-            EnvVar {
-                name: "SPUR_JOB_ID".into(),
-                value: Some(job_id.to_string()),
-                ..Default::default()
-            },
-            EnvVar {
-                name: "SPUR_PEER_NODES".into(),
-                value: Some(peer_nodes.join(",")),
-                ..Default::default()
-            },
-            EnvVar {
-                name: "SPUR_TASK_OFFSET".into(),
-                value: Some(req.task_offset.to_string()),
-                ..Default::default()
-            },
-            EnvVar {
-                name: "SPUR_TARGET_NODE".into(),
-                value: Some(target_node.clone()),
-                ..Default::default()
-            },
-            EnvVar {
-                name: "SPUR_NODE_RANK".into(),
-                value: Some(node_rank.to_string()),
-                ..Default::default()
-            },
-        ];
+        // Build env vars via SpurEnv accumulator
+        let mut senv = SpurEnv::new();
+        senv.set_prefixed("JOB_ID", job_id);
+        senv.set_prefixed("JOBID", job_id);
+        senv.set_prefixed("JOB_NAME", &spec.name);
+        senv.set_prefixed("JOB_PARTITION", &spec.partition);
+        senv.set_prefixed("JOB_ACCOUNT", &spec.account);
+        senv.set_prefixed("JOB_QOS", &spec.qos);
+        senv.set_prefixed("NNODES", num_peers);
+        senv.set_prefixed("JOB_NUM_NODES", num_peers);
+        senv.set_prefixed("NTASKS", spec.num_tasks);
+        senv.set_prefixed("NPROCS", spec.num_tasks);
+        senv.set_prefixed("CPUS_PER_TASK", spec.cpus_per_task);
+        senv.set_prefixed("TASKS_PER_NODE", tasks_per_node);
+        senv.set_prefixed("NODEID", node_rank);
+        senv.set_prefixed("NODELIST", &spec.nodelist);
+        senv.set_prefixed("JOB_NODELIST", &target_node);
 
-        // For multi-node jobs, add distributed training env vars
-        if num_peers > 1 {
-            // MASTER_ADDR: first peer node's address (or headless service DNS)
-            let master_addr = format!("spur-job-{}.{}.svc.cluster.local", job_id, ns);
-            env_vars.push(EnvVar {
-                name: "MASTER_ADDR".into(),
-                value: Some(master_addr),
-                ..Default::default()
-            });
-            env_vars.push(EnvVar {
-                name: "MASTER_PORT".into(),
-                value: Some("29500".into()),
-                ..Default::default()
-            });
-            env_vars.push(EnvVar {
-                name: "WORLD_SIZE".into(),
-                value: Some(num_peers.to_string()),
-                ..Default::default()
-            });
-            env_vars.push(EnvVar {
-                name: "RANK".into(),
-                value: Some(node_rank.to_string()),
-                ..Default::default()
-            });
+        senv.set_spur_prefixed("TASK_OFFSET", req.task_offset);
+        senv.set_spur_prefixed("NODE_RANK", node_rank);
+        if !peer_nodes.is_empty() {
+            senv.set_spur_prefixed("PEER_NODES", peer_nodes.join(","));
         }
+        if !target_node.is_empty() {
+            senv.set_spur_prefixed("TARGET_NODE", &target_node);
+        }
+
+        senv.set("LOCAL_RANK", "0");
+        senv.set("LOCAL_WORLD_SIZE", tasks_per_node);
+        senv.set("NPROC_PER_NODE", tasks_per_node);
+        senv.set("NODE_RANK", node_rank);
+
+        if num_peers > 1 {
+            let master_addr = format!("spur-job-{}.{}.svc.cluster.local", job_id, ns);
+            senv.set("MASTER_ADDR", master_addr);
+            senv.set("MASTER_PORT", "29500");
+            senv.set("WORLD_SIZE", num_peers);
+            senv.set("RANK", node_rank);
+        }
+
+        let mut env_vars: Vec<EnvVar> = senv
+            .into_map()
+            .into_iter()
+            .map(|(name, value)| EnvVar {
+                name,
+                value: Some(value),
+                ..Default::default()
+            })
+            .collect();
 
         // Set GPU vendor-specific env vars for the runtime
         let gpu_count = req
