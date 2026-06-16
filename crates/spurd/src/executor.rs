@@ -640,7 +640,6 @@ fn move_to_cgroup(cgroup_path: &Path, pid: u32) -> bool {
     }
 }
 
-/// Clean up a job's cgroup.
 /// Whether the job's cgroup recorded an OOM kill (cgroup-v2 `memory.events`).
 /// False if the file is absent/unreadable. Call before `cleanup_cgroup`.
 pub fn cgroup_oom_killed(cgroup_path: &Path) -> bool {
@@ -653,6 +652,7 @@ pub fn cgroup_oom_killed(cgroup_path: &Path) -> bool {
     })
 }
 
+/// Kill any leftover processes in the job's cgroup and remove the directory.
 pub fn cleanup_cgroup(cgroup_path: &Path) {
     // Kill any remaining processes
     if let Ok(pids) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) {

@@ -59,6 +59,7 @@ pub(crate) struct PodTracker {
     expected: usize,
     completed: usize,
     failed: bool,
+    oom: bool,
     exit_code: i32,
     message: String,
 }
@@ -388,18 +389,19 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                 false
             };
 
-            // Extract richer status from container statuses
-            let (state, exit_code, message) = if pending_failure {
+            // Extract richer status from container statuses. `oom` carries an
+            // OOMKilled container out-of-band; the wire state stays Failed.
+            let (state, exit_code, message, oom) = if pending_failure {
                 let msg = pod
                     .status
                     .as_ref()
                     .and_then(|s| s.message.as_deref())
                     .unwrap_or("Pod rejected by kubelet before starting")
                     .to_string();
-                (4i32, 1i32, msg) // JOB_FAILED
+                (4i32, 1i32, msg, false) // JOB_FAILED
             } else {
                 match phase {
-                    "Succeeded" => (3, 0, String::new()), // JOB_COMPLETED
+                    "Succeeded" => (3, 0, String::new(), false), // JOB_COMPLETED
                     "Failed" => extract_failure_details(&pod),
                     _ => continue,
                 }
@@ -419,6 +421,7 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                         expected: 0, // unknown
                         completed: 0,
                         failed: false,
+                        oom: false,
                         exit_code: 0,
                         message: String::new(),
                     }
@@ -427,6 +430,7 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                 if state == 4 {
                     // JOB_FAILED
                     entry.failed = true;
+                    entry.oom = oom;
                     entry.exit_code = exit_code;
                     entry.message = message.clone();
                     // Report immediately on first failure
@@ -447,6 +451,11 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                         .get(&job_id)
                         .map(|t| if t.failed { t.exit_code } else { exit_code })
                         .unwrap_or(exit_code)
+                };
+
+                let final_oom = {
+                    let tracker = ctx.pod_tracker.lock().await;
+                    tracker.get(&job_id).map(|t| t.oom).unwrap_or(oom)
                 };
 
                 let final_message = {
@@ -492,19 +501,22 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                 info!(job_id, pod = %pod_name, phase, "reporting Pod completion to spurctld");
 
                 let mut ctrl = ctx.ctrl_client.lock().await;
-                // Honor a specific failure state (e.g. OUT_OF_MEMORY from an
-                // OOMKilled container); otherwise derive from the exit code.
-                let report_state = if state == spur_core::job::JobState::OutOfMemory.to_proto_i32()
-                {
-                    spur_core::job::JobState::OutOfMemory
+                // OOM is encoded via the signal sentinel so the wire state stays a
+                // valid completion report; spurctld maps it to OUT_OF_MEMORY.
+                let (report_state, report_exit, report_signal) = if final_oom {
+                    (spur_core::job::JobState::Completed, 0, OOM_KILL_SIGNAL)
                 } else {
-                    spur_core::job::JobState::completion_state_for_exit_code(final_exit_code)
+                    (
+                        spur_core::job::JobState::completion_state_for_exit_code(final_exit_code),
+                        final_exit_code,
+                        0,
+                    )
                 };
                 let req = ReportJobStatusRequest {
                     job_id,
                     state: report_state.to_proto_i32(),
-                    exit_code: final_exit_code,
-                    signal: 0,
+                    exit_code: report_exit,
+                    signal: report_signal,
                     message: final_message,
                     drain_node: false,
                     drain_reason: String::new(),
@@ -524,6 +536,9 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
 
 const TARGET_NODE_LABEL: &str = "spur.ai/target-node";
 
+/// SIGKILL (9) with the OOM sentinel bit set; spurctld strips it and maps to OUT_OF_MEMORY.
+const OOM_KILL_SIGNAL: i32 = 9 | spur_core::job::OOM_SIGNAL_FLAG;
+
 /// Resolve the Spur node name for a terminal Pod completion report.
 fn resolve_reporting_node(pod: &Pod) -> Option<String> {
     pod.spec
@@ -542,10 +557,13 @@ fn resolve_reporting_node(pod: &Pod) -> Option<String> {
 }
 
 /// Extract failure details from a Failed pod's container statuses.
-fn extract_failure_details(pod: &Pod) -> (i32, i32, String) {
+/// Returns `(wire_state, exit_code, message, oom)`. OOMKilled keeps the wire
+/// state JOB_FAILED and flags `oom` so the caller can encode it via the signal
+/// sentinel; spurctld maps that to OUT_OF_MEMORY at finalization.
+fn extract_failure_details(pod: &Pod) -> (i32, i32, String, bool) {
     let status = match pod.status.as_ref() {
         Some(s) => s,
-        None => return (4, 1, "Pod failed (no status)".into()),
+        None => return (4, 1, "Pod failed (no status)".into(), false),
     };
 
     if let Some(container_statuses) = &status.container_statuses {
@@ -558,9 +576,10 @@ fn extract_failure_details(pod: &Pod) -> (i32, i32, String) {
 
                     if reason == "OOMKilled" {
                         return (
-                            spur_core::job::JobState::OutOfMemory.to_proto_i32(),
+                            4,
                             exit_code,
                             "OOMKilled: container exceeded memory limit".into(),
+                            true,
                         );
                     }
 
@@ -571,19 +590,19 @@ fn extract_failure_details(pod: &Pod) -> (i32, i32, String) {
                     } else {
                         format!("exit_code={}", exit_code)
                     };
-                    return (4, exit_code, msg);
+                    return (4, exit_code, msg, false);
                 }
                 if let Some(waiting) = &state.waiting {
                     let reason = waiting.reason.clone().unwrap_or_default();
                     if reason == "ImagePullBackOff" || reason == "ErrImagePull" {
-                        return (4, 1, format!("Image pull failed: {}", reason));
+                        return (4, 1, format!("Image pull failed: {}", reason), false);
                     }
                 }
             }
         }
     }
 
-    (4, 1, "Pod failed".into())
+    (4, 1, "Pod failed".into(), false)
 }
 
 /// Clean up orphan Pods on startup — Pods with spur labels but no matching SpurJob.
@@ -931,8 +950,9 @@ mod tests {
             }),
         };
 
-        let (state, exit_code, message) = extract_failure_details(&pod);
-        assert_eq!(state, spur_core::job::JobState::OutOfMemory.to_proto_i32());
+        let (state, exit_code, message, oom) = extract_failure_details(&pod);
+        assert_eq!(state, 4, "OOM keeps wire state JOB_FAILED");
+        assert!(oom, "OOM flagged out-of-band for the signal sentinel");
         assert_eq!(exit_code, 137);
         assert!(message.contains("OOMKilled"));
     }
@@ -964,7 +984,7 @@ mod tests {
             }),
         };
 
-        let (state, exit_code, message) = extract_failure_details(&pod);
+        let (state, exit_code, message, _oom) = extract_failure_details(&pod);
         assert_eq!(state, 4);
         assert_eq!(exit_code, 42);
         assert!(message.contains("exit_code=42"));
@@ -997,7 +1017,7 @@ mod tests {
             }),
         };
 
-        let (state, exit_code, message) = extract_failure_details(&pod);
+        let (state, exit_code, message, _oom) = extract_failure_details(&pod);
         assert_eq!(state, 4);
         assert_eq!(exit_code, 1);
         assert_eq!(message, "Error: segfault in main");
@@ -1030,7 +1050,7 @@ mod tests {
             }),
         };
 
-        let (_, _, message) = extract_failure_details(&pod);
+        let (_, _, message, _oom) = extract_failure_details(&pod);
         assert_eq!(message, "DeadlineExceeded");
     }
 
@@ -1059,7 +1079,7 @@ mod tests {
             }),
         };
 
-        let (state, exit_code, message) = extract_failure_details(&pod);
+        let (state, exit_code, message, _oom) = extract_failure_details(&pod);
         assert_eq!(state, 4);
         assert_eq!(exit_code, 1);
         assert!(message.contains("ImagePullBackOff"));
@@ -1090,7 +1110,7 @@ mod tests {
             }),
         };
 
-        let (state, _, message) = extract_failure_details(&pod);
+        let (state, _, message, _oom) = extract_failure_details(&pod);
         assert_eq!(state, 4);
         assert!(message.contains("ErrImagePull"));
     }
@@ -1102,7 +1122,7 @@ mod tests {
             spec: None,
             status: None,
         };
-        let (state, exit_code, message) = extract_failure_details(&pod);
+        let (state, exit_code, message, _oom) = extract_failure_details(&pod);
         assert_eq!(state, 4);
         assert_eq!(exit_code, 1);
         assert_eq!(message, "Pod failed (no status)");
@@ -1120,7 +1140,7 @@ mod tests {
                 ..Default::default()
             }),
         };
-        let (state, exit_code, message) = extract_failure_details(&pod);
+        let (state, exit_code, message, _oom) = extract_failure_details(&pod);
         assert_eq!(state, 4);
         assert_eq!(exit_code, 1);
         assert_eq!(message, "Pod failed");
@@ -1138,7 +1158,7 @@ mod tests {
                 ..Default::default()
             }),
         };
-        let (state, exit_code, message) = extract_failure_details(&pod);
+        let (state, exit_code, message, _oom) = extract_failure_details(&pod);
         assert_eq!(state, 4);
         assert_eq!(exit_code, 1);
         assert_eq!(message, "Pod failed");

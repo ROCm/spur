@@ -18,7 +18,7 @@ use thiserror::Error;
 ///
 /// `None` while any task is non-terminal (or the slice is empty). Once all
 /// tasks are terminal: `Completed` iff all completed, else the worst terminal
-/// state by [`Failed > Deadline > NodeFail > Timeout > Cancelled`].
+/// state by [`OutOfMemory > Failed > Deadline > NodeFail > Timeout > Cancelled`].
 pub fn aggregate_array_state(task_states: &[JobState]) -> Option<JobState> {
     if task_states.is_empty() {
         return None;
@@ -33,7 +33,10 @@ pub fn aggregate_array_state(task_states: &[JobState]) -> Option<JobState> {
     // Worst-state precedence. Exhaustive (no catch-all) so a new JobState can't
     // be silently swallowed at rank 0, masking a failure.
     let rank = |s: &JobState| match s {
-        JobState::Failed | JobState::OutOfMemory => 5,
+        // OutOfMemory outranks Failed so it deterministically wins on ties
+        // rather than depending on iteration order.
+        JobState::OutOfMemory => 6,
+        JobState::Failed => 5,
         JobState::Deadline => 4,
         JobState::NodeFail => 3,
         JobState::Timeout => 2,
@@ -286,6 +289,19 @@ mod tests {
         assert_eq!(
             aggregate_array_state(&[JobState::Deadline, JobState::Failed]),
             Some(JobState::Failed)
+        );
+    }
+
+    #[test]
+    fn test_aggregate_oom_outranks_failed_regardless_of_order() {
+        // OOM must deterministically win over a generic Failed sibling.
+        assert_eq!(
+            aggregate_array_state(&[JobState::Failed, JobState::OutOfMemory]),
+            Some(JobState::OutOfMemory)
+        );
+        assert_eq!(
+            aggregate_array_state(&[JobState::OutOfMemory, JobState::Failed]),
+            Some(JobState::OutOfMemory)
         );
     }
 }
