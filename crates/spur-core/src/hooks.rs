@@ -50,17 +50,17 @@ pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()
         .join(",");
 
     let mut env = SpurEnv::new();
-    env.set_prefixed("JOB_ID", ctx.job_id);
-    env.set_prefixed("JOB_PARTITION", &ctx.partition);
-    env.set_prefixed("JOB_NODELIST", &ctx.nodelist);
-    env.set_prefixed("CPUS_ON_NODE", ctx.cpus);
-    env.set_spur_prefixed("JOB_USER", &username);
-    env.set_spur_prefixed("JOB_UID", ctx.uid);
-    env.set_spur_prefixed("JOB_GID", ctx.gid);
-    env.set_spur_prefixed("JOB_WORK_DIR", &ctx.work_dir);
-    env.set_spur_prefixed("JOB_GPUS", &gpu_list);
-    env.set_spur_prefixed("JOB_MEMORY_MB", ctx.memory_mb);
-    env.set_spur_prefixed("SCRIPT_CONTEXT", &ctx.script_context);
+    env.set_with_slurm_twin("SPUR_JOB_ID", ctx.job_id);
+    env.set_with_slurm_twin("SPUR_JOB_PARTITION", &ctx.partition);
+    env.set_with_slurm_twin("SPUR_JOB_NODELIST", &ctx.nodelist);
+    env.set_with_slurm_twin("SPUR_CPUS_ON_NODE", ctx.cpus);
+    env.set("SPUR_JOB_USER", &username);
+    env.set("SPUR_JOB_UID", ctx.uid);
+    env.set("SPUR_JOB_GID", ctx.gid);
+    env.set("SPUR_JOB_WORK_DIR", &ctx.work_dir);
+    env.set("SPUR_JOB_GPUS", &gpu_list);
+    env.set("SPUR_JOB_MEMORY_MB", ctx.memory_mb);
+    env.set("SPUR_SCRIPT_CONTEXT", &ctx.script_context);
 
     let mut cmd = Command::new(script_path);
     for (k, v) in env.into_map() {

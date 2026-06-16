@@ -460,40 +460,44 @@ impl SlurmAgent for AgentService {
         }
 
         // SPUR+SLURM twins
-        senv.set_prefixed("JOB_ID", job_id);
-        senv.set_prefixed("JOBID", job_id);
-        senv.set_prefixed("JOB_NAME", &spec.name);
-        senv.set_prefixed("JOB_PARTITION", &spec.partition);
-        senv.set_prefixed("JOB_ACCOUNT", &spec.account);
-        senv.set_prefixed("JOB_QOS", &spec.qos);
-        senv.set_prefixed("SUBMIT_DIR", &spec.work_dir);
-        senv.set_prefixed("NNODES", peer_nodes.len());
-        senv.set_prefixed("JOB_NUM_NODES", peer_nodes.len());
-        senv.set_prefixed("NTASKS", spec.num_tasks);
-        senv.set_prefixed("NPROCS", spec.num_tasks);
-        senv.set_prefixed("CPUS_PER_TASK", spec.cpus_per_task);
-        senv.set_prefixed("TASKS_PER_NODE", tasks_per_node);
-        senv.set_prefixed("NODEID", node_rank);
-        senv.set_prefixed("NODELIST", &spec.nodelist);
-        senv.set_prefixed("JOB_NODELIST", &hostname);
-        senv.set_prefixed("CPUS_ON_NODE", spec.cpus_per_task.max(1));
+        senv.set_with_slurm_twin("SPUR_JOB_ID", job_id);
+        senv.set_with_slurm_twin("SPUR_JOBID", job_id);
+        senv.set_with_slurm_twin("SPUR_JOB_NAME", &spec.name);
+        senv.set_with_slurm_twin("SPUR_JOB_PARTITION", &spec.partition);
+        senv.set_with_slurm_twin("SPUR_JOB_ACCOUNT", &spec.account);
+        senv.set_with_slurm_twin("SPUR_JOB_QOS", &spec.qos);
+        senv.set_with_slurm_twin("SPUR_SUBMIT_DIR", &work_dir);
+        senv.set_with_slurm_twin("SPUR_NNODES", peer_nodes.len());
+        senv.set_with_slurm_twin("SPUR_JOB_NUM_NODES", peer_nodes.len());
+        senv.set_with_slurm_twin("SPUR_NTASKS", spec.num_tasks);
+        senv.set_with_slurm_twin("SPUR_NPROCS", spec.num_tasks);
+        senv.set_with_slurm_twin("SPUR_CPUS_PER_TASK", spec.cpus_per_task);
+        senv.set_with_slurm_twin("SPUR_TASKS_PER_NODE", tasks_per_node);
+        senv.set_with_slurm_twin("SPUR_NODEID", node_rank);
+        senv.set_with_slurm_twin("SPUR_NODELIST", &spec.nodelist);
+        senv.set_with_slurm_twin("SPUR_JOB_NODELIST", &spec.nodelist);
+        senv.set_with_slurm_twin("SPURD_NODENAME", &hostname);
+        senv.set_with_slurm_twin(
+            "SPUR_CPUS_ON_NODE",
+            tasks_per_node * spec.cpus_per_task.max(1),
+        );
 
         if array_job_id != 0 {
-            senv.set_prefixed("ARRAY_JOB_ID", array_job_id);
-            senv.set_prefixed("ARRAY_TASK_ID", array_task_id);
+            senv.set_with_slurm_twin("SPUR_ARRAY_JOB_ID", array_job_id);
+            senv.set_with_slurm_twin("SPUR_ARRAY_TASK_ID", array_task_id);
         }
 
         // Spur-only vars
-        senv.set_spur_prefixed("TASK_OFFSET", task_offset);
-        senv.set_spur_prefixed("NODE_RANK", node_rank);
+        senv.set("SPUR_TASK_OFFSET", task_offset);
+        senv.set("SPUR_NODE_RANK", node_rank);
         if !peer_nodes.is_empty() {
-            senv.set_spur_prefixed("PEER_NODES", peer_nodes.join(","));
+            senv.set("SPUR_PEER_NODES", peer_nodes.join(","));
         }
         if !req.target_node.is_empty() {
-            senv.set_spur_prefixed("TARGET_NODE", &req.target_node);
+            senv.set("SPUR_TARGET_NODE", &req.target_node);
         }
         if !spec.burst_buffer.is_empty() {
-            senv.set_spur_prefixed("BURST_BUFFER", &spec.burst_buffer);
+            senv.set("SPUR_BURST_BUFFER", &spec.burst_buffer);
         }
 
         // Third-party distributed training / MPI env vars
@@ -659,10 +663,10 @@ impl SlurmAgent for AgentService {
             // Build the wrapper that launches N tasks with GPU partitioning
             let mut wrapper = String::from("#!/bin/bash\n");
             wrapper.push_str(&format!(
-                "SPUR_NTASKS={}\nSLURM_NTASKS={}\nSPUR_TASK_OFFSET=${{SPUR_TASK_OFFSET:-0}}\n",
-                tasks_per_node, tasks_per_node
+                "_TASKS_ON_NODE={}\nSPUR_TASK_OFFSET=${{SPUR_TASK_OFFSET:-0}}\n",
+                tasks_per_node
             ));
-            wrapper.push_str("for LOCAL_RANK in $(seq 0 $((SPUR_NTASKS - 1))); do\n");
+            wrapper.push_str("for LOCAL_RANK in $(seq 0 $((_TASKS_ON_NODE - 1))); do\n");
             wrapper.push_str("  export LOCAL_RANK\n");
             wrapper.push_str(SpurEnv::per_task_bash_exports());
             wrapper.push_str("  export PMI_RANK=$SPUR_PROCID\n");
@@ -673,7 +677,7 @@ impl SlurmAgent for AgentService {
             // Partition GPUs across tasks if GPUs are allocated
             wrapper.push_str("  if [ -n \"$SPUR_JOB_GPUS\" ]; then\n");
             wrapper.push_str("    IFS=',' read -ra _ALL_GPUS <<< \"$SPUR_JOB_GPUS\"\n");
-            wrapper.push_str("    _GPUS_PER_TASK=$(( ${#_ALL_GPUS[@]} / SPUR_NTASKS ))\n");
+            wrapper.push_str("    _GPUS_PER_TASK=$(( ${#_ALL_GPUS[@]} / _TASKS_ON_NODE ))\n");
             wrapper.push_str("    if [ $_GPUS_PER_TASK -gt 0 ]; then\n");
             wrapper.push_str("      _START=$((LOCAL_RANK * _GPUS_PER_TASK))\n");
             wrapper.push_str(
@@ -984,12 +988,12 @@ impl SlurmAgent for AgentService {
 
         let mut senv = SpurEnv::new();
         senv.extend(&req.environment);
-        senv.set_prefixed("JOB_ID", job_id);
-        senv.set_prefixed("JOBID", job_id);
-        senv.set_prefixed("JOB_PARTITION", &partition);
-        senv.set_prefixed("NODELIST", &nodelist);
-        senv.set_prefixed("JOB_NODELIST", &nodelist);
-        senv.set_prefixed("CPUS_ON_NODE", cpus);
+        senv.set_with_slurm_twin("SPUR_JOB_ID", job_id);
+        senv.set_with_slurm_twin("SPUR_JOBID", job_id);
+        senv.set_with_slurm_twin("SPUR_JOB_PARTITION", &partition);
+        senv.set_with_slurm_twin("SPUR_NODELIST", &nodelist);
+        senv.set_with_slurm_twin("SPUR_JOB_NODELIST", &nodelist);
+        senv.set_with_slurm_twin("SPUR_CPUS_ON_NODE", cpus);
         senv.extend(&gpu_env);
 
         let mut cmd = tokio::process::Command::new(&req.command[0]);

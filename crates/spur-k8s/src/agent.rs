@@ -160,29 +160,34 @@ impl SlurmAgent for VirtualAgent {
 
         // Build env vars via SpurEnv accumulator
         let mut senv = SpurEnv::new();
-        senv.set_prefixed("JOB_ID", job_id);
-        senv.set_prefixed("JOBID", job_id);
-        senv.set_prefixed("JOB_NAME", &spec.name);
-        senv.set_prefixed("JOB_PARTITION", &spec.partition);
-        senv.set_prefixed("JOB_ACCOUNT", &spec.account);
-        senv.set_prefixed("JOB_QOS", &spec.qos);
-        senv.set_prefixed("NNODES", num_peers);
-        senv.set_prefixed("JOB_NUM_NODES", num_peers);
-        senv.set_prefixed("NTASKS", spec.num_tasks);
-        senv.set_prefixed("NPROCS", spec.num_tasks);
-        senv.set_prefixed("CPUS_PER_TASK", spec.cpus_per_task);
-        senv.set_prefixed("TASKS_PER_NODE", tasks_per_node);
-        senv.set_prefixed("NODEID", node_rank);
-        senv.set_prefixed("NODELIST", &spec.nodelist);
-        senv.set_prefixed("JOB_NODELIST", &target_node);
+        senv.set_with_slurm_twin("SPUR_JOB_ID", job_id);
+        senv.set_with_slurm_twin("SPUR_JOBID", job_id);
+        senv.set_with_slurm_twin("SPUR_JOB_NAME", &spec.name);
+        senv.set_with_slurm_twin("SPUR_JOB_PARTITION", &spec.partition);
+        senv.set_with_slurm_twin("SPUR_JOB_ACCOUNT", &spec.account);
+        senv.set_with_slurm_twin("SPUR_JOB_QOS", &spec.qos);
+        senv.set_with_slurm_twin("SPUR_NNODES", num_peers);
+        senv.set_with_slurm_twin("SPUR_JOB_NUM_NODES", num_peers);
+        senv.set_with_slurm_twin("SPUR_NTASKS", spec.num_tasks);
+        senv.set_with_slurm_twin("SPUR_NPROCS", spec.num_tasks);
+        senv.set_with_slurm_twin("SPUR_CPUS_PER_TASK", spec.cpus_per_task);
+        senv.set_with_slurm_twin(
+            "SPUR_CPUS_ON_NODE",
+            tasks_per_node * spec.cpus_per_task.max(1),
+        );
+        senv.set_with_slurm_twin("SPUR_TASKS_PER_NODE", tasks_per_node);
+        senv.set_with_slurm_twin("SPUR_NODEID", node_rank);
+        senv.set_with_slurm_twin("SPUR_NODELIST", &spec.nodelist);
+        senv.set_with_slurm_twin("SPUR_JOB_NODELIST", &spec.nodelist);
+        senv.set_with_slurm_twin("SPURD_NODENAME", &target_node);
 
-        senv.set_spur_prefixed("TASK_OFFSET", req.task_offset);
-        senv.set_spur_prefixed("NODE_RANK", node_rank);
+        senv.set("SPUR_TASK_OFFSET", req.task_offset);
+        senv.set("SPUR_NODE_RANK", node_rank);
         if !peer_nodes.is_empty() {
-            senv.set_spur_prefixed("PEER_NODES", peer_nodes.join(","));
+            senv.set("SPUR_PEER_NODES", peer_nodes.join(","));
         }
         if !target_node.is_empty() {
-            senv.set_spur_prefixed("TARGET_NODE", &target_node);
+            senv.set("SPUR_TARGET_NODE", &target_node);
         }
 
         senv.set("LOCAL_RANK", "0");

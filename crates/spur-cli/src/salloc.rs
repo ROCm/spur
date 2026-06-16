@@ -222,20 +222,20 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     eprintln!("salloc: Granted job allocation {}", job_id);
 
     let mut env = SpurEnv::new();
-    env.set_prefixed("JOB_ID", job_id);
-    env.set_prefixed("JOBID", job_id);
-    env.set_prefixed("JOB_NAME", &job_info.name);
-    env.set_prefixed("JOB_PARTITION", &job_info.partition);
-    env.set_prefixed("JOB_ACCOUNT", &job_info.account);
-    env.set_prefixed("JOB_QOS", &job_info.qos);
-    env.set_prefixed("NODELIST", nodelist);
-    env.set_prefixed("JOB_NODELIST", nodelist);
-    env.set_prefixed("NNODES", job_info.num_nodes);
-    env.set_prefixed("JOB_NUM_NODES", job_info.num_nodes);
-    env.set_prefixed("NTASKS", job_info.num_tasks);
-    env.set_prefixed("NPROCS", job_info.num_tasks);
-    env.set_prefixed("CPUS_PER_TASK", job_info.cpus_per_task);
-    env.set_prefixed("SUBMIT_DIR", &job_info.work_dir);
+    env.set_with_slurm_twin("SPUR_JOB_ID", job_id);
+    env.set_with_slurm_twin("SPUR_JOBID", job_id);
+    env.set_with_slurm_twin("SPUR_JOB_NAME", &job_info.name);
+    env.set_with_slurm_twin("SPUR_JOB_PARTITION", &job_info.partition);
+    env.set_with_slurm_twin("SPUR_JOB_ACCOUNT", &job_info.account);
+    env.set_with_slurm_twin("SPUR_JOB_QOS", &job_info.qos);
+    env.set_with_slurm_twin("SPUR_NODELIST", nodelist);
+    env.set_with_slurm_twin("SPUR_JOB_NODELIST", nodelist);
+    env.set_with_slurm_twin("SPUR_NNODES", job_info.num_nodes);
+    env.set_with_slurm_twin("SPUR_JOB_NUM_NODES", job_info.num_nodes);
+    env.set_with_slurm_twin("SPUR_NTASKS", job_info.num_tasks);
+    env.set_with_slurm_twin("SPUR_NPROCS", job_info.num_tasks);
+    env.set_with_slurm_twin("SPUR_CPUS_PER_TASK", job_info.cpus_per_task);
+    env.set_with_slurm_twin("SPUR_SUBMIT_DIR", &job_info.work_dir);
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let mut cmd = tokio::process::Command::new(&shell);

@@ -22,20 +22,20 @@ impl SpurEnv {
         }
     }
 
-    /// Insert both `SPUR_{suffix}` and `SLURM_{suffix}` with the same value.
-    pub fn set_prefixed(&mut self, suffix: &str, value: impl ToString) {
+    /// Insert `name` and, if it starts with `SPUR`, a twin with the `SPUR`
+    /// prefix replaced by `SLURM` (e.g. `SPUR_JOB_ID` → `SLURM_JOB_ID`)
+    /// If `name` doesn't start with `SPUR`, only the original is inserted.
+    pub fn set_with_slurm_twin(&mut self, name: &str, value: impl ToString) {
         let v = value.to_string();
-        self.vars.insert(format!("SPUR_{suffix}"), v.clone());
-        self.vars.insert(format!("SLURM_{suffix}"), v);
+        if let Some(rest) = name.strip_prefix("SPUR") {
+            self.vars.insert(name.to_string(), v.clone());
+            self.vars.insert(format!("SLURM{rest}"), v);
+        } else {
+            self.vars.insert(name.to_string(), v);
+        }
     }
 
-    /// Insert only `SPUR_{suffix}` (no Slurm equivalent).
-    pub fn set_spur_prefixed(&mut self, suffix: &str, value: impl ToString) {
-        self.vars
-            .insert(format!("SPUR_{suffix}"), value.to_string());
-    }
-
-    /// Insert a raw variable with no prefix.
+    /// Insert a variable as-is.
     pub fn set(&mut self, name: &str, value: impl ToString) {
         self.vars.insert(name.to_string(), value.to_string());
     }
@@ -77,9 +77,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn set_prefixed_inserts_both_twins() {
+    fn twin_inserts_spur_and_slurm() {
         let mut env = SpurEnv::new();
-        env.set_prefixed("JOB_ID", 42);
+        env.set_with_slurm_twin("SPUR_JOB_ID", 42);
         let map = env.into_map();
         assert_eq!(map.get("SPUR_JOB_ID").unwrap(), "42");
         assert_eq!(map.get("SLURM_JOB_ID").unwrap(), "42");
@@ -87,12 +87,21 @@ mod tests {
     }
 
     #[test]
-    fn set_spur_prefixed_inserts_only_spur() {
+    fn twin_handles_spurd_prefix() {
         let mut env = SpurEnv::new();
-        env.set_spur_prefixed("PEER_NODES", "node1,node2");
+        env.set_with_slurm_twin("SPURD_NODENAME", "node01");
         let map = env.into_map();
-        assert_eq!(map.get("SPUR_PEER_NODES").unwrap(), "node1,node2");
-        assert!(!map.contains_key("SLURM_PEER_NODES"));
+        assert_eq!(map.get("SPURD_NODENAME").unwrap(), "node01");
+        assert_eq!(map.get("SLURMD_NODENAME").unwrap(), "node01");
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn twin_without_spur_prefix_inserts_once() {
+        let mut env = SpurEnv::new();
+        env.set_with_slurm_twin("PATH", "/usr/bin");
+        let map = env.into_map();
+        assert_eq!(map.get("PATH").unwrap(), "/usr/bin");
         assert_eq!(map.len(), 1);
     }
 
@@ -102,14 +111,13 @@ mod tests {
         env.set("MASTER_ADDR", "10.0.0.1");
         let map = env.into_map();
         assert_eq!(map.get("MASTER_ADDR").unwrap(), "10.0.0.1");
-        assert!(!map.contains_key("SPUR_MASTER_ADDR"));
         assert_eq!(map.len(), 1);
     }
 
     #[test]
     fn extend_merges_raw_vars() {
         let mut env = SpurEnv::new();
-        env.set_prefixed("JOB_ID", 1);
+        env.set_with_slurm_twin("SPUR_JOB_ID", 1);
 
         let mut extra = HashMap::new();
         extra.insert("PMI_SIZE".into(), "4".into());
@@ -125,20 +133,20 @@ mod tests {
     #[test]
     fn later_insert_overwrites_earlier() {
         let mut env = SpurEnv::new();
-        env.set_prefixed("JOB_ID", 1);
-        env.set_prefixed("JOB_ID", 2);
+        env.set_with_slurm_twin("SPUR_JOB_ID", 1);
+        env.set_with_slurm_twin("SPUR_JOB_ID", 2);
         let map = env.into_map();
         assert_eq!(map.get("SPUR_JOB_ID").unwrap(), "2");
         assert_eq!(map.get("SLURM_JOB_ID").unwrap(), "2");
     }
 
     #[test]
-    fn extend_does_not_clobber_later_prefixed() {
+    fn extend_does_not_clobber_later_twin() {
         let mut env = SpurEnv::new();
         let mut user = HashMap::new();
         user.insert("SPUR_JOB_ID".into(), "user-value".into());
         env.extend(&user);
-        env.set_prefixed("JOB_ID", 99);
+        env.set_with_slurm_twin("SPUR_JOB_ID", 99);
         let map = env.into_map();
         assert_eq!(map["SPUR_JOB_ID"], "99");
         assert_eq!(map["SLURM_JOB_ID"], "99");
