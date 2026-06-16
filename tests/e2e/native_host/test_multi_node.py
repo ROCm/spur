@@ -21,8 +21,10 @@ class TestMultiNodeDispatch:
             "#!/bin/bash\n"
             'echo "node=$(hostname)"\n'
             'echo "SPUR_JOB_ID=${SPUR_JOB_ID}"\n'
+            'echo "SLURM_JOB_ID=${SLURM_JOB_ID}"\n'
             'echo "SPUR_NODE_RANK=${SPUR_NODE_RANK}"\n'
-            'echo "SPUR_NUM_NODES=${SPUR_NUM_NODES}"\n'
+            'echo "SPUR_NNODES=${SPUR_NNODES}"\n'
+            'echo "SLURM_NNODES=${SLURM_NNODES}"\n'
             'echo "SPUR_PEER_NODES=${SPUR_PEER_NODES}"\n'
             "echo TWO_NODE_OK\n",
         )
@@ -33,12 +35,15 @@ class TestMultiNodeDispatch:
         wait_job(cluster, job_id, timeout=90)
         all_output = cluster.read_output_all_nodes(out_path)
         assert "TWO_NODE_OK" in all_output, f"missing TWO_NODE_OK:\n{all_output}"
-        assert "SPUR_NUM_NODES=2" in all_output, f"missing SPUR_NUM_NODES=2:\n{all_output}"
+        assert "SPUR_NNODES=2" in all_output, f"missing SPUR_NNODES=2:\n{all_output}"
+        assert "SLURM_NNODES=2" in all_output, f"missing SLURM_NNODES=2:\n{all_output}"
         assert "SPUR_NODE_RANK=" in all_output, f"missing SPUR_NODE_RANK:\n{all_output}"
         assert any(
             l.startswith("SPUR_PEER_NODES=") and len(l) > len("SPUR_PEER_NODES=")
             for l in all_output.splitlines()
         ), f"SPUR_PEER_NODES should be non-empty:\n{all_output}"
+        # SLURM twins for prefixed vars
+        assert "SLURM_JOB_ID=" in all_output, f"missing SLURM_JOB_ID:\n{all_output}"
 
     def test_distributed_env_vars(self, multi_node_cluster):
         cluster = multi_node_cluster

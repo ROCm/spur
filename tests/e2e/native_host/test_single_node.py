@@ -28,7 +28,8 @@ class TestJobBasics:
         script = cluster.write_file(
             "test-basic.sh",
             '#!/bin/bash\necho "hostname=$(hostname)"\n'
-            'echo "SPUR_JOB_ID=${SPUR_JOB_ID}"\necho SUCCESS\n',
+            'echo "SPUR_JOB_ID=${SPUR_JOB_ID}"\n'
+            'echo "SLURM_JOB_ID=${SLURM_JOB_ID}"\necho SUCCESS\n',
         )
         out = cluster.sbatch(["-J", "test-basic", "-N", "1", "-o", out_path, script])
         job_id = parse_job_id(out)
@@ -40,6 +41,7 @@ class TestJobBasics:
         content = cluster.read_output_on_any_node(out_path)
         assert "SUCCESS" in content, f"output:\n{content}"
         assert f"SPUR_JOB_ID={job_id}" in content, f"output:\n{content}"
+        assert f"SLURM_JOB_ID={job_id}" in content, f"output:\n{content}"
 
     def test_failed_job_state(self, cluster):
         out_path = f"{cluster.remote_dir}/fail.out"

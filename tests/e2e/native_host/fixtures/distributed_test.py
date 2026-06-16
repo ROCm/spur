@@ -25,7 +25,7 @@ def get_spur_env():
     return {
         "job_id": os.environ.get("SPUR_JOB_ID", "0"),
         "node_rank": int(os.environ.get("SPUR_NODE_RANK", os.environ.get("RANK", "0"))),
-        "num_nodes": int(os.environ.get("SPUR_NUM_NODES", os.environ.get("WORLD_SIZE", "1"))),
+        "num_nodes": int(os.environ.get("SPUR_NNODES", os.environ.get("WORLD_SIZE", "1"))),
         "task_offset": int(os.environ.get("SPUR_TASK_OFFSET", "0")),
         "peer_nodes": os.environ.get("SPUR_PEER_NODES", ""),
     }

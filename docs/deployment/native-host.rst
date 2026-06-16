@@ -154,7 +154,7 @@ Submitting Jobs
    #SBATCH --time=4:00:00
 
    torchrun \
-       --nnodes=$SPUR_NUM_NODES \
+       --nnodes=$SPUR_NNODES \
        --node_rank=$SPUR_TASK_OFFSET \
        --master_addr=$(echo $SPUR_PEER_NODES | cut -d: -f1) \
        --master_port=29500 \
@@ -178,7 +178,7 @@ Each node in a multi-node job receives:
    * - ``SPUR_JOB_ID``
      - ``42``
      - Job ID
-   * - ``SPUR_NUM_NODES``
+   * - ``SPUR_NNODES``
      - ``2``
      - Total nodes in allocation
    * - ``SPUR_TASK_OFFSET``
