@@ -61,6 +61,7 @@ enum JobState {
   JOB_PREEMPTED = 8;
   JOB_SUSPENDED = 9;
   JOB_DEADLINE = 10;
+  JOB_OUT_OF_MEMORY = 11;
 }
 
 enum NodeState {

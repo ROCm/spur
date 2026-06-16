@@ -26,7 +26,12 @@ pub enum JobState {
     Preempted,
     Suspended,
     Deadline,
+    OutOfMemory,
 }
+
+/// Sentinel bit spurd OR's into a completion `signal` for an OOM kill, so the
+/// controller maps it to `JobState::OutOfMemory`; low bits keep the real signal.
+pub const OOM_SIGNAL_FLAG: i32 = 0x1000;
 
 impl JobState {
     /// Short code used in squeue output (matches Slurm).
@@ -43,6 +48,7 @@ impl JobState {
             Self::Preempted => "PR",
             Self::Suspended => "S",
             Self::Deadline => "DL",
+            Self::OutOfMemory => "OOM",
         }
     }
 
@@ -60,6 +66,7 @@ impl JobState {
             Self::Preempted => "PREEMPTED",
             Self::Suspended => "SUSPENDED",
             Self::Deadline => "DEADLINE",
+            Self::OutOfMemory => "OUT_OF_MEMORY",
         }
     }
 
@@ -72,6 +79,7 @@ impl JobState {
                 | Self::Timeout
                 | Self::NodeFail
                 | Self::Deadline
+                | Self::OutOfMemory
         )
     }
 
@@ -113,7 +121,7 @@ impl JobState {
     }
 
     /// Every core variant, in proto discriminant order for iteration only.
-    pub const ALL: [JobState; 11] = [
+    pub const ALL: [JobState; 12] = [
         Self::Pending,
         Self::Running,
         Self::Completing,
@@ -125,6 +133,7 @@ impl JobState {
         Self::Preempted,
         Self::Suspended,
         Self::Deadline,
+        Self::OutOfMemory,
     ];
 
     pub const COUNT: usize = Self::ALL.len();
@@ -143,6 +152,7 @@ impl JobState {
             spur_proto::proto::JobState::JobPreempted => Self::Preempted,
             spur_proto::proto::JobState::JobSuspended => Self::Suspended,
             spur_proto::proto::JobState::JobDeadline => Self::Deadline,
+            spur_proto::proto::JobState::JobOutOfMemory => Self::OutOfMemory,
         }
     }
 
@@ -160,6 +170,7 @@ impl JobState {
             Self::Preempted => spur_proto::proto::JobState::JobPreempted,
             Self::Suspended => spur_proto::proto::JobState::JobSuspended,
             Self::Deadline => spur_proto::proto::JobState::JobDeadline,
+            Self::OutOfMemory => spur_proto::proto::JobState::JobOutOfMemory,
         }
     }
 
@@ -706,9 +717,11 @@ impl Job {
             (JobState::Running, JobState::NodeFail) => true,
             (JobState::Running, JobState::Preempted) => true,
             (JobState::Running, JobState::Suspended) => true,
+            (JobState::Running, JobState::OutOfMemory) => true,
             (JobState::Completing, JobState::Completed) => true,
             (JobState::Completing, JobState::Failed) => true,
             (JobState::Completing, JobState::Cancelled) => true,
+            (JobState::Completing, JobState::OutOfMemory) => true,
             (JobState::Suspended, JobState::Running) => true,
             (JobState::Suspended, JobState::Cancelled) => true,
             // Completion routes through Completing like a running job (Slurm JOB_COMPLETING).
@@ -720,6 +733,7 @@ impl Job {
             (JobState::Suspended, JobState::Failed) => true,
             (JobState::Suspended, JobState::Timeout) => true,
             (JobState::Suspended, JobState::NodeFail) => true,
+            (JobState::Suspended, JobState::OutOfMemory) => true,
             // Requeue transitions: terminal → Pending (for --requeue jobs)
             (JobState::Timeout, JobState::Pending) => true,
             (JobState::Preempted, JobState::Pending) => true,
@@ -1045,6 +1059,42 @@ mod tests {
     }
 
     #[test]
+    fn out_of_memory_state_terminal_and_reachable_from_active() {
+        assert!(JobState::OutOfMemory.is_terminal());
+        assert!(!JobState::OutOfMemory.is_active());
+        assert_eq!(JobState::OutOfMemory.code(), "OOM");
+        assert_eq!(JobState::OutOfMemory.display(), "OUT_OF_MEMORY");
+
+        // Running -> OutOfMemory (direct), Completing -> OutOfMemory, and
+        // Suspended -> OutOfMemory are all legal; Pending is not.
+        let mut r = make_job();
+        r.transition(JobState::Running).unwrap();
+        r.transition(JobState::OutOfMemory).unwrap();
+        assert_eq!(r.state, JobState::OutOfMemory);
+        assert!(r.end_time.is_some());
+
+        let mut c = make_job();
+        c.transition(JobState::Running).unwrap();
+        c.transition(JobState::Completing).unwrap();
+        c.transition(JobState::OutOfMemory).unwrap();
+        assert_eq!(c.state, JobState::OutOfMemory);
+
+        let mut p = make_job();
+        assert!(p.transition(JobState::OutOfMemory).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn oom_signal_flag_is_outside_real_signal_range() {
+        // The sentinel must not collide with any real terminating signal (1..=64)
+        // and must be cleanly strippable to recover the underlying SIGKILL.
+        assert!(OOM_SIGNAL_FLAG > 64);
+        let encoded = OOM_SIGNAL_FLAG | 9;
+        assert_ne!(encoded & OOM_SIGNAL_FLAG, 0);
+        assert_eq!(encoded & !OOM_SIGNAL_FLAG, 9);
+    }
+
+    #[test]
     fn deadline_reason_displays_slurm_string() {
         // Slurm reports this exact string ("DeadLine", note the cap D and L).
         // squeue scrapers and Slurm-compat clients pattern-match on it.
@@ -1100,6 +1150,7 @@ mod tests {
             (P::JobPreempted, JobState::Preempted),
             (P::JobSuspended, JobState::Suspended),
             (P::JobDeadline, JobState::Deadline),
+            (P::JobOutOfMemory, JobState::OutOfMemory),
         ];
 
         assert_eq!(TABLE.len(), JobState::COUNT);

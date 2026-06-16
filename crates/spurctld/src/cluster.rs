@@ -1964,8 +1964,21 @@ impl ClusterManager {
                         // none allocated, where derived_completion falls back to
                         // the worst completion.
                         let primary = job.allocated_nodes.first().cloned().unwrap_or_default();
-                        let (final_state, final_exit, final_signal) =
+                        // spurd flags an OOM kill via a sentinel bit in the signal;
+                        // detect it, then strip the bit so the stored signal is the
+                        // real SIGKILL and the job reports OUT_OF_MEMORY.
+                        let oom = job
+                            .node_completions
+                            .values()
+                            .any(|c| c.signal & spur_core::job::OOM_SIGNAL_FLAG != 0);
+                        let (derived_state, final_exit, raw_signal) =
                             Job::derived_completion(&job.node_completions, &primary);
+                        let final_signal = raw_signal & !spur_core::job::OOM_SIGNAL_FLAG;
+                        let final_state = if oom {
+                            JobState::OutOfMemory
+                        } else {
+                            derived_state
+                        };
                         match job.transition(final_state) {
                             Ok(()) => {
                                 job.exit_code = Some(final_exit);
@@ -1974,7 +1987,9 @@ impl ClusterManager {
                                 // steps, accumulated live by JobStepComplete; a
                                 // job with no srun steps keeps 0 (Slurm parity),
                                 // not the batch exit. Left as-is here.
-                                job.pending_reason = if final_signal != 0 {
+                                job.pending_reason = if oom {
+                                    PendingReason::OutOfMemory
+                                } else if final_signal != 0 {
                                     PendingReason::RaisedSignal
                                 } else if final_exit != 0 {
                                     PendingReason::NonZeroExitCode
@@ -3225,6 +3240,45 @@ mod tests {
         assert_eq!(job.state, JobState::Completed);
         assert_eq!(job.exit_code, Some(0));
         assert!(job.node_completions.is_empty());
+        assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_job_node_complete_oom_sets_out_of_memory() {
+        // spurd reports an OOM kill as SIGKILL with the OOM sentinel bit OR'd in.
+        // The job must finalize as OUT_OF_MEMORY / Reason=OutOfMemory, with the
+        // sentinel stripped so the stored signal is the real SIGKILL (9).
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("oom")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        let alloc = scalar_alloc(2, 4000);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["worker1".into()],
+            resources: alloc.clone(),
+            per_node_alloc: per_node_for(&["worker1"], alloc),
+        });
+
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id: 1,
+            node_name: "worker1".into(),
+            exit_code: 0,
+            signal: spur_core::job::OOM_SIGNAL_FLAG | 9,
+        });
+
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::OutOfMemory);
+        assert_eq!(job.pending_reason, PendingReason::OutOfMemory);
+        assert_eq!(job.exit_signal, 9, "OOM sentinel must be stripped");
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
     }
 

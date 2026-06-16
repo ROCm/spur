@@ -492,8 +492,14 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                 info!(job_id, pod = %pod_name, phase, "reporting Pod completion to spurctld");
 
                 let mut ctrl = ctx.ctrl_client.lock().await;
-                let report_state =
-                    spur_core::job::JobState::completion_state_for_exit_code(final_exit_code);
+                // Honor a specific failure state (e.g. OUT_OF_MEMORY from an
+                // OOMKilled container); otherwise derive from the exit code.
+                let report_state = if state == spur_core::job::JobState::OutOfMemory.to_proto_i32()
+                {
+                    spur_core::job::JobState::OutOfMemory
+                } else {
+                    spur_core::job::JobState::completion_state_for_exit_code(final_exit_code)
+                };
                 let req = ReportJobStatusRequest {
                     job_id,
                     state: report_state.to_proto_i32(),
@@ -552,7 +558,7 @@ fn extract_failure_details(pod: &Pod) -> (i32, i32, String) {
 
                     if reason == "OOMKilled" {
                         return (
-                            4,
+                            spur_core::job::JobState::OutOfMemory.to_proto_i32(),
                             exit_code,
                             "OOMKilled: container exceeded memory limit".into(),
                         );
@@ -926,7 +932,7 @@ mod tests {
         };
 
         let (state, exit_code, message) = extract_failure_details(&pod);
-        assert_eq!(state, 4);
+        assert_eq!(state, spur_core::job::JobState::OutOfMemory.to_proto_i32());
         assert_eq!(exit_code, 137);
         assert!(message.contains("OOMKilled"));
     }

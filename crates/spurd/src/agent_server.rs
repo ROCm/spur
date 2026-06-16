@@ -156,7 +156,17 @@ impl AgentService {
 
                 for (job_id, tracked) in jobs.iter_mut() {
                     match tracked.job.try_wait() {
-                        Ok(Some((exit_code, signal))) => {
+                        Ok(Some((exit_code, mut signal))) => {
+                            // Disambiguate an OOM kill (cgroup memory.events) from
+                            // a plain SIGKILL by OR'ing a sentinel into the reported
+                            // signal; read before cleanup_cgroup removes the dir.
+                            let cgroup = tracked.job.take_cgroup();
+                            if let Some(ref cg) = cgroup {
+                                if crate::executor::cgroup_oom_killed(cg) {
+                                    warn!(job_id, "job OOM-killed (cgroup oom_kill > 0)");
+                                    signal |= spur_core::job::OOM_SIGNAL_FLAG;
+                                }
+                            }
                             info!(job_id, exit_code, signal, "job finished");
                             completed.push(CompletedJob {
                                 job_id: *job_id,
@@ -164,7 +174,7 @@ impl AgentService {
                                 signal,
                                 rootfs_mode: tracked.rootfs_mode.clone(),
                                 allocation: tracked.allocation.take(),
-                                cgroup: tracked.job.take_cgroup(),
+                                cgroup,
                                 work_dir: tracked.work_dir.clone(),
                                 uid: tracked.uid,
                                 gid: tracked.gid,

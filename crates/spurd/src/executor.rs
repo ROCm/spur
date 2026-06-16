@@ -542,10 +542,25 @@ fn setup_cgroup(
     memory_mb: u64,
     cpu_ids: &[u32],
 ) -> anyhow::Result<Option<PathBuf>> {
-    let cgroup_path = PathBuf::from(CGROUP_ROOT).join(format!("job_{}", job_id));
+    let cgroup_root = PathBuf::from(CGROUP_ROOT);
+    let cgroup_path = cgroup_root.join(format!("job_{}", job_id));
 
-    // Try to create cgroup — when running as root, failure is fatal.
-    // Non-root is expected to fail (development/test environments).
+    // Delegate controllers to children: in cgroup-v2 a child only gets
+    // memory.*/cpu.*/pids.* files if the parent lists them in subtree_control;
+    // without this the per-job memory limit is never enforced. Root failure fatal.
+    if let Err(e) = std::fs::create_dir_all(&cgroup_root) {
+        if nix::unistd::geteuid().is_root() {
+            anyhow::bail!("cgroup root creation failed as root: {}", e);
+        }
+        warn!(job_id, error = %e, "cgroup creation failed (not root), running without isolation");
+        return Ok(None);
+    }
+    let subtree = cgroup_root.join("cgroup.subtree_control");
+    for ctrl in ["+memory", "+cpu", "+pids", "+cpuset"] {
+        if let Err(e) = std::fs::write(&subtree, ctrl) {
+            warn!(job_id, controller = ctrl, error = %e, "failed to delegate cgroup controller");
+        }
+    }
     if let Err(e) = std::fs::create_dir_all(&cgroup_path) {
         if nix::unistd::geteuid().is_root() {
             anyhow::bail!("cgroup creation failed as root: {}", e);
@@ -626,6 +641,18 @@ fn move_to_cgroup(cgroup_path: &Path, pid: u32) -> bool {
 }
 
 /// Clean up a job's cgroup.
+/// Whether the job's cgroup recorded an OOM kill (cgroup-v2 `memory.events`).
+/// False if the file is absent/unreadable. Call before `cleanup_cgroup`.
+pub fn cgroup_oom_killed(cgroup_path: &Path) -> bool {
+    let Ok(events) = std::fs::read_to_string(cgroup_path.join("memory.events")) else {
+        return false;
+    };
+    events.lines().any(|line| {
+        let mut it = line.split_whitespace();
+        matches!((it.next(), it.next()), (Some("oom_kill"), Some(n)) if n != "0")
+    })
+}
+
 pub fn cleanup_cgroup(cgroup_path: &Path) {
     // Kill any remaining processes
     if let Ok(pids) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) {
@@ -1024,6 +1051,27 @@ mod tests {
             "/var/log/job-42.log"
         );
         assert_eq!(resolve_output_path("", 42, "/tmp"), "/tmp/spur-42.out");
+    }
+
+    #[test]
+    fn cgroup_oom_killed_parses_memory_events() {
+        let dir = tempfile::tempdir().unwrap();
+        // Missing file (no cgroup isolation) -> not OOM.
+        assert!(!cgroup_oom_killed(dir.path()));
+        // oom_kill 0 -> not OOM.
+        std::fs::write(
+            dir.path().join("memory.events"),
+            "low 0\nhigh 0\nmax 5\noom 0\noom_kill 0\n",
+        )
+        .unwrap();
+        assert!(!cgroup_oom_killed(dir.path()));
+        // oom_kill > 0 -> OOM.
+        std::fs::write(
+            dir.path().join("memory.events"),
+            "low 0\nhigh 0\nmax 12\noom 1\noom_kill 1\n",
+        )
+        .unwrap();
+        assert!(cgroup_oom_killed(dir.path()));
     }
 
     #[test]

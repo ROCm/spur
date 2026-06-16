@@ -33,7 +33,7 @@ pub fn aggregate_array_state(task_states: &[JobState]) -> Option<JobState> {
     // Worst-state precedence. Exhaustive (no catch-all) so a new JobState can't
     // be silently swallowed at rank 0, masking a failure.
     let rank = |s: &JobState| match s {
-        JobState::Failed => 5,
+        JobState::Failed | JobState::OutOfMemory => 5,
         JobState::Deadline => 4,
         JobState::NodeFail => 3,
         JobState::Timeout => 2,
