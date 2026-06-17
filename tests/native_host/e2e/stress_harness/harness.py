@@ -33,6 +33,18 @@ if TYPE_CHECKING:
 _DEFAULT_TIERS = "50"
 
 
+def _parse_int_env(var_name: str, raw: str) -> int:
+    """Parse an integer from env or tier token; raise a clear error on failure."""
+    try:
+        return int(raw)
+    except ValueError as e:
+        raise ValueError(f"{var_name}: expected integer, got {raw!r}") from e
+
+
+def _env_int(var_name: str, default: str) -> int:
+    return _parse_int_env(var_name, os.environ.get(var_name, default))
+
+
 def parse_tiers_from_env() -> list[int]:
     raw = os.environ.get("SPUR_STRESS_TIERS", _DEFAULT_TIERS).strip()
     tiers: list[int] = []
@@ -40,31 +52,46 @@ def parse_tiers_from_env() -> list[int]:
         part = part.strip()
         if not part:
             continue
-        tiers.append(int(part))
+        tiers.append(_parse_int_env("SPUR_STRESS_TIERS", part))
     if not tiers:
         tiers = [50]
     return tiers
 
 
 def _stress_parallel() -> int:
-    return max(1, int(os.environ.get("SPUR_STRESS_PARALLEL", "32")))
+    return max(1, _env_int("SPUR_STRESS_PARALLEL", "32"))
 
 
 def _stress_sleep_s() -> int:
-    return max(0, int(os.environ.get("SPUR_STRESS_SLEEP", "0")))
+    return max(0, _env_int("SPUR_STRESS_SLEEP", "0"))
 
 
 def _drain_timeout_s() -> int:
-    return max(30, int(os.environ.get("SPUR_STRESS_DRAIN_TIMEOUT", "1200")))
+    return max(30, _env_int("SPUR_STRESS_DRAIN_TIMEOUT", "1200"))
 
 
 def _sample_max() -> int:
-    return max(1, int(os.environ.get("SPUR_STRESS_SAMPLE_MAX", "100")))
+    return max(1, _env_int("SPUR_STRESS_SAMPLE_MAX", "100"))
 
 
 def _remote_scontrol_parallel() -> int:
     """Max parallel ``scontrol show job`` invocations on the controller (remote xargs -P)."""
-    return max(1, int(os.environ.get("SPUR_STRESS_REMOTE_SCONTROL_PARALLEL", "16")))
+    return max(1, _env_int("SPUR_STRESS_REMOTE_SCONTROL_PARALLEL", "16"))
+
+
+# First column of default ``squeue`` output: plain id, array task ``123_4``,
+# array range ``123_[1-10]``, or hybrid ``123[1-10]`` (see Slurm squeue JOBID).
+_SQUEUE_JOBID_FIRST_COL = re.compile(
+    r"^(?:\d+|\d+_\d+|\d+\[[^\]]+\]|\d+_\[[^\]]+\])(?:\.[\w.+-]+)?$"
+)
+
+
+def _first_field_looks_like_squeue_jobid(token: str) -> bool:
+    if token in ("JOBID", "JOBID(S)"):
+        return False
+    if token.isdigit():
+        return True
+    return bool(_SQUEUE_JOBID_FIRST_COL.fullmatch(token))
 
 
 def count_squeue_jobs(squeue_output: str) -> int:
@@ -77,9 +104,7 @@ def count_squeue_jobs(squeue_output: str) -> int:
         parts = line.split()
         if not parts:
             continue
-        if parts[0] in ("JOBID", "JOBID(S)"):
-            continue
-        if parts[0].isdigit():
+        if _first_field_looks_like_squeue_jobid(parts[0]):
             n += 1
     return n
 

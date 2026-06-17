@@ -11,7 +11,6 @@ from __future__ import annotations
 import pytest
 
 from stress_harness.harness import (
-    _stress_sleep_s,
     format_stress_summary_report,
     parse_tiers_from_env,
     run_native_stress_tier,
@@ -44,7 +43,7 @@ def test_scheduler_stress_submit_drain_latency(cluster):
         controller_addr=cluster.controller_addr,
         node_hosts=[n.host for n in cluster.nodes],
         node_names=list(cluster.node_names),
-        sleep_s=_stress_sleep_s(),
+        sleep_s=results[0].sleep_s,
         results=results,
         sinfo_text=sinfo_text,
     )
