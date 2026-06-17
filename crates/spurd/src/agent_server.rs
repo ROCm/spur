@@ -21,6 +21,7 @@ use spur_sched::cons_tres::{AllocationResult, NodeAllocation};
 use spur_spank::{SpankHook, SpankHost};
 
 use spur_core::config::HooksConfig;
+use spur_core::spur_env::SpurEnv;
 use spur_devices::DeviceRegistry;
 
 use crate::executor;
@@ -428,55 +429,6 @@ impl SlurmAgent for AgentService {
             spec.script.clone()
         };
 
-        // Inject peer node info as environment variables for MPI/distributed apps
-        let mut env = spec.environment.clone();
-
-        // Ensure the Spur CLI binaries (srun/sbatch/... symlinks to `spur`) are
-        // on the job's PATH so `srun` works inside batch scripts. They live next
-        // to this agent binary, so derive the dir from the agent's own path
-        // (deployment-independent — no assumption about the install location).
-        if let Some(bin_dir) = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        {
-            let bin_dir = bin_dir.to_string_lossy().to_string();
-            let base = env
-                .get("PATH")
-                .cloned()
-                .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".to_string());
-            if !base.split(':').any(|p| p == bin_dir) {
-                env.insert("PATH".into(), format!("{}:{}", bin_dir, base));
-            }
-        }
-
-        env.insert("SPUR_JOB_ID".into(), job_id.to_string());
-        env.insert("SPUR_TASK_OFFSET".into(), task_offset.to_string());
-        env.insert("SPUR_NUM_NODES".into(), peer_nodes.len().to_string());
-        // Signal to executor that GRES was explicitly requested (for GPU hiding)
-        if !spec.gres.is_empty() {
-            env.insert("SPUR_GRES_REQUESTED".into(), "1".into());
-        }
-        if !peer_nodes.is_empty() {
-            env.insert("SPUR_PEER_NODES".into(), peer_nodes.join(","));
-        }
-        if !req.target_node.is_empty() {
-            env.insert("SPUR_TARGET_NODE".into(), req.target_node.clone());
-        }
-
-        // Array task identity for scripts. Gate on array_job_id (0 = not an
-        // array; job ids start at 1) since task index 0 is legitimate.
-        if array_job_id != 0 {
-            env.insert("SLURM_ARRAY_TASK_ID".into(), array_task_id.to_string());
-            env.insert("SLURM_ARRAY_JOB_ID".into(), array_job_id.to_string());
-            env.insert("SPUR_ARRAY_TASK_ID".into(), array_task_id.to_string());
-            env.insert("SPUR_ARRAY_JOB_ID".into(), array_job_id.to_string());
-        }
-
-        // Burst buffer: pass via env var so executor can wrap the script
-        if !spec.burst_buffer.is_empty() {
-            env.insert("SPUR_BURST_BUFFER".into(), spec.burst_buffer.clone());
-        }
-
         // Compute tasks_per_node for both single- and multi-node jobs
         let tasks_per_node = if spec.tasks_per_node > 0 {
             spec.tasks_per_node
@@ -484,55 +436,107 @@ impl SlurmAgent for AgentService {
             (spec.num_tasks / spec.num_nodes.max(1)).max(1)
         };
         let node_rank = task_offset / tasks_per_node.max(1);
+        let hostname = hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "localhost".into());
+        let mut senv = SpurEnv::new();
+        senv.extend(&spec.environment);
 
-        // LOCAL_RANK / LOCAL_WORLD_SIZE — always set, even for single-node jobs
-        env.insert("LOCAL_RANK".into(), "0".to_string()); // Single process per node (multi-task wrapper overrides per-process)
-        env.insert("LOCAL_WORLD_SIZE".into(), tasks_per_node.to_string());
-        env.insert("NPROC_PER_NODE".into(), tasks_per_node.to_string());
-        env.insert("NODE_RANK".into(), node_rank.to_string());
-
-        // PMI env vars for MPI runtimes
-        env.insert("PMI_SIZE".into(), spec.num_tasks.to_string());
-        env.insert("PMI_UNIVERSE_SIZE".into(), spec.num_tasks.to_string());
-        env.insert("PMI_APPNUM".into(), "0".to_string());
-        // PMI_RANK is set per-task in the multi-task wrapper; default to task_offset for single-task
-        env.insert("PMI_RANK".into(), task_offset.to_string());
-
-        // PMIx environment (for OpenMPI and other PMIx-aware runtimes)
-        if spec.mpi == "pmix" {
-            env.insert("PMIX_SIZE".into(), spec.num_tasks.to_string());
-            env.insert("PMIX_NAMESPACE".into(), format!("spur.{}", job_id));
-            // PMIX_RANK is set per-task in the multi-task wrapper; default to task_offset
-            env.insert("PMIX_RANK".into(), task_offset.to_string());
-            // OpenMPI direct-launch bootstrap vars
-            env.insert("OMPI_COMM_WORLD_SIZE".into(), spec.num_tasks.to_string());
-            env.insert("OMPI_COMM_WORLD_RANK".into(), task_offset.to_string());
-            env.insert("OMPI_COMM_WORLD_LOCAL_RANK".into(), "0".to_string());
-            env.insert(
-                "OMPI_COMM_WORLD_LOCAL_SIZE".into(),
-                tasks_per_node.to_string(),
-            );
-            env.insert("OMPI_COMM_WORLD_NODE_RANK".into(), node_rank.to_string());
+        // Ensure the Spur CLI binaries (srun/sbatch/... symlinks to `spur`) are
+        // on the job's PATH so `srun` works inside batch scripts.
+        if let Some(bin_dir) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        {
+            let bin_dir = bin_dir.to_string_lossy().to_string();
+            let base = spec
+                .environment
+                .get("PATH")
+                .cloned()
+                .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".to_string());
+            if !base.split(':').any(|p| p == bin_dir) {
+                senv.set("PATH", format!("{}:{}", bin_dir, base));
+            }
         }
 
-        // PyTorch/NCCL/RCCL distributed training env vars
+        // SPUR+SLURM twins
+        senv.set_with_slurm_twin("SPUR_JOB_ID", job_id);
+        senv.set_with_slurm_twin("SPUR_JOBID", job_id);
+        senv.set_with_slurm_twin("SPUR_JOB_NAME", &spec.name);
+        senv.set_with_slurm_twin("SPUR_JOB_PARTITION", &spec.partition);
+        senv.set_with_slurm_twin("SPUR_JOB_ACCOUNT", &spec.account);
+        senv.set_with_slurm_twin("SPUR_JOB_QOS", &spec.qos);
+        senv.set_with_slurm_twin("SPUR_SUBMIT_DIR", &work_dir);
+        senv.set_with_slurm_twin("SPUR_NNODES", peer_nodes.len());
+        senv.set_with_slurm_twin("SPUR_JOB_NUM_NODES", peer_nodes.len());
+        senv.set_with_slurm_twin("SPUR_NTASKS", spec.num_tasks);
+        senv.set_with_slurm_twin("SPUR_NPROCS", spec.num_tasks);
+        senv.set_with_slurm_twin("SPUR_CPUS_PER_TASK", spec.cpus_per_task);
+        senv.set_with_slurm_twin("SPUR_TASKS_PER_NODE", tasks_per_node);
+        senv.set_with_slurm_twin("SPUR_NODEID", node_rank);
+        senv.set_with_slurm_twin("SPUR_NODELIST", &spec.nodelist);
+        senv.set_with_slurm_twin("SPUR_JOB_NODELIST", &spec.nodelist);
+        senv.set_with_slurm_twin("SPURD_NODENAME", &hostname);
+        senv.set_with_slurm_twin(
+            "SPUR_CPUS_ON_NODE",
+            tasks_per_node * spec.cpus_per_task.max(1),
+        );
+
+        if array_job_id != 0 {
+            senv.set_with_slurm_twin("SPUR_ARRAY_JOB_ID", array_job_id);
+            senv.set_with_slurm_twin("SPUR_ARRAY_TASK_ID", array_task_id);
+        }
+
+        // Spur-only vars
+        senv.set("SPUR_TASK_OFFSET", task_offset);
+        senv.set("SPUR_NODE_RANK", node_rank);
+        if !peer_nodes.is_empty() {
+            senv.set("SPUR_PEER_NODES", peer_nodes.join(","));
+        }
+        if !req.target_node.is_empty() {
+            senv.set("SPUR_TARGET_NODE", &req.target_node);
+        }
+        if !spec.burst_buffer.is_empty() {
+            senv.set("SPUR_BURST_BUFFER", &spec.burst_buffer);
+        }
+
+        // Third-party distributed training / MPI env vars
+        senv.set("LOCAL_RANK", "0");
+        senv.set("LOCAL_WORLD_SIZE", tasks_per_node);
+        senv.set("NPROC_PER_NODE", tasks_per_node);
+        senv.set("NODE_RANK", node_rank);
+
+        senv.set("PMI_SIZE", spec.num_tasks);
+        senv.set("PMI_UNIVERSE_SIZE", spec.num_tasks);
+        senv.set("PMI_APPNUM", "0");
+        senv.set("PMI_RANK", task_offset);
+
+        if spec.mpi == "pmix" {
+            senv.set("PMIX_SIZE", spec.num_tasks);
+            senv.set("PMIX_NAMESPACE", format!("spur.{}", job_id));
+            senv.set("PMIX_RANK", task_offset);
+            senv.set("OMPI_COMM_WORLD_SIZE", spec.num_tasks);
+            senv.set("OMPI_COMM_WORLD_RANK", task_offset);
+            senv.set("OMPI_COMM_WORLD_LOCAL_RANK", "0");
+            senv.set("OMPI_COMM_WORLD_LOCAL_SIZE", tasks_per_node);
+            senv.set("OMPI_COMM_WORLD_NODE_RANK", node_rank);
+        }
+
         if peer_nodes.len() > 1 {
-            // MASTER_ADDR: first peer node's address (strip port)
             if let Some(first_peer) = peer_nodes.first() {
                 let master_addr = first_peer
                     .rsplit(':')
                     .nth(1)
                     .or_else(|| first_peer.split(':').next())
                     .unwrap_or(first_peer);
-                env.insert("MASTER_ADDR".into(), master_addr.to_string());
+                senv.set("MASTER_ADDR", master_addr);
             }
-            env.insert("MASTER_PORT".into(), "29500".to_string());
-            env.insert("WORLD_SIZE".into(), peer_nodes.len().to_string());
-
-            // RANK = node index within peer list
-            env.insert("RANK".into(), node_rank.to_string());
-            env.insert("SPUR_NODE_RANK".into(), node_rank.to_string());
+            senv.set("MASTER_PORT", "29500");
+            senv.set("WORLD_SIZE", peer_nodes.len());
+            senv.set("RANK", node_rank);
         }
+
+        let mut env = senv.into_map();
 
         // If container image is specified, prepare rootfs and config for
         // the Rust container runtime (fork + container_init + pivot_root).
@@ -659,15 +663,13 @@ impl SlurmAgent for AgentService {
             // Build the wrapper that launches N tasks with GPU partitioning
             let mut wrapper = String::from("#!/bin/bash\n");
             wrapper.push_str(&format!(
-                "SPUR_NTASKS={}\nSPUR_TASK_OFFSET=${{SPUR_TASK_OFFSET:-0}}\n",
+                "_TASKS_ON_NODE={}\nSPUR_TASK_OFFSET=${{SPUR_TASK_OFFSET:-0}}\n",
                 tasks_per_node
             ));
-            wrapper.push_str("for LOCAL_RANK in $(seq 0 $((SPUR_NTASKS - 1))); do\n");
+            wrapper.push_str("for LOCAL_RANK in $(seq 0 $((_TASKS_ON_NODE - 1))); do\n");
             wrapper.push_str("  export LOCAL_RANK\n");
-            wrapper.push_str("  export SPUR_LOCALID=$LOCAL_RANK\n");
-            wrapper.push_str("  export SPUR_PROCID=$((SPUR_TASK_OFFSET + LOCAL_RANK))\n");
+            wrapper.push_str(SpurEnv::per_task_bash_exports());
             wrapper.push_str("  export PMI_RANK=$SPUR_PROCID\n");
-            // PMIx per-task overrides
             wrapper.push_str("  export PMIX_RANK=$SPUR_PROCID\n");
             wrapper.push_str("  export OMPI_COMM_WORLD_RANK=$SPUR_PROCID\n");
             wrapper.push_str("  export OMPI_COMM_WORLD_LOCAL_RANK=$LOCAL_RANK\n");
@@ -675,7 +677,7 @@ impl SlurmAgent for AgentService {
             // Partition GPUs across tasks if GPUs are allocated
             wrapper.push_str("  if [ -n \"$SPUR_JOB_GPUS\" ]; then\n");
             wrapper.push_str("    IFS=',' read -ra _ALL_GPUS <<< \"$SPUR_JOB_GPUS\"\n");
-            wrapper.push_str("    _GPUS_PER_TASK=$(( ${#_ALL_GPUS[@]} / SPUR_NTASKS ))\n");
+            wrapper.push_str("    _GPUS_PER_TASK=$(( ${#_ALL_GPUS[@]} / _TASKS_ON_NODE ))\n");
             wrapper.push_str("    if [ $_GPUS_PER_TASK -gt 0 ]; then\n");
             wrapper.push_str("      _START=$((LOCAL_RANK * _GPUS_PER_TASK))\n");
             wrapper.push_str(
@@ -984,12 +986,19 @@ impl SlurmAgent for AgentService {
                 .env
         };
 
+        let mut senv = SpurEnv::new();
+        senv.extend(&req.environment);
+        senv.set_with_slurm_twin("SPUR_JOB_ID", job_id);
+        senv.set_with_slurm_twin("SPUR_JOBID", job_id);
+        senv.set_with_slurm_twin("SPUR_JOB_PARTITION", &partition);
+        senv.set_with_slurm_twin("SPUR_NODELIST", &nodelist);
+        senv.set_with_slurm_twin("SPUR_JOB_NODELIST", &nodelist);
+        senv.set_with_slurm_twin("SPUR_CPUS_ON_NODE", cpus);
+        senv.extend(&gpu_env);
+
         let mut cmd = tokio::process::Command::new(&req.command[0]);
         cmd.args(&req.command[1..]).current_dir(&work_dir);
-        for (k, v) in &req.environment {
-            cmd.env(k, v);
-        }
-        for (k, v) in &gpu_env {
+        for (k, v) in senv.into_map() {
             cmd.env(k, v);
         }
 
@@ -1215,6 +1224,7 @@ impl SlurmAgent for AgentService {
                 cmd.env(k, v);
             }
             cmd.env("SPUR_JOB_ID", job_id.to_string());
+            cmd.env("SLURM_JOB_ID", job_id.to_string());
 
             // Try nsenter for namespace isolation (if running as root)
             let mut child = if nix::unistd::geteuid().is_root() {
@@ -1229,6 +1239,7 @@ impl SlurmAgent for AgentService {
                     ns_cmd.env(k, v);
                 }
                 ns_cmd.env("SPUR_JOB_ID", job_id.to_string());
+                ns_cmd.env("SLURM_JOB_ID", job_id.to_string());
                 match ns_cmd.spawn() {
                     Ok(c) => c,
                     Err(_) => match cmd.spawn() {

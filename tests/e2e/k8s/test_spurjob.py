@@ -51,7 +51,7 @@ class TestSpurJobLifecycle:
             [
                 "sh",
                 "-c",
-                "echo rank=$SPUR_NODE_RANK nodes=$SPUR_NUM_NODES host=$(hostname)",
+                "echo rank=$SPUR_NODE_RANK nodes=$SPUR_NNODES host=$(hostname)",
             ],
             2,
         )

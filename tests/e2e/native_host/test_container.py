@@ -212,7 +212,7 @@ class TestContainerMultiNode:
             "#!/bin/bash\n"
             'echo "CONTAINER_NODE=$(hostname)"\n'
             'echo "SPUR_NODE_RANK=${SPUR_NODE_RANK}"\n'
-            'echo "SPUR_NUM_NODES=${SPUR_NUM_NODES}"\n'
+            'echo "SPUR_NNODES=${SPUR_NNODES}"\n'
             "echo CONTAINER_2N_OK\n",
         )
         sb = cluster.sbatch([
@@ -228,7 +228,7 @@ class TestContainerMultiNode:
         assert "CONTAINER_2N_OK" in all_output, (
             f"2-node container job must report CONTAINER_2N_OK\n{diag}\noutput:\n{all_output}"
         )
-        assert "SPUR_NUM_NODES=2" in all_output, f"must see SPUR_NUM_NODES=2\noutput:\n{all_output}"
+        assert "SPUR_NNODES=2" in all_output, f"must see SPUR_NNODES=2\noutput:\n{all_output}"
 
     def test_two_node_container_env_vars(self, multi_container_cluster):
         cluster = multi_container_cluster

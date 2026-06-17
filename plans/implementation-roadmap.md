@@ -113,7 +113,7 @@ Integration points:
 
 Environment variables injected by Spur (already partially implemented):
 ```
-SPUR_NUM_NODES=4
+SPUR_NNODES=4
 SPUR_TASK_OFFSET=0
 SPUR_PEER_NODES=10.44.0.2:6818,10.44.0.3:6818,...
 MASTER_ADDR=10.44.0.2       # first node in allocation
