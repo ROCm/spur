@@ -201,7 +201,7 @@ jobs:
           SPUR_TEST_GPU_VENV: /opt/spur-ci/gpu-venv
         run: |
           chmod +x /tmp/release-binaries/*
-          pytest "$E2E_ASSETS_DIR/tests/native_host/e2e/" -v
+          pytest "$E2E_ASSETS_DIR/tests/native_host/e2e/" -v -m "not stress"
 
       - name: Collect cluster logs
         if: failure()

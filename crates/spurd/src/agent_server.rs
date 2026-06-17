@@ -339,7 +339,12 @@ async fn report_completion(
                 };
                 match client.report_job_status(req).await {
                     Ok(_) => {
-                        info!(job_id, exit_code, "reported completion to controller");
+                        info!(
+                            job_id,
+                            exit_code,
+                            controller = %url,
+                            "reported completion to controller"
+                        );
                         return;
                     }
                     Err(e) => {

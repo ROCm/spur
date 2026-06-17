@@ -133,6 +133,25 @@ Running the Tests
 
 Tests that require more nodes than provided, or missing GPU/container prerequisites, are automatically skipped.
 
+Optional scheduler stress (native-host)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Heavy parallel ``sbatch`` / drain / latency checks live in ``tests/native_host/e2e/test_scheduler_stress.py`` and use helpers under ``tests/native_host/e2e/stress_harness/``. They are marked ``@pytest.mark.stress`` and are **excluded** from the default bare-metal E2E workflow (``pytest … -m "not stress"``).
+
+.. code-block:: bash
+
+   export SPUR_TEST_NODES=10.0.1.10,10.0.1.11
+   export SPUR_TEST_SSH_USER=vm
+
+   # Default tier size 50 jobs (override with SPUR_STRESS_TIERS)
+   pytest tests/native_host/e2e/test_scheduler_stress.py -v -m stress
+
+   # Example sweep (also tune SPUR_STRESS_PARALLEL, SPUR_STRESS_SLEEP, etc.)
+   SPUR_STRESS_TIERS="100 500 1000" SPUR_STRESS_PARALLEL=48 \
+     pytest tests/native_host/e2e/test_scheduler_stress.py -v -m stress
+
+See ``tests/native_host/e2e/stress_harness/README.md`` for environment variables. A shell-based variant remains under ``stress_tests/`` in the repo root.
+
 End-to-End Tests (Kubernetes)
 -----------------------------
 
