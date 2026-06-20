@@ -204,8 +204,8 @@ jobs:
         run: |
           set -euo pipefail
           root=/tmp/e2e-assets/trusted-repo
-          mkdir -p "$root/tests"
-          cp -r tests/e2e "$root/tests/"
+          mkdir -p "$root"
+          cp -r tests "$root/"
           cp -r scripts "$root/"
 
       - name: Upload E2E assets

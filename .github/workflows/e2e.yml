@@ -3,7 +3,7 @@
 # the CI workflow completes successfully.
 #
 # No untrusted code is checked out or compiled here.  Binaries, container
-# image, and E2E assets (tests/e2e, scripts) from the same commit are uploaded by CI
+# image, and test assets (tests/, scripts) from the same commit are uploaded by CI
 # and downloaded here.
 name: E2E
 
@@ -107,7 +107,7 @@ jobs:
       - name: Set up Python venv and install test deps
         run: |
           python3 -m venv /tmp/spur-e2e-venv
-          /tmp/spur-e2e-venv/bin/pip install -r "$E2E_ASSETS_DIR/tests/e2e/requirements.txt"
+          /tmp/spur-e2e-venv/bin/pip install -r "$E2E_ASSETS_DIR/tests/requirements.txt"
           echo "/tmp/spur-e2e-venv/bin" >> "$GITHUB_PATH"
 
       - name: Load SSH key into agent
@@ -201,7 +201,7 @@ jobs:
           SPUR_TEST_GPU_VENV: /opt/spur-ci/gpu-venv
         run: |
           chmod +x /tmp/release-binaries/*
-          pytest "$E2E_ASSETS_DIR/tests/e2e/native_host/" -v
+          pytest "$E2E_ASSETS_DIR/tests/native_host/e2e/" -v
 
       - name: Collect cluster logs
         if: failure()
@@ -396,7 +396,7 @@ jobs:
       - name: Set up Python venv and install test deps
         run: |
           python3 -m venv /tmp/spur-k8s-e2e-venv
-          /tmp/spur-k8s-e2e-venv/bin/pip install -r "$E2E_ASSETS_DIR/tests/e2e/requirements.txt"
+          /tmp/spur-k8s-e2e-venv/bin/pip install -r "$E2E_ASSETS_DIR/tests/requirements.txt"
           echo "/tmp/spur-k8s-e2e-venv/bin" >> "$GITHUB_PATH"
 
       - name: Select kubectl context
@@ -461,7 +461,7 @@ jobs:
         run: |
           set -euo pipefail
           sed "s/namespace: spur/namespace: $SPUR_TEST_NS/g" \
-            "$E2E_ASSETS_DIR/tests/e2e/k8s/manifests/rbac.yaml" | kubectl apply -f -
+            "$E2E_ASSETS_DIR/tests/k8s/e2e/manifests/rbac.yaml" | kubectl apply -f -
 
       - name: Verify cluster can pull CI image
         run: |
@@ -482,7 +482,7 @@ jobs:
 
       - name: Run K8s E2E tests
         run: |
-          pytest "$E2E_ASSETS_DIR/tests/e2e/k8s/" -v
+          pytest "$E2E_ASSETS_DIR/tests/k8s/e2e/" -v
 
       - name: Collect K8s test logs
         if: failure()

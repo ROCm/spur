@@ -463,7 +463,7 @@ class SpurCluster:
             )
 
     def ship_fixture(self, fixture_name: str) -> str:
-        """Ship a file from native_host/fixtures/ to remote_dir on all nodes."""
+        """Ship a file from the fixtures/ directory to remote_dir on all nodes."""
         fixtures_dir = Path(__file__).resolve().parent / "fixtures"
         local_path = fixtures_dir / fixture_name
         if not local_path.is_file():

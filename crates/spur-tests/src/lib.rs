@@ -33,7 +33,7 @@
 
 pub mod harness;
 
-// E2E tests live in tests/e2e/ (Python)
+// E2E tests live in tests/{native_host,k8s}/e2e/ (Python)
 
 // Unit / component tests (no running daemons needed)
 pub mod t01_run;

@@ -34,16 +34,16 @@ All tests are self-contained. No external services needed (no database, no netwo
 End-to-End Tests (Native-Host)
 ------------------------------
 
-The native-host E2E suite lives in ``tests/e2e/native_host/`` and uses pytest. It SSHes into pre-provisioned nodes, deploys Spur, runs tests, and tears down the cluster after each test. Build the release binaries first (``cargo build --release``).
+The native-host E2E suite lives in ``tests/native_host/e2e/`` and uses pytest. It SSHes into pre-provisioned nodes, deploys Spur, runs tests, and tears down the cluster after each test. Build the release binaries first (``cargo build --release``).
 
 Prerequisites
 ~~~~~~~~~~~~~
 
-- Python 3.11+ with ``pip install -r tests/e2e/requirements.txt``
+- Python 3.11+ with ``pip install -r tests/requirements.txt``
 - Pre-provisioned nodes accessible via SSH (password, key, or ssh-agent)
 - Container tests require ``squashfs-tools`` on the runner and all nodes
 - GPU tests require GPU hardware (ROCm/CUDA) on the nodes, plus a Python venv with PyTorch (auto-provisioned if ``SPUR_TEST_GPU_VENV`` is unset)
-- GPU test scripts (``gpu_test.hip``, ``distributed_test.py``, ``inference_test.py``) live in ``tests/e2e/native_host/fixtures/`` and are shipped to nodes by the harness
+- GPU test scripts (``gpu_test.hip``, ``distributed_test.py``, ``inference_test.py``) live in ``tests/native_host/e2e/fixtures/`` and are shipped to nodes by the harness
 
 Environment Variables
 ~~~~~~~~~~~~~~~~~~~~~
@@ -126,17 +126,17 @@ Running the Tests
    export SPUR_TEST_NODES=10.0.1.10,10.0.1.11,10.0.1.12
 
    # Run the full native-host suite
-   pytest tests/e2e/native_host/ -v
+   pytest tests/native_host/e2e/ -v
 
    # Run a specific test
-   pytest tests/e2e/native_host/test_single_node.py::TestJobLifecycle::test_job_cancel -v
+   pytest tests/native_host/e2e/test_single_node.py::TestJobLifecycle::test_job_cancel -v
 
 Tests that require more nodes than provided, or missing GPU/container prerequisites, are automatically skipped.
 
 End-to-End Tests (Kubernetes)
 -----------------------------
 
-The K8s E2E suite lives in ``tests/e2e/k8s/`` and uses pytest with the Kubernetes Python client. It deploys Spur's controller (StatefulSet), operator (Deployment), and SpurJob CRD into a Kubernetes cluster, then submits SpurJobs and verifies their lifecycle.
+The K8s E2E suite lives in ``tests/k8s/e2e/`` and uses pytest with the Kubernetes Python client. It deploys Spur's controller (StatefulSet), operator (Deployment), and SpurJob CRD into a Kubernetes cluster, then submits SpurJobs and verifies their lifecycle.
 
 You need a running Kubernetes cluster with:
 
@@ -147,7 +147,7 @@ You need a running Kubernetes cluster with:
 Prerequisites
 ~~~~~~~~~~~~~
 
-- Python 3.11+ with ``pip install -r tests/e2e/requirements.txt``
+- Python 3.11+ with ``pip install -r tests/requirements.txt``
 - ``kubectl`` access to the cluster
 - A Spur container image available to the cluster
 
@@ -190,7 +190,7 @@ Setup
    # On each node:
    sudo ctr -n k8s.io images import /tmp/spur-ci.tar
 
-The harness applies manifests from ``tests/e2e/k8s/manifests/`` (CRD, RBAC, controller, operator). Production-oriented samples live under ``examples/k8s/``. You do not need a separate ``kubectl apply`` before ``pytest`` unless you are debugging RBAC outside the suite.
+The harness applies manifests from ``tests/k8s/e2e/manifests/`` (CRD, RBAC, controller, operator). Production-oriented samples live under ``examples/k8s/``. You do not need a separate ``kubectl apply`` before ``pytest`` unless you are debugging RBAC outside the suite.
 
 Running the Tests
 ~~~~~~~~~~~~~~~~~
@@ -201,13 +201,13 @@ Running the Tests
    export SPUR_TEST_NS=spur-ci-local
 
    # Run the full K8s suite
-   pytest tests/e2e/k8s/ -v
+   pytest tests/k8s/e2e/ -v
 
    # Run SpurJob lifecycle tests only
-   pytest tests/e2e/k8s/test_spurjob.py -v
+   pytest tests/k8s/e2e/test_spurjob.py -v
 
    # Run Raft HA tests only
-   pytest tests/e2e/k8s/test_raft_ha.py -v
+   pytest tests/k8s/e2e/test_raft_ha.py -v
 
 Cleanup
 ~~~~~~~
