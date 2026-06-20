@@ -52,7 +52,6 @@ pub struct ClusterManager {
     reservations: RwLock<Vec<Reservation>>,
     steps: RwLock<HashMap<(JobId, u32), JobStep>>,
     license_pool: RwLock<HashMap<String, u64>>,
-    hostname_aliases: RwLock<HashMap<String, String>>,
     raft: RwLock<Option<SpurRaft>>,
     accounting: RwLock<Option<AccountingNotifier>>,
     fairshare_cache: Arc<FairshareCache>,
@@ -75,7 +74,6 @@ impl ClusterManager {
             steps: RwLock::new(HashMap::new()),
             next_job_id: AtomicU32::new(1),
             license_pool: RwLock::new(license_pool),
-            hostname_aliases: RwLock::new(HashMap::new()),
             raft: RwLock::new(None),
             accounting: RwLock::new(None),
             fairshare_cache,
@@ -757,85 +755,34 @@ impl ClusterManager {
         source: NodeSource,
         labels: HashMap<String, String>,
     ) -> anyhow::Result<()> {
-        // Normalize node name: if the agent's hostname doesn't match any config
-        // entry, check if there's an unmatched config node it could be aliased to.
-        // This handles single-node setups where config says "localhost" but the
-        // agent registers with its real hostname.
-        let effective_name = {
-            let registered_nodes = self.nodes.read();
-            let mut matches_config = false;
-            for nc in &self.config.nodes {
-                if let Ok(hosts) = spur_core::hostlist::expand(&nc.names) {
-                    if hosts.contains(&name) {
-                        matches_config = true;
-                        break;
-                    }
-                }
-            }
-            if !matches_config {
-                // Agent hostname doesn't match config — find an unmatched config node
-                let mut candidate = None;
-                for nc in &self.config.nodes {
-                    if let Ok(hosts) = spur_core::hostlist::expand(&nc.names) {
-                        for host in &hosts {
-                            if !registered_nodes.contains_key(host) {
-                                candidate = Some(host.clone());
-                                break;
-                            }
-                        }
-                        if candidate.is_some() {
-                            break;
-                        }
-                    }
-                }
-                if let Some(config_name) = candidate {
-                    info!(
-                        agent_hostname = %name,
-                        config_name = %config_name,
-                        "node hostname doesn't match config — using config name"
-                    );
-                    // Store the alias so heartbeats from this hostname find the right node
-                    drop(registered_nodes);
-                    self.hostname_aliases
-                        .write()
-                        .insert(name.clone(), config_name.clone());
-                    config_name
-                } else {
-                    name.clone()
-                }
-            } else {
-                name.clone()
-            }
-        };
-
         let action = {
             let nodes = self.nodes.read();
-            evaluate_registration(nodes.get(&effective_name), &resources)
+            evaluate_registration(nodes.get(&name), &resources)
         };
 
         match action {
             RegistrationAction::Skip => {
-                debug!(node = %effective_name, "node unchanged, skipping");
-                self.sync_node_labels(&effective_name, labels)?;
+                debug!(node = %name, "node unchanged, skipping");
+                self.sync_node_labels(&name, labels)?;
             }
             RegistrationAction::Update => {
                 self.propose(WalOperation::NodeUpdate {
-                    name: effective_name.clone(),
+                    name: name.clone(),
                     resources,
                     address,
                     port,
                     wg_pubkey,
                     version,
                 })?;
-                self.sync_node_labels(&effective_name, labels)?;
-                if let Some(node) = self.nodes.write().get_mut(&effective_name) {
+                self.sync_node_labels(&name, labels)?;
+                if let Some(node) = self.nodes.write().get_mut(&name) {
                     node.source = source;
                 }
-                info!(node = %effective_name, "node updated (resources changed)");
+                info!(node = %name, "node updated (resources changed)");
             }
             RegistrationAction::Register => {
                 self.propose(WalOperation::NodeRegister {
-                    name: effective_name.clone(),
+                    name: name.clone(),
                     resources,
                     address,
                     port,
@@ -843,11 +790,11 @@ impl ClusterManager {
                     version,
                     labels,
                 })?;
-                if let Some(node) = self.nodes.write().get_mut(&effective_name) {
+                if let Some(node) = self.nodes.write().get_mut(&name) {
                     node.source = source;
                     node.agent_start_time = Some(Utc::now());
                 }
-                info!(node = %effective_name, "node registered");
+                info!(node = %name, "node registered");
             }
         }
         Ok(())
@@ -885,14 +832,8 @@ impl ClusterManager {
     /// State recovery is handled separately by `check_node_health`, which
     /// detects the fresh `last_heartbeat` and proposes a WAL-backed transition.
     pub fn update_heartbeat(&self, name: &str, cpu_load: u32, free_memory_mb: u64) -> bool {
-        let effective_name = self
-            .hostname_aliases
-            .read()
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| name.to_string());
         let mut nodes = self.nodes.write();
-        if let Some(node) = nodes.get_mut(&effective_name) {
+        if let Some(node) = nodes.get_mut(name) {
             node.cpu_load = cpu_load;
             node.free_memory_mb = free_memory_mb;
             node.last_heartbeat = Some(Utc::now());
@@ -2265,7 +2206,6 @@ struct ClusterSnapshot {
     reservations: Vec<Reservation>,
     steps: Vec<JobStep>,
     license_pool: HashMap<String, u64>,
-    hostname_aliases: HashMap<String, String>,
 }
 
 impl ClusterManager {
@@ -2313,7 +2253,6 @@ impl StateMachineApply for ClusterManager {
             reservations: self.reservations.read().clone(),
             steps: self.steps.read().values().cloned().collect(),
             license_pool: self.license_pool.read().clone(),
-            hostname_aliases: self.hostname_aliases.read().clone(),
         };
         serde_json::to_vec(&snap).map_err(Into::into)
     }
@@ -2343,7 +2282,6 @@ impl StateMachineApply for ClusterManager {
             }
 
             *self.license_pool.write() = snap.license_pool;
-            *self.hostname_aliases.write() = snap.hostname_aliases;
 
             self.next_job_id.store(next_id, Ordering::Relaxed);
 
