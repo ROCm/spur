@@ -198,7 +198,7 @@ def format_stress_summary_report(
         f"**Date:** {when}",
         f"**Controller:** `{controller_addr}`",
         f"**Nodes:** {n_nodes} — {nodes_line}",
-        "**Harness:** native-host E2E (`tests/e2e/stress_harness`, remote `xargs` submit)",
+        "**Harness:** native-host E2E (`tests/native_host/e2e/stress_harness`, remote `xargs` submit)",
         (
             "**Job type:** single-CPU batch (`#SBATCH -N 1 -n 1`, `exit 0`"
             + (f", `sleep {sleep_s}` before exit)" if sleep_s > 0 else ", instant `exit 0`)")
