@@ -42,11 +42,10 @@ RUN cargo build --release --locked \
     --bin spurctld \
     --bin spurd \
     --bin spurdbd \
-    --bin spurrestd \
     --bin spur-k8s-operator
 
 RUN echo "=== Required GLIBC versions ===" && \
-    for bin in spur spurctld spurd spurdbd spurrestd spur-k8s-operator; do \
+    for bin in spur spurctld spurd spurdbd spur-k8s-operator; do \
         MAX=$(objdump -T target/release/${bin} 2>/dev/null \
             | grep -oP 'GLIBC_\d+\.\d+' | sort -uV | tail -1); \
         echo "  ${bin}: requires ${MAX:-none}"; \
@@ -63,7 +62,6 @@ COPY --from=builder /build/target/release/spur /usr/local/bin/
 COPY --from=builder /build/target/release/spurctld /usr/local/bin/
 COPY --from=builder /build/target/release/spurd /usr/local/bin/
 COPY --from=builder /build/target/release/spurdbd /usr/local/bin/
-COPY --from=builder /build/target/release/spurrestd /usr/local/bin/
 COPY --from=builder /build/target/release/spur-k8s-operator /usr/local/bin/
 
 # Multi-binary image: Kubernetes manifests must set container command per workload
@@ -74,5 +72,4 @@ COPY --from=builder /build/target/release/spur /bin/
 COPY --from=builder /build/target/release/spurctld /bin/
 COPY --from=builder /build/target/release/spurd /bin/
 COPY --from=builder /build/target/release/spurdbd /bin/
-COPY --from=builder /build/target/release/spurrestd /bin/
 COPY --from=builder /build/target/release/spur-k8s-operator /bin/

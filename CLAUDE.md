@@ -33,7 +33,6 @@ crates/
   spurctld/                    # Controller daemon (the brain)
   spurd/                       # Node agent daemon (runs on compute nodes)
   spurdbd/                     # Accounting daemon (PostgreSQL)
-  spurrestd/                   # REST API daemon
   spur-cli/                    # Multi-call CLI binary (spur, sbatch, squeue, etc.)
   spur-ffi/                    # C FFI shim (libspur_compat.so)
   spur-spank/                  # SPANK plugin host
@@ -94,7 +93,7 @@ crates/
 
 | Variable | Used by | Description |
 |----------|---------|-------------|
-| `SPUR_CONTROLLER_ADDR` | CLI, spurd, spurrestd | Controller gRPC address (default: `http://localhost:6817`) |
+| `SPUR_CONTROLLER_ADDR` | CLI, spurd | Controller gRPC address (default: `http://localhost:6817`) |
 | `SPUR_WG_INTERFACE` | spurd | WireGuard interface name for address detection (default: `spur0`) |
 
 ## Do Not

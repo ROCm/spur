@@ -20,7 +20,7 @@ use check::{Channel, UpdateCheckResult};
 use tracing::{debug, info, warn};
 
 /// Spur binary names included in release tarballs.
-pub const SPUR_BINARIES: &[&str] = &["spur", "spurctld", "spurd", "spurdbd", "spurrestd"];
+pub const SPUR_BINARIES: &[&str] = &["spur", "spurctld", "spurd", "spurdbd"];
 
 /// Spawn a non-blocking background update check.
 ///

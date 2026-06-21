@@ -25,7 +25,7 @@ set -euo pipefail
 REPO="ROCm/spur"
 INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
 
-BINARIES="spur spurctld spurd spurdbd spurrestd"
+BINARIES="spur spurctld spurd spurdbd"
 SYMLINKS="sbatch srun squeue scancel sinfo sacct scontrol"
 
 log()  { echo "==> $*"; }
@@ -156,7 +156,7 @@ EXTRACTED=$(find "${TMPDIR}" -maxdepth 1 -type d -name 'spur-*' | head -1)
 [ -n "${EXTRACTED}" ] || err "Could not find extracted directory"
 cp -f "${EXTRACTED}"/bin/* "${INSTALL_DIR}/"
 chmod +x "${INSTALL_DIR}/spur" "${INSTALL_DIR}/spurctld" "${INSTALL_DIR}/spurd" \
-         "${INSTALL_DIR}/spurdbd" "${INSTALL_DIR}/spurrestd"
+         "${INSTALL_DIR}/spurdbd"
 
 # --- Verify ---
 if ! "${INSTALL_DIR}/spur" --version >/dev/null 2>&1; then

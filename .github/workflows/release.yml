@@ -41,7 +41,7 @@ jobs:
           VERSION="${{ github.event.inputs.tag || github.ref_name }}"
           DIST="spur-${VERSION}-linux-amd64"
           mkdir -p "${DIST}/bin"
-          for bin in spur spurctld spurd spurdbd spurrestd; do
+          for bin in spur spurctld spurd spurdbd; do
             cp "dist/bin/${bin}" "${DIST}/bin/"
           done
 
@@ -101,7 +101,7 @@ jobs:
             set -e
             echo "=== $(cat /etc/os-release | grep PRETTY_NAME | cut -d\" -f2) ==="
             echo "glibc: $(ldd --version 2>&1 | head -1)"
-            for bin in spur spurctld spurd spurdbd spurrestd; do
+            for bin in spur spurctld spurd spurdbd; do
               /test/${bin} --help > /dev/null 2>&1
               echo "  ${bin}: OK"
             done
