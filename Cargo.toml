@@ -93,7 +93,7 @@ tar = "0.4"
 semver = "1"
 sha2 = "0.11"
 base64 = "0.22"
-rand = "0.9"
+rand = "0.10"
 subtle = "2"
 serial_test = "3"
 
