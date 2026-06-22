@@ -19,14 +19,15 @@ pub enum QosCheckResult {
 
 /// Check if a job would violate QOS limits.
 ///
-/// `running_jobs` = currently running jobs from the same user+QOS.
-/// `pending_jobs` = currently pending jobs from the same user+QOS.
+/// `user_running_*` aggregate the requesting user's load; `qos_running_tres`
+/// aggregates all running jobs in the QOS (for the `Grp*` group limits).
 pub fn check_qos_limits(
     job: &Job,
     qos: &Qos,
     user_running_count: u32,
     user_submitted_count: u32,
     user_running_tres: &TresRecord,
+    qos_running_tres: &TresRecord,
 ) -> QosCheckResult {
     let limits = &qos.limits;
 
@@ -64,6 +65,11 @@ pub fn check_qos_limits(
             return QosCheckResult::Blocked(PendingReason::QosMaxCpuPerJobLimit);
         }
 
+        let job_nodes = job.spec.num_nodes as u64;
+        if max_tres.get(TresType::Node) > 0 && job_nodes > max_tres.get(TresType::Node) {
+            return QosCheckResult::Blocked(PendingReason::QosMaxNodePerJobLimit);
+        }
+
         if let Some(mem) = job.spec.memory_per_node_mb {
             let total_mem = mem * job.spec.num_nodes as u64;
             if max_tres.get(TresType::Memory) > 0 && total_mem > max_tres.get(TresType::Memory) {
@@ -78,6 +84,32 @@ pub fn check_qos_limits(
         let new_total_cpu = user_running_tres.get(TresType::Cpu) + job_cpus;
         if max_tres.get(TresType::Cpu) > 0 && new_total_cpu > max_tres.get(TresType::Cpu) {
             return QosCheckResult::Blocked(PendingReason::QosMaxCpuPerUserLimit);
+        }
+    }
+
+    // Group TRES across all running jobs in the QOS (GrpCPU/Mem/Node).
+    if let Some(ref grp) = limits.grp_tres {
+        let job_cpus = (job.spec.num_tasks * job.spec.cpus_per_task) as u64;
+        if grp.get(TresType::Cpu) > 0
+            && qos_running_tres.get(TresType::Cpu) + job_cpus > grp.get(TresType::Cpu)
+        {
+            return QosCheckResult::Blocked(PendingReason::QosGrpCpuLimit);
+        }
+
+        let job_nodes = job.spec.num_nodes as u64;
+        if grp.get(TresType::Node) > 0
+            && qos_running_tres.get(TresType::Node) + job_nodes > grp.get(TresType::Node)
+        {
+            return QosCheckResult::Blocked(PendingReason::QosGrpNodeLimit);
+        }
+
+        if let Some(mem) = job.spec.memory_per_node_mb {
+            let job_mem = mem * job.spec.num_nodes as u64;
+            if grp.get(TresType::Memory) > 0
+                && qos_running_tres.get(TresType::Memory) + job_mem > grp.get(TresType::Memory)
+            {
+                return QosCheckResult::Blocked(PendingReason::QosGrpMemLimit);
+            }
         }
     }
 
@@ -126,7 +158,7 @@ mod tests {
     fn test_allowed_when_no_limits() {
         let qos = make_qos(None, None);
         let job = make_test_job();
-        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new());
+        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &TresRecord::new());
         assert_eq!(result, QosCheckResult::Allowed);
     }
 
@@ -134,7 +166,7 @@ mod tests {
     fn test_blocked_by_max_jobs() {
         let qos = make_qos(Some(5), None);
         let job = make_test_job();
-        let result = check_qos_limits(&job, &qos, 5, 5, &TresRecord::new());
+        let result = check_qos_limits(&job, &qos, 5, 5, &TresRecord::new(), &TresRecord::new());
         assert_eq!(
             result,
             QosCheckResult::Blocked(PendingReason::QoSMaxJobsPerUser)
@@ -145,7 +177,7 @@ mod tests {
     fn test_allowed_under_max_jobs() {
         let qos = make_qos(Some(5), None);
         let job = make_test_job();
-        let result = check_qos_limits(&job, &qos, 3, 3, &TresRecord::new());
+        let result = check_qos_limits(&job, &qos, 3, 3, &TresRecord::new(), &TresRecord::new());
         assert_eq!(result, QosCheckResult::Allowed);
     }
 
@@ -153,7 +185,7 @@ mod tests {
     fn test_blocked_by_max_wall() {
         let qos = make_qos(None, Some(60)); // 1 hour max
         let job = make_test_job(); // 2 hour job
-        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new());
+        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &TresRecord::new());
         assert_eq!(
             result,
             QosCheckResult::Blocked(PendingReason::QosMaxWallDurationPerJobLimit)
@@ -173,7 +205,7 @@ mod tests {
             ..Default::default()
         };
         let job = make_test_job(); // 4 CPUs
-        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new());
+        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &TresRecord::new());
         assert_eq!(
             result,
             QosCheckResult::Blocked(PendingReason::QosMaxCpuPerJobLimit)
@@ -195,7 +227,7 @@ mod tests {
         let mut job = make_test_job();
         job.spec.num_nodes = 1;
         job.spec.memory_per_node_mb = Some(2048); // 2 GiB
-        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new());
+        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &TresRecord::new());
         assert_eq!(
             result,
             QosCheckResult::Blocked(PendingReason::QosMaxMemoryPerJob)
@@ -217,7 +249,7 @@ mod tests {
         let job = make_test_job(); // needs 4 CPUs
         let mut running = TresRecord::new();
         running.set(TresType::Cpu, 6); // already using 6; 6 + 4 > 8
-        let result = check_qos_limits(&job, &qos, 0, 0, &running);
+        let result = check_qos_limits(&job, &qos, 0, 0, &running, &TresRecord::new());
         assert_eq!(
             result,
             QosCheckResult::Blocked(PendingReason::QosMaxCpuPerUserLimit)
@@ -235,10 +267,53 @@ mod tests {
             ..Default::default()
         };
         let job = make_test_job();
-        let result = check_qos_limits(&job, &qos, 0, 3, &TresRecord::new());
+        let result = check_qos_limits(&job, &qos, 0, 3, &TresRecord::new(), &TresRecord::new());
         assert_eq!(
             result,
             QosCheckResult::Blocked(PendingReason::QosMaxSubmitJobPerUserLimit)
+        );
+    }
+
+    #[test]
+    fn test_blocked_by_max_node_per_job() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Node, 1); // max 1 node per job
+        let qos = Qos {
+            name: "restricted".into(),
+            limits: QosLimits {
+                max_tres_per_job: Some(tres),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 4;
+        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &TresRecord::new());
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosMaxNodePerJobLimit)
+        );
+    }
+
+    #[test]
+    fn test_blocked_by_grp_cpu() {
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Cpu, 8); // QOS-wide cap 8
+        let qos = Qos {
+            name: "grp".into(),
+            limits: QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let job = make_test_job(); // needs 4 CPUs
+        let mut qos_running = TresRecord::new();
+        qos_running.set(TresType::Cpu, 6); // 6 already in the QOS; 6 + 4 > 8
+        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &qos_running);
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosGrpCpuLimit)
         );
     }
 

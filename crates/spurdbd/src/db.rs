@@ -568,17 +568,18 @@ pub async fn upsert_qos(
     max_tres_per_job: Option<&str>,
     max_submit_per_user: Option<i32>,
     max_tres_per_user: Option<&str>,
+    grp_tres: Option<&str>,
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"
         INSERT INTO qos (name, description, priority, preempt_mode, usage_factor,
                          max_jobs_per_user, max_wall_min, max_tres_per_job,
-                         max_submit_per_user, max_tres_per_user)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                         max_submit_per_user, max_tres_per_user, grp_tres)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (name) DO UPDATE SET
             description = $2, priority = $3, preempt_mode = $4, usage_factor = $5,
             max_jobs_per_user = $6, max_wall_min = $7, max_tres_per_job = $8,
-            max_submit_per_user = $9, max_tres_per_user = $10
+            max_submit_per_user = $9, max_tres_per_user = $10, grp_tres = $11
         "#,
     )
     .bind(name)
@@ -591,6 +592,7 @@ pub async fn upsert_qos(
     .bind(max_tres_per_job)
     .bind(max_submit_per_user)
     .bind(max_tres_per_user)
+    .bind(grp_tres)
     .execute(pool)
     .await?;
     Ok(())
@@ -608,7 +610,7 @@ pub async fn delete_qos(pool: &PgPool, name: &str) -> anyhow::Result<()> {
 /// List all QOS.
 pub async fn list_qos(pool: &PgPool) -> anyhow::Result<Vec<QosRecord>> {
     let rows = sqlx::query(
-        "SELECT name, description, priority, preempt_mode, usage_factor, max_jobs_per_user, max_wall_min, max_tres_per_job, max_submit_per_user, max_tres_per_user FROM qos ORDER BY name"
+        "SELECT name, description, priority, preempt_mode, usage_factor, max_jobs_per_user, max_wall_min, max_tres_per_job, max_submit_per_user, max_tres_per_user, grp_tres FROM qos ORDER BY name"
     ).fetch_all(pool).await?;
 
     Ok(rows
@@ -625,6 +627,7 @@ pub async fn list_qos(pool: &PgPool) -> anyhow::Result<Vec<QosRecord>> {
             max_tres_per_job: r.get("max_tres_per_job"),
             max_submit_per_user: r.get("max_submit_per_user"),
             max_tres_per_user: r.get("max_tres_per_user"),
+            grp_tres: r.get("grp_tres"),
         })
         .collect())
 }
@@ -641,6 +644,7 @@ pub struct QosRecord {
     pub max_tres_per_job: Option<String>,
     pub max_submit_per_user: Option<i32>,
     pub max_tres_per_user: Option<String>,
+    pub grp_tres: Option<String>,
 }
 
 #[cfg(test)]
@@ -777,6 +781,7 @@ mod job_history_tests {
             Some("cpu=2"),
             Some(4),
             Some("cpu=16"),
+            Some("cpu=64"),
         )
         .await?;
 
@@ -792,6 +797,7 @@ mod job_history_tests {
         assert_eq!(got.max_tres_per_job.as_deref(), Some("cpu=2"));
         assert_eq!(got.max_submit_per_user, Some(4));
         assert_eq!(got.max_tres_per_user.as_deref(), Some("cpu=16"));
+        assert_eq!(got.grp_tres.as_deref(), Some("cpu=64"));
 
         sqlx::query("DELETE FROM qos WHERE name = $1")
             .bind(&name)

@@ -780,6 +780,7 @@ message CreateQosRequest {
   string max_tres_per_job = 8;
   uint32 max_submit_jobs_per_user = 9;
   string max_tres_per_user = 10;
+  string grp_tres = 11;
 }
 
 message DeleteQosRequest {
@@ -803,6 +804,7 @@ message QosInfo {
   string max_tres_per_job = 8;
   uint32 max_submit_jobs_per_user = 9;
   string max_tres_per_user = 10;
+  string grp_tres = 11;
 }
 
 // ============================================================

@@ -2481,7 +2481,7 @@ fn qos_block_for(
     jobs: &HashMap<JobId, Job>,
 ) -> Option<spur_core::job::PendingReason> {
     // No QoS -> no QoS-based block.
-    job.spec.qos.as_ref()?;
+    let qos_name = job.spec.qos.as_ref()?;
     let user = &job.spec.user;
     let running_count = jobs
         .values()
@@ -2493,15 +2493,19 @@ fn qos_block_for(
             (j.state == JobState::Pending || j.state == JobState::Running) && j.spec.user == *user
         })
         .count() as u32;
-    let mut running_tres = TresRecord::new();
-    let running_cpus: u64 = jobs
-        .values()
-        .filter(|j| j.state == JobState::Running && j.spec.user == *user)
-        .map(|j| (j.spec.num_tasks * j.spec.cpus_per_task) as u64)
-        .sum();
-    running_tres.set(TresType::Cpu, running_cpus);
+    // Per-user running TRES (MaxTRESPerUser) and QOS-wide running TRES (Grp*).
+    let user_running_tres = sum_running_tres(jobs, |j| j.spec.user == *user);
+    let qos_running_tres =
+        sum_running_tres(jobs, |j| j.spec.qos.as_deref() == Some(qos_name.as_str()));
 
-    match check_qos_limits(job, qos, running_count, submitted_count, &running_tres) {
+    match check_qos_limits(
+        job,
+        qos,
+        running_count,
+        submitted_count,
+        &user_running_tres,
+        &qos_running_tres,
+    ) {
         QosCheckResult::Allowed => None,
         QosCheckResult::Blocked(reason) => Some(reason),
     }
@@ -2536,6 +2540,26 @@ fn partition_block(job: &Job, partitions: &[Partition]) -> Option<spur_core::job
         }
     }
     None
+}
+
+/// Sum cpu/node/mem TRES over running jobs matching `pred`.
+fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> TresRecord {
+    let mut tres = TresRecord::new();
+    let (mut cpu, mut node, mut mem) = (0u64, 0u64, 0u64);
+    for j in jobs.values() {
+        if j.state != JobState::Running || !pred(j) {
+            continue;
+        }
+        cpu += (j.spec.num_tasks * j.spec.cpus_per_task) as u64;
+        node += j.spec.num_nodes as u64;
+        if let Some(m) = j.spec.memory_per_node_mb {
+            mem += m * j.spec.num_nodes as u64;
+        }
+    }
+    tres.set(TresType::Cpu, cpu);
+    tres.set(TresType::Node, node);
+    tres.set(TresType::Memory, mem);
+    tres
 }
 
 fn extract_license_requirements(spec: &JobSpec) -> HashMap<String, u64> {
@@ -4351,6 +4375,51 @@ mod tests {
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::QosMaxWallDurationPerJobLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_sets_qos_grp_cpu_reason() {
+        // GrpCPU aggregates across all running jobs in the QOS: a running 4-cpu
+        // job fills a grp_tres cpu=4 cap, so the next job in the same QOS blocks
+        // with QOSGrpCpuLimit (the group reason, not the per-job/per-user one).
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Cpu, 4);
+        cm.qos_cache().insert(Qos {
+            name: "grp".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut s1 = basic_spec("g1");
+        s1.qos = Some("grp".into());
+        s1.num_tasks = 4;
+        let j1 = submit_and_wait(&cm, s1);
+        let res = scalar_alloc(4, 1000);
+        cm.start_job(
+            j1,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, j1, JobState::Running);
+
+        let mut s2 = basic_spec("g2");
+        s2.qos = Some("grp".into());
+        s2.num_tasks = 1;
+        let j2 = submit_and_wait(&cm, s2);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::QosGrpCpuLimit
         );
     }
 

@@ -238,6 +238,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0),
                     max_tres_per_user: p.get("maxtresperuser").cloned().unwrap_or_default(),
+                    grp_tres: p.get("grptres").cloned().unwrap_or_default(),
                 })
                 .await
                 .context("CreateQos RPC failed")?;
@@ -391,6 +392,7 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0),
                     max_tres_per_user: p.get("maxtresperuser").cloned().unwrap_or_default(),
+                    grp_tres: p.get("grptres").cloned().unwrap_or_default(),
                 })
                 .await
                 .context("CreateQos (modify) RPC failed")?;

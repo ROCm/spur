@@ -127,7 +127,7 @@ pub fn qos_from_proto(info: QosInfo) -> Qos {
             max_submit_jobs_per_user: opt_u32(info.max_submit_jobs_per_user),
             max_tres_per_job: opt_tres(&info.max_tres_per_job),
             max_tres_per_user: opt_tres(&info.max_tres_per_user),
-            grp_tres: None,
+            grp_tres: opt_tres(&info.grp_tres),
             max_wall_minutes: opt_u32(info.max_wall_minutes),
             grp_wall_minutes: None,
         },
@@ -154,6 +154,7 @@ mod tests {
             max_tres_per_job: String::new(),
             max_submit_jobs_per_user: 0,
             max_tres_per_user: String::new(),
+            grp_tres: String::new(),
         }
     }
 
@@ -228,7 +229,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let result = check_qos_limits(&job, &qos, 0, 2, &TresRecord::new());
+        let result = check_qos_limits(&job, &qos, 0, 2, &TresRecord::new(), &TresRecord::new());
         assert_eq!(
             result,
             QosCheckResult::Blocked(PendingReason::QosMaxSubmitJobPerUserLimit)
@@ -256,7 +257,7 @@ mod tests {
         );
         let mut running = TresRecord::new();
         running.set(TresType::Cpu, 6);
-        let result = check_qos_limits(&job, &qos, 0, 0, &running);
+        let result = check_qos_limits(&job, &qos, 0, 0, &running, &TresRecord::new());
         assert_eq!(
             result,
             QosCheckResult::Blocked(PendingReason::QosMaxCpuPerUserLimit)
