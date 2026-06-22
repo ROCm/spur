@@ -139,10 +139,11 @@ impl ClusterManager {
             None => anyhow::bail!("partition '{}' not found", partition_name),
         };
 
-        // Check partition state
-        if part.state != spur_core::partition::PartitionState::Up {
-            anyhow::bail!("partition '{}' is {}", partition_name, part.state.display());
-        }
+        // Partition state (Down/Drain/Inactive) and structural resource limits
+        // (max_nodes/max_time/min_nodes) are NOT rejected here: matching Slurm,
+        // the job is accepted and held PENDING with PartitionInactive /
+        // PartitionConfig (see partition_block + tag_blocked_pending_reasons), so
+        // it runs once the partition is brought back Up or its config changes.
 
         // Check allow_accounts (if non-empty, user's account must be in the list)
         if !part.allow_accounts.is_empty() {
@@ -163,31 +164,6 @@ impl ClusterManager {
                     "account '{}' denied on partition '{}'",
                     account,
                     partition_name
-                );
-            }
-        }
-
-        // Check max_nodes
-        if let Some(max) = part.max_nodes {
-            if spec.num_nodes > max {
-                anyhow::bail!(
-                    "requested {} nodes exceeds partition '{}' max of {}",
-                    spec.num_nodes,
-                    partition_name,
-                    max
-                );
-            }
-        }
-
-        // Check max_time
-        if let (Some(max_mins), Some(ref tl)) = (part.max_time_minutes, &spec.time_limit) {
-            let requested_mins = tl.num_minutes() as u32;
-            if requested_mins > max_mins {
-                anyhow::bail!(
-                    "requested time {} min exceeds partition '{}' max of {} min",
-                    requested_mins,
-                    partition_name,
-                    max_mins
                 );
             }
         }
@@ -1163,6 +1139,15 @@ impl ClusterManager {
             .cloned()
             .collect();
 
+        // Drop jobs structurally unschedulable in their target partition
+        // (inactive partition / request exceeds partition config). Shares
+        // partition_block() with tag_blocked_pending_reasons() so the drop
+        // decision and the shown PartitionInactive/PartitionConfig reason agree.
+        {
+            let partitions = self.partitions.read();
+            pending.retain(|job| partition_block(job, &partitions).is_none());
+        }
+
         // Check dependencies
         let get_job = |id: JobId| -> Option<Job> { jobs.get(&id).cloned() };
         let get_array_tasks = |id: JobId| -> Vec<Job> {
@@ -1442,6 +1427,7 @@ impl ClusterManager {
             let reservations = self.get_reservations();
             let now = Utc::now();
             let available = self.available_licenses_with(&jobs);
+            let partitions = self.partitions.read();
 
             // Dependency outranks QoS/Licenses/Reservation in pending_jobs() and
             // is tagged just before this pass, so re-check it first (same closures).
@@ -1479,8 +1465,11 @@ impl ClusterManager {
                 })
                 .filter_map(|job| {
                     // Same order pending_jobs() drops jobs, so the shown reason is
-                    // the one that actually removed it: Dep -> QoS -> Resv -> Lic.
-                    dependency_block(job)
+                    // the one that actually removed it: Part -> Dep -> QoS -> Resv
+                    // -> Lic. partition_block is first: a structural partition
+                    // block is permanent, so it outranks the transient blocks.
+                    partition_block(job, &partitions)
+                        .or_else(|| dependency_block(job))
                         .or_else(|| qos_block_for(job, &jobs))
                         .or_else(|| reservation_block(job, &reservations, now))
                         .or_else(|| license_block(job, &available))
@@ -2495,6 +2484,39 @@ fn qos_block_for(job: &Job, jobs: &HashMap<JobId, Job>) -> Option<spur_core::job
         QosCheckResult::Allowed => None,
         QosCheckResult::Blocked(reason) => Some(reason),
     }
+}
+
+/// Reason a job can never run in its target partition as configured, or `None`.
+/// `PartitionInactive` when the partition is not accepting jobs (Down/Drain/
+/// Inactive); `PartitionConfig` when the request structurally exceeds the
+/// partition's node or time limits. Unlike `Resources` (a transient busy
+/// cluster), these are permanent given the current config. Shared by
+/// `pending_jobs()` and `tag_blocked_pending_reasons()` so the drop decision and
+/// the displayed reason agree.
+fn partition_block(job: &Job, partitions: &[Partition]) -> Option<spur_core::job::PendingReason> {
+    use spur_core::job::PendingReason;
+    use spur_core::partition::PartitionState;
+
+    let name = job.spec.partition.as_deref().filter(|p| !p.is_empty())?;
+    let part = partitions.iter().find(|p| p.name == name)?;
+
+    if part.state != PartitionState::Up {
+        return Some(PendingReason::PartitionInactive);
+    }
+    if let Some(max) = part.max_nodes {
+        if job.spec.num_nodes > max {
+            return Some(PendingReason::PartitionConfig);
+        }
+    }
+    if part.min_nodes > 0 && job.spec.num_nodes < part.min_nodes {
+        return Some(PendingReason::PartitionConfig);
+    }
+    if let (Some(max_mins), Some(tl)) = (part.max_time_minutes, &job.spec.time_limit) {
+        if tl.num_minutes() > i64::from(max_mins) {
+            return Some(PendingReason::PartitionConfig);
+        }
+    }
+    None
 }
 
 fn extract_license_requirements(spec: &JobSpec) -> HashMap<String, u64> {
@@ -4147,6 +4169,42 @@ mod tests {
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::NodeDown
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_sets_partition_config_reason() {
+        // A request that structurally exceeds the partition's max_nodes can never
+        // run there, so it is held PENDING with PartitionConfig (not Resources).
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].max_nodes = Some(1);
+        let cm = Arc::new(ClusterManager::new(config, dir.path()).unwrap());
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .expect("single-node raft did not self-elect within 5s");
+        cm.set_raft(handle.raft);
+
+        let mut spec = basic_spec("toobig");
+        spec.partition = Some("default".into());
+        spec.num_nodes = 2;
+        let job_id = submit_and_wait(&cm, spec);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::PartitionConfig
+        );
+        // pending_jobs() must agree: the job is dropped, not scheduled.
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "structurally-unschedulable job must be dropped from scheduling"
         );
     }
 

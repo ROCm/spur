@@ -243,6 +243,7 @@ pub enum PendingReason {
     QosMaxMemoryPerJob,
     QosMaxCpuPerUserLimit,
     QosMaxSubmitJobPerUserLimit,
+    PartitionConfig,
 }
 
 impl PendingReason {
@@ -279,6 +280,7 @@ impl PendingReason {
             Self::QosMaxMemoryPerJob => "QOSMaxMemoryPerJob",
             Self::QosMaxCpuPerUserLimit => "QOSMaxCpuPerUserLimit",
             Self::QosMaxSubmitJobPerUserLimit => "QOSMaxSubmitJobPerUserLimit",
+            Self::PartitionConfig => "PartitionConfig",
         }
     }
 }
@@ -1136,6 +1138,8 @@ mod tests {
             PendingReason::QosMaxSubmitJobPerUserLimit,
             "QOSMaxSubmitJobPerUserLimit",
         ),
+        (PendingReason::PartitionConfig, "PartitionConfig"),
+        (PendingReason::PartitionInactive, "PartitionInactive"),
     ];
 
     #[test]
