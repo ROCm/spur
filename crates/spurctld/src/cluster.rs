@@ -1479,11 +1479,11 @@ impl ClusterManager {
                 })
                 .filter_map(|job| {
                     // Same order pending_jobs() drops jobs, so the shown reason is
-                    // the one that actually removed it: Dep -> QoS -> Lic -> Resv.
+                    // the one that actually removed it: Dep -> QoS -> Resv -> Lic.
                     dependency_block(job)
                         .or_else(|| qos_block_for(job, &jobs))
-                        .or_else(|| license_block(job, &available))
                         .or_else(|| reservation_block(job, &reservations, now))
+                        .or_else(|| license_block(job, &available))
                         .map(|reason| (job.job_id, reason))
                 })
                 .collect()

@@ -61,14 +61,12 @@ pub fn check_qos_limits(
     if let Some(ref max_tres) = limits.max_tres_per_job {
         let job_cpus = (job.spec.num_tasks * job.spec.cpus_per_task) as u64;
         if max_tres.get(TresType::Cpu) > 0 && job_cpus > max_tres.get(TresType::Cpu) {
-            // WAIT_QOS_MAX_CPU_PER_JOB ("QOSMaxCpuPerJobLimit").
             return QosCheckResult::Blocked(PendingReason::QosMaxCpuPerJobLimit);
         }
 
         if let Some(mem) = job.spec.memory_per_node_mb {
             let total_mem = mem * job.spec.num_nodes as u64;
             if max_tres.get(TresType::Memory) > 0 && total_mem > max_tres.get(TresType::Memory) {
-                // WAIT_QOS_MAX_MEM_PER_JOB ("QOSMaxMemoryPerJob").
                 return QosCheckResult::Blocked(PendingReason::QosMaxMemoryPerJob);
             }
         }
@@ -79,7 +77,6 @@ pub fn check_qos_limits(
         let job_cpus = (job.spec.num_tasks * job.spec.cpus_per_task) as u64;
         let new_total_cpu = user_running_tres.get(TresType::Cpu) + job_cpus;
         if max_tres.get(TresType::Cpu) > 0 && new_total_cpu > max_tres.get(TresType::Cpu) {
-            // WAIT_QOS_MAX_CPU_PER_USER ("QOSMaxCpuPerUserLimit").
             return QosCheckResult::Blocked(PendingReason::QosMaxCpuPerUserLimit);
         }
     }
