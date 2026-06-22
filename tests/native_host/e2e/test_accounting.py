@@ -20,7 +20,7 @@ class TestSacctExitReporting:
         sig_id = parse_job_id(c.sbatch(["-J", "acct-sig", "-N", "1", sig]))
         assert sig_id is not None
         wait_job(c, sig_id, timeout=60)
-        row = wait_sacct_row(c, sig_id, "JobID,ExitCode")
+        row = wait_sacct_row(c, sig_id, "%i %x")
         # ExitCode renders code:signal; the signal half is the parity fix.
         assert row.split()[1].endswith(":9"), f"expected signal half :9, got {row!r}"
 
@@ -36,7 +36,7 @@ class TestSacctExitReporting:
         m_id = parse_job_id(c.sbatch(["-J", "acct-multi", "-N", "1", multi]))
         assert m_id is not None
         wait_job(c, m_id, timeout=90)
-        row = wait_sacct_row(c, m_id, "JobID,ExitCode,DerivedExitCode")
+        row = wait_sacct_row(c, m_id, "%i %x %X")
         fields = row.split()
         assert fields[1] == "3:0", f"expected ExitCode 3:0, got {fields!r}"
         assert fields[2] == "7:0", f"expected DerivedExitCode 7:0, got {fields!r}"
