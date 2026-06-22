@@ -19,7 +19,7 @@ jobs:
     env:
       CARGO_DENY_VERSION: "0.19.6"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         run: rustup show
       - name: Install cargo-deny
@@ -31,7 +31,7 @@ jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         run: rustup show
       - name: Check formatting
@@ -40,7 +40,7 @@ jobs:
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install protobuf compiler
         run: sudo apt-get install -y protobuf-compiler
@@ -66,7 +66,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install protobuf compiler
         run: sudo apt-get install -y protobuf-compiler
@@ -92,7 +92,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install protobuf compiler
         run: sudo apt-get install -y protobuf-compiler
@@ -120,7 +120,7 @@ jobs:
     env:
       RUSTFLAGS: ""
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install protobuf compiler
         run: sudo apt-get install -y protobuf-compiler
@@ -159,7 +159,7 @@ jobs:
     name: Build Docker Image
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
