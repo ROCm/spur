@@ -233,41 +233,16 @@ pub enum PendingReason {
     OutOfMemory,
 
     // Slurm 25.11 reason-code parity additions; each maps to a WAIT_*/FAIL_*
-    // reason, with the byte-exact Slurm string in display().
+    // reason, with the byte-exact Slurm string in display(). Only reasons with
+    // a live emission path are landed here; the rest are added alongside their
+    // enforcement logic (see #307) to avoid dead variants accreting in the
+    // Raft-snapshot deserialization contract.
     Reservation,
-    PartitionConfig,
-    SystemFailure,
-    AccountingPolicy,
-    AssociationJobLimit,
-    AssociationResourceLimit,
-    AssociationTimeLimit,
-    AssocGrpCpuLimit,
-    AssocGrpMemLimit,
-    AssocGrpNodeLimit,
-    AssocGrpJobsLimit,
-    AssocGrpSubmitJobsLimit,
-    AssocGrpWallLimit,
-    AssocMaxJobsLimit,
-    AssocMaxCpuPerJobLimit,
-    AssocMaxNodePerJobLimit,
-    AssocMaxWallDurationPerJobLimit,
-    QosJobLimit,
-    QosResourceLimit,
-    QosTimeLimit,
-    QosGrpCpuLimit,
-    QosGrpMemLimit,
-    QosGrpNodeLimit,
-    QosGrpJobsLimit,
-    QosGrpSubmitJobsLimit,
-    QosGrpWallLimit,
     QosMaxCpuPerJobLimit,
-    QosMaxNodePerJobLimit,
     QosMaxWallDurationPerJobLimit,
     QosMaxMemoryPerJob,
     QosMaxCpuPerUserLimit,
     QosMaxSubmitJobPerUserLimit,
-    BurstBufferResources,
-    BurstBufferStageIn,
 }
 
 impl PendingReason {
@@ -299,39 +274,11 @@ impl PendingReason {
             Self::BootFail => "BootFailure",
             Self::OutOfMemory => "OutOfMemory",
             Self::Reservation => "Reservation",
-            Self::PartitionConfig => "PartitionConfig",
-            Self::SystemFailure => "SystemFailure",
-            Self::AccountingPolicy => "AccountingPolicy",
-            Self::AssociationJobLimit => "AssociationJobLimit",
-            Self::AssociationResourceLimit => "AssociationResourceLimit",
-            Self::AssociationTimeLimit => "AssociationTimeLimit",
-            Self::AssocGrpCpuLimit => "AssocGrpCpuLimit",
-            Self::AssocGrpMemLimit => "AssocGrpMemLimit",
-            Self::AssocGrpNodeLimit => "AssocGrpNodeLimit",
-            Self::AssocGrpJobsLimit => "AssocGrpJobsLimit",
-            Self::AssocGrpSubmitJobsLimit => "AssocGrpSubmitJobsLimit",
-            Self::AssocGrpWallLimit => "AssocGrpWallLimit",
-            Self::AssocMaxJobsLimit => "AssocMaxJobsLimit",
-            Self::AssocMaxCpuPerJobLimit => "AssocMaxCpuPerJobLimit",
-            Self::AssocMaxNodePerJobLimit => "AssocMaxNodePerJobLimit",
-            Self::AssocMaxWallDurationPerJobLimit => "AssocMaxWallDurationPerJobLimit",
-            Self::QosJobLimit => "QOSJobLimit",
-            Self::QosResourceLimit => "QOSResourceLimit",
-            Self::QosTimeLimit => "QOSTimeLimit",
-            Self::QosGrpCpuLimit => "QOSGrpCpuLimit",
-            Self::QosGrpMemLimit => "QOSGrpMemLimit",
-            Self::QosGrpNodeLimit => "QOSGrpNodeLimit",
-            Self::QosGrpJobsLimit => "QOSGrpJobsLimit",
-            Self::QosGrpSubmitJobsLimit => "QOSGrpSubmitJobsLimit",
-            Self::QosGrpWallLimit => "QOSGrpWallLimit",
             Self::QosMaxCpuPerJobLimit => "QOSMaxCpuPerJobLimit",
-            Self::QosMaxNodePerJobLimit => "QOSMaxNodePerJobLimit",
             Self::QosMaxWallDurationPerJobLimit => "QOSMaxWallDurationPerJobLimit",
             Self::QosMaxMemoryPerJob => "QOSMaxMemoryPerJob",
             Self::QosMaxCpuPerUserLimit => "QOSMaxCpuPerUserLimit",
             Self::QosMaxSubmitJobPerUserLimit => "QOSMaxSubmitJobPerUserLimit",
-            Self::BurstBufferResources => "BurstBufferResources",
-            Self::BurstBufferStageIn => "BurstBufferStageIn",
         }
     }
 }
@@ -1175,54 +1122,7 @@ mod tests {
     /// (variant, exact Slurm 25.11.6 string) for every parity addition.
     const REASON_VOCAB: &[(PendingReason, &str)] = &[
         (PendingReason::Reservation, "Reservation"),
-        (PendingReason::PartitionConfig, "PartitionConfig"),
-        (PendingReason::SystemFailure, "SystemFailure"),
-        (PendingReason::AccountingPolicy, "AccountingPolicy"),
-        (PendingReason::AssociationJobLimit, "AssociationJobLimit"),
-        (
-            PendingReason::AssociationResourceLimit,
-            "AssociationResourceLimit",
-        ),
-        (PendingReason::AssociationTimeLimit, "AssociationTimeLimit"),
-        (PendingReason::AssocGrpCpuLimit, "AssocGrpCpuLimit"),
-        (PendingReason::AssocGrpMemLimit, "AssocGrpMemLimit"),
-        (PendingReason::AssocGrpNodeLimit, "AssocGrpNodeLimit"),
-        (PendingReason::AssocGrpJobsLimit, "AssocGrpJobsLimit"),
-        (
-            PendingReason::AssocGrpSubmitJobsLimit,
-            "AssocGrpSubmitJobsLimit",
-        ),
-        (PendingReason::AssocGrpWallLimit, "AssocGrpWallLimit"),
-        (PendingReason::AssocMaxJobsLimit, "AssocMaxJobsLimit"),
-        (
-            PendingReason::AssocMaxCpuPerJobLimit,
-            "AssocMaxCpuPerJobLimit",
-        ),
-        (
-            PendingReason::AssocMaxNodePerJobLimit,
-            "AssocMaxNodePerJobLimit",
-        ),
-        (
-            PendingReason::AssocMaxWallDurationPerJobLimit,
-            "AssocMaxWallDurationPerJobLimit",
-        ),
-        (PendingReason::QosJobLimit, "QOSJobLimit"),
-        (PendingReason::QosResourceLimit, "QOSResourceLimit"),
-        (PendingReason::QosTimeLimit, "QOSTimeLimit"),
-        (PendingReason::QosGrpCpuLimit, "QOSGrpCpuLimit"),
-        (PendingReason::QosGrpMemLimit, "QOSGrpMemLimit"),
-        (PendingReason::QosGrpNodeLimit, "QOSGrpNodeLimit"),
-        (PendingReason::QosGrpJobsLimit, "QOSGrpJobsLimit"),
-        (
-            PendingReason::QosGrpSubmitJobsLimit,
-            "QOSGrpSubmitJobsLimit",
-        ),
-        (PendingReason::QosGrpWallLimit, "QOSGrpWallLimit"),
         (PendingReason::QosMaxCpuPerJobLimit, "QOSMaxCpuPerJobLimit"),
-        (
-            PendingReason::QosMaxNodePerJobLimit,
-            "QOSMaxNodePerJobLimit",
-        ),
         (
             PendingReason::QosMaxWallDurationPerJobLimit,
             "QOSMaxWallDurationPerJobLimit",
@@ -1236,8 +1136,6 @@ mod tests {
             PendingReason::QosMaxSubmitJobPerUserLimit,
             "QOSMaxSubmitJobPerUserLimit",
         ),
-        (PendingReason::BurstBufferResources, "BurstBufferResources"),
-        (PendingReason::BurstBufferStageIn, "BurstBufferStageIn"),
     ];
 
     #[test]
