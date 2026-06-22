@@ -76,6 +76,10 @@ pub struct SlurmConfig {
     #[serde(default)]
     pub licenses: HashMap<String, u64>,
 
+    /// Cluster-wide burst-buffer capacity pool.
+    #[serde(default)]
+    pub burst_buffer: BurstBufferConfig,
+
     /// Auto-update configuration.
     #[serde(default)]
     pub update: UpdateConfig,
@@ -608,6 +612,21 @@ pub struct NotificationConfig {
 /// seccomp = true      # syscall whitelist (blocks ptrace, mount, bpf)
 /// landlock = true     # filesystem access control (kernel 5.13+)
 /// ```
+/// Cluster-wide burst-buffer capacity, modeled like a single consumable pool
+/// (analogous to a license total). Jobs reserve GB via `--bb capacity=NNN`.
+///
+/// ```toml
+/// [burst_buffer]
+/// total_gb = 1024
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct BurstBufferConfig {
+    /// Total burst-buffer capacity in gibibytes. 0 (default) disables BB: any
+    /// job requesting capacity stays pending with `BurstBufferResources`.
+    #[serde(default)]
+    pub total_gb: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IsolationConfig {
     /// Run jobs as the submitting user's UID/GID (requires root spurd).

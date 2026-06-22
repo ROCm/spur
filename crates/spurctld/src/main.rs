@@ -256,6 +256,7 @@ fn default_config() -> spur_core::config::SlurmConfig {
         topology: None,
         isolation: Default::default(),
         licenses: std::collections::HashMap::new(),
+        burst_buffer: Default::default(),
         update: Default::default(),
         metrics: Default::default(),
         rest_api: Default::default(),

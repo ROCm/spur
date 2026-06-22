@@ -5,6 +5,7 @@ pub mod accounting;
 pub mod admission;
 pub mod array;
 pub mod auth;
+pub mod burst_buffer;
 pub mod config;
 pub mod dependency;
 pub mod hooks;

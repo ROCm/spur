@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 
+use crate::burst_buffer::BbStageState;
 use crate::resource::ResourceAllocations;
 
 /// Unique job identifier assigned by the controller.
@@ -248,6 +249,8 @@ pub enum PendingReason {
     QosGrpCpuLimit,
     QosGrpMemLimit,
     QosGrpNodeLimit,
+    BurstBufferResources,
+    BurstBufferStageIn,
 }
 
 impl PendingReason {
@@ -289,6 +292,8 @@ impl PendingReason {
             Self::QosGrpCpuLimit => "QOSGrpCpuLimit",
             Self::QosGrpMemLimit => "QOSGrpMemLimit",
             Self::QosGrpNodeLimit => "QOSGrpNodeLimit",
+            Self::BurstBufferResources => "BurstBufferResources",
+            Self::BurstBufferStageIn => "BurstBufferStageIn",
         }
     }
 }
@@ -539,6 +544,12 @@ pub struct Job {
     /// Total seconds spent suspended across all suspend/resume cycles.
     #[serde(default)]
     pub suspended_secs: i64,
+
+    /// Burst-buffer staging phase. `None` until the scheduler reserves BB
+    /// capacity for this job; then `Staging` while stage-in runs and `Ready`
+    /// once it completes. A BB job is held off dispatch until `Ready`.
+    #[serde(default)]
+    pub bb_stage_state: BbStageState,
 }
 
 impl Job {
@@ -579,6 +590,7 @@ impl Job {
             node_completions: HashMap::new(),
             suspended_at: None,
             suspended_secs: 0,
+            bb_stage_state: BbStageState::None,
         }
     }
 
@@ -1155,6 +1167,8 @@ mod tests {
         (PendingReason::QosGrpCpuLimit, "QOSGrpCpuLimit"),
         (PendingReason::QosGrpMemLimit, "QOSGrpMemLimit"),
         (PendingReason::QosGrpNodeLimit, "QOSGrpNodeLimit"),
+        (PendingReason::BurstBufferResources, "BurstBufferResources"),
+        (PendingReason::BurstBufferStageIn, "BurstBufferStageIn"),
     ];
 
     #[test]

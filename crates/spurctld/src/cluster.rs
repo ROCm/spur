@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use spur_core::accounting::{Qos, TresRecord, TresType};
+use spur_core::burst_buffer::BbStageState;
 use spur_core::config::SlurmConfig;
 use spur_core::job::{Job, JobId, JobSpec, JobState, NodeCompleteError, PendingReason};
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
@@ -56,6 +57,11 @@ pub struct ClusterManager {
     /// availability is derived as total minus the licenses held by active jobs
     /// (see `available_licenses`), so it cannot drift or diverge from config.
     license_pool: RwLock<HashMap<String, u64>>,
+    /// Configured cluster-wide burst-buffer capacity in GB (immutable; from
+    /// config). Like licenses, current availability is derived as total minus
+    /// the capacity reserved by jobs that have entered staging (see
+    /// `available_bb_with`), so it cannot drift from config.
+    burst_buffer_total_gb: RwLock<u64>,
     tokens: RwLock<HashMap<String, spur_core::admission::AdmissionToken>>,
     raft: RwLock<Option<SpurRaft>>,
     accounting: RwLock<Option<AccountingNotifier>>,
@@ -69,6 +75,7 @@ impl ClusterManager {
     pub fn new(config: SlurmConfig, _state_dir: &Path) -> anyhow::Result<Self> {
         let partitions = config.build_partitions();
         let license_pool = config.licenses.clone();
+        let burst_buffer_total_gb = config.burst_buffer.total_gb;
         let fairshare_cache = Arc::new(FairshareCache::new());
         let qos_cache = Arc::new(QosCache::new());
 
@@ -81,6 +88,7 @@ impl ClusterManager {
             steps: RwLock::new(HashMap::new()),
             next_job_id: AtomicU32::new(1),
             license_pool: RwLock::new(license_pool),
+            burst_buffer_total_gb: RwLock::new(burst_buffer_total_gb),
             tokens: RwLock::new(HashMap::new()),
             raft: RwLock::new(None),
             accounting: RwLock::new(None),
@@ -1288,6 +1296,39 @@ impl ClusterManager {
             });
         }
 
+        // Burst-buffer gate, after licenses (the most downstream consumable;
+        // staging happens last, just before dispatch). Two holds:
+        //   - capacity shortage: a job needing more BB than is free is dropped
+        //     (also reported `BurstBufferResources` by tag_blocked...).
+        //   - mid-stage-in: a job whose capacity is reserved but whose stage-in
+        //     has not completed (`Staging`) is NOT dispatchable yet; only a
+        //     `Ready` (or no-BB) job passes. `remaining` reserves capacity
+        //     highest-priority-first so one pass can't over-subscribe the pool.
+        {
+            let mut remaining = self.available_bb_with(&jobs);
+            pending.retain(|job| {
+                let req = extract_bb_requirement(&job.spec);
+                if req == 0 {
+                    return true; // no BB -> unaffected by the gate
+                }
+                match job.bb_stage_state {
+                    // Stage-in done: dispatchable. Capacity already reserved in
+                    // bb_capacity_in_use(), so don't double-count `remaining`.
+                    BbStageState::Ready => true,
+                    // Capacity reserved, stage-in in flight: hold off dispatch.
+                    BbStageState::Staging => false,
+                    // Not yet staged: needs free capacity to begin staging.
+                    BbStageState::None => {
+                        if req > remaining {
+                            return false;
+                        }
+                        remaining = remaining.saturating_sub(req);
+                        false
+                    }
+                }
+            });
+        }
+
         pending
     }
 
@@ -1331,6 +1372,142 @@ impl ClusterManager {
     fn available_licenses(&self) -> HashMap<String, u64> {
         let jobs = self.jobs.read();
         self.available_licenses_with(&jobs)
+    }
+
+    /// Burst-buffer capacity (GB) reserved by jobs that have entered staging or
+    /// are actively occupying resources. A BB job reserves its capacity when it
+    /// transitions to `Staging`; it holds the reservation through Ready, Running,
+    /// Suspended, and Completing, releasing only when it leaves the active set.
+    /// Pending jobs that have not yet staged (`BbStageState::None`) hold nothing.
+    fn bb_capacity_in_use(jobs: &HashMap<JobId, Job>) -> u64 {
+        let mut used = 0u64;
+        for job in jobs.values() {
+            let holds = match job.state {
+                JobState::Running | JobState::Suspended | JobState::Completing => true,
+                JobState::Pending => job.bb_stage_state != BbStageState::None,
+                _ => false,
+            };
+            if holds {
+                used = used.saturating_add(extract_bb_requirement(&job.spec));
+            }
+        }
+        used
+    }
+
+    /// Currently-free BB capacity (GB): configured total minus capacity reserved
+    /// by staging/active jobs. Derived from the live job set so it always tracks
+    /// config and cannot drift. Caller supplies the already-locked jobs map.
+    fn available_bb_with(&self, jobs: &HashMap<JobId, Job>) -> u64 {
+        let total = *self.burst_buffer_total_gb.read();
+        spur_core::burst_buffer::free_capacity_gb(total, Self::bb_capacity_in_use(jobs))
+    }
+
+    /// Currently-free BB capacity (locks the job table). See
+    /// [`available_bb_with`](Self::available_bb_with).
+    #[cfg(test)]
+    fn available_bb(&self) -> u64 {
+        let jobs = self.jobs.read();
+        self.available_bb_with(&jobs)
+    }
+
+    /// Advance burst-buffer staging for pending BB jobs (leader-only; takes the
+    /// write lock). Reserves capacity highest-priority-first for jobs that have
+    /// not yet staged, moving them `None -> Staging`. Stage-in itself is
+    /// performed out-of-band; [`complete_bb_stage_in`](Self::complete_bb_stage_in)
+    /// advances `Staging -> Ready`. A `Ready` job is dispatchable; a `Staging`
+    /// job is held with `BurstBufferStageIn`. Returns the ids moved into staging.
+    ///
+    /// NOTE: the actual data movement (the real stage-in) is a follow-up; this
+    /// drives the controller-side state machine and the scheduler hold only.
+    pub fn advance_bb_staging(&self) -> Vec<JobId> {
+        let mut started = Vec::new();
+        let mut jobs = self.jobs.write();
+        let total = *self.burst_buffer_total_gb.read();
+        let mut remaining =
+            spur_core::burst_buffer::free_capacity_gb(total, Self::bb_capacity_in_use(&jobs));
+
+        // Reserve highest-priority-first so a scarce pool is not over-subscribed
+        // and low-priority jobs do not jump ahead of blocked high-priority ones.
+        let mut candidates: Vec<JobId> = jobs
+            .values()
+            .filter(|j| {
+                j.state == JobState::Pending
+                    && j.bb_stage_state == BbStageState::None
+                    && j.pending_reason != PendingReason::Held
+                    && extract_bb_requirement(&j.spec) > 0
+            })
+            .map(|j| (j.priority, j.job_id))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect();
+        // Sort by priority desc, then job_id asc for determinism.
+        candidates.sort_by_key(|id| {
+            jobs.get(id)
+                .map(|j| (std::cmp::Reverse(j.priority), *id))
+                .unwrap_or((std::cmp::Reverse(0), *id))
+        });
+
+        for id in candidates {
+            let req = jobs
+                .get(&id)
+                .map(|j| extract_bb_requirement(&j.spec))
+                .unwrap_or(0);
+            if req == 0 || req > remaining {
+                continue;
+            }
+            if let Some(job) = jobs.get_mut(&id) {
+                job.bb_stage_state = BbStageState::Staging;
+                job.pending_reason = PendingReason::BurstBufferStageIn;
+                remaining = remaining.saturating_sub(req);
+                started.push(id);
+            }
+        }
+        started
+    }
+
+    /// Drive in-flight burst-buffer stage-ins to completion and return the ids
+    /// advanced to `Ready`. Leader-only; called once per scheduler cycle.
+    ///
+    /// FOLLOW-UP SEAM: real stage-in is asynchronous data movement performed by
+    /// the node agent, which would call `complete_bb_stage_in()` over a gRPC
+    /// report once the bytes land. Until that round-trip exists, the controller
+    /// completes staging here so the lifecycle (`None -> Staging -> Ready ->
+    /// dispatch`) is end-to-end functional. Replacing this with an agent report
+    /// is the only remaining work; the state machine and scheduler hold are real.
+    pub fn drive_bb_stage_in(&self) -> Vec<JobId> {
+        let staging: Vec<JobId> = {
+            let jobs = self.jobs.read();
+            jobs.values()
+                .filter(|j| {
+                    j.state == JobState::Pending && j.bb_stage_state == BbStageState::Staging
+                })
+                .map(|j| j.job_id)
+                .collect()
+        };
+        staging
+            .into_iter()
+            .filter(|id| self.complete_bb_stage_in(*id))
+            .collect()
+    }
+
+    /// Mark a job's burst-buffer stage-in complete (`Staging -> Ready`), making
+    /// it dispatchable. Returns true if the job was advanced. The agent-side
+    /// data mover calls this once the bytes have landed (follow-up); tests and
+    /// the controller drive it directly.
+    pub fn complete_bb_stage_in(&self, job_id: JobId) -> bool {
+        let mut jobs = self.jobs.write();
+        if let Some(job) = jobs.get_mut(&job_id) {
+            if job.state == JobState::Pending && job.bb_stage_state == BbStageState::Staging {
+                job.bb_stage_state = BbStageState::Ready;
+                if job.pending_reason == PendingReason::BurstBufferStageIn {
+                    job.pending_reason = PendingReason::None;
+                }
+                self.scheduler_notify.notify_one();
+                return true;
+            }
+        }
+        false
     }
 
     /// Cancel pending jobs whose dependencies can never be satisfied (Slurm's
@@ -1437,6 +1614,7 @@ impl ClusterManager {
             let now = Utc::now();
             let available = self.available_licenses_with(&jobs);
             let partitions = self.partitions.read();
+            let bb_free = self.available_bb_with(&jobs);
 
             // Dependency outranks QoS/Licenses/Reservation in pending_jobs() and
             // is tagged just before this pass, so re-check it first (same closures).
@@ -1466,6 +1644,17 @@ impl ClusterManager {
                 }
             };
 
+            // A BB job mid-stage-in displays `BurstBufferStageIn`; one short of
+            // free capacity displays `BurstBufferResources`. Staging is checked
+            // first so a job that already reserved capacity isn't mislabeled as
+            // a resource shortage.
+            let bb_block = |job: &Job| -> Option<PendingReason> {
+                if job.bb_stage_state == BbStageState::Staging {
+                    return Some(PendingReason::BurstBufferStageIn);
+                }
+                burst_buffer_block(job, bb_free)
+            };
+
             jobs.values()
                 .filter(|job| {
                     job.state == JobState::Pending
@@ -1474,12 +1663,14 @@ impl ClusterManager {
                 })
                 .filter_map(|job| {
                     // Same drop order as pending_jobs(): Part -> Dep -> QoS ->
-                    // Resv -> Lic (partition block is permanent, so first).
+                    // Resv -> Lic -> BB (partition block is permanent, so first;
+                    // BB is last because staging runs just before dispatch).
                     partition_block(job, &partitions)
                         .or_else(|| dependency_block(job))
                         .or_else(|| qos_block_for(job, &self.resolve_qos(job), &jobs))
                         .or_else(|| reservation_block(job, &reservations, now))
                         .or_else(|| license_block(job, &available))
+                        .or_else(|| bb_block(job))
                         .map(|reason| (job.job_id, reason))
                 })
                 .collect()
@@ -2333,6 +2524,11 @@ struct ClusterSnapshot {
     license_pool: HashMap<String, u64>,
     #[serde(default)]
     tokens: Vec<spur_core::admission::AdmissionToken>,
+    /// Configured BB total (immutable; serialized for observability but, like
+    /// `license_pool`, NOT restored — config stays authoritative). Per-job
+    /// staging phase rides along on each `Job`.
+    #[serde(default)]
+    burst_buffer_total_gb: u64,
 }
 
 impl ClusterManager {
@@ -2381,6 +2577,7 @@ impl StateMachineApply for ClusterManager {
             steps: self.steps.read().values().cloned().collect(),
             license_pool: self.license_pool.read().clone(),
             tokens: self.tokens.read().values().cloned().collect(),
+            burst_buffer_total_gb: *self.burst_buffer_total_gb.read(),
         };
         serde_json::to_vec(&snap).map_err(Into::into)
     }
@@ -2412,7 +2609,8 @@ impl StateMachineApply for ClusterManager {
             // license_pool is the configured total (immutable); it is intentionally
             // NOT restored from the snapshot so config stays authoritative and any
             // historical drift in old snapshots is discarded. Availability is
-            // derived from the restored jobs.
+            // derived from the restored jobs. burst_buffer_total_gb follows the
+            // same rule; per-job BB staging phase rides along on each restored Job.
 
             let mut tokens = self.tokens.write();
             tokens.clear();
@@ -2564,6 +2762,35 @@ fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> 
     tres.set(TresType::Node, node);
     tres.set(TresType::Memory, mem);
     tres
+}
+
+/// Burst-buffer capacity (GB) a job's `--bb` string reserves cluster-wide.
+/// Shares the grammar with the agent's stage wrapper via `spur_core`.
+fn extract_bb_requirement(spec: &JobSpec) -> u64 {
+    spec.burst_buffer
+        .as_deref()
+        .map(spur_core::burst_buffer::parse_capacity_gb)
+        .unwrap_or(0)
+}
+
+/// `BurstBufferResources` if the job needs more BB capacity than is currently
+/// free, else `None`. Reported when an absolute shortage means the job can
+/// never stage in the current cluster state. `free_gb` is the configured total
+/// minus capacity reserved by staging/active jobs. Shared by `pending_jobs()`
+/// (drop) and `tag_blocked_pending_reasons()` (displayed reason) so they agree.
+fn burst_buffer_block(job: &Job, free_gb: u64) -> Option<spur_core::job::PendingReason> {
+    use spur_core::job::PendingReason;
+    // A job that already reserved capacity (Staging/Ready) is not blocked on
+    // resources — it is either staging or dispatchable.
+    if job.bb_stage_state != BbStageState::None {
+        return None;
+    }
+    let req = extract_bb_requirement(&job.spec);
+    if req > 0 && req > free_gb {
+        Some(PendingReason::BurstBufferResources)
+    } else {
+        None
+    }
 }
 
 fn extract_license_requirements(spec: &JobSpec) -> HashMap<String, u64> {
@@ -2785,6 +3012,7 @@ mod tests {
             topology: None,
             isolation: Default::default(),
             licenses: HashMap::new(),
+            burst_buffer: Default::default(),
             update: Default::default(),
             metrics: Default::default(),
             rest_api: Default::default(),
@@ -4525,6 +4753,168 @@ mod tests {
         assert_eq!(
             granted, 1,
             "pending_jobs() returned {granted} fluent jobs but the pool holds only 1"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bb_request_over_pool_sets_resources_reason() {
+        // A job asking for more BB capacity than the pool holds stays PENDING
+        // with BurstBufferResources, and pending_jobs() drops it from scheduling.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        *cm.burst_buffer_total_gb.write() = 100;
+
+        let mut spec = basic_spec("bb-too-big");
+        spec.burst_buffer = Some("capacity=500".into());
+        let job_id = submit_and_wait(&cm, spec);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::BurstBufferResources
+        );
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        assert!(
+            !pending.contains(&job_id),
+            "a job over the BB pool must be dropped from pending_jobs()"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bb_stage_in_holds_then_becomes_dispatchable() {
+        // A BB job that fits the pool reserves capacity (None -> Staging), is
+        // held with BurstBufferStageIn and excluded from dispatch, then becomes
+        // dispatchable once stage-in completes (Staging -> Ready).
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        *cm.burst_buffer_total_gb.write() = 100;
+
+        let mut spec = basic_spec("bb-stage");
+        spec.burst_buffer = Some("capacity=40".into());
+        let job_id = submit_and_wait(&cm, spec);
+
+        // Begin staging: capacity reserved, job moves to Staging.
+        cm.advance_bb_staging();
+        assert_eq!(
+            cm.get_job(job_id).unwrap().bb_stage_state,
+            BbStageState::Staging
+        );
+        // Reserved capacity is accounted as in-use.
+        assert_eq!(cm.available_bb(), 60);
+
+        // Mid-stage-in: shown as BurstBufferStageIn and NOT dispatchable.
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::BurstBufferStageIn
+        );
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        assert!(
+            !pending.contains(&job_id),
+            "a staging BB job must not be dispatched until stage-in completes"
+        );
+
+        // Stage-in completes: job becomes Ready and dispatchable.
+        assert!(cm.complete_bb_stage_in(job_id));
+        assert_eq!(
+            cm.get_job(job_id).unwrap().bb_stage_state,
+            BbStageState::Ready
+        );
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        assert!(
+            pending.contains(&job_id),
+            "a Ready BB job must be dispatchable"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bb_staging_does_not_oversubscribe_pool() {
+        // Two BB jobs each want 60GB but the pool holds 100. advance_bb_staging()
+        // must reserve for only one; the other stays None and is reported as a
+        // resource shortage.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        *cm.burst_buffer_total_gb.write() = 100;
+
+        let mut s1 = basic_spec("bb-a");
+        s1.burst_buffer = Some("capacity=60".into());
+        let a = submit_and_wait(&cm, s1);
+        let mut s2 = basic_spec("bb-b");
+        s2.burst_buffer = Some("capacity=60".into());
+        let b = submit_and_wait(&cm, s2);
+
+        let staged = cm.advance_bb_staging();
+        assert_eq!(staged.len(), 1, "only one 60GB job fits a 100GB pool");
+
+        let states: Vec<(JobId, BbStageState)> = [a, b]
+            .iter()
+            .map(|id| (*id, cm.get_job(*id).unwrap().bb_stage_state))
+            .collect();
+        let staging = states
+            .iter()
+            .filter(|(_, s)| *s == BbStageState::Staging)
+            .count();
+        let none = states
+            .iter()
+            .filter(|(_, s)| *s == BbStageState::None)
+            .count();
+        assert_eq!((staging, none), (1, 1), "exactly one job stages");
+
+        // The unstaged job is reported as a resource shortage.
+        cm.tag_blocked_pending_reasons();
+        let unstaged = states
+            .iter()
+            .find(|(_, s)| *s == BbStageState::None)
+            .map(|(id, _)| *id)
+            .unwrap();
+        assert_eq!(
+            cm.get_job(unstaged).unwrap().pending_reason,
+            PendingReason::BurstBufferResources
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bb_capacity_freed_when_job_completes() {
+        // A BB job releases its reserved capacity when it leaves the active set,
+        // and the configured total is never mutated.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        *cm.burst_buffer_total_gb.write() = 100;
+
+        let mut spec = basic_spec("bb-life");
+        spec.burst_buffer = Some("capacity=40".into());
+        let id = submit_and_wait(&cm, spec);
+
+        cm.advance_bb_staging();
+        assert!(cm.complete_bb_stage_in(id));
+        assert_eq!(cm.available_bb(), 60);
+
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+        assert_eq!(cm.available_bb(), 60, "running BB job still holds capacity");
+
+        cm.cancel_job(id, "testuser").unwrap();
+        settle(&cm, id, JobState::Cancelled);
+        assert_eq!(
+            cm.available_bb(),
+            100,
+            "capacity must be freed when the job leaves the active set"
+        );
+        assert_eq!(
+            *cm.burst_buffer_total_gb.read(),
+            100,
+            "configured total must never be mutated"
         );
     }
 

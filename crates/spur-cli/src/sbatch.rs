@@ -129,7 +129,7 @@ pub struct SbatchArgs {
     #[arg(long, overrides_with = "het_group")]
     pub het_group: Option<u32>,
 
-    /// Burst buffer specification ("stage_in:cmd;stage_out:cmd")
+    /// Burst buffer spec ("capacity=NNN;stage_in:cmd;stage_out:cmd"); capacity in GB
     #[arg(long, overrides_with = "bb")]
     pub bb: Option<String>,
 

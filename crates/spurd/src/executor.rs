@@ -1118,6 +1118,28 @@ mod tests {
         assert_eq!(wrapped, script);
     }
 
+    #[test]
+    fn test_burst_buffer_capacity_directive_ignored_by_wrapper() {
+        // The controller consumes `capacity=NNN`; the agent's stage wrapper must
+        // ignore it (it's not a stage_in/stage_out command) and only act on the
+        // stage directive. The shared parser owns the capacity grammar.
+        let script = "#!/bin/bash\necho run\n";
+        let bb = "capacity=128;stage_in:cp /data /tmp";
+        let wrapped = wrap_with_burst_buffer(script, bb);
+        assert!(wrapped.contains("cp /data /tmp"));
+        assert!(!wrapped.contains("capacity=128"));
+        assert_eq!(spur_core::burst_buffer::parse_capacity_gb(bb), 128);
+    }
+
+    #[test]
+    fn test_burst_buffer_capacity_only_is_passthrough() {
+        // A BB spec with only a capacity reservation (no stage commands) leaves
+        // the script unwrapped — there is nothing for the agent to run.
+        let script = "#!/bin/bash\necho run\n";
+        let wrapped = wrap_with_burst_buffer(script, "capacity=64");
+        assert_eq!(wrapped, script);
+    }
+
     /// Issue #128: when uid > 0, the wrapper must drop privilege via setpriv
     /// *after* the mounts (which need CAP_SYS_ADMIN). Dropping priv before
     /// unshare would cause unshare(2) to fail with EPERM.
