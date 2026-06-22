@@ -24,9 +24,13 @@ logger = logging.getLogger(__name__)
 
 BINARIES = ["spurctld", "spurd", "spur"]
 CLI_SYMLINKS = ["sbatch", "srun", "squeue", "scancel", "sinfo", "scontrol"]
+# Extra binaries/symlinks pulled in only when accounting (spurdbd) is enabled.
+ACCOUNTING_BINARIES = ["spurdbd"]
+ACCOUNTING_SYMLINKS = ["sacct", "sacctmgr"]
 
 CONTROLLER_PORT = int(os.environ.get("SPUR_TEST_CONTROLLER_PORT", "6817"))
 AGENT_PORT = int(os.environ.get("SPUR_TEST_AGENT_PORT", "6818"))
+ACCOUNTING_PORT = int(os.environ.get("SPUR_TEST_ACCOUNTING_PORT", "6819"))
 
 
 def make_remote_dir() -> str:
@@ -117,15 +121,22 @@ class SshNode:
         self.client.close()
 
 
-def ensure_bins(nodes: list[SshNode], binaries_dir: str, bin_dir: str):
+def ensure_bins(nodes: list[SshNode], binaries_dir: str, bin_dir: str,
+                with_accounting: bool = False):
     """
     Upload binaries to all nodes if not already present (or size differs).
     bin_dir is the remote directory where binaries are installed.
+
+    When *with_accounting* is True, also upload spurdbd and create the
+    sacct/sacctmgr symlinks.
     """
     for node in nodes:
         node.exec(f"mkdir -p '{bin_dir}'")
 
-    for name in BINARIES:
+    binaries = BINARIES + (ACCOUNTING_BINARIES if with_accounting else [])
+    symlinks = CLI_SYMLINKS + (ACCOUNTING_SYMLINKS if with_accounting else [])
+
+    for name in binaries:
         local_path = Path(binaries_dir) / name
         if not local_path.is_file():
             raise FileNotFoundError(
@@ -151,7 +162,7 @@ def ensure_bins(nodes: list[SshNode], binaries_dir: str, bin_dir: str):
     # Create CLI symlinks
     symlink_cmd = (
         f"cd '{bin_dir}' && "
-        + " && ".join(f"ln -sf spur {cmd} 2>/dev/null || true" for cmd in CLI_SYMLINKS)
+        + " && ".join(f"ln -sf spur {cmd} 2>/dev/null || true" for cmd in symlinks)
     )
     for node in nodes:
         node.exec_allow_fail(symlink_cmd)
@@ -180,6 +191,14 @@ class SpurCluster:
         self.agent_as_root: bool = False
         self.agent_labels: dict[int, dict[str, str]] = {}
         self.agent_token: str | None = None
+        # Accounting (spurdbd + Postgres) runs on node 0 only, opt-in.
+        self.accounting_enabled: bool = False
+        self.accounting_addr = f"http://{nodes[0].host}:{ACCOUNTING_PORT}"
+        self._pg_container = f"spur-e2e-pg-{os.getpid()}-{time.time_ns()}"
+        self._pg_port = int(os.environ.get("SPUR_TEST_PG_PORT", "55432"))
+        self._db_url = (
+            f"postgresql://spur:spur@127.0.0.1:{self._pg_port}/spur"
+        )
 
     # --- Lifecycle ---
 
@@ -223,6 +242,8 @@ class SpurCluster:
             self._kill_controller()
             self._kill_agents(use_sudo=False)
             self._kill_agents(use_sudo=True)  # best-effort for rootful
+        if self.accounting_enabled:
+            self._start_accounting()
         self.start_controller(config_overrides, kill_stale=False)
         self.start_agents(kill_stale=False)
         self.wait_ready()
@@ -236,6 +257,8 @@ class SpurCluster:
         """Kill all daemons but keep the working directory intact."""
         self.stop_agents()
         self.stop_controller()
+        if self.accounting_enabled:
+            self._stop_accounting()
 
     def start_controller(self, config_overrides: dict | None = None, kill_stale: bool = True):
         """Start only spurctld. Writes config and waits for it to be ready.
@@ -257,6 +280,18 @@ class SpurCluster:
         if kill_stale:
             self._kill_agents(use_sudo=self.agent_as_root)
         self._start_agents()
+
+    def enable_accounting(self):
+        """Opt in to spurdbd + Postgres. Call before provision()/start().
+
+        Requires Docker and the spurdbd/sacct/sacctmgr binaries on node 0.
+        Raises RuntimeError if the prerequisites are missing — callers (the
+        accounting_cluster fixture) translate that into a pytest skip.
+        """
+        node = self.nodes[0]
+        if node.exec_allow_fail("command -v docker >/dev/null 2>&1 && echo ok").strip() != "ok":
+            raise RuntimeError("docker not available on node 0; cannot run accounting")
+        self.accounting_enabled = True
 
     def stop_controller(self):
         """Kill spurctld only."""
@@ -323,6 +358,12 @@ class SpurCluster:
 
     def scontrol(self, *args: str) -> str:
         return self.cli(["scontrol"] + list(args))
+
+    def sacct(self, args: list[str]) -> str:
+        return self.cli(["sacct", "--accounting", self.accounting_addr] + args)
+
+    def sacctmgr(self, args: list[str]) -> str:
+        return self.cli(["sacctmgr", "--accounting", self.accounting_addr] + args)
 
     def write_file(self, name: str, body: str, *,
                    all_nodes: bool = False, executable: bool = True) -> str:
@@ -649,7 +690,7 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
 
     def _default_config(self) -> dict:
         nodes_list = ",".join(self.node_names)
-        return {
+        cfg = {
             "cluster_name": "e2e-test",
             "scheduler": {"interval_secs": 1, "plugin": "backfill"},
             "auth": {"plugin": "none"},
@@ -669,6 +710,15 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
                 for name in self.node_names
             ],
         }
+        if self.accounting_enabled:
+            # Controller dials spurdbd on node 0; refresh fast so QoS/limit
+            # changes show up within a test's patience window.
+            cfg["accounting"] = {
+                "host": f"{self.nodes[0].host}:{ACCOUNTING_PORT}",
+                "database_url": self._db_url,
+                "fairshare_refresh_secs": 2,
+            }
+        return cfg
 
     def _write_config(self):
         cfg = self._default_config()
@@ -688,6 +738,43 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
         )
         pid = self.nodes[0].exec(cmd).strip()
         logger.info("spurctld started on %s (pid %s)", self.node_names[0], pid)
+
+    def _start_accounting(self):
+        """Bring up Postgres (Docker) + spurdbd on node 0, in that order."""
+        node = self.nodes[0]
+        node.exec_allow_fail(f"docker rm -f '{self._pg_container}' 2>/dev/null || true")
+        node.exec(
+            f"docker run -d --name '{self._pg_container}' "
+            f"-e POSTGRES_USER=spur -e POSTGRES_PASSWORD=spur -e POSTGRES_DB=spur "
+            f"-p {self._pg_port}:5432 postgres:16-alpine"
+        )
+        self._wait_pg(node)
+        cmd = (
+            f"nohup '{self.bin_dir}/spurdbd' "
+            f"--database-url '{self._db_url}' "
+            f"--listen '[::]:{ACCOUNTING_PORT}' --log-level info -D "
+            f"> '{self.log_dir}/spurdbd.log' 2>&1 & echo $!"
+        )
+        pid = node.exec(cmd).strip()
+        logger.info("spurdbd started on %s (pid %s)", self.node_names[0], pid)
+        time.sleep(2)
+
+    def _wait_pg(self, node: SshNode, timeout: int = 60):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            ready = node.exec_allow_fail(
+                f"docker exec '{self._pg_container}' pg_isready -U spur 2>/dev/null "
+                f"&& echo ready || true"
+            )
+            if "ready" in ready:
+                return
+            time.sleep(2)
+        raise RuntimeError("Postgres did not become ready in time")
+
+    def _stop_accounting(self):
+        node = self.nodes[0]
+        self._pkill(node, f"{self.bin_dir}/spurdbd")
+        node.exec_allow_fail(f"docker rm -f '{self._pg_container}' 2>/dev/null || true")
 
     def _sudo_prefix(self) -> str:
         pw = os.environ.get("SPUR_TEST_SSH_PASSWORD", "")
@@ -835,4 +922,27 @@ def wait_job(cluster: SpurCluster, job_id: int, timeout: int = 120) -> str:
         time.sleep(2)
     raise TimeoutError(
         f"Job {job_id} did not finish within {timeout}s (last state: {last})"
+    )
+
+
+def wait_sacct_row(cluster: SpurCluster, job_id: int, fmt: str,
+                   timeout: int = 60) -> str:
+    """Poll `sacct -j <id> -n -o <fmt>` until the job's row appears.
+
+    Job history reaches spurdbd asynchronously after the job ends, so callers
+    must poll. Returns the matching row (whitespace-joined). Raises TimeoutError.
+    """
+    deadline = time.time() + timeout
+    id_str = str(job_id)
+    last = ""
+    while time.time() < deadline:
+        out = cluster.sacct(["-j", id_str, "-n", "-o", fmt])
+        for line in out.splitlines():
+            fields = line.split()
+            if fields and fields[0] == id_str:
+                return " ".join(fields)
+        last = out
+        time.sleep(2)
+    raise TimeoutError(
+        f"Job {job_id} did not appear in sacct within {timeout}s (last: {last!r})"
     )

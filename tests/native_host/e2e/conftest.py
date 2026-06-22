@@ -173,6 +173,37 @@ def multi_node_cluster(ssh_nodes, remote_bin_dir):
     spur_cluster.teardown()
 
 
+@pytest.fixture
+def accounting_cluster(ssh_nodes, remote_bin_dir):
+    """
+    Per-test fixture: a running cluster with spurdbd + Postgres on node 0.
+
+    Skips if node 0 lacks Docker or the accounting binaries, so the suite
+    degrades gracefully where the DB backend is unavailable.
+    """
+    if len(ssh_nodes) < 1:
+        pytest.skip("accounting tests require at least one node")
+    # spurdbd/sacct/sacctmgr are not part of the session-scoped base upload.
+    try:
+        ensure_bins(ssh_nodes[:1], _get_binaries_dir(), remote_bin_dir,
+                    with_accounting=True)
+    except FileNotFoundError as e:
+        pytest.skip(f"accounting binaries unavailable: {e}")
+
+    c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
+    try:
+        c.enable_accounting()
+    except RuntimeError as e:
+        pytest.skip(str(e))
+    try:
+        c.deploy()
+    except Exception:
+        c.teardown()
+        raise
+    yield c
+    c.teardown()
+
+
 def _any_node_has_gpu(nodes: list[SshNode]) -> bool:
     for node in nodes:
         probe = node.exec_allow_fail(

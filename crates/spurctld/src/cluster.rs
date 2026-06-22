@@ -669,7 +669,20 @@ impl ClusterManager {
         }
 
         if let Some(ref notifier) = *self.accounting.read() {
-            notifier.notify_job_end(job_id, state, exit_code, Utc::now());
+            let (exit_signal, derived_exit_code) = self
+                .jobs
+                .read()
+                .get(&job_id)
+                .map(|j| (j.exit_signal, j.derived_exit_code))
+                .unwrap_or((0, 0));
+            notifier.notify_job_end(
+                job_id,
+                state,
+                exit_code,
+                Utc::now(),
+                exit_signal,
+                derived_exit_code,
+            );
         }
 
         let should_requeue = matches!(

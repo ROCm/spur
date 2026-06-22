@@ -80,6 +80,8 @@ impl SlurmAccounting for AccountingService {
             state_str,
             req.exit_code,
             end_time,
+            req.exit_signal,
+            req.derived_exit_code,
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -174,8 +176,8 @@ impl SlurmAccounting for AccountingService {
                 work_dir: String::new(),
                 command: String::new(),
                 exit_code: r.exit_code,
-                exit_signal: 0,
-                derived_exit_code: 0,
+                exit_signal: r.exit_signal,
+                derived_exit_code: r.derived_exit_code,
                 stdout_path: String::new(),
                 stderr_path: String::new(),
                 resources: None,

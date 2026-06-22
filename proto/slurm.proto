@@ -641,6 +641,8 @@ message RecordJobEndRequest {
   JobState final_state = 2;
   int32 exit_code = 3;
   google.protobuf.Timestamp end_time = 4;
+  int32 exit_signal = 5;        // Terminating signal of primary node (0 = none)
+  int32 derived_exit_code = 6;  // Running max over srun step exit codes (0 if no steps)
 }
 
 message GetJobHistoryRequest {

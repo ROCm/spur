@@ -58,12 +58,16 @@ impl AccountingNotifier {
         state: JobState,
         exit_code: i32,
         end_time: DateTime<Utc>,
+        exit_signal: i32,
+        derived_exit_code: i32,
     ) {
         let req = RecordJobEndRequest {
             job_id,
             final_state: state.to_proto_i32(),
             exit_code,
             end_time: Some(datetime_to_proto(end_time)),
+            exit_signal,
+            derived_exit_code,
         };
         let mut client = self.client.clone();
         tokio::spawn(async move {

@@ -67,7 +67,8 @@ pub struct SacctArgs {
 }
 
 const SACCT_DEFAULT_FORMAT: &str = "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x";
-const SACCT_LONG_FORMAT: &str = "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x %.19S %.19E %.10l";
+const SACCT_LONG_FORMAT: &str =
+    "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x %.10X %.19S %.19E %.10l";
 const SACCT_BRIEF_FORMAT: &str = "%.8i %.8T %6x";
 
 pub fn sacct_header(spec: char) -> &'static str {
@@ -82,6 +83,7 @@ pub fn sacct_header(spec: char) -> &'static str {
         'M' => "Elapsed",
         'D' => "NNodes",
         'x' => "ExitCode",
+        'X' => "DerivedExitCode",
         'S' => "Start",
         'E' => "End",
         'V' => "Submit",
@@ -182,6 +184,7 @@ fn resolve_sacct_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
         'M' => format_elapsed(job),
         'D' => job.num_nodes.to_string(),
         'x' => format_exit(job.exit_code, job.exit_signal),
+        'X' => format_exit(job.derived_exit_code, 0),
         'S' => format_timestamp(job.start_time.as_ref()),
         'E' => format_timestamp(job.end_time.as_ref()),
         'V' => format_timestamp(job.submit_time.as_ref()),
@@ -292,7 +295,27 @@ fn datetime_to_proto(dt: chrono::DateTime<chrono::Utc>) -> prost_types::Timestam
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spur_proto::proto::JobState;
+    use spur_proto::proto::{JobInfo, JobState};
+
+    fn job(exit_code: i32, exit_signal: i32, derived_exit_code: i32) -> JobInfo {
+        JobInfo {
+            exit_code,
+            exit_signal,
+            derived_exit_code,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn exit_and_derived_fields_render() {
+        // %x is Slurm's code:signal (signal half must survive from accounting);
+        // %X is DerivedExitCode (running max over steps), signal half always 0.
+        let j = job(3, 9, 7);
+        assert_eq!(resolve_sacct_field(&j, 'x'), "3:9");
+        assert_eq!(resolve_sacct_field(&j, 'X'), "7:0");
+        assert_eq!(resolve_sacct_field(&job(0, 0, 0), 'x'), "0:0");
+        assert_eq!(sacct_header('X'), "DerivedExitCode");
+    }
 
     #[test]
     fn parse_acct_state_maps_deadline() {

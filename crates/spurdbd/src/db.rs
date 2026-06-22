@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     qos             TEXT NOT NULL DEFAULT '',
     state           TEXT NOT NULL DEFAULT 'PENDING',
     exit_code       INTEGER NOT NULL DEFAULT 0,
+    exit_signal     INTEGER NOT NULL DEFAULT 0,
+    derived_exit_code INTEGER NOT NULL DEFAULT 0,
     num_nodes       INTEGER NOT NULL DEFAULT 1,
     num_tasks       INTEGER NOT NULL DEFAULT 1,
     cpus_per_task   INTEGER NOT NULL DEFAULT 1,
@@ -124,6 +126,9 @@ CREATE INDEX IF NOT EXISTS idx_jobs_start_time ON jobs(start_time);
 CREATE INDEX IF NOT EXISTS idx_usage_period ON usage(period_start, period_end);
 CREATE INDEX IF NOT EXISTS idx_assoc_user ON associations(user_name);
 CREATE INDEX IF NOT EXISTS idx_assoc_account ON associations(account);
+
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS exit_signal INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS derived_exit_code INTEGER NOT NULL DEFAULT 0;
 "#;
 
 /// Record a job start in the database.
@@ -164,16 +169,19 @@ pub async fn record_job_start(
 }
 
 /// Record a job completion in the database.
+#[allow(clippy::too_many_arguments)]
 pub async fn record_job_end(
     pool: &PgPool,
     job_id: i32,
     state: &str,
     exit_code: i32,
     end_time: DateTime<Utc>,
+    exit_signal: i32,
+    derived_exit_code: i32,
 ) -> anyhow::Result<()> {
     let result = sqlx::query(
         r#"
-        UPDATE jobs SET state = $2, exit_code = $3, end_time = $4
+        UPDATE jobs SET state = $2, exit_code = $3, end_time = $4, exit_signal = $5, derived_exit_code = $6
         WHERE job_id = $1
         "#,
     )
@@ -181,6 +189,8 @@ pub async fn record_job_end(
     .bind(state)
     .bind(exit_code)
     .bind(end_time)
+    .bind(exit_signal)
+    .bind(derived_exit_code)
     .execute(pool)
     .await?;
 
@@ -258,6 +268,8 @@ pub struct JobRecord {
     pub partition: String,
     pub state: String,
     pub exit_code: i32,
+    pub exit_signal: i32,
+    pub derived_exit_code: i32,
     pub num_nodes: i32,
     pub num_tasks: i32,
     pub nodelist: String,
@@ -278,7 +290,8 @@ pub async fn get_job_history(
 ) -> anyhow::Result<Vec<JobRecord>> {
     let mut qb = QueryBuilder::<sqlx::Postgres>::new(
         "SELECT job_id, name, user_name, account, partition_name, state, exit_code, \
-         num_nodes, num_tasks, nodelist, submit_time, start_time, end_time \
+         exit_signal, derived_exit_code, num_nodes, num_tasks, nodelist, \
+         submit_time, start_time, end_time \
          FROM jobs WHERE 1=1",
     );
 
@@ -319,6 +332,8 @@ pub async fn get_job_history(
             partition: row.get("partition_name"),
             state: row.get("state"),
             exit_code: row.get("exit_code"),
+            exit_signal: row.get("exit_signal"),
+            derived_exit_code: row.get("derived_exit_code"),
             num_nodes: row.get("num_nodes"),
             num_tasks: row.get("num_tasks"),
             nodelist: row.get("nodelist"),
@@ -665,13 +680,13 @@ mod job_history_tests {
         delete_jobs(&pool, &ids).await.ok();
 
         record_job_start(&pool, id0, &user_a, &account_one, "debug", 1, 1, 1, 0, t1).await?;
-        record_job_end(&pool, id0, "COMPLETED", 0, t1 + Duration::minutes(5)).await?;
+        record_job_end(&pool, id0, "COMPLETED", 0, t1 + Duration::minutes(5), 0, 0).await?;
 
         record_job_start(&pool, id1, &user_b, &account_one, "debug", 1, 1, 1, 0, t1).await?;
-        record_job_end(&pool, id1, "FAILED", 1, t1 + Duration::minutes(5)).await?;
+        record_job_end(&pool, id1, "FAILED", 137, t1 + Duration::minutes(5), 9, 137).await?;
 
         record_job_start(&pool, id2, &user_a, &account_two, "debug", 1, 1, 1, 0, t2).await?;
-        record_job_end(&pool, id2, "COMPLETED", 0, t2 + Duration::minutes(5)).await?;
+        record_job_end(&pool, id2, "COMPLETED", 0, t2 + Duration::minutes(5), 0, 0).await?;
 
         let by_user = get_job_history(&pool, Some(&user_a), None, None, None, &[], 100).await?;
         assert_eq!(by_user.len(), 2);
@@ -711,6 +726,8 @@ mod job_history_tests {
         .await?;
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].job_id, id1);
+        assert_eq!(failed[0].exit_signal, 9);
+        assert_eq!(failed[0].derived_exit_code, 137);
 
         let after = get_job_history(&pool, Some(&user_a), None, Some(t2), None, &[], 100).await?;
         assert_eq!(after.len(), 1);
