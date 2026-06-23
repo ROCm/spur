@@ -139,11 +139,8 @@ impl ClusterManager {
             None => anyhow::bail!("partition '{}' not found", partition_name),
         };
 
-        // Partition state (Down/Drain/Inactive) and structural resource limits
-        // (max_nodes/max_time/min_nodes) are NOT rejected here: matching Slurm,
-        // the job is accepted and held PENDING with PartitionInactive /
-        // PartitionConfig (see partition_block + tag_blocked_pending_reasons), so
-        // it runs once the partition is brought back Up or its config changes.
+        // Partition state and resource limits are not rejected here; the job
+        // pends with PartitionInactive/PartitionConfig instead (Slurm parity).
 
         // Check allow_accounts (if non-empty, user's account must be in the list)
         if !part.allow_accounts.is_empty() {
@@ -1139,10 +1136,8 @@ impl ClusterManager {
             .cloned()
             .collect();
 
-        // Drop jobs structurally unschedulable in their target partition
-        // (inactive partition / request exceeds partition config). Shares
-        // partition_block() with tag_blocked_pending_reasons() so the drop
-        // decision and the shown PartitionInactive/PartitionConfig reason agree.
+        // Drop jobs blocked by partition state/config (shares partition_block()
+        // with tag_blocked_pending_reasons() so drop and shown reason agree).
         {
             let partitions = self.partitions.read();
             pending.retain(|job| partition_block(job, &partitions).is_none());
@@ -1464,10 +1459,8 @@ impl ClusterManager {
                         && job.pending_reason != PendingReason::DeadLine
                 })
                 .filter_map(|job| {
-                    // Same order pending_jobs() drops jobs, so the shown reason is
-                    // the one that actually removed it: Part -> Dep -> QoS -> Resv
-                    // -> Lic. partition_block is first: a structural partition
-                    // block is permanent, so it outranks the transient blocks.
+                    // Same drop order as pending_jobs(): Part -> Dep -> QoS ->
+                    // Resv -> Lic (partition block is permanent, so first).
                     partition_block(job, &partitions)
                         .or_else(|| dependency_block(job))
                         .or_else(|| qos_block_for(job, &jobs))
@@ -2486,13 +2479,9 @@ fn qos_block_for(job: &Job, jobs: &HashMap<JobId, Job>) -> Option<spur_core::job
     }
 }
 
-/// Reason a job can never run in its target partition as configured, or `None`.
-/// `PartitionInactive` when the partition is not accepting jobs (Down/Drain/
-/// Inactive); `PartitionConfig` when the request structurally exceeds the
-/// partition's node or time limits. Unlike `Resources` (a transient busy
-/// cluster), these are permanent given the current config. Shared by
-/// `pending_jobs()` and `tag_blocked_pending_reasons()` so the drop decision and
-/// the displayed reason agree.
+/// `PartitionInactive` if the partition is not Up, `PartitionConfig` if the
+/// request exceeds its node/time limits, else `None`. Shared by `pending_jobs()`
+/// and `tag_blocked_pending_reasons()` so drop and displayed reason agree.
 fn partition_block(job: &Job, partitions: &[Partition]) -> Option<spur_core::job::PendingReason> {
     use spur_core::job::PendingReason;
     use spur_core::partition::PartitionState;
@@ -4178,8 +4167,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tag_blocked_sets_partition_config_reason() {
-        // A request that structurally exceeds the partition's max_nodes can never
-        // run there, so it is held PENDING with PartitionConfig (not Resources).
+        // Request exceeds partition max_nodes -> PartitionConfig, not Resources.
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.partitions[0].max_nodes = Some(1);
@@ -4204,8 +4192,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tag_blocked_sets_partition_config_for_time_and_min_nodes() {
-        // max_time and min_nodes are independent PartitionConfig triggers; the
-        // max_nodes branch is covered separately above.
+        // max_time and min_nodes are independent PartitionConfig triggers.
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.partitions[0].max_time = Some("00:10:00".into()); // 10 min cap
@@ -4237,8 +4224,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tag_blocked_sets_partition_inactive_when_not_up() {
-        // A partition that is not Up holds its jobs PENDING with PartitionInactive
-        // (admitted, not rejected at submit).
+        // Non-Up partition -> job admitted and held PENDING with PartitionInactive.
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.partitions[0].state = "DOWN".into();
@@ -4261,8 +4247,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_still_rejects_nonexistent_partition() {
-        // Only inactive/over-config partitions pend; a typo'd/unknown partition
-        // must still be rejected at submit (not silently admitted).
+        // Unknown partition must still be rejected at submit, not held pending.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         let mut spec = basic_spec("badpart");
