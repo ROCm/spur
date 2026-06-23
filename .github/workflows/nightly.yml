@@ -168,6 +168,34 @@ jobs:
           cache-from: type=gha,scope=nightly-docker
           cache-to: type=gha,scope=nightly-docker,mode=max
 
+  trivy-nightly-scan:
+    name: Trivy nightly rescan
+    needs: push-image
+    if: needs.build.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Scan nightly image for vulnerabilities
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
+        with:
+          image-ref: rocm/spur:nightly
+          format: sarif
+          output: trivy-nightly.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+
+      - name: Upload SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-nightly.sarif
+          category: trivy-nightly
+
   release:
     name: Publish nightly
     needs: [build, verify, push-image]
