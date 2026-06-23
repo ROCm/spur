@@ -4,6 +4,7 @@
 mod accounting;
 mod cluster;
 mod fairshare_cache;
+mod metrics_proto;
 mod metrics_server;
 mod raft;
 mod raft_server;

@@ -3,8 +3,10 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use spur_core::job::JobState as CoreJobState;
+use spur_core::node::NodeState as CoreNodeState;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
-use spur_proto::proto::{GetJobsRequest, JobState};
+use spur_proto::proto::{JobMetrics, NodeMetrics};
 
 /// Display scheduler diagnostics and statistics.
 #[derive(Parser, Debug)]
@@ -34,59 +36,20 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .await
         .context("failed to connect to spurctld")?;
 
-    // Ping to get server info
     let ping_resp = client.ping(()).await.context("failed to ping controller")?;
-
     let ping = ping_resp.into_inner();
 
-    // Get all jobs (no state filter) to compute stats
-    let all_jobs_resp = client
-        .get_jobs(GetJobsRequest {
-            states: vec![
-                JobState::JobPending as i32,
-                JobState::JobRunning as i32,
-                JobState::JobCompleting as i32,
-                JobState::JobCompleted as i32,
-                JobState::JobFailed as i32,
-                JobState::JobCancelled as i32,
-                JobState::JobTimeout as i32,
-                JobState::JobNodeFail as i32,
-                JobState::JobPreempted as i32,
-                JobState::JobSuspended as i32,
-                JobState::JobDeadline as i32,
-            ],
-            user: String::new(),
-            partition: String::new(),
-            account: String::new(),
-            job_ids: Vec::new(),
-        })
+    let job_metrics = client
+        .get_job_metrics(())
         .await
-        .context("failed to get jobs")?;
+        .context("failed to get job metrics")?
+        .into_inner();
 
-    let jobs = all_jobs_resp.into_inner().jobs;
-
-    // Count by state
-    let mut pending = 0u32;
-    let mut running = 0u32;
-    let mut completed = 0u32;
-    let mut failed = 0u32;
-    let mut cancelled = 0u32;
-    let mut timeout = 0u32;
-    let mut deadline = 0u32;
-    let total = jobs.len() as u32;
-
-    for job in &jobs {
-        match job.state {
-            s if s == JobState::JobPending as i32 => pending += 1,
-            s if s == JobState::JobRunning as i32 => running += 1,
-            s if s == JobState::JobCompleted as i32 => completed += 1,
-            s if s == JobState::JobFailed as i32 => failed += 1,
-            s if s == JobState::JobCancelled as i32 => cancelled += 1,
-            s if s == JobState::JobTimeout as i32 => timeout += 1,
-            s if s == JobState::JobDeadline as i32 => deadline += 1,
-            _ => {}
-        }
-    }
+    let node_metrics = client
+        .get_node_metrics(())
+        .await
+        .context("failed to get node metrics")?
+        .into_inner();
 
     let server_time = ping
         .server_time
@@ -99,10 +62,12 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         })
         .unwrap_or_else(|| "N/A".into());
 
-    println!("***********************************************");
-    println!("sdiag output at {}", server_time);
-    println!("***********************************************");
-    println!();
+    if !args.noheader {
+        println!("***********************************************");
+        println!("sdiag output at {}", server_time);
+        println!("***********************************************");
+        println!();
+    }
 
     println!("Server Information:");
     println!("  Hostname          : {}", ping.hostname);
@@ -113,19 +78,66 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         println!("  Federation Peers  : {}", ping.federation_peers.join(", "));
     }
 
+    print_job_statistics(&job_metrics);
+    print_node_statistics(&node_metrics);
+
+    print_scheduler_section();
+
+    Ok(())
+}
+
+fn job_count(metrics: &JobMetrics, state: CoreJobState) -> u64 {
+    let wire = state.to_proto_i32();
+    metrics
+        .by_state
+        .iter()
+        .find(|e| e.state == wire)
+        .map(|e| e.count)
+        .unwrap_or(0)
+}
+
+fn node_count(metrics: &NodeMetrics, state: CoreNodeState) -> u64 {
+    let wire = state.to_proto_i32();
+    metrics
+        .by_state
+        .iter()
+        .find(|e| e.state == wire)
+        .map(|e| e.count)
+        .unwrap_or(0)
+}
+
+fn print_job_statistics(metrics: &JobMetrics) {
     println!();
     println!("Job Statistics:");
-    println!("  Total Jobs        : {}", total);
-    println!("  Pending           : {}", pending);
-    println!("  Running           : {}", running);
-    println!("  Completed         : {}", completed);
-    println!("  Failed            : {}", failed);
-    println!("  Cancelled         : {}", cancelled);
-    println!("  Timeout           : {}", timeout);
-    println!("  Deadline          : {}", deadline);
+    println!("  Total Jobs        : {}", metrics.total);
 
-    // Compute some derived stats
-    let finished = completed + failed + cancelled + timeout + deadline;
+    for &state in &CoreJobState::ALL {
+        let count = job_count(metrics, state);
+        println!("  {:18}: {}", state.display(), count);
+    }
+
+    if metrics.held_pending > 0 {
+        println!("  Held (pending)    : {}", metrics.held_pending);
+    }
+
+    println!("  CPUs Allocated    : {}", metrics.running_cpus);
+    println!(
+        "  Memory Allocated  : {} bytes",
+        metrics.running_memory_bytes
+    );
+    println!("  GPUs Allocated    : {}", metrics.running_gpus);
+
+    let pending = job_count(metrics, CoreJobState::Pending);
+    let running = job_count(metrics, CoreJobState::Running);
+    let completing = job_count(metrics, CoreJobState::Completing);
+    let completed = job_count(metrics, CoreJobState::Completed);
+    let failed = job_count(metrics, CoreJobState::Failed);
+    let cancelled = job_count(metrics, CoreJobState::Cancelled);
+    let timeout = job_count(metrics, CoreJobState::Timeout);
+    let deadline = job_count(metrics, CoreJobState::Deadline);
+    let out_of_memory = job_count(metrics, CoreJobState::OutOfMemory);
+
+    let finished = completed + failed + cancelled + timeout + deadline + out_of_memory;
     let success_rate = if finished > 0 {
         (completed as f64 / finished as f64) * 100.0
     } else {
@@ -137,16 +149,63 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     println!("  Finished Jobs     : {}", finished);
     println!("  Success Rate      : {:.1}%", success_rate);
     println!(
-        "  Active Jobs       : {} (pending + running)",
-        pending + running
+        "  Active Jobs       : {} (pending + running + completing)",
+        pending + running + completing
     );
+}
 
-    // Scheduler info (what we can infer)
+fn print_node_statistics(metrics: &NodeMetrics) {
+    println!();
+    println!("Node Statistics:");
+    println!("  Total Nodes       : {}", metrics.total);
+
+    for &state in &CoreNodeState::ALL {
+        let count = node_count(metrics, state);
+        println!("  {:18}: {}", state.display_upper(), count);
+    }
+
+    println!("  Total CPUs        : {}", metrics.total_cpus);
+    println!("  Allocated CPUs    : {}", metrics.alloc_cpus);
+    println!("  Total Memory      : {} bytes", metrics.total_memory_bytes);
+    println!("  Allocated Memory  : {} bytes", metrics.alloc_memory_bytes);
+    println!("  Total GPUs        : {}", metrics.total_gpus);
+    println!("  Allocated GPUs    : {}", metrics.alloc_gpus);
+}
+
+fn print_scheduler_section() {
     println!();
     println!("Scheduler:");
     println!("  Algorithm         : multifactor priority + backfill");
     println!("  Priority Weights  : age=1.0 fairshare=1.0 partition_tier=1.0");
     println!("  Age Half-Life     : 7 days (10080 minutes)");
+}
 
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spur_proto::proto::JobState;
+
+    #[test]
+    fn job_count_reads_proto_entries() {
+        let metrics = JobMetrics {
+            total: 2,
+            by_state: vec![
+                spur_proto::proto::JobStateCount {
+                    state: JobState::JobPending as i32,
+                    count: 1,
+                },
+                spur_proto::proto::JobStateCount {
+                    state: JobState::JobRunning as i32,
+                    count: 1,
+                },
+            ],
+            held_pending: 0,
+            running_cpus: 4,
+            running_memory_bytes: 0,
+            running_gpus: 0,
+        };
+        assert_eq!(job_count(&metrics, CoreJobState::Pending), 1);
+        assert_eq!(job_count(&metrics, CoreJobState::Running), 1);
+        assert_eq!(job_count(&metrics, CoreJobState::OutOfMemory), 0);
+    }
 }

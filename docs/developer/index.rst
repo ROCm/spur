@@ -7,4 +7,5 @@ Everything you need to build, test, and contribute to Spur.
    :maxdepth: 2
 
    building
+   metrics
    contributing

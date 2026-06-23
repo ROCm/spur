@@ -535,6 +535,39 @@ impl SlurmController for ControllerService {
         }))
     }
 
+    async fn get_job_metrics(&self, request: Request<()>) -> Result<Response<JobMetrics>, Status> {
+        if self.check_leader(&request).is_err() {
+            let proxy = &self.leader_proxy;
+            let mut client = proxy.get_leader_client().await?;
+            let mut fwd = Request::new(());
+            *fwd.metadata_mut() = Self::forwarded_metadata();
+            return client.get_job_metrics(fwd).await;
+        }
+
+        let snap = self.cluster.job_metrics();
+        Ok(Response::new(crate::metrics_proto::job_metrics_to_proto(
+            &snap,
+        )))
+    }
+
+    async fn get_node_metrics(
+        &self,
+        request: Request<()>,
+    ) -> Result<Response<NodeMetrics>, Status> {
+        if self.check_leader(&request).is_err() {
+            let proxy = &self.leader_proxy;
+            let mut client = proxy.get_leader_client().await?;
+            let mut fwd = Request::new(());
+            *fwd.metadata_mut() = Self::forwarded_metadata();
+            return client.get_node_metrics(fwd).await;
+        }
+
+        let snap = self.cluster.node_metrics();
+        Ok(Response::new(crate::metrics_proto::node_metrics_to_proto(
+            &snap,
+        )))
+    }
+
     async fn register_agent(
         &self,
         request: Request<RegisterAgentRequest>,
