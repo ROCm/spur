@@ -81,8 +81,6 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     print_job_statistics(&job_metrics);
     print_node_statistics(&node_metrics);
 
-    print_scheduler_section();
-
     Ok(())
 }
 
@@ -106,6 +104,22 @@ fn node_count(metrics: &NodeMetrics, state: CoreNodeState) -> u64 {
         .unwrap_or(0)
 }
 
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    if bytes >= GIB as u64 {
+        format!("{:.1} GiB", bytes as f64 / GIB)
+    } else if bytes >= MIB as u64 {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    } else if bytes >= KIB as u64 {
+        format!("{:.1} KiB", bytes as f64 / KIB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 fn print_job_statistics(metrics: &JobMetrics) {
     println!();
     println!("Job Statistics:");
@@ -122,8 +136,8 @@ fn print_job_statistics(metrics: &JobMetrics) {
 
     println!("  CPUs Allocated    : {}", metrics.running_cpus);
     println!(
-        "  Memory Allocated  : {} bytes",
-        metrics.running_memory_bytes
+        "  Memory Allocated  : {}",
+        format_bytes(metrics.running_memory_bytes)
     );
     println!("  GPUs Allocated    : {}", metrics.running_gpus);
 
@@ -166,18 +180,16 @@ fn print_node_statistics(metrics: &NodeMetrics) {
 
     println!("  Total CPUs        : {}", metrics.total_cpus);
     println!("  Allocated CPUs    : {}", metrics.alloc_cpus);
-    println!("  Total Memory      : {} bytes", metrics.total_memory_bytes);
-    println!("  Allocated Memory  : {} bytes", metrics.alloc_memory_bytes);
+    println!(
+        "  Total Memory      : {}",
+        format_bytes(metrics.total_memory_bytes)
+    );
+    println!(
+        "  Allocated Memory  : {}",
+        format_bytes(metrics.alloc_memory_bytes)
+    );
     println!("  Total GPUs        : {}", metrics.total_gpus);
     println!("  Allocated GPUs    : {}", metrics.alloc_gpus);
-}
-
-fn print_scheduler_section() {
-    println!();
-    println!("Scheduler:");
-    println!("  Algorithm         : multifactor priority + backfill");
-    println!("  Priority Weights  : age=1.0 fairshare=1.0 partition_tier=1.0");
-    println!("  Age Half-Life     : 7 days (10080 minutes)");
 }
 
 #[cfg(test)]
@@ -207,6 +219,14 @@ mod tests {
         assert_eq!(job_count(&metrics, CoreJobState::Pending), 1);
         assert_eq!(job_count(&metrics, CoreJobState::Running), 1);
         assert_eq!(job_count(&metrics, CoreJobState::OutOfMemory), 0);
+    }
+
+    #[test]
+    fn format_bytes_uses_binary_units() {
+        assert_eq!(format_bytes(0), "0 bytes");
+        assert_eq!(format_bytes(512), "512 bytes");
+        assert_eq!(format_bytes(8_388_608), "8.0 MiB");
+        assert_eq!(format_bytes(1_073_741_824), "1.0 GiB");
     }
 
     #[test]
