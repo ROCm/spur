@@ -2748,7 +2748,11 @@ mod tests {
     }
 
     async fn test_cluster(dir: &TempDir) -> Arc<ClusterManager> {
-        let cm = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+        test_cluster_with_config(dir, test_config()).await
+    }
+
+    async fn test_cluster_with_config(dir: &TempDir, config: SlurmConfig) -> Arc<ClusterManager> {
+        let cm = Arc::new(ClusterManager::new(config, dir.path()).unwrap());
         let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
             .await
             .unwrap();
@@ -4179,17 +4183,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.partitions[0].max_nodes = Some(1);
-        let cm = Arc::new(ClusterManager::new(config, dir.path()).unwrap());
-        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
-            .await
-            .unwrap();
-        handle
-            .raft
-            .wait(Some(std::time::Duration::from_secs(5)))
-            .metrics(|m| m.current_leader == Some(1), "leader elected")
-            .await
-            .expect("single-node raft did not self-elect within 5s");
-        cm.set_raft(handle.raft);
+        let cm = test_cluster_with_config(&dir, config).await;
 
         let mut spec = basic_spec("toobig");
         spec.partition = Some("default".into());
@@ -4205,6 +4199,77 @@ mod tests {
         assert!(
             !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
             "structurally-unschedulable job must be dropped from scheduling"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_sets_partition_config_for_time_and_min_nodes() {
+        // max_time and min_nodes are independent PartitionConfig triggers; the
+        // max_nodes branch is covered separately above.
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].max_time = Some("00:10:00".into()); // 10 min cap
+        config.partitions[0].min_nodes = 2;
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut over_time = basic_spec("overtime");
+        over_time.partition = Some("default".into());
+        over_time.time_limit = Some(chrono::Duration::hours(1));
+        let t_id = submit_and_wait(&cm, over_time);
+
+        let mut under_nodes = basic_spec("undernodes");
+        under_nodes.partition = Some("default".into());
+        under_nodes.num_nodes = 1; // below min_nodes=2
+        let n_id = submit_and_wait(&cm, under_nodes);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(t_id).unwrap().pending_reason,
+            PendingReason::PartitionConfig,
+            "time_limit over partition max_time -> PartitionConfig"
+        );
+        assert_eq!(
+            cm.get_job(n_id).unwrap().pending_reason,
+            PendingReason::PartitionConfig,
+            "num_nodes below partition min_nodes -> PartitionConfig"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_sets_partition_inactive_when_not_up() {
+        // A partition that is not Up holds its jobs PENDING with PartitionInactive
+        // (admitted, not rejected at submit).
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].state = "DOWN".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("downpart");
+        spec.partition = Some("default".into());
+        let job_id = submit_and_wait(&cm, spec);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::PartitionInactive
+        );
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "job in a non-Up partition must be dropped from scheduling"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_still_rejects_nonexistent_partition() {
+        // Only inactive/over-config partitions pend; a typo'd/unknown partition
+        // must still be rejected at submit (not silently admitted).
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let mut spec = basic_spec("badpart");
+        spec.partition = Some("does-not-exist".into());
+        assert!(
+            cm.submit_job(spec).is_err(),
+            "submitting to an unknown partition must error"
         );
     }
 
