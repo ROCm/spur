@@ -1,0 +1,4 @@
+---
+# Per-host spur_wg_address may be set in inventory. If omitted, the role assigns
+# the first usable IP in spur_wg_cidr to the controller; agents must be set in
+# inventory (no auto-assignment to avoid collisions).

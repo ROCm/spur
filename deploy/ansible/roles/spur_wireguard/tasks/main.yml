@@ -1,0 +1,87 @@
+---
+- name: Assert wireguard module is loadable
+  ansible.builtin.shell: "modinfo wireguard >/dev/null 2>&1"
+  changed_when: false
+
+- name: Install wireguard-tools (Debian/Ubuntu)
+  ansible.builtin.apt:
+    name: wireguard-tools
+    state: present
+    update_cache: yes
+  when: ansible_os_family == 'Debian'
+
+- name: Install wireguard-tools (RHEL family)
+  ansible.builtin.package:
+    name: wireguard-tools
+    state: present
+  when: ansible_os_family == 'RedHat'
+
+- name: Compute first usable WG address for controllers
+  ansible.builtin.set_fact:
+    spur_wg_address: "{{ spur_wg_cidr | ansible.utils.ipaddr('network') | ansible.utils.ipmath(1) }}"
+  when:
+    - inventory_hostname in groups['spur_controllers']
+    - spur_wg_address is not defined
+
+- name: Initialize WireGuard mesh on controller(s)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if ! ip link show {{ spur_wg_interface }} >/dev/null 2>&1; then
+      {{ spur_install_dir }}/spur net init \
+        --cidr {{ spur_wg_cidr }} \
+        --port {{ spur_wg_port }} \
+        --interface {{ spur_wg_interface }} \
+        --address {{ spur_wg_address }}
+    fi
+    {{ spur_install_dir }}/spur net pubkey 2>/dev/null \
+      || wg show {{ spur_wg_interface }} public-key
+  args:
+    executable: /bin/bash
+  register: wg_ctl_init
+  changed_when: "'net init' in wg_ctl_init.stdout"
+  when: inventory_hostname in groups['spur_controllers']
+
+- name: Capture controller pubkey
+  ansible.builtin.set_fact:
+    spur_wg_controller_pubkey: "{{ wg_ctl_init.stdout_lines | select('match', '^[A-Za-z0-9+/]{43}=$') | list | last }}"
+  when: inventory_hostname in groups['spur_controllers']
+
+- name: Broadcast controller pubkey to all hosts
+  ansible.builtin.set_fact:
+    spur_wg_controller_pubkey: "{{ hostvars[groups['spur_controllers'][0]]['spur_wg_controller_pubkey'] }}"
+    spur_wg_controller_endpoint: "{{ hostvars[groups['spur_controllers'][0]]['ansible_host'] | default(groups['spur_controllers'][0]) }}:{{ spur_wg_port }}"
+
+- name: Join WireGuard mesh on agents
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if ! ip link show {{ spur_wg_interface }} >/dev/null 2>&1; then
+      {{ spur_install_dir }}/spur net join \
+        --endpoint {{ spur_wg_controller_endpoint }} \
+        --server-key {{ spur_wg_controller_pubkey }} \
+        --interface {{ spur_wg_interface }} \
+        --address {{ spur_wg_address }}
+    fi
+    wg show {{ spur_wg_interface }} public-key
+  args:
+    executable: /bin/bash
+  register: wg_agent_pubkey
+  changed_when: "'net join' in wg_agent_pubkey.stdout"
+  when: inventory_hostname in groups['spur_agents'] and inventory_hostname not in groups['spur_controllers']
+
+- name: Capture agent pubkey
+  ansible.builtin.set_fact:
+    spur_wg_pubkey: "{{ wg_agent_pubkey.stdout_lines | select('match', '^[A-Za-z0-9+/]{43}=$') | list | last }}"
+  when: inventory_hostname in groups['spur_agents'] and inventory_hostname not in groups['spur_controllers']
+
+- name: Register all agents as peers on the controller
+  ansible.builtin.shell: |
+    {{ spur_install_dir }}/spur net add-peer \
+      --key {{ hostvars[item]['spur_wg_pubkey'] }} \
+      --allowed-ip {{ hostvars[item]['spur_wg_address'] }}/32
+  loop: "{{ groups['spur_agents'] | difference(groups['spur_controllers']) }}"
+  when: inventory_hostname == groups['spur_controllers'][0]
+  changed_when: true
+
+- name: Verify mesh — every host pings controller WG IP
+  ansible.builtin.command: "ping -c2 -W2 {{ hostvars[groups['spur_controllers'][0]]['spur_wg_address'] }}"
+  changed_when: false

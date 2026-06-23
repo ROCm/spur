@@ -1,0 +1,97 @@
+---
+- name: Resolve every controller's listen IP (needed for the peers list on all hosts)
+  ansible.builtin.set_fact:
+    spur_controller_listen_ip: >-
+      {{ hostvars[item].spur_wg_address if spur_transport == 'wireguard'
+         else (hostvars[item].ansible_host | default(hostvars[item].ansible_default_ipv4.address)) }}
+  delegate_to: "{{ item }}"
+  delegate_facts: true
+  loop: "{{ groups['spur_controllers'] }}"
+  run_once: true
+
+- name: Assign 1-based node_id to each controller (position in inventory)
+  ansible.builtin.set_fact:
+    spur_controller_node_id: "{{ groups['spur_controllers'].index(item) + 1 }}"
+  delegate_to: "{{ item }}"
+  delegate_facts: true
+  loop: "{{ groups['spur_controllers'] }}"
+  run_once: true
+
+- name: Resolve short node name for each agent (used by spur.conf and --hostname)
+  ansible.builtin.set_fact:
+    spur_node_name: "{{ hostvars[item].ansible_hostname }}"
+  delegate_to: "{{ item }}"
+  delegate_facts: true
+  loop: "{{ groups['spur_agents'] }}"
+  run_once: true
+  when: hostvars[item].spur_node_name is not defined
+
+- name: Write spur.conf
+  ansible.builtin.template:
+    src: spur.conf.j2
+    dest: "{{ spur_home }}/etc/spur.conf"
+    mode: "0644"
+  register: spur_conf
+
+- name: Stop existing spurctld (exact-name match — never use pkill -f)
+  ansible.builtin.shell: |
+    pkill -x spurctld 2>/dev/null || true
+    for i in $(seq 1 10); do
+      pgrep -x spurctld >/dev/null || exit 0
+      sleep 0.5
+    done
+    echo "spurctld still running after 5s"
+    exit 1
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Wipe Raft state (when spur_wipe_state is true)
+  ansible.builtin.file:
+    path: "{{ spur_home }}/state"
+    state: absent
+  when: spur_wipe_state | bool
+
+- name: Recreate state dir after wipe
+  ansible.builtin.file:
+    path: "{{ spur_home }}/state"
+    state: directory
+    mode: "0755"
+  when: spur_wipe_state | bool
+
+- name: Start spurctld
+  ansible.builtin.shell: |
+    nohup {{ spur_install_dir }}/spurctld \
+        -f {{ spur_home }}/etc/spur.conf \
+        --state-dir {{ spur_home }}/state \
+        --log-level {{ spur_log_level }} \
+        > {{ spur_home }}/log/spurctld.log 2>&1 < /dev/null &
+    disown
+    echo $!
+  args:
+    executable: /bin/bash
+  register: spurctld_start
+  changed_when: true
+
+- name: Wait for spurctld to listen on {{ spur_controller_port }}
+  ansible.builtin.wait_for:
+    port: "{{ spur_controller_port }}"
+    host: "127.0.0.1"
+    timeout: 30
+
+- name: Wait for Raft leader to be elected (HA mode needs all peers up before quorum)
+  # `spur nodes` returns the error `no leader elected yet` until election succeeds.
+  # In HA mode this can take a few seconds while peers find each other.
+  ansible.builtin.shell: |
+    for i in $(seq 1 60); do
+      out=$({{ spur_install_dir }}/spur nodes 2>&1)
+      echo "$out" | grep -qE 'no leader|not the Raft leader|cannot reach leader|transport error|Connection refused' || { echo OK; exit 0; }
+      sleep 1
+    done
+    echo "timeout waiting for leader: $out"
+    exit 1
+  args:
+    executable: /bin/bash
+  changed_when: false
+  when: spur_ha_enabled | bool
+  run_once: true

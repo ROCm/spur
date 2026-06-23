@@ -1,0 +1,146 @@
+---
+- name: Wait for agents to register with controller
+  # `spur nodes` collapses by partition; use `spur show node <name>` per host instead.
+  ansible.builtin.shell: |
+    set -e
+    for i in $(seq 1 30); do
+      missing=0
+      for h in {{ groups['spur_agents'] | map('extract', hostvars, 'ansible_hostname') | join(' ') }}; do
+        {{ spur_install_dir }}/spur show node "$h" >/dev/null 2>&1 || missing=$((missing+1))
+      done
+      [ "$missing" -eq 0 ] && exit 0
+      sleep 1
+    done
+    echo "timed out: $missing agents still missing"
+    exit 1
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Show spur nodes
+  ansible.builtin.command: "{{ spur_install_dir }}/spur nodes"
+  register: nodes_out
+  changed_when: false
+
+- name: Print spur nodes
+  ansible.builtin.debug:
+    var: nodes_out.stdout_lines
+
+- name: Drop test scripts under /tmp
+  ansible.builtin.copy:
+    dest: /tmp/spur-test-{{ item.name }}.sh
+    mode: "0755"
+    content: "{{ item.body }}"
+  loop:
+    - name: single
+      body: |
+        #!/bin/bash
+        #SBATCH --job-name=ansible-single
+        echo "ran on $(hostname) at $(date)"
+    - name: multi
+      body: |
+        #!/bin/bash
+        #SBATCH --job-name=ansible-multi
+        #SBATCH -N {{ groups['spur_agents'] | length }}
+        #SBATCH --ntasks-per-node=1
+        echo "node $SPUR_TASK_OFFSET of $SPUR_NUM_NODES on $(hostname); peers=$SPUR_PEER_NODES"
+
+- name: Submit single-node test job
+  ansible.builtin.shell: |
+    cd {{ spur_home }}
+    {{ spur_install_dir }}/spur submit /tmp/spur-test-single.sh | grep -oE '[0-9]+'
+  args:
+    executable: /bin/bash
+  register: single_jobid
+  changed_when: true
+
+- name: Wait for single-node job {{ single_jobid.stdout }} to finish
+  ansible.builtin.shell: |
+    for i in $(seq 1 30); do
+      st=$({{ spur_install_dir }}/spur show job {{ single_jobid.stdout }} 2>/dev/null | grep -oE 'JobState=[A-Z]+' | head -1 | cut -d= -f2)
+      case "$st" in
+        COMPLETED|FAILED|CANCELLED|TIMEOUT|NODE_FAIL) echo "$st"; exit 0 ;;
+      esac
+      sleep 1
+    done
+    echo "timeout"
+    exit 1
+  args:
+    executable: /bin/bash
+  register: single_state
+  changed_when: false
+  failed_when: single_state.stdout != "COMPLETED"
+
+- name: Find single-node job output (looked up on every agent since assignment is dynamic)
+  ansible.builtin.shell: |
+    for d in {{ spur_home }} $HOME /root /tmp; do
+      f="$d/spur-{{ single_jobid.stdout }}.out"
+      [ -f "$f" ] && { cat "$f"; exit 0; }
+    done
+    echo ""
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['spur_agents'] }}"
+  register: single_outs
+  changed_when: false
+
+- name: Set single_out to first non-empty result
+  ansible.builtin.set_fact:
+    single_out_text: "{{ (single_outs.results | selectattr('stdout', 'ne', '') | list | first).stdout | default('(not found on any agent)') }}"
+
+- name: Show single-node output
+  ansible.builtin.debug:
+    msg: "Job {{ single_jobid.stdout }} ({{ single_state.stdout }}): {{ single_out_text }}"
+
+- name: Submit multi-node test job (only when more than one agent)
+  ansible.builtin.shell: |
+    cd {{ spur_home }}
+    {{ spur_install_dir }}/spur submit /tmp/spur-test-multi.sh | grep -oE '[0-9]+'
+  args:
+    executable: /bin/bash
+  register: multi_jobid
+  when: groups['spur_agents'] | length > 1
+  changed_when: true
+
+- name: Wait for multi-node job to finish
+  ansible.builtin.shell: |
+    for i in $(seq 1 60); do
+      st=$({{ spur_install_dir }}/spur show job {{ multi_jobid.stdout }} 2>/dev/null | grep -oE 'JobState=[A-Z]+' | head -1 | cut -d= -f2)
+      case "$st" in
+        COMPLETED|FAILED|CANCELLED|TIMEOUT|NODE_FAIL) echo "$st"; exit 0 ;;
+      esac
+      sleep 1
+    done
+    echo "timeout"
+    exit 1
+  args:
+    executable: /bin/bash
+  register: multi_state
+  when: groups['spur_agents'] | length > 1
+  changed_when: false
+  failed_when: multi_state.stdout != "COMPLETED"
+
+- name: Fetch multi-node outputs from every agent (no shared-FS assumption)
+  ansible.builtin.shell: |
+    for d in {{ spur_home }} $HOME /root /tmp; do
+      f="$d/spur-{{ multi_jobid.stdout }}.out"
+      [ -f "$f" ] && { cat "$f"; exit 0; }
+    done
+    echo "(no output on this host)"
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['spur_agents'] }}"
+  register: multi_outs
+  when: groups['spur_agents'] | length > 1
+  changed_when: false
+  failed_when: false
+
+- name: Show multi-node outputs
+  ansible.builtin.debug:
+    msg: "{{ item.item }}: {{ item.stdout | default('(no output)') }}"
+  loop: "{{ multi_outs.results | default([]) }}"
+  when: groups['spur_agents'] | length > 1
+  loop_control:
+    label: "{{ item.item }}"
