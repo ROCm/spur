@@ -536,12 +536,22 @@ impl SlurmController for ControllerService {
     }
 
     async fn get_job_metrics(&self, request: Request<()>) -> Result<Response<JobMetrics>, Status> {
-        if self.check_leader(&request).is_err() {
+        if let Err(status) = self.check_leader(&request) {
+            if request.metadata().get(FORWARDED_HEADER).is_some() {
+                return Err(status);
+            }
             let proxy = &self.leader_proxy;
-            let mut client = proxy.get_leader_client().await?;
-            let mut fwd = Request::new(());
-            *fwd.metadata_mut() = Self::forwarded_metadata();
-            return client.get_job_metrics(fwd).await;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.get_job_metrics(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward get_job_metrics to leader: {e}");
+                    return Err(status);
+                }
+            }
         }
 
         let snap = self.cluster.job_metrics();
@@ -554,12 +564,22 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<()>,
     ) -> Result<Response<NodeMetrics>, Status> {
-        if self.check_leader(&request).is_err() {
+        if let Err(status) = self.check_leader(&request) {
+            if request.metadata().get(FORWARDED_HEADER).is_some() {
+                return Err(status);
+            }
             let proxy = &self.leader_proxy;
-            let mut client = proxy.get_leader_client().await?;
-            let mut fwd = Request::new(());
-            *fwd.metadata_mut() = Self::forwarded_metadata();
-            return client.get_node_metrics(fwd).await;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.get_node_metrics(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward get_node_metrics to leader: {e}");
+                    return Err(status);
+                }
+            }
         }
 
         let snap = self.cluster.node_metrics();

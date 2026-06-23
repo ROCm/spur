@@ -127,30 +127,30 @@ fn print_job_statistics(metrics: &JobMetrics) {
     );
     println!("  GPUs Allocated    : {}", metrics.running_gpus);
 
-    let pending = job_count(metrics, CoreJobState::Pending);
-    let running = job_count(metrics, CoreJobState::Running);
-    let completing = job_count(metrics, CoreJobState::Completing);
     let completed = job_count(metrics, CoreJobState::Completed);
-    let failed = job_count(metrics, CoreJobState::Failed);
-    let cancelled = job_count(metrics, CoreJobState::Cancelled);
-    let timeout = job_count(metrics, CoreJobState::Timeout);
-    let deadline = job_count(metrics, CoreJobState::Deadline);
-    let out_of_memory = job_count(metrics, CoreJobState::OutOfMemory);
-
-    let finished = completed + failed + cancelled + timeout + deadline + out_of_memory;
+    let finished: u64 = CoreJobState::ALL
+        .iter()
+        .filter(|s| s.is_terminal())
+        .map(|s| job_count(metrics, *s))
+        .sum();
     let success_rate = if finished > 0 {
         (completed as f64 / finished as f64) * 100.0
     } else {
         0.0
     };
+    let active: u64 = CoreJobState::ALL
+        .iter()
+        .filter(|s| s.is_active())
+        .map(|s| job_count(metrics, *s))
+        .sum();
 
     println!();
     println!("Derived Statistics:");
     println!("  Finished Jobs     : {}", finished);
     println!("  Success Rate      : {:.1}%", success_rate);
     println!(
-        "  Active Jobs       : {} (pending + running + completing)",
-        pending + running + completing
+        "  Active Jobs       : {} (running + completing + suspended)",
+        active
     );
 }
 
@@ -207,5 +207,52 @@ mod tests {
         assert_eq!(job_count(&metrics, CoreJobState::Pending), 1);
         assert_eq!(job_count(&metrics, CoreJobState::Running), 1);
         assert_eq!(job_count(&metrics, CoreJobState::OutOfMemory), 0);
+    }
+
+    #[test]
+    fn derived_job_totals_use_terminal_and_active_flags() {
+        let metrics = JobMetrics {
+            total: 6,
+            by_state: vec![
+                spur_proto::proto::JobStateCount {
+                    state: JobState::JobPending as i32,
+                    count: 1,
+                },
+                spur_proto::proto::JobStateCount {
+                    state: JobState::JobRunning as i32,
+                    count: 1,
+                },
+                spur_proto::proto::JobStateCount {
+                    state: JobState::JobSuspended as i32,
+                    count: 1,
+                },
+                spur_proto::proto::JobStateCount {
+                    state: JobState::JobNodeFail as i32,
+                    count: 1,
+                },
+                spur_proto::proto::JobStateCount {
+                    state: JobState::JobCompleted as i32,
+                    count: 2,
+                },
+            ],
+            held_pending: 0,
+            running_cpus: 0,
+            running_memory_bytes: 0,
+            running_gpus: 0,
+        };
+
+        let finished: u64 = CoreJobState::ALL
+            .iter()
+            .filter(|s| s.is_terminal())
+            .map(|s| job_count(&metrics, *s))
+            .sum();
+        let active: u64 = CoreJobState::ALL
+            .iter()
+            .filter(|s| s.is_active())
+            .map(|s| job_count(&metrics, *s))
+            .sum();
+
+        assert_eq!(finished, 3); // NODE_FAIL + 2 COMPLETED
+        assert_eq!(active, 2); // RUNNING + SUSPENDED
     }
 }
