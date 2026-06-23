@@ -9,7 +9,7 @@
 //! Token format: `<id>.<secret>` (6-char hex ID, 64-char hex secret).
 
 use chrono::{DateTime, Utc};
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
