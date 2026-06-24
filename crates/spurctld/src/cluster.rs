@@ -1312,12 +1312,10 @@ impl ClusterManager {
                     return true; // no BB -> unaffected by the gate
                 }
                 match job.bb_stage_state {
-                    // Stage-in done: dispatchable. Capacity already reserved in
-                    // bb_capacity_in_use(), so don't double-count `remaining`.
+                    // Capacity already reserved in bb_capacity_in_use(), so
+                    // don't double-count `remaining`.
                     BbStageState::Ready => true,
-                    // Capacity reserved, stage-in in flight: hold off dispatch.
                     BbStageState::Staging => false,
-                    // Not yet staged: needs free capacity to begin staging.
                     BbStageState::None => {
                         if req > remaining {
                             return false;
@@ -1436,10 +1434,7 @@ impl ClusterManager {
                     && j.pending_reason != PendingReason::Held
                     && extract_bb_requirement(&j.spec) > 0
             })
-            .map(|j| (j.priority, j.job_id))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|(_, id)| id)
+            .map(|j| j.job_id)
             .collect();
         // Sort by priority desc, then job_id asc for determinism.
         candidates.sort_by_key(|id| {
@@ -4795,16 +4790,13 @@ mod tests {
         spec.burst_buffer = Some("capacity=40".into());
         let job_id = submit_and_wait(&cm, spec);
 
-        // Begin staging: capacity reserved, job moves to Staging.
         cm.advance_bb_staging();
         assert_eq!(
             cm.get_job(job_id).unwrap().bb_stage_state,
             BbStageState::Staging
         );
-        // Reserved capacity is accounted as in-use.
         assert_eq!(cm.available_bb(), 60);
 
-        // Mid-stage-in: shown as BurstBufferStageIn and NOT dispatchable.
         cm.tag_blocked_pending_reasons();
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
@@ -4816,7 +4808,6 @@ mod tests {
             "a staging BB job must not be dispatched until stage-in completes"
         );
 
-        // Stage-in completes: job becomes Ready and dispatchable.
         assert!(cm.complete_bb_stage_in(job_id));
         assert_eq!(
             cm.get_job(job_id).unwrap().bb_stage_state,
@@ -4863,7 +4854,6 @@ mod tests {
             .count();
         assert_eq!((staging, none), (1, 1), "exactly one job stages");
 
-        // The unstaged job is reported as a resource shortage.
         cm.tag_blocked_pending_reasons();
         let unstaged = states
             .iter()

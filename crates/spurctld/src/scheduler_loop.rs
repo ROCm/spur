@@ -102,11 +102,9 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // empty-check so reasons stay fresh even with nothing schedulable.
         cluster.tag_blocked_pending_reasons();
 
-        // Burst-buffer staging: complete any in-flight stage-ins (Staging ->
-        // Ready) from the previous cycle, then move newly-eligible BB jobs into
-        // staging (reserves capacity, holds with BurstBufferStageIn). Real
-        // agent-side data movement is a follow-up; drive_bb_stage_in() is the
-        // controller-side completion seam.
+        // Drive before advance so capacity freed by completions is available to
+        // newly-eligible jobs in the same cycle. Real agent-side data movement is
+        // a follow-up; drive_bb_stage_in() is the controller-side seam only.
         cluster.drive_bb_stage_in();
         cluster.advance_bb_staging();
 
