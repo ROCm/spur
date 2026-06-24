@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2E tests for sacct accounting: exit:signal and DerivedExitCode (issue #297).
+"""E2E tests for sacct accounting: exit:signal and DerivedExitCode.
 
 Requires spurdbd + Postgres on node 0 (the accounting_cluster fixture, which
 skips when Docker or the accounting binaries are unavailable).

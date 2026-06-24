@@ -758,7 +758,20 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
         )
         pid = node.exec(cmd).strip()
         logger.info("spurdbd started on %s (pid %s)", self.node_names[0], pid)
-        time.sleep(2)
+        # spurctld connects to accounting once at startup, so spurdbd must be
+        # accepting connections before the controller starts — wait for the port.
+        self._wait_port(node, ACCOUNTING_PORT)
+
+    def _wait_port(self, node: SshNode, port: int, timeout: int = 30):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            ok = node.exec_allow_fail(
+                f"bash -c '</dev/tcp/127.0.0.1/{port}' 2>/dev/null && echo ready || true"
+            )
+            if "ready" in ok:
+                return
+            time.sleep(1)
+        raise RuntimeError(f"spurdbd did not listen on port {port} within {timeout}s")
 
     def _wait_pg(self, node: SshNode, timeout: int = 60):
         deadline = time.time() + timeout

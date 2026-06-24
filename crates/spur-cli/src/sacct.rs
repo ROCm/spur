@@ -185,6 +185,10 @@ fn resolve_sacct_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
         'D' => job.num_nodes.to_string(),
         'x' => format_exit(job.exit_code, job.exit_signal),
         'X' => format_exit(job.derived_exit_code, 0),
+        'l' => match job.time_limit.as_ref() {
+            Some(d) if d.seconds > 0 => format_duration(d.seconds),
+            _ => "UNLIMITED".into(),
+        },
         'S' => format_timestamp(job.start_time.as_ref()),
         'E' => format_timestamp(job.end_time.as_ref()),
         'V' => format_timestamp(job.submit_time.as_ref()),
@@ -315,6 +319,15 @@ mod tests {
         assert_eq!(resolve_sacct_field(&j, 'X'), "7:0");
         assert_eq!(resolve_sacct_field(&job(0, 0, 0), 'x'), "0:0");
         assert_eq!(sacct_header('X'), "DerivedExitCode");
+    }
+
+    #[test]
+    fn time_limit_field_renders() {
+        // %l resolves to a formatted duration, or UNLIMITED when unset/zero.
+        let mut j = job(0, 0, 0);
+        assert_eq!(resolve_sacct_field(&j, 'l'), "UNLIMITED");
+        j.time_limit = Some(prost_types::Duration { seconds: 3600, nanos: 0 });
+        assert_eq!(resolve_sacct_field(&j, 'l'), format_duration(3600));
     }
 
     #[test]
