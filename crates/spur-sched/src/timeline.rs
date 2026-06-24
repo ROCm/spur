@@ -73,6 +73,11 @@ impl<'a> AllocationSweep<'a> {
     fn used(&self) -> &ResourceAllocations {
         &self.used
     }
+
+    /// Earliest end among intervals active at the current sweep time.
+    fn earliest_active_end(&self) -> Option<DateTime<Utc>> {
+        self.ending.peek().map(|Reverse((end, _))| *end)
+    }
 }
 
 impl NodeTimeline {
@@ -135,12 +140,17 @@ impl NodeTimeline {
     /// Find the earliest time at which `request` resources are available
     /// for `duration` contiguous time.
     pub fn earliest_start(
-        &mut self,
+        &self,
         request: &ResourceSet,
         duration: Duration,
         after: DateTime<Utc>,
     ) -> DateTime<Utc> {
-        self.gc(after);
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            self.intervals.iter().all(|i| i.end > after),
+            "stale interval in timeline for {}",
+            self.node_name,
+        );
 
         let mut candidate = after;
         let max_check = after + Duration::days(365);
@@ -161,13 +171,7 @@ impl NodeTimeline {
                 }
                 return candidate;
             } else {
-                let next_end = self
-                    .intervals
-                    .iter()
-                    .filter(|i| i.end > candidate)
-                    .map(|i| i.end)
-                    .min();
-                match next_end {
+                match sweep.earliest_active_end() {
                     Some(t) => candidate = t,
                     None => return candidate,
                 }
@@ -432,7 +436,7 @@ mod tests {
             if tl.can_satisfy_at(candidate, request) {
                 let window_end = candidate + duration;
                 let mut ok = true;
-                for interval in &tl.intervals[..tl.overlap_prefix_end(window_end)] {
+                for interval in &tl.intervals {
                     if interval.start <= candidate || interval.end <= candidate {
                         continue;
                     }
@@ -452,7 +456,7 @@ mod tests {
                 let next_end = tl
                     .intervals
                     .iter()
-                    .filter(|i| i.end > candidate)
+                    .filter(|i| i.start <= candidate && i.end > candidate)
                     .map(|i| i.end)
                     .min();
                 match next_end {
@@ -641,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn test_earliest_start_prunes_expired_intervals() {
+    fn test_gc_drops_expired_intervals() {
         let mut tl = make_timeline();
         let base = Utc::now();
 
@@ -657,14 +661,16 @@ mod tests {
         );
         assert_eq!(tl.intervals.len(), 2);
 
+        tl.gc(base);
+        assert_eq!(tl.intervals.len(), 1);
+        assert!(tl.intervals[0].end > base);
+
         let req = ResourceSet {
             cpus: 32,
             ..Default::default()
         };
         let start = tl.earliest_start(&req, Duration::hours(1), base);
         assert!(start >= base + Duration::hours(4));
-        assert_eq!(tl.intervals.len(), 1);
-        assert!(tl.intervals[0].end > base);
     }
 
     #[test]
