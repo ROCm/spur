@@ -50,7 +50,7 @@ pub struct SacctArgs {
     pub brief: bool,
 
     /// Don't print header
-    #[arg(long)]
+    #[arg(short = 'n', long)]
     pub noheader: bool,
 
     /// Max records

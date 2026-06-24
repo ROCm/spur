@@ -289,8 +289,9 @@ class SpurCluster:
         accounting_cluster fixture) translate that into a pytest skip.
         """
         node = self.nodes[0]
-        if node.exec_allow_fail("command -v docker >/dev/null 2>&1 && echo ok").strip() != "ok":
-            raise RuntimeError("docker not available on node 0; cannot run accounting")
+        # `docker info` (not `command -v docker`) so an unreachable daemon socket skips, not errors.
+        if node.exec_allow_fail("docker info >/dev/null 2>&1 && echo ok").strip() != "ok":
+            raise RuntimeError("docker not usable on node 0; cannot run accounting")
         self.accounting_enabled = True
 
     def stop_controller(self):
