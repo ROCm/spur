@@ -1,0 +1,13 @@
+# HELP spur_rpc_stats RPC call count by operation.
+# TYPE spur_rpc_stats gauge
+spur_rpc_stats{operation="GetJobs"} 10
+spur_rpc_stats{operation="SubmitJob"} 2
+# HELP spur_rpc_stats_avg_time Average RPC handler time in microseconds by operation.
+# TYPE spur_rpc_stats_avg_time gauge
+spur_rpc_stats_avg_time{operation="GetJobs"} 50
+spur_rpc_stats_avg_time{operation="SubmitJob"} 1500
+# HELP spur_rpc_stats_total_time Cumulative RPC handler time in microseconds by operation.
+# TYPE spur_rpc_stats_total_time gauge
+spur_rpc_stats_total_time{operation="GetJobs"} 500
+spur_rpc_stats_total_time{operation="SubmitJob"} 3000
+# EOF

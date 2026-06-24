@@ -10,6 +10,8 @@ mod metrics_server;
 mod raft;
 mod raft_server;
 mod rest;
+mod rpc_middleware;
+mod rpc_stats;
 mod scheduler_loop;
 mod server;
 
@@ -20,6 +22,7 @@ use clap::Parser;
 use tracing::info;
 
 use cluster::ClusterManager;
+use rpc_stats::RpcStatsCollector;
 
 #[derive(Parser)]
 #[command(name = "spurctld", about = "Spur controller daemon (spurctld)")]
@@ -189,6 +192,8 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let rpc_stats = Arc::new(RpcStatsCollector::new());
+
     if config.metrics.enabled {
         let metrics_addr = config
             .metrics
@@ -196,8 +201,15 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!(e))?;
         let metrics_cluster = cluster.clone();
         let metrics_raft = raft_handle.clone();
+        let metrics_rpc_stats = rpc_stats.clone();
         tokio::spawn(async move {
-            if let Err(e) = metrics_server::serve(metrics_addr, metrics_cluster, metrics_raft).await
+            if let Err(e) = metrics_server::serve(
+                metrics_addr,
+                metrics_cluster,
+                metrics_raft,
+                metrics_rpc_stats,
+            )
+            .await
             {
                 tracing::error!(error = %e, "OpenMetrics metrics server failed");
             }
@@ -218,7 +230,7 @@ async fn main() -> anyhow::Result<()> {
     // Start gRPC server
     let addr = listen_addr.parse()?;
     info!(%addr, "gRPC server listening");
-    server::serve(addr, cluster, raft_handle).await?;
+    server::serve(addr, cluster, raft_handle, rpc_stats).await?;
 
     sched_handle.abort();
     Ok(())

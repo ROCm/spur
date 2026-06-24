@@ -6,7 +6,7 @@ use clap::Parser;
 use spur_core::job::JobState as CoreJobState;
 use spur_core::node::NodeState as CoreNodeState;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
-use spur_proto::proto::{JobMetrics, NodeMetrics};
+use spur_proto::proto::{JobMetrics, NodeMetrics, RpcOperationStats, RpcStats};
 
 /// Display scheduler diagnostics and statistics.
 #[derive(Parser, Debug)]
@@ -15,6 +15,10 @@ pub struct SdiagArgs {
     /// Don't print header
     #[arg(long)]
     pub noheader: bool,
+
+    /// Reset RPC statistics counters on the controller
+    #[arg(long)]
+    pub reset: bool,
 
     /// Controller address
     #[arg(
@@ -36,6 +40,13 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .await
         .context("failed to connect to spurctld")?;
 
+    if args.reset {
+        client
+            .reset_rpc_stats(())
+            .await
+            .context("failed to reset RPC statistics")?;
+    }
+
     let ping_resp = client.ping(()).await.context("failed to ping controller")?;
     let ping = ping_resp.into_inner();
 
@@ -49,6 +60,12 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .get_node_metrics(())
         .await
         .context("failed to get node metrics")?
+        .into_inner();
+
+    let rpc_stats = client
+        .get_rpc_stats(())
+        .await
+        .context("failed to get RPC statistics")?
         .into_inner();
 
     let server_time = ping
@@ -80,6 +97,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     print_job_statistics(&job_metrics);
     print_node_statistics(&node_metrics);
+    print_rpc_statistics(&rpc_stats);
 
     Ok(())
 }
@@ -192,6 +210,36 @@ fn print_node_statistics(metrics: &NodeMetrics) {
     println!("  Allocated GPUs    : {}", metrics.alloc_gpus);
 }
 
+fn rpc_statistics_lines(stats: &RpcStats) -> Vec<String> {
+    let mut lines = vec![
+        String::new(),
+        "Remote Procedure Call statistics by operation:".to_string(),
+    ];
+
+    if stats.by_operation.is_empty() {
+        lines.push("  (no RPC calls recorded)".to_string());
+        return lines;
+    }
+
+    let mut ops: Vec<&RpcOperationStats> = stats.by_operation.iter().collect();
+    ops.sort_by_key(|b| std::cmp::Reverse(b.total_time_us));
+
+    for op in ops {
+        lines.push(format!(
+            "  {:24} count:{:8}  ave_time_us:{:8}  total_time_us:{}",
+            op.operation, op.count, op.avg_time_us, op.total_time_us
+        ));
+    }
+
+    lines
+}
+
+fn print_rpc_statistics(stats: &RpcStats) {
+    for line in rpc_statistics_lines(stats) {
+        println!("{line}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,5 +322,41 @@ mod tests {
 
         assert_eq!(finished, 3); // NODE_FAIL + 2 COMPLETED
         assert_eq!(active, 2); // RUNNING + SUSPENDED
+    }
+
+    #[test]
+    fn rpc_statistics_lines_empty_state() {
+        let lines = rpc_statistics_lines(&RpcStats::default());
+        assert!(lines.iter().any(|l| l == "  (no RPC calls recorded)"));
+        assert!(lines
+            .iter()
+            .any(|l| l == "Remote Procedure Call statistics by operation:"));
+    }
+
+    #[test]
+    fn rpc_statistics_lines_sorted_by_total_time_us() {
+        let stats = RpcStats {
+            by_operation: vec![
+                RpcOperationStats {
+                    operation: "GetJobs".into(),
+                    count: 5,
+                    total_time_us: 250,
+                    avg_time_us: 50,
+                },
+                RpcOperationStats {
+                    operation: "SubmitJob".into(),
+                    count: 2,
+                    total_time_us: 3000,
+                    avg_time_us: 1500,
+                },
+            ],
+        };
+        let lines = rpc_statistics_lines(&stats);
+        let data_lines: Vec<&String> = lines.iter().filter(|l| l.contains("count:")).collect();
+        assert_eq!(data_lines.len(), 2);
+        assert!(data_lines[0].contains("SubmitJob"));
+        assert!(data_lines[1].contains("GetJobs"));
+        assert!(data_lines[0].contains("ave_time_us:"));
+        assert!(data_lines[0].contains("total_time_us:3000"));
     }
 }

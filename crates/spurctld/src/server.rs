@@ -19,6 +19,8 @@ use spur_proto::proto::*;
 
 use crate::cluster::ClusterManager;
 use crate::raft::RaftHandle;
+use crate::rpc_middleware::RpcStatsLayer;
+use crate::rpc_stats::RpcStatsCollector;
 
 const FORWARDED_HEADER: &str = "x-spur-forwarded";
 const LEADER_HEADER: &str = "x-spur-leader";
@@ -29,6 +31,7 @@ pub struct ControllerService {
     leader_proxy: LeaderProxy,
     /// Node ID → client API address (host:6817) for the x-spur-leader header.
     client_addrs: BTreeMap<u64, String>,
+    rpc_stats: Arc<RpcStatsCollector>,
 }
 
 struct LeaderProxy {
@@ -570,6 +573,37 @@ impl SlurmController for ControllerService {
         Ok(Response::new(crate::metrics_proto::node_metrics_to_proto(
             &snap,
         )))
+    }
+
+    async fn get_rpc_stats(&self, request: Request<()>) -> Result<Response<RpcStats>, Status> {
+        if self.check_leader(&request).is_err() {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.get_rpc_stats(fwd).await;
+            }
+        }
+
+        Ok(Response::new(crate::metrics_proto::rpc_stats_to_proto(
+            &self.rpc_stats.snapshot(),
+        )))
+    }
+
+    async fn reset_rpc_stats(&self, request: Request<()>) -> Result<Response<()>, Status> {
+        if self.check_leader(&request).is_err() {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.reset_rpc_stats(fwd).await;
+            }
+        }
+
+        self.rpc_stats.reset();
+        Ok(Response::new(()))
     }
 
     async fn register_agent(
@@ -1246,6 +1280,7 @@ pub async fn serve(
     addr: SocketAddr,
     cluster: Arc<ClusterManager>,
     raft_handle: Arc<RaftHandle>,
+    rpc_stats: Arc<RpcStatsCollector>,
 ) -> anyhow::Result<()> {
     let client_addrs: BTreeMap<u64, String> = raft_handle
         .peers
@@ -1265,11 +1300,15 @@ pub async fn serve(
     let service = ControllerService {
         cluster,
         client_addrs,
-        raft: raft_handle,
+        raft: raft_handle.clone(),
         leader_proxy,
+        rpc_stats: rpc_stats.clone(),
     };
 
+    let stats_layer = RpcStatsLayer::new(rpc_stats, raft_handle);
+
     tonic::transport::Server::builder()
+        .layer(stats_layer)
         .add_service(SlurmControllerServer::new(service))
         .serve(addr)
         .await?;

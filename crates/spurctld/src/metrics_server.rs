@@ -12,17 +12,19 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use spur_metrics::{
-    encode_job_metrics, encode_nodes_metrics, encode_partitions_metrics, encode_scheduler_metrics,
-    CONTENT_TYPE,
+    encode_job_metrics, encode_nodes_metrics, encode_partitions_metrics, encode_rpc_metrics,
+    encode_scheduler_metrics, CONTENT_TYPE,
 };
 use tracing::info;
 
 use crate::cluster::ClusterManager;
 use crate::raft::RaftHandle;
+use crate::rpc_stats::RpcStatsCollector;
 
 struct MetricsState {
     cluster: Arc<ClusterManager>,
     raft: Arc<RaftHandle>,
+    rpc_stats: Arc<RpcStatsCollector>,
 }
 
 /// Start the metrics HTTP server. Runs until the listener is closed.
@@ -30,14 +32,20 @@ pub async fn serve(
     listen: SocketAddr,
     cluster: Arc<ClusterManager>,
     raft: Arc<RaftHandle>,
+    rpc_stats: Arc<RpcStatsCollector>,
 ) -> anyhow::Result<()> {
-    let state = Arc::new(MetricsState { cluster, raft });
+    let state = Arc::new(MetricsState {
+        cluster,
+        raft,
+        rpc_stats,
+    });
 
     let app = Router::new()
         .route("/metrics", get(metrics_jobs))
         .route("/metrics/jobs", get(metrics_jobs))
         .route("/metrics/nodes", get(metrics_nodes))
         .route("/metrics/partitions", get(metrics_partitions))
+        .route("/metrics/rpc", get(metrics_rpc))
         .route("/metrics/scheduler", get(metrics_scheduler))
         .route("/metrics/jobs-users-accts", get(metrics_jobs_users_accts))
         .with_state(state);
@@ -68,6 +76,13 @@ async fn metrics_partitions(State(state): State<Arc<MetricsState>>) -> Response 
         return not_leader_response();
     }
     metrics_response(encode_partitions_metrics())
+}
+
+async fn metrics_rpc(State(state): State<Arc<MetricsState>>) -> Response {
+    if !state.raft.is_leader() {
+        return not_leader_response();
+    }
+    metrics_response(encode_rpc_metrics(&state.rpc_stats.snapshot()))
 }
 
 async fn metrics_scheduler(State(state): State<Arc<MetricsState>>) -> Response {
@@ -116,6 +131,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::cluster::ClusterManager;
+    use crate::rpc_stats::RpcStatsCollector;
 
     fn test_config() -> SlurmConfig {
         SlurmConfig {
@@ -177,15 +193,63 @@ mod tests {
         let state = Arc::new(MetricsState {
             cluster: cm,
             raft: Arc::new(handle),
+            rpc_stats: Arc::new(RpcStatsCollector::new()),
         });
         let app = Router::new()
             .route("/metrics/jobs", get(metrics_jobs))
             .route("/metrics/nodes", get(metrics_nodes))
             .route("/metrics/partitions", get(metrics_partitions))
+            .route("/metrics/rpc", get(metrics_rpc))
             .route("/metrics/scheduler", get(metrics_scheduler))
             .route("/metrics/jobs-users-accts", get(metrics_jobs_users_accts))
             .with_state(state);
         (app, dir)
+    }
+
+    async fn two_node_raft(
+        dir: &TempDir,
+    ) -> (Arc<crate::raft::RaftHandle>, Arc<crate::raft::RaftHandle>) {
+        let listener1 = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let addr1 = listener1.local_addr().unwrap();
+        let listener2 = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        drop(listener1);
+        drop(listener2);
+
+        let peers = vec![addr1.to_string(), addr2.to_string()];
+
+        let cm1 = Arc::new(ClusterManager::new(test_config(), &dir.path().join("n1")).unwrap());
+        let leader_handle = crate::raft::start_raft(1, &peers, &dir.path().join("n1"), cm1)
+            .await
+            .unwrap();
+        let cm2 = Arc::new(ClusterManager::new(test_config(), &dir.path().join("n2")).unwrap());
+        let follower_handle = crate::raft::start_raft(2, &peers, &dir.path().join("n2"), cm2)
+            .await
+            .unwrap();
+
+        let leader_raft = leader_handle.raft.clone();
+        let follower_raft = follower_handle.raft.clone();
+        tokio::spawn(async move {
+            let _ = crate::raft_server::serve_raft(addr1, leader_raft).await;
+        });
+        tokio::spawn(async move {
+            let _ = crate::raft_server::serve_raft(addr2, follower_raft).await;
+        });
+
+        leader_handle
+            .raft
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(|m| m.current_leader.is_some(), "leader elected")
+            .await
+            .expect("two-node raft did not elect a leader within 10s");
+
+        let leader = Arc::new(leader_handle);
+        let follower = Arc::new(follower_handle);
+        assert!(leader.is_leader() ^ follower.is_leader());
+        if follower.is_leader() {
+            return (follower, leader);
+        }
+        (leader, follower)
     }
 
     #[tokio::test]
@@ -246,6 +310,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metrics_rpc_returns_ok() {
+        let (app, _dir) = test_app().await;
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/metrics/rpc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            CONTENT_TYPE
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.ends_with("# EOF\n"));
+    }
+
+    #[tokio::test]
     async fn metrics_scheduler_returns_ok() {
         let (app, _dir) = test_app().await;
         let resp = app
@@ -261,6 +346,23 @@ mod tests {
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
             CONTENT_TYPE
         );
+    }
+
+    #[tokio::test]
+    async fn metrics_rpc_returns_503_on_follower() {
+        use axum::extract::State;
+
+        let dir = TempDir::new().unwrap();
+        let (leader, follower) = two_node_raft(&dir).await;
+        let _leader = leader;
+        let cm = Arc::new(ClusterManager::new(test_config(), &dir.path().join("cm")).unwrap());
+        let state = Arc::new(MetricsState {
+            cluster: cm,
+            raft: follower,
+            rpc_stats: Arc::new(RpcStatsCollector::new()),
+        });
+        let resp = metrics_rpc(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

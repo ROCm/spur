@@ -31,6 +31,8 @@ serde_json = { workspace = true }
 hostname = "0.4.2"
 openraft = { workspace = true }
 axum = { workspace = true }
+http = "1"
+tower = { workspace = true }
 tower-http = { workspace = true }
 
 [dev-dependencies]

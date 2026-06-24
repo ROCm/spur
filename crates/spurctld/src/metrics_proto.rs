@@ -7,7 +7,26 @@ use spur_core::job::JobState;
 use spur_core::node::NodeState;
 use spur_metrics::job::JobMetricsSnapshot;
 use spur_metrics::node::NodeMetricsSnapshot;
-use spur_proto::proto::{JobMetrics, JobStateCount, NodeMetrics, NodeMetricsEntry, NodeStateCount};
+use spur_metrics::RpcStatsSnapshot;
+use spur_proto::proto::{
+    JobMetrics, JobStateCount, NodeMetrics, NodeMetricsEntry, NodeStateCount, RpcOperationStats,
+    RpcStats,
+};
+
+pub fn rpc_stats_to_proto(snap: &RpcStatsSnapshot) -> RpcStats {
+    let by_operation = snap
+        .by_operation
+        .iter()
+        .map(|op| RpcOperationStats {
+            operation: op.operation.clone(),
+            count: op.count,
+            total_time_us: op.total_time_us,
+            avg_time_us: op.avg_time_us(),
+        })
+        .collect();
+
+    RpcStats { by_operation }
+}
 
 pub fn job_metrics_to_proto(snap: &JobMetricsSnapshot) -> JobMetrics {
     let by_state = JobState::ALL
@@ -73,8 +92,10 @@ mod tests {
     use spur_core::resource::{GpuLinkType, GpuResource, ResourceAllocations, ResourceSet};
     use spur_metrics::export::jobs::{encode_job_metrics, job_state_metric_suffix};
     use spur_metrics::export::nodes::encode_nodes_metrics;
+    use spur_metrics::export::rpc::encode_rpc_metrics;
     use spur_metrics::job::JobMetricsSnapshot;
     use spur_metrics::node::NodeMetricsSnapshot;
+    use spur_metrics::{RpcOperationSnapshot, RpcStatsSnapshot};
 
     use super::*;
 
@@ -193,5 +214,64 @@ mod tests {
         );
         assert_eq!(proto.total, 2);
         assert_eq!(proto.per_node.len(), 2);
+    }
+
+    #[test]
+    fn rpc_proto_matches_http_gauges() {
+        let snap = RpcStatsSnapshot {
+            by_operation: vec![
+                RpcOperationSnapshot {
+                    operation: "SubmitJob".into(),
+                    count: 2,
+                    total_time_us: 3000,
+                },
+                RpcOperationSnapshot {
+                    operation: "GetJobs".into(),
+                    count: 5,
+                    total_time_us: 250,
+                },
+            ],
+        };
+        let proto = rpc_stats_to_proto(&snap);
+        let body = encode_rpc_metrics(&snap);
+
+        for op in &proto.by_operation {
+            let prefix = format!("spur_rpc_stats{{operation=\"{}\"}}", op.operation);
+            let count_line = body
+                .lines()
+                .find(|line| line.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("missing count line for {}", op.operation));
+            let count: u64 = count_line
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(count, op.count);
+
+            let avg_prefix = format!("spur_rpc_stats_avg_time{{operation=\"{}\"}}", op.operation);
+            let avg_line = body
+                .lines()
+                .find(|line| line.starts_with(&avg_prefix))
+                .unwrap();
+            let avg: u64 = avg_line.split_whitespace().nth(1).unwrap().parse().unwrap();
+            assert_eq!(avg, op.avg_time_us);
+
+            let total_prefix = format!(
+                "spur_rpc_stats_total_time{{operation=\"{}\"}}",
+                op.operation
+            );
+            let total_line = body
+                .lines()
+                .find(|line| line.starts_with(&total_prefix))
+                .unwrap();
+            let total: u64 = total_line
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(total, op.total_time_us);
+        }
     }
 }

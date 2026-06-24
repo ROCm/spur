@@ -3677,6 +3677,7 @@ dependencies = [
  "clap",
  "dashmap",
  "hostname",
+ "http",
  "http-body-util",
  "openraft",
  "parking_lot",

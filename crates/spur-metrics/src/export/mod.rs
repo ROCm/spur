@@ -14,6 +14,7 @@ pub const CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; cha
 pub mod jobs;
 pub mod nodes;
 pub mod partitions;
+pub mod rpc;
 pub mod scheduler;
 
 /// Register a scalar `u64` gauge with an initial value.
