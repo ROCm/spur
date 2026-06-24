@@ -94,6 +94,28 @@ impl NodeTimeline {
         self.intervals.partition_point(|i| i.start < window_end)
     }
 
+    /// Return the end time of an interval whose start within `[start, start + duration)`
+    /// is the first point where cumulative allocations block `request`.
+    fn duration_blocker(
+        &self,
+        sweep: &mut AllocationSweep<'_>,
+        request: &ResourceSet,
+        start: DateTime<Utc>,
+        duration: Duration,
+    ) -> Option<DateTime<Utc>> {
+        let window_end = start + duration;
+        for interval in &self.intervals[..self.overlap_prefix_end(window_end)] {
+            if interval.start <= start || interval.end <= start {
+                continue;
+            }
+            sweep.advance_to(interval.start);
+            if !self.total.can_satisfy_with_allocated(sweep.used(), request) {
+                return Some(interval.end);
+            }
+        }
+        None
+    }
+
     pub fn accumulated_at(&self, time: DateTime<Utc>) -> ResourceAllocations {
         let mut used = ResourceAllocations::default();
         for interval in &self.intervals[..self.active_prefix_end(time)] {
@@ -132,22 +154,12 @@ impl NodeTimeline {
             sweep.advance_to(candidate);
 
             if self.total.can_satisfy_with_allocated(sweep.used(), request) {
-                let window_end = candidate + duration;
-                let mut ok = true;
-                for interval in &self.intervals[..self.overlap_prefix_end(window_end)] {
-                    if interval.end > candidate {
-                        let mut used = ResourceAllocations::default();
-                        used.add(&interval.resources);
-                        if !self.total.can_satisfy_with_allocated(&used, request) {
-                            candidate = interval.end;
-                            ok = false;
-                            break;
-                        }
-                    }
+                if let Some(jump) = self.duration_blocker(&mut sweep, request, candidate, duration)
+                {
+                    candidate = jump;
+                    continue;
                 }
-                if ok {
-                    return candidate;
-                }
+                return candidate;
             } else {
                 let next_end = self
                     .intervals
@@ -421,14 +433,16 @@ mod tests {
                 let window_end = candidate + duration;
                 let mut ok = true;
                 for interval in &tl.intervals[..tl.overlap_prefix_end(window_end)] {
-                    if interval.end > candidate {
-                        let mut used = ResourceAllocations::default();
-                        used.add(&interval.resources);
-                        if !tl.total.can_satisfy_with_allocated(&used, request) {
-                            candidate = interval.end;
-                            ok = false;
-                            break;
-                        }
+                    if interval.start <= candidate || interval.end <= candidate {
+                        continue;
+                    }
+                    if interval.start >= window_end {
+                        break;
+                    }
+                    if !tl.can_satisfy_at(interval.start, request) {
+                        candidate = interval.end;
+                        ok = false;
+                        break;
                     }
                 }
                 if ok {
@@ -491,11 +505,7 @@ mod tests {
         for time in event_times {
             sweep.advance_to(time);
             let expected = tl.accumulated_at(time);
-            assert_eq!(
-                sweep.used().cpus,
-                expected.cpus,
-                "cpu mismatch at {time}"
-            );
+            assert_eq!(sweep.used().cpus, expected.cpus, "cpu mismatch at {time}");
             assert_eq!(
                 sweep.used().memory_mb,
                 expected.memory_mb,
@@ -507,6 +517,32 @@ mod tests {
                 "gpu mismatch at {time}"
             );
         }
+    }
+
+    #[test]
+    fn test_earliest_start_cumulative_window_check() {
+        let mut tl = make_timeline();
+        let base = Utc::now();
+
+        tl.reserve(
+            base,
+            base + Duration::hours(4),
+            ResourceAllocations::with_scalar(32, 0),
+        );
+        tl.reserve(
+            base + Duration::hours(1),
+            base + Duration::hours(5),
+            ResourceAllocations::with_scalar(32, 0),
+        );
+
+        let req = ResourceSet {
+            cpus: 32,
+            ..Default::default()
+        };
+        let duration = Duration::hours(3);
+
+        let start = tl.earliest_start(&req, duration, base);
+        assert!(start >= base + Duration::hours(5));
     }
 
     #[test]
@@ -577,7 +613,11 @@ mod tests {
             "gpu".into(),
             (4u32..6).map(AllocatedDevice::injectable).collect(),
         );
-        tl.reserve(base + Duration::hours(1), base + Duration::hours(4), alloc_b);
+        tl.reserve(
+            base + Duration::hours(1),
+            base + Duration::hours(4),
+            alloc_b,
+        );
 
         let req = ResourceSet {
             cpus: 4,
