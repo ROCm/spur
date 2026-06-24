@@ -326,7 +326,10 @@ mod tests {
         // %l resolves to a formatted duration, or UNLIMITED when unset/zero.
         let mut j = job(0, 0, 0);
         assert_eq!(resolve_sacct_field(&j, 'l'), "UNLIMITED");
-        j.time_limit = Some(prost_types::Duration { seconds: 3600, nanos: 0 });
+        j.time_limit = Some(prost_types::Duration {
+            seconds: 3600,
+            nanos: 0,
+        });
         assert_eq!(resolve_sacct_field(&j, 'l'), format_duration(3600));
     }
 
