@@ -139,9 +139,6 @@ impl ClusterManager {
             None => anyhow::bail!("partition '{}' not found", partition_name),
         };
 
-        // Partition state and resource limits are not rejected here; the job
-        // pends with PartitionInactive/PartitionConfig instead (Slurm parity).
-
         // Check allow_accounts (if non-empty, user's account must be in the list)
         if !part.allow_accounts.is_empty() {
             let account = spec.account.as_deref().unwrap_or("");
@@ -2487,7 +2484,9 @@ fn partition_block(job: &Job, partitions: &[Partition]) -> Option<spur_core::job
     use spur_core::partition::PartitionState;
 
     let name = job.spec.partition.as_deref().filter(|p| !p.is_empty())?;
-    let part = partitions.iter().find(|p| p.name == name)?;
+    let Some(part) = partitions.iter().find(|p| p.name == name) else {
+        return Some(PendingReason::PartitionConfig);
+    };
 
     if part.state != PartitionState::Up {
         return Some(PendingReason::PartitionInactive);
@@ -4219,6 +4218,14 @@ mod tests {
             cm.get_job(n_id).unwrap().pending_reason,
             PendingReason::PartitionConfig,
             "num_nodes below partition min_nodes -> PartitionConfig"
+        );
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == t_id),
+            "time-blocked job must be dropped from scheduling"
+        );
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == n_id),
+            "min_nodes-blocked job must be dropped from scheduling"
         );
     }
 
