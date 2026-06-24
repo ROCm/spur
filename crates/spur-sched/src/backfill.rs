@@ -184,6 +184,10 @@ impl Scheduler for BackfillScheduler {
             );
         }
 
+        for timeline in &mut self.timelines {
+            timeline.gc(now);
+        }
+
         // Identify het job groups: collect sets of jobs linked by het_job_id.
         // For each group, ALL components must be schedulable or NONE are scheduled.
         let mut het_groups: HashMap<JobId, Vec<usize>> = HashMap::new();
