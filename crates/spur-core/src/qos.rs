@@ -87,7 +87,6 @@ pub fn check_qos_limits(
         }
     }
 
-    // Group TRES across all running jobs in the QOS (GrpCPU/Mem/Node).
     if let Some(ref grp) = limits.grp_tres {
         let job_cpus = (job.spec.num_tasks * job.spec.cpus_per_task) as u64;
         if grp.get(TresType::Cpu) > 0

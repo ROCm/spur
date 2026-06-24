@@ -30,7 +30,6 @@ impl QosCache {
         }
     }
 
-    /// Look up a QoS by name, returning a clone if present.
     pub fn get(&self, name: &str) -> Option<Qos> {
         self.qos.read().get(name).cloned()
     }
@@ -39,8 +38,7 @@ impl QosCache {
         *self.qos.write() = new_qos;
     }
 
-    /// Insert a single QoS. Test-only seam to populate the cache without the
-    /// accounting daemon.
+    /// Test-only seam: populates the cache without the accounting daemon.
     #[cfg(test)]
     pub(crate) fn insert(&self, qos: Qos) {
         self.qos.write().insert(qos.name.clone(), qos);
@@ -102,8 +100,7 @@ impl Default for QosCache {
     }
 }
 
-/// Convert a `QosInfo` proto into a core `Qos`. A zero/empty limit field means
-/// "no limit" (mirrors how the accounting daemon encodes absent limits).
+/// Zero/empty limit fields mean "no limit" — the accounting daemon encodes absent limits this way.
 pub fn qos_from_proto(info: QosInfo) -> Qos {
     let opt_u32 = |v: u32| if v == 0 { None } else { Some(v) };
     let opt_tres = |s: &str| {

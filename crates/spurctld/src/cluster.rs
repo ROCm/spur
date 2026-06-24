@@ -2472,15 +2472,13 @@ fn license_block(job: &Job, pool: &HashMap<String, u64>) -> Option<spur_core::jo
     None
 }
 
-/// The specific `QOS*` limit a job trips, or `None` if within limits. The caller
-/// resolves the `Qos` (see `resolve_qos`). Shared by `pending_jobs()` and
-/// `tag_blocked_pending_reasons()` so drop and displayed reason agree.
+/// Shared by `pending_jobs()` and `tag_blocked_pending_reasons()` so the drop
+/// decision and displayed reason always agree. Caller resolves the `Qos`.
 fn qos_block_for(
     job: &Job,
     qos: &Qos,
     jobs: &HashMap<JobId, Job>,
 ) -> Option<spur_core::job::PendingReason> {
-    // No QoS -> no QoS-based block.
     let qos_name = job.spec.qos.as_ref()?;
     let user = &job.spec.user;
     let running_count = jobs
@@ -2493,7 +2491,6 @@ fn qos_block_for(
             (j.state == JobState::Pending || j.state == JobState::Running) && j.spec.user == *user
         })
         .count() as u32;
-    // Per-user running TRES (MaxTRESPerUser) and QOS-wide running TRES (Grp*).
     let user_running_tres = sum_running_tres(jobs, |j| j.spec.user == *user);
     let qos_running_tres =
         sum_running_tres(jobs, |j| j.spec.qos.as_deref() == Some(qos_name.as_str()));
@@ -2542,7 +2539,6 @@ fn partition_block(job: &Job, partitions: &[Partition]) -> Option<spur_core::job
     None
 }
 
-/// Sum cpu/node/mem TRES over running jobs matching `pred`.
 fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> TresRecord {
     let mut tres = TresRecord::new();
     let (mut cpu, mut node, mut mem) = (0u64, 0u64, 0u64);
