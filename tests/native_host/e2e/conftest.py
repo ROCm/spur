@@ -131,12 +131,23 @@ def _provision_cluster(ssh_nodes, remote_bin_dir):
 
 
 @pytest.fixture
-def cluster(ssh_nodes, remote_bin_dir):
+def cluster_config_overrides():
+    """Override this fixture in tests/classes to customise the cluster config.
+
+    Return a dict that will be deep-merged into the default config before
+    spurctld starts.  The default (no overrides) returns None.
+    """
+    return None
+
+
+@pytest.fixture
+def cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     """
     Per-test fixture: a fully running Spur cluster with default config.
     Torn down (processes killed, dirs removed) after the test.
     """
-    spur_cluster = _deploy_cluster(ssh_nodes, remote_bin_dir)
+    spur_cluster = _deploy_cluster(ssh_nodes, remote_bin_dir,
+                                   config_overrides=cluster_config_overrides)
     yield spur_cluster
     spur_cluster.teardown()
 
@@ -157,7 +168,7 @@ def unstarted_cluster(ssh_nodes, remote_bin_dir):
 
 
 @pytest.fixture
-def multi_node_cluster(ssh_nodes, remote_bin_dir):
+def multi_node_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     """
     Per-test fixture for multi-node tests.
     Skips if fewer than 2 nodes are configured.
@@ -168,7 +179,8 @@ def multi_node_cluster(ssh_nodes, remote_bin_dir):
             f"(got {len(ssh_nodes)})"
         )
 
-    spur_cluster = _deploy_cluster(ssh_nodes, remote_bin_dir)
+    spur_cluster = _deploy_cluster(ssh_nodes, remote_bin_dir,
+                                   config_overrides=cluster_config_overrides)
     yield spur_cluster
     spur_cluster.teardown()
 

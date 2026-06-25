@@ -240,8 +240,8 @@ class SpurCluster:
         self.agent_labels = agent_labels or {}
         if kill_stale:
             self._kill_controller()
-            self._kill_agents(use_sudo=False)
-            self._kill_agents(use_sudo=True)  # best-effort for rootful
+            self._kill_agents(use_sudo=False, broad=True)
+            self._kill_agents(use_sudo=True, broad=True)  # best-effort for rootful
         if self.accounting_enabled:
             self._start_accounting()
         self.start_controller(config_overrides, kill_stale=False)
@@ -804,9 +804,16 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
     def _kill_controller(self):
         self._pkill(self.nodes[0], f"{self.bin_dir}/spurctld")
 
-    def _kill_agents(self, use_sudo: bool = False):
+    def _kill_agents(self, use_sudo: bool = False, broad: bool = False):
         for node in self.nodes:
             self._pkill(node, f"{self.bin_dir}/spurd", use_sudo=use_sudo)
+            # Kill any process holding the agent port, even from a different
+            # bin_dir (e.g. a stale spurd left by a previous pytest session).
+            if broad:
+                prefix = self._sudo_prefix() if use_sudo else ""
+                node.exec_allow_fail(
+                    f"{prefix}fuser -k {AGENT_PORT}/tcp 2>/dev/null || true"
+                )
 
     def _spurd_start_cmd(self, node_index: int) -> str:
         node = self.nodes[node_index]
