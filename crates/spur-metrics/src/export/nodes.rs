@@ -7,7 +7,6 @@ use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
-use spur_core::config::MetricsExpositionFormat;
 use spur_core::node::NodeState;
 use std::sync::atomic::AtomicU64;
 
@@ -133,17 +132,9 @@ pub fn register_nodes(registry: &mut Registry, snap: &NodeMetricsSnapshot) {
     );
 }
 
-/// Encode node metrics for `/metrics/nodes`.
-pub fn encode_nodes_metrics_with_format(
-    snap: &NodeMetricsSnapshot,
-    format: MetricsExpositionFormat,
-) -> String {
-    encode_registered(|registry| register_nodes(registry, snap), format)
-}
-
-/// Encode node metrics for `/metrics/nodes` (default: Slurm 0.0.4 text).
+/// Encode node metrics for `/metrics/nodes` as OpenMetrics 1.0 text.
 pub fn encode_nodes_metrics(snap: &NodeMetricsSnapshot) -> String {
-    encode_nodes_metrics_with_format(snap, MetricsExpositionFormat::default())
+    encode_registered(|registry| register_nodes(registry, snap))
 }
 
 #[cfg(test)]
@@ -154,23 +145,10 @@ mod tests {
     use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
 
     #[test]
-    fn empty_nodes_export_slurm_exports_zeroes() {
-        let body = encode_nodes_metrics_with_format(
-            &NodeMetricsSnapshot::default(),
-            MetricsExpositionFormat::Slurm_0_0_4,
-        );
+    fn empty_nodes_export_has_zeroes_and_eof() {
+        let body = encode_nodes_metrics(&NodeMetricsSnapshot::default());
         assert!(body.contains("spur_nodes 0\n"));
         assert!(body.contains("spur_nodes_idle 0\n"));
-        assert!(!body.contains("# EOF"));
-    }
-
-    #[test]
-    fn empty_nodes_export_openmetrics_exports_zeroes_and_eof() {
-        let body = encode_nodes_metrics_with_format(
-            &NodeMetricsSnapshot::default(),
-            MetricsExpositionFormat::OpenMetrics_1_0,
-        );
-        assert!(body.contains("spur_nodes 0\n"));
         assert!(body.ends_with("# EOF\n"));
     }
 
@@ -205,7 +183,7 @@ mod tests {
         n2.alloc_resources = spur_core::resource::ResourceAllocations::with_scalar(2, 4096);
 
         let snap = NodeMetricsSnapshot::collect([&n1, &n2]);
-        let body = encode_nodes_metrics_with_format(&snap, MetricsExpositionFormat::Slurm_0_0_4);
+        let body = encode_nodes_metrics(&snap);
 
         assert!(body.contains("# HELP spur_nodes "));
         assert!(body.contains("spur_nodes 2\n"));

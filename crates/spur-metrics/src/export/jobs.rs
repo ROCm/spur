@@ -9,7 +9,6 @@ use spur_core::job::JobState;
 use crate::export::encode_registered;
 use crate::export::register_gauge;
 use crate::job::JobMetricsSnapshot;
-use spur_core::config::MetricsExpositionFormat;
 
 /// Metric name suffix for a [`JobState`] (e.g. `pending`, `node_fail`).
 pub fn job_state_metric_suffix(state: JobState) -> &'static str {
@@ -64,17 +63,9 @@ pub fn register_jobs(registry: &mut Registry, snap: &JobMetricsSnapshot) {
     );
 }
 
-/// Encode job metrics for `/metrics/jobs` (default: Slurm 0.0.4 text).
+/// Encode job metrics for `/metrics/jobs` as OpenMetrics 1.0 text.
 pub fn encode_job_metrics(snap: &JobMetricsSnapshot) -> String {
-    encode_job_metrics_with_format(snap, MetricsExpositionFormat::default())
-}
-
-/// Encode job metrics using the selected wire format.
-pub fn encode_job_metrics_with_format(
-    snap: &JobMetricsSnapshot,
-    format: MetricsExpositionFormat,
-) -> String {
-    encode_registered(|registry| register_jobs(registry, snap), format)
+    encode_registered(|registry| register_jobs(registry, snap))
 }
 
 #[cfg(test)]
@@ -143,20 +134,8 @@ mod tests {
 
     #[test]
     fn openmetrics_format_includes_eof() {
-        let body = encode_job_metrics_with_format(
-            &sample_snapshot(),
-            MetricsExpositionFormat::OpenMetrics_1_0,
-        );
+        let body = encode_job_metrics(&sample_snapshot());
         assert!(body.ends_with("# EOF\n"));
-    }
-
-    #[test]
-    fn slurm_format_has_no_eof() {
-        let body = encode_job_metrics_with_format(
-            &sample_snapshot(),
-            MetricsExpositionFormat::Slurm_0_0_4,
-        );
-        assert!(!body.contains("# EOF"));
     }
 
     /// Slurm job metric names exported for every [`JobState`].

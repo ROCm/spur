@@ -3,13 +3,13 @@
 
 //! prometheus-client registry encoding for spurctld metrics HTTP export.
 
-use prometheus_client::encoding::text::{
-    encode as encode_openmetrics_strict, encode_eof, encode_registry,
-};
+use prometheus_client::encoding::text::encode as encode_openmetrics;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
-use spur_core::config::MetricsExpositionFormat;
 use std::sync::atomic::AtomicU64;
+
+/// HTTP `Content-Type` for OpenMetrics 1.0 text responses.
+pub const CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
 
 pub mod jobs;
 pub mod nodes;
@@ -23,31 +23,14 @@ pub(crate) fn register_gauge(registry: &mut Registry, name: &str, help: &str, va
     registry.register(name, help, gauge);
 }
 
-/// Build a registry, run `register`, and encode with `format`.
-pub fn encode_registered<F>(register: F, format: MetricsExpositionFormat) -> String
+/// Build a registry, run `register`, and encode as OpenMetrics 1.0 text.
+pub fn encode_registered<F>(register: F) -> String
 where
     F: FnOnce(&mut Registry),
 {
     let mut registry = Registry::default();
     register(&mut registry);
-    encode_registry_body(&registry, format)
-}
-
-/// Encode all metrics in `registry` using `format`.
-pub fn encode_registry_body(registry: &Registry, format: MetricsExpositionFormat) -> String {
     let mut body = String::new();
-    match format {
-        MetricsExpositionFormat::Slurm_0_0_4 => {
-            encode_registry(&mut body, registry).expect("in-memory encode_registry");
-        }
-        MetricsExpositionFormat::OpenMetrics_1_0 => {
-            encode_openmetrics_strict(&mut body, registry).expect("in-memory encode");
-        }
-    }
+    encode_openmetrics(&mut body, &registry).expect("in-memory encode");
     body
-}
-
-/// Append the OpenMetrics `# EOF` trailer (for strict 1.0 responses only).
-pub fn append_eof(body: &mut String) {
-    encode_eof(body).expect("in-memory encode_eof");
 }

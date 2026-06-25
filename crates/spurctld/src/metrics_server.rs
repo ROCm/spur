@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Prometheus/OpenMetrics HTTP export for spurctld (default port 6822).
+//! OpenMetrics 1.0 HTTP export for spurctld (default port 6822).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -11,10 +11,9 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use spur_core::config::MetricsExpositionFormat;
 use spur_metrics::{
-    encode_job_metrics_with_format, encode_nodes_metrics_with_format, encode_partitions_metrics,
-    encode_scheduler_metrics,
+    encode_job_metrics, encode_nodes_metrics, encode_partitions_metrics, encode_scheduler_metrics,
+    CONTENT_TYPE,
 };
 use tracing::info;
 
@@ -54,38 +53,28 @@ async fn metrics_jobs(State(state): State<Arc<MetricsState>>) -> Response {
     if !state.raft.is_leader() {
         return not_leader_response();
     }
-    let format = state.cluster.config.metrics.exposition_format;
-    metrics_exposition_response(
-        format,
-        encode_job_metrics_with_format(&state.cluster.job_metrics(), format),
-    )
+    metrics_response(encode_job_metrics(&state.cluster.job_metrics()))
 }
 
 async fn metrics_nodes(State(state): State<Arc<MetricsState>>) -> Response {
     if !state.raft.is_leader() {
         return not_leader_response();
     }
-    let format = state.cluster.config.metrics.exposition_format;
-    metrics_exposition_response(
-        format,
-        encode_nodes_metrics_with_format(&state.cluster.node_metrics(), format),
-    )
+    metrics_response(encode_nodes_metrics(&state.cluster.node_metrics()))
 }
 
 async fn metrics_partitions(State(state): State<Arc<MetricsState>>) -> Response {
     if !state.raft.is_leader() {
         return not_leader_response();
     }
-    let format = state.cluster.config.metrics.exposition_format;
-    metrics_exposition_response(format, encode_partitions_metrics(format))
+    metrics_response(encode_partitions_metrics())
 }
 
 async fn metrics_scheduler(State(state): State<Arc<MetricsState>>) -> Response {
     if !state.raft.is_leader() {
         return not_leader_response();
     }
-    let format = state.cluster.config.metrics.exposition_format;
-    metrics_exposition_response(format, encode_scheduler_metrics(format))
+    metrics_response(encode_scheduler_metrics())
 }
 
 async fn metrics_jobs_users_accts(State(state): State<Arc<MetricsState>>) -> Response {
@@ -110,26 +99,17 @@ fn not_leader_response() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "not the Raft leader").into_response()
 }
 
-fn metrics_exposition_response(format: MetricsExpositionFormat, body: String) -> Response {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, format.content_type())],
-        body,
-    )
-        .into_response()
+fn metrics_response(body: String) -> Response {
+    (StatusCode::OK, [(header::CONTENT_TYPE, CONTENT_TYPE)], body).into_response()
 }
 
 /// Leader-gated metrics response (testable without a live Raft node).
 #[cfg(test)]
-fn leader_metrics_response(
-    is_leader: bool,
-    format: MetricsExpositionFormat,
-    body: String,
-) -> Response {
+fn leader_metrics_response(is_leader: bool, body: String) -> Response {
     if !is_leader {
         return not_leader_response();
     }
-    metrics_exposition_response(format, body)
+    metrics_response(body)
 }
 
 #[cfg(test)]
@@ -139,44 +119,26 @@ mod tests {
     use spur_metrics::node::NodeMetricsSnapshot;
 
     #[test]
-    fn leader_returns_slurm_content_type() {
-        let format = MetricsExpositionFormat::Slurm_0_0_4;
-        let body = encode_job_metrics_with_format(&JobMetricsSnapshot::default(), format);
-        let response = leader_metrics_response(true, format, body);
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::CONTENT_TYPE).unwrap(),
-            format.content_type()
-        );
-    }
-
-    #[test]
     fn leader_returns_openmetrics_content_type() {
-        let format = MetricsExpositionFormat::OpenMetrics_1_0;
-        let body = encode_job_metrics_with_format(&JobMetricsSnapshot::default(), format);
-        let response = leader_metrics_response(true, format, body);
+        let body = encode_job_metrics(&JobMetricsSnapshot::default());
+        let response = leader_metrics_response(true, body);
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(header::CONTENT_TYPE).unwrap(),
-            "application/openmetrics-text; version=1.0.0; charset=utf-8"
+            CONTENT_TYPE
         );
     }
 
     #[test]
-    fn stub_nodes_endpoint_returns_200_on_leader() {
-        let format = MetricsExpositionFormat::Slurm_0_0_4;
-        let response = leader_metrics_response(
-            true,
-            format,
-            encode_nodes_metrics_with_format(&NodeMetricsSnapshot::default(), format),
-        );
+    fn nodes_endpoint_returns_200_on_leader() {
+        let response =
+            leader_metrics_response(true, encode_nodes_metrics(&NodeMetricsSnapshot::default()));
         assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]
     fn follower_returns_503() {
-        let response =
-            leader_metrics_response(false, MetricsExpositionFormat::Slurm_0_0_4, String::new());
+        let response = leader_metrics_response(false, String::new());
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

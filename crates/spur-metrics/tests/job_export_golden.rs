@@ -3,11 +3,10 @@
 
 //! Golden and catalog tests for job metrics export.
 
-use spur_core::config::MetricsExpositionFormat;
 use spur_core::job::{Job, JobSpec, JobState, PendingReason};
 use spur_core::resource::{AllocatedDevice, ResourceAllocations};
 use spur_metrics::job::JobMetricsSnapshot;
-use spur_metrics::{encode_job_metrics, encode_job_metrics_with_format, job_state_metric_suffix};
+use spur_metrics::{encode_job_metrics, job_state_metric_suffix};
 use std::path::PathBuf;
 
 fn fixtures_dir() -> PathBuf {
@@ -51,22 +50,9 @@ fn sample_snapshot() -> JobMetricsSnapshot {
 }
 
 #[test]
-fn golden_job_metrics_slurm_0_0_4() {
-    let body =
-        encode_job_metrics_with_format(&sample_snapshot(), MetricsExpositionFormat::Slurm_0_0_4);
-    let path = fixtures_dir().join("jobs.slurm_0_0_4.prom");
-    let expected =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    assert_eq!(body, expected);
-}
-
-#[test]
-fn golden_job_metrics_openmetrics_1_0() {
-    let body = encode_job_metrics_with_format(
-        &sample_snapshot(),
-        MetricsExpositionFormat::OpenMetrics_1_0,
-    );
-    let path = fixtures_dir().join("jobs.openmetrics_1_0.prom");
+fn golden_job_metrics() {
+    let body = encode_job_metrics(&sample_snapshot());
+    let path = fixtures_dir().join("jobs.prom");
     let expected =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     assert_eq!(body, expected);
@@ -85,7 +71,7 @@ fn job_metrics_catalog_uses_spur_prefix_and_gauges() {
     }
 }
 
-/// Regenerate `tests/fixtures/jobs.*.prom` after intentional encoder changes:
+/// Regenerate `tests/fixtures/jobs.prom` after intentional encoder changes:
 /// `cargo test -p spur-metrics --test job_export_golden refresh_golden_fixtures -- --ignored --exact`
 #[test]
 #[ignore = "manual fixture refresh"]
@@ -93,14 +79,5 @@ fn refresh_golden_fixtures() {
     let snap = sample_snapshot();
     let dir = fixtures_dir();
     std::fs::create_dir_all(&dir).expect("fixtures dir");
-    std::fs::write(
-        dir.join("jobs.slurm_0_0_4.prom"),
-        encode_job_metrics_with_format(&snap, MetricsExpositionFormat::Slurm_0_0_4),
-    )
-    .expect("write slurm fixture");
-    std::fs::write(
-        dir.join("jobs.openmetrics_1_0.prom"),
-        encode_job_metrics_with_format(&snap, MetricsExpositionFormat::OpenMetrics_1_0),
-    )
-    .expect("write openmetrics fixture");
+    std::fs::write(dir.join("jobs.prom"), encode_job_metrics(&snap)).expect("write fixture");
 }

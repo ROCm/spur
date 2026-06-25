@@ -3,13 +3,10 @@
 
 //! Golden and catalog tests for node metrics export.
 
-use spur_core::config::MetricsExpositionFormat;
 use spur_core::node::{Node, NodeState};
 use spur_core::resource::{GpuLinkType, GpuResource, ResourceAllocations, ResourceSet};
 use spur_metrics::node::NodeMetricsSnapshot;
-use spur_metrics::{
-    encode_nodes_metrics, encode_nodes_metrics_with_format, node_state_metric_suffix,
-};
+use spur_metrics::{encode_nodes_metrics, node_state_metric_suffix};
 use std::path::PathBuf;
 
 fn fixtures_dir() -> PathBuf {
@@ -17,9 +14,6 @@ fn fixtures_dir() -> PathBuf {
 }
 
 fn normalize_exposition(body: &str) -> String {
-    // prometheus-client's Family uses a HashMap internally, so sample ordering for
-    // labeled metrics is not stable. Normalize by sorting sample lines within
-    // each metric block (HELP/TYPE preserved).
     let mut out = String::new();
     let mut block: Vec<&str> = Vec::new();
 
@@ -28,7 +22,6 @@ fn normalize_exposition(body: &str) -> String {
             return;
         }
 
-        // Preserve HELP/TYPE in their original order at the top of the block.
         let mut headers: Vec<&str> = Vec::new();
         let mut samples: Vec<&str> = Vec::new();
         for &line in block.iter() {
@@ -100,24 +93,9 @@ fn sample_snapshot() -> NodeMetricsSnapshot {
 }
 
 #[test]
-fn golden_node_metrics_slurm_0_0_4() {
-    let body = normalize_exposition(&encode_nodes_metrics_with_format(
-        &sample_snapshot(),
-        MetricsExpositionFormat::Slurm_0_0_4,
-    ));
-    let path = fixtures_dir().join("nodes.slurm_0_0_4.prom");
-    let expected =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    assert_eq!(body, expected);
-}
-
-#[test]
-fn golden_node_metrics_openmetrics_1_0() {
-    let body = normalize_exposition(&encode_nodes_metrics_with_format(
-        &sample_snapshot(),
-        MetricsExpositionFormat::OpenMetrics_1_0,
-    ));
-    let path = fixtures_dir().join("nodes.openmetrics_1_0.prom");
+fn golden_node_metrics() {
+    let body = normalize_exposition(&encode_nodes_metrics(&sample_snapshot()));
+    let path = fixtures_dir().join("nodes.prom");
     let expected =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     assert_eq!(body, expected);
@@ -138,7 +116,7 @@ fn node_metrics_catalog_uses_spur_prefix_and_gauges() {
     assert!(body.contains("spur_node_memory_bytes{node=\"node-a\"} "));
 }
 
-/// Regenerate `tests/fixtures/nodes.*.prom` after intentional encoder changes:
+/// Regenerate `tests/fixtures/nodes.prom` after intentional encoder changes:
 /// `cargo test -p spur-metrics --test node_export_golden refresh_golden_fixtures -- --ignored --exact`
 #[test]
 #[ignore = "manual fixture refresh"]
@@ -147,19 +125,8 @@ fn refresh_golden_fixtures() {
     let dir = fixtures_dir();
     std::fs::create_dir_all(&dir).expect("fixtures dir");
     std::fs::write(
-        dir.join("nodes.slurm_0_0_4.prom"),
-        normalize_exposition(&encode_nodes_metrics_with_format(
-            &snap,
-            MetricsExpositionFormat::Slurm_0_0_4,
-        )),
+        dir.join("nodes.prom"),
+        normalize_exposition(&encode_nodes_metrics(&snap)),
     )
-    .expect("write slurm fixture");
-    std::fs::write(
-        dir.join("nodes.openmetrics_1_0.prom"),
-        normalize_exposition(&encode_nodes_metrics_with_format(
-            &snap,
-            MetricsExpositionFormat::OpenMetrics_1_0,
-        )),
-    )
-    .expect("write openmetrics fixture");
+    .expect("write fixture");
 }

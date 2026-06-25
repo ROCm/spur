@@ -156,36 +156,10 @@ pub struct MetricsConfig {
     /// Route exists but returns 404 until a follow-up PR implements the exporter.
     #[serde(default)]
     pub high_cardinality: bool,
-    /// Text exposition wire format for `/metrics/*` responses.
-    #[serde(default)]
-    pub exposition_format: MetricsExpositionFormat,
 }
 
 fn default_metrics_listen_addr() -> String {
     "[::]:6822".into()
-}
-
-/// Metrics HTTP text exposition format (Slurm 0.0.4 default vs OpenMetrics 1.0 strict).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[allow(non_camel_case_types)]
-pub enum MetricsExpositionFormat {
-    /// Prometheus text exposition 0.0.4 (Slurm 25.11–compatible; no `# EOF`).
-    #[default]
-    #[serde(rename = "slurm_0_0_4")]
-    Slurm_0_0_4,
-    /// OpenMetrics 1.0 strict text (`# EOF` required).
-    #[serde(rename = "openmetrics_1_0")]
-    OpenMetrics_1_0,
-}
-
-impl MetricsExpositionFormat {
-    /// HTTP `Content-Type` for this format.
-    pub fn content_type(self) -> &'static str {
-        match self {
-            Self::Slurm_0_0_4 => "text/plain; version=0.0.4; charset=utf-8",
-            Self::OpenMetrics_1_0 => "application/openmetrics-text; version=1.0.0; charset=utf-8",
-        }
-    }
 }
 
 /// Metrics HTTP bind policy.
@@ -204,7 +178,6 @@ impl Default for MetricsConfig {
             listen_addr: default_metrics_listen_addr(),
             bind: MetricsBind::Loopback,
             high_cardinality: false,
-            exposition_format: MetricsExpositionFormat::default(),
         }
     }
 }
@@ -994,17 +967,12 @@ enabled = false
 listen_addr = "[::]:9999"
 bind = "all"
 high_cardinality = true
-exposition_format = "openmetrics_1_0"
 "#;
         let config = SlurmConfig::load_from_str(toml).unwrap();
         assert!(!config.metrics.enabled);
         assert_eq!(config.metrics.listen_addr, "[::]:9999");
         assert_eq!(config.metrics.bind, MetricsBind::All);
         assert!(config.metrics.high_cardinality);
-        assert_eq!(
-            config.metrics.exposition_format,
-            MetricsExpositionFormat::OpenMetrics_1_0
-        );
         assert_eq!(
             config.metrics.effective_listen_addr().unwrap(),
             "[::]:9999".parse().unwrap()
@@ -1019,31 +987,23 @@ exposition_format = "openmetrics_1_0"
         assert_eq!(config.metrics.bind, MetricsBind::Loopback);
         assert!(!config.metrics.high_cardinality);
         assert_eq!(
-            config.metrics.exposition_format,
-            MetricsExpositionFormat::Slurm_0_0_4
-        );
-        assert_eq!(
-            config.metrics.exposition_format.content_type(),
-            "text/plain; version=0.0.4; charset=utf-8"
-        );
-        assert_eq!(
             config.metrics.effective_listen_addr().unwrap(),
             "127.0.0.1:6822".parse().unwrap()
         );
     }
 
     #[test]
-    fn test_metrics_exposition_format_serde() {
+    fn test_metrics_stale_exposition_format_ignored() {
         let toml = r#"
 cluster_name = "x"
 
 [metrics]
 exposition_format = "slurm_0_0_4"
 "#;
-        let config = SlurmConfig::load_from_str(toml).unwrap();
-        assert_eq!(
-            config.metrics.exposition_format,
-            MetricsExpositionFormat::Slurm_0_0_4
+        let config = SlurmConfig::load_from_str(toml);
+        assert!(
+            config.is_ok(),
+            "stale exposition_format key should be silently ignored"
         );
     }
 
