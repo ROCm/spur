@@ -599,19 +599,6 @@ pub struct NotificationConfig {
     pub from_address: Option<String>,
 }
 
-/// Job isolation configuration for native-host and container jobs.
-///
-/// Each layer operates independently and degrades gracefully when the
-/// kernel doesn't support it or spurd isn't running as root.
-///
-/// Example:
-/// ```toml
-/// [isolation]
-/// setuid = true       # Run jobs as submitting user (requires root)
-/// namespaces = true   # PID + mount namespace isolation
-/// seccomp = true      # syscall whitelist (blocks ptrace, mount, bpf)
-/// landlock = true     # filesystem access control (kernel 5.13+)
-/// ```
 /// Cluster-wide burst-buffer capacity, modeled like a single consumable pool
 /// (analogous to a license total). Jobs reserve GB via `--bb capacity=NNN`.
 ///
@@ -627,6 +614,19 @@ pub struct BurstBufferConfig {
     pub total_gb: u64,
 }
 
+/// Job isolation configuration for native-host and container jobs.
+///
+/// Each layer operates independently and degrades gracefully when the
+/// kernel doesn't support it or spurd isn't running as root.
+///
+/// Example:
+/// ```toml
+/// [isolation]
+/// setuid = true       # Run jobs as submitting user (requires root)
+/// namespaces = true   # PID + mount namespace isolation
+/// seccomp = true      # syscall whitelist (blocks ptrace, mount, bpf)
+/// landlock = true     # filesystem access control (kernel 5.13+)
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IsolationConfig {
     /// Run jobs as the submitting user's UID/GID (requires root spurd).

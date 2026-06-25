@@ -158,6 +158,7 @@ mod tests {
             hooks: Default::default(),
             devices: Default::default(),
             admission: Default::default(),
+            burst_buffer: Default::default(),
         }
     }
 
