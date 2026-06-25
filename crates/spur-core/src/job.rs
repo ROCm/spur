@@ -226,6 +226,7 @@ pub enum PendingReason {
     JobHeldAdmin,
     BadConstraints,
     PartitionInactive,
+    PartitionConfig,
     DependencyNeverSatisfied,
     InvalidAccount,
     InvalidQOS,
@@ -243,7 +244,6 @@ pub enum PendingReason {
     QosMaxMemoryPerJob,
     QosMaxCpuPerUserLimit,
     QosMaxSubmitJobPerUserLimit,
-    PartitionConfig,
     QosMaxNodePerJobLimit,
     QosGrpCpuLimit,
     QosGrpMemLimit,
@@ -273,6 +273,7 @@ impl PendingReason {
             Self::JobHeldAdmin => "JobHeldAdmin",
             Self::BadConstraints => "BadConstraints",
             Self::PartitionInactive => "PartitionInactive",
+            Self::PartitionConfig => "PartitionConfig",
             Self::DependencyNeverSatisfied => "DependencyNeverSatisfied",
             Self::InvalidAccount => "InvalidAccount",
             Self::InvalidQOS => "InvalidQOS",
@@ -284,7 +285,6 @@ impl PendingReason {
             Self::QosMaxMemoryPerJob => "QOSMaxMemoryPerJob",
             Self::QosMaxCpuPerUserLimit => "QOSMaxCpuPerUserLimit",
             Self::QosMaxSubmitJobPerUserLimit => "QOSMaxSubmitJobPerUserLimit",
-            Self::PartitionConfig => "PartitionConfig",
             Self::QosMaxNodePerJobLimit => "QOSMaxNodePerJobLimit",
             Self::QosGrpCpuLimit => "QOSGrpCpuLimit",
             Self::QosGrpMemLimit => "QOSGrpMemLimit",
@@ -1131,6 +1131,8 @@ mod tests {
 
     /// (variant, exact Slurm 25.11.6 string) for every parity addition.
     const REASON_VOCAB: &[(PendingReason, &str)] = &[
+        (PendingReason::PartitionConfig, "PartitionConfig"),
+        (PendingReason::PartitionInactive, "PartitionInactive"),
         (PendingReason::Reservation, "Reservation"),
         (PendingReason::QosMaxCpuPerJobLimit, "QOSMaxCpuPerJobLimit"),
         (
@@ -1146,8 +1148,6 @@ mod tests {
             PendingReason::QosMaxSubmitJobPerUserLimit,
             "QOSMaxSubmitJobPerUserLimit",
         ),
-        (PendingReason::PartitionConfig, "PartitionConfig"),
-        (PendingReason::PartitionInactive, "PartitionInactive"),
         (
             PendingReason::QosMaxNodePerJobLimit,
             "QOSMaxNodePerJobLimit",
