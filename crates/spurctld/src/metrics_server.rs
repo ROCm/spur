@@ -103,42 +103,176 @@ fn metrics_response(body: String) -> Response {
     (StatusCode::OK, [(header::CONTENT_TYPE, CONTENT_TYPE)], body).into_response()
 }
 
-/// Leader-gated metrics response (testable without a live Raft node).
-#[cfg(test)]
-fn leader_metrics_response(is_leader: bool, body: String) -> Response {
-    if !is_leader {
-        return not_leader_response();
-    }
-    metrics_response(body)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spur_metrics::job::JobMetricsSnapshot;
-    use spur_metrics::node::NodeMetricsSnapshot;
+    use std::collections::HashMap;
+    use std::time::Duration;
 
-    #[test]
-    fn leader_returns_openmetrics_content_type() {
-        let body = encode_job_metrics(&JobMetricsSnapshot::default());
-        let response = leader_metrics_response(true, body);
-        assert_eq!(response.status(), StatusCode::OK);
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use spur_core::config::SlurmConfig;
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    use crate::cluster::ClusterManager;
+
+    fn test_config() -> SlurmConfig {
+        SlurmConfig {
+            cluster_name: "test".into(),
+            controller: spur_core::config::ControllerConfig {
+                first_job_id: 1,
+                ..Default::default()
+            },
+            accounting: Default::default(),
+            scheduler: Default::default(),
+            auth: Default::default(),
+            partitions: vec![spur_core::config::PartitionConfig {
+                name: "default".into(),
+                default: true,
+                state: "UP".into(),
+                nodes: "ALL".into(),
+                selector: Default::default(),
+                max_time: None,
+                default_time: None,
+                max_nodes: None,
+                min_nodes: 1,
+                allow_accounts: Vec::new(),
+                allow_groups: Vec::new(),
+                priority_tier: 1,
+                preempt_mode: String::new(),
+            }],
+            nodes: Vec::new(),
+            network: Default::default(),
+            logging: Default::default(),
+            kubernetes: Default::default(),
+            notifications: Default::default(),
+            power: Default::default(),
+            federation: Default::default(),
+            topology: None,
+            isolation: Default::default(),
+            licenses: HashMap::new(),
+            update: Default::default(),
+            metrics: Default::default(),
+            rest_api: Default::default(),
+            hooks: Default::default(),
+            devices: Default::default(),
+            admission: Default::default(),
+        }
+    }
+
+    async fn test_app() -> (Router, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let cm = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .expect("single-node raft did not self-elect within 5s");
+        let state = Arc::new(MetricsState {
+            cluster: cm,
+            raft: Arc::new(handle),
+        });
+        let app = Router::new()
+            .route("/metrics/jobs", get(metrics_jobs))
+            .route("/metrics/nodes", get(metrics_nodes))
+            .route("/metrics/partitions", get(metrics_partitions))
+            .route("/metrics/scheduler", get(metrics_scheduler))
+            .route("/metrics/jobs-users-accts", get(metrics_jobs_users_accts))
+            .with_state(state);
+        (app, dir)
+    }
+
+    #[tokio::test]
+    async fn metrics_jobs_returns_ok() {
+        let (app, _dir) = test_app().await;
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/metrics/jobs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            CONTENT_TYPE
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("spur_jobs"));
+    }
+
+    #[tokio::test]
+    async fn metrics_nodes_returns_ok() {
+        let (app, _dir) = test_app().await;
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/metrics/nodes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
             CONTENT_TYPE
         );
     }
 
-    #[test]
-    fn nodes_endpoint_returns_200_on_leader() {
-        let response =
-            leader_metrics_response(true, encode_nodes_metrics(&NodeMetricsSnapshot::default()));
-        assert_eq!(response.status(), StatusCode::OK);
+    #[tokio::test]
+    async fn metrics_partitions_returns_ok() {
+        let (app, _dir) = test_app().await;
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/metrics/partitions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            CONTENT_TYPE
+        );
     }
 
-    #[test]
-    fn follower_returns_503() {
-        let response = leader_metrics_response(false, String::new());
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    #[tokio::test]
+    async fn metrics_scheduler_returns_ok() {
+        let (app, _dir) = test_app().await;
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/metrics/scheduler")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            CONTENT_TYPE
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_jobs_users_accts_returns_404_when_disabled() {
+        let (app, _dir) = test_app().await;
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/metrics/jobs-users-accts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
