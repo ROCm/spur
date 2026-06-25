@@ -41,6 +41,25 @@ pub enum NodeCommand {
         #[arg(required = true)]
         labels: Vec<String>,
     },
+    /// Drain a node: stop scheduling new jobs while existing jobs finish.
+    Drain {
+        /// Node name
+        node: String,
+        /// Reason for draining
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Remove a node from the cluster entirely.
+    Remove {
+        /// Node name
+        node: String,
+        /// Force removal even if jobs are running (jobs will be failed with NODE_FAIL)
+        #[arg(long)]
+        force: bool,
+        /// Reason for removal
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 pub async fn main() -> Result<()> {
@@ -52,6 +71,12 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let controller = parsed.controller;
     match parsed.command {
         NodeCommand::Label { node, labels } => cmd_label(&controller, node, labels).await,
+        NodeCommand::Drain { node, reason } => cmd_drain(&controller, node, reason).await,
+        NodeCommand::Remove {
+            node,
+            force,
+            reason,
+        } => cmd_remove(&controller, node, force, reason).await,
     }
 }
 
@@ -99,6 +124,66 @@ async fn cmd_label(controller: &str, node: String, label_args: Vec<String>) -> R
         println!("  {node}: {k} removed");
     }
 
+    Ok(())
+}
+
+async fn cmd_drain(controller: &str, node: String, reason: Option<String>) -> Result<()> {
+    let mut client = SlurmControllerClient::connect(controller.to_string()).await?;
+    let resp = client
+        .drain_node(spur_proto::proto::DrainNodeRequest {
+            name: node.clone(),
+            reason: reason.clone().unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
+
+    if resp.running_jobs > 0 {
+        println!(
+            "Node {node} set to draining ({} running job{} will finish first)",
+            resp.running_jobs,
+            if resp.running_jobs == 1 { "" } else { "s" }
+        );
+    } else {
+        println!("Node {node} set to drain");
+    }
+    if let Some(r) = reason {
+        println!("  reason: {r}");
+    }
+    Ok(())
+}
+
+async fn cmd_remove(
+    controller: &str,
+    node: String,
+    force: bool,
+    reason: Option<String>,
+) -> Result<()> {
+    let mut client = SlurmControllerClient::connect(controller.to_string()).await?;
+    let resp = client
+        .deregister_node(spur_proto::proto::DeregisterNodeRequest {
+            name: node.clone(),
+            force,
+            reason: reason.clone().unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
+
+    if resp.evicted_jobs_count > 0 {
+        println!(
+            "Node {node} removed from cluster ({} job{} evicted)",
+            resp.evicted_jobs_count,
+            if resp.evicted_jobs_count == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+    } else {
+        println!("Node {node} removed from cluster");
+    }
+    if let Some(r) = reason {
+        println!("  reason: {r}");
+    }
     Ok(())
 }
 
