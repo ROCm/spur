@@ -97,16 +97,18 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // out of this cycle instead of sitting PENDING forever.
         cluster.cancel_unsatisfiable_dependency_jobs();
 
-        // Tag jobs pending_jobs() will drop (QoS/license/reservation) with their
-        // real reason, since they never reach update_pending_reasons(). Before the
-        // empty-check so reasons stay fresh even with nothing schedulable.
-        cluster.tag_blocked_pending_reasons();
-
         // Drive before advance so capacity freed by completions is available to
         // newly-eligible jobs in the same cycle. Real agent-side data movement is
         // a follow-up; drive_bb_stage_in() is the controller-side seam only.
         cluster.drive_bb_stage_in();
         cluster.advance_bb_staging();
+
+        // Tag jobs pending_jobs() will drop (QoS/license/reservation/BB) with
+        // their real reason, since they never reach update_pending_reasons().
+        // Runs after BB staging so BurstBufferStageIn reasons reflect the
+        // up-to-date staging state set in this cycle. Before the empty-check so
+        // reasons stay fresh even with nothing schedulable.
+        cluster.tag_blocked_pending_reasons();
 
         let pending = cluster.pending_jobs();
         if pending.is_empty() {

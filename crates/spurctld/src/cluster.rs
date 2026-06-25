@@ -1432,6 +1432,7 @@ impl ClusterManager {
                 j.state == JobState::Pending
                     && j.bb_stage_state == BbStageState::None
                     && j.pending_reason != PendingReason::Held
+                    && j.pending_reason != PendingReason::DeadLine
                     && extract_bb_requirement(&j.spec) > 0
             })
             .map(|j| j.job_id)
