@@ -317,6 +317,53 @@ mod tests {
     }
 
     #[test]
+    fn test_blocked_by_grp_node() {
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 4); // QOS-wide cap 4 nodes
+        let qos = Qos {
+            name: "grp".into(),
+            limits: QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 3;
+        let mut qos_running = TresRecord::new();
+        qos_running.set(TresType::Node, 2); // 2 nodes already running; 2 + 3 > 4
+        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &qos_running);
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosGrpNodeLimit)
+        );
+    }
+
+    #[test]
+    fn test_blocked_by_grp_mem() {
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Memory, 4096); // QOS-wide cap 4 GiB
+        let qos = Qos {
+            name: "grp".into(),
+            limits: QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.memory_per_node_mb = Some(3000); // job needs 3 GiB
+        let mut qos_running = TresRecord::new();
+        qos_running.set(TresType::Memory, 2000); // 2 GiB already running; 2000 + 3000 > 4096
+        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &qos_running);
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosGrpMemLimit)
+        );
+    }
+
+    #[test]
     fn test_qos_priority_adjustment() {
         let qos = Qos {
             priority: 500,

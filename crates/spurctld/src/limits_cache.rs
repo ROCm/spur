@@ -101,7 +101,7 @@ impl Default for QosCache {
 }
 
 /// Zero/empty limit fields mean "no limit" — the accounting daemon encodes absent limits this way.
-pub fn qos_from_proto(info: QosInfo) -> Qos {
+fn qos_from_proto(info: QosInfo) -> Qos {
     let opt_u32 = |v: u32| if v == 0 { None } else { Some(v) };
     let opt_tres = |s: &str| {
         if s.is_empty() {
@@ -156,13 +156,14 @@ mod tests {
     }
 
     #[test]
-    fn test_proto_to_qos_parses_all_five_limits() {
+    fn test_proto_to_qos_parses_all_limits() {
         let mut p = proto("limited");
         p.max_jobs_per_user = 4;
         p.max_submit_jobs_per_user = 8;
         p.max_wall_minutes = 60;
         p.max_tres_per_job = "cpu=2".into();
         p.max_tres_per_user = "cpu=16".into();
+        p.grp_tres = "cpu=64".into();
 
         let qos = qos_from_proto(p);
         assert_eq!(qos.limits.max_jobs_per_user, Some(4));
@@ -181,6 +182,10 @@ mod tests {
                 .as_ref()
                 .map(|t| t.get(TresType::Cpu)),
             Some(16)
+        );
+        assert_eq!(
+            qos.limits.grp_tres.as_ref().map(|t| t.get(TresType::Cpu)),
+            Some(64)
         );
     }
 

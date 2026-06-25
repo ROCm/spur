@@ -2483,15 +2483,23 @@ fn qos_block_for(
     let user = &job.spec.user;
     let running_count = jobs
         .values()
-        .filter(|j| j.state == JobState::Running && j.spec.user == *user)
+        .filter(|j| {
+            j.state == JobState::Running
+                && j.spec.user == *user
+                && j.spec.qos.as_deref() == Some(qos_name.as_str())
+        })
         .count() as u32;
     let submitted_count = jobs
         .values()
         .filter(|j| {
-            (j.state == JobState::Pending || j.state == JobState::Running) && j.spec.user == *user
+            (j.state == JobState::Pending || j.state == JobState::Running)
+                && j.spec.user == *user
+                && j.spec.qos.as_deref() == Some(qos_name.as_str())
         })
         .count() as u32;
-    let user_running_tres = sum_running_tres(jobs, |j| j.spec.user == *user);
+    let user_running_tres = sum_running_tres(jobs, |j| {
+        j.spec.user == *user && j.spec.qos.as_deref() == Some(qos_name.as_str())
+    });
     let qos_running_tres =
         sum_running_tres(jobs, |j| j.spec.qos.as_deref() == Some(qos_name.as_str()));
 
