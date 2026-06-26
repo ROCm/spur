@@ -529,6 +529,9 @@ impl SlurmController for ControllerService {
         } else {
             Some(req.reason)
         };
+        if self.cluster.get_node(&req.name).is_none() {
+            return Err(Status::not_found(format!("node {} not found", req.name)));
+        }
         let (actual_state, running_jobs) = self
             .cluster
             .drain_node(&req.name, reason)
@@ -563,6 +566,9 @@ impl SlurmController for ControllerService {
         } else {
             Some(req.reason)
         };
+        if self.cluster.get_node(&req.name).is_none() {
+            return Err(Status::not_found(format!("node {} not found", req.name)));
+        }
         let evicted = self
             .cluster
             .remove_node(&req.name, req.force, reason)
@@ -616,6 +622,9 @@ impl SlurmController for ControllerService {
             }
         }
 
+        if self.cluster.get_node(&req.hostname).is_none() {
+            return Ok(Response::new(()));
+        }
         let evicted = self
             .cluster
             .remove_node(
