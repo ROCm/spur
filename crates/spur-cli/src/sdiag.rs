@@ -6,7 +6,7 @@ use clap::Parser;
 use spur_core::job::JobState as CoreJobState;
 use spur_core::node::NodeState as CoreNodeState;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
-use spur_proto::proto::{JobMetrics, NodeMetrics, RpcOperationStats, RpcStats};
+use spur_proto::proto::{JobMetrics, NodeMetrics, RpcOperationStats, RpcStats, SchedStats};
 
 /// Display scheduler diagnostics and statistics.
 #[derive(Parser, Debug)]
@@ -16,7 +16,7 @@ pub struct SdiagArgs {
     #[arg(long)]
     pub noheader: bool,
 
-    /// Reset RPC statistics counters on the controller
+    /// Reset accumulated statistics counters on the controller
     #[arg(long)]
     pub reset: bool,
 
@@ -42,9 +42,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     if args.reset {
         client
-            .reset_rpc_stats(())
+            .reset_diag_stats(())
             .await
-            .context("failed to reset RPC statistics")?;
+            .context("failed to reset diagnostic statistics")?;
     }
 
     let ping_resp = client.ping(()).await.context("failed to ping controller")?;
@@ -66,6 +66,12 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .get_rpc_stats(())
         .await
         .context("failed to get RPC statistics")?
+        .into_inner();
+
+    let sched_stats = client
+        .get_sched_stats(())
+        .await
+        .context("failed to get scheduler statistics")?
         .into_inner();
 
     let server_time = ping
@@ -97,6 +103,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     print_job_statistics(&job_metrics);
     print_node_statistics(&node_metrics);
+    print_scheduler_statistics(&sched_stats);
     print_rpc_statistics(&rpc_stats);
 
     Ok(())
@@ -208,6 +215,31 @@ fn print_node_statistics(metrics: &NodeMetrics) {
     );
     println!("  Total GPUs        : {}", metrics.total_gpus);
     println!("  Allocated GPUs    : {}", metrics.alloc_gpus);
+}
+
+fn scheduler_statistics_lines(stats: &SchedStats) -> Vec<String> {
+    vec![
+        String::new(),
+        "Scheduler Statistics:".to_string(),
+        format!("  Plugin              : {}", stats.plugin),
+        format!("  Cycles              : {}", stats.cycles),
+        format!("  Cycle last (us)     : {}", stats.cycle_last_time_us),
+        format!("  Cycle total (us)    : {}", stats.cycle_total_time_us),
+        format!("  Cycle avg (us)      : {}", stats.cycle_avg_time_us),
+        format!("  Schedule last (us)  : {}", stats.schedule_last_time_us),
+        format!("  Schedule total (us) : {}", stats.schedule_total_time_us),
+        format!("  Schedule avg (us)   : {}", stats.schedule_avg_time_us),
+        format!("  Jobs submitted      : {}", stats.jobs_submitted),
+        format!("  Jobs started        : {}", stats.jobs_started),
+        format!("  Jobs completed      : {}", stats.jobs_completed),
+        format!("  Jobs started (last) : {}", stats.jobs_started_last_cycle),
+    ]
+}
+
+fn print_scheduler_statistics(stats: &SchedStats) {
+    for line in scheduler_statistics_lines(stats) {
+        println!("{line}");
+    }
 }
 
 fn rpc_statistics_lines(stats: &RpcStats) -> Vec<String> {
@@ -322,6 +354,30 @@ mod tests {
 
         assert_eq!(finished, 3); // NODE_FAIL + 2 COMPLETED
         assert_eq!(active, 2); // RUNNING + SUSPENDED
+    }
+
+    #[test]
+    fn scheduler_statistics_lines_include_cycle_and_lifecycle_fields() {
+        let stats = SchedStats {
+            plugin: "backfill".into(),
+            cycles: 5,
+            cycle_total_time_us: 2500,
+            cycle_last_time_us: 600,
+            cycle_avg_time_us: 500,
+            schedule_total_time_us: 800,
+            schedule_last_time_us: 200,
+            schedule_avg_time_us: 160,
+            jobs_submitted: 10,
+            jobs_started: 8,
+            jobs_completed: 7,
+            jobs_started_last_cycle: 2,
+        };
+        let lines = scheduler_statistics_lines(&stats);
+        assert!(lines.iter().any(|l| l.contains("Plugin")));
+        assert!(lines.iter().any(|l| l.contains("Cycles")));
+        assert!(lines.iter().any(|l| l.contains("Cycle total (us)")));
+        assert!(lines.iter().any(|l| l.contains("Schedule total (us)")));
+        assert!(lines.iter().any(|l| l.contains("Jobs started (last) : 2")));
     }
 
     #[test]

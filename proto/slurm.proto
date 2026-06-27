@@ -285,6 +285,11 @@ service SlurmController {
   rpc GetRpcStats(google.protobuf.Empty) returns (RpcStats);
   rpc ResetRpcStats(google.protobuf.Empty) returns (google.protobuf.Empty);
 
+  // Scheduler cycle and lifecycle statistics (since process start or last reset)
+  rpc GetSchedStats(google.protobuf.Empty) returns (SchedStats);
+  rpc ResetSchedStats(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc ResetDiagStats(google.protobuf.Empty) returns (google.protobuf.Empty);
+
   // Agent registration
   rpc RegisterAgent(RegisterAgentRequest) returns (RegisterAgentResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
@@ -500,6 +505,21 @@ message RpcOperationStats {
 
 message RpcStats {
   repeated RpcOperationStats by_operation = 1;
+}
+
+message SchedStats {
+  string plugin = 1;
+  uint64 cycles = 2;
+  uint64 cycle_total_time_us = 3;
+  uint64 cycle_last_time_us = 4;
+  uint64 cycle_avg_time_us = 5;
+  uint64 schedule_total_time_us = 6;
+  uint64 schedule_last_time_us = 7;
+  uint64 schedule_avg_time_us = 8;
+  uint64 jobs_submitted = 9;
+  uint64 jobs_started = 10;
+  uint64 jobs_completed = 11;
+  uint64 jobs_started_last_cycle = 12;
 }
 
 message RegisterAgentRequest {

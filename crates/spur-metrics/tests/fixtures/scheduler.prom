@@ -1,0 +1,37 @@
+# HELP spur_scheduler_info Active scheduler plugin (value is always 1).
+# TYPE spur_scheduler_info gauge
+spur_scheduler_info{plugin="backfill"} 1
+# HELP spur_scheduler_cycles Scheduling cycles executed since reset.
+# TYPE spur_scheduler_cycles gauge
+spur_scheduler_cycles 10
+# HELP spur_scheduler_cycle_total_time_us Cumulative scheduling cycle wall time in microseconds.
+# TYPE spur_scheduler_cycle_total_time_us gauge
+spur_scheduler_cycle_total_time_us 5000
+# HELP spur_scheduler_cycle_last_time_us Most recent scheduling cycle wall time in microseconds.
+# TYPE spur_scheduler_cycle_last_time_us gauge
+spur_scheduler_cycle_last_time_us 600
+# HELP spur_scheduler_cycle_avg_time_us Average scheduling cycle wall time in microseconds.
+# TYPE spur_scheduler_cycle_avg_time_us gauge
+spur_scheduler_cycle_avg_time_us 500
+# HELP spur_scheduler_schedule_total_time_us Cumulative Scheduler::schedule() time in microseconds.
+# TYPE spur_scheduler_schedule_total_time_us gauge
+spur_scheduler_schedule_total_time_us 1500
+# HELP spur_scheduler_schedule_last_time_us Most recent Scheduler::schedule() time in microseconds.
+# TYPE spur_scheduler_schedule_last_time_us gauge
+spur_scheduler_schedule_last_time_us 200
+# HELP spur_scheduler_schedule_avg_time_us Average Scheduler::schedule() time in microseconds.
+# TYPE spur_scheduler_schedule_avg_time_us gauge
+spur_scheduler_schedule_avg_time_us 150
+# HELP spur_scheduler_jobs_submitted Jobs submitted since reset.
+# TYPE spur_scheduler_jobs_submitted gauge
+spur_scheduler_jobs_submitted 42
+# HELP spur_scheduler_jobs_started Jobs started since reset.
+# TYPE spur_scheduler_jobs_started gauge
+spur_scheduler_jobs_started 30
+# HELP spur_scheduler_jobs_completed Jobs completed since reset.
+# TYPE spur_scheduler_jobs_completed gauge
+spur_scheduler_jobs_completed 28
+# HELP spur_scheduler_jobs_started_last_cycle Jobs started in the most recent scheduling cycle.
+# TYPE spur_scheduler_jobs_started_last_cycle gauge
+spur_scheduler_jobs_started_last_cycle 3
+# EOF

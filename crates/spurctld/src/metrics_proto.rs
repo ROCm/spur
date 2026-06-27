@@ -8,9 +8,10 @@ use spur_core::node::NodeState;
 use spur_metrics::job::JobMetricsSnapshot;
 use spur_metrics::node::NodeMetricsSnapshot;
 use spur_metrics::RpcStatsSnapshot;
+use spur_metrics::SchedStatsSnapshot;
 use spur_proto::proto::{
     JobMetrics, JobStateCount, NodeMetrics, NodeMetricsEntry, NodeStateCount, RpcOperationStats,
-    RpcStats,
+    RpcStats, SchedStats,
 };
 
 pub fn rpc_stats_to_proto(snap: &RpcStatsSnapshot) -> RpcStats {
@@ -26,6 +27,23 @@ pub fn rpc_stats_to_proto(snap: &RpcStatsSnapshot) -> RpcStats {
         .collect();
 
     RpcStats { by_operation }
+}
+
+pub fn sched_stats_to_proto(snap: &SchedStatsSnapshot) -> SchedStats {
+    SchedStats {
+        plugin: snap.plugin.clone(),
+        cycles: snap.cycles,
+        cycle_total_time_us: snap.cycle_total_time_us,
+        cycle_last_time_us: snap.cycle_last_time_us,
+        cycle_avg_time_us: snap.cycle_avg_time_us(),
+        schedule_total_time_us: snap.schedule_total_time_us,
+        schedule_last_time_us: snap.schedule_last_time_us,
+        schedule_avg_time_us: snap.schedule_avg_time_us(),
+        jobs_submitted: snap.jobs_submitted,
+        jobs_started: snap.jobs_started,
+        jobs_completed: snap.jobs_completed,
+        jobs_started_last_cycle: snap.jobs_started_last_cycle,
+    }
 }
 
 pub fn job_metrics_to_proto(snap: &JobMetricsSnapshot) -> JobMetrics {
@@ -93,9 +111,10 @@ mod tests {
     use spur_metrics::export::jobs::{encode_job_metrics, job_state_metric_suffix};
     use spur_metrics::export::nodes::encode_nodes_metrics;
     use spur_metrics::export::rpc::encode_rpc_metrics;
+    use spur_metrics::export::scheduler::encode_scheduler_metrics;
     use spur_metrics::job::JobMetricsSnapshot;
     use spur_metrics::node::NodeMetricsSnapshot;
-    use spur_metrics::{RpcOperationSnapshot, RpcStatsSnapshot};
+    use spur_metrics::{RpcOperationSnapshot, RpcStatsSnapshot, SchedStatsSnapshot};
 
     use super::*;
 
@@ -273,5 +292,41 @@ mod tests {
                 .unwrap();
             assert_eq!(total, op.total_time_us);
         }
+    }
+
+    #[test]
+    fn sched_proto_matches_http_gauges() {
+        let snap = SchedStatsSnapshot {
+            plugin: "backfill".into(),
+            cycles: 10,
+            cycle_total_time_us: 5000,
+            cycle_last_time_us: 600,
+            schedule_total_time_us: 1500,
+            schedule_last_time_us: 200,
+            jobs_submitted: 42,
+            jobs_started: 30,
+            jobs_completed: 28,
+            jobs_started_last_cycle: 3,
+        };
+        let proto = sched_stats_to_proto(&snap);
+        let body = encode_scheduler_metrics(&snap);
+
+        assert_eq!(proto.cycles, gauge_value(&body, "spur_scheduler_cycles"));
+        assert_eq!(
+            proto.cycle_avg_time_us,
+            gauge_value(&body, "spur_scheduler_cycle_avg_time_us")
+        );
+        assert_eq!(
+            proto.schedule_avg_time_us,
+            gauge_value(&body, "spur_scheduler_schedule_avg_time_us")
+        );
+        assert_eq!(
+            proto.jobs_submitted,
+            gauge_value(&body, "spur_scheduler_jobs_submitted")
+        );
+        assert_eq!(
+            proto.jobs_started_last_cycle,
+            gauge_value(&body, "spur_scheduler_jobs_started_last_cycle")
+        );
     }
 }

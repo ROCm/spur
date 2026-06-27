@@ -20,11 +20,13 @@ use tracing::info;
 use crate::cluster::ClusterManager;
 use crate::raft::RaftHandle;
 use crate::rpc_stats::RpcStatsCollector;
+use crate::sched_stats::SchedStatsCollector;
 
 struct MetricsState {
     cluster: Arc<ClusterManager>,
     raft: Arc<RaftHandle>,
     rpc_stats: Arc<RpcStatsCollector>,
+    sched_stats: Arc<SchedStatsCollector>,
 }
 
 /// Start the metrics HTTP server. Runs until the listener is closed.
@@ -33,11 +35,13 @@ pub async fn serve(
     cluster: Arc<ClusterManager>,
     raft: Arc<RaftHandle>,
     rpc_stats: Arc<RpcStatsCollector>,
+    sched_stats: Arc<SchedStatsCollector>,
 ) -> anyhow::Result<()> {
     let state = Arc::new(MetricsState {
         cluster,
         raft,
         rpc_stats,
+        sched_stats,
     });
 
     let app = Router::new()
@@ -89,7 +93,7 @@ async fn metrics_scheduler(State(state): State<Arc<MetricsState>>) -> Response {
     if !state.raft.is_leader() {
         return not_leader_response();
     }
-    metrics_response(encode_scheduler_metrics())
+    metrics_response(encode_scheduler_metrics(&state.sched_stats.snapshot()))
 }
 
 async fn metrics_jobs_users_accts(State(state): State<Arc<MetricsState>>) -> Response {
@@ -132,6 +136,7 @@ mod tests {
 
     use crate::cluster::ClusterManager;
     use crate::rpc_stats::RpcStatsCollector;
+    use crate::sched_stats::SchedStatsCollector;
 
     fn test_config() -> SlurmConfig {
         SlurmConfig {
@@ -194,6 +199,7 @@ mod tests {
             cluster: cm,
             raft: Arc::new(handle),
             rpc_stats: Arc::new(RpcStatsCollector::new()),
+            sched_stats: Arc::new(SchedStatsCollector::new("backfill")),
         });
         let app = Router::new()
             .route("/metrics/jobs", get(metrics_jobs))
@@ -360,8 +366,11 @@ mod tests {
             cluster: cm,
             raft: follower,
             rpc_stats: Arc::new(RpcStatsCollector::new()),
+            sched_stats: Arc::new(SchedStatsCollector::new("backfill")),
         });
-        let resp = metrics_rpc(State(state)).await;
+        let resp = metrics_rpc(State(state.clone())).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let resp = metrics_scheduler(State(state)).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 

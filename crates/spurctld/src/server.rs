@@ -21,6 +21,7 @@ use crate::cluster::ClusterManager;
 use crate::raft::RaftHandle;
 use crate::rpc_middleware::RpcStatsLayer;
 use crate::rpc_stats::RpcStatsCollector;
+use crate::sched_stats::SchedStatsCollector;
 
 const FORWARDED_HEADER: &str = "x-spur-forwarded";
 const LEADER_HEADER: &str = "x-spur-leader";
@@ -32,6 +33,7 @@ pub struct ControllerService {
     /// Node ID → client API address (host:6817) for the x-spur-leader header.
     client_addrs: BTreeMap<u64, String>,
     rpc_stats: Arc<RpcStatsCollector>,
+    sched_stats: Arc<SchedStatsCollector>,
 }
 
 struct LeaderProxy {
@@ -603,6 +605,53 @@ impl SlurmController for ControllerService {
         }
 
         self.rpc_stats.reset();
+        Ok(Response::new(()))
+    }
+
+    async fn get_sched_stats(&self, request: Request<()>) -> Result<Response<SchedStats>, Status> {
+        if self.check_leader(&request).is_err() {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.get_sched_stats(fwd).await;
+            }
+        }
+
+        Ok(Response::new(crate::metrics_proto::sched_stats_to_proto(
+            &self.sched_stats.snapshot(),
+        )))
+    }
+
+    async fn reset_sched_stats(&self, request: Request<()>) -> Result<Response<()>, Status> {
+        if self.check_leader(&request).is_err() {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.reset_sched_stats(fwd).await;
+            }
+        }
+
+        self.sched_stats.reset();
+        Ok(Response::new(()))
+    }
+
+    async fn reset_diag_stats(&self, request: Request<()>) -> Result<Response<()>, Status> {
+        if self.check_leader(&request).is_err() {
+            {
+                let proxy = &self.leader_proxy;
+                let mut client = proxy.get_leader_client().await?;
+                let mut fwd = Request::new(());
+                *fwd.metadata_mut() = Self::forwarded_metadata();
+                return client.reset_diag_stats(fwd).await;
+            }
+        }
+
+        self.rpc_stats.reset();
+        self.sched_stats.reset();
         Ok(Response::new(()))
     }
 
@@ -1281,6 +1330,7 @@ pub async fn serve(
     cluster: Arc<ClusterManager>,
     raft_handle: Arc<RaftHandle>,
     rpc_stats: Arc<RpcStatsCollector>,
+    sched_stats: Arc<SchedStatsCollector>,
 ) -> anyhow::Result<()> {
     let client_addrs: BTreeMap<u64, String> = raft_handle
         .peers
@@ -1303,6 +1353,7 @@ pub async fn serve(
         raft: raft_handle.clone(),
         leader_proxy,
         rpc_stats: rpc_stats.clone(),
+        sched_stats: sched_stats.clone(),
     };
 
     let stats_layer = RpcStatsLayer::new(rpc_stats, raft_handle);

@@ -29,6 +29,7 @@ use crate::accounting::AccountingNotifier;
 use crate::fairshare_cache::FairshareCache;
 use crate::limits_cache::QosCache;
 use crate::raft::{ClientResponse, JobFinalized, SpurRaft, StateMachineApply};
+use crate::sched_stats::SchedStatsCollector;
 
 /// Result of recording a per-node completion report.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +70,7 @@ pub struct ClusterManager {
     qos_cache: Arc<QosCache>,
     /// Wake signal for the scheduler loop.
     pub(crate) scheduler_notify: Arc<Notify>,
+    sched_stats: RwLock<Option<Arc<SchedStatsCollector>>>,
 }
 
 impl ClusterManager {
@@ -95,6 +97,7 @@ impl ClusterManager {
             fairshare_cache,
             qos_cache,
             scheduler_notify: Arc::new(Notify::new()),
+            sched_stats: RwLock::new(None),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -119,6 +122,7 @@ impl ClusterManager {
 
         let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
         let specs = expand_job_specs(spec, job_id)?;
+        let submitted = specs.len() as u64;
 
         for task_spec in specs {
             let task_id = if task_spec.array_job_id.is_some() {
@@ -130,6 +134,13 @@ impl ClusterManager {
                 job_id: task_id,
                 spec: Box::new(task_spec),
             })?;
+        }
+
+        if submitted > 0 {
+            // Array expansion is all-or-nothing: count only after every JobSubmit propose succeeds.
+            if let Some(stats) = self.sched_stats.read().as_ref() {
+                stats.record_submitted(submitted);
+            }
         }
 
         self.scheduler_notify.notify_one();
@@ -594,6 +605,9 @@ impl ClusterManager {
     }
 
     fn run_job_finalized_side_effects(&self, finalized: JobFinalized) {
+        if let Some(stats) = self.sched_stats.read().as_ref() {
+            stats.record_completed();
+        }
         self.run_epilog_slurmctld(finalized.job_id);
         self.notify_job_finished(finalized.job_id, finalized.state, finalized.exit_code);
     }
@@ -1980,6 +1994,27 @@ impl ClusterManager {
 
     pub fn set_accounting(&self, notifier: AccountingNotifier) {
         *self.accounting.write() = Some(notifier);
+    }
+
+    pub fn set_sched_stats(&self, stats: Arc<SchedStatsCollector>) {
+        *self.sched_stats.write() = Some(stats);
+    }
+
+    pub(crate) fn record_sched_cycle(
+        &self,
+        cycle_time_us: u64,
+        schedule_time_us: u64,
+        jobs_started: u64,
+    ) {
+        if let Some(stats) = self.sched_stats.read().as_ref() {
+            stats.record_cycle(cycle_time_us, schedule_time_us, jobs_started);
+        }
+    }
+
+    pub(crate) fn record_sched_job_started(&self) {
+        if let Some(stats) = self.sched_stats.read().as_ref() {
+            stats.record_started();
+        }
     }
 
     pub fn fairshare_cache(&self) -> &Arc<FairshareCache> {
@@ -3625,6 +3660,37 @@ mod tests {
 
         let node = cm.get_node("worker1").unwrap();
         assert_eq!(node.alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sched_stats_track_submit_start_complete() {
+        use std::sync::Arc;
+
+        use crate::sched_stats::SchedStatsCollector;
+
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let stats = Arc::new(SchedStatsCollector::new("backfill"));
+        cm.set_sched_stats(stats.clone());
+
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = submit_and_wait(&cm, basic_spec("stats-job"));
+        assert_eq!(stats.snapshot().jobs_submitted, 1);
+
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            resources.clone(),
+            per_node_for(&["worker1"], resources),
+        )
+        .unwrap();
+        cm.record_sched_job_started();
+        assert_eq!(stats.snapshot().jobs_started, 1);
+
+        cm.complete_job(job_id, 0, JobState::Completed).unwrap();
+        settle(&cm, job_id, JobState::Completed);
+        assert_eq!(stats.snapshot().jobs_completed, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

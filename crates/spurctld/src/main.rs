@@ -12,6 +12,7 @@ mod raft_server;
 mod rest;
 mod rpc_middleware;
 mod rpc_stats;
+mod sched_stats;
 mod scheduler_loop;
 mod server;
 
@@ -23,6 +24,7 @@ use tracing::info;
 
 use cluster::ClusterManager;
 use rpc_stats::RpcStatsCollector;
+use sched_stats::SchedStatsCollector;
 
 #[derive(Parser)]
 #[command(name = "spurctld", about = "Spur controller daemon (spurctld)")]
@@ -140,6 +142,9 @@ async fn main() -> anyhow::Result<()> {
     let raft_handle = Arc::new(handle);
     cluster.set_raft(raft_handle.raft.clone());
 
+    let sched_stats = Arc::new(SchedStatsCollector::new(config.scheduler.plugin.clone()));
+    cluster.set_sched_stats(sched_stats.clone());
+
     // Connect to accounting daemon (best-effort -- scheduling works without it)
     match accounting::AccountingNotifier::connect(&config.accounting.host).await {
         Ok(notifier) => {
@@ -202,12 +207,14 @@ async fn main() -> anyhow::Result<()> {
         let metrics_cluster = cluster.clone();
         let metrics_raft = raft_handle.clone();
         let metrics_rpc_stats = rpc_stats.clone();
+        let metrics_sched_stats = sched_stats.clone();
         tokio::spawn(async move {
             if let Err(e) = metrics_server::serve(
                 metrics_addr,
                 metrics_cluster,
                 metrics_raft,
                 metrics_rpc_stats,
+                metrics_sched_stats,
             )
             .await
             {
@@ -230,7 +237,7 @@ async fn main() -> anyhow::Result<()> {
     // Start gRPC server
     let addr = listen_addr.parse()?;
     info!(%addr, "gRPC server listening");
-    server::serve(addr, cluster, raft_handle, rpc_stats).await?;
+    server::serve(addr, cluster, raft_handle, rpc_stats, sched_stats).await?;
 
     sched_handle.abort();
     Ok(())

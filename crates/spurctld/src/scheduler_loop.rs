@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use chrono::Utc;
 use tracing::{debug, error, info, warn};
@@ -124,6 +125,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             continue;
         }
 
+        let cycle_start = Instant::now();
+
         let cluster_state = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
@@ -134,6 +137,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // Catch panics in the scheduler so that a single bad job doesn't kill
         // the entire scheduling loop (issue #56).
         let sched_ref = &mut scheduler;
+        let schedule_start = Instant::now();
         let assignments = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             sched_ref.schedule(&pending, &cluster_state)
         })) {
@@ -146,9 +150,14 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                         .or_else(|| e.downcast_ref::<&str>().copied())
                         .unwrap_or("unknown")
                 );
+                let cycle_time_us = cycle_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
+                let schedule_time_us =
+                    schedule_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
+                cluster.record_sched_cycle(cycle_time_us, schedule_time_us, 0);
                 continue;
             }
         };
+        let schedule_time_us = schedule_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
 
         // Preemption: if high-priority jobs couldn't be scheduled,
         // cancel lower-priority running jobs to free resources.
@@ -178,6 +187,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             }
         }
 
+        let mut jobs_started_cycle = 0u64;
         for assignment in assignments {
             let job = match cluster.get_job(assignment.job_id) {
                 Some(j) => j,
@@ -234,6 +244,9 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                     continue;
                 }
             }
+
+            cluster.record_sched_job_started();
+            jobs_started_cycle += 1;
 
             // Dispatch job to ALL assigned nodes
             let job_id = assignment.job_id;
@@ -343,6 +356,9 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 }
             });
         }
+
+        let cycle_time_us = cycle_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        cluster.record_sched_cycle(cycle_time_us, schedule_time_us, jobs_started_cycle);
     }
 }
 
