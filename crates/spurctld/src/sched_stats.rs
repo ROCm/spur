@@ -22,7 +22,7 @@ struct SchedAccum {
     schedule_last_time_us: u64,
     jobs_submitted: u64,
     jobs_started: u64,
-    jobs_completed: u64,
+    jobs_finalized: u64,
     jobs_started_last_cycle: u64,
 }
 
@@ -54,11 +54,13 @@ impl SchedStatsCollector {
     }
 
     pub fn record_started(&self) {
-        self.inner.lock().jobs_started += 1;
+        let mut accum = self.inner.lock();
+        accum.jobs_started = accum.jobs_started.saturating_add(1);
     }
 
-    pub fn record_completed(&self) {
-        self.inner.lock().jobs_completed += 1;
+    pub fn record_finalized(&self) {
+        let mut accum = self.inner.lock();
+        accum.jobs_finalized = accum.jobs_finalized.saturating_add(1);
     }
 
     pub fn snapshot(&self) -> SchedStatsSnapshot {
@@ -72,7 +74,7 @@ impl SchedStatsCollector {
             schedule_last_time_us: accum.schedule_last_time_us,
             jobs_submitted: accum.jobs_submitted,
             jobs_started: accum.jobs_started,
-            jobs_completed: accum.jobs_completed,
+            jobs_finalized: accum.jobs_finalized,
             jobs_started_last_cycle: accum.jobs_started_last_cycle,
         }
     }
@@ -110,12 +112,12 @@ mod tests {
         stats.record_submitted(3);
         stats.record_started();
         stats.record_started();
-        stats.record_completed();
+        stats.record_finalized();
 
         let snap = stats.snapshot();
         assert_eq!(snap.jobs_submitted, 3);
         assert_eq!(snap.jobs_started, 2);
-        assert_eq!(snap.jobs_completed, 1);
+        assert_eq!(snap.jobs_finalized, 1);
     }
 
     #[test]

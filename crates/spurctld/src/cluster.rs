@@ -122,7 +122,6 @@ impl ClusterManager {
 
         let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
         let specs = expand_job_specs(spec, job_id)?;
-        let submitted = specs.len() as u64;
 
         for task_spec in specs {
             let task_id = if task_spec.array_job_id.is_some() {
@@ -134,12 +133,8 @@ impl ClusterManager {
                 job_id: task_id,
                 spec: Box::new(task_spec),
             })?;
-        }
-
-        if submitted > 0 {
-            // Array expansion is all-or-nothing: count only after every JobSubmit propose succeeds.
             if let Some(stats) = self.sched_stats.read().as_ref() {
-                stats.record_submitted(submitted);
+                stats.record_submitted(1);
             }
         }
 
@@ -606,7 +601,7 @@ impl ClusterManager {
 
     fn run_job_finalized_side_effects(&self, finalized: JobFinalized) {
         if let Some(stats) = self.sched_stats.read().as_ref() {
-            stats.record_completed();
+            stats.record_finalized();
         }
         self.run_epilog_slurmctld(finalized.job_id);
         self.notify_job_finished(finalized.job_id, finalized.state, finalized.exit_code);
@@ -3690,7 +3685,7 @@ mod tests {
 
         cm.complete_job(job_id, 0, JobState::Completed).unwrap();
         settle(&cm, job_id, JobState::Completed);
-        assert_eq!(stats.snapshot().jobs_completed, 1);
+        assert_eq!(stats.snapshot().jobs_finalized, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -518,7 +518,7 @@ message SchedStats {
   uint64 schedule_avg_time_us = 8;
   uint64 jobs_submitted = 9;
   uint64 jobs_started = 10;
-  uint64 jobs_completed = 11;
+  uint64 jobs_finalized = 11;
   uint64 jobs_started_last_cycle = 12;
 }
 

@@ -12,7 +12,7 @@ pub struct SchedStatsSnapshot {
     pub schedule_last_time_us: u64,
     pub jobs_submitted: u64,
     pub jobs_started: u64,
-    pub jobs_completed: u64,
+    pub jobs_finalized: u64,
     pub jobs_started_last_cycle: u64,
 }
 

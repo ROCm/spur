@@ -28,9 +28,9 @@ spur_scheduler_jobs_submitted 42
 # HELP spur_scheduler_jobs_started Jobs started since reset.
 # TYPE spur_scheduler_jobs_started gauge
 spur_scheduler_jobs_started 30
-# HELP spur_scheduler_jobs_completed Jobs completed since reset.
-# TYPE spur_scheduler_jobs_completed gauge
-spur_scheduler_jobs_completed 28
+# HELP spur_scheduler_jobs_finalized Jobs reaching a terminal state since reset.
+# TYPE spur_scheduler_jobs_finalized gauge
+spur_scheduler_jobs_finalized 28
 # HELP spur_scheduler_jobs_started_last_cycle Jobs started in the most recent scheduling cycle.
 # TYPE spur_scheduler_jobs_started_last_cycle gauge
 spur_scheduler_jobs_started_last_cycle 3

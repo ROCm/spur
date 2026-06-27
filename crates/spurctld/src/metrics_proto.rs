@@ -41,7 +41,7 @@ pub fn sched_stats_to_proto(snap: &SchedStatsSnapshot) -> SchedStats {
         schedule_avg_time_us: snap.schedule_avg_time_us(),
         jobs_submitted: snap.jobs_submitted,
         jobs_started: snap.jobs_started,
-        jobs_completed: snap.jobs_completed,
+        jobs_finalized: snap.jobs_finalized,
         jobs_started_last_cycle: snap.jobs_started_last_cycle,
     }
 }
@@ -305,7 +305,7 @@ mod tests {
             schedule_last_time_us: 200,
             jobs_submitted: 42,
             jobs_started: 30,
-            jobs_completed: 28,
+            jobs_finalized: 28,
             jobs_started_last_cycle: 3,
         };
         let proto = sched_stats_to_proto(&snap);

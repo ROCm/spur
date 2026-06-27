@@ -67,7 +67,7 @@ fn sample_snapshot() -> SchedStatsSnapshot {
         schedule_last_time_us: 200,
         jobs_submitted: 42,
         jobs_started: 30,
-        jobs_completed: 28,
+        jobs_finalized: 28,
         jobs_started_last_cycle: 3,
     }
 }

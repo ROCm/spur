@@ -92,9 +92,9 @@ pub fn register_scheduler(registry: &mut Registry, snap: &SchedStatsSnapshot) {
     );
     register_gauge(
         registry,
-        "spur_scheduler_jobs_completed",
-        "Jobs completed since reset",
-        snap.jobs_completed,
+        "spur_scheduler_jobs_finalized",
+        "Jobs reaching a terminal state since reset",
+        snap.jobs_finalized,
     );
     register_gauge(
         registry,
@@ -123,7 +123,7 @@ mod tests {
             schedule_last_time_us: 200,
             jobs_submitted: 42,
             jobs_started: 30,
-            jobs_completed: 28,
+            jobs_finalized: 28,
             jobs_started_last_cycle: 3,
         }
     }

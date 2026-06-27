@@ -231,7 +231,7 @@ fn scheduler_statistics_lines(stats: &SchedStats) -> Vec<String> {
         format!("  Schedule avg (us)   : {}", stats.schedule_avg_time_us),
         format!("  Jobs submitted      : {}", stats.jobs_submitted),
         format!("  Jobs started        : {}", stats.jobs_started),
-        format!("  Jobs completed      : {}", stats.jobs_completed),
+        format!("  Jobs finalized      : {}", stats.jobs_finalized),
         format!("  Jobs started (last) : {}", stats.jobs_started_last_cycle),
     ]
 }
@@ -369,7 +369,7 @@ mod tests {
             schedule_avg_time_us: 160,
             jobs_submitted: 10,
             jobs_started: 8,
-            jobs_completed: 7,
+            jobs_finalized: 7,
             jobs_started_last_cycle: 2,
         };
         let lines = scheduler_statistics_lines(&stats);
