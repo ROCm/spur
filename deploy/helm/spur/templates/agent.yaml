@@ -1,0 +1,111 @@
+{{- if .Values.agent.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: spurd
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spur.componentLabels" (dict "ctx" . "component" "agent") | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "spur.componentSelectorLabels" (dict "ctx" . "component" "agent") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "spur.componentLabels" (dict "ctx" . "component" "agent") | nindent 8 }}
+        {{- with .Values.agent.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.agent.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "spur.serviceAccountName" . }}
+      hostPID: {{ .Values.agent.hostPID }}
+      hostNetwork: {{ .Values.agent.hostNetwork }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: spurd
+          image: {{ include "spur.image" (dict "ctx" . "component" .Values.agent) }}
+          imagePullPolicy: {{ include "spur.imagePullPolicy" (dict "ctx" . "component" .Values.agent) }}
+          command: [spurd]
+          args:
+            - --controller={{ include "spur.controllerHost" . }}:{{ .Values.controller.service.grpcPort }}
+            - --listen=[::]:{{ .Values.agent.service.grpcPort }}
+          ports:
+            - containerPort: {{ .Values.agent.service.grpcPort }}
+              name: grpc
+          {{- if .Values.agent.privileged }}
+          securityContext:
+            privileged: true
+          {{- end }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- with .Values.agent.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: spool
+              mountPath: /var/spool/spur
+            - name: dev
+              mountPath: /dev
+            - name: sys
+              mountPath: /sys
+              readOnly: true
+            {{- if .Values.agent.gpu.rocm }}
+            - name: dev-kfd
+              mountPath: /dev/kfd
+            - name: dev-dri
+              mountPath: /dev/dri
+            {{- end }}
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: {{ .Values.agent.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.agent.probes.readiness.periodSeconds }}
+          {{- with .Values.agent.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: spool
+          hostPath:
+            path: {{ .Values.agent.spool.hostPath }}
+            type: DirectoryOrCreate
+        - name: dev
+          hostPath:
+            path: /dev
+        - name: sys
+          hostPath:
+            path: /sys
+        {{- if .Values.agent.gpu.rocm }}
+        - name: dev-kfd
+          hostPath:
+            path: /dev/kfd
+            type: CharDevice
+        - name: dev-dri
+          hostPath:
+            path: /dev/dri
+            type: Directory
+        {{- end }}
+{{- end }}
