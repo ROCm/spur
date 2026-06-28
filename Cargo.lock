@@ -3711,6 +3711,7 @@ dependencies = [
  "prost-types",
  "serde",
  "serde_json",
+ "shlex",
  "spur-core",
  "spur-devices",
  "spur-net",

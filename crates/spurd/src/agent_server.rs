@@ -310,6 +310,27 @@ mod completion_report_tests {
     }
 }
 
+/// Build the bash job script for a launch request.
+///
+/// A non-empty `script` is used verbatim — the submitter asked for shell
+/// semantics. Otherwise `argv` is a literal argument vector, so each element is
+/// shell-escaped before being joined. Escaping is load-bearing: without it an
+/// argv element such as `echo x > /etc/passwd` would have its redirection and
+/// metacharacters interpreted by this outer wrapper script. When argv wraps a
+/// sandbox (e.g. `axis run -- bash -c "<cmd>"`), an unescaped redirect would run
+/// outside the sandbox, defeating the confinement entirely.
+fn build_job_script(script: &str, argv: &[String]) -> Result<String, Status> {
+    if !script.is_empty() {
+        return Ok(script.to_string());
+    }
+    if argv.is_empty() {
+        return Err(Status::invalid_argument("no script or argv"));
+    }
+    let joined = shlex::try_join(argv.iter().map(String::as_str))
+        .map_err(|e| Status::invalid_argument(format!("argv is not shell-safe: {e}")))?;
+    Ok(format!("#!/bin/bash\n{joined}\n"))
+}
+
 async fn report_completion(
     controller_addr: &str,
     job_id: u32,
@@ -431,18 +452,7 @@ impl SlurmAgent for AgentService {
             spec.work_dir.clone()
         };
 
-        let script = if spec.script.is_empty() {
-            if spec.argv.is_empty() {
-                return Err(Status::invalid_argument("no script or argv"));
-            }
-            // Build a script from argv
-            let mut s = String::from("#!/bin/bash\n");
-            s.push_str(&spec.argv.join(" "));
-            s.push('\n');
-            s
-        } else {
-            spec.script.clone()
-        };
+        let script = build_job_script(&spec.script, &spec.argv)?;
 
         // Compute tasks_per_node for both single- and multi-node jobs
         let tasks_per_node = if spec.tasks_per_node > 0 {
@@ -1536,6 +1546,52 @@ mod tests {
     use super::*;
     use spur_core::resource::ResourceSet;
     use tonic::Request;
+
+    #[test]
+    fn build_job_script_uses_explicit_script_verbatim() {
+        let s = build_job_script("#!/bin/sh\nmake -j4\n", &[]).unwrap();
+        assert_eq!(s, "#!/bin/sh\nmake -j4\n");
+    }
+
+    #[test]
+    fn build_job_script_errors_on_empty() {
+        assert!(build_job_script("", &[]).is_err());
+    }
+
+    #[test]
+    fn build_job_script_escapes_argv_so_redirect_stays_in_arg() {
+        // A sandbox wrapper whose final argv element carries shell syntax. The
+        // redirection must remain *inside* the `bash -c` argument, never leak to
+        // the outer wrapper script (which would escape the sandbox).
+        let argv: Vec<String> = [
+            "axis",
+            "run",
+            "--policy",
+            "p.yaml",
+            "--",
+            "bash",
+            "-c",
+            "echo pwned > /tmp/out.txt",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let s = build_job_script("", &argv).unwrap();
+        let cmd = s.strip_prefix("#!/bin/bash\n").unwrap().trim_end();
+        // The wrapper invocation is preserved as distinct tokens...
+        assert!(cmd.starts_with("axis run --policy p.yaml -- bash -c "));
+        // ...and the metacharacter-bearing element is a single quoted argument,
+        // so the outer shell sees no bare `>`.
+        assert!(cmd.ends_with("'echo pwned > /tmp/out.txt'"));
+        assert!(!cmd.contains("-c echo pwned >"));
+    }
+
+    #[test]
+    fn build_job_script_simple_argv_round_trips() {
+        let argv: Vec<String> = ["echo", "hello"].iter().map(|s| s.to_string()).collect();
+        let s = build_job_script("", &argv).unwrap();
+        assert_eq!(s, "#!/bin/bash\necho hello\n");
+    }
 
     async fn run_command_test_setup() -> (AgentService, u32) {
         let svc = AgentService::new(
