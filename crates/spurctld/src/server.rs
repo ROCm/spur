@@ -593,21 +593,6 @@ impl SlurmController for ControllerService {
         )))
     }
 
-    async fn reset_rpc_stats(&self, request: Request<()>) -> Result<Response<()>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.reset_rpc_stats(fwd).await;
-            }
-        }
-
-        self.rpc_stats.reset();
-        Ok(Response::new(()))
-    }
-
     async fn get_sched_stats(&self, request: Request<()>) -> Result<Response<SchedStats>, Status> {
         if self.check_leader(&request).is_err() {
             {
@@ -622,21 +607,6 @@ impl SlurmController for ControllerService {
         Ok(Response::new(crate::metrics_proto::sched_stats_to_proto(
             &self.sched_stats.snapshot(),
         )))
-    }
-
-    async fn reset_sched_stats(&self, request: Request<()>) -> Result<Response<()>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.reset_sched_stats(fwd).await;
-            }
-        }
-
-        self.sched_stats.reset();
-        Ok(Response::new(()))
     }
 
     async fn reset_diag_stats(&self, request: Request<()>) -> Result<Response<()>, Status> {

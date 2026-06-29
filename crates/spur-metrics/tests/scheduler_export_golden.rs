@@ -76,16 +76,13 @@ fn sample_snapshot() -> SchedStatsSnapshot {
 fn golden_scheduler_metrics() {
     let body = normalize_exposition(&encode_scheduler_metrics(&sample_snapshot()));
     let path = fixtures_dir().join("scheduler.prom");
+
+    if std::env::var_os("UPDATE_GOLDEN").is_some() {
+        std::fs::write(&path, &body).expect("write golden fixture");
+        return;
+    }
+
     let expected =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     assert_eq!(body, expected);
-}
-
-/// Regenerate `tests/fixtures/scheduler.prom` after intentional encoder changes:
-/// `cargo test -p spur-metrics --test scheduler_export_golden refresh_golden_fixtures -- --ignored --exact`
-#[test]
-#[ignore = "manual fixture refresh"]
-fn refresh_golden_fixtures() {
-    let body = normalize_exposition(&encode_scheduler_metrics(&sample_snapshot()));
-    std::fs::write(fixtures_dir().join("scheduler.prom"), body).expect("write golden fixture");
 }

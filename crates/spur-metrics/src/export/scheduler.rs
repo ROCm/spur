@@ -38,9 +38,9 @@ pub fn register_scheduler(registry: &mut Registry, snap: &SchedStatsSnapshot) {
 
     register_gauge(
         registry,
-        "spur_scheduler_cycles",
-        "Scheduling cycles executed since reset",
-        snap.cycles,
+        "spur_scheduler_cycle_last_time_us",
+        "Most recent scheduling cycle wall time in microseconds",
+        snap.cycle_last_time_us,
     );
     register_gauge(
         registry,
@@ -50,21 +50,9 @@ pub fn register_scheduler(registry: &mut Registry, snap: &SchedStatsSnapshot) {
     );
     register_gauge(
         registry,
-        "spur_scheduler_cycle_last_time_us",
-        "Most recent scheduling cycle wall time in microseconds",
-        snap.cycle_last_time_us,
-    );
-    register_gauge(
-        registry,
-        "spur_scheduler_cycle_avg_time_us",
-        "Average scheduling cycle wall time in microseconds",
-        snap.cycle_avg_time_us(),
-    );
-    register_gauge(
-        registry,
-        "spur_scheduler_schedule_total_time_us",
-        "Cumulative Scheduler::schedule() time in microseconds",
-        snap.schedule_total_time_us,
+        "spur_scheduler_cycles_total",
+        "Scheduling cycles executed since reset",
+        snap.cycles,
     );
     register_gauge(
         registry,
@@ -74,33 +62,33 @@ pub fn register_scheduler(registry: &mut Registry, snap: &SchedStatsSnapshot) {
     );
     register_gauge(
         registry,
-        "spur_scheduler_schedule_avg_time_us",
-        "Average Scheduler::schedule() time in microseconds",
-        snap.schedule_avg_time_us(),
-    );
-    register_gauge(
-        registry,
-        "spur_scheduler_jobs_submitted",
-        "Jobs submitted since reset",
-        snap.jobs_submitted,
-    );
-    register_gauge(
-        registry,
-        "spur_scheduler_jobs_started",
-        "Jobs started since reset",
-        snap.jobs_started,
-    );
-    register_gauge(
-        registry,
-        "spur_scheduler_jobs_finalized",
-        "Jobs reaching a terminal state since reset",
-        snap.jobs_finalized,
+        "spur_scheduler_schedule_total_time_us",
+        "Cumulative Scheduler::schedule() time in microseconds",
+        snap.schedule_total_time_us,
     );
     register_gauge(
         registry,
         "spur_scheduler_jobs_started_last_cycle",
         "Jobs started in the most recent scheduling cycle",
         snap.jobs_started_last_cycle,
+    );
+    register_gauge(
+        registry,
+        "spur_scheduler_jobs_submitted_total",
+        "Jobs submitted since reset",
+        snap.jobs_submitted,
+    );
+    register_gauge(
+        registry,
+        "spur_scheduler_jobs_started_total",
+        "Jobs started since reset",
+        snap.jobs_started,
+    );
+    register_gauge(
+        registry,
+        "spur_scheduler_jobs_finalized_total",
+        "Jobs reaching a terminal state since reset",
+        snap.jobs_finalized,
     );
 }
 
@@ -132,10 +120,10 @@ mod tests {
     fn export_includes_scheduler_gauges() {
         let body = encode_scheduler_metrics(&sample_snapshot());
         assert!(body.contains("spur_scheduler_info{plugin=\"backfill\"} 1"));
-        assert!(body.contains("spur_scheduler_cycles 10"));
-        assert!(body.contains("spur_scheduler_cycle_avg_time_us 500"));
-        assert!(body.contains("spur_scheduler_schedule_avg_time_us 150"));
-        assert!(body.contains("spur_scheduler_jobs_submitted 42"));
+        assert!(body.contains("spur_scheduler_cycles_total 10"));
+        assert!(body.contains("spur_scheduler_cycle_total_time_us 5000"));
+        assert!(!body.contains("_avg_time_us"));
+        assert!(body.contains("spur_scheduler_jobs_submitted_total 42"));
         assert!(body.contains("spur_scheduler_jobs_started_last_cycle 3"));
         assert!(body.ends_with("# EOF\n"));
     }
@@ -147,7 +135,7 @@ mod tests {
             ..Default::default()
         };
         let body = encode_scheduler_metrics(&snap);
-        assert!(body.contains("spur_scheduler_cycles 0"));
+        assert!(body.contains("spur_scheduler_cycles_total 0"));
         assert!(body.ends_with("# EOF\n"));
     }
 }

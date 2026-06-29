@@ -245,7 +245,6 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 }
             }
 
-            cluster.record_sched_job_started();
             jobs_started_cycle += 1;
 
             // Dispatch job to ALL assigned nodes

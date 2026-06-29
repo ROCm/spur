@@ -311,22 +311,42 @@ mod tests {
         let proto = sched_stats_to_proto(&snap);
         let body = encode_scheduler_metrics(&snap);
 
-        assert_eq!(proto.cycles, gauge_value(&body, "spur_scheduler_cycles"));
         assert_eq!(
-            proto.cycle_avg_time_us,
-            gauge_value(&body, "spur_scheduler_cycle_avg_time_us")
-        );
-        assert_eq!(
-            proto.schedule_avg_time_us,
-            gauge_value(&body, "spur_scheduler_schedule_avg_time_us")
+            proto.cycles,
+            gauge_value(&body, "spur_scheduler_cycles_total")
         );
         assert_eq!(
             proto.jobs_submitted,
-            gauge_value(&body, "spur_scheduler_jobs_submitted")
+            gauge_value(&body, "spur_scheduler_jobs_submitted_total")
+        );
+        assert_eq!(
+            proto.jobs_started,
+            gauge_value(&body, "spur_scheduler_jobs_started_total")
+        );
+        assert_eq!(
+            proto.jobs_finalized,
+            gauge_value(&body, "spur_scheduler_jobs_finalized_total")
         );
         assert_eq!(
             proto.jobs_started_last_cycle,
             gauge_value(&body, "spur_scheduler_jobs_started_last_cycle")
         );
+        assert_eq!(
+            proto.cycle_last_time_us,
+            gauge_value(&body, "spur_scheduler_cycle_last_time_us")
+        );
+        assert_eq!(
+            proto.cycle_total_time_us,
+            gauge_value(&body, "spur_scheduler_cycle_total_time_us")
+        );
+        assert_eq!(
+            proto.schedule_last_time_us,
+            gauge_value(&body, "spur_scheduler_schedule_last_time_us")
+        );
+        assert_eq!(
+            proto.schedule_total_time_us,
+            gauge_value(&body, "spur_scheduler_schedule_total_time_us")
+        );
+        assert!(!body.contains("_avg_time_us"));
     }
 }

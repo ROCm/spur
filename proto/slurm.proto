@@ -283,12 +283,10 @@ service SlurmController {
 
   // Controller RPC handler statistics (since process start or last reset)
   rpc GetRpcStats(google.protobuf.Empty) returns (RpcStats);
-  rpc ResetRpcStats(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc ResetDiagStats(google.protobuf.Empty) returns (google.protobuf.Empty);
 
   // Scheduler cycle and lifecycle statistics (since process start or last reset)
   rpc GetSchedStats(google.protobuf.Empty) returns (SchedStats);
-  rpc ResetSchedStats(google.protobuf.Empty) returns (google.protobuf.Empty);
-  rpc ResetDiagStats(google.protobuf.Empty) returns (google.protobuf.Empty);
 
   // Agent registration
   rpc RegisterAgent(RegisterAgentRequest) returns (RegisterAgentResponse);

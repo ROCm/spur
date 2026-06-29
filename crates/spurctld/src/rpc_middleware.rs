@@ -84,9 +84,7 @@ fn should_record_operation(operation: &str) -> bool {
     !matches!(
         operation,
         "GetRpcStats"
-            | "ResetRpcStats"
             | "GetSchedStats"
-            | "ResetSchedStats"
             | "ResetDiagStats"
             | "GetJobMetrics"
             | "GetNodeMetrics"
@@ -121,9 +119,7 @@ mod tests {
         assert!(should_record_operation("SubmitJob"));
         assert!(should_record_operation("GetJobs"));
         assert!(!should_record_operation("GetRpcStats"));
-        assert!(!should_record_operation("ResetRpcStats"));
         assert!(!should_record_operation("GetSchedStats"));
-        assert!(!should_record_operation("ResetSchedStats"));
         assert!(!should_record_operation("ResetDiagStats"));
         assert!(!should_record_operation("GetJobMetrics"));
         assert!(!should_record_operation("GetNodeMetrics"));

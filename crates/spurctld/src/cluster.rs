@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
@@ -70,7 +70,7 @@ pub struct ClusterManager {
     qos_cache: Arc<QosCache>,
     /// Wake signal for the scheduler loop.
     pub(crate) scheduler_notify: Arc<Notify>,
-    sched_stats: RwLock<Option<Arc<SchedStatsCollector>>>,
+    sched_stats: OnceLock<Arc<SchedStatsCollector>>,
 }
 
 impl ClusterManager {
@@ -97,7 +97,7 @@ impl ClusterManager {
             fairshare_cache,
             qos_cache,
             scheduler_notify: Arc::new(Notify::new()),
-            sched_stats: RwLock::new(None),
+            sched_stats: OnceLock::new(),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -133,7 +133,7 @@ impl ClusterManager {
                 job_id: task_id,
                 spec: Box::new(task_spec),
             })?;
-            if let Some(stats) = self.sched_stats.read().as_ref() {
+            if let Some(stats) = self.sched_stats.get() {
                 stats.record_submitted(1);
             }
         }
@@ -600,7 +600,7 @@ impl ClusterManager {
     }
 
     fn run_job_finalized_side_effects(&self, finalized: JobFinalized) {
-        if let Some(stats) = self.sched_stats.read().as_ref() {
+        if let Some(stats) = self.sched_stats.get() {
             stats.record_finalized();
         }
         self.run_epilog_slurmctld(finalized.job_id);
@@ -1992,7 +1992,7 @@ impl ClusterManager {
     }
 
     pub fn set_sched_stats(&self, stats: Arc<SchedStatsCollector>) {
-        *self.sched_stats.write() = Some(stats);
+        let _ = self.sched_stats.set(stats);
     }
 
     pub(crate) fn record_sched_cycle(
@@ -2001,14 +2001,8 @@ impl ClusterManager {
         schedule_time_us: u64,
         jobs_started: u64,
     ) {
-        if let Some(stats) = self.sched_stats.read().as_ref() {
+        if let Some(stats) = self.sched_stats.get() {
             stats.record_cycle(cycle_time_us, schedule_time_us, jobs_started);
-        }
-    }
-
-    pub(crate) fn record_sched_job_started(&self) {
-        if let Some(stats) = self.sched_stats.read().as_ref() {
-            stats.record_started();
         }
     }
 
@@ -3680,7 +3674,7 @@ mod tests {
             per_node_for(&["worker1"], resources),
         )
         .unwrap();
-        cm.record_sched_job_started();
+        cm.record_sched_cycle(0, 0, 1);
         assert_eq!(stats.snapshot().jobs_started, 1);
 
         cm.complete_job(job_id, 0, JobState::Completed).unwrap();
