@@ -312,13 +312,10 @@ mod completion_report_tests {
 
 /// Build the bash job script for a launch request.
 ///
-/// A non-empty `script` is used verbatim — the submitter asked for shell
-/// semantics. Otherwise `argv` is a literal argument vector, so each element is
-/// shell-escaped before being joined. Escaping is load-bearing: without it an
-/// argv element such as `echo x > /etc/passwd` would have its redirection and
-/// metacharacters interpreted by this outer wrapper script. When argv wraps a
-/// sandbox (e.g. `axis run -- bash -c "<cmd>"`), an unescaped redirect would run
-/// outside the sandbox, defeating the confinement entirely.
+/// A non-empty `script` is used verbatim. Otherwise `argv` is a literal
+/// argument vector whose elements are shell-escaped, so metacharacters stay
+/// data rather than being interpreted by the wrapper shell (a redirect leaking
+/// to the outer shell would escape an argv-wrapped sandbox).
 fn build_job_script(script: &str, argv: &[String]) -> Result<String, Status> {
     if !script.is_empty() {
         return Ok(script.to_string());
@@ -1562,7 +1559,10 @@ mod tests {
     fn build_job_script_escapes_argv_so_redirect_stays_in_arg() {
         // A sandbox wrapper whose final argv element carries shell syntax. The
         // redirection must remain *inside* the `bash -c` argument, never leak to
-        // the outer wrapper script (which would escape the sandbox).
+        // the outer wrapper script (which would escape the sandbox). Shell-split
+        // the generated command and assert it round-trips back to the original
+        // argv: were `>` left unquoted it would split into its own token and the
+        // equality would fail, independent of the quoting style shlex chooses.
         let argv: Vec<String> = [
             "axis",
             "run",
@@ -1578,12 +1578,8 @@ mod tests {
         .collect();
         let s = build_job_script("", &argv).unwrap();
         let cmd = s.strip_prefix("#!/bin/bash\n").unwrap().trim_end();
-        // The wrapper invocation is preserved as distinct tokens...
-        assert!(cmd.starts_with("axis run --policy p.yaml -- bash -c "));
-        // ...and the metacharacter-bearing element is a single quoted argument,
-        // so the outer shell sees no bare `>`.
-        assert!(cmd.ends_with("'echo pwned > /tmp/out.txt'"));
-        assert!(!cmd.contains("-c echo pwned >"));
+        let reparsed = shlex::split(cmd).expect("generated command must be shell-parseable");
+        assert_eq!(reparsed, argv);
     }
 
     #[test]
