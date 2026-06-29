@@ -4,6 +4,7 @@
 //! prometheus-client registry encoding for spurctld metrics HTTP export.
 
 use prometheus_client::encoding::text::encode as encode_openmetrics;
+use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use std::sync::atomic::AtomicU64;
@@ -22,6 +23,15 @@ pub(crate) fn register_gauge(registry: &mut Registry, name: &str, help: &str, va
     let gauge = Gauge::<u64, AtomicU64>::default();
     gauge.set(value);
     registry.register(name, help, gauge);
+}
+
+/// Register a scalar `u64` counter seeded from a snapshot value.
+pub(crate) fn register_counter(registry: &mut Registry, name: &str, help: &str, value: u64) {
+    let counter = Counter::<u64, AtomicU64>::default();
+    if value > 0 {
+        counter.inc_by(value);
+    }
+    registry.register(name, help, counter);
 }
 
 /// Build a registry, run `register`, and encode as OpenMetrics 1.0 text.

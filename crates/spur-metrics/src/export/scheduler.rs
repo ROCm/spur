@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Scheduler gauge registration for `/metrics/scheduler`.
+//! Scheduler metric registration for `/metrics/scheduler`.
 
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
@@ -10,7 +10,7 @@ use prometheus_client::registry::Registry;
 use std::sync::atomic::AtomicU64;
 
 use crate::export::encode_registered;
-use crate::export::register_gauge;
+use crate::export::{register_counter, register_gauge};
 use crate::scheduler::SchedStatsSnapshot;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -32,7 +32,7 @@ fn set_plugin_info(registry: &mut Registry, snap: &SchedStatsSnapshot) {
     );
 }
 
-/// Register scheduler gauges into `registry` from `snap`.
+/// Register scheduler metrics into `registry` from `snap`.
 pub fn register_scheduler(registry: &mut Registry, snap: &SchedStatsSnapshot) {
     set_plugin_info(registry, snap);
 
@@ -48,9 +48,9 @@ pub fn register_scheduler(registry: &mut Registry, snap: &SchedStatsSnapshot) {
         "Cumulative scheduling cycle wall time in microseconds",
         snap.cycle_total_time_us,
     );
-    register_gauge(
+    register_counter(
         registry,
-        "spur_scheduler_cycles_total",
+        "spur_scheduler_cycles",
         "Scheduling cycles executed since reset",
         snap.cycles,
     );
@@ -72,21 +72,21 @@ pub fn register_scheduler(registry: &mut Registry, snap: &SchedStatsSnapshot) {
         "Jobs started in the most recent scheduling cycle",
         snap.jobs_started_last_cycle,
     );
-    register_gauge(
+    register_counter(
         registry,
-        "spur_scheduler_jobs_submitted_total",
+        "spur_scheduler_jobs_submitted",
         "Jobs submitted since reset",
         snap.jobs_submitted,
     );
-    register_gauge(
+    register_counter(
         registry,
-        "spur_scheduler_jobs_started_total",
+        "spur_scheduler_jobs_started",
         "Jobs started since reset",
         snap.jobs_started,
     );
-    register_gauge(
+    register_counter(
         registry,
-        "spur_scheduler_jobs_finalized_total",
+        "spur_scheduler_jobs_finalized",
         "Jobs reaching a terminal state since reset",
         snap.jobs_finalized,
     );
@@ -116,8 +116,18 @@ mod tests {
         }
     }
 
+    fn metric_type<'a>(body: &'a str, name: &str) -> &'a str {
+        let prefix = format!("# TYPE {name} ");
+        body.lines()
+            .find(|line| line.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("missing TYPE line for {name}"))
+            .split_whitespace()
+            .nth(3)
+            .unwrap_or_else(|| panic!("malformed TYPE line for {name}"))
+    }
+
     #[test]
-    fn export_includes_scheduler_gauges() {
+    fn export_includes_scheduler_metrics() {
         let body = encode_scheduler_metrics(&sample_snapshot());
         assert!(body.contains("spur_scheduler_info{plugin=\"backfill\"} 1"));
         assert!(body.contains("spur_scheduler_cycles_total 10"));
@@ -125,6 +135,15 @@ mod tests {
         assert!(!body.contains("_avg_time_us"));
         assert!(body.contains("spur_scheduler_jobs_submitted_total 42"));
         assert!(body.contains("spur_scheduler_jobs_started_last_cycle 3"));
+        assert_eq!(metric_type(&body, "spur_scheduler_cycles"), "counter");
+        assert_eq!(
+            metric_type(&body, "spur_scheduler_jobs_submitted"),
+            "counter"
+        );
+        assert_eq!(
+            metric_type(&body, "spur_scheduler_cycle_last_time_us"),
+            "gauge"
+        );
         assert!(body.ends_with("# EOF\n"));
     }
 
@@ -136,6 +155,7 @@ mod tests {
         };
         let body = encode_scheduler_metrics(&snap);
         assert!(body.contains("spur_scheduler_cycles_total 0"));
+        assert_eq!(metric_type(&body, "spur_scheduler_cycles"), "counter");
         assert!(body.ends_with("# EOF\n"));
     }
 }
