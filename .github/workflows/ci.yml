@@ -231,7 +231,7 @@ jobs:
       - name: Load image
         run: docker load -i /tmp/spur-image.tar
 
-      - name: Scan image for vulnerabilities and secrets
+      - name: Scan image for vulnerabilities and secrets (SARIF)
         id: scan
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
@@ -250,6 +250,112 @@ jobs:
         with:
           sarif_file: trivy-image.sarif
           category: trivy-image
+
+      - name: Scan image (JSON report for internal integrations)
+        id: json-scan
+        if: always() && steps.scan.outcome != 'skipped'
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: spur:ci
+          scanners: vuln,misconfig,secret,license
+          format: json
+          output: security-reports/spur-image-trivy-result.json
+          exit-code: "0"
+
+      - name: Generate SBOM (SPDX)
+        id: sbom
+        if: always() && steps.json-scan.outcome == 'success'
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: spur:ci
+          format: spdx-json
+          output: security-reports/spur-image-sbom.spdx.json
+          exit-code: "0"
+
+      - name: Generate scan-manifest.json
+        if: always() && steps.json-scan.outcome == 'success'
+        run: |
+          python3 - <<'PYEOF'
+          import json, os
+          from collections import Counter
+          from datetime import datetime, timezone
+
+          reports_dir = "security-reports"
+          report_file = "spur-image-trivy-result.json"
+          sbom_file = "spur-image-sbom.spdx.json"
+          report_path = os.path.join(reports_dir, report_file)
+
+          vuln_summary = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "UNKNOWN": 0}
+          scan_status = "success"
+
+          if os.path.isfile(report_path):
+              try:
+                  with open(report_path) as f:
+                      data = json.load(f)
+                  counts = Counter()
+                  for r in data.get("Results", []):
+                      for v in r.get("Vulnerabilities", []):
+                          counts[v.get("Severity", "UNKNOWN")] += 1
+                  vuln_summary = {s: counts.get(s, 0) for s in vuln_summary}
+              except Exception:
+                  scan_status = "failed"
+          else:
+              scan_status = "failed"
+
+          artifact = {
+              "artifact": "spur-image.tar",
+              "scan_type": "image",
+              "report_file": report_file,
+              "sbom_file": sbom_file if os.path.isfile(os.path.join(reports_dir, sbom_file)) else "",
+              "scan_status": scan_status,
+              "vulnerability_summary": vuln_summary,
+          }
+
+          manifest = {
+              "scan_id": f"{os.environ.get('GITHUB_RUN_ID', 'unknown')}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
+              "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "ci": {
+                  "provider": "github-actions",
+                  "repository": os.environ.get("GITHUB_REPOSITORY", ""),
+                  "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+                  "run_number": os.environ.get("GITHUB_RUN_NUMBER", ""),
+                  "sha": os.environ.get("GITHUB_SHA", ""),
+                  "ref": os.environ.get("GITHUB_REF", ""),
+              },
+              "release": {
+                  "repo_name": "spur",
+                  "branch": os.environ.get("GITHUB_REF_NAME", "main"),
+                  "release_tag": os.environ.get("GITHUB_SHA", "")[:12],
+              },
+              "trivy_version": "0.36.0",
+              "sbom_format": "spdx-json",
+              "artifacts": [artifact],
+              "summary": {
+                  "total_artifacts": 1,
+                  "successful": 1 if scan_status == "success" else 0,
+                  "failed": 0 if scan_status == "success" else 1,
+                  "sbom_generated": 1 if os.path.isfile(os.path.join(reports_dir, sbom_file)) else 0,
+                  "total_vulnerabilities": vuln_summary,
+              },
+          }
+
+          manifest_path = os.path.join(reports_dir, "scan-manifest.json")
+          with open(manifest_path, "w") as f:
+              json.dump(manifest, f, indent=2)
+
+          print(f"Manifest written to: {manifest_path}")
+          print(f"Artifacts scanned : {manifest['summary']['total_artifacts']}")
+          print(f"Successful        : {manifest['summary']['successful']}")
+          print(f"Vulnerabilities   : {json.dumps(vuln_summary)}")
+          PYEOF
+
+      - name: Upload security scan reports
+        if: always() && steps.json-scan.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: security-scan-reports
+          path: security-reports/
+          retention-days: 30
 
   trivy-dockerfile-scan:
     name: Trivy Dockerfile scan
