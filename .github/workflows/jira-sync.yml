@@ -1,0 +1,36 @@
+name: Sync Security Alerts to Jira
+
+on:
+  # Run after CI completes (Trivy uploads SARIF)
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  # Also on a schedule to catch state changes
+  schedule:
+    - cron: '17 8 * * *'  # daily 08:17 UTC
+  workflow_dispatch:
+
+permissions:
+  security-events: read
+  contents: read
+
+jobs:
+  sync-to-jira:
+    name: Sync GHAS alerts to Jira
+    runs-on: ubuntu-latest
+    # Only run on main branch events and successful CI
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    steps:
+      - name: Sync code scanning alerts to Jira
+        uses: github/ghas-jira-integration@v1
+        with:
+          jira_url: 'https://pensando.atlassian.net'
+          jira_user: '${{ secrets.JIRA_USER }}'
+          jira_token: '${{ secrets.JIRA_TOKEN }}'
+          jira_project: 'PSIRT'
+          sync_direction: 'gh2jira'
+          jira_labels: 'trivy,security-scan,spur'
