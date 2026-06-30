@@ -68,7 +68,14 @@ fn load_controller_addr_from_config() {
 }
 
 fn main() -> anyhow::Result<()> {
-    // Load controller address from config file (if not set via env var)
+    // Rust sets SIGPIPE=SIG_IGN; restore default so pipe consumers exit cleanly.
+    // SAFETY: called before the tokio runtime and any threads are started.
+    #[cfg(unix)]
+    unsafe {
+        use nix::sys::signal::{signal, SigHandler, Signal};
+        let _ = signal(Signal::SIGPIPE, SigHandler::SigDfl);
+    }
+
     load_controller_addr_from_config();
 
     // Multi-call binary: dispatch based on argv[0] (symlink name).
