@@ -79,6 +79,7 @@ impl ClusterManager {
         let license_pool = config.licenses.clone();
         let burst_buffer_total_gb = config.burst_buffer.total_gb;
         let fairshare_cache = Arc::new(FairshareCache::new());
+        let first_job_id = config.controller.first_job_id;
         let qos_cache = Arc::new(QosCache::new());
 
         let cm = Self {
@@ -88,7 +89,7 @@ impl ClusterManager {
             partitions: RwLock::new(partitions),
             reservations: RwLock::new(Vec::new()),
             steps: RwLock::new(HashMap::new()),
-            next_job_id: AtomicU32::new(1),
+            next_job_id: AtomicU32::new(first_job_id),
             license_pool: RwLock::new(license_pool),
             burst_buffer_total_gb: RwLock::new(burst_buffer_total_gb),
             tokens: RwLock::new(HashMap::new()),
@@ -3357,6 +3358,29 @@ mod tests {
         assert_eq!(job.spec.name, "test-job");
         assert_eq!(job.state, JobState::Pending);
         assert!(cm.next_job_id.load(Ordering::Relaxed) >= 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_start_respects_first_job_id() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.controller.first_job_id = 500;
+        let cm = Arc::new(ClusterManager::new(config, dir.path()).unwrap());
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .expect("single-node raft did not self-elect within 5s");
+        cm.set_raft(handle.raft);
+
+        assert_eq!(cm.next_job_id.load(Ordering::Relaxed), 500);
+
+        let job_id = submit_and_wait(&cm, basic_spec("first-job"));
+        assert_eq!(job_id, 500);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
