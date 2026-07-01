@@ -129,6 +129,8 @@ impl SpurStore {
 
         let snap_path = raft_dir.join("snapshot.json");
         if snap_path.exists() {
+            // Soft-fail: a corrupt snapshot triggers re-snapshot on the next leader term.
+            // A missing/corrupt purged.json (below) cannot be recovered the same way.
             match std::fs::read_to_string(&snap_path) {
                 Ok(data) => match serde_json::from_str::<PersistedSnapshot>(&data) {
                     Ok(ps) => {
@@ -142,6 +144,16 @@ impl SpurStore {
             }
         }
 
+        let purged_path = raft_dir.join("purged.json");
+        if purged_path.exists() {
+            // Hard-fail: silently falling back to None reproduces the startup panic.
+            let data = std::fs::read_to_string(&purged_path)?;
+            inner.last_purged = Some(
+                serde_json::from_str::<LogId<NodeId>>(&data)
+                    .map_err(|e| anyhow::anyhow!("failed to parse purged.json: {e}"))?,
+            );
+        }
+
         info!(
             log_entries = inner.log.len(),
             vote = ?inner.vote,
@@ -153,6 +165,18 @@ impl SpurStore {
             raft_dir,
             applier,
         })
+    }
+
+    fn persist_last_purged(&self, log_id: &LogId<NodeId>) -> Result<(), std::io::Error> {
+        let path = self.raft_dir.join("purged.json");
+        let tmp = self.raft_dir.join("purged.json.tmp");
+        let data = serde_json::to_vec(log_id)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // Write-then-rename: a crash mid-write must never corrupt purged.json.
+        std::fs::write(&tmp, &data)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("{tmp:?}: {e}")))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("{path:?}: {e}")))
     }
 
     fn persist_vote(&self, vote: &Vote<NodeId>) -> Result<(), std::io::Error> {
@@ -319,6 +343,9 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
     }
 
     async fn purge_logs_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
+        self.persist_last_purged(&log_id).map_err(|e| {
+            StorageError::from_io_error(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
+        })?;
         let mut inner = self.inner.write();
         let keys: Vec<_> = inner.log.range(..=log_id.index).map(|(k, _)| *k).collect();
         for k in keys {
@@ -851,5 +878,37 @@ mod tests {
         assert!(inner.vote.is_none());
         assert!(inner.log.is_empty());
         assert!(inner.last_applied.is_none());
+    }
+
+    #[tokio::test]
+    async fn store_persists_last_purged_across_restart() {
+        use openraft::RaftStorage;
+        let dir = TempDir::new().unwrap();
+        let log_id = LogId {
+            leader_id: openraft::LeaderId {
+                term: 7,
+                node_id: 1,
+            },
+            index: 9999,
+        };
+
+        // Exercise the real public purge path, not the internal helper.
+        {
+            let mut store = Arc::new(SpurStore::new(dir.path(), noop_applier()).unwrap());
+            store.purge_logs_upto(log_id).await.unwrap();
+        }
+
+        // Simulate restart: reconstruct from the same dir and verify via get_log_state.
+        let mut store2 = Arc::new(SpurStore::new(dir.path(), noop_applier()).unwrap());
+        let state = store2.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id, Some(log_id));
+    }
+
+    #[test]
+    fn store_no_purged_file_recovers_as_none() {
+        let dir = TempDir::new().unwrap();
+        let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
+        let inner = store.inner.read();
+        assert!(inner.last_purged.is_none());
     }
 }
