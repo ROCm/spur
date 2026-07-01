@@ -323,19 +323,16 @@ impl Default for ControllerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountingConfig {
-    /// PostgreSQL connection string for accounting. When set, spurctld
-    /// connects directly and serves the SlurmAccounting gRPC service on
-    /// port 6817 alongside the controller API.
-    #[serde(default = "default_database_url")]
+    /// PostgreSQL connection string for accounting. When non-empty, spurctld
+    /// connects and serves the SlurmAccounting gRPC service on port 6817
+    /// alongside the controller API. Empty (default) disables accounting.
+    #[serde(default)]
     pub database_url: String,
     /// How often to refresh fairshare/QoS caches from the accounting database.
     #[serde(default = "default_fairshare_refresh_secs")]
     pub fairshare_refresh_secs: u32,
 }
 
-fn default_database_url() -> String {
-    "postgresql://spur:spur@localhost/spur".into()
-}
 fn default_fairshare_refresh_secs() -> u32 {
     300
 }
@@ -343,7 +340,7 @@ fn default_fairshare_refresh_secs() -> u32 {
 impl Default for AccountingConfig {
     fn default() -> Self {
         Self {
-            database_url: "postgresql://spur:spur@localhost/spur".into(),
+            database_url: String::new(),
             fairshare_refresh_secs: 300,
         }
     }

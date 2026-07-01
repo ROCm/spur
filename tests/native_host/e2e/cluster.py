@@ -124,7 +124,7 @@ def ensure_bins(nodes: list[SshNode], binaries_dir: str, bin_dir: str,
     Upload binaries to all nodes if not already present (or size differs).
     bin_dir is the remote directory where binaries are installed.
 
-    When *with_accounting* is True, also create sacct/sacctmgr symlinks.
+    When *with_accounting* is True, also create accounting CLI symlinks.
     """
     for node in nodes:
         node.exec(f"mkdir -p '{bin_dir}'")

@@ -505,7 +505,10 @@ impl ClusterManager {
                 spec_for_notify.user.clone(),
                 spec_for_notify.account.clone().unwrap_or_default(),
                 spec_for_notify.partition.clone().unwrap_or_default(),
-                &resources,
+                spec_for_notify.num_nodes,
+                spec_for_notify.num_tasks,
+                spec_for_notify.cpus_per_task,
+                resources.memory_mb,
                 Utc::now(),
             );
         }
