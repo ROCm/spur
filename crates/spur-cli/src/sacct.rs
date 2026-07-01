@@ -57,13 +57,13 @@ pub struct SacctArgs {
     #[arg(long, default_value = "100")]
     pub limit: u32,
 
-    /// Accounting daemon address
+    /// Controller address (accounting is served on the same port)
     #[arg(
         long,
-        env = "SPUR_ACCOUNTING_ADDR",
-        default_value = "http://localhost:6819"
+        env = "SPUR_CONTROLLER_ADDR",
+        default_value = "http://localhost:6817"
     )]
-    pub accounting: String,
+    pub controller: String,
 }
 
 const SACCT_DEFAULT_FORMAT: &str = "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x";
@@ -126,9 +126,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         })
         .unwrap_or_default();
 
-    let mut client = SlurmAccountingClient::connect(args.accounting)
+    let mut client = SlurmAccountingClient::connect(args.controller)
         .await
-        .context("failed to connect to spurdbd")?;
+        .context("failed to connect to controller")?;
 
     let start_after = args
         .starttime

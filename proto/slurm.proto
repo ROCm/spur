@@ -335,7 +335,7 @@ service SlurmAgent {
   rpc AttachJob(stream AttachJobInput) returns (stream AttachJobOutput);
 }
 
-// -- Accounting service (slurmdbd) --
+// -- Accounting service --
 
 service SlurmAccounting {
   rpc RecordJobStart(RecordJobStartRequest) returns (google.protobuf.Empty);

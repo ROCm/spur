@@ -3689,6 +3689,7 @@ dependencies = [
  "spur-proto",
  "spur-sched",
  "spur-update",
+ "sqlx",
  "tempfile",
  "tokio",
  "tonic",
@@ -3722,25 +3723,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
- "tonic",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "spurdbd"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "prost-types",
- "serde",
- "serde_json",
- "spur-core",
- "spur-proto",
- "sqlx",
- "tokio",
  "tonic",
  "tracing",
  "tracing-subscriber",

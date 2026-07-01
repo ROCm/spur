@@ -23,9 +23,8 @@ Build and load container images:
 Components
 ----------
 
-- **spurctld** — Controller. Runs as a StatefulSet with Raft consensus for high availability. Also serves the Slurm-compatible REST API on port 6820.
+- **spurctld** — Controller. Runs as a StatefulSet with Raft consensus for high availability. Handles accounting (backed by PostgreSQL via ``accounting.database_url``) and serves the Slurm-compatible REST API on port 6820.
 - **spurd** — Node agent. Runs on each compute node (DaemonSet or Deployment).
-- **spurdbd** — Accounting daemon. Stores job history in PostgreSQL.
 - **spur-k8s-operator** — Watches ``SpurJob`` custom resources and submits them to the controller.
 
 Example manifests for production-style deployment live in ``examples/k8s/``.
@@ -47,7 +46,6 @@ Apply manifests in order:
    kubectl apply -f examples/k8s/spurjob-crd.yaml
    kubectl apply -f examples/k8s/spurctld.yaml
    kubectl apply -f examples/k8s/spurd.yaml
-   kubectl apply -f examples/k8s/spurdbd.yaml
    kubectl apply -f examples/k8s/operator.yaml
    kubectl apply -f examples/k8s/pdb.yaml
 

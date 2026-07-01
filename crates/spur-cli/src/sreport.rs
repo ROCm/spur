@@ -29,14 +29,14 @@ pub struct SreportArgs {
     #[arg(short = 'p', long, global = true)]
     pub parsable: bool,
 
-    /// Accounting daemon address
+    /// Controller address (accounting is served on the same port)
     #[arg(
         long,
-        env = "SPUR_ACCOUNTING_ADDR",
-        default_value = "http://localhost:6819",
+        env = "SPUR_CONTROLLER_ADDR",
+        default_value = "http://localhost:6817",
         global = true
     )]
-    pub accounting: String,
+    pub controller: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -66,9 +66,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .and_then(parse_time_arg)
         .map(datetime_to_proto);
 
-    let mut client = SlurmAccountingClient::connect(args.accounting.clone())
+    let mut client = SlurmAccountingClient::connect(args.controller.clone())
         .await
-        .context("failed to connect to spurdbd")?;
+        .context("failed to connect to controller")?;
 
     match &args.command {
         SreportCommand::Cluster { report_type } => match report_type.to_lowercase().as_str() {
