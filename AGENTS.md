@@ -12,9 +12,10 @@ cargo build
 
 ## Architecture
 
-- **spurctld** — Controller daemon. Serves the gRPC API (`SlurmController` on port 6817). Supports HA via Raft log replication (openraft, always-on — even single-node runs a 1-member Raft cluster). Leader handles writes; non-leaders forward automatically.
+- **spurctld** — Controller daemon. Serves the gRPC API (`SlurmController` + `SlurmAccounting` on port 6817). Accounting runs in-process backed by PostgreSQL (`accounting.database_url`). Supports HA via Raft log replication (openraft, always-on — even single-node runs a 1-member Raft cluster). Leader handles writes; non-leaders forward automatically.
 - **spurd** — Node agent daemon. Runs on each compute node. Registers with the controller, sends heartbeats, and receives job launch/cancel commands via gRPC (`SlurmAgent` on port 6818).
-- **spur-cli** — Multi-call CLI binary. Talks to `spurctld` for scheduling and admin, `spurdbd` for accounting. Invoked as `spur <command>` (e.g. `spur submit`, `spur queue`) or via Slurm-compatible symlinks (`sbatch`, `squeue`, `sinfo`, etc.).
+- **spur-cli** — Multi-call CLI binary. Talks to `spurctld` for scheduling, admin, and accounting (all on port 6817). Invoked as `spur <command>` (e.g. `spur submit`, `spur queue`) or via Slurm-compatible symlinks (`sbatch`, `squeue`, `sinfo`, etc.).
+- **No separate daemons for accounting or REST.** Slurm splits these into `slurmdbd` and `slurmrestd`. In Spur, `spurctld` handles accounting (backed by PostgreSQL) and the REST API (Axum) directly. This keeps the distribution to three binaries (`spurctld`, `spurd`, `spur`) and eliminates inter-daemon networking.
 - **Proto**: `proto/slurm.proto` is the public API surface that FFI and REST depend on. `raft_internal.proto` is separate — internal controller-to-controller plumbing only.
 - **Config**: TOML format at `/etc/spur/spur.conf`. See `spur-core/src/config.rs` for all fields.
 

@@ -2,20 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use chrono::{DateTime, Utc};
-use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, QueryBuilder, Row};
-use tracing::{info, warn};
-
-/// Connect to PostgreSQL and return a connection pool.
-pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
-    let pool = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(database_url)
-        .await?;
-
-    info!("connected to database");
-    Ok(pool)
-}
+use tracing::warn;
 
 /// Run database migrations (create tables if they don't exist).
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
@@ -659,7 +647,10 @@ mod job_history_tests {
 
     async fn test_pool() -> anyhow::Result<PgPool> {
         let url = std::env::var("DATABASE_URL")?;
-        let pool = connect(&url).await?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&url)
+            .await?;
         migrate(&pool).await?;
         Ok(pool)
     }

@@ -22,7 +22,7 @@ data:
     plugin = "backfill"
 
     [accounting]
-    host = "spurdbd.spur.svc.cluster.local:6819"
+    database_url = "postgresql://spur:spur@postgres.spur.svc.cluster.local/spur"
 
     [[partitions]]
     name = "default"

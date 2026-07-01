@@ -3,12 +3,12 @@
 
 use chrono::{DateTime, Duration, Utc};
 
-use crate::db::UsageRecord;
+use super::db::UsageRecord;
 
 /// Compute fair-share factors for all users from usage data.
 ///
 /// Returns a map of (user, account) → fair-share factor.
-pub fn compute_fairshare(
+pub(super) fn compute_fairshare(
     usage: &[UsageRecord],
     account_weights: &std::collections::HashMap<String, f64>,
     halflife_days: u32,

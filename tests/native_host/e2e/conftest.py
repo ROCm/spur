@@ -188,14 +188,12 @@ def multi_node_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
 @pytest.fixture
 def accounting_cluster(ssh_nodes, remote_bin_dir):
     """
-    Per-test fixture: a running cluster with spurdbd + Postgres on node 0.
+    Per-test fixture: a running cluster with Postgres on node 0.
 
-    Skips if node 0 lacks Docker or the accounting binaries, so the suite
-    degrades gracefully where the DB backend is unavailable.
+    Accounting runs inside spurctld. Skips if node 0 lacks Docker.
     """
     if len(ssh_nodes) < 1:
         pytest.skip("accounting tests require at least one node")
-    # spurdbd/sacct/sacctmgr are not part of the session-scoped base upload.
     try:
         ensure_bins(ssh_nodes[:1], _get_binaries_dir(), remote_bin_dir,
                     with_accounting=True)
