@@ -30,5 +30,8 @@ libc = "0.2"
 flate2 = { workspace = true }
 tar = { workspace = true }
 
+[dev-dependencies]
+serial_test = { workspace = true }
+
 [lints]
 workspace = true

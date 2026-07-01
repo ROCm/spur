@@ -3475,6 +3475,7 @@ dependencies = [
  "prost-types",
  "serde",
  "serde_json",
+ "serial_test",
  "spur-core",
  "spur-net",
  "spur-proto",
