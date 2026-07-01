@@ -14,9 +14,9 @@ use std::collections::HashMap;
 pub struct SbatchArgs {
     // Precedence is CLI > env (SBATCH_*) > #SBATCH directive, matching Slurm;
     // `resolve_sbatch_args` enforces it. `overrides_with = "self"` gives
-    // repeated scalar flags last-wins semantics. Vec args (gres, licenses,
-    // container_mounts, container_env) have no `overrides_with` because they
-    // accumulate by design.
+    // repeated flags last-wins semantics (gres included). The remaining Vec
+    // args (licenses, container_mounts, container_env) have no `overrides_with`
+    // because they accumulate by design.
     /// Job name
     #[arg(
         short = 'J',
@@ -69,7 +69,14 @@ pub struct SbatchArgs {
     pub mem_per_cpu: Option<String>,
 
     /// Generic resources (e.g., "gpu:4", "gpu:mi300x:8")
-    #[arg(long, env = "SBATCH_GRES", value_delimiter = ',')]
+    // Matches Slurm: `value_delimiter` keeps a single comma-list cumulative,
+    // while `overrides_with` makes a repeated --gres replace instead of append.
+    #[arg(
+        long,
+        env = "SBATCH_GRES",
+        value_delimiter = ',',
+        overrides_with = "gres"
+    )]
     pub gres: Vec<String>,
 
     /// Licenses (e.g., "fluent:5", "matlab:1")
@@ -295,15 +302,13 @@ pub fn parse_sbatch_directives(script: &str) -> Vec<String> {
     args
 }
 
-/// Resolve `SbatchArgs` from `#SBATCH` directives, the CLI, and `SBATCH_*` env
-/// vars with Slurm precedence: CLI > env > directive > default.
+/// Resolve `SbatchArgs` with Slurm precedence: CLI > env (SBATCH_*) > #SBATCH
+/// directive > default.
 ///
-/// clap can resolve CLI > env > default within a single parse, but it cannot
-/// rank a directive against an env var, because directives are fed in as argv
-/// and would always outrank env. So we parse the CLI (with env enabled) and the
-/// directives independently, then per field keep the CLI value whenever clap
-/// reports its source as the command line or an env var, and otherwise fall
-/// back to the directive value.
+/// clap resolves CLI > env in one parse, but directives fed as argv are tagged
+/// `CommandLine` and would outrank env. So we parse CLI and directives
+/// separately and merge per field: keep the CLI/env value when set, else the
+/// directive.
 pub fn resolve_sbatch_args(
     directives: &[String],
     cli_args: &[String],
@@ -388,9 +393,10 @@ fn merge_resolved(cli_matches: &clap::ArgMatches, cli: SbatchArgs, dir: SbatchAr
     fallback!(container_remap_root, "container_remap_root");
     fallback!(controller, "controller");
     fallback!(script, "script");
+    // gres replaces rather than accumulates, so it merges like the scalars.
+    fallback!(gres, "gres");
 
-    out.gres = resolve_gres(cli_matches, dir.gres, std::mem::take(&mut out.gres));
-    // Vec args without env defaults accumulate directives then CLI values.
+    // These repeatable options accumulate directive then CLI values by design.
     out.licenses = concat_vec(dir.licenses, std::mem::take(&mut out.licenses));
     out.container_mounts = concat_vec(
         dir.container_mounts,
@@ -404,22 +410,6 @@ fn merge_resolved(cli_matches: &clap::ArgMatches, cli: SbatchArgs, dir: SbatchAr
 fn concat_vec(mut directive: Vec<String>, mut cli: Vec<String>) -> Vec<String> {
     directive.append(&mut cli);
     directive
-}
-
-/// `gres` follows the file's CLI > env > directive precedence. An explicit CLI
-/// `--gres` accumulates with directive values, since Vec args merge by design;
-/// but `SBATCH_GRES` replaces a directive so an env default can override
-/// `#SBATCH --gres`, consistent with the scalar flags.
-fn resolve_gres(
-    cli_matches: &clap::ArgMatches,
-    directive: Vec<String>,
-    cli: Vec<String>,
-) -> Vec<String> {
-    match cli_matches.value_source("gres") {
-        Some(ValueSource::CommandLine) => concat_vec(directive, cli),
-        Some(ValueSource::EnvVariable) => cli,
-        _ => directive,
-    }
 }
 
 /// Basic shell word splitting (handles simple quoting).
@@ -918,12 +908,30 @@ echo "hello world"
 
     #[test]
     fn test_vec_args_accumulate_from_both_sources() {
-        // Vec args have no overrides_with — they intentionally accumulate.
+        // Repeatable options accumulate directive and CLI values by design.
         let args = parse_merged(
-            &["--gres=gpu:mi300x:8"],
-            &["sbatch", "--gres=license:fluent:1"],
+            &["--container-mounts=/a:/a"],
+            &["sbatch", "--container-mounts=/b:/b"],
         );
-        assert_eq!(args.gres, vec!["gpu:mi300x:8", "license:fluent:1"]);
+        assert_eq!(args.container_mounts, vec!["/a:/a", "/b:/b"]);
+    }
+
+    #[test]
+    fn test_repeated_gres_flag_replaces() {
+        let args = parse_merged(&[], &["sbatch", "--gres=gpu:2", "--gres=gpu:5"]);
+        assert_eq!(args.gres, vec!["gpu:5"]);
+    }
+
+    #[test]
+    fn test_comma_gres_is_cumulative() {
+        let args = parse_merged(&[], &["sbatch", "--gres=gpu:2,fpga:1"]);
+        assert_eq!(args.gres, vec!["gpu:2", "fpga:1"]);
+    }
+
+    #[test]
+    fn test_cli_gres_replaces_directive() {
+        let args = parse_merged(&["--gres=gpu:8"], &["sbatch", "--gres=gpu:2"]);
+        assert_eq!(args.gres, vec!["gpu:2"]);
     }
 
     #[test]
@@ -952,25 +960,6 @@ echo "hello world"
     // SbatchEnvGuard to stay independent of the runner's environment.
     use serial_test::serial;
 
-    const SBATCH_ENV_VARS: &[&str] = &[
-        "SBATCH_JOB_NAME",
-        "SBATCH_PARTITION",
-        "SBATCH_ACCOUNT",
-        "SBATCH_QOS",
-        "SBATCH_TIMELIMIT",
-        "SBATCH_OUTPUT",
-        "SBATCH_ERROR",
-        "SBATCH_GRES",
-        "SBATCH_CONSTRAINT",
-        "SBATCH_NODELIST",
-        "SBATCH_EXCLUDE",
-        "SBATCH_RESERVATION",
-        "SBATCH_DISTRIBUTION",
-        "SBATCH_EXPORT",
-        "SBATCH_MEM",
-        "SBATCH_MEM_PER_CPU",
-    ];
-
     /// Clears every SBATCH_* var on construction and on drop, so an assertion
     /// panic can never leak env state into the next test in this process.
     struct SbatchEnvGuard;
@@ -985,9 +974,15 @@ echo "hello world"
             std::env::set_var(key, val);
         }
 
+        /// The set of SBATCH_* vars is derived from the `env=` attributes on
+        /// SbatchArgs so it cannot drift as flags are added or removed.
         fn clear() {
-            for key in SBATCH_ENV_VARS {
-                std::env::remove_var(key);
+            for arg in SbatchArgs::command().get_arguments() {
+                let Some(env) = arg.get_env() else { continue };
+                let name = env.to_string_lossy();
+                if name.starts_with("SBATCH_") {
+                    std::env::remove_var(name.as_ref());
+                }
             }
         }
     }
@@ -1061,14 +1056,11 @@ echo "hello world"
 
     #[test]
     #[serial]
-    fn test_gres_accumulates_and_ignores_env_fallback() {
-        // When CLI/directive supply gres, SBATCH_GRES is not consulted.
+    fn test_cli_gres_replaces_directive_and_ignores_env() {
+        // CLI --gres wins over both the directive and SBATCH_GRES.
         let env = SbatchEnvGuard::new();
-        env.set("SBATCH_GRES", "env:1");
-        let args = parse_merged(
-            &["--gres=gpu:mi300x:8"],
-            &["sbatch", "--gres=license:fluent:1"],
-        );
-        assert_eq!(args.gres, vec!["gpu:mi300x:8", "license:fluent:1"]);
+        env.set("SBATCH_GRES", "gpu:1");
+        let args = parse_merged(&["--gres=gpu:mi300x:8"], &["sbatch", "--gres=gpu:2"]);
+        assert_eq!(args.gres, vec!["gpu:2"]);
     }
 }
