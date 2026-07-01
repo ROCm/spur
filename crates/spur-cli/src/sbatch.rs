@@ -406,9 +406,10 @@ fn concat_vec(mut directive: Vec<String>, mut cli: Vec<String>) -> Vec<String> {
     directive
 }
 
-/// `gres` accumulates directive and explicit CLI values (preserving existing
-/// behavior); `SBATCH_GRES` is only consulted as a fallback when neither the
-/// CLI nor a directive supplied any value.
+/// `gres` follows the file's CLI > env > directive precedence. An explicit CLI
+/// `--gres` accumulates with directive values, since Vec args merge by design;
+/// but `SBATCH_GRES` replaces a directive so an env default can override
+/// `#SBATCH --gres`, consistent with the scalar flags.
 fn resolve_gres(
     cli_matches: &clap::ArgMatches,
     directive: Vec<String>,
@@ -416,9 +417,8 @@ fn resolve_gres(
 ) -> Vec<String> {
     match cli_matches.value_source("gres") {
         Some(ValueSource::CommandLine) => concat_vec(directive, cli),
-        _ if !directive.is_empty() => directive,
         Some(ValueSource::EnvVariable) => cli,
-        _ => Vec::new(),
+        _ => directive,
     }
 }
 
@@ -948,9 +948,8 @@ echo "hello world"
     }
 
     // SBATCH_* env vars provide defaults (CLI > env > directive). These tests
-    // mutate process-global env vars, so they run serially and clear all
-    // SBATCH_* vars before and after to stay independent of the runner's
-    // environment.
+    // mutate process-global env vars, so they run serially and use
+    // SbatchEnvGuard to stay independent of the runner's environment.
     use serial_test::serial;
 
     const SBATCH_ENV_VARS: &[&str] = &[
@@ -972,39 +971,57 @@ echo "hello world"
         "SBATCH_MEM_PER_CPU",
     ];
 
-    fn clear_sbatch_env() {
-        for key in SBATCH_ENV_VARS {
-            std::env::remove_var(key);
+    /// Clears every SBATCH_* var on construction and on drop, so an assertion
+    /// panic can never leak env state into the next test in this process.
+    struct SbatchEnvGuard;
+
+    impl SbatchEnvGuard {
+        fn new() -> Self {
+            Self::clear();
+            SbatchEnvGuard
+        }
+
+        fn set(&self, key: &str, val: &str) {
+            std::env::set_var(key, val);
+        }
+
+        fn clear() {
+            for key in SBATCH_ENV_VARS {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    impl Drop for SbatchEnvGuard {
+        fn drop(&mut self) {
+            Self::clear();
         }
     }
 
     #[test]
     #[serial]
     fn test_env_provides_default() {
-        clear_sbatch_env();
-        std::env::set_var("SBATCH_PARTITION", "gpu");
+        let env = SbatchEnvGuard::new();
+        env.set("SBATCH_PARTITION", "gpu");
         let args = parse_merged(&[], &["sbatch"]);
-        clear_sbatch_env();
         assert_eq!(args.partition.as_deref(), Some("gpu"));
     }
 
     #[test]
     #[serial]
     fn test_cli_overrides_env() {
-        clear_sbatch_env();
-        std::env::set_var("SBATCH_PARTITION", "gpu");
+        let env = SbatchEnvGuard::new();
+        env.set("SBATCH_PARTITION", "gpu");
         let args = parse_merged(&[], &["sbatch", "--partition=cpu"]);
-        clear_sbatch_env();
         assert_eq!(args.partition.as_deref(), Some("cpu"));
     }
 
     #[test]
     #[serial]
     fn test_env_overrides_directive() {
-        clear_sbatch_env();
-        std::env::set_var("SBATCH_PARTITION", "gpu");
+        let env = SbatchEnvGuard::new();
+        env.set("SBATCH_PARTITION", "gpu");
         let args = parse_merged(&["--partition=script-part"], &["sbatch"]);
-        clear_sbatch_env();
         assert_eq!(
             args.partition.as_deref(),
             Some("gpu"),
@@ -1015,33 +1032,43 @@ echo "hello world"
     #[test]
     #[serial]
     fn test_directive_used_when_no_env_or_cli() {
-        clear_sbatch_env();
+        let _env = SbatchEnvGuard::new();
         let args = parse_merged(&["--partition=script-part"], &["sbatch"]);
-        clear_sbatch_env();
         assert_eq!(args.partition.as_deref(), Some("script-part"));
     }
 
     #[test]
     #[serial]
     fn test_env_gres_comma_split() {
-        clear_sbatch_env();
-        std::env::set_var("SBATCH_GRES", "gpu:1,license:x");
+        let env = SbatchEnvGuard::new();
+        env.set("SBATCH_GRES", "gpu:1,license:x");
         let args = parse_merged(&[], &["sbatch"]);
-        clear_sbatch_env();
         assert_eq!(args.gres, vec!["gpu:1", "license:x"]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_env_gres_overrides_directive() {
+        let env = SbatchEnvGuard::new();
+        env.set("SBATCH_GRES", "gpu:2");
+        let args = parse_merged(&["--gres=gpu:8"], &["sbatch"]);
+        assert_eq!(
+            args.gres,
+            vec!["gpu:2"],
+            "env gres must override #SBATCH directive"
+        );
     }
 
     #[test]
     #[serial]
     fn test_gres_accumulates_and_ignores_env_fallback() {
         // When CLI/directive supply gres, SBATCH_GRES is not consulted.
-        clear_sbatch_env();
-        std::env::set_var("SBATCH_GRES", "env:1");
+        let env = SbatchEnvGuard::new();
+        env.set("SBATCH_GRES", "env:1");
         let args = parse_merged(
             &["--gres=gpu:mi300x:8"],
             &["sbatch", "--gres=license:fluent:1"],
         );
-        clear_sbatch_env();
         assert_eq!(args.gres, vec!["gpu:mi300x:8", "license:fluent:1"]);
     }
 }
