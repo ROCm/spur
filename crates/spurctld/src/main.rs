@@ -145,36 +145,49 @@ async fn main() -> anyhow::Result<()> {
     let sched_stats = Arc::new(SchedStatsCollector::new(config.scheduler.plugin.clone()));
     cluster.set_sched_stats(sched_stats.clone());
 
-    // Connect to accounting daemon (best-effort -- scheduling works without it)
-    match accounting::AccountingNotifier::connect(&config.accounting.host).await {
-        Ok(notifier) => {
-            cluster.set_accounting(notifier);
-            info!(
-                "accounting notifier connected to {}",
-                config.accounting.host
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                host = %config.accounting.host,
-                "failed to connect to accounting daemon; job history will not be recorded"
-            );
-        }
-    }
+    // Build accounting PgPool (best-effort — scheduling works without it)
+    let accounting_pool = if config.accounting.database_url.is_empty() {
+        info!("accounting disabled (database_url not configured)");
+        None
+    } else {
+        match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(8)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect(&config.accounting.database_url)
+            .await
+        {
+            Ok(pool) => {
+                if let Err(e) = accounting::db::migrate(&pool).await {
+                    tracing::error!(error = %e, "accounting migration failed; disabling accounting");
+                    None
+                } else {
+                    info!("accounting database connected");
+                    let notifier = accounting::AccountingNotifier::new(pool.clone());
+                    cluster.set_accounting(notifier);
 
-    // Start fairshare factor refresh loop
-    cluster.fairshare_cache().spawn_refresh_loop(
-        config.accounting.host.clone(),
-        config.scheduler.fairshare_halflife_days,
-        config.accounting.fairshare_refresh_secs as u64,
-    );
+                    cluster.fairshare_cache().spawn_refresh_loop(
+                        pool.clone(),
+                        config.scheduler.fairshare_halflife_days,
+                        config.accounting.fairshare_refresh_secs as u64,
+                    );
 
-    // QoS limits refresh loop (shares the accounting host + cadence).
-    cluster.qos_cache().spawn_refresh_loop(
-        config.accounting.host.clone(),
-        config.accounting.fairshare_refresh_secs as u64,
-    );
+                    cluster.qos_cache().spawn_refresh_loop(
+                        pool.clone(),
+                        config.accounting.fairshare_refresh_secs as u64,
+                    );
+
+                    Some(pool)
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to connect to accounting database; job history will not be recorded"
+                );
+                None
+            }
+        }
+    };
 
     // Start scheduler loop (only schedules when this node is Raft leader)
     let sched_cluster = cluster.clone();
@@ -247,7 +260,15 @@ async fn main() -> anyhow::Result<()> {
     // Start gRPC server
     let addr = listen_addr.parse()?;
     info!(%addr, "gRPC server listening");
-    server::serve(addr, cluster, raft_handle, rpc_stats, sched_stats).await?;
+    server::serve(
+        addr,
+        cluster,
+        raft_handle,
+        rpc_stats,
+        sched_stats,
+        accounting_pool,
+    )
+    .await?;
 
     sched_handle.abort();
     Ok(())

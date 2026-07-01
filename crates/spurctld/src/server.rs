@@ -1445,6 +1445,7 @@ pub async fn serve(
     raft_handle: Arc<RaftHandle>,
     rpc_stats: Arc<RpcStatsCollector>,
     sched_stats: Arc<SchedStatsCollector>,
+    accounting_pool: Option<sqlx::PgPool>,
 ) -> anyhow::Result<()> {
     let client_addrs: BTreeMap<u64, String> = raft_handle
         .peers
@@ -1472,11 +1473,14 @@ pub async fn serve(
 
     let stats_layer = RpcStatsLayer::new(rpc_stats, raft_handle);
 
-    tonic::transport::Server::builder()
-        .layer(stats_layer)
-        .add_service(SlurmControllerServer::new(service))
-        .serve(addr)
-        .await?;
+    let mut builder = tonic::transport::Server::builder().layer(stats_layer);
+
+    let mut router = builder.add_service(SlurmControllerServer::new(service));
+    if let Some(pool) = accounting_pool {
+        router = router.add_service(crate::accounting::accounting_server(pool));
+    }
+
+    router.serve(addr).await?;
 
     Ok(())
 }

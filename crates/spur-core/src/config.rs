@@ -323,29 +323,16 @@ impl Default for ControllerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountingConfig {
-    /// Address of the accounting daemon.
-    #[serde(default = "default_accounting_host")]
-    pub host: String,
-    /// PostgreSQL connection string.
-    #[serde(default = "default_database_url")]
+    /// PostgreSQL connection string for accounting. When non-empty, spurctld
+    /// connects and serves the SlurmAccounting gRPC service on port 6817
+    /// alongside the controller API. Empty (default) disables accounting.
+    #[serde(default)]
     pub database_url: String,
-    /// How long to keep completed job records.
-    #[serde(default = "default_purge_days")]
-    pub purge_after_days: u32,
-    /// How often to refresh fairshare factors from the accounting daemon.
+    /// How often to refresh fairshare/QoS caches from the accounting database.
     #[serde(default = "default_fairshare_refresh_secs")]
     pub fairshare_refresh_secs: u32,
 }
 
-fn default_accounting_host() -> String {
-    "localhost:6819".into()
-}
-fn default_database_url() -> String {
-    "postgresql://spur:spur@localhost/spur".into()
-}
-fn default_purge_days() -> u32 {
-    365
-}
 fn default_fairshare_refresh_secs() -> u32 {
     300
 }
@@ -353,9 +340,7 @@ fn default_fairshare_refresh_secs() -> u32 {
 impl Default for AccountingConfig {
     fn default() -> Self {
         Self {
-            host: "localhost:6819".into(),
-            database_url: "postgresql://spur:spur@localhost/spur".into(),
-            purge_after_days: 365,
+            database_url: String::new(),
             fairshare_refresh_secs: 300,
         }
     }

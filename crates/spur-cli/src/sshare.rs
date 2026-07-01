@@ -26,13 +26,13 @@ pub struct SshareArgs {
     #[arg(short = 'h', long)]
     pub noheader: bool,
 
-    /// Accounting daemon address
+    /// Controller address (accounting is served on the same port)
     #[arg(
         long,
-        env = "SPUR_ACCOUNTING_ADDR",
-        default_value = "http://localhost:6819"
+        env = "SPUR_CONTROLLER_ADDR",
+        default_value = "http://localhost:6817"
     )]
-    pub accounting: String,
+    pub controller: String,
 }
 
 pub async fn main() -> Result<()> {
@@ -42,9 +42,9 @@ pub async fn main() -> Result<()> {
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = SshareArgs::try_parse_from(&args)?;
 
-    let mut client = SlurmAccountingClient::connect(args.accounting.clone())
+    let mut client = SlurmAccountingClient::connect(args.controller.clone())
         .await
-        .context("failed to connect to spurdbd")?;
+        .context("failed to connect to controller")?;
 
     // Get accounts
     let accounts_resp = client

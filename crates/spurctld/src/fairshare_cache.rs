@@ -6,11 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::RwLock;
-use tonic::transport::Channel;
+use sqlx::PgPool;
 use tracing::{debug, info, warn};
-
-use spur_proto::proto::slurm_accounting_client::SlurmAccountingClient;
-use spur_proto::proto::GetFairshareFactorsRequest;
 
 pub struct FairshareCache {
     factors: RwLock<HashMap<(String, String), f64>>,
@@ -43,7 +40,7 @@ impl FairshareCache {
 
     pub fn spawn_refresh_loop(
         self: &Arc<Self>,
-        host: String,
+        pool: PgPool,
         halflife_days: u32,
         refresh_interval_secs: u64,
     ) {
@@ -51,14 +48,11 @@ impl FairshareCache {
         let interval = Duration::from_secs(refresh_interval_secs.max(10));
 
         tokio::spawn(async move {
-            let uri = if host.starts_with("http://") || host.starts_with("https://") {
-                host.clone()
-            } else {
-                format!("http://{}", host)
-            };
-
-            match tokio::time::timeout(Duration::from_secs(5), Self::fetch(&uri, halflife_days))
-                .await
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::accounting::fairshare_factors(&pool, halflife_days),
+            )
+            .await
             {
                 Ok(Ok(factors)) => {
                     info!(count = factors.len(), "fairshare cache initialized");
@@ -77,7 +71,7 @@ impl FairshareCache {
 
                 match tokio::time::timeout(
                     Duration::from_secs(10),
-                    Self::fetch(&uri, halflife_days),
+                    crate::accounting::fairshare_factors(&pool, halflife_days),
                 )
                 .await
                 {
@@ -89,22 +83,5 @@ impl FairshareCache {
                 }
             }
         });
-    }
-
-    async fn fetch(
-        uri: &str,
-        halflife_days: u32,
-    ) -> anyhow::Result<HashMap<(String, String), f64>> {
-        let mut client: SlurmAccountingClient<Channel> =
-            SlurmAccountingClient::connect(uri.to_owned()).await?;
-        let req = GetFairshareFactorsRequest { halflife_days };
-        let resp = client.get_fairshare_factors(req).await?;
-        let factors = resp
-            .into_inner()
-            .entries
-            .into_iter()
-            .map(|e| ((e.user, e.account), e.factor))
-            .collect();
-        Ok(factors)
     }
 }

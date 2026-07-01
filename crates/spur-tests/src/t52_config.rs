@@ -95,7 +95,6 @@ plugin = "backfill"
 interval_secs = 2
 
 [accounting]
-host = "db1:6819"
 database_url = "postgresql://spur:spur@db1/spur"
 
 [[partitions]]
