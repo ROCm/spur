@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{JobSpec, SubmitJobRequest};
 use std::collections::HashMap;
@@ -11,21 +12,31 @@ use std::collections::HashMap;
 #[derive(Parser, Debug)]
 #[command(name = "sbatch", about = "Submit a batch job script")]
 pub struct SbatchArgs {
-    // CLI args override #SBATCH directives. clap merges directives + CLI argv;
-    // `overrides_with = "self"` allows duplicates with last-wins, so a CLI flag
-    // appearing after a directive flag wins. Vec args (gres, licenses,
-    // container_mounts, container_env) accumulate by design and have no
-    // `overrides_with`. Closes #143.
+    // Precedence is CLI > env (SBATCH_*) > #SBATCH directive, matching Slurm;
+    // `resolve_sbatch_args` enforces it. `overrides_with = "self"` gives
+    // repeated scalar flags last-wins semantics. Vec args (gres, licenses,
+    // container_mounts, container_env) have no `overrides_with` because they
+    // accumulate by design.
     /// Job name
-    #[arg(short = 'J', long, overrides_with = "job_name")]
+    #[arg(
+        short = 'J',
+        long,
+        env = "SBATCH_JOB_NAME",
+        overrides_with = "job_name"
+    )]
     pub job_name: Option<String>,
 
     /// Partition
-    #[arg(short = 'p', long, overrides_with = "partition")]
+    #[arg(
+        short = 'p',
+        long,
+        env = "SBATCH_PARTITION",
+        overrides_with = "partition"
+    )]
     pub partition: Option<String>,
 
     /// Account
-    #[arg(short = 'A', long, overrides_with = "account")]
+    #[arg(short = 'A', long, env = "SBATCH_ACCOUNT", overrides_with = "account")]
     pub account: Option<String>,
 
     /// Number of nodes
@@ -50,15 +61,15 @@ pub struct SbatchArgs {
     pub cpus_per_task: u32,
 
     /// Memory per node (e.g., "4G", "4096M", "4096")
-    #[arg(long, overrides_with = "mem")]
+    #[arg(long, env = "SBATCH_MEM", overrides_with = "mem")]
     pub mem: Option<String>,
 
     /// Memory per CPU
-    #[arg(long, overrides_with = "mem_per_cpu")]
+    #[arg(long, env = "SBATCH_MEM_PER_CPU", overrides_with = "mem_per_cpu")]
     pub mem_per_cpu: Option<String>,
 
     /// Generic resources (e.g., "gpu:4", "gpu:mi300x:8")
-    #[arg(long)]
+    #[arg(long, env = "SBATCH_GRES", value_delimiter = ',')]
     pub gres: Vec<String>,
 
     /// Licenses (e.g., "fluent:5", "matlab:1")
@@ -74,7 +85,7 @@ pub struct SbatchArgs {
     pub gpus_per_node: Option<String>,
 
     /// Time limit (e.g., "4:00:00", "1-00:00:00")
-    #[arg(short = 't', long, overrides_with = "time")]
+    #[arg(short = 't', long, env = "SBATCH_TIMELIMIT", overrides_with = "time")]
     pub time: Option<String>,
 
     /// Minimum time limit
@@ -86,15 +97,15 @@ pub struct SbatchArgs {
     pub chdir: Option<String>,
 
     /// Stdout file
-    #[arg(short = 'o', long, overrides_with = "output")]
+    #[arg(short = 'o', long, env = "SBATCH_OUTPUT", overrides_with = "output")]
     pub output: Option<String>,
 
     /// Stderr file
-    #[arg(short = 'e', long, overrides_with = "error")]
+    #[arg(short = 'e', long, env = "SBATCH_ERROR", overrides_with = "error")]
     pub error: Option<String>,
 
     /// QoS
-    #[arg(short = 'q', long, overrides_with = "qos")]
+    #[arg(short = 'q', long, env = "SBATCH_QOS", overrides_with = "qos")]
     pub qos: Option<String>,
 
     /// Job dependency (e.g., "afterok:123")
@@ -102,19 +113,29 @@ pub struct SbatchArgs {
     pub dependency: Option<String>,
 
     /// Node list
-    #[arg(short = 'w', long, overrides_with = "nodelist")]
+    #[arg(
+        short = 'w',
+        long,
+        env = "SBATCH_NODELIST",
+        overrides_with = "nodelist"
+    )]
     pub nodelist: Option<String>,
 
     /// Exclude nodes
-    #[arg(short = 'x', long, overrides_with = "exclude")]
+    #[arg(short = 'x', long, env = "SBATCH_EXCLUDE", overrides_with = "exclude")]
     pub exclude: Option<String>,
 
     /// Required node features (e.g., "mi300x,nvlink")
-    #[arg(short = 'C', long, overrides_with = "constraint")]
+    #[arg(
+        short = 'C',
+        long,
+        env = "SBATCH_CONSTRAINT",
+        overrides_with = "constraint"
+    )]
     pub constraint: Option<String>,
 
     /// Target a named reservation
-    #[arg(long, overrides_with = "reservation")]
+    #[arg(long, env = "SBATCH_RESERVATION", overrides_with = "reservation")]
     pub reservation: Option<String>,
 
     /// Job array (e.g., "0-99%10")
@@ -122,7 +143,12 @@ pub struct SbatchArgs {
     pub array: Option<String>,
 
     /// Task distribution (block, cyclic, plane, arbitrary)
-    #[arg(short = 'm', long, overrides_with = "distribution")]
+    #[arg(
+        short = 'm',
+        long,
+        env = "SBATCH_DISTRIBUTION",
+        overrides_with = "distribution"
+    )]
     pub distribution: Option<String>,
 
     /// Heterogeneous job component index (0 = first component)
@@ -182,7 +208,12 @@ pub struct SbatchArgs {
     pub mail_user: Option<String>,
 
     /// Export environment variables
-    #[arg(long, default_value = "ALL", overrides_with = "export")]
+    #[arg(
+        long,
+        env = "SBATCH_EXPORT",
+        default_value = "ALL",
+        overrides_with = "export"
+    )]
     pub export: String,
 
     // Container
@@ -264,16 +295,131 @@ pub fn parse_sbatch_directives(script: &str) -> Vec<String> {
     args
 }
 
-/// Build the argv that clap parses: directives first, CLI args after.
+/// Resolve `SbatchArgs` from `#SBATCH` directives, the CLI, and `SBATCH_*` env
+/// vars with Slurm precedence: CLI > env > directive > default.
 ///
-/// Order is load-bearing: scalar args in `SbatchArgs` use `overrides_with =
-/// "self"` for last-wins semantics, so a CLI flag appearing after a directive
-/// flag wins. Vec args (e.g. `--gres`) accumulate from both sources.
-pub fn merge_directives_and_cli(directives: &[String], cli_args: &[String]) -> Vec<String> {
-    let mut merged = vec!["sbatch".to_string()];
-    merged.extend(directives.iter().cloned());
-    merged.extend(cli_args.iter().skip(1).cloned()); // skip argv[0]
-    merged
+/// clap can resolve CLI > env > default within a single parse, but it cannot
+/// rank a directive against an env var, because directives are fed in as argv
+/// and would always outrank env. So we parse the CLI (with env enabled) and the
+/// directives independently, then per field keep the CLI value whenever clap
+/// reports its source as the command line or an env var, and otherwise fall
+/// back to the directive value.
+pub fn resolve_sbatch_args(
+    directives: &[String],
+    cli_args: &[String],
+) -> clap::error::Result<SbatchArgs> {
+    let cli_matches = SbatchArgs::command().try_get_matches_from(cli_args)?;
+    let cli = SbatchArgs::from_arg_matches(&cli_matches)?;
+
+    let mut directive_argv = vec!["sbatch".to_string()];
+    directive_argv.extend(directives.iter().cloned());
+    let dir = SbatchArgs::try_parse_from(&directive_argv)?;
+
+    Ok(merge_resolved(&cli_matches, cli, dir))
+}
+
+/// True when neither the CLI nor an env var set the field. `value_source` is
+/// `None` for absent args with no default, which counts the same as a default.
+fn is_default(matches: &clap::ArgMatches, id: &str) -> bool {
+    !matches!(
+        matches.value_source(id),
+        Some(ValueSource::CommandLine) | Some(ValueSource::EnvVariable)
+    )
+}
+
+/// `cli` already has env values folded in by clap, so falling back to the
+/// directive value only when `is_default` holds yields CLI > env > directive.
+fn merge_resolved(cli_matches: &clap::ArgMatches, cli: SbatchArgs, dir: SbatchArgs) -> SbatchArgs {
+    let mut out = cli;
+
+    macro_rules! fallback {
+        ($field:ident, $id:literal) => {
+            if is_default(cli_matches, $id) {
+                out.$field = dir.$field;
+            }
+        };
+    }
+
+    fallback!(job_name, "job_name");
+    fallback!(partition, "partition");
+    fallback!(account, "account");
+    fallback!(nodes, "nodes");
+    fallback!(ntasks, "ntasks");
+    fallback!(ntasks_per_node, "ntasks_per_node");
+    fallback!(cpus_per_task, "cpus_per_task");
+    fallback!(mem, "mem");
+    fallback!(mem_per_cpu, "mem_per_cpu");
+    fallback!(gpus, "gpus");
+    fallback!(gpus_per_node, "gpus_per_node");
+    fallback!(time, "time");
+    fallback!(time_min, "time_min");
+    fallback!(chdir, "chdir");
+    fallback!(output, "output");
+    fallback!(error, "error");
+    fallback!(qos, "qos");
+    fallback!(dependency, "dependency");
+    fallback!(nodelist, "nodelist");
+    fallback!(exclude, "exclude");
+    fallback!(constraint, "constraint");
+    fallback!(reservation, "reservation");
+    fallback!(array, "array");
+    fallback!(distribution, "distribution");
+    fallback!(het_group, "het_group");
+    fallback!(bb, "bb");
+    fallback!(begin, "begin");
+    fallback!(deadline, "deadline");
+    fallback!(spread_job, "spread_job");
+    fallback!(topology, "topology");
+    fallback!(open_mode, "open_mode");
+    fallback!(mpi, "mpi");
+    fallback!(requeue, "requeue");
+    fallback!(exclusive, "exclusive");
+    fallback!(hold, "hold");
+    fallback!(comment, "comment");
+    fallback!(mail_type, "mail_type");
+    fallback!(mail_user, "mail_user");
+    fallback!(export, "export");
+    fallback!(container_image, "container_image");
+    fallback!(container_workdir, "container_workdir");
+    fallback!(container_name, "container_name");
+    fallback!(container_readonly, "container_readonly");
+    fallback!(container_mount_home, "container_mount_home");
+    fallback!(container_entrypoint, "container_entrypoint");
+    fallback!(container_remap_root, "container_remap_root");
+    fallback!(controller, "controller");
+    fallback!(script, "script");
+
+    out.gres = resolve_gres(cli_matches, dir.gres, std::mem::take(&mut out.gres));
+    // Vec args without env defaults accumulate directives then CLI values.
+    out.licenses = concat_vec(dir.licenses, std::mem::take(&mut out.licenses));
+    out.container_mounts = concat_vec(
+        dir.container_mounts,
+        std::mem::take(&mut out.container_mounts),
+    );
+    out.container_env = concat_vec(dir.container_env, std::mem::take(&mut out.container_env));
+
+    out
+}
+
+fn concat_vec(mut directive: Vec<String>, mut cli: Vec<String>) -> Vec<String> {
+    directive.append(&mut cli);
+    directive
+}
+
+/// `gres` accumulates directive and explicit CLI values (preserving existing
+/// behavior); `SBATCH_GRES` is only consulted as a fallback when neither the
+/// CLI nor a directive supplied any value.
+fn resolve_gres(
+    cli_matches: &clap::ArgMatches,
+    directive: Vec<String>,
+    cli: Vec<String>,
+) -> Vec<String> {
+    match cli_matches.value_source("gres") {
+        Some(ValueSource::CommandLine) => concat_vec(directive, cli),
+        _ if !directive.is_empty() => directive,
+        Some(ValueSource::EnvVariable) => cli,
+        _ => Vec::new(),
+    }
 }
 
 /// Basic shell word splitting (handles simple quoting).
@@ -481,9 +627,8 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         .as_deref()
         .map(parse_sbatch_directives)
         .unwrap_or_default();
-    let merged_args = merge_directives_and_cli(&directive_args, &cli_args);
 
-    let args = SbatchArgs::try_parse_from(&merged_args)?;
+    let args = resolve_sbatch_args(&directive_args, &cli_args)?;
 
     // Build the job spec
     let script = match &args.script {
@@ -719,8 +864,7 @@ echo "hello world"
     fn parse_merged(directives: &[&str], cli: &[&str]) -> SbatchArgs {
         let directives: Vec<String> = directives.iter().map(|s| s.to_string()).collect();
         let cli: Vec<String> = cli.iter().map(|s| s.to_string()).collect();
-        let merged = merge_directives_and_cli(&directives, &cli);
-        SbatchArgs::try_parse_from(&merged).expect("parse failed")
+        resolve_sbatch_args(&directives, &cli).expect("parse failed")
     }
 
     #[test]
@@ -801,5 +945,103 @@ echo "hello world"
         // overrides_with.
         let args = parse_merged(&["--cpus-per-task=4"], &["sbatch", "--cpus-per-task=8"]);
         assert_eq!(args.cpus_per_task, 8);
+    }
+
+    // SBATCH_* env vars provide defaults (CLI > env > directive). These tests
+    // mutate process-global env vars, so they run serially and clear all
+    // SBATCH_* vars before and after to stay independent of the runner's
+    // environment.
+    use serial_test::serial;
+
+    const SBATCH_ENV_VARS: &[&str] = &[
+        "SBATCH_JOB_NAME",
+        "SBATCH_PARTITION",
+        "SBATCH_ACCOUNT",
+        "SBATCH_QOS",
+        "SBATCH_TIMELIMIT",
+        "SBATCH_OUTPUT",
+        "SBATCH_ERROR",
+        "SBATCH_GRES",
+        "SBATCH_CONSTRAINT",
+        "SBATCH_NODELIST",
+        "SBATCH_EXCLUDE",
+        "SBATCH_RESERVATION",
+        "SBATCH_DISTRIBUTION",
+        "SBATCH_EXPORT",
+        "SBATCH_MEM",
+        "SBATCH_MEM_PER_CPU",
+    ];
+
+    fn clear_sbatch_env() {
+        for key in SBATCH_ENV_VARS {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_env_provides_default() {
+        clear_sbatch_env();
+        std::env::set_var("SBATCH_PARTITION", "gpu");
+        let args = parse_merged(&[], &["sbatch"]);
+        clear_sbatch_env();
+        assert_eq!(args.partition.as_deref(), Some("gpu"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_cli_overrides_env() {
+        clear_sbatch_env();
+        std::env::set_var("SBATCH_PARTITION", "gpu");
+        let args = parse_merged(&[], &["sbatch", "--partition=cpu"]);
+        clear_sbatch_env();
+        assert_eq!(args.partition.as_deref(), Some("cpu"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_env_overrides_directive() {
+        clear_sbatch_env();
+        std::env::set_var("SBATCH_PARTITION", "gpu");
+        let args = parse_merged(&["--partition=script-part"], &["sbatch"]);
+        clear_sbatch_env();
+        assert_eq!(
+            args.partition.as_deref(),
+            Some("gpu"),
+            "env var must override #SBATCH directive"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_directive_used_when_no_env_or_cli() {
+        clear_sbatch_env();
+        let args = parse_merged(&["--partition=script-part"], &["sbatch"]);
+        clear_sbatch_env();
+        assert_eq!(args.partition.as_deref(), Some("script-part"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_env_gres_comma_split() {
+        clear_sbatch_env();
+        std::env::set_var("SBATCH_GRES", "gpu:1,license:x");
+        let args = parse_merged(&[], &["sbatch"]);
+        clear_sbatch_env();
+        assert_eq!(args.gres, vec!["gpu:1", "license:x"]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_gres_accumulates_and_ignores_env_fallback() {
+        // When CLI/directive supply gres, SBATCH_GRES is not consulted.
+        clear_sbatch_env();
+        std::env::set_var("SBATCH_GRES", "env:1");
+        let args = parse_merged(
+            &["--gres=gpu:mi300x:8"],
+            &["sbatch", "--gres=license:fluent:1"],
+        );
+        clear_sbatch_env();
+        assert_eq!(args.gres, vec!["gpu:mi300x:8", "license:fluent:1"]);
     }
 }
