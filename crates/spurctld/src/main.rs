@@ -147,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Build accounting PgPool (best-effort — scheduling works without it)
     let accounting_pool = if config.accounting.database_url.is_empty() {
-        tracing::warn!("accounting.database_url not set; job history will not be recorded");
+        info!("accounting disabled (database_url not configured)");
         None
     } else {
         match sqlx::postgres::PgPoolOptions::new()
@@ -158,24 +158,26 @@ async fn main() -> anyhow::Result<()> {
         {
             Ok(pool) => {
                 if let Err(e) = accounting::db::migrate(&pool).await {
-                    tracing::warn!(error = %e, "accounting database migration failed");
+                    tracing::error!(error = %e, "accounting migration failed; disabling accounting");
+                    None
+                } else {
+                    info!("accounting database connected");
+                    let notifier = accounting::AccountingNotifier::new(pool.clone());
+                    cluster.set_accounting(notifier);
+
+                    cluster.fairshare_cache().spawn_refresh_loop(
+                        pool.clone(),
+                        config.scheduler.fairshare_halflife_days,
+                        config.accounting.fairshare_refresh_secs as u64,
+                    );
+
+                    cluster.qos_cache().spawn_refresh_loop(
+                        pool.clone(),
+                        config.accounting.fairshare_refresh_secs as u64,
+                    );
+
+                    Some(pool)
                 }
-                info!("accounting database connected");
-                let notifier = accounting::AccountingNotifier::new(pool.clone());
-                cluster.set_accounting(notifier);
-
-                cluster.fairshare_cache().spawn_refresh_loop(
-                    pool.clone(),
-                    config.scheduler.fairshare_halflife_days,
-                    config.accounting.fairshare_refresh_secs as u64,
-                );
-
-                cluster.qos_cache().spawn_refresh_loop(
-                    pool.clone(),
-                    config.accounting.fairshare_refresh_secs as u64,
-                );
-
-                Some(pool)
             }
             Err(e) => {
                 tracing::warn!(

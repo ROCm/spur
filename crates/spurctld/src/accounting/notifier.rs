@@ -6,7 +6,6 @@ use sqlx::PgPool;
 use tracing::warn;
 
 use spur_core::job::{JobId, JobState};
-use spur_core::resource::ResourceAllocations;
 
 pub struct AccountingNotifier {
     pool: PgPool,
@@ -17,18 +16,24 @@ impl AccountingNotifier {
         Self { pool }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn notify_job_start(
         &self,
         job_id: JobId,
         user: String,
         account: String,
         partition: String,
-        resources: &ResourceAllocations,
+        num_nodes: u32,
+        num_tasks: u32,
+        cpus_per_task: u32,
+        memory_mb: u64,
         start_time: DateTime<Utc>,
     ) {
         let pool = self.pool.clone();
-        let cpus = resources.cpus as i32;
-        let memory_mb = resources.memory_mb as i64;
+        let num_nodes = num_nodes as i32;
+        let num_tasks = num_tasks as i32;
+        let cpus_per_task = cpus_per_task as i32;
+        let memory_mb = memory_mb as i64;
         tokio::spawn(async move {
             if let Err(e) = super::db::record_job_start(
                 &pool,
@@ -36,9 +41,9 @@ impl AccountingNotifier {
                 &user,
                 &account,
                 &partition,
-                1,
-                cpus,
-                1,
+                num_nodes,
+                num_tasks,
+                cpus_per_task,
                 memory_mb,
                 start_time,
             )

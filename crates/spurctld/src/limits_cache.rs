@@ -193,4 +193,76 @@ mod tests {
             QosCheckResult::Blocked(PendingReason::QosMaxCpuPerUserLimit)
         );
     }
+
+    #[test]
+    fn test_qos_from_record_parses_limits() {
+        let record = crate::accounting::db::QosRecord {
+            name: "high".into(),
+            description: "High priority QoS".into(),
+            priority: 100,
+            preempt_mode: "cancel".into(),
+            usage_factor: 2.0,
+            max_jobs_per_user: Some(10),
+            max_wall_min: Some(60),
+            max_tres_per_job: Some("cpu=32,mem=128G".into()),
+            max_submit_per_user: Some(50),
+            max_tres_per_user: Some("cpu=64".into()),
+            grp_tres: Some("gpu=8".into()),
+        };
+
+        let qos = qos_from_record(record);
+
+        assert_eq!(qos.name, "high");
+        assert_eq!(qos.priority, 100);
+        assert_eq!(qos.preempt_mode, QosPreemptMode::Cancel);
+        assert_eq!(qos.usage_factor, 2.0);
+        assert_eq!(qos.limits.max_jobs_per_user, Some(10));
+        assert_eq!(qos.limits.max_wall_minutes, Some(60));
+        assert_eq!(qos.limits.max_submit_jobs_per_user, Some(50));
+        assert!(qos.limits.max_tres_per_job.is_some());
+        assert_eq!(
+            qos.limits
+                .max_tres_per_job
+                .as_ref()
+                .unwrap()
+                .get(TresType::Cpu),
+            32
+        );
+        assert!(qos.limits.max_tres_per_user.is_some());
+        assert_eq!(
+            qos.limits
+                .max_tres_per_user
+                .as_ref()
+                .unwrap()
+                .get(TresType::Cpu),
+            64
+        );
+        assert!(qos.limits.grp_tres.is_some());
+    }
+
+    #[test]
+    fn test_qos_from_record_zero_and_none_are_none() {
+        let record = crate::accounting::db::QosRecord {
+            name: "minimal".into(),
+            description: String::new(),
+            priority: 0,
+            preempt_mode: "off".into(),
+            usage_factor: 1.0,
+            max_jobs_per_user: Some(0),
+            max_wall_min: None,
+            max_tres_per_job: Some(String::new()),
+            max_submit_per_user: Some(-1),
+            max_tres_per_user: None,
+            grp_tres: None,
+        };
+
+        let qos = qos_from_record(record);
+
+        assert_eq!(qos.limits.max_jobs_per_user, None);
+        assert_eq!(qos.limits.max_wall_minutes, None);
+        assert!(qos.limits.max_tres_per_job.is_none());
+        assert_eq!(qos.limits.max_submit_jobs_per_user, None);
+        assert!(qos.limits.max_tres_per_user.is_none());
+        assert!(qos.limits.grp_tres.is_none());
+    }
 }
