@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 #
+# Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 # run_all.sh — drive run_perf.sh across several tiers and aggregate metrics.
 #
 # Output is printed to stdout only (combined CSV-style table at end).

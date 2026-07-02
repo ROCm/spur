@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 #
+# Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 # run_perf.sh — Spur scheduling and ingestion perf benchmark.
 #
 # Runs ON a cluster node where the `spur` CLI is installed.
@@ -70,7 +73,7 @@
 #   DRAIN_WALL_S   = t_all_end − t_release_end
 #   TOTAL_WALL_S   = t_all_end − t_sub_start
 #   E2E_TPUT_JPS   = ACCEPTED / TOTAL_WALL_S  (0 if total is 0)
-#   PEAK_IN_QUEUE  = max user job count seen while polling spur jobs during drain
+#   PEAK_IN_QUEUE  = max tier jobs (JOB_NAME) seen while polling spur jobs during drain
 #
 # Metric 3 — latency percentiles (server timestamps, ~1s resolution):
 #   Per sampled job j (every stride-th ID, stride = max(1, ACCEPTED/SAMPLE_MAX)):
@@ -209,7 +212,7 @@ peak_running=0
 drain_timed_out=0
 q=0
 while :; do
-  q="$("$SPUR_CLI" jobs 2>/dev/null | awk 'NR > 1 && $4 == "'"$USER"'"' | wc -l | tr -d ' ')"
+  q="$("$SPUR_CLI" jobs -h -o "%j" 2>/dev/null | awk -v name="$JOB_NAME" '$1 == name' | wc -l | tr -d ' ')"
   [ "$q" -gt "$peak_running" ] && peak_running="$q"
   [ "$q" -eq 0 ] && break
   [ "$(date +%s)" -ge "$t_drain_deadline" ] && {

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from perf_harness.harness import parse_run_perf_metrics, tier_result_from_metrics
+from perf_harness.harness import parse_run_perf_metrics, parse_tiers_from_env, tier_result_from_metrics
 
 
 def test_parse_run_perf_metrics_block():
@@ -38,3 +38,13 @@ TURNAROUND_S min/p50/p95/p99/max=0/1/1/1/1
     assert tier.perf_job_name == "spur_perf_test"
     assert tier.queue_wait.p95 == 1.0
     assert tier.completed_sampled == 5
+
+
+def test_parse_tiers_from_env_rejects_non_positive(monkeypatch):
+    monkeypatch.setenv("SPUR_PERF_TIERS", "50 0")
+    try:
+        parse_tiers_from_env()
+    except ValueError as exc:
+        assert "positive job count" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for non-positive tier")

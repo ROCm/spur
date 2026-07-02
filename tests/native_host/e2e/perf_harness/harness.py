@@ -63,7 +63,12 @@ def parse_tiers_from_env() -> list[int]:
         part = part.strip()
         if not part:
             continue
-        tiers.append(_parse_int_env("SPUR_PERF_TIERS", part))
+        value = _parse_int_env("SPUR_PERF_TIERS", part)
+        if value <= 0:
+            raise ValueError(
+                f"SPUR_PERF_TIERS: expected positive job count, got {value!r}"
+            )
+        tiers.append(value)
     return tiers or [50]
 
 
