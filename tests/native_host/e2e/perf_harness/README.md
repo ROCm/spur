@@ -14,6 +14,11 @@ and the [`run_perf.sh`](../../../../perf_tests/run_perf.sh) header comment.
    ephemeral cluster.
 3. Parse stdout into `PerfTierResult`; optionally write JSON (`SPUR_PERF_JSON_OUT`).
 
+When `SPUR_PERF_TIERS` lists more than one size, the harness tears down and
+redeploys the ephemeral cluster before each tier after the first (fresh
+controller state). Shell-only `run_all.sh` sweeps reuse one controller and run
+warm after the first tier.
+
 Entry point: `tests/native_host/e2e/test_scheduler_perf.py` (`@pytest.mark.perf`).
 Default E2E CI excludes perf: `pytest …/native_host/e2e/ -m "not perf"`.
 
@@ -55,6 +60,18 @@ Use `pytest -s` to see the markdown summary printed by the test.
 only): build PR binaries, download latest `nightly` release, run perf twice
 (`SPUR_PERF_RUN_LABEL=pr-<n>` and `nightly`), then `perf_harness.compare` prints
 a markdown diff to the workflow log. No artifacts uploaded.
+
+The **Perf** workflow appears under Actions only after `perf.yml` is merged to
+the default branch. Until then, run the harness locally or trigger it from a
+branch that already contains the workflow file.
+
+| Workflow input | Default | Maps to |
+|----------------|---------|---------|
+| `pr_number` | _(required)_ | PR head checkout and `SPUR_PERF_RUN_LABEL=pr-<n>` |
+| `tiers` | `50` | `SPUR_PERF_TIERS` |
+| `parallel` | `32` | `SPUR_PERF_PARALLEL` |
+| `compare_threshold_pct` | `10` | `compare.py --threshold` / `SPUR_PERF_COMPARE_THRESHOLD_PCT` |
+| `fail_on_regression` | `false` | `compare.py --fail-on-regression` |
 
 Compare two JSON files manually:
 

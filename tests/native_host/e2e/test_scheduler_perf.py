@@ -11,6 +11,7 @@ prints a markdown-style summary to stdout.
 from __future__ import annotations
 
 import os
+import warnings
 
 import pytest
 
@@ -39,8 +40,8 @@ def test_scheduler_perf_submit_drain_latency(cluster):
     sinfo_text = None
     try:
         sinfo_text = cluster.sinfo()
-    except Exception:
-        pass
+    except Exception as exc:
+        warnings.warn(f"cluster.sinfo() failed: {exc}", stacklevel=2)
 
     report = format_perf_summary_report(suite, sinfo_text=sinfo_text)
     print(report, flush=True)

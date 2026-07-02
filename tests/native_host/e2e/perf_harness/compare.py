@@ -93,6 +93,20 @@ def compare_perf_suites(
     return comparisons
 
 
+def _tier_mismatch_warnings(
+    candidate: PerfSuiteResult,
+    baseline: PerfSuiteResult,
+) -> list[str]:
+    cand_ns = {t.tier_n for t in candidate.tiers}
+    base_ns = {t.tier_n for t in baseline.tiers}
+    warnings: list[str] = []
+    for tier_n in sorted(cand_ns - base_ns):
+        warnings.append(f"baseline missing tier N={tier_n}")
+    for tier_n in sorted(base_ns - cand_ns):
+        warnings.append(f"candidate missing tier N={tier_n}")
+    return warnings
+
+
 def format_comparison_report(
     candidate: PerfSuiteResult,
     baseline: PerfSuiteResult,
@@ -107,9 +121,20 @@ def format_comparison_report(
         f"**Baseline:** {baseline.label} (`{baseline.controller_addr}`)",
         f"**Regression threshold:** ±{threshold_pct:.0f}% vs baseline",
         "",
-        "## Summary",
-        "",
     ]
+
+    mismatch_warnings = _tier_mismatch_warnings(candidate, baseline)
+    if mismatch_warnings:
+        lines.extend(["## Warnings", ""])
+        lines.extend(f"- {warning}" for warning in mismatch_warnings)
+        lines.append("")
+
+    lines.extend(
+        [
+            "## Summary",
+            "",
+        ]
+    )
 
     regressions: list[str] = []
     improvements: list[str] = []

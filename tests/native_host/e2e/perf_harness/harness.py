@@ -102,6 +102,8 @@ class PerfTierResult:
     submitjob_rpc_avg_us: float
     submitjob_rpc_count_delta: int
     submitjob_rpc_total_us_delta: int
+    release_wall_s: float
+    perf_job_name: str
     drain_wall_s: float
     total_wall_s: float
     e2e_tput_jps: float
@@ -164,6 +166,10 @@ def _int_metric(metrics: dict[str, str], key: str, default: int = 0) -> int:
         return default
 
 
+def _str_metric(metrics: dict[str, str], key: str, default: str = "") -> str:
+    return metrics.get(key, default)
+
+
 def tier_result_from_metrics(
     *,
     tier_n: int,
@@ -186,6 +192,8 @@ def tier_result_from_metrics(
         submitjob_rpc_avg_us=_float_metric(metrics, "SUBMITJOB_RPC_AVG_US"),
         submitjob_rpc_count_delta=_int_metric(metrics, "SUBMITJOB_RPC_COUNT_DELTA"),
         submitjob_rpc_total_us_delta=_int_metric(metrics, "SUBMITJOB_RPC_TOTAL_US_DELTA"),
+        release_wall_s=_float_metric(metrics, "RELEASE_WALL_S"),
+        perf_job_name=_str_metric(metrics, "PERF_JOB_NAME"),
         drain_wall_s=_float_metric(metrics, "DRAIN_WALL_S"),
         total_wall_s=_float_metric(metrics, "TOTAL_WALL_S"),
         e2e_tput_jps=_float_metric(metrics, "E2E_TPUT_JPS"),
@@ -211,11 +219,28 @@ def _ensure_run_perf_script(cluster: SpurCluster) -> str:
     return remote_path
 
 
-def run_native_perf_tier(cluster: SpurCluster, tier_n: int) -> PerfTierResult:
+def _redeploy_cluster(cluster: SpurCluster) -> None:
+    """Tear down and redeploy so the next perf tier starts on a cold controller."""
+    overrides = cluster.config_overrides or None
+    labels = cluster.agent_labels or None
+    agent_as_root = cluster.agent_as_root
+    cluster.teardown()
+    cluster.deploy(
+        config_overrides=overrides,
+        agent_as_root=agent_as_root,
+        agent_labels=labels,
+    )
+
+
+def run_native_perf_tier(
+    cluster: SpurCluster,
+    tier_n: int,
+    *,
+    script_path: str,
+) -> PerfTierResult:
     """Run one perf tier on the controller node via ``run_perf.sh``."""
     sleep_s = _perf_sleep_s()
     parallel = min(_perf_parallel(), tier_n) if tier_n > 0 else 1
-    script_path = _ensure_run_perf_script(cluster)
 
     cmd = (
         f"export SPUR_CONTROLLER_ADDR={shlex.quote(cluster.controller_addr)}; "
@@ -238,15 +263,24 @@ def run_native_perf_tier(cluster: SpurCluster, tier_n: int) -> PerfTierResult:
 
 
 def run_native_perf_suite(cluster: SpurCluster, *, label: str | None = None) -> PerfSuiteResult:
-    """Run all tiers from ``SPUR_PERF_*`` env against an ephemeral cluster."""
+    """Run all tiers from ``SPUR_PERF_*`` env against an ephemeral cluster.
+
+    When multiple tier sizes are configured, the cluster is torn down and
+    redeployed before each tier after the first so metrics are not skewed by
+    accumulated job state from earlier tiers.
+    """
     run_label = label or os.environ.get("SPUR_PERF_RUN_LABEL", "local")
     sleep_s = _perf_sleep_s()
     parallel = _perf_parallel()
     tiers_cfg = parse_tiers_from_env()
 
+    script_path = _ensure_run_perf_script(cluster)
     results: list[PerfTierResult] = []
-    for tier_n in tiers_cfg:
-        results.append(run_native_perf_tier(cluster, tier_n))
+    for index, tier_n in enumerate(tiers_cfg):
+        if index > 0:
+            _redeploy_cluster(cluster)
+            script_path = _ensure_run_perf_script(cluster)
+        results.append(run_native_perf_tier(cluster, tier_n, script_path=script_path))
 
     return PerfSuiteResult(
         label=run_label,
@@ -294,17 +328,17 @@ def format_perf_summary_report(suite: PerfSuiteResult, *, sinfo_text: str | None
         [
             "## Throughput by tier",
             "",
-            "| Jobs | Submit wall | **Submit tput** | **RPC avg µs** | Drain wall | "
-            "Total wall | **E2E tput** | Peak in queue |",
-            "|-----:|------------:|----------------:|---------------:|-----------:|"
-            "-----------:|-------------:|--------------:|",
+            "| Jobs | Submit wall | **Submit tput** | **RPC avg µs** | Release wall | "
+            "Drain wall | Total wall | **E2E tput** | Peak in queue |",
+            "|-----:|------------:|----------------:|---------------:|-------------:|"
+            "-----------:|-----------:|-------------:|--------------:|",
         ]
     )
     for t in suite.tiers:
         lines.append(
             f"| {t.accepted} | {t.submit_wall_s:.2f}s | **{t.submit_tput_jps:.0f} j/s** | "
-            f"{t.submitjob_rpc_avg_us:.0f} | {t.drain_wall_s:.2f}s | {t.total_wall_s:.2f}s | "
-            f"**{t.e2e_tput_jps:.0f} j/s** | {t.peak_in_queue} |"
+            f"{t.submitjob_rpc_avg_us:.0f} | {t.release_wall_s:.2f}s | {t.drain_wall_s:.2f}s | "
+            f"{t.total_wall_s:.2f}s | **{t.e2e_tput_jps:.0f} j/s** | {t.peak_in_queue} |"
         )
     lines.append("")
 
@@ -320,9 +354,10 @@ def format_perf_summary_report(suite: PerfSuiteResult, *, sinfo_text: str | None
         qw = t.queue_wait
         rt = t.run_time
         tt = t.turnaround
+        job_name_suffix = f", job_name=`{t.perf_job_name}`" if t.perf_job_name else ""
         lines.extend(
             [
-                f"### Tier N={t.tier_n} (sleep={t.sleep_s}s, sampled={t.sampled})",
+                f"### Tier N={t.tier_n} (sleep={t.sleep_s}s, sampled={t.sampled}{job_name_suffix})",
                 "",
                 "| Metric | p50 | p95 | max |",
                 "|--------|----:|----:|----:|",
@@ -375,6 +410,8 @@ def load_suite_json(path: str | Path) -> PerfSuiteResult:
                 submitjob_rpc_avg_us=t["submitjob_rpc_avg_us"],
                 submitjob_rpc_count_delta=t["submitjob_rpc_count_delta"],
                 submitjob_rpc_total_us_delta=t["submitjob_rpc_total_us_delta"],
+                release_wall_s=t.get("release_wall_s", 0.0),
+                perf_job_name=t.get("perf_job_name", ""),
                 drain_wall_s=t["drain_wall_s"],
                 total_wall_s=t["total_wall_s"],
                 e2e_tput_jps=t["e2e_tput_jps"],

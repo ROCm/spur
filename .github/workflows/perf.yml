@@ -25,6 +25,11 @@ on:
         required: false
         default: false
         type: boolean
+      compare_threshold_pct:
+        description: Regression/improvement threshold percent (compare.py)
+        required: false
+        default: "10"
+        type: string
 
 permissions:
   contents: read
@@ -45,6 +50,7 @@ jobs:
       PERF_ASSETS_DIR: /tmp/spur-perf-assets-${{ github.run_id }}
       SPUR_PERF_TIERS: ${{ inputs.tiers }}
       SPUR_PERF_PARALLEL: ${{ inputs.parallel }}
+      SPUR_PERF_COMPARE_THRESHOLD_PCT: ${{ inputs.compare_threshold_pct }}
     steps:
       - name: Resolve PR head SHA
         id: pr
@@ -185,6 +191,7 @@ jobs:
           set -euo pipefail
           echo "######## PERF COMPARISON (PR #${{ inputs.pr_number }} vs nightly) ########"
           ARGS=(/tmp/perf-pr.json /tmp/perf-nightly.json)
+          ARGS+=(--threshold "${{ inputs.compare_threshold_pct }}")
           if [ "${{ inputs.fail_on_regression }}" = "true" ]; then
             ARGS+=(--fail-on-regression)
           fi

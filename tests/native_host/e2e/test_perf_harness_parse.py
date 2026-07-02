@@ -18,6 +18,8 @@ SUBMIT_TPUT_JPS=40.0
 SUBMITJOB_RPC_COUNT_DELTA=10
 SUBMITJOB_RPC_TOTAL_US_DELTA=50000
 SUBMITJOB_RPC_AVG_US=5000
+PERF_JOB_NAME=spur_perf_test
+RELEASE_WALL_S=0.050
 DRAIN_WALL_S=1.000
 TOTAL_WALL_S=1.250
 E2E_TPUT_JPS=8.0
@@ -32,5 +34,7 @@ TURNAROUND_S min/p50/p95/p99/max=0/1/1/1/1
     assert tier.accepted == 10
     assert tier.submit_tput_jps == 40.0
     assert tier.submitjob_rpc_avg_us == 5000
+    assert tier.release_wall_s == 0.05
+    assert tier.perf_job_name == "spur_perf_test"
     assert tier.queue_wait.p95 == 1.0
     assert tier.completed_sampled == 5

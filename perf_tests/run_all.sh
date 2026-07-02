@@ -11,6 +11,11 @@
 # Environment: SPUR_CONTROLLER_ADDR (default http://localhost:6817), SPUR_CLI,
 # TIERS, SLEEP, PAR (passed through to each run_perf.sh tier).
 #
+# Combined table uses `column` when installed; prints raw CSV otherwise.
+# Each tier uses a unique PERF_JOB_NAME on one shared controller; later tiers
+# see warm controller state. For isolated tiers per size, use the pytest harness
+# (redeploys between tiers) or run one tier per ./run_perf.sh invocation.
+#
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -58,4 +63,8 @@ done
 
 echo
 echo "######## COMBINED RESULTS ########"
-column -s, -t "$COMBINED"
+if command -v column >/dev/null 2>&1; then
+  column -s, -t "$COMBINED"
+else
+  cat "$COMBINED"
+fi

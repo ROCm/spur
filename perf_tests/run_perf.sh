@@ -15,6 +15,8 @@
 #
 # Output is printed to stdout only (KEY=VALUE metrics block at end).
 #
+# Exits non-zero when fewer than N jobs are accepted or the drain poll times out.
+#
 # Requires GNU coreutils (date -d, sort -g).
 #
 # Environment: SPUR_CONTROLLER_ADDR (spurctld gRPC, default http://localhost:6817),
@@ -172,6 +174,7 @@ seq 1 "$N" | xargs -P "$PAR" -I{} bash -c \
 t_sub_end="$(now)"
 
 NSUB="$(grep -c . "$IDS" 2>/dev/null || echo 0)"
+[ "$NSUB" -eq "$N" ] || die "only $NSUB/$N jobs accepted"
 SUBMIT_WALL="$(awk "BEGIN{printf \"%.3f\", $t_sub_end - $t_sub_start}")"
 SUBMIT_TPUT="$(awk -v wall="$SUBMIT_WALL" -v nsub="$NSUB" 'BEGIN{ if (wall > 0) printf "%.1f", nsub / wall; else print 0 }')"
 echo "    accepted=$NSUB  submit_wall=${SUBMIT_WALL}s  submit_throughput=${SUBMIT_TPUT} jobs/s"
@@ -195,7 +198,7 @@ while read -r jid; do
   [ -z "$jid" ] && continue
   echo "$jid"
 done < "$IDS" | xargs -r -P "$PAR" -I{} bash -c \
-  '$SPUR_CLI control release "$1" 2>/dev/null || true' _ {}
+  '$SPUR_CLI control release "$1" >/dev/null 2>/dev/null || true' _ {}
 t_release_end="$(now)"
 RELEASE_WALL="$(awk "BEGIN{printf \"%.3f\", $t_release_end - $t_release_start}")"
 echo "    release_wall=${RELEASE_WALL}s"
@@ -203,16 +206,20 @@ echo "    release_wall=${RELEASE_WALL}s"
 echo "==> Waiting for queue to drain (timeout ${DRAIN_TIMEOUT}s)..."
 t_drain_deadline=$(( $(date +%s) + DRAIN_TIMEOUT ))
 peak_running=0
+drain_timed_out=0
+q=0
 while :; do
   q="$("$SPUR_CLI" jobs 2>/dev/null | awk 'NR > 1 && $4 == "'"$USER"'"' | wc -l | tr -d ' ')"
   [ "$q" -gt "$peak_running" ] && peak_running="$q"
   [ "$q" -eq 0 ] && break
   [ "$(date +%s)" -ge "$t_drain_deadline" ] && {
     echo "    DRAIN TIMEOUT, $q still queued"
+    drain_timed_out=1
     break
   }
   sleep 1
 done
+[ "$drain_timed_out" -eq 0 ] || die "drain timeout after ${DRAIN_TIMEOUT}s, $q jobs still queued"
 t_all_end="$(now)"
 DRAIN_WALL="$(awk "BEGIN{printf \"%.3f\", $t_all_end - $t_release_end}")"
 TOTAL_WALL="$(awk "BEGIN{printf \"%.3f\", $t_all_end - $t_sub_start}")"
