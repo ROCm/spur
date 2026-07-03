@@ -3365,17 +3365,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.controller.first_job_id = 500;
-        let cm = Arc::new(ClusterManager::new(config, dir.path()).unwrap());
-        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
-            .await
-            .unwrap();
-        handle
-            .raft
-            .wait(Some(std::time::Duration::from_secs(5)))
-            .metrics(|m| m.current_leader == Some(1), "leader elected")
-            .await
-            .expect("single-node raft did not self-elect within 5s");
-        cm.set_raft(handle.raft);
+        let cm = test_cluster_with_config(&dir, config).await;
 
         assert_eq!(cm.next_job_id.load(Ordering::Relaxed), 500);
 
