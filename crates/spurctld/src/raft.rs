@@ -156,11 +156,14 @@ impl SpurStore {
             );
         } else if let Some(snap_last) = snapshot_last_log_id {
             // Backward compat: a node that compacted its log before purged.json
-            // existed has a snapshot but no purged.json. openraft purges up to the
-            // snapshot's last_log_id when it compacts, so that id is the correct
-            // last_purged lower bound. Without this, such a node recovers with
-            // last_purged=None and reproduces the startup panic the moment openraft
-            // reads a purged log range.
+            // existed has a snapshot but no purged.json. The true last_purged is
+            // actually lower (openraft retains up to max_in_snapshot_log_to_keep
+            // entries below the snapshot), so the snapshot's last_log_id is a SAFE
+            // upper bound, not the exact value -- the extra retained logs are just
+            // orphaned and cleaned on the next purge. This matches what openraft
+            // uses to reconcile a snapshot-vs-log hole. Without it, such a node
+            // recovers with last_purged=None and reproduces the startup panic the
+            // moment openraft reads a purged log range.
             warn!(
                 last_purged = ?snap_last,
                 "purged.json missing; deriving last_purged from snapshot meta (pre-patch compat)"
@@ -924,6 +927,20 @@ mod tests {
         let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
         let inner = store.inner.read();
         assert!(inner.last_purged.is_none());
+    }
+
+    #[test]
+    fn store_corrupt_purged_file_hard_fails() {
+        let dir = TempDir::new().unwrap();
+        // Create the store once so the raft/ subdir exists, then corrupt purged.json.
+        SpurStore::new(dir.path(), noop_applier()).unwrap();
+        std::fs::write(
+            dir.path().join("raft").join("purged.json"),
+            "not valid json",
+        )
+        .unwrap();
+
+        assert!(SpurStore::new(dir.path(), noop_applier()).is_err());
     }
 
     // A node that compacted its log before purged.json existed has a snapshot
