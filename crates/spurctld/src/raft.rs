@@ -127,15 +127,17 @@ impl SpurStore {
             }
         }
 
+        let mut snapshot_last_log_id: Option<LogId<NodeId>> = None;
         let snap_path = raft_dir.join("snapshot.json");
         if snap_path.exists() {
             // Soft-fail: a corrupt snapshot triggers re-snapshot on the next leader term.
-            // A missing/corrupt purged.json (below) cannot be recovered the same way.
+            // A present-but-corrupt purged.json (below) cannot be recovered the same way.
             match std::fs::read_to_string(&snap_path) {
                 Ok(data) => match serde_json::from_str::<PersistedSnapshot>(&data) {
                     Ok(ps) => {
                         inner.last_applied = ps.meta.last_log_id;
                         inner.last_membership = ps.meta.last_membership.clone();
+                        snapshot_last_log_id = ps.meta.last_log_id;
                         applier.restore_from_snapshot(&ps.data);
                     }
                     Err(e) => warn!("failed to parse snapshot.json: {e}"),
@@ -152,6 +154,18 @@ impl SpurStore {
                 serde_json::from_str::<LogId<NodeId>>(&data)
                     .map_err(|e| anyhow::anyhow!("failed to parse purged.json: {e}"))?,
             );
+        } else if let Some(snap_last) = snapshot_last_log_id {
+            // Backward compat: a node that compacted its log before purged.json
+            // existed has a snapshot but no purged.json. openraft purges up to the
+            // snapshot's last_log_id when it compacts, so that id is the correct
+            // last_purged lower bound. Without this, such a node recovers with
+            // last_purged=None and reproduces the startup panic the moment openraft
+            // reads a purged log range.
+            warn!(
+                last_purged = ?snap_last,
+                "purged.json missing; deriving last_purged from snapshot meta (pre-patch compat)"
+            );
+            inner.last_purged = Some(snap_last);
         }
 
         info!(
@@ -910,5 +924,38 @@ mod tests {
         let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
         let inner = store.inner.read();
         assert!(inner.last_purged.is_none());
+    }
+
+    // A node that compacted its log before purged.json existed has a snapshot
+    // but no purged.json. Recovery must derive last_purged from the snapshot
+    // meta rather than defaulting to None (which reproduces the startup panic).
+    #[tokio::test]
+    async fn store_derives_last_purged_from_snapshot_when_purged_file_absent() {
+        use openraft::RaftStorage;
+        let dir = TempDir::new().unwrap();
+
+        let snap_last = LogId {
+            leader_id: openraft::LeaderId {
+                term: 3,
+                node_id: 1,
+            },
+            index: 100,
+        };
+
+        // Write a snapshot but no purged.json, mirroring a pre-patch compacted node.
+        {
+            let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
+            let meta = SnapshotMeta {
+                last_log_id: Some(snap_last),
+                last_membership: StoredMembership::default(),
+                snapshot_id: "snap-100".into(),
+            };
+            store.persist_snapshot(&meta, b"snapshot data").unwrap();
+        }
+        assert!(!dir.path().join("raft").join("purged.json").exists());
+
+        let mut store = Arc::new(SpurStore::new(dir.path(), noop_applier()).unwrap());
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id, Some(snap_last));
     }
 }
