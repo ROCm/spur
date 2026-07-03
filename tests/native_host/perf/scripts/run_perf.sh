@@ -16,7 +16,8 @@
 # Jobs are released before drain; metric 3 samples the released run. Active jobs
 # matching PERF_JOB_NAME are cancelled on exit (success or failure).
 #
-# Output is printed to stdout only (KEY=VALUE metrics block at end).
+# Human-readable progress on stdout; tier metrics as one JSON line:
+#   PERF_METRICS_JSON={...}
 #
 # Exits non-zero when fewer than N jobs are accepted or the drain poll times out.
 #
@@ -51,7 +52,7 @@
 #   TOTAL_WALL_S   = t_all_end   − t_sub_start
 #   (gap t_sub_end → t_release_start is POST-RPC read only; not reported)
 #
-# ── Metric formulas (stdout KEY=VALUE block) ───────────────────────────────────
+# Parse metrics JSON from run_perf.sh tier output (see scripts/run_perf.sh).
 #
 # Config (inputs, not computed):
 #   TIER_N, JOB_SLEEP_S, SUBMITTERS, PERF_JOB_NAME
@@ -273,27 +274,44 @@ read -r RT_MIN RT_P50 RT_P95 RT_P99 RT_MAX <<<"$(pctl 2)"
 read -r TT_MIN TT_P50 TT_P95 TT_P99 TT_MAX <<<"$(pctl 3)"
 SAMPLED=$(wc -l < "$LATENCY_ROWS" | tr -d ' ')
 
-{
-  echo "TIER_N=$N"
-  echo "JOB_SLEEP_S=$SLEEP"
-  echo "SUBMITTERS=$PAR"
-  echo "ACCEPTED=$NSUB"
-  echo "SUBMIT_WALL_S=$SUBMIT_WALL"
-  echo "SUBMIT_TPUT_JPS=$SUBMIT_TPUT"
-  echo "SUBMITJOB_RPC_COUNT_DELTA=$DELTA_COUNT"
-  echo "SUBMITJOB_RPC_TOTAL_US_DELTA=$DELTA_TOTAL"
-  echo "SUBMITJOB_RPC_AVG_US=$SUBMITJOB_RPC_AVG_US"
-  echo "PERF_JOB_NAME=$JOB_NAME"
-  echo "RELEASE_WALL_S=$RELEASE_WALL"
-  echo "DRAIN_WALL_S=$DRAIN_WALL"
-  echo "TOTAL_WALL_S=$TOTAL_WALL"
-  echo "E2E_TPUT_JPS=$E2E_TPUT"
-  echo "PEAK_IN_QUEUE=$peak_running"
-  echo "SAMPLED=$SAMPLED COMPLETED_SAMPLED=$completed NONCOMPLETED_SAMPLED=$failed"
-  echo "QUEUE_WAIT_S min/p50/p95/p99/max=$QW_MIN/$QW_P50/$QW_P95/$QW_P99/$QW_MAX"
-  echo "RUN_TIME_S   min/p50/p95/p99/max=$RT_MIN/$RT_P50/$RT_P95/$RT_P99/$RT_MAX"
-  echo "TURNAROUND_S min/p50/p95/p99/max=$TT_MIN/$TT_P50/$TT_P95/$TT_P99/$TT_MAX"
-}
+export PERF_JSON_N="$N" PERF_JSON_SLEEP="$SLEEP" PERF_JSON_PAR="$PAR"
+export PERF_JSON_NSUB="$NSUB" PERF_JSON_SUBMIT_WALL="$SUBMIT_WALL"
+export PERF_JSON_SUBMIT_TPUT="$SUBMIT_TPUT" PERF_JSON_DELTA_COUNT="$DELTA_COUNT"
+export PERF_JSON_DELTA_TOTAL="$DELTA_TOTAL" PERF_JSON_RPC_AVG="$SUBMITJOB_RPC_AVG_US"
+export PERF_JSON_JOB_NAME="$JOB_NAME" PERF_JSON_RELEASE_WALL="$RELEASE_WALL"
+export PERF_JSON_DRAIN_WALL="$DRAIN_WALL" PERF_JSON_TOTAL_WALL="$TOTAL_WALL"
+export PERF_JSON_E2E_TPUT="$E2E_TPUT" PERF_JSON_PEAK="$peak_running"
+export PERF_JSON_SAMPLED="$SAMPLED" PERF_JSON_COMPLETED="$completed"
+export PERF_JSON_FAILED="$failed"
+export PERF_JSON_QW_MIN="$QW_MIN" PERF_JSON_QW_P50="$QW_P50" PERF_JSON_QW_P95="$QW_P95"
+export PERF_JSON_QW_P99="$QW_P99" PERF_JSON_QW_MAX="$QW_MAX"
+export PERF_JSON_RT_MIN="$RT_MIN" PERF_JSON_RT_P50="$RT_P50" PERF_JSON_RT_P95="$RT_P95"
+export PERF_JSON_RT_P99="$RT_P99" PERF_JSON_RT_MAX="$RT_MAX"
+export PERF_JSON_TT_MIN="$TT_MIN" PERF_JSON_TT_P50="$TT_P50" PERF_JSON_TT_P95="$TT_P95"
+export PERF_JSON_TT_P99="$TT_P99" PERF_JSON_TT_MAX="$TT_MAX"
+python3 -c 'import json, os; print("PERF_METRICS_JSON=" + json.dumps({
+  "tier_n": int(os.environ["PERF_JSON_N"]),
+  "sleep_s": int(os.environ["PERF_JSON_SLEEP"]),
+  "submitters": int(os.environ["PERF_JSON_PAR"]),
+  "accepted": int(os.environ["PERF_JSON_NSUB"]),
+  "submit_wall_s": float(os.environ["PERF_JSON_SUBMIT_WALL"]),
+  "submit_tput_jps": float(os.environ["PERF_JSON_SUBMIT_TPUT"]),
+  "submitjob_rpc_count_delta": int(os.environ["PERF_JSON_DELTA_COUNT"]),
+  "submitjob_rpc_total_us_delta": int(os.environ["PERF_JSON_DELTA_TOTAL"]),
+  "submitjob_rpc_avg_us": float(os.environ["PERF_JSON_RPC_AVG"]),
+  "perf_job_name": os.environ["PERF_JSON_JOB_NAME"],
+  "release_wall_s": float(os.environ["PERF_JSON_RELEASE_WALL"]),
+  "drain_wall_s": float(os.environ["PERF_JSON_DRAIN_WALL"]),
+  "total_wall_s": float(os.environ["PERF_JSON_TOTAL_WALL"]),
+  "e2e_tput_jps": float(os.environ["PERF_JSON_E2E_TPUT"]),
+  "peak_in_queue": int(os.environ["PERF_JSON_PEAK"]),
+  "sampled": int(os.environ["PERF_JSON_SAMPLED"]),
+  "completed_sampled": int(os.environ["PERF_JSON_COMPLETED"]),
+  "noncompleted_sampled": int(os.environ["PERF_JSON_FAILED"]),
+  "queue_wait": {"min": float(os.environ["PERF_JSON_QW_MIN"]), "p50": float(os.environ["PERF_JSON_QW_P50"]), "p95": float(os.environ["PERF_JSON_QW_P95"]), "p99": float(os.environ["PERF_JSON_QW_P99"]), "max": float(os.environ["PERF_JSON_QW_MAX"])},
+  "run_time": {"min": float(os.environ["PERF_JSON_RT_MIN"]), "p50": float(os.environ["PERF_JSON_RT_P50"]), "p95": float(os.environ["PERF_JSON_RT_P95"]), "p99": float(os.environ["PERF_JSON_RT_P99"]), "max": float(os.environ["PERF_JSON_RT_MAX"])},
+  "turnaround": {"min": float(os.environ["PERF_JSON_TT_MIN"]), "p50": float(os.environ["PERF_JSON_TT_P50"]), "p95": float(os.environ["PERF_JSON_TT_P95"]), "p99": float(os.environ["PERF_JSON_TT_P99"]), "max": float(os.environ["PERF_JSON_TT_MAX"])},
+}, separators=(",", ":")))'
 
 echo "==> Cleaning up active jobs (name=$JOB_NAME)..."
 cleanup_jobs

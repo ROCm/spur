@@ -1,4 +1,4 @@
-# Spur performance tests
+# Spur performance scripts
 
 Shell benchmarks for scheduling and ingestion on a Spur cluster: submit throughput,
 `SubmitJob` RPC handle time, and queue-wait latency after held jobs are released.
@@ -8,21 +8,21 @@ Shell benchmarks for scheduling and ingestion on a Spur cluster: submit throughp
 
 | File | Purpose |
 |------|---------|
-| [`run_perf.sh`](run_perf.sh) | One tier; stdout KEY=VALUE metrics block |
-| [`run_all.sh`](run_all.sh) | Several tiers; combined summary table on stdout |
+| [`run_perf.sh`](run_perf.sh) | One tier; stdout ends with `PERF_METRICS_JSON={...}` |
+| [`run_all.sh`](run_all.sh) | Several tiers on one controller; combined summary table |
 
 ## Manual run (existing cluster)
 
 Run on a node where `spur` can reach spurctld (`SPUR_CONTROLLER_ADDR`).
 
 ```bash
-cd perf_tests
+cd tests/native_host/perf/scripts
 chmod +x run_perf.sh run_all.sh
 
 # One tier: N jobs, sleep seconds, parallel submitters
 ./run_perf.sh 1000 0 48
 
-# Multi-tier sweep
+# Multi-tier sweep (warm controller between tiers — see run_all.sh header)
 TIERS="100 500 1000 2000" PAR=48 SLEEP=0 ./run_all.sh
 ```
 
@@ -44,4 +44,4 @@ Copy to a remote node if needed: `scp run_perf.sh run_all.sh <host>:~/`
 ## Pytest and CI
 
 For ephemeral-cluster runs, JSON export, PR-vs-nightly comparison, and `SPUR_PERF_*`
-variables, see [`tests/native_host/e2e/perf_harness/README.md`](../tests/native_host/e2e/perf_harness/README.md).
+variables, see [`../README.md`](../README.md).

@@ -4,8 +4,8 @@
 """
 Optional scheduler perf test (native-host).
 
-Uses the same ``cluster`` fixture as other native tests. After a successful run,
-prints a markdown-style summary to stdout.
+Uses the shared ``cluster`` fixture from ``tests/native_host/conftest.py``.
+After a successful run, prints a markdown-style summary to stdout.
 """
 
 from __future__ import annotations
@@ -15,16 +15,12 @@ import warnings
 
 import pytest
 
-from perf_harness.harness import (
-    format_perf_summary_report,
-    parse_tiers_from_env,
-    run_native_perf_suite,
-    write_suite_json,
-)
+from perf.harness import parse_tiers_from_env, run_native_perf_suite
+from perf.report import format_perf_summary_report, write_suite_json
 
 
 @pytest.mark.perf
-def test_scheduler_perf_submit_drain_latency(cluster):
+def test_scheduler_perf_submit_drain_latency(cluster, perf_json_path):
     tiers = parse_tiers_from_env()
     assert tiers, "SPUR_PERF_TIERS produced no tiers"
 
@@ -46,6 +42,6 @@ def test_scheduler_perf_submit_drain_latency(cluster):
     report = format_perf_summary_report(suite, sinfo_text=sinfo_text)
     print(report, flush=True)
 
-    json_out = os.environ.get("SPUR_PERF_JSON_OUT", "").strip()
+    json_out = perf_json_path
     if json_out:
         write_suite_json(suite, json_out)

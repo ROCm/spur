@@ -5,18 +5,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from perf_harness.compare import (
-    _delta_pct,
-    _tier_mismatch_warnings,
-    _verdict,
-    compare_perf_suites,
-    format_comparison_report,
-    main,
-)
-from perf_harness.harness import (
+from perf.report import (
+    DEFAULT_METRIC_POLICIES,
+    MetricPolicy,
     PercentileStats,
     PerfSuiteResult,
     PerfTierResult,
+    compare_perf_suites,
+    delta_pct,
+    format_comparison_report,
+    load_suite_json,
+    main,
+    tier_mismatch_warnings,
+    verdict_for_metric,
     write_suite_json,
 )
 
@@ -67,41 +68,39 @@ def _suite(label: str, *tiers: PerfTierResult) -> PerfSuiteResult:
 
 
 def test_delta_pct_zero_baseline():
-    assert _delta_pct(0.0, 0.0) == 0.0
-    assert _delta_pct(10.0, 0.0) is None
+    assert delta_pct(0.0, 0.0) == 0.0
+    assert delta_pct(10.0, 0.0) is None
 
 
 def test_delta_pct_normal():
-    assert _delta_pct(110.0, 100.0) == 10.0
-    assert _delta_pct(90.0, 100.0) == -10.0
+    assert delta_pct(110.0, 100.0) == 10.0
+    assert delta_pct(90.0, 100.0) == -10.0
 
 
 def test_verdict_higher_is_better():
-    threshold = 10.0
-    assert _verdict(15.0, higher_is_better=True, threshold=threshold) == "improved"
-    assert _verdict(-15.0, higher_is_better=True, threshold=threshold) == "regressed"
-    assert _verdict(5.0, higher_is_better=True, threshold=threshold) == "similar"
-    assert _verdict(None, higher_is_better=True, threshold=threshold) == "n/a"
+    policy = MetricPolicy(True, 10.0, 0.0, True)
+    assert verdict_for_metric(15.0, candidate=115.0, baseline=100.0, policy=policy) == "improved"
+    assert verdict_for_metric(-15.0, candidate=85.0, baseline=100.0, policy=policy) == "regressed"
+    assert verdict_for_metric(5.0, candidate=105.0, baseline=100.0, policy=policy) == "similar"
+    assert verdict_for_metric(None, candidate=0.0, baseline=0.0, policy=policy) == "n/a"
 
 
-def test_verdict_lower_is_better():
-    threshold = 10.0
-    assert _verdict(-15.0, higher_is_better=False, threshold=threshold) == "improved"
-    assert _verdict(15.0, higher_is_better=False, threshold=threshold) == "regressed"
-    assert _verdict(5.0, higher_is_better=False, threshold=threshold) == "similar"
+def test_verdict_abs_floor_latency():
+    policy = DEFAULT_METRIC_POLICIES["queue_wait_p50_s"]
+    assert verdict_for_metric(100.0, candidate=2.0, baseline=1.0, policy=policy) == "similar"
 
 
 def test_compare_perf_suites_skips_missing_baseline_tier():
     candidate = _suite("pr", _tier(100), _tier(500))
     baseline = _suite("nightly", _tier(100))
-    comparisons = compare_perf_suites(candidate, baseline, threshold_pct=10.0)
+    comparisons = compare_perf_suites(candidate, baseline)
     assert set(comparisons) == {100}
 
 
 def test_tier_mismatch_warnings():
     candidate = _suite("pr", _tier(100), _tier(500))
     baseline = _suite("nightly", _tier(100), _tier(1000))
-    warnings = _tier_mismatch_warnings(candidate, baseline)
+    warnings = tier_mismatch_warnings(candidate, baseline)
     assert warnings == [
         "baseline missing tier N=500",
         "candidate missing tier N=1000",
@@ -111,10 +110,35 @@ def test_tier_mismatch_warnings():
 def test_format_comparison_report_includes_warnings():
     candidate = _suite("pr", _tier(100), _tier(500))
     baseline = _suite("nightly", _tier(100))
-    comparisons = compare_perf_suites(candidate, baseline, threshold_pct=10.0)
+    comparisons = compare_perf_suites(candidate, baseline)
     report = format_comparison_report(candidate, baseline, comparisons, threshold_pct=10.0)
     assert "## Warnings" in report
     assert "baseline missing tier N=500" in report
+
+
+def test_format_comparison_report_splits_fail_gated_regressions():
+    candidate = _suite(
+        "pr",
+        _tier(100, submit_tput_jps=70.0, queue_wait_p50=20.0),
+    )
+    baseline = _suite("nightly", _tier(100, submit_tput_jps=100.0, queue_wait_p50=5.0))
+    comparisons = compare_perf_suites(candidate, baseline)
+    report = format_comparison_report(candidate, baseline, comparisons, threshold_pct=10.0)
+    assert "### Regressions (fail-gated)" in report
+    assert "submit_tput_jps" in report
+    assert "### Latency deltas (advisory, not fail-gated)" in report
+    assert "queue_wait_p50_s" in report
+
+
+def test_suite_json_roundtrip(tmp_path: Path):
+    suite = _suite("roundtrip", _tier(50))
+    path = tmp_path / "suite.json"
+    write_suite_json(suite, path)
+    loaded = load_suite_json(path)
+    assert loaded.label == suite.label
+    assert len(loaded.tiers) == 1
+    assert loaded.tiers[0].tier_n == 50
+    assert loaded.tiers[0].submit_tput_jps == suite.tiers[0].submit_tput_jps
 
 
 def test_main_fail_on_regression(tmp_path: Path):

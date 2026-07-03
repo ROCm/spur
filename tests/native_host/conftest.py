@@ -15,7 +15,7 @@ import pytest
 
 from cluster import SshNode, SpurCluster, ensure_bins, make_remote_dir
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _get_nodes_config() -> list[str]:
@@ -96,7 +96,7 @@ def remote_bin_dir(ssh_nodes, tmp_path_factory):
         node.exec_allow_fail(f"rm -rf '{remote_path}'")
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="session")
 def _ensure_bins(ssh_nodes, remote_bin_dir):
     """
     Session-scoped: uploads binaries to all nodes once.
@@ -141,7 +141,7 @@ def cluster_config_overrides():
 
 
 @pytest.fixture
-def cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
+def cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides, _ensure_bins):
     """
     Per-test fixture: a fully running Spur cluster with default config.
     Torn down (processes killed, dirs removed) after the test.
@@ -153,7 +153,7 @@ def cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
 
 
 @pytest.fixture
-def unstarted_cluster(ssh_nodes, remote_bin_dir):
+def unstarted_cluster(ssh_nodes, remote_bin_dir, _ensure_bins):
     """
     Per-test fixture: a provisioned cluster (dirs created, hostnames
     resolved) but **not started**.
@@ -168,7 +168,7 @@ def unstarted_cluster(ssh_nodes, remote_bin_dir):
 
 
 @pytest.fixture
-def multi_node_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
+def multi_node_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides, _ensure_bins):
     """
     Per-test fixture for multi-node tests.
     Skips if fewer than 2 nodes are configured.
@@ -227,7 +227,7 @@ def _any_node_has_gpu(nodes: list[SshNode]) -> bool:
 
 
 @pytest.fixture
-def gpu_cluster(request, ssh_nodes, remote_bin_dir):
+def gpu_cluster(request, ssh_nodes, remote_bin_dir, _ensure_bins):
     """
     Per-test fixture for GPU tests.
 
@@ -246,7 +246,7 @@ def gpu_cluster(request, ssh_nodes, remote_bin_dir):
 
 
 @pytest.fixture(scope="class")
-def label_cluster(ssh_nodes, remote_bin_dir):
+def label_cluster(ssh_nodes, remote_bin_dir, _ensure_bins):
     """Class-scoped cluster for node label and partition selector tests."""
     if len(ssh_nodes) < 2:
         pytest.skip(

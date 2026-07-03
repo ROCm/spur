@@ -32,6 +32,14 @@ STAMP="$(date +%Y%m%d_%H%M%S)"
 COMBINED="$(mktemp)"
 trap 'rm -f "$COMBINED"' EXIT
 
+_json_field() {
+  python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d[sys.argv[2]])' "$1" "$2"
+}
+
+_json_pct() {
+  python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d[sys.argv[2]][sys.argv[3]])' "$1" "$2" "$3"
+}
+
 echo "tier_n,accepted,submit_wall_s,submit_tput_jps,submitjob_rpc_avg_us,drain_wall_s,total_wall_s,e2e_tput_jps,peak_in_queue,qw_p50,qw_p95,qw_max,tt_p50,tt_p95,tt_max" > "$COMBINED"
 
 echo "######## Spur perf run $STAMP ########"
@@ -44,22 +52,26 @@ for n in $TIERS; do
   echo "======================== TIER N=$n ========================"
   tier_out="$(mktemp)"
   PERF_JOB_NAME="spur_perf_${STAMP}_n${n}" ./run_perf.sh "$n" "$SLEEP" "$PAR" 2>&1 | tee "$tier_out"
-  acc=$(grep -E '^ACCEPTED=' "$tier_out" | cut -d= -f2)
-  sw=$(grep -E '^SUBMIT_WALL_S=' "$tier_out" | cut -d= -f2)
-  st=$(grep -E '^SUBMIT_TPUT_JPS=' "$tier_out" | cut -d= -f2)
-  rpc=$(grep -E '^SUBMITJOB_RPC_AVG_US=' "$tier_out" | cut -d= -f2)
-  dw=$(grep -E '^DRAIN_WALL_S=' "$tier_out" | cut -d= -f2)
-  tw=$(grep -E '^TOTAL_WALL_S=' "$tier_out" | cut -d= -f2)
-  e2e=$(grep -E '^E2E_TPUT_JPS=' "$tier_out" | cut -d= -f2)
-  pk=$(grep -E '^PEAK_IN_QUEUE=' "$tier_out" | cut -d= -f2)
-  qw=$(grep -E '^QUEUE_WAIT_S' "$tier_out" | grep -oE '[0-9]+/[0-9]+/[0-9]+/[0-9]+/[0-9]+' | head -1)
-  tt=$(grep -E '^TURNAROUND_S' "$tier_out" | grep -oE '[0-9]+/[0-9]+/[0-9]+/[0-9]+/[0-9]+' | head -1)
-  qw_p50=$(echo "$qw" | cut -d/ -f2)
-  qw_p95=$(echo "$qw" | cut -d/ -f3)
-  qw_max=$(echo "$qw" | cut -d/ -f5)
-  tt_p50=$(echo "$tt" | cut -d/ -f2)
-  tt_p95=$(echo "$tt" | cut -d/ -f3)
-  tt_max=$(echo "$tt" | cut -d/ -f5)
+  json_line=$(grep '^PERF_METRICS_JSON=' "$tier_out" | tail -1)
+  if [ -z "$json_line" ]; then
+    echo "ERROR: tier N=$n produced no PERF_METRICS_JSON line" >&2
+    exit 1
+  fi
+  payload="${json_line#PERF_METRICS_JSON=}"
+  acc=$(_json_field "$payload" accepted)
+  sw=$(_json_field "$payload" submit_wall_s)
+  st=$(_json_field "$payload" submit_tput_jps)
+  rpc=$(_json_field "$payload" submitjob_rpc_avg_us)
+  dw=$(_json_field "$payload" drain_wall_s)
+  tw=$(_json_field "$payload" total_wall_s)
+  e2e=$(_json_field "$payload" e2e_tput_jps)
+  pk=$(_json_field "$payload" peak_in_queue)
+  qw_p50=$(_json_pct "$payload" queue_wait p50)
+  qw_p95=$(_json_pct "$payload" queue_wait p95)
+  qw_max=$(_json_pct "$payload" queue_wait max)
+  tt_p50=$(_json_pct "$payload" turnaround p50)
+  tt_p95=$(_json_pct "$payload" turnaround p95)
+  tt_max=$(_json_pct "$payload" turnaround max)
   echo "$n,$acc,$sw,$st,$rpc,$dw,$tw,$e2e,$pk,$qw_p50,$qw_p95,$qw_max,$tt_p50,$tt_p95,$tt_max" >> "$COMBINED"
   rm -f "$tier_out"
 done
