@@ -73,10 +73,10 @@ python -m perf.report /tmp/perf-pr.json /tmp/perf-nightly.json --fail-on-regress
 ## CI
 
 Manual workflow [`.github/workflows/perf.yml`](../../../.github/workflows/perf.yml)
-builds PR and nightly binaries, then calls `run_perf_compare.sh`. First merge of
-this layout must land before the workflow paths resolve on the default branch.
+downloads PR binaries and test assets from the successful CI run for the PR head
+SHA (no build on the bare-metal runner), compares against the latest nightly
+release, and runs `run_perf_compare.sh`.
 
 ## Further reading
 
 - Metric definitions: header comment in [`scripts/run_perf.sh`](scripts/run_perf.sh)
-- Ingestion benchmark doc: [`docs/developer/ingestion-benchmark.md`](../../../docs/developer/ingestion-benchmark.md)

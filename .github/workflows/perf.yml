@@ -1,6 +1,8 @@
 # Manual perf comparison: PR binaries vs latest nightly on bare-metal cluster.
 #
 # workflow_dispatch only — not part of default CI/E2E.
+# No PR checkout or build on the self-hosted runner; PR binaries and test assets
+# come from the successful CI run for the PR head SHA (same pattern as e2e.yml).
 name: Perf
 
 on:
@@ -33,6 +35,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   perf-compare:
@@ -52,7 +55,7 @@ jobs:
       SPUR_PERF_PARALLEL: ${{ inputs.parallel }}
       SPUR_PERF_COMPARE_THRESHOLD_PCT: ${{ inputs.compare_threshold_pct }}
     steps:
-      - name: Resolve PR head SHA
+      - name: Resolve PR head SHA and CI run
         id: pr
         env:
           GH_TOKEN: ${{ github.token }}
@@ -61,28 +64,29 @@ jobs:
           PR="${{ inputs.pr_number }}"
           HEAD_SHA=$(gh pr view "$PR" --repo "${{ github.repository }}" --json headRefOid -q .headRefOid)
           HEAD_REF=$(gh pr view "$PR" --repo "${{ github.repository }}" --json headRefName -q .headRefName)
+          RUN_ID=$(gh run list --repo "${{ github.repository }}" --workflow CI \
+            --commit "$HEAD_SHA" --status success --json databaseId -q '.[0].databaseId')
+          test -n "$RUN_ID" || { echo "no successful CI run for $HEAD_SHA"; exit 1; }
           echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
           echo "head_ref=${HEAD_REF}" >> "$GITHUB_OUTPUT"
-          echo "PR #${PR} @ ${HEAD_SHA} (${HEAD_REF})"
+          echo "ci_run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "PR #${PR} @ ${HEAD_SHA} (${HEAD_REF}), CI run ${RUN_ID}"
 
-      - name: Checkout PR head
-        uses: actions/checkout@v7
+      - name: Download PR binaries from CI
+        uses: actions/download-artifact@v8
         with:
-          ref: ${{ steps.pr.outputs.head_sha }}
-          path: pr-src
+          name: release-binaries
+          path: /tmp/perf-pr-bins
+          run-id: ${{ steps.pr.outputs.ci_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build PR release binaries
-        working-directory: pr-src
-        run: |
-          set -euo pipefail
-          docker build -f Dockerfile --target dist -t spur:perf-pr .
-          CID=$(docker create spur:perf-pr)
-          mkdir -p /tmp/perf-pr-bins
-          for bin in spur spurctld spurd spurdbd; do
-            docker cp "$CID:/usr/local/bin/$bin" "/tmp/perf-pr-bins/$bin"
-          done
-          docker rm "$CID"
-          chmod +x /tmp/perf-pr-bins/*
+      - name: Download PR perf assets from CI
+        uses: actions/download-artifact@v8
+        with:
+          name: e2e-assets
+          path: ${{ env.PERF_ASSETS_DIR }}
+          run-id: ${{ steps.pr.outputs.ci_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download latest nightly binaries
         env:
@@ -93,18 +97,11 @@ jobs:
           gh release download nightly --repo "${{ github.repository }}" \
             --pattern 'spur-*.tar.gz' --dir /tmp/nightly-dl
           tar xzf /tmp/nightly-dl/spur-*.tar.gz -C /tmp/nightly-dl
-          BINDIR=$(find /tmp/nightly-dl -path '*/bin' -type d | head -1)
+          BINDIR=$(find /tmp/nightly-dl -path '*/bin' -type d -print -quit)
           test -n "$BINDIR"
           mkdir -p /tmp/perf-nightly-bins
           cp -a "$BINDIR"/* /tmp/perf-nightly-bins/
           chmod +x /tmp/perf-nightly-bins/*
-
-      - name: Stage perf test assets
-        run: |
-          set -euo pipefail
-          mkdir -p "$PERF_ASSETS_DIR"
-          cp -r pr-src/tests "$PERF_ASSETS_DIR/"
-          cp -r pr-src/scripts "$PERF_ASSETS_DIR/"
 
       - name: Set up Python venv
         run: |
@@ -139,7 +136,11 @@ jobs:
               "${BM_SSH_USER}@${node}" "
               sudo pkill -f '${BM_REMOTE_BIN_DIR}/spurctld' 2>/dev/null || true
               sudo pkill -f '${BM_REMOTE_BIN_DIR}/spurd' 2>/dev/null || true
-              sudo rm -rf /tmp/spur-e2e-* 2>/dev/null || true
+              sudo pkill -f '${BM_REMOTE_BIN_DIR_PR}/spurctld' 2>/dev/null || true
+              sudo pkill -f '${BM_REMOTE_BIN_DIR_PR}/spurd' 2>/dev/null || true
+              sudo pkill -f '${BM_REMOTE_BIN_DIR_NIGHTLY}/spurctld' 2>/dev/null || true
+              sudo pkill -f '${BM_REMOTE_BIN_DIR_NIGHTLY}/spurd' 2>/dev/null || true
+              sudo rm -rf '${BM_REMOTE_BIN_DIR_PR}' '${BM_REMOTE_BIN_DIR_NIGHTLY}' /tmp/spur-e2e-* 2>/dev/null || true
             " || true
           done
 
@@ -149,6 +150,7 @@ jobs:
           SPUR_TEST_SSH_USER: ${{ env.BM_SSH_USER }}
         run: |
           set -euo pipefail
+          chmod +x /tmp/perf-pr-bins/*
           chmod +x "$PERF_ASSETS_DIR/tests/native_host/perf/run_perf_compare.sh"
           ARGS=(
             /tmp/perf-pr-bins
@@ -179,7 +181,7 @@ jobs:
               sudo pkill -f '${BM_REMOTE_BIN_DIR_NIGHTLY}/spurd' 2>/dev/null || true
               sudo pkill -f '${BM_REMOTE_BIN_DIR}/spurctld' 2>/dev/null || true
               sudo pkill -f '${BM_REMOTE_BIN_DIR}/spurd' 2>/dev/null || true
-              sudo rm -rf /tmp/spur-e2e-* 2>/dev/null || true
+              sudo rm -rf '${BM_REMOTE_BIN_DIR_PR}' '${BM_REMOTE_BIN_DIR_NIGHTLY}' /tmp/spur-e2e-* 2>/dev/null || true
             " || true
           done
 
@@ -187,6 +189,6 @@ jobs:
         if: always()
         run: |
           rm -rf /tmp/spur-perf-venv /tmp/perf-pr-bins /tmp/perf-nightly-bins
-          rm -rf /tmp/nightly-dl "$PERF_ASSETS_DIR" pr-src
+          rm -rf /tmp/nightly-dl "$PERF_ASSETS_DIR"
           rm -f /tmp/perf-pr.json /tmp/perf-nightly.json
           ssh-agent -k || true

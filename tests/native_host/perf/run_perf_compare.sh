@@ -20,7 +20,8 @@
 #   --fail-on-regression          Exit non-zero when fail-gated metrics regress
 #
 # Environment (required): SPUR_TEST_NODES, SPUR_TEST_SSH_USER
-# Optional: SPUR_PERF_TIERS, SPUR_PERF_PARALLEL, SPUR_PERF_SLEEP, SPUR_TEST_SSH_KEY, etc.
+# Optional: SPUR_PERF_TIERS, SPUR_PERF_PARALLEL, SPUR_PERF_SLEEP, SPUR_TEST_SSH_KEY,
+# SPUR_TEST_SSH_PASSWORD (password auth via sshpass when set), etc.
 #
 set -euo pipefail
 
@@ -91,15 +92,26 @@ cleanup_cluster() {
   [ -n "${SPUR_TEST_NODES:-}" ] || return 0
   [ -n "${SPUR_TEST_SSH_USER:-}" ] || return 0
 
+  _ssh_node() {
+    local node=$1
+    local remote_cmd=$2
+    if [ -n "${SPUR_TEST_SSH_PASSWORD:-}" ]; then
+      sshpass -p "$SPUR_TEST_SSH_PASSWORD" ssh "${SPUR_TEST_SSH_USER}@${node}" "$remote_cmd"
+    else
+      ssh -o BatchMode=yes "${SPUR_TEST_SSH_USER}@${node}" "$remote_cmd"
+    fi
+  }
+
   IFS=',' read -ra NODES <<< "$SPUR_TEST_NODES"
   for node in "${NODES[@]}"; do
     node="${node#"${node%%[![:space:]]*}"}"
     node="${node%"${node##*[![:space:]]}"}"
     [ -n "$node" ] || continue
-    ssh "${SPUR_TEST_SSH_USER}@${node}" "
+    _ssh_node "$node" "
       if [ -n '${remote_dir}' ]; then
         pkill -f '${remote_dir}/spurctld' 2>/dev/null || true
         pkill -f '${remote_dir}/spurd' 2>/dev/null || true
+        rm -rf '${remote_dir}' 2>/dev/null || true
       fi
       rm -rf /tmp/spur-e2e-* 2>/dev/null || true
     " || true

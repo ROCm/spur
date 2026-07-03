@@ -178,7 +178,7 @@ Perf-specific environment variables:
      - Regression threshold for ``python -m perf.report``.
      - ``10``
 
-See ``tests/native_host/perf/README.md`` and ``docs/developer/ingestion-benchmark.md`` for metric definitions.
+See ``tests/native_host/perf/README.md`` and the header comment in ``tests/native_host/perf/scripts/run_perf.sh`` for metric definitions.
 
 End-to-End Tests (Kubernetes)
 -----------------------------
