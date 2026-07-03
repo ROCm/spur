@@ -994,7 +994,7 @@ echo "hello world"
     }
 
     #[test]
-    #[serial]
+    #[serial(env_injection)]
     fn test_env_provides_default() {
         let env = SbatchEnvGuard::new();
         env.set("SBATCH_PARTITION", "gpu");
@@ -1003,7 +1003,7 @@ echo "hello world"
     }
 
     #[test]
-    #[serial]
+    #[serial(env_injection)]
     fn test_cli_overrides_env() {
         let env = SbatchEnvGuard::new();
         env.set("SBATCH_PARTITION", "gpu");
@@ -1012,7 +1012,7 @@ echo "hello world"
     }
 
     #[test]
-    #[serial]
+    #[serial(env_injection)]
     fn test_env_overrides_directive() {
         let env = SbatchEnvGuard::new();
         env.set("SBATCH_PARTITION", "gpu");
@@ -1025,7 +1025,7 @@ echo "hello world"
     }
 
     #[test]
-    #[serial]
+    #[serial(env_injection)]
     fn test_directive_used_when_no_env_or_cli() {
         let _env = SbatchEnvGuard::new();
         let args = parse_merged(&["--partition=script-part"], &["sbatch"]);
@@ -1033,7 +1033,7 @@ echo "hello world"
     }
 
     #[test]
-    #[serial]
+    #[serial(env_injection)]
     fn test_env_gres_comma_split() {
         let env = SbatchEnvGuard::new();
         env.set("SBATCH_GRES", "gpu:1,license:x");
@@ -1042,7 +1042,7 @@ echo "hello world"
     }
 
     #[test]
-    #[serial]
+    #[serial(env_injection)]
     fn test_env_gres_overrides_directive() {
         let env = SbatchEnvGuard::new();
         env.set("SBATCH_GRES", "gpu:2");
@@ -1055,7 +1055,7 @@ echo "hello world"
     }
 
     #[test]
-    #[serial]
+    #[serial(env_injection)]
     fn test_cli_gres_replaces_directive_and_ignores_env() {
         // CLI --gres wins over both the directive and SBATCH_GRES.
         let env = SbatchEnvGuard::new();
