@@ -1,0 +1,54 @@
+---
+# Cluster identity
+spur_cluster_name: spur-cluster
+
+# Install
+spur_version: latest                # latest | nightly | vX.Y.Z
+spur_install_dir: /root/.local/bin
+spur_home: /root/spur
+
+# Transport: direct (LAN, no encryption) | wireguard (encrypted mesh)
+spur_transport: direct
+
+# WireGuard mesh settings (only used when spur_transport == wireguard)
+spur_wg_cidr: 10.44.0.0/16
+spur_wg_port: 51820
+spur_wg_interface: spur0
+
+# Ports
+spur_controller_port: 6817
+spur_agent_port: 6818
+spur_raft_port: 6821
+
+# Accounting (PostgreSQL + spurdbd). OPTIONAL — set spur_accounting_enabled: false to skip.
+# Single service for the whole cluster. Runs on spur_accounting_host (default: the
+# first controller), which may be any managed host — a controller, an agent, or a
+# dedicated node. Controllers report usage to it over gRPC; it owns the local postgres.
+spur_accounting_enabled: true
+# spur_accounting_host: set in inventory to pin the accounting node (any managed
+# host). Left unset here so an inventory value wins; defaults to the first
+# controller via `| default(groups['spur_controllers'][0])` where referenced.
+spur_accounting_db_name: spur
+spur_accounting_db_user: spur
+spur_accounting_db_password: spur
+spur_accounting_port: 6819
+
+# Logging
+spur_log_level: info
+
+# Wipe Raft state on (re)deploy. Default false so re-runs/upgrades are non-destructive; set true for a fresh install.
+spur_wipe_state: false
+
+# HA mode is enabled automatically when groups['spur_controllers'] has more than one host.
+# In HA mode:
+#   - every controller is given a node_id (its 1-based position in groups['spur_controllers'])
+#   - spur.conf gets `peers = ["ctl1:6821", "ctl2:6821", ...]` (same order on every host)
+#   - agents are pointed at the FIRST controller; openraft forwards writes to the leader,
+#     but agents do not yet fail over to a different controller if the first one dies
+#     (Spur 0.3.0 limitation — `spurd --controller` takes a single URL). Put an L4 VIP /
+#     DNS round-robin in front of port 6817 for real failover. See README.
+spur_ha_enabled: "{{ (groups.get('spur_controllers', []) | length) > 1 }}"
+
+# Whether the controller node also runs spurd (lets controller be a compute target).
+# Auto: true if a host is in BOTH controller and agent groups.
+spur_controller_runs_agent: "{{ inventory_hostname in groups.get('spur_agents', []) and inventory_hostname in groups.get('spur_controllers', []) }}"

@@ -1,0 +1,156 @@
+---
+- name: Resolve every controller's listen IP (needed for the peers list on all hosts)
+  ansible.builtin.set_fact:
+    spur_controller_listen_ip: >-
+      {{ hostvars[item].spur_wg_address if spur_transport == 'wireguard'
+         else (hostvars[item].ansible_host | default(hostvars[item].ansible_default_ipv4.address)) }}
+  delegate_to: "{{ item }}"
+  delegate_facts: true
+  loop: "{{ groups['spur_controllers'] }}"
+  run_once: true
+
+- name: Assign 1-based node_id to each controller (position in inventory)
+  ansible.builtin.set_fact:
+    spur_controller_node_id: "{{ groups['spur_controllers'].index(item) + 1 }}"
+  delegate_to: "{{ item }}"
+  delegate_facts: true
+  loop: "{{ groups['spur_controllers'] }}"
+  run_once: true
+
+- name: Resolve the accounting host's advertised IP (for the [accounting] block)
+  vars:
+    acct_host: "{{ spur_accounting_host | default(groups['spur_controllers'][0]) }}"
+  ansible.builtin.set_fact:
+    spur_accounting_listen_ip: >-
+      {{ hostvars[acct_host].spur_wg_address if spur_transport == 'wireguard'
+         else (hostvars[acct_host].ansible_host
+               | default(hostvars[acct_host].ansible_default_ipv4.address)) }}
+  run_once: true
+  when: spur_accounting_enabled | bool
+
+- name: Resolve short node name for each agent (used by spur.conf and --hostname)
+  ansible.builtin.set_fact:
+    spur_node_name: "{{ hostvars[item].ansible_hostname }}"
+  delegate_to: "{{ item }}"
+  delegate_facts: true
+  loop: "{{ groups['spur_agents'] }}"
+  run_once: true
+  when: hostvars[item].spur_node_name is not defined
+
+# Client env so the CLI (squeue/sinfo/scontrol and sacct/sacctmgr/...) works on
+# controllers without per-command flags. Controller-nodes only. Each controller
+# points SPUR_CONTROLLER_ADDR at its own local spurctld.
+- name: Set SPUR_CONTROLLER_ADDR in /etc/environment (controllers)
+  ansible.builtin.lineinfile:
+    path: /etc/environment
+    regexp: '^SPUR_CONTROLLER_ADDR='
+    line: "SPUR_CONTROLLER_ADDR=http://{{ spur_controller_listen_ip }}:{{ spur_controller_port }}"
+
+- name: Set SPUR_ACCOUNTING_ADDR in /etc/environment (controllers)
+  ansible.builtin.lineinfile:
+    path: /etc/environment
+    regexp: '^SPUR_ACCOUNTING_ADDR='
+    line: "SPUR_ACCOUNTING_ADDR=http://{{ hostvars[groups['spur_controllers'][0]]['spur_accounting_listen_ip'] }}:{{ spur_accounting_port }}"
+  when: spur_accounting_enabled | bool
+
+- name: Write spur.conf
+  ansible.builtin.template:
+    src: spur.conf.j2
+    dest: "{{ spur_home }}/etc/spur.conf"
+    mode: "0644"
+  register: spur_conf
+
+- name: Install spurctld systemd unit
+  ansible.builtin.template:
+    src: spurctld.service.j2
+    dest: /etc/systemd/system/spurctld.service
+    mode: "0644"
+  register: spurctld_unit
+
+- name: Reload systemd so the unit is picked up
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+# openraft ignores config peers after first init and uses the persisted
+# membership, so a changed controller set can't take effect on restart.
+# Fail loudly rather than break silently. Agents are not Raft members and
+# can be added/removed freely without a wipe.
+- name: Read persisted Raft peer addresses (HA, no-wipe)
+  ansible.builtin.shell: |
+    set -o pipefail
+    grep -ho '"addr":"[^"]*"' {{ spur_home }}/state/raft/log/*.json 2>/dev/null \
+      | sed -E 's/"addr":"([^"]*)"/\1/' | sort -u
+  args:
+    executable: /bin/bash
+  register: raft_peers
+  changed_when: false
+  failed_when: false
+  when:
+    - spur_ha_enabled | bool
+    - not (spur_wipe_state | bool)
+
+- name: Fail if the controller (Raft) set changed without a state wipe
+  ansible.builtin.fail:
+    msg: >-
+      Persisted Raft membership {{ raft_peers.stdout_lines | sort }} does not
+      match the inventory controllers
+      {{ groups['spur_controllers'] | map('extract', hostvars, 'spur_controller_listen_ip') | map('regex_replace', '$', ':' ~ spur_raft_port) | sort }}.
+      Spur 0.3.0 has no online membership change, so adding/removing/reordering a
+      controller needs a Raft reinit: re-run with -e spur_wipe_state=true.
+      Adding/removing compute agents does not require this.
+  vars:
+    desired_peers: "{{ groups['spur_controllers'] | map('extract', hostvars, 'spur_controller_listen_ip') | map('regex_replace', '$', ':' ~ spur_raft_port) | sort }}"
+  when:
+    - spur_ha_enabled | bool
+    - not (spur_wipe_state | bool)
+    - raft_peers.stdout | default('') | length > 0
+    - (raft_peers.stdout_lines | sort) != desired_peers
+
+# Stop BEFORE wiping state so spurctld does not rewrite the Raft log we are about to delete.
+- name: Stop spurctld before wiping state
+  ansible.builtin.systemd:
+    name: spurctld
+    state: stopped
+  failed_when: false
+
+- name: Wipe Raft state (when spur_wipe_state is true)
+  ansible.builtin.file:
+    path: "{{ spur_home }}/state"
+    state: absent
+  when: spur_wipe_state | bool
+
+- name: Recreate state dir after wipe
+  ansible.builtin.file:
+    path: "{{ spur_home }}/state"
+    state: directory
+    mode: "0755"
+  when: spur_wipe_state | bool
+
+- name: Enable and (re)start spurctld
+  ansible.builtin.systemd:
+    name: spurctld
+    enabled: true
+    state: restarted
+
+- name: Wait for spurctld to listen on {{ spur_controller_port }}
+  ansible.builtin.wait_for:
+    port: "{{ spur_controller_port }}"
+    host: "127.0.0.1"
+    timeout: 30
+
+- name: Wait for Raft leader to be elected (HA mode needs all peers up before quorum)
+  # `spur nodes` returns the error `no leader elected yet` until election succeeds.
+  # In HA mode this can take a few seconds while peers find each other.
+  ansible.builtin.shell: |
+    for i in $(seq 1 60); do
+      out=$({{ spur_install_dir }}/spur nodes 2>&1)
+      echo "$out" | grep -qE 'no leader|not the Raft leader|cannot reach leader|transport error|Connection refused' || { echo OK; exit 0; }
+      sleep 1
+    done
+    echo "timeout waiting for leader: $out"
+    exit 1
+  args:
+    executable: /bin/bash
+  changed_when: false
+  when: spur_ha_enabled | bool
+  run_once: true

@@ -1,0 +1,102 @@
+---
+# Optional accounting stack: PostgreSQL + spurdbd. Runs on the first controller only
+# (accounting is a single service for the whole cluster). Everything is gated on
+# spur_accounting_enabled so `-e spur_accounting_enabled=false` skips the stack entirely.
+
+- name: Install PostgreSQL
+  ansible.builtin.apt:
+    name:
+      - postgresql
+      - postgresql-contrib
+    state: present
+    update_cache: true
+  when: spur_accounting_enabled | bool
+
+- name: Ensure PostgreSQL is enabled and started
+  ansible.builtin.service:
+    name: postgresql
+    enabled: true
+    state: started
+  when: spur_accounting_enabled | bool
+
+# The community.postgresql collection is not guaranteed to be installed on the
+# control node, so create the role/database with psql via `become_user: postgres`.
+# Both operations are made idempotent by checking for existence first.
+- name: Check whether the spur DB role exists
+  ansible.builtin.command: >-
+    psql -tAc "SELECT 1 FROM pg_roles WHERE rolname = '{{ spur_accounting_db_user }}'"
+  become: true
+  become_user: postgres
+  register: spur_db_role_check
+  changed_when: false
+  when: spur_accounting_enabled | bool
+
+- name: Create the spur DB role
+  ansible.builtin.command: >-
+    psql -c "CREATE ROLE {{ spur_accounting_db_user }} LOGIN PASSWORD '{{ spur_accounting_db_password }}'"
+  become: true
+  become_user: postgres
+  when:
+    - spur_accounting_enabled | bool
+    - spur_db_role_check.stdout | trim != "1"
+
+- name: Check whether the spur database exists
+  ansible.builtin.command: >-
+    psql -tAc "SELECT 1 FROM pg_database WHERE datname = '{{ spur_accounting_db_name }}'"
+  become: true
+  become_user: postgres
+  register: spur_db_check
+  changed_when: false
+  when: spur_accounting_enabled | bool
+
+- name: Create the spur database owned by the spur role
+  ansible.builtin.command: >-
+    psql -c "CREATE DATABASE {{ spur_accounting_db_name }} OWNER {{ spur_accounting_db_user }}"
+  become: true
+  become_user: postgres
+  when:
+    - spur_accounting_enabled | bool
+    - spur_db_check.stdout | trim != "1"
+
+- name: Verify spurdbd binary is present
+  ansible.builtin.stat:
+    path: "{{ spur_install_dir }}/spurdbd"
+  register: spurdbd_bin
+  when: spur_accounting_enabled | bool
+
+- name: Fail if spurdbd binary is missing
+  ansible.builtin.fail:
+    msg: >-
+      spurdbd binary not found at {{ spur_install_dir }}/spurdbd. The upstream
+      install.sh should install it alongside spur/spurctld/spurd — re-run the
+      installer or disable accounting with spur_accounting_enabled=false.
+  when:
+    - spur_accounting_enabled | bool
+    - not spurdbd_bin.stat.exists
+
+- name: Install spurdbd systemd unit
+  ansible.builtin.template:
+    src: spurdbd.service.j2
+    dest: /etc/systemd/system/spurdbd.service
+    mode: "0644"
+  register: spurdbd_unit
+  when: spur_accounting_enabled | bool
+
+- name: Reload systemd so the unit is picked up
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: spur_accounting_enabled | bool
+
+- name: Enable and (re)start spurdbd
+  ansible.builtin.systemd:
+    name: spurdbd
+    enabled: true
+    state: restarted
+  when: spur_accounting_enabled | bool
+
+- name: Wait for spurdbd to listen on {{ spur_accounting_port }}
+  ansible.builtin.wait_for:
+    port: "{{ spur_accounting_port }}"
+    host: "127.0.0.1"
+    timeout: 30
+  when: spur_accounting_enabled | bool

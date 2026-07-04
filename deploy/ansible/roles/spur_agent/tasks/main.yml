@@ -1,0 +1,43 @@
+---
+- name: Resolve agent's advertised address
+  ansible.builtin.set_fact:
+    spur_agent_listen_ip: >-
+      {{ spur_wg_address if spur_transport == 'wireguard'
+         else (ansible_host | default(ansible_default_ipv4.address)) }}
+    spur_node_name: "{{ spur_node_name | default(ansible_hostname) }}"
+
+- name: Resolve controller address agents will talk to
+  # NOTE: spurd --controller takes a single URL in Spur 0.3.0. In HA mode we still
+  # point at the first controller — non-leader controllers forward writes via the
+  # Raft cluster. Real failover when ctl[0] dies needs a VIP / DNS in front of 6817.
+  ansible.builtin.set_fact:
+    spur_controller_addr: >-
+      {{ hostvars[groups['spur_controllers'][0]]['spur_wg_address']
+         if spur_transport == 'wireguard'
+         else hostvars[groups['spur_controllers'][0]]['ansible_host']
+              | default(hostvars[groups['spur_controllers'][0]]['ansible_default_ipv4']['address']) }}
+
+- name: Install spurd systemd unit
+  # WorkingDirectory in the unit is {{ spur_home }} so job stdout (spur-<N>.out)
+  # always lands there regardless of where the daemon was launched from.
+  ansible.builtin.template:
+    src: spurd.service.j2
+    dest: /etc/systemd/system/spurd.service
+    mode: "0644"
+  register: spurd_unit
+
+- name: Reload systemd so the unit is picked up
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Enable and (re)start spurd
+  ansible.builtin.systemd:
+    name: spurd
+    enabled: true
+    state: restarted
+
+- name: Wait for spurd to listen on {{ spur_agent_port }}
+  ansible.builtin.wait_for:
+    port: "{{ spur_agent_port }}"
+    host: "127.0.0.1"
+    timeout: 30

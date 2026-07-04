@@ -1,0 +1,17 @@
+[Unit]
+Description=Spur Node Agent (spurd)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME={{ spur_home }}
+WorkingDirectory={{ spur_home }}
+ExecStart={{ spur_install_dir }}/spurd --controller http://{{ spur_controller_addr }}:{{ spur_controller_port }} --hostname {{ spur_node_name }} --address {{ spur_agent_listen_ip }} --listen 0.0.0.0:{{ spur_agent_port }} --log-level {{ spur_log_level }}
+Restart=on-failure
+RestartSec=3
+User=root
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

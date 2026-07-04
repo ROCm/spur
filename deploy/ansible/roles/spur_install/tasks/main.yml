@@ -1,0 +1,137 @@
+---
+- name: Preflight — check required commands
+  ansible.builtin.shell: "command -v {{ item }}"
+  args:
+    executable: /bin/bash
+  register: pf_cmd
+  changed_when: false
+  failed_when: pf_cmd.rc != 0
+  loop:
+    - curl
+    - tar
+    - bash
+
+- name: Preflight — detect existing Spur daemons (informational)
+  ansible.builtin.shell: |
+    set +e
+    for p in spurctld spurd spurrestd; do
+      pid=$(pgrep -x "$p" 2>/dev/null | head -1)
+      [ -n "$pid" ] && echo "$p running (PID $pid)"
+    done
+    exit 0
+  register: pf_running
+  changed_when: false
+
+- name: Preflight — note any running daemons
+  ansible.builtin.debug:
+    msg: "{{ pf_running.stdout_lines | default(['no spur daemons running']) }}"
+
+- name: Preflight — fail if Spur ports are held by a non-Spur process
+  ansible.builtin.shell: |
+    set +e
+    # ss -p prints "users:((\"<name>\",pid=...))" as the last column when run as root.
+    # Any owner that is NOT spurctld/spurd/spurrestd on our ports is a conflict.
+    bad=$(ss -tlnpH "( sport = :{{ spur_controller_port }} or sport = :{{ spur_agent_port }} or sport = :{{ spur_raft_port }} )" 2>/dev/null \
+          | grep -oE 'users:\(\("[^"]+"' \
+          | sed -E 's|.*"([^"]+)".*|\1|' \
+          | grep -v -E '^(spurctld|spurd|spurrestd)$')
+    if [ -n "$bad" ]; then
+      echo "non-spur process(es) on spur ports: $bad"
+      exit 1
+    fi
+    exit 0
+  args:
+    executable: /bin/bash
+  register: pf_ports
+  changed_when: false
+  failed_when: pf_ports.rc != 0
+
+- name: Create Spur directory layout
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ spur_home }}"
+    - "{{ spur_home }}/state"
+    - "{{ spur_home }}/log"
+    - "{{ spur_home }}/etc"
+    - "{{ spur_install_dir }}"
+
+- name: Check for existing spur binary
+  ansible.builtin.stat:
+    path: "{{ spur_install_dir }}/spur"
+  register: spur_bin_stat
+
+# Two install sources:
+#   1. spur_binary_src (a directory on the Ansible control node holding pre-built
+#      spur/spurctld/spurd/spurdbd) — used for air-gapped installs and when the
+#      upstream repo has no published GitHub release yet. Takes precedence.
+#   2. upstream install.sh — downloads the latest published release.
+- name: Copy pre-built Spur binaries from control node
+  ansible.builtin.copy:
+    src: "{{ spur_binary_src }}/{{ item }}"
+    dest: "{{ spur_install_dir }}/{{ item }}"
+    mode: "0755"
+  loop:
+    - spur
+    - spurctld
+    - spurd
+    - spurdbd
+  when: spur_binary_src | default('') | length > 0
+
+- name: Install Spur via upstream installer
+  ansible.builtin.shell: |
+    set -euo pipefail
+    curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh \
+      | INSTALL_DIR={{ spur_install_dir }} bash -s -- {{ spur_version }}
+  args:
+    executable: /bin/bash
+  when:
+    - spur_binary_src | default('') | length == 0
+    - not spur_bin_stat.stat.exists
+  register: install_run
+  changed_when: install_run.rc == 0
+
+- name: Verify spur binary is present
+  ansible.builtin.stat:
+    path: "{{ spur_install_dir }}/spur"
+  register: spur_ver
+  failed_when: not spur_ver.stat.exists
+
+# Slurm-compatible entrypoints. The single `spur` multi-call binary dispatches
+# on argv[0], so these symlinks give users drop-in sbatch/squeue/etc. Created
+# regardless of install source (pre-built or upstream installer).
+- name: Symlink Slurm-compatible CLI names
+  ansible.builtin.file:
+    src: "{{ spur_install_dir }}/spur"
+    dest: "{{ spur_install_dir }}/{{ item }}"
+    state: link
+    force: true
+  loop:
+    - sbatch
+    - squeue
+    - sinfo
+    - scancel
+    - sacct
+    - scontrol
+    - salloc
+    - srun
+
+- name: Show install result
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: spur binaries installed in {{ spur_install_dir }}"
+
+- name: Read remote /etc/environment
+  ansible.builtin.slurp:
+    src: /etc/environment
+  register: etc_environment
+  failed_when: false
+
+- name: Ensure ~/.local/bin is on PATH for non-interactive SSH sessions
+  ansible.builtin.lineinfile:
+    path: /etc/environment
+    backrefs: yes
+    regexp: '^PATH="(?!.*{{ spur_install_dir | regex_escape }})(.*)"$'
+    line: 'PATH="{{ spur_install_dir }}:\1"'
+  when: spur_install_dir not in (etc_environment.content | default('') | b64decode)

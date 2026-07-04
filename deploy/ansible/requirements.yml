@@ -1,0 +1,9 @@
+---
+# Control-node collection dependencies.
+# Install with: ansible-galaxy collection install -r requirements.yml
+#
+# The ansible.utils ipaddr/ipmath filters also require the Python `netaddr`
+# library on the control node:  python3 -m pip install netaddr
+collections:
+  # Provides ansible.utils.ipaddr / ipmath used by the spur_wireguard role.
+  - name: ansible.utils

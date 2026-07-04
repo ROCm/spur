@@ -1,0 +1,16 @@
+[Unit]
+Description=Spur Accounting Daemon (spurdbd)
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+ExecStart={{ spur_install_dir }}/spurdbd --database-url postgresql://{{ spur_accounting_db_user }}:{{ spur_accounting_db_password }}@localhost/{{ spur_accounting_db_name }} --listen [::]:{{ spur_accounting_port }} --migrate --log-level {{ spur_log_level }}
+Restart=on-failure
+RestartSec=3
+User=root
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

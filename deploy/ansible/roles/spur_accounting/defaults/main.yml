@@ -1,0 +1,6 @@
+---
+spur_accounting_enabled: true
+spur_accounting_db_name: spur
+spur_accounting_db_user: spur
+spur_accounting_db_password: spur
+spur_accounting_port: 6819

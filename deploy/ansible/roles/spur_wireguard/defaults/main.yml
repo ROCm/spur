@@ -1,0 +1,6 @@
+---
+# WireGuard transport is single-controller only: `spur net init` auto-assigns
+# the controller .1, and there is no multi-controller mesh command. The role
+# assigns each agent a unique address (.2, .3, ...) by inventory position, or
+# honors a per-host spur_wg_address set in inventory. Requires the ansible.utils
+# collection on the control node (ansible-galaxy collection install -r requirements.yml).

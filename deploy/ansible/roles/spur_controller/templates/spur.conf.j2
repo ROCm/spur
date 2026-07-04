@@ -1,0 +1,42 @@
+cluster_name = "{{ spur_cluster_name }}"
+
+[controller]
+listen_addr = "[::]:{{ spur_controller_port }}"
+hosts = [{% for h in groups['spur_controllers'] %}"{{ hostvars[h]['spur_controller_listen_ip'] }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+state_dir = "{{ spur_home }}/state"
+raft_listen_addr = "[::]:{{ spur_raft_port }}"
+{% if spur_ha_enabled %}
+node_id = {{ spur_controller_node_id }}
+peers = [{% for h in groups['spur_controllers'] %}"{{ hostvars[h]['spur_controller_listen_ip'] }}:{{ spur_raft_port }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+{% endif %}
+
+[scheduler]
+plugin = "backfill"
+interval_secs = 1
+
+{% if spur_accounting_enabled | default(true) %}
+[accounting]
+host = "{{ spur_accounting_listen_ip }}:{{ spur_accounting_port | default(6819) }}"
+database_url = "postgresql://{{ spur_accounting_db_user | default('spur') }}:{{ spur_accounting_db_password | default('spur') }}@localhost/{{ spur_accounting_db_name | default('spur') }}"
+fairshare_refresh_secs = 30
+{% endif %}
+
+[network]
+wg_enabled = {{ (spur_transport == 'wireguard') | string | lower }}
+{% if spur_transport == 'wireguard' %}
+wg_interface = "{{ spur_wg_interface }}"
+{% endif %}
+agent_port = {{ spur_agent_port }}
+
+{% for h in groups['spur_agents'] %}
+[[nodes]]
+names = "{{ hostvars[h]['spur_node_name'] }}"
+cpus = {{ hostvars[h]['ansible_processor_vcpus'] }}
+memory_mb = {{ (hostvars[h]['ansible_memtotal_mb'] * 0.9) | int }}
+
+{% endfor %}
+[[partitions]]
+name = "default"
+default = true
+nodes = "{{ groups['spur_agents'] | map('extract', hostvars, 'spur_node_name') | join(',') }}"
+max_time = "INFINITE"

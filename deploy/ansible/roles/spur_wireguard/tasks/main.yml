@@ -1,0 +1,158 @@
+---
+# WireGuard mesh setup. The `spur net` CLI supports a single controller (which
+# auto-assigns itself .1) plus N agents that join and are registered as peers.
+# Multi-controller (HA) WireGuard is not supported by the CLI, so this role
+# asserts a single controller.
+- name: Assert ansible.utils collection is available (provides ipaddr/ipmath)
+  ansible.builtin.assert:
+    that:
+      - "'10.0.0.0/24' | ansible.utils.ipaddr('network') == '10.0.0.0'"
+    fail_msg: >-
+      The ansible.utils collection is required for WireGuard transport.
+      Install it on the control node:
+      ansible-galaxy collection install -r requirements.yml
+  run_once: true
+  delegate_to: localhost
+
+- name: Assert a single controller (CLI WireGuard mesh is single-controller only)
+  ansible.builtin.assert:
+    that:
+      - groups['spur_controllers'] | length == 1
+    fail_msg: >-
+      WireGuard transport supports exactly one controller (spur net init
+      auto-assigns the controller .1 and there is no multi-controller mesh
+      command). Use spur_transport=direct for HA, or a single controller.
+  run_once: true
+
+- name: Assert wireguard module is loadable
+  ansible.builtin.shell: "modinfo wireguard >/dev/null 2>&1"
+  changed_when: false
+
+- name: Install wireguard-tools (Debian/Ubuntu)
+  ansible.builtin.apt:
+    name: wireguard-tools
+    state: present
+    update_cache: yes
+  when: ansible_os_family == 'Debian'
+
+- name: Install wireguard-tools (RHEL family)
+  ansible.builtin.package:
+    name: wireguard-tools
+    state: present
+  when: ansible_os_family == 'RedHat'
+
+# The controller always gets .1 (assigned by `spur net init`). Agents get a
+# unique address from their position in the mesh: .2, .3, ... A per-host
+# spur_wg_address set in inventory always wins.
+- name: Build ordered agent list (non-controller agents)
+  ansible.builtin.set_fact:
+    spur_wg_agents: "{{ groups['spur_agents'] | difference(groups['spur_controllers']) }}"
+
+- name: Set controller WG address to the mesh .1
+  ansible.builtin.set_fact:
+    spur_wg_address: "{{ spur_wg_cidr | ansible.utils.ipaddr('network') | ansible.utils.ipmath(1) }}"
+  when:
+    - inventory_hostname in groups['spur_controllers']
+    - spur_wg_address is not defined
+
+- name: Assign each agent a unique WG address (.2, .3, ... by position)
+  ansible.builtin.set_fact:
+    spur_wg_address: "{{ spur_wg_cidr | ansible.utils.ipaddr('network') | ansible.utils.ipmath(spur_wg_agents.index(inventory_hostname) + 2) }}"
+  when:
+    - inventory_hostname in spur_wg_agents
+    - spur_wg_address is not defined
+
+- name: Initialize WireGuard mesh on the controller
+  # `spur net init` auto-assigns .1 from --cidr and logs to stderr. It is not
+  # idempotent, so only run it when the interface is not already up.
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if ip link show {{ spur_wg_interface }} >/dev/null 2>&1; then
+      echo "SPUR_WG_ALREADY_UP"
+    else
+      {{ spur_install_dir }}/spur net init \
+        --cidr {{ spur_wg_cidr }} \
+        --port {{ spur_wg_port }} \
+        --interface {{ spur_wg_interface }} 1>&2
+    fi
+  args:
+    executable: /bin/bash
+  register: wg_ctl_init
+  changed_when: "'SPUR_WG_ALREADY_UP' not in wg_ctl_init.stdout"
+  when: inventory_hostname in groups['spur_controllers']
+
+- name: Read controller WG public key
+  ansible.builtin.command: "wg show {{ spur_wg_interface }} public-key"
+  register: wg_ctl_pubkey
+  changed_when: false
+  when: inventory_hostname in groups['spur_controllers']
+
+- name: Broadcast controller pubkey + endpoint to all hosts
+  ansible.builtin.set_fact:
+    spur_wg_controller_pubkey: "{{ hostvars[groups['spur_controllers'][0]]['wg_ctl_pubkey'].stdout | trim }}"
+    spur_wg_controller_endpoint: "{{ hostvars[groups['spur_controllers'][0]]['ansible_host'] | default(groups['spur_controllers'][0]) }}:{{ spur_wg_port }}"
+
+- name: Assert each agent has a WG address before join
+  ansible.builtin.assert:
+    that:
+      - spur_wg_address is defined
+    fail_msg: "Agent {{ inventory_hostname }} has no spur_wg_address; set it in inventory or check spur_wg_cidr."
+  when: inventory_hostname in spur_wg_agents
+
+- name: Join WireGuard mesh on agents
+  # `spur net join` needs --prefix-len to match spur_wg_cidr (defaults to 16),
+  # else the interface address/AllowedIPs are wrong. Logs to stderr.
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if ip link show {{ spur_wg_interface }} >/dev/null 2>&1; then
+      echo "SPUR_WG_ALREADY_UP"
+    else
+      {{ spur_install_dir }}/spur net join \
+        --endpoint {{ spur_wg_controller_endpoint }} \
+        --server-key {{ spur_wg_controller_pubkey }} \
+        --address {{ spur_wg_address }} \
+        --prefix-len {{ spur_wg_cidr | ansible.utils.ipaddr('prefix') }} \
+        --interface {{ spur_wg_interface }} 1>&2
+    fi
+  args:
+    executable: /bin/bash
+  register: wg_agent_join
+  changed_when: "'SPUR_WG_ALREADY_UP' not in wg_agent_join.stdout"
+  when: inventory_hostname in spur_wg_agents
+
+- name: Read agent WG public key
+  ansible.builtin.command: "wg show {{ spur_wg_interface }} public-key"
+  register: wg_agent_pubkey
+  changed_when: false
+  when: inventory_hostname in spur_wg_agents
+
+- name: Capture agent pubkey
+  ansible.builtin.set_fact:
+    spur_wg_pubkey: "{{ wg_agent_pubkey.stdout | trim }}"
+  when: inventory_hostname in spur_wg_agents
+
+- name: Register all agents as peers on the controller
+  ansible.builtin.command: >-
+    {{ spur_install_dir }}/spur net add-peer
+      --key {{ hostvars[item]['spur_wg_pubkey'] }}
+      --allowed-ip {{ hostvars[item]['spur_wg_address'] }}/32
+      --interface {{ spur_wg_interface }}
+  loop: "{{ spur_wg_agents }}"
+  when: inventory_hostname == groups['spur_controllers'][0]
+  changed_when: true
+
+- name: Verify mesh — every host pings controller WG IP
+  ansible.builtin.command: "ping -c2 -W2 {{ hostvars[groups['spur_controllers'][0]]['spur_wg_address'] }}"
+  register: wg_ping
+  changed_when: false
+  failed_when: false
+
+- name: Warn if the WG mesh ping did not succeed
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: could not ping the controller over WireGuard
+      ({{ hostvars[groups['spur_controllers'][0]]['spur_wg_address'] }}).
+      The tunnel is configured (interface + peers are up) but traffic did not
+      pass — expected when all hosts already share an L2/L3 network, or a real
+      routing/firewall issue otherwise. Verify with `wg show {{ spur_wg_interface }}`.
+  when: wg_ping.rc | default(1) != 0

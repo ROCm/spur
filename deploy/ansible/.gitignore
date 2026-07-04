@@ -1,0 +1,7 @@
+# Real inventories contain host IPs and credentials — never commit them.
+# Only the *.example.ini templates (placeholder addresses) are tracked.
+inventory/*.ini
+!inventory/*.example.ini
+
+# Ansible runtime artifacts
+*.retry

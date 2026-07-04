@@ -1,0 +1,17 @@
+[Unit]
+Description=Spur Controller Daemon (spurctld)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME={{ spur_home }}
+WorkingDirectory={{ spur_home }}
+ExecStart={{ spur_install_dir }}/spurctld -f {{ spur_home }}/etc/spur.conf --state-dir {{ spur_home }}/state --log-level {{ spur_log_level }}
+Restart=on-failure
+RestartSec=3
+User=root
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
