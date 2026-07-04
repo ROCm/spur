@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::admission::AdmissionToken;
 use crate::job::{JobId, JobSpec, JobState};
 use crate::node::NodeState;
+use crate::reservation::Reservation;
 use std::collections::HashMap;
 
 use crate::resource::{ResourceAllocations, ResourceSet};
@@ -118,6 +119,71 @@ pub enum WalOperation {
     TokenRevoke {
         token_id: String,
     },
+
+    ReservationCreate {
+        reservation: Reservation,
+    },
+    ReservationUpdate {
+        name: String,
+        duration_minutes: u32,
+        add_nodes: Vec<String>,
+        remove_nodes: Vec<String>,
+        add_users: Vec<String>,
+        remove_users: Vec<String>,
+        add_accounts: Vec<String>,
+        remove_accounts: Vec<String>,
+    },
+    ReservationDelete {
+        name: String,
+    },
+}
+
+#[cfg(test)]
+mod reservation_wal_tests {
+    use super::*;
+    use crate::reservation::{Reservation, ReservationFlags};
+    use chrono::Utc;
+
+    #[test]
+    fn reservation_create_round_trips() {
+        let now = Utc::now();
+        let op = WalOperation::ReservationCreate {
+            reservation: Reservation {
+                name: "r1".into(),
+                start_time: now,
+                end_time: now + chrono::Duration::hours(1),
+                nodes: vec!["n1".into()],
+                accounts: Vec::new(),
+                users: vec!["alice".into()],
+                flags: ReservationFlags {
+                    maint: true,
+                    ..Default::default()
+                },
+            },
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::ReservationCreate { reservation } => {
+                assert_eq!(reservation.name, "r1");
+                assert!(reservation.flags.maint);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn reservation_delete_round_trips() {
+        let op = WalOperation::ReservationDelete {
+            name: "r1".into(),
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::ReservationDelete { name } => assert_eq!(name, "r1"),
+            _ => panic!("wrong variant"),
+        }
+    }
 }
 
 #[cfg(test)]

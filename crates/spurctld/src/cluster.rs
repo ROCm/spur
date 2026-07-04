@@ -18,7 +18,9 @@ use spur_core::job::{Job, JobId, JobSpec, JobState, NodeCompleteError, PendingRe
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::Partition;
 use spur_core::qos::{check_qos_limits, QosCheckResult};
-use spur_core::reservation::Reservation;
+use spur_core::reservation::{
+    self, normalize_node_list, running_jobs_overlap_start, Reservation,
+};
 use spur_core::resource::{ResourceAllocations, ResourceSet};
 use spur_core::step::{JobStep, StepState, STEP_BATCH, STEP_RESERVED_MIN};
 use spur_core::wal::WalOperation;
@@ -1787,18 +1789,26 @@ impl ClusterManager {
         }
     }
 
-    /// Create a new reservation.
-    pub fn create_reservation(&self, res: Reservation) -> anyhow::Result<()> {
-        let mut reservations = self.reservations.write();
-        if reservations.iter().any(|r| r.name == res.name) {
+    /// Create a new reservation (validated, persisted via Raft).
+    pub fn create_reservation(&self, mut res: Reservation) -> anyhow::Result<()> {
+        if self
+            .reservations
+            .read()
+            .iter()
+            .any(|r| r.name == res.name)
+        {
             anyhow::bail!("reservation '{}' already exists", res.name);
         }
-        info!(name = %res.name, "reservation created");
-        reservations.push(res);
+        let known: std::collections::HashSet<String> =
+            self.nodes.read().keys().cloned().collect();
+        res.nodes = normalize_node_list(&res.nodes, &known)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        self.validate_reservation_job_overlap(&res, None)?;
+        self.propose(WalOperation::ReservationCreate { reservation: res })?;
         Ok(())
     }
 
-    /// Update an existing reservation.
+    /// Update an existing reservation (validated, persisted via Raft).
     #[allow(clippy::too_many_arguments)]
     pub fn update_reservation(
         &self,
@@ -1811,12 +1821,219 @@ impl ClusterManager {
         add_accounts: &[String],
         remove_accounts: &[String],
     ) -> anyhow::Result<()> {
-        let mut reservations = self.reservations.write();
-        let res = reservations
-            .iter_mut()
+        let mut preview = self
+            .reservations
+            .read()
+            .iter()
             .find(|r| r.name == name)
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!("reservation '{}' not found", name))?;
 
+        if duration_minutes > 0 {
+            preview.end_time =
+                preview.start_time + chrono::Duration::minutes(duration_minutes as i64);
+        }
+        let known: std::collections::HashSet<String> =
+            self.nodes.read().keys().cloned().collect();
+        let mut add_expanded = Vec::new();
+        for n in add_nodes {
+            add_expanded.extend(normalize_node_list(std::slice::from_ref(n), &known).map_err(
+                |e| anyhow::anyhow!("{e}"),
+            )?);
+        }
+        for node in &add_expanded {
+            if !preview.nodes.contains(node) {
+                preview.nodes.push(node.clone());
+            }
+        }
+        preview.nodes.retain(|n| !remove_nodes.contains(n));
+        for user in add_users {
+            if !preview.users.contains(user) {
+                preview.users.push(user.clone());
+            }
+        }
+        preview.users.retain(|u| !remove_users.contains(u));
+        for account in add_accounts {
+            if !preview.accounts.contains(account) {
+                preview.accounts.push(account.clone());
+            }
+        }
+        preview.accounts.retain(|a| !remove_accounts.contains(a));
+
+        self.validate_reservation_job_overlap(&preview, Some(name))?;
+
+        self.propose(WalOperation::ReservationUpdate {
+            name: name.to_string(),
+            duration_minutes,
+            add_nodes: add_expanded,
+            remove_nodes: remove_nodes.to_vec(),
+            add_users: add_users.to_vec(),
+            remove_users: remove_users.to_vec(),
+            add_accounts: add_accounts.to_vec(),
+            remove_accounts: remove_accounts.to_vec(),
+        })?;
+        Ok(())
+    }
+
+    /// Delete a reservation by name (persisted via Raft).
+    pub fn delete_reservation(&self, name: &str) -> anyhow::Result<()> {
+        let res = self
+            .reservations
+            .read()
+            .iter()
+            .find(|r| r.name == name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("reservation '{}' not found", name))?;
+
+        for job in self.jobs.read().values() {
+            if !matches!(
+                job.state,
+                JobState::Running | JobState::Completing | JobState::Suspended
+            ) {
+                continue;
+            }
+            if job.spec.reservation.as_deref() == Some(name) {
+                anyhow::bail!(
+                    "reservation '{}' in use by running job {}",
+                    name,
+                    job.job_id
+                );
+            }
+        }
+
+        self.propose(WalOperation::ReservationDelete {
+            name: name.to_string(),
+        })?;
+
+        if !res.flags.no_hold_jobs {
+            self.hold_jobs_for_deleted_reservation(name);
+        }
+        Ok(())
+    }
+
+    /// Remove reservations past their end time when no jobs still reference them.
+    pub fn purge_expired_reservations(&self) {
+        let now = Utc::now();
+        let expired: Vec<String> = self
+            .reservations
+            .read()
+            .iter()
+            .filter(|r| r.is_expired(now))
+            .map(|r| r.name.clone())
+            .collect();
+        for name in expired {
+            let in_use = self.jobs.read().values().any(|job| {
+                matches!(
+                    job.state,
+                    JobState::Running | JobState::Completing | JobState::Suspended
+                ) && job.spec.reservation.as_deref() == Some(name.as_str())
+            });
+            if in_use {
+                continue;
+            }
+            if let Err(e) = self.propose(WalOperation::ReservationDelete { name: name.clone() }) {
+                warn!(name = %name, error = %e, "failed to purge expired reservation");
+            }
+        }
+    }
+
+    /// Cancel running jobs whose reservation window has ended.
+    pub fn enforce_reservation_end_times(&self) {
+        let now = Utc::now();
+        let reservations: std::collections::HashMap<String, Reservation> = self
+            .get_reservations()
+            .into_iter()
+            .map(|r| (r.name.clone(), r))
+            .collect();
+        let to_cancel: Vec<JobId> = self
+            .jobs
+            .read()
+            .values()
+            .filter_map(|job| {
+                if !matches!(
+                    job.state,
+                    JobState::Running | JobState::Completing | JobState::Suspended
+                ) {
+                    return None;
+                }
+                let res_name = job.spec.reservation.as_ref()?;
+                let res = reservations.get(res_name)?;
+                if res.is_expired(now) {
+                    Some(job.job_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for job_id in to_cancel {
+            if let Err(e) = self.complete_job(job_id, -1, JobState::Cancelled) {
+                warn!(job_id, error = %e, "failed to cancel job after reservation ended");
+            }
+        }
+    }
+
+    fn validate_reservation_job_overlap(
+        &self,
+        res: &Reservation,
+        except_name: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if res.flags.ignore_jobs {
+            return Ok(());
+        }
+        let jobs = self.jobs.read();
+        if let Some((job_id, node)) = running_jobs_overlap_start(
+            &jobs,
+            &res.nodes,
+            res.start_time,
+            except_name,
+        ) {
+            anyhow::bail!(
+                "requested nodes are busy (job {} on {} until after reservation start)",
+                job_id,
+                node
+            );
+        }
+        Ok(())
+    }
+
+    fn hold_jobs_for_deleted_reservation(&self, name: &str) {
+        let pending: Vec<JobId> = self
+            .jobs
+            .read()
+            .values()
+            .filter(|j| {
+                j.state == JobState::Pending
+                    && j.spec.reservation.as_deref() == Some(name)
+                    && j.pending_reason != PendingReason::Held
+            })
+            .map(|j| j.job_id)
+            .collect();
+        for job_id in pending {
+            if let Err(e) = self.hold_job(job_id) {
+                warn!(job_id, error = %e, "failed to hold job after reservation delete");
+                continue;
+            }
+            if let Some(job) = self.jobs.write().get_mut(&job_id) {
+                job.pending_reason = PendingReason::ReservationDeleted;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_reservation_update_locked(
+        reservations: &mut [Reservation],
+        name: &str,
+        duration_minutes: u32,
+        add_nodes: &[String],
+        remove_nodes: &[String],
+        add_users: &[String],
+        remove_users: &[String],
+        add_accounts: &[String],
+        remove_accounts: &[String],
+    ) {
+        let Some(res) = reservations.iter_mut().find(|r| r.name == name) else {
+            return;
+        };
         if duration_minutes > 0 {
             res.end_time = res.start_time + chrono::Duration::minutes(duration_minutes as i64);
         }
@@ -1838,21 +2055,6 @@ impl ClusterManager {
             }
         }
         res.accounts.retain(|a| !remove_accounts.contains(a));
-
-        info!(name, "reservation updated");
-        Ok(())
-    }
-
-    /// Delete a reservation by name.
-    pub fn delete_reservation(&self, name: &str) -> anyhow::Result<()> {
-        let mut reservations = self.reservations.write();
-        let len_before = reservations.len();
-        reservations.retain(|r| r.name != name);
-        if reservations.len() == len_before {
-            anyhow::bail!("reservation '{}' not found", name);
-        }
-        info!(name, "reservation deleted");
-        Ok(())
     }
 
     /// Get all reservations.
@@ -1894,6 +2096,11 @@ impl ClusterManager {
             // tick; clobbering with Resources/NodeDown would mislead any
             // observer that polls in between.
             if job_entry.pending_reason == PendingReason::DeadLine {
+                continue;
+            }
+
+            if let Some(reason) = reservation_fence_reason(job, cluster_state) {
+                job_entry.pending_reason = reason;
                 continue;
             }
 
@@ -2727,6 +2934,42 @@ impl ClusterManager {
                     t.revoked = true;
                 }
             }
+            WalOperation::ReservationCreate { reservation } => {
+                self.reservations.write().push(reservation.clone());
+                info!(name = %reservation.name, "reservation created");
+            }
+            WalOperation::ReservationUpdate {
+                name,
+                duration_minutes,
+                add_nodes,
+                remove_nodes,
+                add_users,
+                remove_users,
+                add_accounts,
+                remove_accounts,
+            } => {
+                let mut reservations = self.reservations.write();
+                Self::apply_reservation_update_locked(
+                    reservations.as_mut(),
+                    name,
+                    *duration_minutes,
+                    add_nodes,
+                    remove_nodes,
+                    add_users,
+                    remove_users,
+                    add_accounts,
+                    remove_accounts,
+                );
+                info!(name, "reservation updated");
+            }
+            WalOperation::ReservationDelete { name } => {
+                let mut reservations = self.reservations.write();
+                let len_before = reservations.len();
+                reservations.retain(|r| r.name != *name);
+                if reservations.len() < len_before {
+                    info!(name, "reservation deleted");
+                }
+            }
         }
         self.next_job_id.store(next_id, Ordering::Relaxed);
         response
@@ -2850,6 +3093,50 @@ impl StateMachineApply for ClusterManager {
                 "restored cluster state from Raft snapshot"
             );
         }
+    }
+}
+
+fn reservation_fence_reason(
+    job: &Job,
+    cluster_state: &spur_sched::traits::ClusterState,
+) -> Option<PendingReason> {
+    let now = Utc::now();
+    let duration = job
+        .spec
+        .time_limit
+        .unwrap_or(chrono::Duration::hours(1));
+    let mut maint_block = false;
+    let mut any_block = false;
+
+    for node in cluster_state.nodes {
+        if let Some(pname) = job.spec.partition.as_deref() {
+            let requested: Vec<&str> = pname.split(',').map(str::trim).collect();
+            if !requested
+                .iter()
+                .any(|rp| node.partitions.iter().any(|np| np == rp))
+            {
+                continue;
+            }
+        }
+        for res in cluster_state.reservations {
+            if !res.covers_node(&node.name) {
+                continue;
+            }
+            if reservation::prospective_overlap(job, res, &node.name, now, duration) {
+                any_block = true;
+                if res.flags.maint {
+                    maint_block = true;
+                }
+            }
+        }
+    }
+
+    if maint_block {
+        Some(PendingReason::ReservedMaintenance)
+    } else if any_block {
+        Some(PendingReason::ReqNodeNotAvail)
+    } else {
+        None
     }
 }
 

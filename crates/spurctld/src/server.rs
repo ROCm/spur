@@ -1182,6 +1182,8 @@ impl SlurmController for ControllerService {
 
         let end_time = start_time + chrono::Duration::minutes(req.duration_minutes as i64);
 
+        let flags = spur_core::reservation::ReservationFlags::parse_list(&req.flags);
+
         let reservation = spur_core::reservation::Reservation {
             name: req.name,
             start_time,
@@ -1189,11 +1191,12 @@ impl SlurmController for ControllerService {
             nodes: req.nodes,
             accounts: req.accounts,
             users: req.users,
+            flags,
         };
 
         self.cluster
             .create_reservation(reservation)
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         Ok(Response::new(()))
     }
@@ -1229,7 +1232,7 @@ impl SlurmController for ControllerService {
                 &req.add_accounts,
                 &req.remove_accounts,
             )
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
         Ok(Response::new(()))
     }
 
@@ -1273,6 +1276,7 @@ impl SlurmController for ControllerService {
             }
         }
         let reservations = self.cluster.get_reservations();
+        let now = Utc::now();
         let infos: Vec<ReservationInfo> = reservations
             .iter()
             .map(|r| ReservationInfo {
@@ -1282,6 +1286,8 @@ impl SlurmController for ControllerService {
                 nodes: r.nodes.join(","),
                 accounts: r.accounts.join(","),
                 users: r.users.join(","),
+                flags: r.flags.display_csv(),
+                state: r.state_label(now).into(),
             })
             .collect();
         Ok(Response::new(ListReservationsResponse {
@@ -1783,6 +1789,7 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         switch_name: node.switch_name.clone().unwrap_or_default(),
         active_reservation: String::new(),
         labels: node.labels.clone(),
+        reservation_maint: false,
     }
 }
 
@@ -1913,9 +1920,11 @@ fn annotate_nodes_with_reservations(
     now: DateTime<Utc>,
 ) {
     for node_info in nodes.iter_mut() {
+        node_info.reservation_maint = false;
         for res in reservations {
             if res.is_active(now) && res.covers_node(&node_info.name) {
                 node_info.active_reservation = res.name.clone();
+                node_info.reservation_maint = res.flags.maint;
                 break;
             }
         }
@@ -1969,6 +1978,7 @@ mod tests {
             nodes: nodes.iter().map(|s| s.to_string()).collect(),
             accounts: Vec::new(),
             users: Vec::new(),
+            flags: Default::default(),
         }
     }
 

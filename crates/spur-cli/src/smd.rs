@@ -109,6 +109,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
 fn node_state_str(node: &NodeInfo) -> &'static str {
     if !node.active_reservation.is_empty() && node.state == NodeState::NodeIdle as i32 {
+        if node.reservation_maint {
+            return "maint";
+        }
         return "resv";
     }
     spur_core::node::NodeState::from_proto_i32(node.state)

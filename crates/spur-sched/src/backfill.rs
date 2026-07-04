@@ -8,7 +8,7 @@ use tracing::debug;
 
 use spur_core::job::{Job, JobId};
 use spur_core::node::Node;
-use spur_core::reservation::Reservation;
+use spur_core::reservation::{self, Reservation};
 use spur_core::resource::{build_exclusive_allocation, build_node_allocation, ResourceSet};
 
 use crate::timeline::NodeTimeline;
@@ -43,6 +43,33 @@ impl BackfillScheduler {
             .iter()
             .map(|n| NodeTimeline::new(n.name.clone(), n.total_resources.clone()))
             .collect();
+    }
+
+    /// Returns true when `[start, start+duration)` intersects a reservation on `node`
+    /// and the job is not authorized for that reservation.
+    fn start_overlaps_reservation(
+        job: &Job,
+        node: &str,
+        reservations: &[Reservation],
+        start: chrono::DateTime<Utc>,
+        duration: chrono::Duration,
+    ) -> bool {
+        let end = start + duration;
+        for res in reservations {
+            if !res.covers_node(node) {
+                continue;
+            }
+            let res_name = job.spec.reservation.as_deref().filter(|s| !s.is_empty());
+            if res_name == Some(res.name.as_str())
+                && res.allows_user(&job.spec.user, job.spec.account.as_deref())
+            {
+                continue;
+            }
+            if end > res.start_time && start < res.end_time {
+                return true;
+            }
+        }
+        false
     }
 
     /// Find nodes that satisfy a job's resource requirements.
@@ -126,6 +153,7 @@ impl BackfillScheduler {
                 }
                 // Reservation enforcement
                 let now = Utc::now();
+                let job_duration = job.spec.time_limit.unwrap_or(Duration::hours(1));
                 let job_reservation = job.spec.reservation.as_deref().filter(|s| !s.is_empty());
 
                 let active_reservations: Vec<&Reservation> = reservations
@@ -134,11 +162,9 @@ impl BackfillScheduler {
                     .collect();
 
                 if let Some(res_name) = job_reservation {
-                    // Job targets a reservation -- only allow nodes in that reservation
                     if !active_reservations.iter().any(|r| r.name == res_name) {
                         return false;
                     }
-                    // Check user/account is allowed
                     let user = &job.spec.user;
                     let account = job.spec.account.as_deref();
                     if !active_reservations
@@ -147,10 +173,26 @@ impl BackfillScheduler {
                     {
                         return false;
                     }
+                    if let Some(res) = reservations.iter().find(|r| r.name == res_name) {
+                        let job_end = now + job_duration;
+                        if now < res.start_time || job_end > res.end_time {
+                            return false;
+                        }
+                    }
                 } else {
-                    // Job does NOT target a reservation -- skip reserved nodes
                     if !active_reservations.is_empty() {
                         return false;
+                    }
+                    for res in reservations {
+                        if reservation::prospective_overlap(
+                            job,
+                            res,
+                            &node.name,
+                            now,
+                            job_duration,
+                        ) {
+                            return false;
+                        }
                     }
                 }
 
@@ -248,6 +290,16 @@ impl Scheduler for BackfillScheduler {
                     (ni, start)
                 })
                 .collect();
+
+            node_starts.retain(|(ni, start)| {
+                !Self::start_overlaps_reservation(
+                    job,
+                    &cluster.nodes[*ni].name,
+                    cluster.reservations,
+                    *start,
+                    duration,
+                )
+            });
 
             // For --spread-job, sort by least-loaded (ascending alloc) so we
             // prefer nodes with the most available resources. For normal jobs,
@@ -1064,10 +1116,11 @@ mod tests {
         Reservation {
             name: name.into(),
             start_time: now - Duration::hours(1),
-            end_time: now + Duration::hours(1),
+            end_time: now + Duration::hours(2),
             nodes,
             accounts: Vec::new(),
             users,
+            flags: Default::default(),
         }
     }
 
@@ -1187,6 +1240,7 @@ mod tests {
             nodes: vec!["node001".into()],
             accounts: Vec::new(),
             users: vec!["alice".into()],
+            flags: Default::default(),
         };
 
         // Non-reservation job should be able to use node001 since reservation is inactive
@@ -1203,6 +1257,44 @@ mod tests {
         assert_eq!(assignments.len(), 1);
         // node001 should be available since the reservation hasn't started
         // (scheduler picks by weight/time, node001 is a valid target)
+    }
+
+    #[test]
+    fn test_prospective_reservation_blocks_long_job() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(1);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let now = Utc::now();
+        let future_reservation = Reservation {
+            name: "upcoming".into(),
+            start_time: now + Duration::minutes(30),
+            end_time: now + Duration::hours(2),
+            nodes: vec!["node001".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: Default::default(),
+        };
+
+        let mut job = make_job(1, 1, 1);
+        job.spec.time_limit = Some(Duration::hours(2));
+
+        let pending = vec![job];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[future_reservation],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert!(
+            assignments.is_empty(),
+            "job that would overlap upcoming reservation must not schedule"
+        );
     }
 
     #[test]

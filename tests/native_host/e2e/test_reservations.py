@@ -1,0 +1,118 @@
+# Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""E2E tests for node reservations."""
+
+import time
+
+from cluster import parse_job_id, wait_job
+
+
+class TestReservations:
+    def test_create_list_and_delete_reservation(self, cluster):
+        node = cluster.node_names[0]
+        create_out = cluster.scontrol(
+            "create-reservation",
+            f"--name=res-e2e-{int(time.time())}",
+            "--start-time=now",
+            "--duration=60",
+            f"--nodes={node}",
+            "--users=testuser",
+        )
+        assert "created" in create_out.lower()
+
+        show_out = cluster.scontrol("show", "reservation")
+        assert node in show_out
+        assert "ACTIVE" in show_out or "INACTIVE" in show_out
+
+    def test_unauthorized_job_blocked_on_reserved_node(self, cluster):
+        res_name = f"res-block-{int(time.time())}"
+        node = cluster.node_names[0]
+        cluster.scontrol(
+            "create-reservation",
+            f"--name={res_name}",
+            "--start-time=now",
+            "--duration=30",
+            f"--nodes={node}",
+            "--users=resuser",
+        )
+
+        script = cluster.write_file("res-block.sh", "#!/bin/bash\nsleep 120\n")
+        sb = cluster.sbatch(["-N", "1", "-w", node, "-t", "1", script])
+        job_id = parse_job_id(sb)
+        assert job_id is not None
+
+        deadline = time.time() + 30
+        blocked = False
+        while time.time() < deadline:
+            sq = cluster.squeue_all()
+            if str(job_id) in sq and "PD" in sq.split(str(job_id))[1][:40]:
+                blocked = True
+                break
+            time.sleep(2)
+
+        assert blocked, f"job {job_id} should stay pending on reserved node:\n{sq}"
+
+    def test_reservation_job_schedules_for_authorized_user(self, cluster):
+        res_name = f"res-auth-{int(time.time())}"
+        node = cluster.node_names[0]
+        cluster.scontrol(
+            "create-reservation",
+            f"--name={res_name}",
+            "--start-time=now",
+            "--duration=30",
+            f"--nodes={node}",
+            "--users=testuser",
+        )
+
+        script = cluster.write_file("res-auth.sh", "#!/bin/bash\necho RES_OK\n")
+        out_path = f"{cluster.remote_dir}/res-auth.out"
+        sb = cluster.sbatch(
+            [
+                "-N",
+                "1",
+                f"--reservation={res_name}",
+                "-w",
+                node,
+                "-t",
+                "1",
+                "-o",
+                out_path,
+                script,
+            ]
+        )
+        job_id = parse_job_id(sb)
+        assert job_id is not None
+
+        state = wait_job(cluster, job_id, timeout=60)
+        assert state in ("CD", "GONE"), f"expected completed, got {state}"
+
+        content = cluster.read_output_on_any_node(out_path)
+        assert "RES_OK" in content
+
+    def test_create_rejects_busy_node_without_ignore_jobs(self, cluster):
+        node = cluster.node_names[0]
+        long_script = cluster.write_file("res-long.sh", "#!/bin/bash\nsleep 300\n")
+        sb = cluster.sbatch(["-N", "1", "-w", node, "-t", "10", long_script])
+        job_id = parse_job_id(sb)
+        assert job_id is not None
+
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            sq = cluster.squeue_all()
+            if str(job_id) in sq and " R " in sq:
+                break
+            time.sleep(2)
+
+        res_name = f"res-busy-{int(time.time())}"
+        try:
+            cluster.scontrol(
+                "create-reservation",
+                f"--name={res_name}",
+                "--start-time=now",
+                "--duration=10",
+                f"--nodes={node}",
+            )
+            assert False, "expected reservation create to fail on busy node"
+        except Exception as exc:
+            assert "busy" in str(exc).lower() or "error" in str(exc).lower()

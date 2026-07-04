@@ -251,6 +251,8 @@ pub enum PendingReason {
     QosGrpNodeLimit,
     BurstBufferResources,
     BurstBufferStageIn,
+    ReservedMaintenance,
+    ReservationDeleted,
 }
 
 impl PendingReason {
@@ -294,6 +296,8 @@ impl PendingReason {
             Self::QosGrpNodeLimit => "QOSGrpNodeLimit",
             Self::BurstBufferResources => "BurstBufferResources",
             Self::BurstBufferStageIn => "BurstBufferStageIn",
+            Self::ReservedMaintenance => "ReqNodeNotAvail, Reserved for maintenance",
+            Self::ReservationDeleted => "ReservationDeleted",
         }
     }
 }

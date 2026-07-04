@@ -121,6 +121,11 @@ mod tests {
             (PendingReason::Held, "JobHeldUser"),
             // Reason-code vocabulary parity (Slurm 25.11.6 job_reason_string).
             (PendingReason::Reservation, "Reservation"),
+            (
+                PendingReason::ReservedMaintenance,
+                "ReqNodeNotAvail, Reserved for maintenance",
+            ),
+            (PendingReason::ReservationDeleted, "ReservationDeleted"),
             (PendingReason::QosMaxCpuPerJobLimit, "QOSMaxCpuPerJobLimit"),
             (
                 PendingReason::QosMaxWallDurationPerJobLimit,

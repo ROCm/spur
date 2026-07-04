@@ -103,6 +103,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // a follow-up; drive_bb_stage_in() is the controller-side seam only.
         cluster.drive_bb_stage_in();
         cluster.advance_bb_staging();
+        cluster.purge_expired_reservations();
+        cluster.enforce_reservation_end_times();
 
         // Tag jobs pending_jobs() will drop (QoS/license/reservation/BB) with
         // their real reason, since they never reach update_pending_reasons().
