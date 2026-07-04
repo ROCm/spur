@@ -196,6 +196,7 @@ message JobInfo {
   // Array jobs
   uint32 array_job_id = 50;
   uint32 array_task_id = 51;
+  string reservation = 52;
 }
 
 message NodeInfo {

@@ -411,10 +411,22 @@ pub(crate) fn compute_job_allocation(
 }
 
 /// Try to preempt lower-priority running jobs to make room for higher-priority pending jobs.
-fn try_preempt(cluster: &Arc<ClusterManager>, unscheduled: &[&spur_core::job::Job]) {
+pub(crate) fn try_preempt(cluster: &Arc<ClusterManager>, unscheduled: &[&spur_core::job::Job]) {
     use spur_core::job::JobState;
+    use spur_core::partition::{Partition, PreemptMode};
+    use spur_core::reservation::job_runs_in_active_reservation;
 
-    // Get running jobs sorted by priority (lowest first = best preemption candidates)
+    let now = chrono::Utc::now();
+    let reservations = cluster.get_reservations();
+    let partitions = cluster.get_partitions();
+
+    let partition_for = |job: &spur_core::job::Job| -> Option<&Partition> {
+        job.spec
+            .partition
+            .as_ref()
+            .and_then(|pname| partitions.iter().find(|p| p.name == *pname))
+    };
+
     let mut running: Vec<spur_core::job::Job> = cluster
         .get_jobs(&[JobState::Running], None, None, None, &[])
         .into_iter()
@@ -422,25 +434,59 @@ fn try_preempt(cluster: &Arc<ClusterManager>, unscheduled: &[&spur_core::job::Jo
     running.sort_by_key(|j| j.priority);
 
     for pending in unscheduled {
-        // Only preempt if pending job has significantly higher priority
+        let Some(pending_part) = partition_for(pending) else {
+            continue;
+        };
+        let preempt_mode = pending_part.preempt_mode;
+        if preempt_mode == PreemptMode::Off {
+            continue;
+        }
+        let pending_tier = pending_part.priority_tier;
+
         for candidate in &running {
-            if candidate.priority < pending.priority / 2 {
-                // Preempt: cancel the lower-priority job
-                info!(
-                    preempted_job = candidate.job_id,
-                    preempted_priority = candidate.priority,
-                    pending_job = pending.job_id,
-                    pending_priority = pending.priority,
-                    "preempting lower-priority job"
-                );
-                if let Err(e) = cluster.complete_job(candidate.job_id, -1, JobState::Preempted) {
-                    warn!(
-                        job_id = candidate.job_id,
-                        error = %e,
-                        "failed to preempt job"
-                    );
+            if candidate.priority >= pending.priority / 2 {
+                continue;
+            }
+
+            if job_runs_in_active_reservation(candidate, &reservations, now) {
+                let candidate_tier = partition_for(candidate)
+                    .map(|p| p.priority_tier)
+                    .unwrap_or(1);
+                if pending_tier <= candidate_tier {
+                    continue;
                 }
-                break; // One preemption per cycle, re-evaluate next cycle
+            }
+
+            info!(
+                preempted_job = candidate.job_id,
+                preempted_priority = candidate.priority,
+                pending_job = pending.job_id,
+                pending_priority = pending.priority,
+                preempt_mode = ?preempt_mode,
+                "preempting lower-priority job"
+            );
+
+            let result = match preempt_mode {
+                PreemptMode::Off => Ok(()),
+                PreemptMode::Suspend => cluster.suspend_job(candidate.job_id, "scheduler"),
+                PreemptMode::Cancel => {
+                    cluster
+                        .complete_job(candidate.job_id, -1, JobState::Preempted)
+                        .and_then(|_| cluster.requeue_preempted_job(candidate.job_id, false))
+                }
+                PreemptMode::Requeue => cluster
+                    .complete_job(candidate.job_id, -1, JobState::Preempted)
+                    .and_then(|_| cluster.requeue_preempted_job(candidate.job_id, true)),
+            };
+
+            if let Err(e) = result {
+                warn!(
+                    job_id = candidate.job_id,
+                    error = %e,
+                    "failed to preempt job"
+                );
+            } else {
+                break;
             }
         }
     }

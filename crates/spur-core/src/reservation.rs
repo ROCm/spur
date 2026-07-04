@@ -16,6 +16,8 @@ pub struct ReservationFlags {
     pub ignore_jobs: bool,
     #[serde(default)]
     pub no_hold_jobs: bool,
+    #[serde(default)]
+    pub overlap: bool,
 }
 
 impl ReservationFlags {
@@ -27,6 +29,7 @@ impl ReservationFlags {
                     "maint" => flags.maint = true,
                     "ignore_jobs" => flags.ignore_jobs = true,
                     "no_hold_jobs" => flags.no_hold_jobs = true,
+                    "overlap" => flags.overlap = true,
                     "" => {}
                     _ => {}
                 }
@@ -58,6 +61,9 @@ impl ReservationFlags {
         }
         if self.no_hold_jobs {
             parts.push("NO_HOLD_JOBS");
+        }
+        if self.overlap {
+            parts.push("OVERLAP");
         }
         parts.join(",")
     }
@@ -125,6 +131,57 @@ impl Reservation {
             .as_deref()
             .is_some_and(|n| n == self.name)
     }
+}
+
+/// Whether two reservations share a node and overlap in time.
+pub fn reservations_overlap(a: &Reservation, b: &Reservation) -> bool {
+    if a.end_time <= b.start_time || b.end_time <= a.start_time {
+        return false;
+    }
+    a.nodes.iter().any(|n| b.covers_node(n))
+}
+
+/// Whether overlap between `candidate` and `existing` is permitted by flags.
+pub fn overlap_allowed(candidate: &Reservation, existing: &Reservation) -> bool {
+    candidate.flags.overlap
+        || candidate.flags.maint
+        || existing.flags.overlap
+        || existing.flags.maint
+}
+
+/// Running job is tied to an active reservation on its allocated nodes.
+pub fn job_runs_in_active_reservation(
+    job: &Job,
+    reservations: &[Reservation],
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(res_name) = job.spec.reservation.as_deref() else {
+        return false;
+    };
+    reservations.iter().any(|r| {
+        r.name == res_name
+            && r.is_active(now)
+            && job
+                .allocated_nodes
+                .iter()
+                .any(|node| r.covers_node(node))
+    })
+}
+
+/// Pending or running job has a matching active reservation (for priority ordering).
+pub fn job_has_active_reservation(
+    job: &Job,
+    reservations: &[Reservation],
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(res_name) = job.spec.reservation.as_deref() else {
+        return false;
+    };
+    reservations.iter().any(|r| {
+        r.name == res_name
+            && (r.is_active(now) || r.is_future(now))
+            && r.allows_user(&job.spec.user, job.spec.account.as_deref())
+    })
 }
 
 /// Expand hostlist patterns and verify each name exists in the cluster.
@@ -293,10 +350,64 @@ mod tests {
 
     #[test]
     fn flags_parse_csv() {
-        let f = ReservationFlags::parse_csv("maint,ignore_jobs");
+        let f = ReservationFlags::parse_csv("maint,ignore_jobs,overlap");
         assert!(f.maint);
         assert!(f.ignore_jobs);
         assert!(!f.no_hold_jobs);
+        assert!(f.overlap);
+    }
+
+    #[test]
+    fn reservations_overlap_detects_shared_node_and_time() {
+        let now = Utc::now();
+        let a = Reservation {
+            name: "a".into(),
+            start_time: now,
+            end_time: now + Duration::hours(1),
+            nodes: vec!["node001".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: ReservationFlags::default(),
+        };
+        let b = Reservation {
+            name: "b".into(),
+            start_time: now + Duration::minutes(30),
+            end_time: now + Duration::hours(2),
+            nodes: vec!["node001".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: ReservationFlags::default(),
+        };
+        assert!(reservations_overlap(&a, &b));
+    }
+
+    #[test]
+    fn overlap_allowed_with_overlap_flag() {
+        let now = Utc::now();
+        let mut a = Reservation {
+            name: "a".into(),
+            start_time: now,
+            end_time: now + Duration::hours(1),
+            nodes: vec!["node001".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: ReservationFlags {
+                overlap: true,
+                ..Default::default()
+            },
+        };
+        let b = Reservation {
+            name: "b".into(),
+            start_time: now,
+            end_time: now + Duration::hours(1),
+            nodes: vec!["node001".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: ReservationFlags::default(),
+        };
+        assert!(overlap_allowed(&a, &b));
+        a.flags.overlap = false;
+        assert!(!overlap_allowed(&a, &b));
     }
 
     #[test]

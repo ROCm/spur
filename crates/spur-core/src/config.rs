@@ -381,6 +381,9 @@ pub struct SchedulerConfig {
     /// Max seconds to wait in COMPLETING before force-finishing the job.
     #[serde(default = "default_complete_wait")]
     pub complete_wait_secs: u32,
+    /// Grace minutes after a reservation ends before cancelling its running jobs.
+    #[serde(default)]
+    pub resv_overrun_minutes: u32,
 }
 
 fn default_scheduler_plugin() -> String {
@@ -408,6 +411,7 @@ impl Default for SchedulerConfig {
             fairshare_halflife_days: 14,
             default_time_limit_minutes: 60,
             complete_wait_secs: 300,
+            resv_overrun_minutes: 0,
         }
     }
 }

@@ -717,6 +717,36 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Return a preempted job to the pending queue.
+    pub fn requeue_preempted_job(&self, job_id: JobId, force: bool) -> anyhow::Result<()> {
+        const MAX_REQUEUE: u32 = 3;
+        let old_state = {
+            let jobs = self.jobs.read();
+            let Some(job) = jobs.get(&job_id) else {
+                return Ok(());
+            };
+            if job.requeue_count >= MAX_REQUEUE {
+                return Ok(());
+            }
+            if job.state != JobState::Preempted {
+                return Ok(());
+            }
+            if !force && !job.spec.requeue {
+                return Ok(());
+            }
+            job.state
+        };
+
+        self.propose(WalOperation::JobStateChange {
+            job_id,
+            old_state,
+            new_state: JobState::Pending,
+        })?;
+
+        info!(job_id, "preempted job requeued");
+        Ok(())
+    }
+
     /// Requeue a job back to Pending after a dispatch failure.
     /// Unlike `maybe_requeue`, this is unconditional and doesn't require
     /// the requeue flag on the spec. Used when the agent rejects a job
@@ -1349,6 +1379,7 @@ impl ClusterManager {
         // Recompute effective priority with age + partition tier
         let now = Utc::now();
         let partitions = self.partitions.read();
+        let reservations = self.get_reservations();
         for job in &mut pending {
             let age_minutes = (now - job.submit_time).num_minutes().max(0);
             let partition_tier = job
@@ -1368,8 +1399,15 @@ impl ClusterManager {
                 partition_tier,
             );
         }
+        drop(partitions);
 
-        pending.sort_by_key(|j| std::cmp::Reverse(j.priority));
+        pending.sort_by(|a, b| {
+            let a_res = reservation::job_has_active_reservation(a, &reservations, now);
+            let b_res = reservation::job_has_active_reservation(b, &reservations, now);
+            b_res
+                .cmp(&a_res)
+                .then(b.priority.cmp(&a.priority))
+        });
 
         // License reservation, in priority order. `remaining` starts from current
         // availability (config total minus licenses held by running jobs) and each
@@ -1804,6 +1842,7 @@ impl ClusterManager {
         res.nodes = normalize_node_list(&res.nodes, &known)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         self.validate_reservation_job_overlap(&res, None)?;
+        self.validate_reservation_storage_overlap(&res, None)?;
         self.propose(WalOperation::ReservationCreate { reservation: res })?;
         Ok(())
     }
@@ -1861,6 +1900,7 @@ impl ClusterManager {
         preview.accounts.retain(|a| !remove_accounts.contains(a));
 
         self.validate_reservation_job_overlap(&preview, Some(name))?;
+        self.validate_reservation_storage_overlap(&preview, Some(name))?;
 
         self.propose(WalOperation::ReservationUpdate {
             name: name.to_string(),
@@ -1937,9 +1977,10 @@ impl ClusterManager {
         }
     }
 
-    /// Cancel running jobs whose reservation window has ended.
+    /// Cancel running jobs whose reservation window has ended (after optional grace).
     pub fn enforce_reservation_end_times(&self) {
         let now = Utc::now();
+        let grace = chrono::Duration::minutes(self.config.scheduler.resv_overrun_minutes as i64);
         let reservations: std::collections::HashMap<String, Reservation> = self
             .get_reservations()
             .into_iter()
@@ -1958,7 +1999,7 @@ impl ClusterManager {
                 }
                 let res_name = job.spec.reservation.as_ref()?;
                 let res = reservations.get(res_name)?;
-                if res.is_expired(now) {
+                if now > res.end_time + grace {
                     Some(job.job_id)
                 } else {
                     None
@@ -1991,6 +2032,29 @@ impl ClusterManager {
                 "requested nodes are busy (job {} on {} until after reservation start)",
                 job_id,
                 node
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_reservation_storage_overlap(
+        &self,
+        res: &Reservation,
+        except_name: Option<&str>,
+    ) -> anyhow::Result<()> {
+        for existing in self.reservations.read().iter() {
+            if except_name == Some(existing.name.as_str()) {
+                continue;
+            }
+            if !reservation::reservations_overlap(res, existing) {
+                continue;
+            }
+            if reservation::overlap_allowed(res, existing) {
+                continue;
+            }
+            anyhow::bail!(
+                "reservation overlaps with existing reservation '{}'",
+                existing.name
             );
         }
         Ok(())
@@ -5123,6 +5187,164 @@ mod tests {
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::Reservation
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reservation_overlap_rejected_without_flag() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        let base = Reservation {
+            name: String::new(),
+            start_time: now,
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: Default::default(),
+        };
+        let mut r1 = base.clone();
+        r1.name = "r1".into();
+        cm.create_reservation(r1).unwrap();
+        let mut r2 = base;
+        r2.name = "r2".into();
+        r2.start_time = now + chrono::Duration::hours(1);
+        assert!(cm.create_reservation(r2).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reservation_overlap_allowed_with_overlap_flag() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        let base = Reservation {
+            name: String::new(),
+            start_time: now,
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: Default::default(),
+        };
+        let mut r1 = base.clone();
+        r1.name = "r1".into();
+        cm.create_reservation(r1).unwrap();
+        let mut r2 = base;
+        r2.name = "r2".into();
+        r2.start_time = now + chrono::Duration::hours(1);
+        r2.flags.overlap = true;
+        assert!(cm.create_reservation(r2).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_prioritize_active_reservation_targets() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "r1".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["testuser".into()],
+            flags: Default::default(),
+        })
+        .unwrap();
+
+        let mut plain = basic_spec("plain");
+        plain.priority = Some(5000);
+        let plain_id = submit_and_wait(&cm, plain);
+
+        let mut resv = basic_spec("resv");
+        resv.priority = Some(1000);
+        resv.reservation = Some("r1".into());
+        let resv_id = submit_and_wait(&cm, resv);
+
+        let pending = cm.pending_jobs();
+        assert_eq!(pending.first().map(|j| j.job_id), Some(resv_id));
+        assert!(pending.iter().any(|j| j.job_id == plain_id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resv_overrun_grace_delays_cancel() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.scheduler.resv_overrun_minutes = 30;
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "r1".into(),
+            start_time: now - chrono::Duration::hours(1),
+            end_time: now - chrono::Duration::minutes(5),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["testuser".into()],
+            flags: Default::default(),
+        })
+        .unwrap();
+
+        let mut spec = basic_spec("resv-run");
+        spec.reservation = Some("r1".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            job_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        cm.enforce_reservation_end_times();
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_skips_jobs_in_active_reservation_at_same_tier() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].preempt_mode = "cancel".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "r1".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["testuser".into()],
+            flags: Default::default(),
+        })
+        .unwrap();
+
+        let mut low = basic_spec("low");
+        low.priority = Some(100);
+        low.reservation = Some("r1".into());
+        let low_id = submit_and_wait(&cm, low);
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            low_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, low_id, JobState::Running);
+
+        let mut high = basic_spec("high");
+        high.priority = Some(10_000);
+        let high_id = submit_and_wait(&cm, high);
+        let high_job = cm.get_job(high_id).unwrap();
+
+        crate::scheduler_loop::try_preempt(&cm, &[&high_job]);
+        assert_eq!(cm.get_job(low_id).unwrap().state, JobState::Running);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

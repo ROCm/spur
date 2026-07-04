@@ -193,6 +193,7 @@ pub fn squeue_header(spec: char) -> &'static str {
         'N' => "NODELIST",
         'b' => "GRES",
         'L' => "TIME_LEFT",
+        'v' => "RESERVATION",
         _ => "?",
     }
 }
