@@ -179,6 +179,23 @@ jobs:
           scp $SSH_OPTS "$KEY" ci@"$DRIVER_IP":/tmp/ci-ssh-key
           ssh $SSH_OPTS ci@"$DRIVER_IP" "chmod 600 /tmp/ci-ssh-key"
 
+      - name: Load AppArmor profile for rootless containers
+        if: matrix.cluster_type == 'native-host'
+        run: |
+          DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
+          GPU_IPS="${{ steps.cluster.outputs.gpu_ips }}"
+          KEY="${{ steps.ssh.outputs.privkey }}"
+          SSH_OPTS="-o StrictHostKeyChecking=no -i $KEY"
+          SPURD="/tmp/spur-ci-bin/spurd"
+          PROF="abi <abi/4.0>,
+          profile spur-ci ${SPURD} flags=(unconfined) {
+            userns,
+          }"
+          IFS=',' read -ra NODES <<< "$GPU_IPS"
+          for node in "${NODES[@]}"; do
+            ssh $SSH_OPTS ci@"$node" "echo '${PROF}' | sudo apparmor_parser -r 2>/dev/null || true"
+          done
+
       - name: Run tests inside driver VM (native-host)
         if: matrix.cluster_type == 'native-host'
         run: |
