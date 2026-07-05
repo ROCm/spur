@@ -5,7 +5,7 @@
 
 import time
 
-from cluster import parse_job_id, wait_job
+from cluster import parse_job_id, wait_job, wait_job_state
 
 
 class TestReservations:
@@ -50,16 +50,7 @@ class TestReservations:
         job_id = parse_job_id(sb)
         assert job_id is not None
 
-        deadline = time.time() + 30
-        blocked = False
-        while time.time() < deadline:
-            sq = cluster.squeue_all()
-            if str(job_id) in sq and "PD" in sq.split(str(job_id))[1][:40]:
-                blocked = True
-                break
-            time.sleep(2)
-
-        assert blocked, f"job {job_id} should stay pending on reserved node:\n{sq}"
+        wait_job_state(cluster, job_id, "PD", timeout=30)
 
     def test_reservation_job_schedules_for_authorized_user(self, cluster):
         res_name = f"res-auth-{int(time.time())}"
@@ -105,12 +96,7 @@ class TestReservations:
         job_id = parse_job_id(sb)
         assert job_id is not None
 
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            sq = cluster.squeue_all()
-            if str(job_id) in sq and " R " in sq:
-                break
-            time.sleep(2)
+        wait_job_state(cluster, job_id, "R", timeout=30)
 
         res_name = f"res-busy-{int(time.time())}"
         out = cluster.cli_allow_fail(

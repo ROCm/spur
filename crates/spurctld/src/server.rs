@@ -1197,7 +1197,7 @@ impl SlurmController for ControllerService {
 
         self.cluster
             .create_reservation(reservation)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            .map_err(reservation_rpc_status)?;
 
         Ok(Response::new(()))
     }
@@ -1233,7 +1233,7 @@ impl SlurmController for ControllerService {
                 &req.add_accounts,
                 &req.remove_accounts,
             )
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            .map_err(reservation_rpc_status)?;
         Ok(Response::new(()))
     }
 
@@ -1259,7 +1259,7 @@ impl SlurmController for ControllerService {
         let name = request.into_inner().name;
         self.cluster
             .delete_reservation(&name)
-            .map_err(|e| Status::not_found(e.to_string()))?;
+            .map_err(reservation_rpc_status)?;
         Ok(Response::new(()))
     }
 
@@ -1923,13 +1923,29 @@ fn annotate_nodes_with_reservations(
 ) {
     for node_info in nodes.iter_mut() {
         node_info.reservation_maint = false;
+        node_info.active_reservation.clear();
         for res in reservations {
             if res.is_active(now) && res.covers_node(&node_info.name) {
-                node_info.active_reservation = res.name.clone();
-                node_info.reservation_maint = res.flags.maint;
-                break;
+                if node_info.active_reservation.is_empty() {
+                    node_info.active_reservation = res.name.clone();
+                }
+                if res.flags.maint {
+                    node_info.reservation_maint = true;
+                }
             }
         }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn reservation_rpc_status(err: impl std::fmt::Display) -> Status {
+    let message = err.to_string();
+    if message.contains("raft propose failed") {
+        Status::internal(message)
+    } else if message.contains("not found") {
+        Status::not_found(message)
+    } else {
+        Status::invalid_argument(message)
     }
 }
 
@@ -1957,6 +1973,7 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use spur_core::job::{JobState, NodeCompleteError};
+    use spur_core::reservation::ReservationFlags;
     use tonic::Code;
 
     fn make_node_info(name: &str) -> NodeInfo {
@@ -2040,6 +2057,41 @@ mod tests {
         ];
         annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now());
         assert_eq!(nodes[0].active_reservation, "first");
+    }
+
+    #[test]
+    fn test_annotate_maint_flag_with_overlapping_reservations() {
+        let mut nodes = vec![make_node_info("n1")];
+        let now = Utc::now();
+        let plain = Reservation {
+            name: "plain".into(),
+            start_time: now - Duration::hours(1),
+            end_time: now + Duration::hours(1),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: ReservationFlags {
+                overlap: true,
+                ..Default::default()
+            },
+        };
+        let maint = Reservation {
+            name: "maint".into(),
+            start_time: now - Duration::hours(1),
+            end_time: now + Duration::hours(1),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: ReservationFlags {
+                maint: true,
+                overlap: true,
+                ..Default::default()
+            },
+        };
+        let reservations = vec![plain, maint];
+        annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now());
+        assert_eq!(nodes[0].active_reservation, "plain");
+        assert!(nodes[0].reservation_maint);
     }
 
     #[test]

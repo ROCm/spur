@@ -241,14 +241,16 @@ pub fn running_jobs_overlap_start(
         if !overlaps_node {
             continue;
         }
-        let end = running_job_end(job, Utc::now()).unwrap_or(start_time);
+        let node = job
+            .allocated_nodes
+            .iter()
+            .find(|n| node_set.contains(n.as_str()))
+            .cloned()
+            .unwrap_or_default();
+        let Some(end) = running_job_end(job, Utc::now()) else {
+            return Some((job.job_id, node));
+        };
         if end > start_time {
-            let node = job
-                .allocated_nodes
-                .iter()
-                .find(|n| node_set.contains(n.as_str()))
-                .cloned()
-                .unwrap_or_default();
             return Some((job.job_id, node));
         }
     }
@@ -274,7 +276,7 @@ pub fn prospective_overlap(
     }
     let job_end = now + job_duration;
     if reservation.is_active(now) {
-        return job_end > reservation.end_time || now < reservation.start_time;
+        return true;
     }
     if reservation.is_future(now) {
         return job_end > reservation.start_time;
@@ -405,6 +407,40 @@ mod tests {
         assert!(overlap_allowed(&a, &b));
         a.flags.overlap = false;
         assert!(!overlap_allowed(&a, &b));
+    }
+
+    #[test]
+    fn prospective_overlap_blocks_unauthorized_job_on_active_reservation() {
+        let now = Utc::now();
+        let res = Reservation {
+            name: "r1".into(),
+            start_time: now - Duration::minutes(30),
+            end_time: now + Duration::hours(1),
+            nodes: vec!["node001".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: ReservationFlags::default(),
+        };
+        let job = Job::new(1, JobSpec::default());
+        assert!(prospective_overlap(
+            &job,
+            &res,
+            "node001",
+            now,
+            Duration::minutes(1),
+        ));
+    }
+
+    #[test]
+    fn running_jobs_overlap_start_treats_unknown_end_as_occupied() {
+        let now = Utc::now();
+        let start_time = now + Duration::hours(1);
+        let mut job = Job::new(1, JobSpec::default());
+        job.state = JobState::Running;
+        job.allocated_nodes = vec!["node001".into()];
+        let jobs = std::collections::HashMap::from([(1, job)]);
+        let overlap = running_jobs_overlap_start(&jobs, &["node001".into()], start_time, None);
+        assert_eq!(overlap, Some((1, "node001".into())));
     }
 
     #[test]
