@@ -1182,7 +1182,8 @@ impl SlurmController for ControllerService {
 
         let end_time = start_time + chrono::Duration::minutes(req.duration_minutes as i64);
 
-        let flags = spur_core::reservation::ReservationFlags::parse_list(&req.flags);
+        let flags = spur_core::reservation::ReservationFlags::parse_list(&req.flags)
+            .map_err(Status::invalid_argument)?;
 
         let reservation = spur_core::reservation::Reservation {
             name: req.name,

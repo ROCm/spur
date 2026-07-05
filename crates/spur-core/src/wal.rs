@@ -174,9 +174,7 @@ mod reservation_wal_tests {
 
     #[test]
     fn reservation_delete_round_trips() {
-        let op = WalOperation::ReservationDelete {
-            name: "r1".into(),
-        };
+        let op = WalOperation::ReservationDelete { name: "r1".into() };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {

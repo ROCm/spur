@@ -10,10 +10,11 @@ from cluster import parse_job_id, wait_job
 
 class TestReservations:
     def test_create_list_and_delete_reservation(self, cluster):
+        res_name = f"res-e2e-{int(time.time())}"
         node = cluster.node_names[0]
         create_out = cluster.scontrol(
             "create-reservation",
-            f"--name=res-e2e-{int(time.time())}",
+            f"--name={res_name}",
             "--start-time=now",
             "--duration=60",
             f"--nodes={node}",
@@ -22,8 +23,15 @@ class TestReservations:
         assert "created" in create_out.lower()
 
         show_out = cluster.scontrol("show", "reservation")
+        assert res_name in show_out
         assert node in show_out
         assert "ACTIVE" in show_out or "INACTIVE" in show_out
+
+        delete_out = cluster.scontrol("delete-reservation", res_name)
+        assert "deleted" in delete_out.lower()
+
+        show_after = cluster.scontrol("show", "reservation")
+        assert res_name not in show_after
 
     def test_unauthorized_job_blocked_on_reserved_node(self, cluster):
         res_name = f"res-block-{int(time.time())}"
@@ -105,14 +113,15 @@ class TestReservations:
             time.sleep(2)
 
         res_name = f"res-busy-{int(time.time())}"
-        try:
-            cluster.scontrol(
+        out = cluster.cli_allow_fail(
+            [
+                "scontrol",
                 "create-reservation",
                 f"--name={res_name}",
                 "--start-time=now",
                 "--duration=10",
                 f"--nodes={node}",
-            )
-            assert False, "expected reservation create to fail on busy node"
-        except Exception as exc:
-            assert "busy" in str(exc).lower() or "error" in str(exc).lower()
+            ]
+        )
+        msg = out.lower()
+        assert "busy" in msg or "until after reservation start" in msg, f"unexpected: {out}"

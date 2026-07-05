@@ -174,8 +174,8 @@ impl BackfillScheduler {
                         return false;
                     }
                     if let Some(res) = reservations.iter().find(|r| r.name == res_name) {
-                        let job_end = now + job_duration;
-                        if now < res.start_time || job_end > res.end_time {
+                        let earliest = now.max(res.start_time);
+                        if earliest + job_duration > res.end_time {
                             return false;
                         }
                     }
@@ -184,13 +184,8 @@ impl BackfillScheduler {
                         return false;
                     }
                     for res in reservations {
-                        if reservation::prospective_overlap(
-                            job,
-                            res,
-                            &node.name,
-                            now,
-                            job_duration,
-                        ) {
+                        if reservation::prospective_overlap(job, res, &node.name, now, job_duration)
+                        {
                             return false;
                         }
                     }

@@ -21,7 +21,7 @@ pub struct ReservationFlags {
 }
 
 impl ReservationFlags {
-    pub fn parse_list(values: &[String]) -> Self {
+    pub fn parse_list(values: &[String]) -> Result<Self, String> {
         let mut flags = Self::default();
         for v in values {
             for part in v.split(',') {
@@ -31,20 +31,19 @@ impl ReservationFlags {
                     "no_hold_jobs" => flags.no_hold_jobs = true,
                     "overlap" => flags.overlap = true,
                     "" => {}
-                    _ => {}
+                    other => return Err(format!("unknown reservation flag '{other}'")),
                 }
             }
         }
-        flags
+        Ok(flags)
     }
 
-    pub fn parse_csv(csv: &str) -> Self {
+    pub fn parse_csv(csv: &str) -> Result<Self, String> {
         if csv.is_empty() {
-            return Self::default();
+            return Ok(Self::default());
         }
         Self::parse_list(
-            &csv
-                .split(',')
+            &csv.split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>(),
@@ -124,13 +123,6 @@ impl Reservation {
         }
         false
     }
-
-    pub fn job_targets(&self, job: &Job) -> bool {
-        job.spec
-            .reservation
-            .as_deref()
-            .is_some_and(|n| n == self.name)
-    }
 }
 
 /// Whether two reservations share a node and overlap in time.
@@ -161,10 +153,7 @@ pub fn job_runs_in_active_reservation(
     reservations.iter().any(|r| {
         r.name == res_name
             && r.is_active(now)
-            && job
-                .allocated_nodes
-                .iter()
-                .any(|node| r.covers_node(node))
+            && job.allocated_nodes.iter().any(|node| r.covers_node(node))
     })
 }
 
@@ -179,7 +168,7 @@ pub fn job_has_active_reservation(
     };
     reservations.iter().any(|r| {
         r.name == res_name
-            && (r.is_active(now) || r.is_future(now))
+            && r.is_active(now)
             && r.allows_user(&job.spec.user, job.spec.account.as_deref())
     })
 }
@@ -245,7 +234,10 @@ pub fn running_jobs_overlap_start(
                 continue;
             }
         }
-        let overlaps_node = job.allocated_nodes.iter().any(|n| node_set.contains(n.as_str()));
+        let overlaps_node = job
+            .allocated_nodes
+            .iter()
+            .any(|n| node_set.contains(n.as_str()));
         if !overlaps_node {
             continue;
         }
@@ -350,11 +342,16 @@ mod tests {
 
     #[test]
     fn flags_parse_csv() {
-        let f = ReservationFlags::parse_csv("maint,ignore_jobs,overlap");
+        let f = ReservationFlags::parse_csv("maint,ignore_jobs,overlap").unwrap();
         assert!(f.maint);
         assert!(f.ignore_jobs);
         assert!(!f.no_hold_jobs);
         assert!(f.overlap);
+    }
+
+    #[test]
+    fn flags_reject_unknown() {
+        assert!(ReservationFlags::parse_csv("not_a_flag").is_err());
     }
 
     #[test]

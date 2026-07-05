@@ -87,7 +87,7 @@ pub enum ScontrolCommand {
         /// Comma-separated users (optional)
         #[arg(long, default_value = "")]
         users: String,
-        /// Comma-separated flags (maint, ignore_jobs, no_hold_jobs)
+        /// Comma-separated flags (maint, ignore_jobs, no_hold_jobs, overlap)
         #[arg(long, default_value = "")]
         flags: String,
     },

@@ -18,9 +18,7 @@ use spur_core::job::{Job, JobId, JobSpec, JobState, NodeCompleteError, PendingRe
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::Partition;
 use spur_core::qos::{check_qos_limits, QosCheckResult};
-use spur_core::reservation::{
-    self, normalize_node_list, running_jobs_overlap_start, Reservation,
-};
+use spur_core::reservation::{self, normalize_node_list, running_jobs_overlap_start, Reservation};
 use spur_core::resource::{ResourceAllocations, ResourceSet};
 use spur_core::step::{JobStep, StepState, STEP_BATCH, STEP_RESERVED_MIN};
 use spur_core::wal::WalOperation;
@@ -1404,9 +1402,7 @@ impl ClusterManager {
         pending.sort_by(|a, b| {
             let a_res = reservation::job_has_active_reservation(a, &reservations, now);
             let b_res = reservation::job_has_active_reservation(b, &reservations, now);
-            b_res
-                .cmp(&a_res)
-                .then(b.priority.cmp(&a.priority))
+            b_res.cmp(&a_res).then(b.priority.cmp(&a.priority))
         });
 
         // License reservation, in priority order. `remaining` starts from current
@@ -1829,18 +1825,11 @@ impl ClusterManager {
 
     /// Create a new reservation (validated, persisted via Raft).
     pub fn create_reservation(&self, mut res: Reservation) -> anyhow::Result<()> {
-        if self
-            .reservations
-            .read()
-            .iter()
-            .any(|r| r.name == res.name)
-        {
+        if self.reservations.read().iter().any(|r| r.name == res.name) {
             anyhow::bail!("reservation '{}' already exists", res.name);
         }
-        let known: std::collections::HashSet<String> =
-            self.nodes.read().keys().cloned().collect();
-        res.nodes = normalize_node_list(&res.nodes, &known)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let known: std::collections::HashSet<String> = self.nodes.read().keys().cloned().collect();
+        res.nodes = normalize_node_list(&res.nodes, &known).map_err(|e| anyhow::anyhow!("{e}"))?;
         self.validate_reservation_job_overlap(&res, None)?;
         self.validate_reservation_storage_overlap(&res, None)?;
         self.propose(WalOperation::ReservationCreate { reservation: res })?;
@@ -1872,13 +1861,13 @@ impl ClusterManager {
             preview.end_time =
                 preview.start_time + chrono::Duration::minutes(duration_minutes as i64);
         }
-        let known: std::collections::HashSet<String> =
-            self.nodes.read().keys().cloned().collect();
+        let known: std::collections::HashSet<String> = self.nodes.read().keys().cloned().collect();
         let mut add_expanded = Vec::new();
         for n in add_nodes {
-            add_expanded.extend(normalize_node_list(std::slice::from_ref(n), &known).map_err(
-                |e| anyhow::anyhow!("{e}"),
-            )?);
+            add_expanded.extend(
+                normalize_node_list(std::slice::from_ref(n), &known)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+            );
         }
         for node in &add_expanded {
             if !preview.nodes.contains(node) {
@@ -1971,8 +1960,18 @@ impl ClusterManager {
             if in_use {
                 continue;
             }
+            let no_hold = self
+                .reservations
+                .read()
+                .iter()
+                .find(|r| r.name == name)
+                .is_some_and(|r| r.flags.no_hold_jobs);
             if let Err(e) = self.propose(WalOperation::ReservationDelete { name: name.clone() }) {
                 warn!(name = %name, error = %e, "failed to purge expired reservation");
+                continue;
+            }
+            if !no_hold {
+                self.hold_jobs_for_deleted_reservation(&name);
             }
         }
     }
@@ -2022,12 +2021,9 @@ impl ClusterManager {
             return Ok(());
         }
         let jobs = self.jobs.read();
-        if let Some((job_id, node)) = running_jobs_overlap_start(
-            &jobs,
-            &res.nodes,
-            res.start_time,
-            except_name,
-        ) {
+        if let Some((job_id, node)) =
+            running_jobs_overlap_start(&jobs, &res.nodes, res.start_time, except_name)
+        {
             anyhow::bail!(
                 "requested nodes are busy (job {} on {} until after reservation start)",
                 job_id,
@@ -3165,10 +3161,7 @@ fn reservation_fence_reason(
     cluster_state: &spur_sched::traits::ClusterState,
 ) -> Option<PendingReason> {
     let now = Utc::now();
-    let duration = job
-        .spec
-        .time_limit
-        .unwrap_or(chrono::Duration::hours(1));
+    let duration = job.spec.time_limit.unwrap_or(chrono::Duration::hours(1));
     let mut maint_block = false;
     let mut any_block = false;
 
@@ -5345,6 +5338,115 @@ mod tests {
 
         crate::scheduler_loop::try_preempt(&cm, &[&high_job]);
         assert_eq!(cm.get_job(low_id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_skips_jobs_on_unrelated_nodes() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].preempt_mode = "cancel".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+
+        let mut low = basic_spec("low");
+        low.priority = Some(100);
+        low.nodelist = Some("n2".into());
+        let low_id = submit_and_wait(&cm, low);
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            low_id,
+            vec!["n2".into()],
+            res.clone(),
+            per_node_for(&["n2"], res),
+        )
+        .unwrap();
+        settle(&cm, low_id, JobState::Running);
+
+        let mut high = basic_spec("high");
+        high.priority = Some(10_000);
+        high.nodelist = Some("n1".into());
+        let high_id = submit_and_wait(&cm, high);
+        let high_job = cm.get_job(high_id).unwrap();
+
+        crate::scheduler_loop::try_preempt(&cm, &[&high_job]);
+        assert_eq!(cm.get_job(low_id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn purge_expired_holds_pending_reservation_jobs() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.apply_operation(&WalOperation::ReservationCreate {
+            reservation: Reservation {
+                name: "r1".into(),
+                start_time: now - chrono::Duration::hours(2),
+                end_time: now - chrono::Duration::minutes(1),
+                nodes: vec!["n1".into()],
+                accounts: Vec::new(),
+                users: vec!["testuser".into()],
+                flags: Default::default(),
+            },
+        });
+
+        let mut spec = basic_spec("resv-pending");
+        spec.reservation = Some("r1".into());
+        let job_id = submit_and_wait(&cm, spec);
+
+        cm.purge_expired_reservations();
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.pending_reason, PendingReason::ReservationDeleted);
+        assert_eq!(job.priority, 0);
+        assert!(cm.get_reservations().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_reservation_create_update_delete() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        let res = Reservation {
+            name: "r1".into(),
+            start_time: now,
+            end_time: now + chrono::Duration::hours(1),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: Default::default(),
+        };
+        cm.apply_operation(&WalOperation::ReservationCreate {
+            reservation: res.clone(),
+        });
+        assert_eq!(cm.get_reservations().len(), 1);
+        assert_eq!(cm.get_reservations()[0].name, "r1");
+
+        cm.apply_operation(&WalOperation::ReservationUpdate {
+            name: "r1".into(),
+            duration_minutes: 120,
+            add_nodes: Vec::new(),
+            remove_nodes: Vec::new(),
+            add_users: vec!["bob".into()],
+            remove_users: Vec::new(),
+            add_accounts: Vec::new(),
+            remove_accounts: Vec::new(),
+        });
+        let updated = cm
+            .get_reservations()
+            .into_iter()
+            .find(|r| r.name == "r1")
+            .unwrap();
+        assert!(updated.users.contains(&"bob".into()));
+        assert_eq!(
+            updated.end_time,
+            updated.start_time + chrono::Duration::minutes(120)
+        );
+
+        cm.apply_operation(&WalOperation::ReservationDelete { name: "r1".into() });
+        assert!(cm.get_reservations().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

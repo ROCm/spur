@@ -419,6 +419,7 @@ pub(crate) fn try_preempt(cluster: &Arc<ClusterManager>, unscheduled: &[&spur_co
     let now = chrono::Utc::now();
     let reservations = cluster.get_reservations();
     let partitions = cluster.get_partitions();
+    let cluster_nodes = cluster.get_nodes();
 
     let partition_for = |job: &spur_core::job::Job| -> Option<&Partition> {
         job.spec
@@ -448,6 +449,10 @@ pub(crate) fn try_preempt(cluster: &Arc<ClusterManager>, unscheduled: &[&spur_co
                 continue;
             }
 
+            if !preempt_overlaps_pending_nodes(pending, candidate, &cluster_nodes) {
+                continue;
+            }
+
             if job_runs_in_active_reservation(candidate, &reservations, now) {
                 let candidate_tier = partition_for(candidate)
                     .map(|p| p.priority_tier)
@@ -467,16 +472,14 @@ pub(crate) fn try_preempt(cluster: &Arc<ClusterManager>, unscheduled: &[&spur_co
             );
 
             let result = match preempt_mode {
-                PreemptMode::Off => Ok(()),
                 PreemptMode::Suspend => cluster.suspend_job(candidate.job_id, "scheduler"),
-                PreemptMode::Cancel => {
-                    cluster
-                        .complete_job(candidate.job_id, -1, JobState::Preempted)
-                        .and_then(|_| cluster.requeue_preempted_job(candidate.job_id, false))
-                }
+                PreemptMode::Cancel => cluster
+                    .complete_job(candidate.job_id, -1, JobState::Preempted)
+                    .and_then(|_| cluster.requeue_preempted_job(candidate.job_id, false)),
                 PreemptMode::Requeue => cluster
                     .complete_job(candidate.job_id, -1, JobState::Preempted)
                     .and_then(|_| cluster.requeue_preempted_job(candidate.job_id, true)),
+                PreemptMode::Off => unreachable!("filtered above"),
             };
 
             if let Err(e) = result {
@@ -490,6 +493,48 @@ pub(crate) fn try_preempt(cluster: &Arc<ClusterManager>, unscheduled: &[&spur_co
             }
         }
     }
+}
+
+/// True when `candidate` occupies a node the pending job could target.
+fn preempt_overlaps_pending_nodes(
+    pending: &spur_core::job::Job,
+    candidate: &spur_core::job::Job,
+    nodes: &[spur_core::node::Node],
+) -> bool {
+    if candidate.allocated_nodes.is_empty() {
+        return false;
+    }
+    let occupied: HashSet<&str> = candidate
+        .allocated_nodes
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    if let Some(ref nodelist) = pending.spec.nodelist {
+        return nodelist
+            .split(',')
+            .map(str::trim)
+            .any(|n| occupied.contains(n));
+    }
+
+    let partitions: Vec<&str> = pending
+        .spec
+        .partition
+        .as_deref()
+        .map(|p| p.split(',').map(str::trim).collect())
+        .unwrap_or_default();
+
+    nodes.iter().any(|node| {
+        if !occupied.contains(node.name.as_str()) {
+            return false;
+        }
+        if partitions.is_empty() {
+            return true;
+        }
+        partitions
+            .iter()
+            .any(|p| node.partitions.iter().any(|np| np == p))
+    })
 }
 
 /// Forward unschedulable jobs to federation peer clusters.
