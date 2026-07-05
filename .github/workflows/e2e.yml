@@ -197,8 +197,6 @@ jobs:
           scp $SSH_OPTS -r /tmp/e2e-assets ci@"$DRIVER_IP":/tmp/
           scp $SSH_OPTS "$KEY" ci@"$DRIVER_IP":/tmp/ci-ssh-key
           ssh $SSH_OPTS ci@"$DRIVER_IP" "chmod 600 /tmp/ci-ssh-key"
-          # Kubeconfig: driver VM is also the control plane, so kubeadm
-          # already placed it at ~/.kube/config during bootstrap.
 
       - name: Load AppArmor profile for rootless containers
         if: matrix.cluster_type == 'native-host'
