@@ -36,7 +36,8 @@ spec:
         fsGroup: 1001
       containers:
         - name: spurctld
-          image: spur:latest
+          image: ghcr.io/rocm/spur:ci
+          imagePullPolicy: IfNotPresent
           command: [spurctld]
           args:
             - --listen=[::]:6817

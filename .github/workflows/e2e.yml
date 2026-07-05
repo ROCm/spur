@@ -235,6 +235,7 @@ jobs:
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY" ci@"$DRIVER_IP" bash -s <<REMOTE
           set -euo pipefail
           export KUBECONFIG=/home/ci/.kube/config
+          export SPUR_CI_IMAGE=docker.io/library/spur:ci
           source /opt/spur-ci/test-venv/bin/activate
           pytest /tmp/e2e-assets/tests/k8s/e2e/ -v --junitxml=/tmp/results.xml
           REMOTE
