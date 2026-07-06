@@ -156,6 +156,7 @@ mod tests {
             job_in(1, "default", JobState::Pending),
             job_in(2, "default", JobState::Running),
             job_in(3, "gpu", JobState::Running),
+            job_in(4, "nonexistent", JobState::Pending),
         ];
         let nodes = [
             node_in("n1", &["default"], 8, 16384),
@@ -167,6 +168,7 @@ mod tests {
 
         let default = &snap.per_partition[0];
         assert_eq!(default.name, "default");
+        // job 4's partition isn't in the known list — jobs_total (2) excludes it.
         assert_eq!(default.jobs_total, 2);
         assert_eq!(default.count_job_state(JobState::Pending), 1);
         assert_eq!(default.count_job_state(JobState::Running), 1);
