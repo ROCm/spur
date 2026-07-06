@@ -24,14 +24,10 @@ struct PartitionLabel {
 
 fn family_gauge(
     family: &Family<PartitionLabel, Gauge<u64, AtomicU64>>,
-    partition: &str,
+    label: &PartitionLabel,
     value: u64,
 ) {
-    family
-        .get_or_create(&PartitionLabel {
-            partition: partition.to_string(),
-        })
-        .set(value);
+    family.get_or_create(label).set(value);
 }
 
 /// Register partition gauges into `registry` from `snap`.
@@ -65,17 +61,20 @@ pub fn register_partitions(registry: &mut Registry, snap: &PartitionMetricsSnaps
     }
 
     for p in &snap.per_partition {
-        family_gauge(&jobs, &p.name, p.jobs_total);
-        family_gauge(&cpus, &p.name, p.cpus);
-        family_gauge(&cpus_alloc, &p.name, p.cpus_alloc);
-        family_gauge(&nodes, &p.name, p.nodes_total);
-        family_gauge(&memory_bytes, &p.name, p.memory_bytes);
-        family_gauge(&memory_alloc_bytes, &p.name, p.memory_alloc_bytes);
+        let label = PartitionLabel {
+            partition: p.name.clone(),
+        };
+        family_gauge(&jobs, &label, p.jobs_total);
+        family_gauge(&cpus, &label, p.cpus);
+        family_gauge(&cpus_alloc, &label, p.cpus_alloc);
+        family_gauge(&nodes, &label, p.nodes_total);
+        family_gauge(&memory_bytes, &label, p.memory_bytes);
+        family_gauge(&memory_alloc_bytes, &label, p.memory_alloc_bytes);
         for (state, family) in &job_state_families {
-            family_gauge(family, &p.name, p.count_job_state(*state));
+            family_gauge(family, &label, p.count_job_state(*state));
         }
         for (state, family) in &node_state_families {
-            family_gauge(family, &p.name, p.count_node_state(*state));
+            family_gauge(family, &label, p.count_node_state(*state));
         }
     }
 

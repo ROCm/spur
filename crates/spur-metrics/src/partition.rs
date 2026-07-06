@@ -40,13 +40,18 @@ impl PartitionMetricsSnapshot {
     /// membership, not the raw hostlist pattern in partition config).
     pub fn collect<'a>(
         partition_names: impl IntoIterator<Item = &'a str>,
-        jobs: impl IntoIterator<Item = &'a Job> + Clone,
-        nodes: impl IntoIterator<Item = &'a Node> + Clone,
+        jobs: impl IntoIterator<Item = &'a Job>,
+        nodes: impl IntoIterator<Item = &'a Node>,
     ) -> Self {
-        let mut per_partition = Vec::new();
-
-        for name in partition_names {
-            let mut m = PerPartitionMetrics {
+        let names: Vec<&'a str> = partition_names.into_iter().collect();
+        let index_of: std::collections::HashMap<&'a str, usize> = names
+            .iter()
+            .enumerate()
+            .map(|(i, &name)| (name, i))
+            .collect();
+        let mut per_partition: Vec<PerPartitionMetrics> = names
+            .iter()
+            .map(|name| PerPartitionMetrics {
                 name: name.to_string(),
                 jobs_total: 0,
                 jobs_by_state: [0; JOB_STATE_COUNT],
@@ -56,20 +61,29 @@ impl PartitionMetricsSnapshot {
                 cpus_alloc: 0,
                 memory_bytes: 0,
                 memory_alloc_bytes: 0,
+            })
+            .collect();
+
+        for job in jobs {
+            let Some(&i) = job
+                .spec
+                .partition
+                .as_deref()
+                .and_then(|name| index_of.get(name))
+            else {
+                continue;
             };
+            let m = &mut per_partition[i];
+            m.jobs_total += 1;
+            m.jobs_by_state[job_state_index(job.state)] += 1;
+        }
 
-            for job in jobs.clone() {
-                if job.spec.partition.as_deref() != Some(name) {
+        for node in nodes {
+            for partition in &node.partitions {
+                let Some(&i) = index_of.get(partition.as_str()) else {
                     continue;
-                }
-                m.jobs_total += 1;
-                m.jobs_by_state[job_state_index(job.state)] += 1;
-            }
-
-            for node in nodes.clone() {
-                if !node.partitions.iter().any(|p| p == name) {
-                    continue;
-                }
+                };
+                let m = &mut per_partition[i];
                 m.nodes_total += 1;
                 m.nodes_by_state[node_state_index(node.state)] += 1;
                 m.cpus += u64::from(node.total_resources.cpus);
@@ -77,8 +91,6 @@ impl PartitionMetricsSnapshot {
                 m.memory_bytes += memory_mb_to_bytes(node.total_resources.memory_mb);
                 m.memory_alloc_bytes += memory_mb_to_bytes(node.alloc_resources.memory_mb);
             }
-
-            per_partition.push(m);
         }
 
         per_partition.sort_by(|a, b| a.name.cmp(&b.name));

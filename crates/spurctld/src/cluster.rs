@@ -260,11 +260,19 @@ impl ClusterManager {
 
     /// Aggregated per-partition metrics from the current job, node, and partition maps.
     pub fn partition_metrics(&self) -> PartitionMetricsSnapshot {
-        let partitions = self.partitions.read();
-        let names: Vec<&str> = partitions.iter().map(|p| p.name.as_str()).collect();
+        let names: Vec<String> = self
+            .partitions
+            .read()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
         let jobs = self.jobs.read();
         let nodes = self.nodes.read();
-        PartitionMetricsSnapshot::collect(names, jobs.values(), nodes.values())
+        PartitionMetricsSnapshot::collect(
+            names.iter().map(|s| s.as_str()),
+            jobs.values(),
+            nodes.values(),
+        )
     }
 
     /// Aggregated per-user and per-account job metrics from the current job map.
