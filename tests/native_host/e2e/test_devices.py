@@ -11,13 +11,10 @@ from __future__ import annotations
 
 import re
 import time
-from pathlib import Path
 
 import pytest
 
 from cluster import SpurCluster, job_state, parse_job_id, wait_job
-
-_FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
 def _parse_probe(content: str) -> dict[str, str]:

@@ -43,7 +43,7 @@ Prerequisites
 - Pre-provisioned nodes accessible via SSH (password, key, or ssh-agent)
 - Container tests require ``squashfs-tools`` on the runner and all nodes
 - GPU tests require GPU hardware (ROCm/CUDA) on the nodes, plus a Python venv with PyTorch (auto-provisioned if ``SPUR_TEST_GPU_VENV`` is unset)
-- GPU test scripts (``gpu_test.hip``, ``distributed_test.py``, ``inference_test.py``) live in ``tests/native_host/e2e/fixtures/`` and are shipped to nodes by the harness
+- GPU test scripts (``gpu_test.hip``, ``distributed_test.py``, ``inference_test.py``) live in ``tests/native_host/fixtures/`` and are shipped to nodes by the harness
 
 Environment Variables
 ~~~~~~~~~~~~~~~~~~~~~
