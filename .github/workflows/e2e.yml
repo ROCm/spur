@@ -73,6 +73,8 @@ jobs:
             STATUS_CONTEXT: "E2E / k8s"
     env:
       STATUS_CONTEXT: ${{ matrix.STATUS_CONTEXT }}
+      # LogLevel=ERROR silences the known-hosts warning from UserKnownHostsFile=/dev/null.
+      SSH_OPTS: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
     steps:
       - name: Set pending status
         uses: actions/github-script@v9
@@ -158,8 +160,8 @@ jobs:
             echo "Waiting for $ip..."
             ok=false
             for i in $(seq 1 90); do
-              if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=3 \
-                -o BatchMode=yes -i "$KEY" ci@"$ip" true 2>/dev/null; then
+              if ssh $SSH_OPTS -o ConnectTimeout=3 -o BatchMode=yes \
+                -i "$KEY" ci@"$ip" true 2>/dev/null; then
                 echo "  $ip ready"
                 ok=true
                 break
@@ -191,20 +193,17 @@ jobs:
         run: |
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
-          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i $KEY"
 
-          scp $SSH_OPTS -r /tmp/release-binaries ci@"$DRIVER_IP":/tmp/
-          scp $SSH_OPTS -r /tmp/e2e-assets ci@"$DRIVER_IP":/tmp/
-          scp $SSH_OPTS "$KEY" ci@"$DRIVER_IP":/tmp/ci-ssh-key
-          ssh $SSH_OPTS ci@"$DRIVER_IP" "chmod 600 /tmp/ci-ssh-key"
+          scp $SSH_OPTS -i "$KEY" -r /tmp/release-binaries ci@"$DRIVER_IP":/tmp/
+          scp $SSH_OPTS -i "$KEY" -r /tmp/e2e-assets ci@"$DRIVER_IP":/tmp/
+          scp $SSH_OPTS -i "$KEY" "$KEY" ci@"$DRIVER_IP":/tmp/ci-ssh-key
+          ssh $SSH_OPTS -i "$KEY" ci@"$DRIVER_IP" "chmod 600 /tmp/ci-ssh-key"
 
       - name: Load AppArmor profile for rootless containers
         if: matrix.cluster_type == 'native-host'
         run: |
-          DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
           GPU_IPS="${{ steps.cluster.outputs.gpu_ips }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
-          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i $KEY"
           SPURD="/tmp/spur-ci-bin/spurd"
           PROF="abi <abi/4.0>,
           profile spur-ci ${SPURD} flags=(unconfined) {
@@ -212,7 +211,7 @@ jobs:
           }"
           IFS=',' read -ra NODES <<< "$GPU_IPS"
           for node in "${NODES[@]}"; do
-            ssh $SSH_OPTS ci@"$node" "echo '${PROF}' | sudo apparmor_parser -r 2>/dev/null || true"
+            ssh $SSH_OPTS -i "$KEY" ci@"$node" "echo '${PROF}' | sudo apparmor_parser -r 2>/dev/null || true"
           done
 
       - name: Run tests inside driver VM (native-host)
@@ -222,7 +221,7 @@ jobs:
           GPU_IPS="${{ steps.cluster.outputs.gpu_ips }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
 
-          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY" ci@"$DRIVER_IP" bash -s <<REMOTE
+          ssh $SSH_OPTS -i "$KEY" ci@"$DRIVER_IP" bash -s <<REMOTE
           set -euo pipefail
           export SPUR_TEST_NODES="$GPU_IPS"
           export SPUR_TEST_SSH_USER=ci
@@ -240,10 +239,9 @@ jobs:
         run: |
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
-          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i $KEY"
           NS="spur-ci-${{ github.run_id }}"
 
-          ssh $SSH_OPTS ci@"$DRIVER_IP" bash -s <<REMOTE
+          ssh $SSH_OPTS -i "$KEY" ci@"$DRIVER_IP" bash -s <<REMOTE
           set -euo pipefail
           export KUBECONFIG=/home/ci/.kube/config
 
@@ -266,7 +264,7 @@ jobs:
           KEY="${{ steps.ssh.outputs.privkey }}"
           NS="spur-ci-${{ github.run_id }}"
 
-          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY" ci@"$DRIVER_IP" bash -s <<REMOTE
+          ssh $SSH_OPTS -i "$KEY" ci@"$DRIVER_IP" bash -s <<REMOTE
           set -euo pipefail
           export KUBECONFIG=/home/ci/.kube/config
           export SPUR_CI_IMAGE=docker.io/library/spur:ci
@@ -280,28 +278,26 @@ jobs:
         run: |
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
-          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i $KEY"
           mkdir -p /tmp/e2e-results
-          ssh $SSH_OPTS ci@"$DRIVER_IP" bash -s <<'REMOTE' || true
+          ssh $SSH_OPTS -i "$KEY" ci@"$DRIVER_IP" bash -s <<'REMOTE' || true
           set -uo pipefail
           export KUBECONFIG=/home/ci/.kube/config
           D=/tmp/cluster-dump
           rm -rf "$D" && mkdir -p "$D"
           kubectl get events -A --sort-by=.lastTimestamp > "$D/events.txt" 2>&1 || true
-          # -o wide includes the RESTARTS column, key for spotting controller restarts.
           kubectl get pods -A -o wide > "$D/pods.txt" 2>&1 || true
-          kubectl get endpoints -A -o wide > "$D/endpoints.txt" 2>&1 || true
+          # Only collect logs for the long-lived controller/operator pods.
           for ns in $(kubectl get ns -o name 2>/dev/null | sed 's|namespace/||' | grep -E 'spur'); do
-            kubectl -n "$ns" describe pods > "$D/describe-$ns.txt" 2>&1 || true
-            for p in $(kubectl -n "$ns" get pods -o name 2>/dev/null); do
-              name=${p#pod/}
-              kubectl -n "$ns" logs "$name" --all-containers --timestamps > "$D/log-$ns-$name.txt" 2>&1 || true
-              kubectl -n "$ns" logs "$name" --all-containers --previous --timestamps > "$D/log-$ns-$name-prev.txt" 2>&1 || true
+            for selector in app=spurctld app=spur-k8s-operator; do
+              for p in $(kubectl -n "$ns" get pods -l "$selector" -o name 2>/dev/null); do
+                name=${p#pod/}
+                kubectl -n "$ns" logs "$name" --all-containers --timestamps > "$D/log-$ns-$name.txt" 2>&1 || true
+                kubectl -n "$ns" logs "$name" --all-containers --previous --timestamps > "$D/log-$ns-$name-prev.txt" 2>&1 || true
+              done
             done
           done
-          tar -czf /tmp/cluster-dump.tgz -C "$D" . 2>/dev/null || true
           REMOTE
-          scp $SSH_OPTS ci@"$DRIVER_IP":/tmp/cluster-dump.tgz /tmp/e2e-results/ 2>/dev/null || true
+          scp $SSH_OPTS -i "$KEY" -r ci@"$DRIVER_IP":/tmp/cluster-dump /tmp/e2e-results/ 2>/dev/null || true
 
       - name: Collect results from driver VM
         if: always()
@@ -309,9 +305,9 @@ jobs:
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
           mkdir -p /tmp/e2e-results
-          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY" \
+          scp $SSH_OPTS -i "$KEY" \
             ci@"$DRIVER_IP":/tmp/results.xml /tmp/e2e-results/ 2>/dev/null || true
-          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY" ci@"$DRIVER_IP" \
+          ssh $SSH_OPTS -i "$KEY" ci@"$DRIVER_IP" \
             "find /tmp -name '*.log' -exec rm -f {} + 2>/dev/null" || true
 
       - name: Upload test results
