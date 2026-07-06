@@ -23,6 +23,7 @@ from kubernetes.utils import create_from_dict
 logger = logging.getLogger(__name__)
 
 _MANIFESTS_DIR = Path(__file__).resolve().parent / "manifests"
+_DEFAULT_IMAGE = "ghcr.io/rocm/spur:ci"
 
 SPUR_JOB_GROUP = "spur.amd.com"
 SPUR_JOB_VERSION = "v1alpha1"
@@ -121,7 +122,7 @@ class FixtureConfig:
 
     @classmethod
     def single_node(cls) -> FixtureConfig:
-        image = os.environ.get("SPUR_CI_IMAGE", "spur:ci")
+        image = os.environ.get("SPUR_CI_IMAGE", _DEFAULT_IMAGE)
         return cls(
             replicas=1,
             image=image,
@@ -144,7 +145,7 @@ default_time = "10m"
 
     @classmethod
     def raft_ha(cls) -> FixtureConfig:
-        image = os.environ.get("SPUR_CI_IMAGE", "spur:ci")
+        image = os.environ.get("SPUR_CI_IMAGE", _DEFAULT_IMAGE)
         return cls(
             replicas=3,
             image=image,
@@ -350,7 +351,7 @@ class ClusterFixture:
             doc = doc.strip()
             if not doc:
                 continue
-            patched = doc.replace("spur:latest", self.config.image)
+            patched = doc.replace(_DEFAULT_IMAGE, self.config.image)
             if replicas is not None:
                 patched = patched.replace("replicas: 3", f"replicas: {replicas}")
             value = yaml.safe_load(patched)

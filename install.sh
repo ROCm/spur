@@ -114,9 +114,14 @@ fi
 # --- Resolve version ---
 if [ "$VERSION" = "latest" ]; then
     log "Fetching latest release..."
-    VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-        | grep '"tag_name"' | head -1 | cut -d'"' -f4) \
-        || err "No releases found. Create one with: gh release create v0.1.0"
+    # Use the Atom feed: /releases/latest ignores pre-releases (all our
+    # releases are pre-releases) and the unauthenticated API is rate-limited
+    # per IP. Feed is newest-first; take the first non-nightly tag.
+    VERSION=$(curl -fsSL "https://github.com/${REPO}/releases.atom" \
+        | grep -oE 'releases/tag/[^"]+' | sed 's#releases/tag/##' \
+        | grep -v '^nightly$' | head -1) \
+        || err "Could not resolve latest release from https://github.com/${REPO}/releases"
+    [ -n "$VERSION" ] || err "No releases found at https://github.com/${REPO}/releases"
 fi
 log "Installing Spur ${VERSION}"
 
@@ -125,10 +130,12 @@ TMPDIR=$(mktemp -d)
 trap 'rm -rf "${TMPDIR}"' EXIT
 
 if [ "$VERSION" = "nightly" ]; then
-    # Nightly tarballs include date+sha in the name — find the .tar.gz asset
-    TARBALL=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/tags/nightly" \
-        | grep '"name"' | grep '\.tar\.gz"' | grep -v sha256 | head -1 | cut -d'"' -f4) \
+    # Nightly tarball name carries date+sha; read it from expanded_assets
+    # rather than the rate-limited API.
+    TARBALL=$(curl -fsSL "https://github.com/${REPO}/releases/expanded_assets/nightly" \
+        | grep -oE 'spur-nightly-[^"]+-linux-amd64\.tar\.gz' | head -1) \
         || err "Could not find nightly release assets"
+    [ -n "$TARBALL" ] || err "Could not find nightly release assets"
 else
     TARBALL="spur-${VERSION}-linux-amd64.tar.gz"
 fi

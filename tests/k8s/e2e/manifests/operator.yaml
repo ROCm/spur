@@ -31,7 +31,8 @@ spec:
     spec:
       containers:
         - name: operator
-          image: spur:latest
+          image: ghcr.io/rocm/spur:ci
+          imagePullPolicy: IfNotPresent
           command: [spur-k8s-operator]
           args:
             - --controller-addr=spurctld.spur.svc.cluster.local:6817

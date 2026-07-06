@@ -2,3 +2,7 @@
 # https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
 * @powderluv @sgopinath1 @shiv-tyagi @yansun1996 @sajmera-pensando
+
+# CI workflows and test harness require maintainer review
+.github/workflows/** @shiv-tyagi
+tests/** @shiv-tyagi
