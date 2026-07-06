@@ -1,26 +1,83 @@
-name: Release
+name: Release Please
 
 on:
   push:
-    tags: ["v*"]
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Release tag (e.g. v0.1.0)"
-        required: true
+    branches: [main]
 
 permissions:
   contents: write
+  pull-requests: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  release-please:
+    name: Release PR and tag
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      # A GitHub App token (not GITHUB_TOKEN) so the release PR triggers CI + E2E.
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      # The `simple` release type only bumps Cargo.toml + CHANGELOG.md. CI builds with
+      # --locked, so Cargo.lock must be re-synced on the release PR or the build fails.
+      - name: Resolve release PR branch
+        id: pr
+        if: ${{ steps.release.outputs.pr }}
+        env:
+          PR_JSON: ${{ steps.release.outputs.pr }}
+        run: echo "branch=$(jq -r .headBranchName <<<"$PR_JSON")" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release PR branch
+        if: ${{ steps.release.outputs.pr }}
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.pr.outputs.branch }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Install Rust toolchain
+        if: ${{ steps.release.outputs.pr }}
+        run: rustup show
+
+      - name: Sync Cargo.lock with bumped workspace version
+        if: ${{ steps.release.outputs.pr }}
+        run: |
+          cargo update --workspace
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock already in sync."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "chore: sync Cargo.lock"
+          git push
+
   build:
     name: Build release binaries
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -38,7 +95,7 @@ jobs:
 
       - name: Package binaries
         run: |
-          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${{ needs.release-please.outputs.tag_name }}"
           DIST="spur-${VERSION}-linux-amd64"
           mkdir -p "${DIST}/bin"
           for bin in spur spurctld spurd spurdbd; do
@@ -70,7 +127,7 @@ jobs:
 
   verify:
     name: Verify on ${{ matrix.name }}
-    needs: build
+    needs: [release-please, build]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -110,16 +167,14 @@ jobs:
 
   push-image:
     name: Push image to Docker Hub
-    needs: [build, verify]
+    needs: [release-please, build, verify]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
 
       - uses: docker/setup-buildx-action@v4
-
-      - name: Determine tag
-        id: tag
-        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v4
@@ -133,8 +188,8 @@ jobs:
         with:
           images: rocm/spur
           tags: |
-            type=semver,pattern={{version}},value=${{ steps.tag.outputs.tag }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ steps.tag.outputs.tag }}
+            type=semver,pattern={{version}},value=${{ needs.release-please.outputs.tag_name }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release-please.outputs.tag_name }}
 
       - name: Build and push
         uses: docker/build-push-action@v7
@@ -148,27 +203,26 @@ jobs:
           cache-from: type=gha,scope=release-docker
           cache-to: type=gha,scope=release-docker,mode=max
 
-  release:
-    name: Create GitHub Release
-    needs: [build, verify, push-image]
+  upload:
+    name: Attach assets to release
+    needs: [release-please, build, verify, push-image]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
 
       - uses: actions/download-artifact@v8
         with:
           name: spur-linux-amd64
 
-      - name: Determine tag
-        id: tag
-        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
-
-      - name: Create release
+      # release-please already created the GitHub Release (with changelog notes) and the
+      # tag when the release PR merged. Attach the built assets to that existing release.
+      - name: Upload release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
-          TAG="${{ steps.tag.outputs.tag }}"
-          gh release create "${TAG}" \
-            --title "Spur ${TAG}" \
-            --generate-notes \
-            spur-*.tar.gz spur-*.tar.gz.sha256
+          gh release upload "${TAG}" \
+            spur-*.tar.gz spur-*.tar.gz.sha256 \
+            --clobber
