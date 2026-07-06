@@ -6,6 +6,7 @@
       "package-name": "spur",
       "include-component-in-tag": false,
       "draft-pull-request": true,
+      "prerelease": true,
       "bump-minor-pre-major": true,
       "changelog-sections": [
         { "type": "feat", "section": "Features" },
