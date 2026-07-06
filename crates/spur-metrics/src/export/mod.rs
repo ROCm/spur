@@ -13,6 +13,7 @@ use std::sync::atomic::AtomicU64;
 pub const CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
 
 pub mod jobs;
+pub mod jobs_users_accts;
 pub mod nodes;
 pub mod partitions;
 pub mod rpc;

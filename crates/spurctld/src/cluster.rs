@@ -24,6 +24,8 @@ use spur_core::step::{JobStep, StepState, STEP_BATCH, STEP_RESERVED_MIN};
 use spur_core::wal::WalOperation;
 use spur_metrics::job::JobMetricsSnapshot;
 use spur_metrics::node::NodeMetricsSnapshot;
+use spur_metrics::partition::PartitionMetricsSnapshot;
+use spur_metrics::user_acct::UserAcctMetricsSnapshot;
 
 use crate::accounting::AccountingNotifier;
 use crate::fairshare_cache::FairshareCache;
@@ -254,6 +256,21 @@ impl ClusterManager {
     pub fn node_metrics(&self) -> NodeMetricsSnapshot {
         let nodes = self.nodes.read();
         NodeMetricsSnapshot::collect(nodes.values())
+    }
+
+    /// Aggregated per-partition metrics from the current job, node, and partition maps.
+    pub fn partition_metrics(&self) -> PartitionMetricsSnapshot {
+        let partitions = self.partitions.read();
+        let names: Vec<&str> = partitions.iter().map(|p| p.name.as_str()).collect();
+        let jobs = self.jobs.read();
+        let nodes = self.nodes.read();
+        PartitionMetricsSnapshot::collect(names, jobs.values(), nodes.values())
+    }
+
+    /// Aggregated per-user and per-account job metrics from the current job map.
+    pub fn user_acct_metrics(&self) -> UserAcctMetricsSnapshot {
+        let jobs = self.jobs.read();
+        UserAcctMetricsSnapshot::collect(jobs.values())
     }
 
     /// Get jobs matching filters.
