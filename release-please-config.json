@@ -7,18 +7,10 @@
       "include-component-in-tag": false,
       "draft-pull-request": true,
       "bump-minor-pre-major": true,
-      "bump-patch-for-minor-pre-major": true,
       "changelog-sections": [
         { "type": "feat", "section": "Features" },
         { "type": "fix", "section": "Bug Fixes" },
-        { "type": "perf", "section": "Performance" },
-        { "type": "refactor", "section": "Refactors" },
-        { "type": "docs", "section": "Documentation" },
-        { "type": "ci", "section": "CI", "hidden": true },
-        { "type": "test", "section": "Tests", "hidden": true },
-        { "type": "build", "section": "Build", "hidden": true },
-        { "type": "style", "section": "Styles", "hidden": true },
-        { "type": "chore", "section": "Miscellaneous", "hidden": true }
+        { "type": "perf", "section": "Performance" }
       ],
       "extra-files": [
         { "type": "toml", "path": "Cargo.toml", "jsonpath": "$.workspace.package.version" }
