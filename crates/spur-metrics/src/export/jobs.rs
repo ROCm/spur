@@ -45,6 +45,12 @@ pub fn register_jobs(registry: &mut Registry, snap: &JobMetricsSnapshot) {
 
     register_gauge(
         registry,
+        "spur_jobs_hold",
+        "Number of jobs in Pending state with a hold set",
+        snap.held_pending,
+    );
+    register_gauge(
+        registry,
         "spur_jobs_cpus_alloc",
         "Total CPUs allocated to jobs in Running or Completing state",
         snap.running_cpus,
@@ -117,6 +123,7 @@ mod tests {
         assert!(body.contains("# HELP spur_jobs "));
         assert!(body.contains("spur_jobs 4\n"));
         assert!(body.contains("spur_jobs_pending 2\n"));
+        assert!(body.contains("spur_jobs_hold 1\n"));
         assert!(body.contains("spur_jobs_running 1\n"));
         assert!(body.contains("spur_jobs_completed 1\n"));
         assert!(body.contains("spur_jobs_cpus_alloc 4\n"));
