@@ -1,12 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+
 name: Release Please
 
 on:
   push:
     branches: [main]
 
-permissions:
-  contents: write
-  pull-requests: write
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,21 +15,24 @@ jobs:
   release-please:
     name: Release PR and tag
     runs-on: ubuntu-latest
-    outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
-      # A GitHub App token (not GITHUB_TOKEN) so the release PR triggers CI + E2E.
+      # A GitHub App token (not GITHUB_TOKEN) so the release PR triggers CI + E2E
+      # and the tag push triggers release.yml.
       - name: Generate app token
         id: app-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
         with:
           app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
 
       - name: Run release-please
         id: release
-        uses: googleapis/release-please-action@v4
+        uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
         with:
           token: ${{ steps.app-token.outputs.token }}
           config-file: release-please-config.json
@@ -46,10 +49,11 @@ jobs:
 
       - name: Checkout release PR branch
         if: ${{ steps.release.outputs.pr }}
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ steps.pr.outputs.branch }}
           token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
         if: ${{ steps.release.outputs.pr }}
@@ -67,162 +71,11 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Cargo.lock
           git commit -m "chore: sync Cargo.lock"
-          git push
 
-  build:
-    name: Build release binaries
-    needs: release-please
-    if: ${{ needs.release-please.outputs.release_created == 'true' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Build portable binaries (Ubuntu 22.04+ compatible)
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: Dockerfile
-          target: dist
-          push: false
-          outputs: type=local,dest=./dist
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Package binaries
-        run: |
-          VERSION="${{ needs.release-please.outputs.tag_name }}"
-          DIST="spur-${VERSION}-linux-amd64"
-          mkdir -p "${DIST}/bin"
-          for bin in spur spurctld spurd spurdbd; do
-            cp "dist/bin/${bin}" "${DIST}/bin/"
-          done
-
-          # Create Slurm-compat symlinks
-          cd "${DIST}/bin"
-          for cmd in sbatch srun squeue scancel sinfo sacct scontrol; do
-            ln -s spur "${cmd}"
-          done
-          cd ../..
-
-          # Include example config
-          mkdir -p "${DIST}/etc"
-          cp examples/spur.conf "${DIST}/etc/spur.conf.example"
-
-          tar czf "${DIST}.tar.gz" "${DIST}"
-          sha256sum "${DIST}.tar.gz" > "${DIST}.tar.gz.sha256"
-          echo "DIST=${DIST}" >> "$GITHUB_ENV"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: spur-linux-amd64
-          path: |
-            spur-*.tar.gz
-            spur-*.tar.gz.sha256
-
-  verify:
-    name: Verify on ${{ matrix.name }}
-    needs: [release-please, build]
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - distro: "ubuntu:20.04"
-            name: "Ubuntu 20.04"
-          - distro: "ubuntu:22.04"
-            name: "Ubuntu 22.04"
-          - distro: "ubuntu:24.04"
-            name: "Ubuntu 24.04"
-          - distro: "ubuntu:26.04"
-            name: "Ubuntu 26.04 (beta)"
-            experimental: true
-          - distro: "almalinux:8"
-            name: "RHEL 8 (AlmaLinux)"
-    continue-on-error: ${{ matrix.experimental || false }}
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: spur-linux-amd64
-
-      - name: Test binaries on ${{ matrix.name }}
-        run: |
-          tar xzf spur-*.tar.gz
-          BINDIR=$(ls -d spur-*/bin | head -1)
-          docker run --rm -v "$(pwd)/${BINDIR}:/test:ro" ${{ matrix.distro }} bash -c '
-            set -e
-            echo "=== $(cat /etc/os-release | grep PRETTY_NAME | cut -d\" -f2) ==="
-            echo "glibc: $(ldd --version 2>&1 | head -1)"
-            for bin in spur spurctld spurd spurdbd; do
-              /test/${bin} --help > /dev/null 2>&1
-              echo "  ${bin}: OK"
-            done
-            echo "All binaries verified"
-          '
-
-  push-image:
-    name: Push image to Docker Hub
-    needs: [release-please, build, verify]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
-
-      - uses: docker/setup-buildx-action@v4
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: rocm/spur
-          tags: |
-            type=semver,pattern={{version}},value=${{ needs.release-please.outputs.tag_name }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release-please.outputs.tag_name }}
-
-      - name: Build and push
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: Dockerfile
-          target: runtime
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=release-docker
-          cache-to: type=gha,scope=release-docker,mode=max
-
-  upload:
-    name: Attach assets to release
-    needs: [release-please, build, verify, push-image]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
-
-      - uses: actions/download-artifact@v8
-        with:
-          name: spur-linux-amd64
-
-      # release-please already created the GitHub Release (with changelog notes) and the
-      # tag when the release PR merged. Attach the built assets to that existing release.
-      - name: Upload release assets
+      - name: Push Cargo.lock update
+        if: ${{ steps.release.outputs.pr }}
         env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.release-please.outputs.tag_name }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          gh release upload "${TAG}" \
-            spur-*.tar.gz spur-*.tar.gz.sha256 \
-            --clobber
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:${{ steps.pr.outputs.branch }}"

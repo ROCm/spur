@@ -1,0 +1,178 @@
+# SPDX-License-Identifier: Apache-2.0
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to (re)build and publish, e.g. v0.4.0'
+        required: true
+        type: string
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build release binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build portable binaries (Ubuntu 22.04+ compatible)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          target: dist
+          push: false
+          outputs: type=local,dest=./dist
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Package binaries
+        run: |
+          DIST="spur-${TAG}-linux-amd64"
+          mkdir -p "${DIST}/bin"
+          for bin in spur spurctld spurd spurdbd; do
+            cp "dist/bin/${bin}" "${DIST}/bin/"
+          done
+
+          # Create Slurm-compat symlinks
+          cd "${DIST}/bin"
+          for cmd in sbatch srun squeue scancel sinfo sacct scontrol; do
+            ln -s spur "${cmd}"
+          done
+          cd ../..
+
+          # Include example config
+          mkdir -p "${DIST}/etc"
+          cp examples/spur.conf "${DIST}/etc/spur.conf.example"
+
+          tar czf "${DIST}.tar.gz" "${DIST}"
+          sha256sum "${DIST}.tar.gz" > "${DIST}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: spur-linux-amd64
+          path: |
+            spur-*.tar.gz
+            spur-*.tar.gz.sha256
+
+  verify:
+    name: Verify on ${{ matrix.name }}
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: "ubuntu:20.04"
+            name: "Ubuntu 20.04"
+          - distro: "ubuntu:22.04"
+            name: "Ubuntu 22.04"
+          - distro: "ubuntu:24.04"
+            name: "Ubuntu 24.04"
+          - distro: "ubuntu:26.04"
+            name: "Ubuntu 26.04 (beta)"
+            experimental: true
+          - distro: "almalinux:8"
+            name: "RHEL 8 (AlmaLinux)"
+    continue-on-error: ${{ matrix.experimental || false }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: spur-linux-amd64
+
+      - name: Test binaries on ${{ matrix.name }}
+        run: |
+          tar xzf spur-*.tar.gz
+          BINDIR=$(ls -d spur-*/bin | head -1)
+          docker run --rm -v "$(pwd)/${BINDIR}:/test:ro" ${{ matrix.distro }} bash -c '
+            set -e
+            echo "=== $(cat /etc/os-release | grep PRETTY_NAME | cut -d\" -f2) ==="
+            echo "glibc: $(ldd --version 2>&1 | head -1)"
+            for bin in spur spurctld spurd spurdbd; do
+              /test/${bin} --help > /dev/null 2>&1
+              echo "  ${bin}: OK"
+            done
+            echo "All binaries verified"
+          '
+
+  push-image:
+    name: Push image to Docker Hub
+    needs: [verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: rocm/spur
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
+
+      - name: Build and push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=release-docker
+          cache-to: type=gha,scope=release-docker,mode=max
+
+  upload:
+    name: Attach assets to release
+    needs: [build, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: spur-linux-amd64
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${TAG}" \
+            spur-*.tar.gz spur-*.tar.gz.sha256 \
+            --clobber \
+            --repo "${GITHUB_REPOSITORY}"
