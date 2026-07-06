@@ -275,6 +275,34 @@ jobs:
           pytest /tmp/e2e-assets/tests/k8s/e2e/ -v --junitxml=/tmp/results.xml
           REMOTE
 
+      - name: Dump cluster diagnostics (k8s)
+        if: always() && matrix.cluster_type == 'k8s'
+        run: |
+          DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
+          KEY="${{ steps.ssh.outputs.privkey }}"
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i $KEY"
+          mkdir -p /tmp/e2e-results
+          ssh $SSH_OPTS ci@"$DRIVER_IP" bash -s <<'REMOTE' || true
+          set -uo pipefail
+          export KUBECONFIG=/home/ci/.kube/config
+          D=/tmp/cluster-dump
+          rm -rf "$D" && mkdir -p "$D"
+          kubectl get events -A --sort-by=.lastTimestamp > "$D/events.txt" 2>&1 || true
+          # -o wide includes the RESTARTS column, key for spotting controller restarts.
+          kubectl get pods -A -o wide > "$D/pods.txt" 2>&1 || true
+          kubectl get endpoints -A -o wide > "$D/endpoints.txt" 2>&1 || true
+          for ns in $(kubectl get ns -o name 2>/dev/null | sed 's|namespace/||' | grep -E 'spur'); do
+            kubectl -n "$ns" describe pods > "$D/describe-$ns.txt" 2>&1 || true
+            for p in $(kubectl -n "$ns" get pods -o name 2>/dev/null); do
+              name=${p#pod/}
+              kubectl -n "$ns" logs "$name" --all-containers --timestamps > "$D/log-$ns-$name.txt" 2>&1 || true
+              kubectl -n "$ns" logs "$name" --all-containers --previous --timestamps > "$D/log-$ns-$name-prev.txt" 2>&1 || true
+            done
+          done
+          tar -czf /tmp/cluster-dump.tgz -C "$D" . 2>/dev/null || true
+          REMOTE
+          scp $SSH_OPTS ci@"$DRIVER_IP":/tmp/cluster-dump.tgz /tmp/e2e-results/ 2>/dev/null || true
+
       - name: Collect results from driver VM
         if: always()
         run: |
