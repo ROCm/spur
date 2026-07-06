@@ -2104,9 +2104,15 @@ impl ClusterManager {
         cycle_time_us: u64,
         schedule_time_us: u64,
         jobs_started: u64,
+        hit_depth_limit: bool,
     ) {
         if let Some(stats) = self.sched_stats.get() {
-            stats.record_cycle(cycle_time_us, schedule_time_us, jobs_started);
+            stats.record_cycle(
+                cycle_time_us,
+                schedule_time_us,
+                jobs_started,
+                hit_depth_limit,
+            );
         }
     }
 
@@ -3904,7 +3910,7 @@ mod tests {
             per_node_for(&["worker1"], resources),
         )
         .unwrap();
-        cm.record_sched_cycle(0, 0, 1);
+        cm.record_sched_cycle(0, 0, 1, false);
         assert_eq!(stats.snapshot().jobs_started, 1);
 
         cm.complete_job(job_id, 0, JobState::Completed).unwrap();

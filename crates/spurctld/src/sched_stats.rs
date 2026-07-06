@@ -26,6 +26,8 @@ pub struct SchedStatsCollector {
     jobs_submitted: AtomicU64,
     jobs_started: AtomicU64,
     jobs_finalized: AtomicU64,
+    exit_end: AtomicU64,
+    exit_max_depth: AtomicU64,
 }
 
 impl SchedStatsCollector {
@@ -36,10 +38,20 @@ impl SchedStatsCollector {
             jobs_submitted: AtomicU64::new(0),
             jobs_started: AtomicU64::new(0),
             jobs_finalized: AtomicU64::new(0),
+            exit_end: AtomicU64::new(0),
+            exit_max_depth: AtomicU64::new(0),
         }
     }
 
-    pub fn record_cycle(&self, cycle_time_us: u64, schedule_time_us: u64, jobs_started: u64) {
+    /// Record one scheduling cycle. `hit_depth_limit` is true when more jobs
+    /// were pending than `scheduler.max_jobs_per_cycle` allowed considering.
+    pub fn record_cycle(
+        &self,
+        cycle_time_us: u64,
+        schedule_time_us: u64,
+        jobs_started: u64,
+        hit_depth_limit: bool,
+    ) {
         let mut accum = self.cycle.lock();
         accum.cycles = accum.cycles.saturating_add(1);
         accum.cycle_total_time_us = accum.cycle_total_time_us.saturating_add(cycle_time_us);
@@ -52,6 +64,11 @@ impl SchedStatsCollector {
         drop(accum);
         if jobs_started > 0 {
             self.jobs_started.fetch_add(jobs_started, Ordering::Relaxed);
+        }
+        if hit_depth_limit {
+            self.exit_max_depth.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.exit_end.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -78,6 +95,8 @@ impl SchedStatsCollector {
             jobs_started: self.jobs_started.load(Ordering::Relaxed),
             jobs_finalized: self.jobs_finalized.load(Ordering::Relaxed),
             jobs_started_last_cycle: accum.jobs_started_last_cycle,
+            exit_end: self.exit_end.load(Ordering::Relaxed),
+            exit_max_depth: self.exit_max_depth.load(Ordering::Relaxed),
         }
     }
 
@@ -86,6 +105,8 @@ impl SchedStatsCollector {
         self.jobs_submitted.store(0, Ordering::Relaxed);
         self.jobs_started.store(0, Ordering::Relaxed);
         self.jobs_finalized.store(0, Ordering::Relaxed);
+        self.exit_end.store(0, Ordering::Relaxed);
+        self.exit_max_depth.store(0, Ordering::Relaxed);
     }
 }
 
@@ -96,8 +117,8 @@ mod tests {
     #[test]
     fn record_cycle_accumulates_timing_and_started_jobs() {
         let stats = SchedStatsCollector::new("backfill");
-        stats.record_cycle(1000, 200, 2);
-        stats.record_cycle(500, 100, 1);
+        stats.record_cycle(1000, 200, 2, false);
+        stats.record_cycle(500, 100, 1, false);
 
         let snap = stats.snapshot();
         assert_eq!(snap.plugin, "backfill");
@@ -116,7 +137,7 @@ mod tests {
     fn lifecycle_counters_accumulate() {
         let stats = SchedStatsCollector::new("backfill");
         stats.record_submitted(3);
-        stats.record_cycle(0, 0, 2);
+        stats.record_cycle(0, 0, 2, false);
         stats.record_finalized();
 
         let snap = stats.snapshot();
@@ -126,15 +147,29 @@ mod tests {
     }
 
     #[test]
+    fn exit_reason_counters_split_by_depth_limit() {
+        let stats = SchedStatsCollector::new("backfill");
+        stats.record_cycle(100, 50, 1, false);
+        stats.record_cycle(100, 50, 1, true);
+        stats.record_cycle(100, 50, 1, true);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.exit_end, 1);
+        assert_eq!(snap.exit_max_depth, 2);
+    }
+
+    #[test]
     fn reset_clears_accumulators() {
         let stats = SchedStatsCollector::new("backfill");
-        stats.record_cycle(100, 50, 1);
+        stats.record_cycle(100, 50, 1, true);
         stats.record_submitted(1);
         stats.reset();
         let snap = stats.snapshot();
         assert_eq!(snap.cycles, 0);
         assert_eq!(snap.jobs_submitted, 0);
         assert_eq!(snap.jobs_started, 0);
+        assert_eq!(snap.exit_end, 0);
+        assert_eq!(snap.exit_max_depth, 0);
         assert_eq!(snap.plugin, "backfill");
     }
 }

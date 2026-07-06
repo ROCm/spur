@@ -90,6 +90,18 @@ pub fn register_scheduler(registry: &mut Registry, snap: &SchedStatsSnapshot) {
         "Jobs reaching a terminal state since reset",
         snap.jobs_finalized,
     );
+    register_counter(
+        registry,
+        "spur_scheduler_exit_end",
+        "Cycles that considered every pending job",
+        snap.exit_end,
+    );
+    register_counter(
+        registry,
+        "spur_scheduler_exit_max_depth",
+        "Cycles that stopped early at scheduler.max_jobs_per_cycle",
+        snap.exit_max_depth,
+    );
 }
 
 /// Encode scheduler metrics for `/metrics/scheduler` as OpenMetrics 1.0 text.
@@ -113,6 +125,8 @@ mod tests {
             jobs_started: 30,
             jobs_finalized: 28,
             jobs_started_last_cycle: 3,
+            exit_end: 8,
+            exit_max_depth: 2,
         }
     }
 
@@ -135,6 +149,8 @@ mod tests {
         assert!(!body.contains("_avg_time_us"));
         assert!(body.contains("spur_scheduler_jobs_submitted_total 42"));
         assert!(body.contains("spur_scheduler_jobs_started_last_cycle 3"));
+        assert!(body.contains("spur_scheduler_exit_end_total 8"));
+        assert!(body.contains("spur_scheduler_exit_max_depth_total 2"));
         assert_eq!(metric_type(&body, "spur_scheduler_cycles"), "counter");
         assert_eq!(
             metric_type(&body, "spur_scheduler_jobs_submitted"),
