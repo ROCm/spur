@@ -54,22 +54,9 @@ impl BackfillScheduler {
         start: chrono::DateTime<Utc>,
         duration: chrono::Duration,
     ) -> bool {
-        let end = start + duration;
-        for res in reservations {
-            if !res.covers_node(node) {
-                continue;
-            }
-            let res_name = job.spec.reservation.as_deref().filter(|s| !s.is_empty());
-            if res_name == Some(res.name.as_str())
-                && res.allows_user(&job.spec.user, job.spec.account.as_deref())
-            {
-                continue;
-            }
-            if end > res.start_time && start < res.end_time {
-                return true;
-            }
-        }
-        false
+        reservations
+            .iter()
+            .any(|res| reservation::prospective_overlap_at(job, res, node, start, duration))
     }
 
     /// Find nodes that satisfy a job's resource requirements.

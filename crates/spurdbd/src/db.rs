@@ -129,6 +129,7 @@ CREATE INDEX IF NOT EXISTS idx_assoc_account ON associations(account);
 
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS exit_signal INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS derived_exit_code INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reservation TEXT NOT NULL DEFAULT '';
 "#;
 
 /// Record a job start in the database.
@@ -144,14 +145,16 @@ pub async fn record_job_start(
     cpus_per_task: i32,
     memory_mb: i64,
     start_time: DateTime<Utc>,
+    reservation: &str,
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"
-        INSERT INTO jobs (job_id, user_name, account, partition_name, num_nodes, num_tasks, cpus_per_task, memory_mb, start_time, state)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'RUNNING')
+        INSERT INTO jobs (job_id, user_name, account, partition_name, num_nodes, num_tasks, cpus_per_task, memory_mb, start_time, state, reservation)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'RUNNING', $10)
         ON CONFLICT (job_id) DO UPDATE SET
             start_time = $9,
-            state = 'RUNNING'
+            state = 'RUNNING',
+            reservation = $10
         "#,
     )
     .bind(job_id)
@@ -163,6 +166,7 @@ pub async fn record_job_start(
     .bind(cpus_per_task)
     .bind(memory_mb)
     .bind(start_time)
+    .bind(reservation)
     .execute(pool)
     .await?;
     Ok(())
@@ -276,6 +280,7 @@ pub struct JobRecord {
     pub submit_time: DateTime<Utc>,
     pub start_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
+    pub reservation: String,
 }
 
 /// Query job history.
@@ -291,7 +296,7 @@ pub async fn get_job_history(
     let mut qb = QueryBuilder::<sqlx::Postgres>::new(
         "SELECT job_id, name, user_name, account, partition_name, state, exit_code, \
          exit_signal, derived_exit_code, num_nodes, num_tasks, nodelist, \
-         submit_time, start_time, end_time \
+         submit_time, start_time, end_time, reservation \
          FROM jobs WHERE 1=1",
     );
 
@@ -340,6 +345,7 @@ pub async fn get_job_history(
             submit_time: row.get("submit_time"),
             start_time: row.get("start_time"),
             end_time: row.get("end_time"),
+            reservation: row.get("reservation"),
         })
         .collect();
 
@@ -694,13 +700,52 @@ mod job_history_tests {
 
         delete_jobs(&pool, &ids).await.ok();
 
-        record_job_start(&pool, id0, &user_a, &account_one, "debug", 1, 1, 1, 0, t1).await?;
+        record_job_start(
+            &pool,
+            id0,
+            &user_a,
+            &account_one,
+            "debug",
+            1,
+            1,
+            1,
+            0,
+            t1,
+            "",
+        )
+        .await?;
         record_job_end(&pool, id0, "COMPLETED", 0, t1 + Duration::minutes(5), 0, 0).await?;
 
-        record_job_start(&pool, id1, &user_b, &account_one, "debug", 1, 1, 1, 0, t1).await?;
+        record_job_start(
+            &pool,
+            id1,
+            &user_b,
+            &account_one,
+            "debug",
+            1,
+            1,
+            1,
+            0,
+            t1,
+            "",
+        )
+        .await?;
         record_job_end(&pool, id1, "FAILED", 137, t1 + Duration::minutes(5), 9, 137).await?;
 
-        record_job_start(&pool, id2, &user_a, &account_two, "debug", 1, 1, 1, 0, t2).await?;
+        record_job_start(
+            &pool,
+            id2,
+            &user_a,
+            &account_two,
+            "debug",
+            1,
+            1,
+            1,
+            0,
+            t2,
+            "",
+        )
+        .await?;
         record_job_end(&pool, id2, "COMPLETED", 0, t2 + Duration::minutes(5), 0, 0).await?;
 
         let by_user = get_job_history(&pool, Some(&user_a), None, None, None, &[], 100).await?;

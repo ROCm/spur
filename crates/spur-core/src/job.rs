@@ -253,9 +253,18 @@ pub enum PendingReason {
     BurstBufferStageIn,
     ReservedMaintenance,
     ReservationDeleted,
+    JobHoldMaxRequeue,
 }
 
 impl PendingReason {
+    /// True when the job is held and must not be scheduled until released.
+    pub fn is_scheduling_hold(&self) -> bool {
+        matches!(
+            self,
+            Self::Held | Self::JobHeldAdmin | Self::JobHoldMaxRequeue | Self::ReservationDeleted
+        )
+    }
+
     pub fn display(&self) -> &'static str {
         match self {
             Self::None => "None",
@@ -298,6 +307,7 @@ impl PendingReason {
             Self::BurstBufferStageIn => "BurstBufferStageIn",
             Self::ReservedMaintenance => "ReqNodeNotAvail, Reserved for maintenance",
             Self::ReservationDeleted => "ReservationDeleted",
+            Self::JobHoldMaxRequeue => "JobHoldMaxRequeue",
         }
     }
 }
@@ -782,6 +792,7 @@ impl Job {
             // Requeue transitions: terminal → Pending (for --requeue jobs)
             (JobState::Timeout, JobState::Pending) => true,
             (JobState::Preempted, JobState::Pending) => true,
+            (JobState::Preempted, JobState::Cancelled) => true,
             (JobState::NodeFail, JobState::Pending) => true,
             (JobState::Failed, JobState::Pending) => true,
             _ => false,
@@ -1174,6 +1185,7 @@ mod tests {
         (PendingReason::QosGrpNodeLimit, "QOSGrpNodeLimit"),
         (PendingReason::BurstBufferResources, "BurstBufferResources"),
         (PendingReason::BurstBufferStageIn, "BurstBufferStageIn"),
+        (PendingReason::JobHoldMaxRequeue, "JobHoldMaxRequeue"),
     ];
 
     #[test]

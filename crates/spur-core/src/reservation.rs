@@ -258,11 +258,11 @@ pub fn running_jobs_overlap_start(
 }
 
 /// Whether a job without reservation access would overlap this reservation window.
-pub fn prospective_overlap(
+pub fn prospective_overlap_at(
     job: &Job,
     reservation: &Reservation,
     node: &str,
-    now: DateTime<Utc>,
+    at: DateTime<Utc>,
     job_duration: Duration,
 ) -> bool {
     if !reservation.covers_node(node) {
@@ -274,14 +274,19 @@ pub fn prospective_overlap(
     {
         return false;
     }
-    let job_end = now + job_duration;
-    if reservation.is_active(now) {
-        return true;
-    }
-    if reservation.is_future(now) {
-        return job_end > reservation.start_time;
-    }
-    false
+    let job_end = at + job_duration;
+    job_end > reservation.start_time && at < reservation.end_time
+}
+
+/// Whether a job without reservation access would overlap this reservation window at `now`.
+pub fn prospective_overlap(
+    job: &Job,
+    reservation: &Reservation,
+    node: &str,
+    now: DateTime<Utc>,
+    job_duration: Duration,
+) -> bool {
+    prospective_overlap_at(job, reservation, node, now, job_duration)
 }
 
 #[cfg(test)]

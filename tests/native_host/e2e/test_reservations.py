@@ -89,6 +89,90 @@ class TestReservations:
         content = cluster.read_output_on_any_node(out_path)
         assert "RES_OK" in content
 
+    def test_hold_on_delete_and_release(self, cluster):
+        res_name = f"res-hold-{int(time.time())}"
+        node = cluster.node_names[0]
+        cluster.scontrol(
+            "create-reservation",
+            f"--name={res_name}",
+            "--start-time=now",
+            "--duration=60",
+            f"--nodes={node}",
+            "--users=testuser",
+        )
+
+        script = cluster.write_file("res-hold.sh", "#!/bin/bash\necho HOLD_RELEASE_OK\n")
+        out_path = f"{cluster.remote_dir}/res-hold.out"
+        sb = cluster.sbatch(
+            [
+                "-N",
+                "1",
+                f"--reservation={res_name}",
+                "-w",
+                node,
+                "-t",
+                "1",
+                "-o",
+                out_path,
+                script,
+            ]
+        )
+        job_id = parse_job_id(sb)
+        assert job_id is not None
+        wait_job_state(cluster, job_id, "PD", timeout=30)
+
+        cluster.scontrol("delete-reservation", res_name)
+
+        wait_job_state(cluster, job_id, "PD", timeout=30)
+        held = cluster.squeue(["-j", str(job_id), "-o", "%T %r"])
+        assert "PD" in held
+        assert "ReservationDeleted" in held
+
+        cluster.scontrol("release", str(job_id))
+
+        state = wait_job(cluster, job_id, timeout=60)
+        assert state in ("CD", "GONE"), f"expected completed after release, got {state}"
+        content = cluster.read_output_on_any_node(out_path)
+        assert "HOLD_RELEASE_OK" in content
+
+    def test_no_hold_jobs_delete(self, cluster):
+        res_name = f"res-nohold-{int(time.time())}"
+        node = cluster.node_names[0]
+        cluster.scontrol(
+            "create-reservation",
+            f"--name={res_name}",
+            "--start-time=now",
+            "--duration=60",
+            f"--nodes={node}",
+            "--users=testuser",
+            "--flags=no_hold_jobs",
+        )
+
+        script = cluster.write_file("res-nohold.sh", "#!/bin/bash\nsleep 120\n")
+        sb = cluster.sbatch(
+            [
+                "-N",
+                "1",
+                f"--reservation={res_name}",
+                "-w",
+                node,
+                "-t",
+                "1",
+                script,
+            ]
+        )
+        job_id = parse_job_id(sb)
+        assert job_id is not None
+        wait_job_state(cluster, job_id, "PD", timeout=30)
+
+        cluster.scontrol("delete-reservation", res_name)
+
+        wait_job_state(cluster, job_id, "PD", timeout=30)
+        show = cluster.squeue(["-j", str(job_id), "-o", "%T %r %v"])
+        assert "PD" in show
+        assert "Held" not in show
+        assert res_name not in show
+
     def test_create_rejects_busy_node_without_ignore_jobs(self, cluster):
         node = cluster.node_names[0]
         long_script = cluster.write_file("res-long.sh", "#!/bin/bash\nsleep 300\n")

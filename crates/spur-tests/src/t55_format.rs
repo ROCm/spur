@@ -126,6 +126,7 @@ mod tests {
                 "ReqNodeNotAvail, Reserved for maintenance",
             ),
             (PendingReason::ReservationDeleted, "ReservationDeleted"),
+            (PendingReason::JobHoldMaxRequeue, "JobHoldMaxRequeue"),
             (PendingReason::QosMaxCpuPerJobLimit, "QOSMaxCpuPerJobLimit"),
             (
                 PendingReason::QosMaxWallDurationPerJobLimit,

@@ -48,6 +48,8 @@ pub struct JobFinalized {
 pub struct ClientResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs_finalized: Vec<JobFinalized>,
+    #[serde(default)]
+    pub reservation_created: bool,
 }
 
 /// Trait for applying committed Raft entries to the cluster state.

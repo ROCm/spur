@@ -196,6 +196,8 @@ message JobInfo {
   // Array jobs
   uint32 array_job_id = 50;
   uint32 array_task_id = 51;
+
+  // Reservation
   string reservation = 52;
 }
 
@@ -700,6 +702,7 @@ message RecordJobStartRequest {
   string partition = 4;
   ResourceAllocations resources = 5;
   google.protobuf.Timestamp start_time = 6;
+  string reservation = 7;
 }
 
 message RecordJobEndRequest {

@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::admission::AdmissionToken;
-use crate::job::{JobId, JobSpec, JobState};
+use crate::job::{JobId, JobSpec, JobState, PendingReason};
 use crate::node::NodeState;
 use crate::reservation::Reservation;
 use std::collections::HashMap;
@@ -27,6 +27,12 @@ pub enum WalOperation {
         job_id: JobId,
         old_state: JobState,
         new_state: JobState,
+        /// When set with `new_state == Pending`, applied atomically instead of clearing to `None`.
+        #[serde(default)]
+        pending_reason: Option<PendingReason>,
+        /// When set with `new_state == Pending`, sets priority in the same apply step (e.g. hold at 0).
+        #[serde(default)]
+        pending_priority: Option<u32>,
     },
     JobStart {
         job_id: JobId,
@@ -58,6 +64,15 @@ pub enum WalOperation {
         job_id: JobId,
         old_priority: u32,
         new_priority: u32,
+        /// When set, applied on all replicas so pending reason survives replay.
+        #[serde(default)]
+        pending_reason: Option<PendingReason>,
+        /// When true, clears automatic requeue counter (admin release after max requeue).
+        #[serde(default)]
+        reset_requeue_count: bool,
+        /// When true, clears `spec.reservation` (admin release after reservation delete hold).
+        #[serde(default)]
+        clear_reservation: bool,
     },
     JobSuspend {
         job_id: JobId,
@@ -136,6 +151,83 @@ pub enum WalOperation {
     ReservationDelete {
         name: String,
     },
+}
+
+impl WalOperation {
+    pub fn job_state_change(job_id: JobId, old_state: JobState, new_state: JobState) -> Self {
+        Self::JobStateChange {
+            job_id,
+            old_state,
+            new_state,
+            pending_reason: None,
+            pending_priority: None,
+        }
+    }
+
+    /// Pending transition that applies a scheduling hold atomically (priority 0 + reason).
+    pub fn job_state_change_held_pending(
+        job_id: JobId,
+        old_state: JobState,
+        reason: PendingReason,
+    ) -> Self {
+        Self::JobStateChange {
+            job_id,
+            old_state,
+            new_state: JobState::Pending,
+            pending_reason: Some(reason),
+            pending_priority: Some(0),
+        }
+    }
+}
+
+#[cfg(test)]
+mod job_state_change_wal_tests {
+    use super::*;
+
+    #[test]
+    fn job_state_change_held_pending_round_trips() {
+        let op = WalOperation::job_state_change_held_pending(
+            1,
+            JobState::Preempted,
+            PendingReason::JobHoldMaxRequeue,
+        );
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobStateChange {
+                job_id,
+                old_state,
+                new_state,
+                pending_reason,
+                pending_priority,
+            } => {
+                assert_eq!(job_id, 1);
+                assert_eq!(old_state, JobState::Preempted);
+                assert_eq!(new_state, JobState::Pending);
+                assert_eq!(pending_reason, Some(PendingReason::JobHoldMaxRequeue));
+                assert_eq!(pending_priority, Some(0));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn job_state_change_without_hold_fields_deserializes() {
+        let op = WalOperation::job_state_change(1, JobState::Pending, JobState::Running);
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobStateChange {
+                pending_reason,
+                pending_priority,
+                ..
+            } => {
+                assert_eq!(pending_reason, None);
+                assert_eq!(pending_priority, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
 }
 
 #[cfg(test)]

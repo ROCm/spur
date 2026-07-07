@@ -47,6 +47,7 @@ impl SlurmAccounting for AccountingService {
             1,
             memory_mb,
             start_time,
+            &req.reservation,
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -185,7 +186,7 @@ impl SlurmAccounting for AccountingService {
                 qos: String::new(),
                 array_job_id: 0,
                 array_task_id: 0,
-                reservation: String::new(),
+                reservation: r.reservation.clone(),
             })
             .collect();
 

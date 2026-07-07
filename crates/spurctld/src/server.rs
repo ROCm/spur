@@ -17,7 +17,7 @@ use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::slurm_controller_server::{SlurmController, SlurmControllerServer};
 use spur_proto::proto::*;
 
-use crate::cluster::ClusterManager;
+use crate::cluster::{ClusterManager, ReservationError};
 use crate::raft::RaftHandle;
 use crate::rpc_middleware::RpcStatsLayer;
 use crate::rpc_stats::RpcStatsCollector;
@@ -1937,15 +1937,12 @@ fn annotate_nodes_with_reservations(
     }
 }
 
-#[allow(clippy::result_large_err)]
-fn reservation_rpc_status(err: impl std::fmt::Display) -> Status {
-    let message = err.to_string();
-    if message.contains("raft propose failed") {
-        Status::internal(message)
-    } else if message.contains("not found") {
-        Status::not_found(message)
-    } else {
-        Status::invalid_argument(message)
+fn reservation_rpc_status(err: ReservationError) -> Status {
+    match err {
+        ReservationError::InvalidArgument(m) => Status::invalid_argument(m),
+        ReservationError::NotFound(m) => Status::not_found(m),
+        ReservationError::AlreadyExists(m) => Status::already_exists(m),
+        ReservationError::Raft(m) => Status::internal(m),
     }
 }
 

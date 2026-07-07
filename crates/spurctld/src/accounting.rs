@@ -35,6 +35,7 @@ impl AccountingNotifier {
         partition: String,
         resources: &ResourceAllocations,
         start_time: DateTime<Utc>,
+        reservation: Option<String>,
     ) {
         let req = RecordJobStartRequest {
             job_id,
@@ -43,6 +44,7 @@ impl AccountingNotifier {
             partition,
             resources: Some(allocations_to_proto(resources)),
             start_time: Some(datetime_to_proto(start_time)),
+            reservation: reservation.unwrap_or_default(),
         };
         let mut client = self.client.clone();
         tokio::spawn(async move {
