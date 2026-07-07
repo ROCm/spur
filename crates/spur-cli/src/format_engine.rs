@@ -111,6 +111,38 @@ pub fn parse_format(fmt: &str, header_map: &dyn Fn(char) -> &'static str) -> Vec
     fields
 }
 
+/// Parse sacct/sreport-style comma-separated field names (e.g.
+/// `JobID,JobName%-20,Elapsed`), unlike squeue/sinfo's `%`-specifier syntax.
+pub fn parse_named_format(
+    fmt: &str,
+    name_to_spec: &dyn Fn(&str) -> Option<char>,
+    header_map: &dyn Fn(char) -> &'static str,
+) -> Vec<FormatField> {
+    let mut fields = Vec::new();
+    for item in fmt.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let (name, width) = match item.split_once('%') {
+            Some((n, w)) => (n.trim(), w.trim().parse::<i32>().unwrap_or(0)),
+            None => (item, 0),
+        };
+        let Some(spec) = name_to_spec(name) else {
+            continue;
+        };
+        let abs_width = width.unsigned_abs() as usize;
+        fields.push(FormatField {
+            spec,
+            width: abs_width,
+            right_align: width >= 0,
+            truncate: if abs_width > 0 { Some(abs_width) } else { None },
+            header: header_map(spec).to_string(),
+        });
+    }
+    fields
+}
+
 /// Format a single row using parsed fields and a value resolver.
 pub fn format_row(fields: &[FormatField], resolver: &dyn Fn(char) -> String) -> String {
     let mut parts = Vec::new();
@@ -277,5 +309,63 @@ mod tests {
         assert!(header.contains("JOBID"));
         assert!(header.contains("PARTITION"));
         assert!(header.contains("NAME"));
+    }
+
+    fn test_name_to_spec(name: &str) -> Option<char> {
+        match name.to_lowercase().as_str() {
+            "jobid" => Some('i'),
+            "partition" => Some('P'),
+            "jobname" => Some('j'),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn parse_named_format_comma_separated_names() {
+        let fields = parse_named_format(
+            "JobID,Partition,JobName",
+            &test_name_to_spec,
+            &squeue_header,
+        );
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].spec, 'i');
+        assert_eq!(fields[1].spec, 'P');
+        assert_eq!(fields[2].spec, 'j');
+        assert_eq!(fields[0].width, 0);
+    }
+
+    #[test]
+    fn parse_named_format_applies_percent_width() {
+        let fields = parse_named_format("JobName%20", &test_name_to_spec, &squeue_header);
+        assert_eq!(fields[0].width, 20);
+        assert!(fields[0].right_align);
+        assert_eq!(fields[0].truncate, Some(20));
+    }
+
+    #[test]
+    fn parse_named_format_negative_width_left_aligns() {
+        let fields = parse_named_format("JobName%-20", &test_name_to_spec, &squeue_header);
+        assert_eq!(fields[0].width, 20);
+        assert!(!fields[0].right_align);
+    }
+
+    #[test]
+    fn parse_named_format_skips_unknown_field_names() {
+        let fields = parse_named_format(
+            "JobID,NotAField,Partition",
+            &test_name_to_spec,
+            &squeue_header,
+        );
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].spec, 'i');
+        assert_eq!(fields[1].spec, 'P');
+    }
+
+    #[test]
+    fn parse_named_format_is_case_insensitive() {
+        let fields = parse_named_format("jobid,PARTITION", &test_name_to_spec, &squeue_header);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].spec, 'i');
+        assert_eq!(fields[1].spec, 'P');
     }
 }

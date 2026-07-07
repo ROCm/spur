@@ -96,6 +96,31 @@ pub fn sacct_header(spec: char) -> &'static str {
     }
 }
 
+/// Maps a sacct `--format` field name to its internal spec char.
+fn sacct_field_spec(name: &str) -> Option<char> {
+    match name.to_lowercase().as_str() {
+        "jobid" => Some('i'),
+        "jobname" => Some('j'),
+        "user" => Some('u'),
+        "account" => Some('a'),
+        "partition" => Some('P'),
+        "state" => Some('T'),
+        "elapsed" => Some('M'),
+        "nnodes" => Some('D'),
+        "exitcode" => Some('x'),
+        "derivedexitcode" => Some('X'),
+        "start" => Some('S'),
+        "end" => Some('E'),
+        "submit" => Some('V'),
+        "timelimit" => Some('l'),
+        "nodelist" => Some('n'),
+        "ncpus" => Some('C'),
+        "reqmem" => Some('R'),
+        "qos" => Some('Q'),
+        _ => None,
+    }
+}
+
 pub async fn main() -> Result<()> {
     main_with_args(std::env::args().collect()).await
 }
@@ -103,17 +128,16 @@ pub async fn main() -> Result<()> {
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = SacctArgs::try_parse_from(&args)?;
 
-    let fmt = if let Some(ref f) = args.format {
-        f.clone()
+    // -o/--format uses Slurm's comma-separated field-name syntax, not %-specifiers.
+    let fields = if let Some(ref f) = args.format {
+        format_engine::parse_named_format(f, &sacct_field_spec, &sacct_header)
     } else if args.long {
-        SACCT_LONG_FORMAT.to_string()
+        format_engine::parse_format(SACCT_LONG_FORMAT, &sacct_header)
     } else if args.brief {
-        SACCT_BRIEF_FORMAT.to_string()
+        format_engine::parse_format(SACCT_BRIEF_FORMAT, &sacct_header)
     } else {
-        SACCT_DEFAULT_FORMAT.to_string()
+        format_engine::parse_format(SACCT_DEFAULT_FORMAT, &sacct_header)
     };
-
-    let fields = format_engine::parse_format(&fmt, &sacct_header);
 
     // Parse state filter
     let states: Vec<i32> = args
@@ -361,5 +385,32 @@ mod tests {
         for (s, expected) in cases {
             assert_eq!(parse_acct_state(s), Some(expected as i32), "state {s}");
         }
+    }
+
+    #[test]
+    fn sacct_field_spec_is_case_insensitive_and_round_trips_header() {
+        for name in ["JobID", "jobid", "JOBID"] {
+            assert_eq!(sacct_field_spec(name), Some('i'));
+        }
+        assert_eq!(sacct_field_spec("NotAField"), None);
+    }
+
+    #[test]
+    fn custom_format_comma_separated_names_populate_requested_columns() {
+        // Real Slurm's sacct --format syntax; used to produce blank columns.
+        let fields = format_engine::parse_named_format(
+            "JobID,JobName,Partition,State",
+            &sacct_field_spec,
+            &sacct_header,
+        );
+        assert_eq!(fields.len(), 4);
+        let mut j = job(0, 0, 0);
+        j.name = "train".into();
+        j.partition = "gpu".into();
+        j.job_id = 42;
+        let row = format_engine::format_row(&fields, &|spec| resolve_sacct_field(&j, spec));
+        assert!(row.contains("42"));
+        assert!(row.contains("train"));
+        assert!(row.contains("gpu"));
     }
 }
