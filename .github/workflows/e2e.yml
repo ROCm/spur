@@ -75,6 +75,7 @@ jobs:
       STATUS_CONTEXT: ${{ matrix.STATUS_CONTEXT }}
       # LogLevel=ERROR silences the known-hosts warning from UserKnownHostsFile=/dev/null.
       SSH_OPTS: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+      RUN_DIR: /tmp/spur-e2e-${{ github.run_id }}
     steps:
       - name: Set pending status
         uses: actions/github-script@v9
@@ -92,7 +93,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: release-binaries
-          path: /tmp/release-binaries
+          path: ${{ env.RUN_DIR }}/release-binaries
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -100,7 +101,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: e2e-assets
-          path: /tmp/e2e-assets
+          path: ${{ env.RUN_DIR }}/e2e-assets
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -109,7 +110,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: spur-image
-          path: /tmp
+          path: ${{ env.RUN_DIR }}
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -186,7 +187,7 @@ jobs:
             --ssh-key "${{ steps.ssh.outputs.privkey }}" \
             --ssh-user ci \
             --kubeconfig "$KUBECONFIG_DIR/config" \
-            --image-tar /tmp/spur-image.tar
+            --image-tar "${{ env.RUN_DIR }}/spur-image.tar"
           echo "kubeconfig=$KUBECONFIG_DIR/config" >> "$GITHUB_OUTPUT"
 
       - name: Push artifacts into driver VM
@@ -194,17 +195,18 @@ jobs:
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
 
-          scp $SSH_OPTS -i "$KEY" -r /tmp/release-binaries ci@"$DRIVER_IP":/tmp/
-          scp $SSH_OPTS -i "$KEY" -r /tmp/e2e-assets ci@"$DRIVER_IP":/tmp/
-          scp $SSH_OPTS -i "$KEY" "$KEY" ci@"$DRIVER_IP":/tmp/ci-ssh-key
-          ssh $SSH_OPTS -i "$KEY" ci@"$DRIVER_IP" "chmod 600 /tmp/ci-ssh-key"
+          ssh $SSH_OPTS -i "$KEY" ci@"$DRIVER_IP" "mkdir -p ${{ env.RUN_DIR }}"
+          scp $SSH_OPTS -i "$KEY" -r "${{ env.RUN_DIR }}/release-binaries" ci@"$DRIVER_IP":"${{ env.RUN_DIR }}/"
+          scp $SSH_OPTS -i "$KEY" -r "${{ env.RUN_DIR }}/e2e-assets" ci@"$DRIVER_IP":"${{ env.RUN_DIR }}/"
+          scp $SSH_OPTS -i "$KEY" "$KEY" ci@"$DRIVER_IP":"${{ env.RUN_DIR }}/ci-ssh-key"
+          ssh $SSH_OPTS -i "$KEY" ci@"$DRIVER_IP" "chmod 600 ${{ env.RUN_DIR }}/ci-ssh-key"
 
       - name: Load AppArmor profile for rootless containers
         if: matrix.cluster_type == 'native-host'
         run: |
           GPU_IPS="${{ steps.cluster.outputs.gpu_ips }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
-          SPURD="/tmp/spur-ci-bin/spurd"
+          SPURD="/tmp/spur-ci-bin-${{ github.run_id }}/spurd"
           PROF="abi <abi/4.0>,
           profile spur-ci ${SPURD} flags=(unconfined) {
             userns,
@@ -225,13 +227,13 @@ jobs:
           set -euo pipefail
           export SPUR_TEST_NODES="$GPU_IPS"
           export SPUR_TEST_SSH_USER=ci
-          export SPUR_TEST_SSH_KEY=/tmp/ci-ssh-key
-          export SPUR_TEST_BINARIES_DIR=/tmp/release-binaries
-          export SPUR_TEST_REMOTE_BIN_DIR=/tmp/spur-ci-bin
+          export SPUR_TEST_SSH_KEY=${{ env.RUN_DIR }}/ci-ssh-key
+          export SPUR_TEST_BINARIES_DIR=${{ env.RUN_DIR }}/release-binaries
+          export SPUR_TEST_REMOTE_BIN_DIR=/tmp/spur-ci-bin-${{ github.run_id }}
           export SPUR_TEST_GPU_VENV=/opt/spur-ci/gpu-venv
-          chmod +x /tmp/release-binaries/*
+          chmod +x ${{ env.RUN_DIR }}/release-binaries/*
           source /opt/spur-ci/test-venv/bin/activate
-          pytest /tmp/e2e-assets/tests/native_host/e2e/ -v --junitxml=/tmp/results.xml
+          pytest ${{ env.RUN_DIR }}/e2e-assets/tests/native_host/e2e/ -v --junitxml=${{ env.RUN_DIR }}/results.xml
           REMOTE
 
       - name: Apply RBAC and verify cluster state (k8s)
@@ -250,7 +252,7 @@ jobs:
 
           # Apply RBAC with namespace patched
           sed "s/namespace: spur/namespace: $NS/g" \
-            /tmp/e2e-assets/tests/k8s/e2e/manifests/rbac.yaml | kubectl apply -f -
+            ${{ env.RUN_DIR }}/e2e-assets/tests/k8s/e2e/manifests/rbac.yaml | kubectl apply -f -
 
           # Verify nodes are labeled
           echo "=== Labeled nodes ==="
@@ -270,7 +272,7 @@ jobs:
           export SPUR_CI_IMAGE=docker.io/library/spur:ci
           export SPUR_TEST_NS="$NS"
           source /opt/spur-ci/test-venv/bin/activate
-          pytest /tmp/e2e-assets/tests/k8s/e2e/ -v --junitxml=/tmp/results.xml
+          pytest ${{ env.RUN_DIR }}/e2e-assets/tests/k8s/e2e/ -v --junitxml=${{ env.RUN_DIR }}/results.xml
           REMOTE
 
       - name: Dump cluster diagnostics (k8s)
@@ -278,7 +280,7 @@ jobs:
         run: |
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
-          mkdir -p /tmp/e2e-results
+          mkdir -p "${{ env.RUN_DIR }}/e2e-results"
           ssh $SSH_OPTS -i "$KEY" ci@"$DRIVER_IP" bash -s <<'REMOTE' || true
           set -uo pipefail
           export KUBECONFIG=/home/ci/.kube/config
@@ -286,7 +288,6 @@ jobs:
           rm -rf "$D" && mkdir -p "$D"
           kubectl get events -A --sort-by=.lastTimestamp > "$D/events.txt" 2>&1 || true
           kubectl get pods -A -o wide > "$D/pods.txt" 2>&1 || true
-          # Only collect logs for the long-lived controller/operator pods.
           for ns in $(kubectl get ns -o name 2>/dev/null | sed 's|namespace/||' | grep -E 'spur'); do
             for selector in app=spurctld app=spur-k8s-operator; do
               for p in $(kubectl -n "$ns" get pods -l "$selector" -o name 2>/dev/null); do
@@ -297,25 +298,23 @@ jobs:
             done
           done
           REMOTE
-          scp $SSH_OPTS -i "$KEY" -r ci@"$DRIVER_IP":/tmp/cluster-dump /tmp/e2e-results/ 2>/dev/null || true
+          scp $SSH_OPTS -i "$KEY" -r ci@"$DRIVER_IP":/tmp/cluster-dump "${{ env.RUN_DIR }}/e2e-results/" 2>/dev/null || true
 
       - name: Collect results from driver VM
         if: always()
         run: |
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
-          mkdir -p /tmp/e2e-results
+          mkdir -p "${{ env.RUN_DIR }}/e2e-results"
           scp $SSH_OPTS -i "$KEY" \
-            ci@"$DRIVER_IP":/tmp/results.xml /tmp/e2e-results/ 2>/dev/null || true
-          ssh $SSH_OPTS -i "$KEY" ci@"$DRIVER_IP" \
-            "find /tmp -name '*.log' -exec rm -f {} + 2>/dev/null" || true
+            ci@"$DRIVER_IP":"${{ env.RUN_DIR }}/results.xml" "${{ env.RUN_DIR }}/e2e-results/" 2>/dev/null || true
 
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: e2e-results-${{ matrix.cluster_type }}
-          path: /tmp/e2e-results/
+          path: ${{ env.RUN_DIR }}/e2e-results/
           retention-days: 3
           if-no-files-found: ignore
 
@@ -329,6 +328,10 @@ jobs:
       - name: Cleanup ephemeral keys
         if: always()
         run: rm -rf "${{ steps.ssh.outputs.key_dir }}"
+
+      - name: Cleanup run directory
+        if: always()
+        run: rm -rf "${{ env.RUN_DIR }}"
 
       - name: Report status
         if: always()
