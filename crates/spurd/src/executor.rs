@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -252,6 +252,10 @@ async fn spawn_job_process(
     } = *cfg;
     info!(job_id, work_dir, "launching job");
 
+    // spurd (root) creates output files/dirs before dropping privilege, so they
+    // must be re-owned to the submitting user. Guard matches the priv-drop below.
+    let should_chown = uid > 0 && nix::unistd::geteuid().is_root();
+
     // Invoke SPANK Init hook (after prolog, before process spawn)
     if let Some(spank) = spank {
         if let Err(e) = spank.invoke_hook(spur_spank::SpankHook::Init) {
@@ -268,15 +272,16 @@ async fn spawn_job_process(
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
     // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
     // the job can still run; absolute output paths in the spec are unaffected.
-    let effective_work_dir: String = if tokio::fs::create_dir_all(work_dir).await.is_ok() {
-        work_dir.to_string()
-    } else {
-        warn!(
-            job_id,
-            work_dir, "work_dir unavailable on this node, using /tmp"
-        );
-        "/tmp".to_string()
-    };
+    let effective_work_dir: String =
+        if create_dirs_owned(Path::new(work_dir), should_chown, uid, gid).is_ok() {
+            work_dir.to_string()
+        } else {
+            warn!(
+                job_id,
+                work_dir, "work_dir unavailable on this node, using /tmp"
+            );
+            "/tmp".to_string()
+        };
     let work_dir = effective_work_dir.as_str();
 
     // Wrap script with burst buffer stage-in/stage-out if configured
@@ -311,10 +316,10 @@ async fn spawn_job_process(
 
     // Ensure output directories exist
     if let Some(parent) = Path::new(&stdout_resolved).parent() {
-        tokio::fs::create_dir_all(parent).await.ok();
+        create_dirs_owned(parent, should_chown, uid, gid).ok();
     }
     if let Some(parent) = Path::new(&stderr_resolved).parent() {
-        tokio::fs::create_dir_all(parent).await.ok();
+        create_dirs_owned(parent, should_chown, uid, gid).ok();
     }
 
     // Guard: stdin must not overlap stdout/stderr (truncation would destroy input)
@@ -364,6 +369,11 @@ async fn spawn_job_process(
             .context("failed to create stderr file")?
     };
 
+    if should_chown {
+        fchown_to_job_user(&stdout_file, uid, gid);
+        fchown_to_job_user(&stderr_file, uid, gid);
+    }
+
     let mut env = environment.clone();
 
     // GPU isolation via registry-based device injection plan.
@@ -394,6 +404,7 @@ async fn spawn_job_process(
             ctn,
             &env,
             use_append,
+            should_chown,
             &stdout_resolved,
             &stderr_resolved,
         )
@@ -739,6 +750,48 @@ fn get_child_pids(pid: i32) -> Vec<i32> {
         .collect()
 }
 
+/// Chown an open file to the job's uid/gid via the fd. Using the fd (not the
+/// path) avoids a symlink-swap TOCTOU on the user-controlled output path, since
+/// spurd runs as root. Best-effort: failures are logged, not fatal.
+fn fchown_to_job_user<F: AsFd>(fd: &F, uid: u32, gid: u32) {
+    use nix::unistd::{Gid, Uid};
+    if let Err(e) = nix::unistd::fchown(fd, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))) {
+        warn!(error = %e, "failed to chown job output to submitting user");
+    }
+}
+
+/// Chown a path to the job's uid/gid. Best-effort: failures are logged, not
+/// fatal — output ownership is a convenience, not a correctness requirement.
+fn chown_to_job_user(path: &Path, uid: u32, gid: u32) {
+    use nix::unistd::{Gid, Uid};
+    if let Err(e) = nix::unistd::chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))) {
+        warn!(path = %path.display(), error = %e, "failed to chown job output to submitting user");
+    }
+}
+
+/// Create `dir` and any missing parents. When `chown` is true, only the
+/// components created by this call are chowned to (uid, gid); pre-existing
+/// directories (e.g. a shared `/home/user`) are left untouched.
+fn create_dirs_owned(dir: &Path, chown: bool, uid: u32, gid: u32) -> std::io::Result<()> {
+    let mut created = Vec::new();
+    let mut cur = Some(dir);
+    while let Some(p) = cur {
+        if p.exists() {
+            break;
+        }
+        created.push(p.to_path_buf());
+        cur = p.parent();
+    }
+    std::fs::create_dir_all(dir)?;
+    if chown {
+        // Chown outermost-created first so ancestors exist before descendants.
+        for p in created.iter().rev() {
+            chown_to_job_user(p, uid, gid);
+        }
+    }
+    Ok(())
+}
+
 /// Resolve output path patterns (%j → job_id, etc.)
 fn resolve_output_path(pattern: &str, job_id: JobId, work_dir: &str) -> String {
     let resolved = if pattern.is_empty() {
@@ -772,6 +825,7 @@ async fn launch_container_job(
     ctn: &ContainerLaunchConfig,
     env: &HashMap<String, String>,
     use_append: bool,
+    should_chown: bool,
     stdout_path: &str,
     stderr_path: &str,
 ) -> anyhow::Result<RunningJob> {
@@ -797,6 +851,13 @@ async fn launch_container_job(
     } else {
         std::fs::File::create(stderr_path).context("create stderr for container job")?
     };
+
+    // Re-own output to the submitting user: these are opened by spurd (root)
+    // before the fork/priv-drop, so they'd otherwise be root-owned.
+    if should_chown {
+        fchown_to_job_user(&stdout_fd, cfg.uid, cfg.gid);
+        fchown_to_job_user(&stderr_fd, cfg.uid, cfg.gid);
+    }
 
     // Sync pipe: child writes status, parent reads.
     // Convert OwnedFd to raw fds for manual lifecycle management across fork.
@@ -1089,6 +1150,45 @@ mod tests {
             (0, 15)
         );
         assert_eq!(decode_wait_status(WaitStatus::StillAlive), (-1, 0));
+    }
+
+    #[test]
+    fn create_dirs_owned_creates_full_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a/b/c");
+        // chown=false keeps this root-free and deterministic in CI.
+        create_dirs_owned(&nested, false, 0, 0).unwrap();
+        assert!(nested.is_dir());
+    }
+
+    #[test]
+    fn create_dirs_owned_is_idempotent_on_existing_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        // Pre-existing directory must not error and must remain present.
+        create_dirs_owned(dir.path(), false, 0, 0).unwrap();
+        assert!(dir.path().is_dir());
+        // A second call over an already-created subtree also succeeds.
+        let nested = dir.path().join("x/y");
+        create_dirs_owned(&nested, false, 0, 0).unwrap();
+        create_dirs_owned(&nested, false, 0, 0).unwrap();
+        assert!(nested.is_dir());
+    }
+
+    #[test]
+    fn fchown_to_job_user_same_owner_leaves_ownership_intact() {
+        use std::os::unix::fs::MetadataExt;
+        // Chowning a file to its current owner is permitted even for non-root,
+        // so this exercises the real fchown path via the fd without needing
+        // root or depending on which uid the test runs as.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.log");
+        let file = std::fs::File::create(&path).unwrap();
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        fchown_to_job_user(&file, uid, gid);
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.uid(), uid);
+        assert_eq!(meta.gid(), gid);
     }
 
     #[test]
