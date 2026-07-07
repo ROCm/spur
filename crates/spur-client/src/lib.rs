@@ -8,8 +8,10 @@
 //! is service-agnostic: callers wrap the returned channel in whatever generated
 //! client they need (e.g. `SlurmControllerClient::new(channel)`).
 
+use std::time::Duration;
+
 use tonic::transport::{Channel, Endpoint};
-use tracing::warn;
+use tracing::debug;
 
 /// Parse a comma-separated endpoint string into normalized `http(s)://host:port`
 /// entries. Whitespace is trimmed and empty entries dropped. Entries without a
@@ -55,7 +57,7 @@ pub async fn connect_channel(endpoints: &str) -> Result<Channel, tonic::transpor
     for endpoint in &list[..last] {
         match try_connect(endpoint).await {
             Ok(channel) => return Ok(channel),
-            Err(e) => warn!(
+            Err(e) => debug!(
                 %endpoint,
                 error = %e,
                 "controller endpoint unreachable, trying next"
@@ -67,7 +69,10 @@ pub async fn connect_channel(endpoints: &str) -> Result<Channel, tonic::transpor
 }
 
 async fn try_connect(endpoint: &str) -> Result<Channel, tonic::transport::Error> {
-    Endpoint::from_shared(endpoint.to_string())?.connect().await
+    Endpoint::from_shared(endpoint.to_string())?
+        .connect_timeout(Duration::from_secs(2))
+        .connect()
+        .await
 }
 
 #[cfg(test)]
@@ -135,6 +140,15 @@ mod tests {
         let down = free_addr().await;
         let up = spawn_server().await;
         let endpoints = format!("http://{down},http://{up}");
+        assert!(connect_channel(&endpoints).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn connect_rotates_past_multiple_dead() {
+        let down1 = free_addr().await;
+        let down2 = free_addr().await;
+        let up = spawn_server().await;
+        let endpoints = format!("http://{down1},http://{down2},http://{up}");
         assert!(connect_channel(&endpoints).await.is_ok());
     }
 

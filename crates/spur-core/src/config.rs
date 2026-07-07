@@ -329,7 +329,13 @@ impl ControllerConfig {
         let port = self.listen_addr.rsplit(':').next().unwrap_or("6817");
         self.hosts
             .iter()
-            .map(|host| format!("http://{host}:{port}"))
+            .map(|host| {
+                if host.contains(':') && !host.starts_with('[') {
+                    format!("http://[{host}]:{port}")
+                } else {
+                    format!("http://{host}:{port}")
+                }
+            })
             .collect()
     }
 }
@@ -991,6 +997,35 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cfg.endpoints(), vec!["http://ctrl1:7000"]);
+    }
+
+    #[test]
+    fn test_controller_endpoints_empty_hosts() {
+        let cfg = ControllerConfig {
+            hosts: vec![],
+            ..Default::default()
+        };
+        assert!(cfg.endpoints().is_empty());
+    }
+
+    #[test]
+    fn test_controller_endpoints_ipv6_host_bracketed() {
+        let cfg = ControllerConfig {
+            listen_addr: "[::]:6817".into(),
+            hosts: vec!["::1".into()],
+            ..Default::default()
+        };
+        assert_eq!(cfg.endpoints(), vec!["http://[::1]:6817"]);
+    }
+
+    #[test]
+    fn test_controller_endpoints_ipv6_already_bracketed() {
+        let cfg = ControllerConfig {
+            listen_addr: "[::]:6817".into(),
+            hosts: vec!["[::1]".into()],
+            ..Default::default()
+        };
+        assert_eq!(cfg.endpoints(), vec!["http://[::1]:6817"]);
     }
 
     #[test]
