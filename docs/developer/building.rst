@@ -34,7 +34,7 @@ All tests are self-contained. No external services needed (no database, no netwo
 End-to-End Tests (Native-Host)
 ------------------------------
 
-The native-host E2E suite lives in ``tests/native_host/e2e/`` and uses pytest. It SSHes into pre-provisioned nodes, deploys Spur, runs tests, and tears down the cluster after each test. Build the release binaries first (``cargo build --release``).
+The native-host E2E suite lives in ``tests/native_host/e2e/`` and uses pytest. Shared cluster helpers (``cluster.py``, ``conftest.py``) live in ``tests/native_host/``. The suite SSHes into pre-provisioned nodes, deploys Spur, runs tests, and tears down the cluster after each test. Build the release binaries first (``cargo build --release``).
 
 Prerequisites
 ~~~~~~~~~~~~~
@@ -43,7 +43,7 @@ Prerequisites
 - Pre-provisioned nodes accessible via SSH (password, key, or ssh-agent)
 - Container tests require ``squashfs-tools`` on the runner and all nodes
 - GPU tests require GPU hardware (ROCm/CUDA) on the nodes, plus a Python venv with PyTorch (auto-provisioned if ``SPUR_TEST_GPU_VENV`` is unset)
-- GPU test scripts (``gpu_test.hip``, ``distributed_test.py``, ``inference_test.py``) live in ``tests/native_host/e2e/fixtures/`` and are shipped to nodes by the harness
+- GPU test scripts (``gpu_test.hip``, ``distributed_test.py``, ``inference_test.py``) live in ``tests/native_host/fixtures/`` and are shipped to nodes by the harness
 
 Environment Variables
 ~~~~~~~~~~~~~~~~~~~~~
@@ -125,13 +125,60 @@ Running the Tests
 
    export SPUR_TEST_NODES=10.0.1.10,10.0.1.11,10.0.1.12
 
-   # Run the full native-host suite
-   pytest tests/native_host/e2e/ -v
+   # Run the full native-host suite (excludes optional perf tests)
+   pytest tests/native_host/e2e/ -v -m "not perf"
 
    # Run a specific test
    pytest tests/native_host/e2e/test_single_node.py::TestJobLifecycle::test_job_cancel -v
 
 Tests that require more nodes than provided, or missing GPU/container prerequisites, are automatically skipped.
+
+Scheduler perf tests (optional)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Optional scheduler throughput and latency benchmarks live in ``tests/native_host/perf/``. Shell scripts are under ``tests/native_host/perf/scripts/`` (``run_perf.sh``, ``run_all.sh``). They are excluded from default E2E CI (``-m "not perf"``).
+
+Do **not** run bare ``pytest`` from ``tests/`` without a path or marker filter: ``testpaths`` includes ``native_host/perf`` and those tests require ``SPUR_TEST_NODES``.
+
+.. code-block:: bash
+
+   export SPUR_TEST_NODES=10.0.1.10,10.0.1.11,10.0.1.12
+   export SPUR_TEST_SSH_USER=vm
+
+   # One perf suite; write JSON with --perf-json (not an env var)
+   pytest -c tests/pytest.ini tests/native_host/perf/ -v -m perf -s \
+     --perf-json=/tmp/perf-local.json
+
+   # Compare two binary trees (CI uses run_perf_compare.sh)
+   tests/native_host/perf/run_perf_compare.sh /path/to/candidate /path/to/baseline \
+     --candidate-json /tmp/perf-candidate.json \
+     --baseline-json /tmp/perf-baseline.json
+
+Perf-specific environment variables:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Variable
+     - Description
+     - Example
+   * - ``SPUR_PERF_TIERS``
+     - Space- or comma-separated job counts per tier.
+     - ``50`` or ``100 500 1000``
+   * - ``SPUR_PERF_PARALLEL``
+     - Parallel submitters (capped per tier).
+     - ``32``
+   * - ``SPUR_PERF_SLEEP``
+     - Seconds each benchmark job sleeps.
+     - ``0``
+   * - ``SPUR_PERF_RUN_LABEL``
+     - Label stored in suite JSON.
+     - ``pr-382``
+   * - ``SPUR_PERF_COMPARE_THRESHOLD_PCT``
+     - Regression threshold for ``python -m perf.report``.
+     - ``10``
+
+See ``tests/native_host/perf/README.md`` and the header comment in ``tests/native_host/perf/scripts/run_perf.sh`` for metric definitions.
 
 End-to-End Tests (Kubernetes)
 -----------------------------

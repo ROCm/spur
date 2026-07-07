@@ -115,6 +115,23 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+  perf-harness-unit:
+    name: Perf harness unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python venv
+        run: |
+          python3 -m venv /tmp/spur-perf-unit-venv
+          /tmp/spur-perf-unit-venv/bin/pip install -r tests/requirements.txt
+          echo "/tmp/spur-perf-unit-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Run perf harness unit tests
+        working-directory: tests
+        run: |
+          pytest native_host/perf/test_perf_parse.py native_host/perf/test_perf_report.py -q
+
   coverage:
     runs-on: ubuntu-latest
     env:

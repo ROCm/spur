@@ -231,7 +231,7 @@ jobs:
           export SPUR_TEST_GPU_VENV=/opt/spur-ci/gpu-venv
           chmod +x /tmp/release-binaries/*
           source /opt/spur-ci/test-venv/bin/activate
-          pytest /tmp/e2e-assets/tests/native_host/e2e/ -v --junitxml=/tmp/results.xml
+          pytest /tmp/e2e-assets/tests/native_host/e2e/ -v -m "not perf" --junitxml=/tmp/results.xml
           REMOTE
 
       - name: Apply RBAC and verify cluster state (k8s)

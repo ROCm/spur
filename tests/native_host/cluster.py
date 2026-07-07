@@ -22,6 +22,8 @@ import tomli_w
 
 logger = logging.getLogger(__name__)
 
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+
 BINARIES = ["spurctld", "spurd", "spur"]
 CLI_SYMLINKS = ["sbatch", "srun", "squeue", "scancel", "sinfo", "scontrol"]
 # Extra binaries/symlinks pulled in only when accounting (spurdbd) is enabled.
@@ -535,8 +537,7 @@ class SpurCluster:
 
     def ship_fixture(self, fixture_name: str) -> str:
         """Ship a file from the fixtures/ directory to remote_dir on all nodes."""
-        fixtures_dir = Path(__file__).resolve().parent / "fixtures"
-        local_path = fixtures_dir / fixture_name
+        local_path = FIXTURES_DIR / fixture_name
         if not local_path.is_file():
             raise FileNotFoundError(f"Missing fixture: {local_path}")
         self.ship_file_to_all(local_path, fixture_name)

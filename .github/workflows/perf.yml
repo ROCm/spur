@@ -1,0 +1,194 @@
+# Manual perf comparison: PR binaries vs latest nightly on bare-metal cluster.
+#
+# workflow_dispatch only — not part of default CI/E2E.
+# No PR checkout or build on the self-hosted runner; PR binaries and test assets
+# come from the successful CI run for the PR head SHA (same pattern as e2e.yml).
+name: Perf
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Open PR number to benchmark
+        required: true
+        type: number
+      tiers:
+        description: SPUR_PERF_TIERS (space-separated job counts)
+        required: false
+        default: "50"
+        type: string
+      parallel:
+        description: SPUR_PERF_PARALLEL
+        required: false
+        default: "32"
+        type: string
+      fail_on_regression:
+        description: Fail workflow if comparison shows regressions
+        required: false
+        default: false
+        type: boolean
+      compare_threshold_pct:
+        description: Regression/improvement threshold percent (perf.report)
+        required: false
+        default: "10"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  perf-compare:
+    name: Perf PR vs nightly
+    runs-on: [self-hosted, bare-metal-cluster]
+    concurrency:
+      group: native-host-cluster
+      queue: max
+    env:
+      BM_NODES: ${{ secrets.BM_NODES }}
+      BM_SSH_USER: ${{ secrets.BM_SSH_USER }}
+      BM_REMOTE_BIN_DIR: /tmp/spur-ci-bin
+      BM_REMOTE_BIN_DIR_PR: /tmp/spur-ci-bin-perf-pr
+      BM_REMOTE_BIN_DIR_NIGHTLY: /tmp/spur-ci-bin-perf-nightly
+      PERF_ASSETS_DIR: /tmp/spur-perf-assets-${{ github.run_id }}
+      SPUR_PERF_TIERS: ${{ inputs.tiers }}
+      SPUR_PERF_PARALLEL: ${{ inputs.parallel }}
+      SPUR_PERF_COMPARE_THRESHOLD_PCT: ${{ inputs.compare_threshold_pct }}
+    steps:
+      - name: Resolve PR head SHA and CI run
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PR="${{ inputs.pr_number }}"
+          HEAD_SHA=$(gh pr view "$PR" --repo "${{ github.repository }}" --json headRefOid -q .headRefOid)
+          HEAD_REF=$(gh pr view "$PR" --repo "${{ github.repository }}" --json headRefName -q .headRefName)
+          RUN_ID=$(gh run list --repo "${{ github.repository }}" --workflow CI \
+            --commit "$HEAD_SHA" --status success --json databaseId -q '.[0].databaseId')
+          test -n "$RUN_ID" || { echo "no successful CI run for $HEAD_SHA"; exit 1; }
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "head_ref=${HEAD_REF}" >> "$GITHUB_OUTPUT"
+          echo "ci_run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "PR #${PR} @ ${HEAD_SHA} (${HEAD_REF}), CI run ${RUN_ID}"
+
+      - name: Download PR binaries from CI
+        uses: actions/download-artifact@v8
+        with:
+          name: release-binaries
+          path: /tmp/perf-pr-bins
+          run-id: ${{ steps.pr.outputs.ci_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download PR perf assets from CI
+        uses: actions/download-artifact@v8
+        with:
+          name: e2e-assets
+          path: ${{ env.PERF_ASSETS_DIR }}
+          run-id: ${{ steps.pr.outputs.ci_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download latest nightly binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/nightly-dl
+          gh release download nightly --repo "${{ github.repository }}" \
+            --pattern 'spur-*.tar.gz' --dir /tmp/nightly-dl
+          tar xzf /tmp/nightly-dl/spur-*.tar.gz -C /tmp/nightly-dl
+          BINDIR=$(find /tmp/nightly-dl -path '*/bin' -type d -print -quit)
+          test -n "$BINDIR"
+          mkdir -p /tmp/perf-nightly-bins
+          cp -a "$BINDIR"/* /tmp/perf-nightly-bins/
+          chmod +x /tmp/perf-nightly-bins/*
+
+      - name: Set up Python venv
+        run: |
+          python3 -m venv /tmp/spur-perf-venv
+          /tmp/spur-perf-venv/bin/pip install -r "$PERF_ASSETS_DIR/tests/requirements.txt"
+          echo "/tmp/spur-perf-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Load SSH key into agent
+        run: |
+          eval "$(ssh-agent -s)"
+          printf '%s\n' "$BM_SSH_KEY" | ssh-add -
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+        env:
+          BM_SSH_KEY: ${{ secrets.BM_SSH_KEY }}
+
+      - name: Mask sensitive values
+        run: |
+          IFS=',' read -ra NODES <<< "$BM_NODES"
+          for node in "${NODES[@]}"; do
+            node="${node#"${node%%[![:space:]]*}"}"
+            node="${node%"${node##*[![:space:]]}"}"
+            [ -n "$node" ] && echo "::add-mask::${node}"
+          done
+          echo "::add-mask::${BM_SSH_USER}"
+
+      - name: Kill stale cluster processes
+        run: |
+          IFS=',' read -ra NODES <<< "$BM_NODES"
+          for node in "${NODES[@]}"; do
+            ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+              "${BM_SSH_USER}@${node}" "
+              sudo pkill -f '${BM_REMOTE_BIN_DIR}/spurctld' 2>/dev/null || true
+              sudo pkill -f '${BM_REMOTE_BIN_DIR}/spurd' 2>/dev/null || true
+              sudo pkill -f '${BM_REMOTE_BIN_DIR_PR}/spurctld' 2>/dev/null || true
+              sudo pkill -f '${BM_REMOTE_BIN_DIR_PR}/spurd' 2>/dev/null || true
+              sudo pkill -f '${BM_REMOTE_BIN_DIR_NIGHTLY}/spurctld' 2>/dev/null || true
+              sudo pkill -f '${BM_REMOTE_BIN_DIR_NIGHTLY}/spurd' 2>/dev/null || true
+              sudo rm -rf '${BM_REMOTE_BIN_DIR_PR}' '${BM_REMOTE_BIN_DIR_NIGHTLY}' /tmp/spur-e2e-* 2>/dev/null || true
+            " || true
+          done
+
+      - name: Run perf compare (PR vs nightly)
+        env:
+          SPUR_TEST_NODES: ${{ env.BM_NODES }}
+          SPUR_TEST_SSH_USER: ${{ env.BM_SSH_USER }}
+        run: |
+          set -euo pipefail
+          chmod +x /tmp/perf-pr-bins/*
+          chmod +x "$PERF_ASSETS_DIR/tests/native_host/perf/run_perf_compare.sh"
+          ARGS=(
+            /tmp/perf-pr-bins
+            /tmp/perf-nightly-bins
+            --candidate-remote-dir "${BM_REMOTE_BIN_DIR_PR}"
+            --baseline-remote-dir "${BM_REMOTE_BIN_DIR_NIGHTLY}"
+            --candidate-label "pr-${{ inputs.pr_number }}"
+            --baseline-label nightly
+            --candidate-json /tmp/perf-pr.json
+            --baseline-json /tmp/perf-nightly.json
+            --threshold "${{ inputs.compare_threshold_pct }}"
+          )
+          if [ "${{ inputs.fail_on_regression }}" = "true" ]; then
+            ARGS+=(--fail-on-regression)
+          fi
+          "$PERF_ASSETS_DIR/tests/native_host/perf/run_perf_compare.sh" "${ARGS[@]}"
+
+      - name: Cleanup remote processes
+        if: always()
+        run: |
+          IFS=',' read -ra NODES <<< "$BM_NODES"
+          for node in "${NODES[@]}"; do
+            ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+              "${BM_SSH_USER}@${node}" "
+              sudo pkill -f '${BM_REMOTE_BIN_DIR_PR}/spurctld' 2>/dev/null || true
+              sudo pkill -f '${BM_REMOTE_BIN_DIR_PR}/spurd' 2>/dev/null || true
+              sudo pkill -f '${BM_REMOTE_BIN_DIR_NIGHTLY}/spurctld' 2>/dev/null || true
+              sudo pkill -f '${BM_REMOTE_BIN_DIR_NIGHTLY}/spurd' 2>/dev/null || true
+              sudo pkill -f '${BM_REMOTE_BIN_DIR}/spurctld' 2>/dev/null || true
+              sudo pkill -f '${BM_REMOTE_BIN_DIR}/spurd' 2>/dev/null || true
+              sudo rm -rf '${BM_REMOTE_BIN_DIR_PR}' '${BM_REMOTE_BIN_DIR_NIGHTLY}' /tmp/spur-e2e-* 2>/dev/null || true
+            " || true
+          done
+
+      - name: Cleanup local artifacts
+        if: always()
+        run: |
+          rm -rf /tmp/spur-perf-venv /tmp/perf-pr-bins /tmp/perf-nightly-bins
+          rm -rf /tmp/nightly-dl "$PERF_ASSETS_DIR"
+          rm -f /tmp/perf-pr.json /tmp/perf-nightly.json
+          ssh-agent -k || true

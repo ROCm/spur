@@ -12,11 +12,8 @@ provision it (requires python3-venv + network access on nodes).
 """
 
 import os
-from pathlib import Path
 
-from cluster import SpurCluster, parse_job_id, wait_job
-
-_FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+from cluster import FIXTURES_DIR, SpurCluster, parse_job_id, wait_job
 
 
 def _resolve_gpu_venv(cluster: SpurCluster) -> str:
@@ -49,7 +46,7 @@ class TestGpuSingleNode:
         cluster.gpu_preflight(1)
 
         # Compile HIP gpu_test on the node if source and hipcc are available
-        fixtures = _FIXTURES_DIR
+        fixtures = FIXTURES_DIR
         hip_src = fixtures / "gpu_test.hip"
         if hip_src.is_file():
             cluster.ship_file_to_all(hip_src, "gpu_test.hip")
@@ -82,7 +79,7 @@ class TestGpuMultiNode:
         cluster = gpu_cluster
         cluster.gpu_preflight(2)
 
-        fixtures = _FIXTURES_DIR
+        fixtures = FIXTURES_DIR
         hip_src = fixtures / "gpu_test.hip"
         if hip_src.is_file():
             cluster.ship_file_to_all(hip_src, "gpu_test.hip")
@@ -114,7 +111,7 @@ class TestGpuMultiNode:
 
         venv_path = _resolve_gpu_venv(cluster)
         rd = cluster.remote_dir
-        fixtures = _FIXTURES_DIR
+        fixtures = FIXTURES_DIR
 
         # Ship the test script
         src = fixtures / "distributed_test.py"
@@ -149,7 +146,7 @@ class TestGpuMultiNode:
 
         venv_path = _resolve_gpu_venv(cluster)
         rd = cluster.remote_dir
-        fixtures = _FIXTURES_DIR
+        fixtures = FIXTURES_DIR
 
         # Ship the test script
         src = fixtures / "inference_test.py"
