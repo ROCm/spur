@@ -705,6 +705,7 @@ message RecordJobStartRequest {
   ResourceAllocations resources = 5;
   google.protobuf.Timestamp start_time = 6;
   string reservation = 7;
+  string name = 8;
 }
 
 message RecordJobEndRequest {

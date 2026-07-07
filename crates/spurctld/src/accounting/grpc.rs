@@ -46,6 +46,7 @@ impl SlurmAccounting for AccountingService {
         db::record_job_start(
             &self.pool,
             req.job_id as i32,
+            &req.name,
             &req.user,
             &req.account,
             &req.partition,

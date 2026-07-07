@@ -578,6 +578,7 @@ impl ClusterManager {
         if let Some(ref notifier) = *self.accounting.read() {
             notifier.notify_job_start(JobStartRecord {
                 job_id,
+                name: spec_for_notify.name.clone(),
                 user: spec_for_notify.user.clone(),
                 account: spec_for_notify.account.clone().unwrap_or_default(),
                 partition: spec_for_notify.partition.clone().unwrap_or_default(),

@@ -9,6 +9,7 @@ use spur_core::job::{JobId, JobState};
 
 pub struct JobStartRecord {
     pub job_id: JobId,
+    pub name: String,
     pub user: String,
     pub account: String,
     pub partition: String,
@@ -32,6 +33,7 @@ impl AccountingNotifier {
     pub fn notify_job_start(&self, record: JobStartRecord) {
         let pool = self.pool.clone();
         let job_id = record.job_id;
+        let name = record.name;
         let user = record.user;
         let account = record.account;
         let partition = record.partition;
@@ -45,6 +47,7 @@ impl AccountingNotifier {
             if let Err(e) = super::db::record_job_start(
                 &pool,
                 job_id as i32,
+                &name,
                 &user,
                 &account,
                 &partition,

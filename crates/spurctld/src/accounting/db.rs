@@ -124,6 +124,7 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reservation TEXT NOT NULL DEFAULT '';
 pub async fn record_job_start(
     pool: &PgPool,
     job_id: i32,
+    name: &str,
     user: &str,
     account: &str,
     partition: &str,
@@ -137,9 +138,10 @@ pub async fn record_job_start(
     // job_id reuse after a Raft wipe means a conflict is a new, unrelated job.
     sqlx::query(
         r#"
-        INSERT INTO jobs (job_id, user_name, account, partition_name, num_nodes, num_tasks, cpus_per_task, memory_mb, start_time, state, reservation)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'RUNNING', $10)
+        INSERT INTO jobs (job_id, name, user_name, account, partition_name, num_nodes, num_tasks, cpus_per_task, memory_mb, start_time, state, reservation)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'RUNNING', $11)
         ON CONFLICT (job_id) DO UPDATE SET
+            name = EXCLUDED.name,
             user_name = EXCLUDED.user_name,
             account = EXCLUDED.account,
             partition_name = EXCLUDED.partition_name,
@@ -156,6 +158,7 @@ pub async fn record_job_start(
         "#,
     )
     .bind(job_id)
+    .bind(name)
     .bind(user)
     .bind(account)
     .bind(partition)
@@ -718,6 +721,7 @@ mod job_history_tests {
         record_job_start(
             &pool,
             id0,
+            "job-a",
             &user_a,
             &account_one,
             "debug",
@@ -734,6 +738,7 @@ mod job_history_tests {
         record_job_start(
             &pool,
             id1,
+            "job-b",
             &user_b,
             &account_one,
             "debug",
@@ -750,6 +755,7 @@ mod job_history_tests {
         record_job_start(
             &pool,
             id2,
+            "job-c",
             &user_a,
             &account_two,
             "debug",
@@ -824,17 +830,24 @@ mod job_history_tests {
         delete_jobs(&pool, &[id]).await.ok();
 
         let t1 = Utc::now() - Duration::hours(2);
-        record_job_start(&pool, id, "root", "acct-old", "debug", 2, 4, 2, 8192, t1).await?;
+        record_job_start(
+            &pool, id, "old-job", "root", "acct-old", "debug", 2, 4, 2, 8192, t1, "",
+        )
+        .await?;
         record_job_end(&pool, id, "FAILED", 137, t1 + Duration::minutes(5), 9, 137).await?;
 
         let t2 = Utc::now() - Duration::hours(1);
-        record_job_start(&pool, id, "vm", "acct-new", "gpu", 1, 1, 1, 1024, t2).await?;
+        record_job_start(
+            &pool, id, "new-job", "vm", "acct-new", "gpu", 1, 1, 1, 1024, t2, "",
+        )
+        .await?;
 
         let history = get_job_history(&pool, None, None, None, None, &[], 100)
             .await?
             .into_iter()
             .find(|r| r.job_id == id)
             .expect("reused job_id should still be queryable");
+        assert_eq!(history.name, "new-job");
         assert_eq!(history.user_name, "vm");
         assert_eq!(history.account, "acct-new");
         assert_eq!(history.partition, "gpu");
