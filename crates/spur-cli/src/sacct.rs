@@ -96,7 +96,6 @@ pub fn sacct_header(spec: char) -> &'static str {
     }
 }
 
-/// Maps a sacct `--format` field name to its internal spec char.
 fn sacct_field_spec(name: &str) -> Option<char> {
     match name.to_lowercase().as_str() {
         "jobid" => Some('i'),
@@ -392,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn sacct_field_spec_is_case_insensitive_and_round_trips_header() {
+    fn sacct_field_spec_is_case_insensitive_and_rejects_unknown_names() {
         for name in ["JobID", "jobid", "JOBID"] {
             assert_eq!(sacct_field_spec(name), Some('i'));
         }

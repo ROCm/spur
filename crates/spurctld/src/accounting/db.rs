@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use chrono::{DateTime, Utc};
+use sqlx::postgres::PgRow;
 use sqlx::{PgPool, QueryBuilder, Row};
 
 /// Run database migrations (create tables if they don't exist).
@@ -200,7 +201,11 @@ pub async fn record_job_end(
     exit_signal: i32,
     derived_exit_code: i32,
 ) -> anyhow::Result<()> {
-    sqlx::query(
+    // RETURNING folds the read into the same upsert statement, so a job_id
+    // reused by a concurrent record_job_start can't slip stale field values
+    // into the usage row computed below. ON CONFLICT still tolerates end
+    // arriving before start (see the start_time null-check in update_usage).
+    let row = sqlx::query(
         r#"
         INSERT INTO jobs (job_id, user_name, state, exit_code, end_time, exit_signal, derived_exit_code)
         VALUES ($1, '', $2, $3, $4, $5, $6)
@@ -210,6 +215,7 @@ pub async fn record_job_end(
             end_time = $4,
             exit_signal = $5,
             derived_exit_code = $6
+        RETURNING user_name, account, start_time, num_tasks, cpus_per_task
         "#,
     )
     .bind(job_id)
@@ -218,27 +224,16 @@ pub async fn record_job_end(
     .bind(end_time)
     .bind(exit_signal)
     .bind(derived_exit_code)
-    .execute(pool)
+    .fetch_one(pool)
     .await?;
 
-    update_usage(pool, job_id, end_time).await?;
+    update_usage(pool, row, end_time).await?;
 
     Ok(())
 }
 
-/// Update usage accounting for a completed job.
-async fn update_usage(pool: &PgPool, job_id: i32, end_time: DateTime<Utc>) -> anyhow::Result<()> {
-    let row = sqlx::query(
-        "SELECT user_name, account, start_time, num_tasks, cpus_per_task FROM jobs WHERE job_id = $1",
-    )
-    .bind(job_id)
-    .fetch_optional(pool)
-    .await?;
-
-    let Some(row) = row else {
-        return Ok(());
-    };
-
+/// Update usage accounting for a completed job, from the row `record_job_end` just wrote.
+async fn update_usage(pool: &PgPool, row: PgRow, end_time: DateTime<Utc>) -> anyhow::Result<()> {
     let user: String = row.get("user_name");
     let account: String = row.get("account");
     let start_time: Option<DateTime<Utc>> = row.get("start_time");
