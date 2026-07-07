@@ -130,7 +130,11 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     // -o/--format uses Slurm's comma-separated field-name syntax, not %-specifiers.
     let fields = if let Some(ref f) = args.format {
-        format_engine::parse_named_format(f, &sacct_field_spec, &sacct_header)
+        let fields = format_engine::parse_named_format(f, &sacct_field_spec, &sacct_header);
+        if fields.is_empty() {
+            anyhow::bail!("sacct: no recognized fields in --format='{f}'");
+        }
+        fields
     } else if args.long {
         format_engine::parse_format(SACCT_LONG_FORMAT, &sacct_header)
     } else if args.brief {
@@ -412,5 +416,17 @@ mod tests {
         assert!(row.contains("42"));
         assert!(row.contains("train"));
         assert!(row.contains("gpu"));
+    }
+
+    #[tokio::test]
+    async fn format_with_no_recognized_fields_fails_fast() {
+        // Errors before ever connecting, so no server/network is needed here.
+        let err = main_with_args(vec![
+            "sacct".into(),
+            "--format=NotAField,AlsoNotAField".into(),
+        ])
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no recognized fields"));
     }
 }

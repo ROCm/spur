@@ -17,6 +17,7 @@ pub struct JobStartRecord {
     pub num_tasks: u32,
     pub cpus_per_task: u32,
     pub memory_mb: u64,
+    pub submit_time: DateTime<Utc>,
     pub start_time: DateTime<Utc>,
     pub reservation: Option<String>,
 }
@@ -41,6 +42,7 @@ impl AccountingNotifier {
         let num_tasks = record.num_tasks as i32;
         let cpus_per_task = record.cpus_per_task as i32;
         let memory_mb = record.memory_mb as i64;
+        let submit_time = record.submit_time;
         let start_time = record.start_time;
         let reservation = record.reservation.unwrap_or_default();
         tokio::spawn(async move {
@@ -55,6 +57,7 @@ impl AccountingNotifier {
                 num_tasks,
                 cpus_per_task,
                 memory_mb,
+                submit_time,
                 start_time,
                 &reservation,
             )

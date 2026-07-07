@@ -36,6 +36,10 @@ impl SlurmAccounting for AccountingService {
             .start_time
             .map(|t| DateTime::from_timestamp(t.seconds, t.nanos as u32).unwrap_or_default())
             .unwrap_or_else(Utc::now);
+        let submit_time = req
+            .submit_time
+            .map(|t| DateTime::from_timestamp(t.seconds, t.nanos as u32).unwrap_or_default())
+            .unwrap_or(start_time);
 
         let (memory_mb, cpus) = req
             .resources
@@ -54,6 +58,7 @@ impl SlurmAccounting for AccountingService {
             cpus,
             1,
             memory_mb,
+            submit_time,
             start_time,
             &req.reservation,
         )

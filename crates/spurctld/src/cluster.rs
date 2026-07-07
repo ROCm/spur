@@ -516,6 +516,7 @@ impl ClusterManager {
         // Validate job exists and can transition
         let old_state;
         let spec_for_notify;
+        let submit_time_for_notify;
         {
             let jobs = self.jobs.read();
             let job = jobs
@@ -523,6 +524,7 @@ impl ClusterManager {
                 .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
             old_state = job.state;
             spec_for_notify = job.spec.clone();
+            submit_time_for_notify = job.submit_time;
             if job.state != JobState::Pending {
                 anyhow::bail!("job {} cannot start from state {:?}", job_id, job.state);
             }
@@ -586,6 +588,7 @@ impl ClusterManager {
                 num_tasks: spec_for_notify.num_tasks,
                 cpus_per_task: spec_for_notify.cpus_per_task,
                 memory_mb: resources.memory_mb,
+                submit_time: submit_time_for_notify,
                 start_time: Utc::now(),
                 reservation: spec_for_notify.reservation.clone(),
             });

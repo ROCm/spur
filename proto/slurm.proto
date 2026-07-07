@@ -706,6 +706,7 @@ message RecordJobStartRequest {
   google.protobuf.Timestamp start_time = 6;
   string reservation = 7;
   string name = 8;
+  google.protobuf.Timestamp submit_time = 9;
 }
 
 message RecordJobEndRequest {

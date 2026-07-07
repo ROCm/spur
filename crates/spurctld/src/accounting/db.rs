@@ -132,14 +132,15 @@ pub async fn record_job_start(
     num_tasks: i32,
     cpus_per_task: i32,
     memory_mb: i64,
+    submit_time: DateTime<Utc>,
     start_time: DateTime<Utc>,
     reservation: &str,
 ) -> anyhow::Result<()> {
     // job_id reuse after a Raft wipe means a conflict is a new, unrelated job.
     sqlx::query(
         r#"
-        INSERT INTO jobs (job_id, name, user_name, account, partition_name, num_nodes, num_tasks, cpus_per_task, memory_mb, start_time, state, reservation)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'RUNNING', $11)
+        INSERT INTO jobs (job_id, name, user_name, account, partition_name, num_nodes, num_tasks, cpus_per_task, memory_mb, submit_time, start_time, state, reservation)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'RUNNING', $12)
         ON CONFLICT (job_id) DO UPDATE SET
             name = EXCLUDED.name,
             user_name = EXCLUDED.user_name,
@@ -149,6 +150,7 @@ pub async fn record_job_start(
             num_tasks = EXCLUDED.num_tasks,
             cpus_per_task = EXCLUDED.cpus_per_task,
             memory_mb = EXCLUDED.memory_mb,
+            submit_time = EXCLUDED.submit_time,
             start_time = EXCLUDED.start_time,
             state = EXCLUDED.state,
             exit_code = 0,
@@ -166,6 +168,7 @@ pub async fn record_job_start(
     .bind(num_tasks)
     .bind(cpus_per_task)
     .bind(memory_mb)
+    .bind(submit_time)
     .bind(start_time)
     .bind(reservation)
     .execute(pool)
@@ -730,6 +733,7 @@ mod job_history_tests {
             1,
             0,
             t1,
+            t1,
             "",
         )
         .await?;
@@ -747,6 +751,7 @@ mod job_history_tests {
             1,
             0,
             t1,
+            t1,
             "",
         )
         .await?;
@@ -763,6 +768,7 @@ mod job_history_tests {
             1,
             1,
             0,
+            t2,
             t2,
             "",
         )
@@ -829,16 +835,27 @@ mod job_history_tests {
         let id = test_job_id(3);
         delete_jobs(&pool, &[id]).await.ok();
 
-        let t1 = Utc::now() - Duration::hours(2);
+        let submit1 = Utc::now() - Duration::hours(3);
+        let start1 = Utc::now() - Duration::hours(2);
         record_job_start(
-            &pool, id, "old-job", "root", "acct-old", "debug", 2, 4, 2, 8192, t1, "",
+            &pool, id, "old-job", "root", "acct-old", "debug", 2, 4, 2, 8192, submit1, start1, "",
         )
         .await?;
-        record_job_end(&pool, id, "FAILED", 137, t1 + Duration::minutes(5), 9, 137).await?;
+        record_job_end(
+            &pool,
+            id,
+            "FAILED",
+            137,
+            start1 + Duration::minutes(5),
+            9,
+            137,
+        )
+        .await?;
 
-        let t2 = Utc::now() - Duration::hours(1);
+        let submit2 = Utc::now() - Duration::minutes(90);
+        let start2 = Utc::now() - Duration::hours(1);
         record_job_start(
-            &pool, id, "new-job", "vm", "acct-new", "gpu", 1, 1, 1, 1024, t2, "",
+            &pool, id, "new-job", "vm", "acct-new", "gpu", 1, 1, 1, 1024, submit2, start2, "",
         )
         .await?;
 
@@ -856,6 +873,11 @@ mod job_history_tests {
         assert_eq!(history.exit_signal, 0);
         assert_eq!(history.derived_exit_code, 0);
         assert!(history.end_time.is_none());
+        assert_eq!(
+            history.submit_time.timestamp(),
+            submit2.timestamp(),
+            "submit_time must not carry over from the previous job"
+        );
 
         delete_jobs(&pool, &[id]).await?;
         Ok(())
