@@ -111,8 +111,7 @@ pub fn parse_format(fmt: &str, header_map: &dyn Fn(char) -> &'static str) -> Vec
     fields
 }
 
-/// Parse sacct/sreport-style comma-separated field names (e.g.
-/// `JobID,JobName%-20,Elapsed`), unlike squeue/sinfo's `%`-specifier syntax.
+/// Parse sacct/sreport-style comma-separated field names, unlike squeue/sinfo's `%`-specifiers.
 pub fn parse_named_format(
     fmt: &str,
     name_to_spec: &dyn Fn(&str) -> Option<char>,

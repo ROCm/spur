@@ -201,10 +201,7 @@ pub async fn record_job_end(
     exit_signal: i32,
     derived_exit_code: i32,
 ) -> anyhow::Result<()> {
-    // RETURNING folds the read into the same upsert statement, so a job_id
-    // reused by a concurrent record_job_start can't slip stale field values
-    // into the usage row computed below. ON CONFLICT still tolerates end
-    // arriving before start (see the start_time null-check in update_usage).
+    // RETURNING closes the record_job_start job_id-reuse race by reading in the same statement.
     let row = sqlx::query(
         r#"
         INSERT INTO jobs (job_id, user_name, state, exit_code, end_time, exit_signal, derived_exit_code)
