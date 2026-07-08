@@ -42,9 +42,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = SmdArgs::try_parse_from(&args)?;
 
     loop {
-        let mut client = SlurmControllerClient::connect(args.controller.clone())
+        let channel = spur_client::connect_channel(&args.controller)
             .await
             .context("failed to connect to spurctld")?;
+        let mut client = SlurmControllerClient::new(channel);
 
         let nodes = client
             .get_nodes(GetNodesRequest {

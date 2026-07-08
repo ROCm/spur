@@ -67,9 +67,8 @@ pub extern "C" fn slurm_submit_batch_job(
         use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
         use spur_proto::proto::{JobSpec, SubmitJobRequest};
 
-        let mut client = SlurmControllerClient::connect(controller_addr().to_string())
-            .await
-            .ok()?;
+        let channel = spur_client::connect_channel(controller_addr()).await.ok()?;
+        let mut client = SlurmControllerClient::new(channel);
 
         let spec = JobSpec {
             name: c_str_to_string(desc.name),
@@ -126,9 +125,8 @@ pub extern "C" fn slurm_load_jobs(
         use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
         use spur_proto::proto::GetJobsRequest;
 
-        let mut client = SlurmControllerClient::connect(controller_addr().to_string())
-            .await
-            .ok()?;
+        let channel = spur_client::connect_channel(controller_addr()).await.ok()?;
+        let mut client = SlurmControllerClient::new(channel);
 
         let resp = client.get_jobs(GetJobsRequest::default()).await.ok()?;
 
@@ -204,9 +202,8 @@ pub extern "C" fn slurm_load_node(
         use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
         use spur_proto::proto::GetNodesRequest;
 
-        let mut client = SlurmControllerClient::connect(controller_addr().to_string())
-            .await
-            .ok()?;
+        let channel = spur_client::connect_channel(controller_addr()).await.ok()?;
+        let mut client = SlurmControllerClient::new(channel);
 
         let resp = client.get_nodes(GetNodesRequest::default()).await.ok()?;
 
@@ -258,9 +255,8 @@ pub extern "C" fn slurm_load_partitions(
         use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
         use spur_proto::proto::GetPartitionsRequest;
 
-        let mut client = SlurmControllerClient::connect(controller_addr().to_string())
-            .await
-            .ok()?;
+        let channel = spur_client::connect_channel(controller_addr()).await.ok()?;
+        let mut client = SlurmControllerClient::new(channel);
 
         let resp = client
             .get_partitions(GetPartitionsRequest::default())
@@ -305,9 +301,8 @@ pub extern "C" fn slurm_kill_job(job_id: c_uint, signal: u16, _flags: u16) -> c_
         use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
         use spur_proto::proto::CancelJobRequest;
 
-        let mut client = SlurmControllerClient::connect(controller_addr().to_string())
-            .await
-            .ok()?;
+        let channel = spur_client::connect_channel(controller_addr()).await.ok()?;
+        let mut client = SlurmControllerClient::new(channel);
 
         client
             .cancel_job(CancelJobRequest {

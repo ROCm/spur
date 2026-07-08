@@ -73,7 +73,7 @@ fn parse_ttl(s: &str) -> Result<u32> {
 async fn cmd_create(controller: &str, ttl: Option<String>) -> Result<()> {
     let ttl_secs = ttl.map(|t| parse_ttl(&t)).transpose()?;
 
-    let mut client = SlurmControllerClient::connect(controller.to_string()).await?;
+    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
     let resp = client.create_token(CreateTokenRequest { ttl_secs }).await?;
 
     let inner = resp.into_inner();
@@ -83,7 +83,7 @@ async fn cmd_create(controller: &str, ttl: Option<String>) -> Result<()> {
 }
 
 async fn cmd_list(controller: &str) -> Result<()> {
-    let mut client = SlurmControllerClient::connect(controller.to_string()).await?;
+    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
     let resp = client.list_tokens(ListTokensRequest {}).await?;
     let tokens = resp.into_inner().tokens;
 
@@ -109,7 +109,7 @@ async fn cmd_list(controller: &str) -> Result<()> {
 }
 
 async fn cmd_revoke(controller: &str, token_id: &str) -> Result<()> {
-    let mut client = SlurmControllerClient::connect(controller.to_string()).await?;
+    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
     client
         .revoke_token(RevokeTokenRequest {
             token_id: token_id.to_string(),

@@ -56,6 +56,14 @@ pub struct SallocArgs {
     #[arg(short = 'C', long)]
     pub constraint: Option<String>,
 
+    /// Node list
+    #[arg(short = 'w', long)]
+    pub nodelist: Option<String>,
+
+    /// Exclude nodes
+    #[arg(short = 'x', long)]
+    pub exclude: Option<String>,
+
     /// Target a named reservation
     #[arg(long)]
     pub reservation: Option<String>,
@@ -103,15 +111,18 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let controller = args.controller.clone();
     let exclusive = args.exclusive;
     let constraint = args.constraint;
+    let nodelist = args.nodelist;
+    let exclude = args.exclude;
     let reservation = args.reservation;
     let partition = args.partition;
     let account = args.account;
     let ntasks = args.ntasks;
     let cpus_per_task = args.cpus_per_task;
 
-    let mut client = SlurmControllerClient::connect(controller)
+    let channel = spur_client::connect_channel(&controller)
         .await
         .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
 
     // Submit interactive allocation (sleep infinity holds the allocation)
     let job_spec = JobSpec {
@@ -130,6 +141,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         time_limit,
         exclusive,
         constraint: constraint.unwrap_or_default(),
+        nodelist: nodelist.unwrap_or_default(),
+        exclude: exclude.unwrap_or_default(),
         reservation: reservation.unwrap_or_default(),
         interactive: true,
         environment: HashMap::new(),
@@ -272,5 +285,27 @@ fn parse_memory_mb(s: &str) -> Result<u64> {
         Ok(mb.parse().context("invalid memory value")?)
     } else {
         Ok(s.parse().context("invalid memory value")?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_nodelist_and_exclude_short() {
+        let args = SallocArgs::try_parse_from(["salloc", "-w", "node001,node002", "-x", "node003"])
+            .expect("parse failed");
+        assert_eq!(args.nodelist.as_deref(), Some("node001,node002"));
+        assert_eq!(args.exclude.as_deref(), Some("node003"));
+    }
+
+    #[test]
+    fn parses_nodelist_and_exclude_long() {
+        let args =
+            SallocArgs::try_parse_from(["salloc", "--nodelist", "node001", "--exclude", "node002"])
+                .expect("parse failed");
+        assert_eq!(args.nodelist.as_deref(), Some("node001"));
+        assert_eq!(args.exclude.as_deref(), Some("node002"));
     }
 }

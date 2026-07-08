@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 spur-proto = { path = "../spur-proto" }
+spur-client = { path = "../spur-client" }
 spur-core = { path = "../spur-core" }
 spur-update = { path = "../spur-update" }
 spur-net = { path = "../spur-net" }

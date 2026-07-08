@@ -269,8 +269,39 @@ pub struct SbatchArgs {
     )]
     pub controller: String,
 
+    /// Wrap the given command in a minimal shell script (mutually exclusive with a script file)
+    #[arg(long, conflicts_with = "script")]
+    pub wrap: Option<String>,
+
     /// The batch script file
     pub script: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+enum BodySource {
+    Wrap(String),
+    File(String),
+    Stdin,
+}
+
+/// Decide where the batch script body comes from.
+///
+/// `--wrap` wins; else a script file; else stdin (when piped); else error.
+fn choose_body_source(
+    wrap: Option<String>,
+    script: Option<String>,
+    stdin_is_terminal: bool,
+) -> Result<BodySource> {
+    match (wrap, script) {
+        (Some(cmd), _) => Ok(BodySource::Wrap(cmd)),
+        (None, Some(path)) => Ok(BodySource::File(path)),
+        (None, None) if stdin_is_terminal => bail!("sbatch: no script file specified"),
+        (None, None) => Ok(BodySource::Stdin),
+    }
+}
+
+fn wrap_command_body(cmd: &str) -> String {
+    format!("#!/bin/sh\n# This script was created by sbatch --wrap.\n\n{cmd}\n")
 }
 
 /// Parse #SBATCH directives from a script, returning them as argv-style strings.
@@ -601,34 +632,54 @@ pub async fn main() -> Result<()> {
     main_with_args(std::env::args().collect()).await
 }
 
+/// The token to treat as a batch script path for `#SBATCH` pre-parsing, if any.
+/// Returns `None` when `--wrap` is used (wrap has no script file) or when the
+/// last token is a flag / the `sbatch` argv[0].
+fn candidate_script_path(cli_args: &[String]) -> Option<&str> {
+    if cli_args
+        .iter()
+        .any(|a| a == "--wrap" || a.starts_with("--wrap="))
+    {
+        return None;
+    }
+    match cli_args.last() {
+        Some(last) if !last.starts_with('-') && last != "sbatch" => Some(last.as_str()),
+        _ => None,
+    }
+}
+
+/// Default job name: explicit `-J`, else `"wrap"` for wrap-mode, else the
+/// script filename, else `"sbatch"` (stdin).
+fn default_job_name(job_name: Option<&str>, script: Option<&str>, is_wrap: bool) -> String {
+    if let Some(name) = job_name {
+        return name.to_string();
+    }
+    if is_wrap {
+        return "wrap".to_string();
+    }
+    script.unwrap_or("sbatch").to_string()
+}
+
 pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
-    // If script is provided, parse directives from it
-    let script_content = if let Some(script_path) = cli_args.last() {
-        if !script_path.starts_with('-') && script_path != "sbatch" {
-            std::fs::read_to_string(script_path).ok()
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let script_content =
+        candidate_script_path(&cli_args).and_then(|p| std::fs::read_to_string(p).ok());
 
     let directive_args = script_content
         .as_deref()
         .map(parse_sbatch_directives)
         .unwrap_or_default();
 
-    let args = resolve_sbatch_args(&directive_args, &cli_args)?;
+    let mut args = resolve_sbatch_args(&directive_args, &cli_args)?;
 
     // Build the job spec
-    let script = match &args.script {
-        Some(path) => std::fs::read_to_string(path)
+    let is_wrap = args.wrap.is_some();
+    let stdin_is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let script = match choose_body_source(args.wrap.take(), args.script.clone(), stdin_is_terminal)?
+    {
+        BodySource::Wrap(cmd) => wrap_command_body(&cmd),
+        BodySource::File(path) => std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read script: {}", path))?,
-        None => {
-            if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                bail!("sbatch: no script file specified");
-            }
-            // Read from stdin
+        BodySource::Stdin => {
             let mut buf = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
             buf
@@ -639,9 +690,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         .chdir
         .unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().into());
 
-    let name = args
-        .job_name
-        .unwrap_or_else(|| args.script.as_deref().unwrap_or("sbatch").to_string());
+    let name = default_job_name(args.job_name.as_deref(), args.script.as_deref(), is_wrap);
 
     // Build GRES list
     let mut gres = args.gres;
@@ -781,9 +830,10 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
     };
 
     // Submit to controller
-    let mut client = SlurmControllerClient::connect(args.controller)
+    let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
 
     let response = client
         .submit_job(SubmitJobRequest {
@@ -1057,10 +1107,145 @@ echo "hello world"
     #[test]
     #[serial(env_injection)]
     fn test_cli_gres_replaces_directive_and_ignores_env() {
-        // CLI --gres wins over both the directive and SBATCH_GRES.
         let env = SbatchEnvGuard::new();
         env.set("SBATCH_GRES", "gpu:1");
         let args = parse_merged(&["--gres=gpu:mi300x:8"], &["sbatch", "--gres=gpu:2"]);
         assert_eq!(args.gres, vec!["gpu:2"]);
+    }
+
+    // --- sbatch --wrap ---
+
+    #[test]
+    fn test_wrap_command_body_matches_slurm() {
+        assert_eq!(
+            wrap_command_body("echo hi"),
+            "#!/bin/sh\n# This script was created by sbatch --wrap.\n\necho hi\n"
+        );
+    }
+
+    #[test]
+    fn test_choose_body_source_wrap_wins() {
+        assert_eq!(
+            choose_body_source(Some("srun x".into()), None, true).unwrap(),
+            BodySource::Wrap("srun x".into())
+        );
+    }
+
+    #[test]
+    fn test_choose_body_source_file() {
+        assert_eq!(
+            choose_body_source(None, Some("job.sh".into()), true).unwrap(),
+            BodySource::File("job.sh".into())
+        );
+    }
+
+    #[test]
+    fn test_choose_body_source_stdin_when_piped() {
+        assert_eq!(
+            choose_body_source(None, None, false).unwrap(),
+            BodySource::Stdin
+        );
+    }
+
+    #[test]
+    fn test_choose_body_source_errors_on_tty_with_no_input() {
+        assert!(choose_body_source(None, None, true).is_err());
+    }
+
+    #[test]
+    fn test_wrap_conflicts_with_script() {
+        let res = SbatchArgs::try_parse_from(["sbatch", "--wrap=echo hi", "job.sh"]);
+        assert!(res.is_err(), "--wrap and a script file must conflict");
+    }
+
+    #[test]
+    fn test_candidate_script_path_normal() {
+        let args: Vec<String> = vec!["sbatch", "job.sh"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert_eq!(candidate_script_path(&args), Some("job.sh"));
+    }
+
+    #[test]
+    fn test_candidate_script_path_wrap_flag() {
+        let args: Vec<String> = vec!["sbatch", "--wrap", "run.sh"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert_eq!(candidate_script_path(&args), None);
+    }
+
+    #[test]
+    fn test_candidate_script_path_wrap_equals() {
+        let args: Vec<String> = vec!["sbatch", "--wrap=echo hi"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert_eq!(candidate_script_path(&args), None);
+    }
+
+    #[test]
+    fn test_candidate_script_path_trailing_flag() {
+        let args: Vec<String> = vec!["sbatch", "--nodes=2"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert_eq!(candidate_script_path(&args), None);
+    }
+
+    #[test]
+    fn test_candidate_script_path_bare_sbatch() {
+        let args: Vec<String> = vec!["sbatch"].into_iter().map(Into::into).collect();
+        assert_eq!(candidate_script_path(&args), None);
+    }
+
+    #[test]
+    fn test_default_job_name_stdin() {
+        assert_eq!(default_job_name(None, None, false), "sbatch");
+    }
+
+    #[test]
+    fn test_default_job_name_wrap() {
+        assert_eq!(default_job_name(None, None, true), "wrap");
+    }
+
+    #[test]
+    fn test_default_job_name_explicit() {
+        assert_eq!(default_job_name(Some("mine"), None, false), "mine");
+    }
+
+    #[test]
+    fn test_default_job_name_explicit_overrides_wrap() {
+        assert_eq!(default_job_name(Some("mine"), None, true), "mine");
+    }
+
+    #[test]
+    fn test_default_job_name_from_script() {
+        assert_eq!(default_job_name(None, Some("job.sh"), false), "job.sh");
+    }
+
+    #[test]
+    fn test_default_job_name_explicit_overrides_script() {
+        assert_eq!(
+            default_job_name(Some("mine"), Some("job.sh"), false),
+            "mine"
+        );
+    }
+
+    #[test]
+    fn test_wrap_job_name_override() {
+        let args = SbatchArgs::try_parse_from(["sbatch", "-J", "mine", "--wrap=echo hi"]).unwrap();
+        assert_eq!(args.job_name.as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn test_wrap_string_not_parsed_for_directives() {
+        let directives = parse_sbatch_directives("#SBATCH --nodes=9\n");
+        assert_eq!(directives, vec!["--nodes=9"]);
+        assert_eq!(
+            wrap_command_body("#SBATCH --nodes=9"),
+            "#!/bin/sh\n# This script was created by sbatch --wrap.\n\n#SBATCH --nodes=9\n"
+        );
     }
 }

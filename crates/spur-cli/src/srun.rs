@@ -77,6 +77,14 @@ pub struct SrunArgs {
     #[arg(short = 'C', long)]
     pub constraint: Option<String>,
 
+    /// Node list
+    #[arg(short = 'w', long)]
+    pub nodelist: Option<String>,
+
+    /// Exclude nodes
+    #[arg(short = 'x', long)]
+    pub exclude: Option<String>,
+
     /// Target a named reservation
     #[arg(long)]
     pub reservation: Option<String>,
@@ -218,9 +226,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .unwrap_or(0);
 
     // Submit as a batch job
-    let mut client = SlurmControllerClient::connect(args.controller.clone())
+    let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
 
     let job_spec = JobSpec {
         name,
@@ -239,6 +248,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         environment,
         time_limit,
         constraint: args.constraint.unwrap_or_default(),
+        nodelist: args.nodelist.unwrap_or_default(),
+        exclude: args.exclude.unwrap_or_default(),
         reservation: args.reservation.unwrap_or_default(),
         mpi: args.mpi,
         container_image: args.container_image.unwrap_or_default(),
@@ -537,9 +548,10 @@ async fn run_as_step(
 ) -> Result<()> {
     use spur_proto::proto::RunStepRequest;
 
-    let mut client = SlurmControllerClient::connect(args.controller.clone())
+    let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
 
     // Create a step on the controller for tracking; capture the assigned
     // step_id so the completion (and thus DerivedExitCode) records against it.
@@ -628,5 +640,40 @@ fn srun_hook_context(script_context: &str, work_dir: &str) -> spur_core::hooks::
         gpu_devices: Vec::new(),
         cpus: 1,
         memory_mb: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_nodelist_and_exclude_short() {
+        let args = SrunArgs::try_parse_from([
+            "srun",
+            "-w",
+            "node001,node002",
+            "-x",
+            "node003",
+            "hostname",
+        ])
+        .expect("parse failed");
+        assert_eq!(args.nodelist.as_deref(), Some("node001,node002"));
+        assert_eq!(args.exclude.as_deref(), Some("node003"));
+    }
+
+    #[test]
+    fn parses_nodelist_and_exclude_long() {
+        let args = SrunArgs::try_parse_from([
+            "srun",
+            "--nodelist",
+            "node001",
+            "--exclude",
+            "node002",
+            "hostname",
+        ])
+        .expect("parse failed");
+        assert_eq!(args.nodelist.as_deref(), Some("node001"));
+        assert_eq!(args.exclude.as_deref(), Some("node002"));
     }
 }

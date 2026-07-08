@@ -49,21 +49,10 @@ fn load_controller_addr_from_config() {
     }
 
     if let Ok(config) = spur_core::config::SlurmConfig::load_from_file(&config_path) {
-        // Extract host and port from the config
-        let host = config
-            .controller
-            .hosts
-            .first()
-            .map(|h| h.as_str())
-            .unwrap_or("localhost");
-        let port = config
-            .controller
-            .listen_addr
-            .rsplit(':')
-            .next()
-            .unwrap_or("6817");
-        let addr = format!("http://{}:{}", host, port);
-        std::env::set_var("SPUR_CONTROLLER_ADDR", &addr);
+        let endpoints = config.controller.endpoints();
+        if !endpoints.is_empty() {
+            std::env::set_var("SPUR_CONTROLLER_ADDR", endpoints.join(","));
+        }
     }
 }
 

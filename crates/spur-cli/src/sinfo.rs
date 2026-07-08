@@ -70,9 +70,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     let fields = format_engine::parse_format(&fmt, &format_engine::sinfo_header);
 
-    let mut client = SlurmControllerClient::connect(args.controller)
+    let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
 
     // Get partitions
     let partitions_resp = client

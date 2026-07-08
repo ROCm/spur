@@ -3476,6 +3476,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "spur-client",
  "spur-core",
  "spur-net",
  "spur-proto",
@@ -3486,6 +3487,17 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "whoami",
+]
+
+[[package]]
+name = "spur-client"
+version = "0.3.0"
+dependencies = [
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-health",
+ "tracing",
 ]
 
 [[package]]
@@ -3535,6 +3547,7 @@ name = "spur-ffi"
 version = "0.3.0"
 dependencies = [
  "prost-types",
+ "spur-client",
  "spur-core",
  "spur-proto",
  "tokio",
@@ -3713,6 +3726,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shlex",
+ "spur-client",
  "spur-core",
  "spur-devices",
  "spur-net",
@@ -4023,7 +4037,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -4186,6 +4200,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -4304,6 +4319,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "tonic-health"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fcfab99db777fba2802f0dfa861d1628d1ae916fb199d29819941f139ae85082"
+dependencies = [
+ "prost",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
 ]
 
 [[package]]

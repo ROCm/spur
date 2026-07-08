@@ -344,17 +344,12 @@ async fn report_completion(
     // RaisedSignal outcome from the reported `signal`.
     let state = spur_core::job::JobState::completion_state_for_exit_code(exit_code).to_proto_i32();
 
-    let url = if controller_addr.starts_with("http") {
-        controller_addr.to_string()
-    } else {
-        format!("http://{}", controller_addr)
-    };
-
     // Retry up to 3 times with 1-second backoff — a single transient failure
     // must not permanently lose a job completion.
     for attempt in 1..=3 {
-        match SlurmControllerClient::connect(url.clone()).await {
-            Ok(mut client) => {
+        match spur_client::connect_channel(controller_addr).await {
+            Ok(channel) => {
+                let mut client = SlurmControllerClient::new(channel);
                 let req = ReportJobStatusRequest {
                     job_id,
                     state,
@@ -370,7 +365,7 @@ async fn report_completion(
                         info!(
                             job_id,
                             exit_code,
-                            controller = %url,
+                            controller = %controller_addr,
                             "reported completion to controller"
                         );
                         return;

@@ -47,9 +47,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .and_then(|s| s.parse().ok())
         .context("sattach: invalid job ID format (expected JOB_ID or JOB_ID.STEP_ID)")?;
 
-    let mut client = SlurmControllerClient::connect(args.controller)
+    let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
 
     // Look up the job to find which node it is running on
     let job = client

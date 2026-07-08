@@ -38,9 +38,10 @@ pub async fn main() -> Result<()> {
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = ExecArgs::try_parse_from(&args)?;
 
-    let mut client = SlurmControllerClient::connect(args.controller.clone())
+    let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to controller")?;
+    let mut client = SlurmControllerClient::new(channel);
 
     let resp = client
         .exec_in_job(ExecInJobRequest {

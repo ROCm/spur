@@ -49,9 +49,10 @@ impl NodeReporter {
 
     /// Register with the controller.
     pub async fn register(&self) -> anyhow::Result<()> {
-        let mut client = SlurmControllerClient::connect(self.controller_addr.clone())
+        let channel = spur_client::connect_channel(&self.controller_addr)
             .await
             .context("failed to connect to spurctld for registration")?;
+        let mut client = SlurmControllerClient::new(channel);
 
         let resp = client
             .register_agent(RegisterAgentRequest {
@@ -83,9 +84,10 @@ impl NodeReporter {
     /// Notify the controller that this agent is shutting down.
     pub async fn deregister(&self, reason: &str) -> anyhow::Result<()> {
         let current_token = self.node_token.read().unwrap().clone();
-        let mut client = SlurmControllerClient::connect(self.controller_addr.clone())
+        let channel = spur_client::connect_channel(&self.controller_addr)
             .await
             .context("failed to connect to spurctld for deregistration")?;
+        let mut client = SlurmControllerClient::new(channel);
 
         client
             .deregister_agent(spur_proto::proto::DeregisterAgentRequest {
@@ -112,8 +114,9 @@ impl NodeReporter {
             self.free_memory_mb.store(free_mem, Ordering::Relaxed);
             let current_token = self.node_token.read().unwrap().clone();
 
-            match SlurmControllerClient::connect(self.controller_addr.clone()).await {
-                Ok(mut client) => {
+            match spur_client::connect_channel(&self.controller_addr).await {
+                Ok(channel) => {
+                    let mut client = SlurmControllerClient::new(channel);
                     match client
                         .heartbeat(spur_proto::proto::HeartbeatRequest {
                             hostname: self.hostname.clone(),

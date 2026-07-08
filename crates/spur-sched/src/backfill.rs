@@ -1,10 +1,10 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{Duration, Utc};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use spur_core::job::{Job, JobId};
 use spur_core::node::Node;
@@ -70,32 +70,30 @@ impl BackfillScheduler {
         let required = job_resource_request(job);
 
         // Parse nodelist / exclude constraints once, outside the per-node loop.
-        let nodelist: Option<Vec<&str>> = job
+        let nodelist: Option<HashSet<String>> = job
             .spec
             .nodelist
             .as_deref()
             .filter(|s| !s.is_empty())
-            .map(|s| s.split(',').map(str::trim).collect());
+            .map(|s| HashSet::from_iter(expand_hostlist_or_split(s)));
 
-        let exclude: Vec<&str> = job
+        let exclude: HashSet<String> = job
             .spec
             .exclude
             .as_deref()
-            .map(|s| s.split(',').map(str::trim).collect())
+            .map(|s| HashSet::from_iter(expand_hostlist_or_split(s)))
             .unwrap_or_default();
 
         nodes
             .iter()
             .enumerate()
             .filter(|(_, node)| {
-                // Honour --nodelist: node must be in the explicit allow-list.
                 if let Some(ref allowed) = nodelist {
-                    if !allowed.contains(&node.name.as_str()) {
+                    if !allowed.contains(&node.name) {
                         return false;
                     }
                 }
-                // Honour --exclude: node must not be in the deny-list.
-                if exclude.contains(&node.name.as_str()) {
+                if exclude.contains(&node.name) {
                     return false;
                 }
                 // Check partition membership (comma-separated OR matching)
@@ -403,7 +401,23 @@ impl Scheduler for BackfillScheduler {
     }
 }
 
-/// Extract the per-node resource request from a job spec.
+/// Expand a hostlist pattern (e.g. `node[001-003]`) into individual names.
+/// Falls back to a plain comma-split if the pattern is malformed, so
+/// existing behavior is preserved for simple comma-separated lists.
+fn expand_hostlist_or_split(pattern: &str) -> Vec<String> {
+    match spur_core::hostlist::expand(pattern) {
+        Ok(names) => names,
+        Err(e) => {
+            warn!(
+                pattern,
+                error = %e,
+                "hostlist expansion failed, falling back to comma-split"
+            );
+            pattern.split(',').map(|s| s.trim().to_string()).collect()
+        }
+    }
+}
+
 pub fn job_resource_request(job: &Job) -> ResourceSet {
     let cpus = if job.spec.tasks_per_node.is_some() {
         job.spec.tasks_per_node.unwrap_or(1) * job.spec.cpus_per_task
@@ -874,6 +888,67 @@ mod tests {
 
         let assignments = sched.schedule(&pending, &cluster);
         assert_eq!(assignments.len(), 0);
+    }
+
+    #[test]
+    fn test_nodelist_hostlist_range() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(4);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let pending = vec![make_job_with_nodelist(1, 2, Some("node[001-002]"), None)];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes.len(), 2);
+        assert!(assignments[0].nodes.contains(&"node001".to_string()));
+        assert!(assignments[0].nodes.contains(&"node002".to_string()));
+    }
+
+    #[test]
+    fn test_exclude_hostlist_range() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(4);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let pending = vec![make_job_with_nodelist(1, 2, None, Some("node[001-002]"))];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes.len(), 2);
+        assert!(!assignments[0].nodes.contains(&"node001".to_string()));
+        assert!(!assignments[0].nodes.contains(&"node002".to_string()));
+        assert!(assignments[0].nodes.contains(&"node003".to_string()));
+        assert!(assignments[0].nodes.contains(&"node004".to_string()));
+    }
+
+    #[test]
+    fn test_malformed_hostlist_falls_back_to_comma_split() {
+        // Reversed range is invalid; fallback returns the literal as a single token.
+        let result = expand_hostlist_or_split("node[003-001]");
+        assert_eq!(result, vec!["node[003-001]"]);
+
+        // Plain comma-separated list is not a hostlist pattern; fallback splits correctly.
+        let result = expand_hostlist_or_split("a,b,c");
+        assert_eq!(result, vec!["a", "b", "c"]);
     }
 
     #[test]

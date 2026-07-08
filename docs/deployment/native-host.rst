@@ -131,6 +131,14 @@ Start the agent:
 
 The agent auto-detects CPUs, memory, and GPUs, then registers with the controller over the mesh.
 
+For an HA quorum, pass every controller as a comma-separated list so the agent
+and CLI fail over to a surviving node if one is unreachable. The same format
+works for the ``SPUR_CONTROLLER_ADDR`` environment variable:
+
+.. code-block:: bash
+
+   --controller http://10.44.0.1:6817,http://10.44.0.2:6817,http://10.44.0.3:6817
+
 Repeat for each worker, incrementing the WireGuard address.
 
 Verify:

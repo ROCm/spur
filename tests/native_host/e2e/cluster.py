@@ -324,21 +324,28 @@ class SpurCluster:
 
     # --- CLI wrappers ---
 
-    def cli(self, args: list[str]) -> str:
-        """Run a spur CLI command on the controller node."""
+    def cli(self, args: list[str], controller_addr: str | None = None) -> str:
+        """Run a spur CLI command on the controller node.
+
+        *controller_addr* overrides the endpoint(s) passed via
+        ``SPUR_CONTROLLER_ADDR`` (e.g. a comma-separated failover list).
+        """
         cmd_parts = [
-            f"SPUR_CONTROLLER_ADDR='{self.controller_addr}'",
+            f"SPUR_CONTROLLER_ADDR='{controller_addr or self.controller_addr}'",
             f"PATH='{self.bin_dir}':$PATH",
             f"'{self.bin_dir}/{args[0]}'",
         ]
         cmd_parts.extend(f"'{a}'" for a in args[1:])
         return self.nodes[0].exec(" ".join(cmd_parts))
 
-    def cli_allow_fail(self, args: list[str]) -> str:
+    def cli_allow_fail(self, args: list[str], controller_addr: str | None = None) -> str:
         """Run a spur CLI command, returning stdout+stderr regardless of exit
-        code. Use to assert on expected submission rejections."""
+        code. Use to assert on expected submission rejections.
+
+        *controller_addr* overrides ``SPUR_CONTROLLER_ADDR`` as in :meth:`cli`.
+        """
         cmd_parts = [
-            f"SPUR_CONTROLLER_ADDR='{self.controller_addr}'",
+            f"SPUR_CONTROLLER_ADDR='{controller_addr or self.controller_addr}'",
             f"PATH='{self.bin_dir}':$PATH",
             f"'{self.bin_dir}/{args[0]}'",
         ]

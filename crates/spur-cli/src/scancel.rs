@@ -75,9 +75,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .user
         .unwrap_or_else(|| whoami::username().unwrap_or_else(|_| "unknown".into()));
 
-    let mut client = SlurmControllerClient::connect(args.controller)
+    let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
 
     if !args.job_ids.is_empty() {
         // Cancel specific jobs

@@ -1,0 +1,18 @@
+[package]
+name = "spur-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+tonic = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic-health = "0.14"
+
+[lints]
+workspace = true

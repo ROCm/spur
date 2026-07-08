@@ -331,6 +331,25 @@ impl Default for ControllerConfig {
     }
 }
 
+impl ControllerConfig {
+    /// Client-facing controller endpoints, one per `hosts` entry, each combined
+    /// with the port from `listen_addr`. Used for client-side failover across an
+    /// HA quorum.
+    pub fn endpoints(&self) -> Vec<String> {
+        let port = self.listen_addr.rsplit(':').next().unwrap_or("6817");
+        self.hosts
+            .iter()
+            .map(|host| {
+                if host.contains(':') && !host.starts_with('[') {
+                    format!("http://[{host}]:{port}")
+                } else {
+                    format!("http://{host}:{port}")
+                }
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountingConfig {
     /// Address of the accounting daemon.
@@ -966,6 +985,68 @@ pub fn format_time(total_minutes: Option<u32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_controller_endpoints_single_host() {
+        let cfg = ControllerConfig::default();
+        assert_eq!(cfg.endpoints(), vec!["http://localhost:6817"]);
+    }
+
+    #[test]
+    fn test_controller_endpoints_multi_host() {
+        let cfg = ControllerConfig {
+            listen_addr: "[::]:6817".into(),
+            hosts: vec!["ctrl1".into(), "ctrl2".into(), "ctrl3".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.endpoints(),
+            vec![
+                "http://ctrl1:6817",
+                "http://ctrl2:6817",
+                "http://ctrl3:6817"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_controller_endpoints_custom_port() {
+        let cfg = ControllerConfig {
+            listen_addr: "0.0.0.0:7000".into(),
+            hosts: vec!["ctrl1".into()],
+            ..Default::default()
+        };
+        assert_eq!(cfg.endpoints(), vec!["http://ctrl1:7000"]);
+    }
+
+    #[test]
+    fn test_controller_endpoints_empty_hosts() {
+        let cfg = ControllerConfig {
+            hosts: vec![],
+            ..Default::default()
+        };
+        assert!(cfg.endpoints().is_empty());
+    }
+
+    #[test]
+    fn test_controller_endpoints_ipv6_host_bracketed() {
+        let cfg = ControllerConfig {
+            listen_addr: "[::]:6817".into(),
+            hosts: vec!["::1".into()],
+            ..Default::default()
+        };
+        assert_eq!(cfg.endpoints(), vec!["http://[::1]:6817"]);
+    }
+
+    #[test]
+    fn test_controller_endpoints_ipv6_already_bracketed() {
+        let cfg = ControllerConfig {
+            listen_addr: "[::]:6817".into(),
+            hosts: vec!["[::1]".into()],
+            ..Default::default()
+        };
+        assert_eq!(cfg.endpoints(), vec!["http://[::1]:6817"]);
+    }
 
     #[test]
     fn test_parse_time() {

@@ -11,6 +11,7 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 spur-proto = { path = "../spur-proto" }
+spur-client = { path = "../spur-client" }
 spur-core = { path = "../spur-core" }
 tokio = { workspace = true }
 tonic = { workspace = true }
