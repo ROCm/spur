@@ -25,7 +25,7 @@ use spur_core::wal::WalOperation;
 use spur_metrics::job::JobMetricsSnapshot;
 use spur_metrics::node::NodeMetricsSnapshot;
 
-use crate::accounting::AccountingNotifier;
+use crate::accounting::{AccountingNotifier, JobStartRecord};
 use crate::fairshare_cache::FairshareCache;
 use crate::limits_cache::QosCache;
 use crate::raft::{ClientResponse, JobFinalized, SpurRaft, StateMachineApply};
@@ -540,15 +540,15 @@ impl ClusterManager {
         }
 
         if let Some(ref notifier) = *self.accounting.read() {
-            notifier.notify_job_start(
+            notifier.notify_job_start(JobStartRecord {
                 job_id,
-                spec_for_notify.user.clone(),
-                spec_for_notify.account.clone().unwrap_or_default(),
-                spec_for_notify.partition.clone().unwrap_or_default(),
-                &resources,
-                Utc::now(),
-                spec_for_notify.reservation.clone(),
-            );
+                user: spec_for_notify.user.clone(),
+                account: spec_for_notify.account.clone().unwrap_or_default(),
+                partition: spec_for_notify.partition.clone().unwrap_or_default(),
+                resources: resources.clone(),
+                start_time: Utc::now(),
+                reservation: spec_for_notify.reservation.clone(),
+            });
         }
 
         debug!(job_id, "job started");

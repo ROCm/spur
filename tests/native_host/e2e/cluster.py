@@ -355,6 +355,9 @@ class SpurCluster:
     def sbatch(self, args: list[str]) -> str:
         return self.cli(["sbatch"] + args)
 
+    def squeue(self, args: list[str]) -> str:
+        return self.cli(["squeue"] + args)
+
     def squeue_all(self) -> str:
         return self.cli(["squeue", "-t", "all"])
 

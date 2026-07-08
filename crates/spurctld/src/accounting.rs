@@ -12,6 +12,16 @@ use spur_proto::proto::{RecordJobEndRequest, RecordJobStartRequest};
 
 use crate::server::{allocations_to_proto, datetime_to_proto};
 
+pub struct JobStartRecord {
+    pub job_id: JobId,
+    pub user: String,
+    pub account: String,
+    pub partition: String,
+    pub resources: ResourceAllocations,
+    pub start_time: DateTime<Utc>,
+    pub reservation: Option<String>,
+}
+
 pub struct AccountingNotifier {
     client: SlurmAccountingClient<Channel>,
 }
@@ -27,26 +37,18 @@ impl AccountingNotifier {
         Ok(Self { client })
     }
 
-    pub fn notify_job_start(
-        &self,
-        job_id: JobId,
-        user: String,
-        account: String,
-        partition: String,
-        resources: &ResourceAllocations,
-        start_time: DateTime<Utc>,
-        reservation: Option<String>,
-    ) {
+    pub fn notify_job_start(&self, record: JobStartRecord) {
         let req = RecordJobStartRequest {
-            job_id,
-            user,
-            account,
-            partition,
-            resources: Some(allocations_to_proto(resources)),
-            start_time: Some(datetime_to_proto(start_time)),
-            reservation: reservation.unwrap_or_default(),
+            job_id: record.job_id,
+            user: record.user,
+            account: record.account,
+            partition: record.partition,
+            resources: Some(allocations_to_proto(&record.resources)),
+            start_time: Some(datetime_to_proto(record.start_time)),
+            reservation: record.reservation.unwrap_or_default(),
         };
         let mut client = self.client.clone();
+        let job_id = record.job_id;
         tokio::spawn(async move {
             if let Err(e) = client.record_job_start(req).await {
                 warn!(job_id, error = %e, "failed to record job start in accounting");

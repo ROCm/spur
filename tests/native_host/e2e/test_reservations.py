@@ -55,13 +55,14 @@ class TestReservations:
     def test_reservation_job_schedules_for_authorized_user(self, cluster):
         res_name = f"res-auth-{int(time.time())}"
         node = cluster.node_names[0]
+        submit_user = cluster.nodes[0].user
         cluster.scontrol(
             "create-reservation",
             f"--name={res_name}",
             "--start-time=now",
             "--duration=30",
             f"--nodes={node}",
-            "--users=testuser",
+            f"--users={submit_user}",
         )
 
         script = cluster.write_file("res-auth.sh", "#!/bin/bash\necho RES_OK\n")
@@ -124,7 +125,7 @@ class TestReservations:
         cluster.scontrol("delete-reservation", res_name)
 
         wait_job_state(cluster, job_id, "PD", timeout=30)
-        held = cluster.squeue(["-j", str(job_id), "-o", "%T %r"])
+        held = cluster.squeue(["-j", str(job_id), "-o", "%t %r"])
         assert "PD" in held
         assert "ReservationDeleted" in held
 
@@ -168,7 +169,7 @@ class TestReservations:
         cluster.scontrol("delete-reservation", res_name)
 
         wait_job_state(cluster, job_id, "PD", timeout=30)
-        show = cluster.squeue(["-j", str(job_id), "-o", "%T %r %v"])
+        show = cluster.squeue(["-j", str(job_id), "-o", "%t %r %v"])
         assert "PD" in show
         assert "Held" not in show
         assert res_name not in show
