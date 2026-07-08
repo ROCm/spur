@@ -3916,17 +3916,9 @@ fn apply_default_partition(spec: &mut JobSpec, partitions: &[Partition]) {
     }
 }
 
-/// Resolve a job's effective QOS at submission time, mirroring
-/// `apply_default_partition`: written once into `spec.qos` so every later
-/// reader (`resolve_qos`, `qos_block_for`, display, accounting) sees the
-/// real name with no special-casing, and so the choice is replay-
-/// deterministic (baked into the `JobSpec` the WAL entry carries).
-///
-/// An explicit `--qos` naming a QOS that doesn't exist is rejected outright
-/// — the user asked for something specific and got it wrong. An
-/// association's default that no longer exists (e.g. the QOS was deleted
-/// after being set as a default) degrades silently to no QOS instead,
-/// since that's an admin-configuration issue, not a user submission error.
+/// Resolve a job's effective QOS at submission time (mirrors
+/// `apply_default_partition`). An explicit `--qos` naming an unknown QOS is
+/// rejected; a stale association default degrades silently instead.
 fn apply_default_qos(
     spec: &mut JobSpec,
     assoc_cache: &AssociationCache,
@@ -7113,10 +7105,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn association_default_qos_reaches_real_enforcement() {
-        // End-to-end: an association default isn't just cosmetic — a job
-        // submitted with no --qos inherits it at submission and is then
-        // actually subject to that QOS's limits, exactly as if --qos had
-        // been passed explicitly.
+        // A default isn't just cosmetic: it's subject to the QOS's limits
+        // exactly as if --qos had been passed explicitly.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 8, 16000);

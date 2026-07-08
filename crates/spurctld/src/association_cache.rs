@@ -9,10 +9,8 @@ use parking_lot::RwLock;
 use sqlx::PgPool;
 use tracing::{info, warn};
 
-/// Controller-side cache of user/account association defaults, loaded from
-/// the accounting database. Mirrors `FairshareCache`/`QosCache`: an
-/// `RwLock`-guarded snapshot refreshed on a background loop that retains
-/// stale data on error.
+/// Controller-side cache of user/account association defaults. Mirrors
+/// `FairshareCache`/`QosCache`.
 pub struct AssociationCache {
     default_qos: RwLock<HashMap<(String, String), String>>,
     default_account: RwLock<HashMap<String, String>>,

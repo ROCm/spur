@@ -510,11 +510,9 @@ pub async fn add_user(
     .execute(pool)
     .await?;
 
-    // partition_name is nullable and Postgres never treats NULL = NULL for
-    // uniqueness, so `ON CONFLICT (user_name, account, partition_name)`
-    // can't be used to upsert here (it silently inserts a duplicate every
-    // time instead of matching). Update explicitly instead, serialized per
-    // (user, account) so two concurrent first-time calls can't both insert.
+    // partition_name is nullable (NULL != NULL), so ON CONFLICT on it can't
+    // upsert; update explicitly, serialized per (user, account) so two
+    // concurrent first-time calls can't both insert.
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1 || ':' || $2)::bigint)")
         .bind(user)
@@ -570,17 +568,9 @@ pub async fn remove_user(pool: &PgPool, user: &str, account: &str) -> anyhow::Re
     Ok(())
 }
 
-/// List users, optionally filtered by account. Joins each user's own
-/// association row (`partition_name IS NULL`, the only kind `add_user`
-/// creates) to surface its `default_qos`.
-///
-/// `DISTINCT ON` + `a.id DESC`: a database predating the `add_user` upsert
-/// fix above may still carry duplicate association rows for the same
-/// (user, account) with disagreeing `default_qos` values (from before that
-/// fix). Rather than leaving the join's row selection to be
-/// nondeterministic, always surface the most-recently-written one. This is
-/// a read-side accommodation only — it does not touch or delete the older
-/// rows.
+/// List users, joining each one's own association row for `default_qos`.
+/// `DISTINCT ON ... a.id DESC` picks the newest row if legacy duplicates
+/// exist (pre-dating the add_user upsert fix); it never touches the others.
 pub async fn list_users(pool: &PgPool, account: Option<&str>) -> anyhow::Result<Vec<UserRecord>> {
     let rows = if let Some(acct) = account {
         sqlx::query(
@@ -1010,12 +1000,8 @@ mod job_history_tests {
     #[tokio::test]
     #[ignore = "requires DATABASE_URL and PostgreSQL"]
     async fn add_user_never_creates_a_duplicate_association_row() -> anyhow::Result<()> {
-        // Regression: associations.partition_name is nullable, and Postgres
-        // never treats NULL = NULL for uniqueness, so an `INSERT ... ON
-        // CONFLICT (user_name, account, partition_name)` silently fails to
-        // match and inserts a new row every time instead of updating the
-        // existing one. Repeated add_user calls (exactly what `sacctmgr
-        // modify user` now does) must converge on ONE row, not accumulate.
+        // Repeated add_user calls (what `sacctmgr modify user` now does)
+        // must converge on one row, not accumulate duplicates.
         let pool = test_pool().await?;
         let pid = std::process::id();
         let user = format!("spur_nodupe_user_{pid}");

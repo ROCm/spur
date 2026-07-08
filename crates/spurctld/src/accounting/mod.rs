@@ -45,11 +45,8 @@ pub async fn fairshare_factors(
     ))
 }
 
-/// Load the (user, account) -> default QOS and user -> default account
-/// maps directly from the database.
-///
-/// Reused by the controller's in-process `AssociationCache` to resolve a
-/// job's effective QOS at submission time when `--qos` is not given.
+/// Load the (user, account) -> default QOS and user -> default account maps
+/// backing the controller's `AssociationCache`.
 pub async fn association_maps(
     pool: &PgPool,
 ) -> anyhow::Result<(HashMap<(String, String), String>, HashMap<String, String>)> {
