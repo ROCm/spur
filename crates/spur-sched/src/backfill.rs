@@ -1,16 +1,17 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use chrono::{Duration, Utc};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use spur_core::job::{Job, JobId};
 use spur_core::node::Node;
 use spur_core::reservation::Reservation;
 use spur_core::resource::{build_exclusive_allocation, build_node_allocation, ResourceSet};
 
+use crate::node_match::NodePlacement;
 use crate::timeline::NodeTimeline;
 use crate::traits::{Assignment, ClusterState, Scheduler};
 
@@ -52,107 +53,25 @@ impl BackfillScheduler {
         nodes: &[Node],
         reservations: &[Reservation],
     ) -> Vec<usize> {
-        let partition_name = job.spec.partition.as_deref();
         let required = job_resource_request(job);
-
-        // Parse nodelist / exclude constraints once, outside the per-node loop.
-        let nodelist: Option<HashSet<String>> = job
-            .spec
-            .nodelist
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(|s| HashSet::from_iter(expand_hostlist_or_split(s)));
-
-        let exclude: HashSet<String> = job
-            .spec
-            .exclude
-            .as_deref()
-            .map(|s| HashSet::from_iter(expand_hostlist_or_split(s)))
-            .unwrap_or_default();
+        let placement = NodePlacement::new(job);
+        let now = Utc::now();
 
         nodes
             .iter()
             .enumerate()
             .filter(|(_, node)| {
-                if let Some(ref allowed) = nodelist {
-                    if !allowed.contains(&node.name) {
-                        return false;
-                    }
-                }
-                if exclude.contains(&node.name) {
+                if !placement.matches(node, reservations, now) {
                     return false;
                 }
-                // Check partition membership (comma-separated OR matching)
-                if let Some(pname) = partition_name {
-                    let requested: Vec<&str> = pname.split(',').map(str::trim).collect();
-                    if !requested
-                        .iter()
-                        .any(|rp| node.partitions.iter().any(|np| np == rp))
-                    {
-                        return false;
-                    }
-                }
-                // Check node is schedulable
-                if !node.is_schedulable() {
-                    return false;
-                }
-                // Exclusive job needs an idle node (no current allocations)
-                if job.spec.exclusive
-                    && (node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices())
-                {
-                    return false;
-                }
-                // Skip nodes fully consumed by an exclusive job
+                // Skip nodes fully consumed by an exclusive job.
                 if node.alloc_resources.cpus >= node.total_resources.cpus
                     && node.total_resources.cpus > 0
                 {
                     return false;
                 }
-                // Check --constraint: all requested features must be present on the node
-                if let Some(ref constraint) = job.spec.constraint {
-                    let required_features: Vec<&str> = constraint
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    if !required_features
-                        .iter()
-                        .all(|f| node.features.contains(&f.to_string()))
-                    {
-                        return false;
-                    }
-                }
-                // Reservation enforcement
-                let now = Utc::now();
-                let job_reservation = job.spec.reservation.as_deref().filter(|s| !s.is_empty());
-
-                let active_reservations: Vec<&Reservation> = reservations
-                    .iter()
-                    .filter(|r| r.is_active(now) && r.covers_node(&node.name))
-                    .collect();
-
-                if let Some(res_name) = job_reservation {
-                    // Job targets a reservation -- only allow nodes in that reservation
-                    if !active_reservations.iter().any(|r| r.name == res_name) {
-                        return false;
-                    }
-                    // Check user/account is allowed
-                    let user = &job.spec.user;
-                    let account = job.spec.account.as_deref();
-                    if !active_reservations
-                        .iter()
-                        .any(|r| r.name == res_name && r.allows_user(user, account))
-                    {
-                        return false;
-                    }
-                } else {
-                    // Job does NOT target a reservation -- skip reserved nodes
-                    if !active_reservations.is_empty() {
-                        return false;
-                    }
-                }
-
-                // Check resource capacity (total, not current available)
+                // Capacity against total resources: the backfill timeline below
+                // decides *when* the node is free, not whether it ever fits.
                 node.total_resources.can_satisfy(&required)
             })
             .map(|(i, _)| i)
@@ -364,23 +283,6 @@ impl Scheduler for BackfillScheduler {
 
     fn name(&self) -> &str {
         "backfill"
-    }
-}
-
-/// Expand a hostlist pattern (e.g. `node[001-003]`) into individual names.
-/// Falls back to a plain comma-split if the pattern is malformed, so
-/// existing behavior is preserved for simple comma-separated lists.
-fn expand_hostlist_or_split(pattern: &str) -> Vec<String> {
-    match spur_core::hostlist::expand(pattern) {
-        Ok(names) => names,
-        Err(e) => {
-            warn!(
-                pattern,
-                error = %e,
-                "hostlist expansion failed, falling back to comma-split"
-            );
-            pattern.split(',').map(|s| s.trim().to_string()).collect()
-        }
     }
 }
 
@@ -904,17 +806,6 @@ mod tests {
         assert!(!assignments[0].nodes.contains(&"node002".to_string()));
         assert!(assignments[0].nodes.contains(&"node003".to_string()));
         assert!(assignments[0].nodes.contains(&"node004".to_string()));
-    }
-
-    #[test]
-    fn test_malformed_hostlist_falls_back_to_comma_split() {
-        // Reversed range is invalid; fallback returns the literal as a single token.
-        let result = expand_hostlist_or_split("node[003-001]");
-        assert_eq!(result, vec!["node[003-001]"]);
-
-        // Plain comma-separated list is not a hostlist pattern; fallback splits correctly.
-        let result = expand_hostlist_or_split("a,b,c");
-        assert_eq!(result, vec!["a", "b", "c"]);
     }
 
     #[test]

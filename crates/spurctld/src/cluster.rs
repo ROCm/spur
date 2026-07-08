@@ -1897,87 +1897,76 @@ impl ClusterManager {
                 continue;
             }
 
-            // Determine the correct reason
-            let partition_name = job.spec.partition.as_deref();
+            // Placement constraints (nodelist/exclude/partition/constraint/
+            // reservation/exclusive) come from the SAME matcher the scheduler
+            // uses, so the reason we report can't disagree with what backfill
+            // actually does.
+            let placement = spur_sched::node_match::NodePlacement::new(job);
+            let now = chrono::Utc::now();
 
-            // Check if any node is schedulable in the target partition
-            let nodes_in_partition: Vec<&spur_core::node::Node> = cluster_state
+            let needed = (job.spec.num_nodes as usize).max(1);
+
+            // Nodes the job could EVER target (load-independent identity:
+            // nodelist/exclude, partition, features, reservation). Node state
+            // and capacity are deliberately excluded here.
+            let eligible: Vec<&spur_core::node::Node> = cluster_state
                 .nodes
                 .iter()
-                .filter(|n| {
-                    if let Some(pname) = partition_name {
-                        n.partitions.iter().any(|p| p == pname)
-                    } else {
-                        true
-                    }
-                })
+                .filter(|n| placement.eligible(n, cluster_state.reservations, now))
                 .collect();
 
-            if nodes_in_partition.is_empty() {
-                // No nodes in partition at all
-                job_entry.pending_reason = PendingReason::Resources;
+            // Not enough nodes can ever satisfy the placement constraints — the
+            // job is unschedulable as written (bad --nodelist/-w, too many
+            // nodes requested, unmatchable --constraint), not merely waiting.
+            if eligible.len() < needed {
+                job_entry.pending_reason = if job.spec.constraint.is_some() && eligible.is_empty() {
+                    PendingReason::BadConstraints
+                } else if job.spec.nodelist.as_deref().is_some_and(|s| !s.is_empty()) {
+                    PendingReason::ReqNodeNotAvail
+                } else {
+                    PendingReason::Resources
+                };
                 continue;
             }
 
-            // is_up() (not is_available()) so a fully-`Allocated` busy cluster
-            // counts as up — that's a `Resources` wait, not `NodeDown`.
-            let all_down = nodes_in_partition.iter().all(|n| !n.state.is_up());
-
-            if all_down {
-                job_entry.pending_reason = PendingReason::NodeDown;
+            // Enough eligible nodes exist but none are up. is_up() (not
+            // is_available()) so a fully-`Allocated` busy cluster counts as up —
+            // a `Resources` wait, not down. A job pinned via --nodelist to
+            // down/drained nodes reports ReqNodeNotAvail (Slurm parity);
+            // otherwise the partition is genuinely NodeDown.
+            if eligible.iter().all(|n| !n.state.is_up()) {
+                job_entry.pending_reason =
+                    if job.spec.nodelist.as_deref().is_some_and(|s| !s.is_empty()) {
+                        PendingReason::ReqNodeNotAvail
+                    } else {
+                        PendingReason::NodeDown
+                    };
                 continue;
             }
 
-            // Nodes exist but may be fully allocated — check if any node
-            // can satisfy resource requirements with AVAILABLE resources.
-            //
-            // Issue #65 (reopen of #56): previous check used total_resources,
-            // which always returned true for idle nodes even when their
-            // available resources (total - alloc) were insufficient because
-            // other jobs consumed them. Must use available = total - alloc.
+            // Count nodes that are schedulable AND can satisfy the request with
+            // AVAILABLE resources (total - alloc), matching what backfill does.
+            // Fewer free than needed → waiting on Resources; otherwise the job
+            // is simply queued behind higher priority.
             let required = spur_sched::backfill::job_resource_request(job);
-            let has_capable_node = nodes_in_partition.iter().any(|n| {
-                if !n.is_schedulable() {
-                    return false;
-                }
-                // Skip nodes fully consumed by existing allocations
-                if n.alloc_resources.cpus >= n.total_resources.cpus && n.total_resources.cpus > 0 {
-                    return false;
-                }
-                // Exclusive job needs an idle node (no current allocations)
-                if job.spec.exclusive
-                    && (n.alloc_resources.cpus > 0 || n.alloc_resources.has_devices())
-                {
-                    return false;
-                }
-                // Constraint feature check
-                if let Some(ref constraint) = job.spec.constraint {
-                    let required_features: Vec<&str> = constraint
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    if !required_features
-                        .iter()
-                        .all(|f| n.features.contains(&f.to_string()))
+            let free_now = eligible
+                .iter()
+                .filter(|n| placement.matches(n, cluster_state.reservations, now))
+                .filter(|n| {
+                    if n.alloc_resources.cpus >= n.total_resources.cpus
+                        && n.total_resources.cpus > 0
                     {
                         return false;
                     }
-                }
-                // Check AVAILABLE resources (total minus already allocated),
-                // not just total capacity. This matches what the backfill
-                // scheduler actually does when trying to place a job.
-                n.can_satisfy_request(&required)
-            });
+                    n.can_satisfy_request(&required)
+                })
+                .count();
 
-            if !has_capable_node {
-                // Resources insufficient or constraints prevent scheduling
-                job_entry.pending_reason = PendingReason::Resources;
+            job_entry.pending_reason = if free_now < needed {
+                PendingReason::Resources
             } else {
-                // Capable nodes exist but currently occupied — backfill will
-                // schedule this job once they free up (or higher-priority jobs run)
-                job_entry.pending_reason = PendingReason::Priority;
-            }
+                PendingReason::Priority
+            };
         }
     }
 
@@ -4719,6 +4708,95 @@ mod tests {
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::NodeDown
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nodelist_that_cannot_match_reports_req_node_not_avail() {
+        // A job pinned to a node that isn't idle/usable must report
+        // ReqNodeNotAvail, not Priority (as if merely queued behind others).
+        use spur_core::node::NodeState;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+
+        let mut spec = basic_spec("pinned");
+        spec.nodelist = Some("n1".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let snapshot = cm.get_job(job_id).unwrap();
+
+        // n1 is drained (not schedulable); n2 is idle but excluded by nodelist.
+        let mut n1 = cm.get_node("n1").unwrap();
+        n1.state = NodeState::Drain;
+        let n2 = cm.get_node("n2").unwrap();
+        let nodes = vec![n1, n2];
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::ReqNodeNotAvail
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn more_nodes_than_exist_reports_resources_not_priority() {
+        // B-05: a job needing more nodes than the partition has must report
+        // Resources, not Priority — it can never be scheduled by waiting.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+
+        let mut spec = basic_spec("toobig");
+        spec.num_nodes = 3; // only 2 nodes exist
+        spec.num_tasks = 3;
+        let job_id = submit_and_wait(&cm, spec);
+        let snapshot = cm.get_job(job_id).unwrap();
+
+        let nodes = vec![cm.get_node("n1").unwrap(), cm.get_node("n2").unwrap()];
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::Resources
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unmatchable_constraint_reports_bad_constraints() {
+        // A --constraint no node carries can never schedule -> BadConstraints.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        let mut spec = basic_spec("feat");
+        spec.constraint = Some("mi300x".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let snapshot = cm.get_job(job_id).unwrap();
+
+        // Node has no features.
+        let nodes = vec![cm.get_node("n1").unwrap()];
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::BadConstraints
         );
     }
 

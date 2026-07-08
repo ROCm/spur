@@ -438,9 +438,18 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let _req = request.into_inner();
+        let req = request.into_inner();
         let nodes = self.cluster.get_nodes();
-        let mut proto_nodes: Vec<NodeInfo> = nodes.iter().map(node_to_proto).collect();
+
+        // Honour the request filters; without this, `scontrol show node X` and
+        // `sinfo -n X` return the whole cluster.
+        let mut proto_nodes: Vec<NodeInfo> = nodes
+            .iter()
+            .filter(|n| node_matches_filter(n, &req.nodelist, &req.partition))
+            .map(node_to_proto)
+            .filter(|n| req.states.is_empty() || req.states.contains(&n.state))
+            .collect();
+
         let reservations = self.cluster.get_reservations();
         annotate_nodes_with_reservations(&mut proto_nodes, &reservations, Utc::now());
         Ok(Response::new(GetNodesResponse { nodes: proto_nodes }))
@@ -1907,6 +1916,23 @@ pub(crate) fn datetime_to_proto(dt: chrono::DateTime<chrono::Utc>) -> prost_type
     }
 }
 
+/// Whether a node passes a GetNodes request's name/partition filters. An empty
+/// filter matches everything; `nodelist` accepts a Slurm hostlist pattern.
+fn node_matches_filter(node: &spur_core::node::Node, nodelist: &str, partition: &str) -> bool {
+    let nodelist = nodelist.trim();
+    if !nodelist.is_empty() {
+        let allowed = spur_sched::node_match::expand_hostlist_or_split(nodelist);
+        if !allowed.iter().any(|n| n == &node.name) {
+            return false;
+        }
+    }
+    let partition = partition.trim();
+    if !partition.is_empty() && !node.partitions.iter().any(|p| p == partition) {
+        return false;
+    }
+    true
+}
+
 fn annotate_nodes_with_reservations(
     nodes: &mut [NodeInfo],
     reservations: &[Reservation],
@@ -1970,6 +1996,49 @@ mod tests {
             accounts: Vec::new(),
             users: Vec::new(),
         }
+    }
+
+    fn core_node(name: &str, partition: &str) -> spur_core::node::Node {
+        let mut n =
+            spur_core::node::Node::new(name.into(), spur_core::resource::ResourceSet::default());
+        n.partitions = vec![partition.into()];
+        n
+    }
+
+    #[test]
+    fn test_node_filter_empty_matches_all() {
+        let n = core_node("gpu01", "batch");
+        assert!(node_matches_filter(&n, "", ""));
+        assert!(node_matches_filter(&n, "  ", "  "));
+    }
+
+    #[test]
+    fn test_node_filter_by_name() {
+        let n = core_node("gpu01", "batch");
+        assert!(node_matches_filter(&n, "gpu01", ""));
+        assert!(!node_matches_filter(&n, "gpu02", ""));
+    }
+
+    #[test]
+    fn test_node_filter_hostlist_bracket() {
+        let n = core_node("gpu03", "batch");
+        assert!(node_matches_filter(&n, "gpu[01-04]", ""));
+        assert!(!node_matches_filter(&n, "gpu[05-08]", ""));
+    }
+
+    #[test]
+    fn test_node_filter_by_partition() {
+        let n = core_node("gpu01", "batch");
+        assert!(node_matches_filter(&n, "", "batch"));
+        assert!(!node_matches_filter(&n, "", "debug"));
+    }
+
+    #[test]
+    fn test_node_filter_name_and_partition_both_apply() {
+        let n = core_node("gpu01", "batch");
+        // Right name, wrong partition -> excluded.
+        assert!(!node_matches_filter(&n, "gpu01", "debug"));
+        assert!(node_matches_filter(&n, "gpu01", "batch"));
     }
 
     #[test]
