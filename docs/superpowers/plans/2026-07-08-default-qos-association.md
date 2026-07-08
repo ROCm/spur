@@ -241,3 +241,34 @@ testbed, this time against the Spur build from this branch:
   column to Spur's existing simpler table — default to the latter unless
   parity fidelity is specifically requested (Spur's `sacctmgr show`
   output is not yet byte-for-byte Slurm-compatible today either).
+
+## Implementation notes (post-hoc)
+
+Implemented as designed above, plus one addition found during live
+verification, not anticipated in the original plan:
+
+- **`add_user` was silently duplicating `associations` rows on every
+  call**, pre-existing and unrelated to this feature's own logic, but
+  newly consequential because `sacctmgr modify user` (implemented here)
+  is the first caller that repeatedly re-upserts the same association.
+  Root cause: `partition_name` is nullable and Postgres never treats
+  `NULL = NULL` for uniqueness, so the `ON CONFLICT (user_name, account,
+  partition_name)` target never matched. Fixed with an explicit
+  `UPDATE ... falling back to INSERT` in `add_user`, and a `DISTINCT ON`
+  in `list_users` so any already-duplicated row (from before this fix)
+  still displays deterministically. Deliberately **no destructive
+  migration** — no `DELETE`, no column-nullability change — since an
+  automatic migration that alters or removes existing rows on every
+  controller startup is not something to risk on a live database;
+  existing duplicates are left in place but self-heal to consistent
+  values the next time that association is touched.
+- Live verification also surfaced that the `AssociationCache` (like the
+  pre-existing `QosCache`/`FairshareCache` it mirrors) only refreshes on
+  `fairshare_refresh_secs` (30s in the tested config) — a default set
+  immediately before submitting a job may not be visible yet. This
+  matches existing cache behavior for QOS/fairshare and was not treated
+  as a defect.
+- `crates/spurd` was not touched (confirmed via diff against
+  `upstream/main`); the live-verification redeploy rebuilt it anyway
+  purely as a safety margin against the wider gap between the currently-
+  deployed base and this branch's base, unrelated to this feature.
