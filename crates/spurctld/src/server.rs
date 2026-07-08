@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -441,11 +441,18 @@ impl SlurmController for ControllerService {
         let req = request.into_inner();
         let nodes = self.cluster.get_nodes();
 
+        let nodelist = req.nodelist.trim();
+        let allowed_names: Option<HashSet<String>> = (!nodelist.is_empty()).then(|| {
+            spur_sched::node_match::expand_hostlist_or_split(nodelist)
+                .into_iter()
+                .collect()
+        });
+
         // Honour the request filters; without this, `scontrol show node X` and
         // `sinfo -n X` return the whole cluster.
         let mut proto_nodes: Vec<NodeInfo> = nodes
             .iter()
-            .filter(|n| node_matches_filter(n, &req.nodelist, &req.partition))
+            .filter(|n| node_matches_filter(n, allowed_names.as_ref(), &req.partition))
             .map(node_to_proto)
             .filter(|n| req.states.is_empty() || req.states.contains(&n.state))
             .collect();
@@ -1916,21 +1923,28 @@ pub(crate) fn datetime_to_proto(dt: chrono::DateTime<chrono::Utc>) -> prost_type
     }
 }
 
-/// Whether a node passes a GetNodes request's name/partition filters. An empty
-/// filter matches everything; `nodelist` accepts a Slurm hostlist pattern.
-fn node_matches_filter(node: &spur_core::node::Node, nodelist: &str, partition: &str) -> bool {
-    let nodelist = nodelist.trim();
-    if !nodelist.is_empty() {
-        let allowed = spur_sched::node_match::expand_hostlist_or_split(nodelist);
-        if !allowed.iter().any(|n| n == &node.name) {
+/// Whether a node passes a GetNodes request's name/partition filters. A `None`
+/// name set matches every name; an empty `partition` matches every partition.
+/// `allowed_names` is the caller-expanded Slurm hostlist. `partition` accepts a
+/// Slurm-style comma-separated list, matching if any token names a node partition.
+fn node_matches_filter(
+    node: &spur_core::node::Node,
+    allowed_names: Option<&HashSet<String>>,
+    partition: &str,
+) -> bool {
+    if let Some(allowed) = allowed_names {
+        if !allowed.contains(&node.name) {
             return false;
         }
     }
-    let partition = partition.trim();
-    if !partition.is_empty() && !node.partitions.iter().any(|p| p == partition) {
-        return false;
+    let mut tokens = partition
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    if partition.trim().is_empty() {
+        return true;
     }
-    true
+    tokens.any(|req| node.partitions.iter().any(|p| p == req))
 }
 
 fn annotate_nodes_with_reservations(
@@ -2005,40 +2019,56 @@ mod tests {
         n
     }
 
+    fn names(pattern: &str) -> Option<HashSet<String>> {
+        let pattern = pattern.trim();
+        (!pattern.is_empty()).then(|| {
+            spur_sched::node_match::expand_hostlist_or_split(pattern)
+                .into_iter()
+                .collect()
+        })
+    }
+
     #[test]
     fn test_node_filter_empty_matches_all() {
         let n = core_node("gpu01", "batch");
-        assert!(node_matches_filter(&n, "", ""));
-        assert!(node_matches_filter(&n, "  ", "  "));
+        assert!(node_matches_filter(&n, names("").as_ref(), ""));
+        assert!(node_matches_filter(&n, names("  ").as_ref(), "  "));
     }
 
     #[test]
     fn test_node_filter_by_name() {
         let n = core_node("gpu01", "batch");
-        assert!(node_matches_filter(&n, "gpu01", ""));
-        assert!(!node_matches_filter(&n, "gpu02", ""));
+        assert!(node_matches_filter(&n, names("gpu01").as_ref(), ""));
+        assert!(!node_matches_filter(&n, names("gpu02").as_ref(), ""));
     }
 
     #[test]
     fn test_node_filter_hostlist_bracket() {
         let n = core_node("gpu03", "batch");
-        assert!(node_matches_filter(&n, "gpu[01-04]", ""));
-        assert!(!node_matches_filter(&n, "gpu[05-08]", ""));
+        assert!(node_matches_filter(&n, names("gpu[01-04]").as_ref(), ""));
+        assert!(!node_matches_filter(&n, names("gpu[05-08]").as_ref(), ""));
     }
 
     #[test]
     fn test_node_filter_by_partition() {
         let n = core_node("gpu01", "batch");
-        assert!(node_matches_filter(&n, "", "batch"));
-        assert!(!node_matches_filter(&n, "", "debug"));
+        assert!(node_matches_filter(&n, names("").as_ref(), "batch"));
+        assert!(!node_matches_filter(&n, names("").as_ref(), "debug"));
     }
 
     #[test]
     fn test_node_filter_name_and_partition_both_apply() {
         let n = core_node("gpu01", "batch");
         // Right name, wrong partition -> excluded.
-        assert!(!node_matches_filter(&n, "gpu01", "debug"));
-        assert!(node_matches_filter(&n, "gpu01", "batch"));
+        assert!(!node_matches_filter(&n, names("gpu01").as_ref(), "debug"));
+        assert!(node_matches_filter(&n, names("gpu01").as_ref(), "batch"));
+    }
+
+    #[test]
+    fn test_node_filter_partition_comma_list() {
+        let n = core_node("gpu01", "gpu");
+        assert!(node_matches_filter(&n, names("").as_ref(), "gpu,cpu"));
+        assert!(!node_matches_filter(&n, names("").as_ref(), "cpu,fpga"));
     }
 
     #[test]
