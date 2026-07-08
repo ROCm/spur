@@ -58,6 +58,13 @@ pub enum WalOperation {
         old_priority: u32,
         new_priority: u32,
     },
+    /// Requeue a preempted job to Pending with an eligibility hold until
+    /// `begin_time` (leader-stamped once, applied verbatim for deterministic replay).
+    JobRequeueHold {
+        job_id: JobId,
+        /// Absolute instant before which the requeued job stays ineligible.
+        begin_time: chrono::DateTime<chrono::Utc>,
+    },
     JobSuspend {
         job_id: JobId,
         /// Controller-stamped instant of suspension (for replay-deterministic accounting).
@@ -194,6 +201,27 @@ mod deregistration_wal_tests {
 #[cfg(test)]
 mod suspend_wal_tests {
     use super::*;
+
+    #[test]
+    fn requeue_hold_op_round_trips() {
+        let begin_time = chrono::Utc::now();
+        let op = WalOperation::JobRequeueHold {
+            job_id: 42,
+            begin_time,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobRequeueHold {
+                job_id,
+                begin_time: b,
+            } => {
+                assert_eq!(job_id, 42);
+                assert_eq!(b, begin_time);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
 
     #[test]
     fn suspend_resume_ops_round_trip() {

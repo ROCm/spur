@@ -88,6 +88,12 @@ impl JobState {
         matches!(self, Self::Running | Self::Completing | Self::Suspended)
     }
 
+    /// End of a run: `is_terminal()` plus `Preempted` (which may still requeue).
+    /// Distinct from `is_terminal()`, whose semantics must not shift.
+    pub fn is_finalized(&self) -> bool {
+        self.is_terminal() || matches!(self, Self::Preempted)
+    }
+
     /// Per-node completion state implied by one exit code.
     pub fn completion_state_for_exit_code(exit_code: i32) -> Self {
         if exit_code == 0 {
@@ -812,13 +818,9 @@ impl Job {
         }
     }
 
-    /// Transition tolerant of already-applied entries, for the WAL apply path.
-    ///
-    /// A request to move to the state the job is already in is a `NoOp` rather
-    /// than an error: replaying a committed log or catching up an HA follower
-    /// legitimately re-applies entries, and those must not surface as invalid
-    /// transitions. Genuine illegal moves (e.g. Completed -> Running) still
-    /// error. Live command paths use the strict `transition()` instead.
+    /// WAL-apply transition: a move to the current state is a `NoOp` (replay /
+    /// follower catch-up), illegal moves still error. Live paths use
+    /// `transition()`.
     pub fn apply_transition(
         &mut self,
         to: JobState,
@@ -1122,6 +1124,21 @@ mod tests {
         job.transition(JobState::Completed).unwrap();
         assert!(job.apply_transition(JobState::Running).is_err());
         assert_eq!(job.state, JobState::Completed);
+    }
+
+    #[test]
+    fn is_finalized_covers_terminal_and_preempted_but_not_active() {
+        // Distinct from is_terminal(): Preempted is finalized (end of run) but
+        // NOT terminal (it may be requeued to Pending).
+        assert!(JobState::Preempted.is_finalized());
+        assert!(!JobState::Preempted.is_terminal());
+        assert!(JobState::Completed.is_finalized());
+        assert!(JobState::Cancelled.is_finalized());
+        // Active / schedulable states are not finalized.
+        assert!(!JobState::Running.is_finalized());
+        assert!(!JobState::Completing.is_finalized());
+        assert!(!JobState::Suspended.is_finalized());
+        assert!(!JobState::Pending.is_finalized());
     }
 
     #[test]

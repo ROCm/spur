@@ -424,11 +424,8 @@ fn job_preempt_mode(
         .unwrap_or(PreemptMode::Off)
 }
 
-/// Try to preempt lower-priority running jobs to make room for higher-priority
-/// pending jobs. Honors the running job's partition PreemptMode: cancel and
-/// requeue kill the process on every node (requeue also returns the job to
-/// Pending); suspend stops it in place. Jobs whose partition has PreemptMode
-/// Off are never preempted.
+/// Preempt lower-priority running jobs per their partition PreemptMode
+/// (Off jobs are never preempted).
 async fn try_preempt(
     cluster: &Arc<ClusterManager>,
     partitions: &[spur_core::partition::Partition],
@@ -465,9 +462,7 @@ async fn try_preempt(
             );
             match cluster.preempt_job(candidate.job_id, mode) {
                 Ok(PreemptOutcome::Killed) => {
-                    // Signal 0 = graceful cancel (SIGTERM, then SIGKILL after a
-                    // grace period), giving the preempted job a chance to
-                    // checkpoint — matches Slurm's default preemption grace.
+                    // Signal 0 = graceful cancel (SIGTERM then SIGKILL).
                     send_cancel_to_agents(cluster, candidate, 0).await;
                 }
                 Ok(PreemptOutcome::Suspended) => {
