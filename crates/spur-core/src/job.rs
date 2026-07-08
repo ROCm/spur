@@ -260,8 +260,8 @@ impl PendingReason {
             Self::Priority => "Priority",
             Self::Resources => "Resources",
             Self::PartitionDown => "PartitionDown",
-            Self::PartitionNodeLimit => "PartNodeLimit",
-            Self::PartitionTimeLimit => "PartTimeLimit",
+            Self::PartitionNodeLimit => "PartitionNodeLimit",
+            Self::PartitionTimeLimit => "PartitionTimeLimit",
             Self::Dependency => "Dependency",
             Self::NodeDown => "NodeDown",
             Self::Held => "JobHeldUser",
@@ -1097,6 +1097,20 @@ mod tests {
         done.transition(JobState::Running).unwrap();
         done.transition(JobState::Completed).unwrap();
         assert!(done.transition(JobState::Deadline).is_err());
+    }
+
+    #[test]
+    fn partition_limit_reasons_match_slurm_strings() {
+        // squeue displays these verbatim; verified byte-exact against
+        // slurm 25.11.6 (`(PartitionNodeLimit)`), so they must not abbreviate.
+        assert_eq!(
+            PendingReason::PartitionNodeLimit.display(),
+            "PartitionNodeLimit"
+        );
+        assert_eq!(
+            PendingReason::PartitionTimeLimit.display(),
+            "PartitionTimeLimit"
+        );
     }
 
     #[test]

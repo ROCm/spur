@@ -1897,29 +1897,30 @@ impl ClusterManager {
                 continue;
             }
 
-            // Placement constraints (nodelist/exclude/partition/constraint/
-            // reservation/exclusive) come from the SAME matcher the scheduler
-            // uses, so the reason we report can't disagree with what backfill
-            // actually does.
+            // Reuse the scheduler's matcher so the reason can't disagree with
+            // what backfill actually does.
             let placement = spur_sched::node_match::NodePlacement::new(job);
             let now = chrono::Utc::now();
 
             let needed = (job.spec.num_nodes as usize).max(1);
 
-            // Nodes the job could EVER target (load-independent identity:
-            // nodelist/exclude, partition, features, reservation). Node state
-            // and capacity are deliberately excluded here.
             let eligible: Vec<&spur_core::node::Node> = cluster_state
                 .nodes
                 .iter()
                 .filter(|n| placement.eligible(n, cluster_state.reservations, now))
                 .collect();
 
-            // Not enough nodes can ever satisfy the placement constraints — the
-            // job is unschedulable as written (bad --nodelist/-w, too many
-            // nodes requested, unmatchable --constraint), not merely waiting.
+            // Fewer eligible nodes than requested: unschedulable as written.
             if eligible.len() < needed {
-                job_entry.pending_reason = if job.spec.constraint.is_some() && eligible.is_empty() {
+                let partition_size = cluster_state
+                    .nodes
+                    .iter()
+                    .filter(|n| placement.in_partition(n))
+                    .count();
+
+                job_entry.pending_reason = if needed > partition_size {
+                    PendingReason::PartitionNodeLimit
+                } else if job.spec.constraint.is_some() && eligible.is_empty() {
                     PendingReason::BadConstraints
                 } else if job.spec.nodelist.as_deref().is_some_and(|s| !s.is_empty()) {
                     PendingReason::ReqNodeNotAvail
@@ -1929,11 +1930,9 @@ impl ClusterManager {
                 continue;
             }
 
-            // Enough eligible nodes exist but none are up. is_up() (not
-            // is_available()) so a fully-`Allocated` busy cluster counts as up —
-            // a `Resources` wait, not down. A job pinned via --nodelist to
-            // down/drained nodes reports ReqNodeNotAvail (Slurm parity);
-            // otherwise the partition is genuinely NodeDown.
+            // Eligible nodes exist but none are up. is_up() keeps a busy
+            // `Allocated` cluster out of NodeDown; a nodelist pin to down nodes
+            // is ReqNodeNotAvail (Slurm parity).
             if eligible.iter().all(|n| !n.state.is_up()) {
                 job_entry.pending_reason =
                     if job.spec.nodelist.as_deref().is_some_and(|s| !s.is_empty()) {
@@ -1944,10 +1943,8 @@ impl ClusterManager {
                 continue;
             }
 
-            // Count nodes that are schedulable AND can satisfy the request with
-            // AVAILABLE resources (total - alloc), matching what backfill does.
-            // Fewer free than needed → waiting on Resources; otherwise the job
-            // is simply queued behind higher priority.
+            // Fewer nodes free (schedulable, available resources) than needed →
+            // Resources; otherwise queued behind higher priority.
             let required = spur_sched::backfill::job_resource_request(job);
             let free_now = eligible
                 .iter()
@@ -4745,9 +4742,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn more_nodes_than_exist_reports_resources_not_priority() {
-        // B-05: a job needing more nodes than the partition has must report
-        // Resources, not Priority — it can never be scheduled by waiting.
+    async fn more_nodes_than_exist_reports_partition_node_limit() {
+        // B-05: a job needing more nodes than the partition physically has must
+        // report PartitionNodeLimit (Slurm parity, verified on slurm 25.11.6),
+        // not Priority — it can never be scheduled by waiting.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 4, 8000);
@@ -4769,7 +4767,7 @@ mod tests {
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
-            PendingReason::Resources
+            PendingReason::PartitionNodeLimit
         );
     }
 

@@ -1,19 +1,9 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared node-placement matching.
-//!
-//! The scheduler ([`crate::backfill::BackfillScheduler::find_suitable_nodes`])
-//! and the pending-reason classifier both need to answer "could this job ever
-//! be placed on this node, ignoring current free capacity?". Keeping that logic
-//! in one place stops the two paths from drifting — a drift that previously let
-//! a job pinned to an unusable `--nodelist` report `Priority` (waiting its turn)
-//! instead of `Resources`/`ReqNodeNotAvail` (never schedulable here).
-//!
-//! Resource-capacity is deliberately *not* checked here: the scheduler compares
-//! against a node's total resources on a reservation timeline, while the
-//! pending-reason path compares against currently-available resources. Callers
-//! apply their own capacity check on top of [`NodePlacement::matches`].
+//! Shared node-placement matching used by both the scheduler and the
+//! pending-reason classifier so the two cannot drift. Capacity is not checked
+//! here: callers apply their own (scheduler vs total, pending-reason vs free).
 
 use std::collections::HashSet;
 
@@ -112,14 +102,8 @@ impl<'a> NodePlacement<'a> {
             .all(|f| node.features.iter().any(|nf| nf == f))
     }
 
-    /// Load-independent placement identity: could the job EVER target this node,
-    /// regardless of the node's current state or free capacity? Covers
-    /// nodelist/exclude, partition, feature constraints, and reservation access.
-    ///
-    /// This is the set the pending-reason classifier reasons over: if fewer than
-    /// `num_nodes` nodes are eligible here, the job is unschedulable as written
-    /// (bad `--nodelist`, unmatchable `--constraint`, too many nodes) rather than
-    /// merely waiting for busy nodes to free up.
+    /// Load-independent placement identity (nodelist/exclude, partition,
+    /// features, reservation), ignoring node state and free capacity.
     pub fn eligible(&self, node: &Node, reservations: &[Reservation], now: DateTime<Utc>) -> bool {
         self.allows_name(&node.name)
             && self.in_partition(node)
@@ -127,10 +111,8 @@ impl<'a> NodePlacement<'a> {
             && self.reservation_ok(node, reservations, now)
     }
 
-    /// Whether this node is a valid placement target for the job right now,
-    /// ignoring only current free capacity (the timeline decides *when* a busy
-    /// node frees up). Adds runtime state to [`eligible`](Self::eligible):
-    /// schedulability and the exclusive-idle requirement.
+    /// [`eligible`](Self::eligible) plus runtime state (schedulable,
+    /// exclusive-idle), still ignoring free capacity.
     pub fn matches(&self, node: &Node, reservations: &[Reservation], now: DateTime<Utc>) -> bool {
         if !self.eligible(node, reservations, now) {
             return false;
