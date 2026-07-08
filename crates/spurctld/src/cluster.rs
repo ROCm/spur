@@ -858,40 +858,6 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Return a preempted job to the pending queue.
-    pub fn requeue_preempted_job(&self, job_id: JobId, force: bool) -> anyhow::Result<()> {
-        let max = self.config.controller.max_batch_requeue;
-        let old_state = {
-            let jobs = self.jobs.read();
-            let Some(job) = jobs.get(&job_id) else {
-                return Ok(());
-            };
-            if job.requeue_count >= max {
-                if job.state == JobState::Preempted {
-                    drop(jobs);
-                    return self.hold_job_at_max_requeue(job_id);
-                }
-                return Ok(());
-            };
-            if job.state != JobState::Preempted {
-                return Ok(());
-            }
-            if !force && !job.spec.requeue {
-                return Ok(());
-            }
-            job.state
-        };
-
-        self.propose(WalOperation::job_state_change(
-            job_id,
-            old_state,
-            JobState::Pending,
-        ))?;
-
-        info!(job_id, "preempted job requeued");
-        Ok(())
-    }
-
     /// Requeue a job back to Pending after a dispatch failure.
     /// Unlike `maybe_requeue`, this is unconditional and doesn't require
     /// the requeue flag on the spec. Used when the agent rejects a job
@@ -2809,8 +2775,7 @@ impl ClusterManager {
                             job.allocated_resources = None;
                             job.per_node_alloc.clear();
                         }
-                        job.pending_reason =
-                            pending_reason.clone().unwrap_or(PendingReason::None);
+                        job.pending_reason = pending_reason.clone().unwrap_or(PendingReason::None);
                         if let Some(priority) = pending_priority {
                             job.priority = *priority;
                         }
@@ -6729,7 +6694,7 @@ mod tests {
         }
         assert_eq!(cm.get_job(job_id).unwrap().requeue_count, 5);
 
-        cm.requeue_preempted_job(job_id, true).unwrap();
+        cm.hold_job_at_max_requeue(job_id).unwrap();
         wait_for("job held at max requeue", || {
             cm.get_job(job_id).is_some_and(|j| {
                 j.state == JobState::Pending && j.pending_reason == PendingReason::JobHoldMaxRequeue
@@ -6956,7 +6921,7 @@ mod tests {
                 state: JobState::Preempted,
             });
         }
-        cm.requeue_preempted_job(job_id, true).unwrap();
+        cm.hold_job_at_max_requeue(job_id).unwrap();
         wait_for("job held at max requeue", || {
             cm.get_job(job_id)
                 .is_some_and(|j| j.pending_reason == PendingReason::JobHoldMaxRequeue)
