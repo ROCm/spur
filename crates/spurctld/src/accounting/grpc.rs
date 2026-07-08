@@ -320,12 +320,24 @@ impl SlurmAccounting for AccountingService {
 
     async fn add_user(&self, request: Request<AddUserRequest>) -> Result<Response<()>, Status> {
         let req = request.into_inner();
+        if !req.default_qos.is_empty() {
+            let exists = db::qos_exists(&self.pool, &req.default_qos)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            if !exists {
+                return Err(Status::not_found(format!(
+                    "QOS '{}' does not exist",
+                    req.default_qos
+                )));
+            }
+        }
         db::add_user(
             &self.pool,
             &req.user,
             &req.account,
             &req.admin_level,
             req.is_default,
+            &req.default_qos,
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -364,6 +376,7 @@ impl SlurmAccounting for AccountingService {
                 account: r.account,
                 admin_level: r.admin_level,
                 default_account: r.default_account.unwrap_or_default(),
+                default_qos: r.default_qos.unwrap_or_default(),
             })
             .collect();
 

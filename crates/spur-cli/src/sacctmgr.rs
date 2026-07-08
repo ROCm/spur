@@ -115,6 +115,30 @@ async fn connect(addr: &str) -> Result<SlurmAccountingClient<tonic::transport::C
         .context("failed to connect to controller")
 }
 
+/// Extract the fields shared by `add user` and `modify user` (both upsert
+/// via the same `AddUserRequest`). Returns (name, account, admin_level,
+/// default_qos).
+fn build_add_user_request(
+    p: &std::collections::HashMap<String, String>,
+) -> Result<(String, String, String, String)> {
+    let name = p
+        .get("name")
+        .or_else(|| p.get("user"))
+        .ok_or_else(|| anyhow::anyhow!("name= required"))?
+        .clone();
+    let account = p
+        .get("account")
+        .or_else(|| p.get("defaultaccount"))
+        .ok_or_else(|| anyhow::anyhow!("account= required"))?
+        .clone();
+    let admin = p
+        .get("adminlevel")
+        .cloned()
+        .unwrap_or_else(|| "none".into());
+    let default_qos = p.get("defaultqos").cloned().unwrap_or_default();
+    Ok((name, account, admin, default_qos))
+}
+
 async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
     let p = parse_params(params);
 
@@ -162,22 +186,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
             Ok(())
         }
         "user" => {
-            let name = p
-                .get("name")
-                .or_else(|| p.get("user"))
-                .ok_or_else(|| anyhow::anyhow!("name= required"))?;
-            let account = p
-                .get("account")
-                .or_else(|| p.get("defaultaccount"))
-                .ok_or_else(|| anyhow::anyhow!("account= required"))?;
-            let admin = p
-                .get("adminlevel")
-                .cloned()
-                .unwrap_or_else(|| "none".into());
-            let is_default = p
-                .get("defaultaccount")
-                .map(|da| da == account)
-                .unwrap_or(true);
+            let (name, account, admin, default_qos) = build_add_user_request(&p)?;
 
             let mut client = connect(addr).await?;
             client
@@ -185,7 +194,11 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     user: name.clone(),
                     account: account.clone(),
                     admin_level: admin.clone(),
-                    is_default,
+                    is_default: p
+                        .get("defaultaccount")
+                        .map(|da| da == &account)
+                        .unwrap_or(true),
+                    default_qos: default_qos.clone(),
                 })
                 .await
                 .context("AddUser RPC failed")?;
@@ -194,6 +207,9 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 " Adding User(s)\n  Name       = {}\n  Account    = {}\n  Admin      = {}",
                 name, account, admin
             );
+            if !default_qos.is_empty() {
+                println!("  DefQOS     = {}", default_qos);
+            }
             println!(" User added.");
             Ok(())
         }
@@ -401,10 +417,27 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
             Ok(())
         }
         "user" => {
-            println!(" Modifying user with: {:?}", p);
-            println!(
-                " (User modify updates admin level via add — use 'sacctmgr add user' to update)"
-            );
+            let (name, account, admin, default_qos) = build_add_user_request(&p)?;
+
+            let mut client = connect(addr).await?;
+            client
+                .add_user(AddUserRequest {
+                    user: name.clone(),
+                    account: account.clone(),
+                    admin_level: admin,
+                    is_default: p
+                        .get("defaultaccount")
+                        .map(|da| da == &account)
+                        .unwrap_or(true),
+                    default_qos: default_qos.clone(),
+                })
+                .await
+                .context("AddUser (modify) RPC failed")?;
+
+            println!(" Modified user '{}'.", name);
+            if !default_qos.is_empty() {
+                println!("  DefQOS     = {}", default_qos);
+            }
             Ok(())
         }
         other => bail!("sacctmgr: unknown entity type '{}'", other),
@@ -464,15 +497,15 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
             let users = resp.into_inner().users;
 
             println!(
-                "{:<15} {:<20} {:<10} {:<20}",
-                "User", "Account", "Admin", "Default Acct"
+                "{:<15} {:<20} {:<10} {:<20} {:<15}",
+                "User", "Account", "Admin", "Default Acct", "Def QOS"
             );
-            println!("{}", "-".repeat(65));
+            println!("{}", "-".repeat(80));
 
             for u in &users {
                 println!(
-                    "{:<15} {:<20} {:<10} {:<20}",
-                    u.name, u.account, u.admin_level, u.default_account,
+                    "{:<15} {:<20} {:<10} {:<20} {:<15}",
+                    u.name, u.account, u.admin_level, u.default_account, u.default_qos,
                 );
             }
             Ok(())
@@ -583,5 +616,65 @@ fn parse_wall_time(s: &str) -> Option<u32> {
             Some(h * 60 + m)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_add_user_request_parses_defaultqos() {
+        let p = parse_params(&[
+            "name=vm".into(),
+            "account=testacct".into(),
+            "defaultqos=highprio".into(),
+        ]);
+        let (name, account, admin, default_qos) = build_add_user_request(&p).unwrap();
+        assert_eq!(name, "vm");
+        assert_eq!(account, "testacct");
+        assert_eq!(admin, "none");
+        assert_eq!(default_qos, "highprio");
+    }
+
+    #[test]
+    fn build_add_user_request_defaultqos_absent_is_empty() {
+        let p = parse_params(&["name=vm".into(), "account=testacct".into()]);
+        let (_, _, _, default_qos) = build_add_user_request(&p).unwrap();
+        assert_eq!(default_qos, "");
+    }
+
+    #[test]
+    fn build_add_user_request_missing_name_errors() {
+        let p = parse_params(&["account=testacct".into()]);
+        assert!(build_add_user_request(&p).is_err());
+    }
+
+    #[test]
+    fn build_add_user_request_missing_account_errors() {
+        let p = parse_params(&["name=vm".into()]);
+        assert!(build_add_user_request(&p).is_err());
+    }
+
+    #[test]
+    fn build_add_user_request_add_and_modify_produce_the_same_shape() {
+        // add and modify both funnel through the same helper, so `sacctmgr
+        // add user name=X account=Y defaultqos=Z` and `sacctmgr modify user
+        // name=X account=Y set defaultqos=Z` build identical requests.
+        let add_params = parse_params(&[
+            "name=vm".into(),
+            "account=testacct".into(),
+            "defaultqos=highprio".into(),
+        ]);
+        let modify_params = parse_params(&[
+            "name=vm".into(),
+            "account=testacct".into(),
+            "set".into(),
+            "defaultqos=highprio".into(),
+        ]);
+        assert_eq!(
+            build_add_user_request(&add_params).unwrap(),
+            build_add_user_request(&modify_params).unwrap()
+        );
     }
 }

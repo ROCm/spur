@@ -30,6 +30,7 @@ use spur_metrics::partition::PartitionMetricsSnapshot;
 use spur_metrics::user_acct::UserAcctMetricsSnapshot;
 
 use crate::accounting::{AccountingNotifier, JobStartRecord};
+use crate::association_cache::AssociationCache;
 use crate::fairshare_cache::FairshareCache;
 use crate::limits_cache::QosCache;
 use crate::raft::{ClientResponse, JobFinalized, SpurRaft, StateMachineApply};
@@ -121,6 +122,7 @@ pub struct ClusterManager {
     accounting: RwLock<Option<AccountingNotifier>>,
     fairshare_cache: Arc<FairshareCache>,
     qos_cache: Arc<QosCache>,
+    association_cache: Arc<AssociationCache>,
     /// Wake signal for the scheduler loop.
     pub(crate) scheduler_notify: Arc<Notify>,
     sched_stats: OnceLock<Arc<SchedStatsCollector>>,
@@ -134,6 +136,7 @@ impl ClusterManager {
         let fairshare_cache = Arc::new(FairshareCache::new());
         let first_job_id = config.controller.first_job_id;
         let qos_cache = Arc::new(QosCache::new());
+        let association_cache = Arc::new(AssociationCache::new());
 
         let cm = Self {
             config,
@@ -150,6 +153,7 @@ impl ClusterManager {
             accounting: RwLock::new(None),
             fairshare_cache,
             qos_cache,
+            association_cache,
             scheduler_notify: Arc::new(Notify::new()),
             sched_stats: OnceLock::new(),
         };
@@ -163,6 +167,7 @@ impl ClusterManager {
     pub fn submit_job(&self, mut spec: JobSpec) -> anyhow::Result<JobId> {
         apply_default_partition(&mut spec, &self.partitions.read());
         self.validate_partition(&spec)?;
+        apply_default_qos(&mut spec, &self.association_cache, &self.qos_cache)?;
 
         // Reject unknown/malformed dependency types up front so users get a
         // clear error instead of a silently-deadlocked job (e.g. `expand:N`).
@@ -2573,6 +2578,10 @@ impl ClusterManager {
         &self.qos_cache
     }
 
+    pub fn association_cache(&self) -> &Arc<AssociationCache> {
+        &self.association_cache
+    }
+
     /// Resolve a job's QoS from the cache; unknown/absent name → limitless default.
     fn resolve_qos(&self, job: &Job) -> Qos {
         match job.spec.qos.as_deref() {
@@ -3905,6 +3914,53 @@ fn apply_default_partition(spec: &mut JobSpec, partitions: &[Partition]) {
             spec.partition = Some(first.name.clone());
         }
     }
+}
+
+/// Resolve a job's effective QOS at submission time, mirroring
+/// `apply_default_partition`: written once into `spec.qos` so every later
+/// reader (`resolve_qos`, `qos_block_for`, display, accounting) sees the
+/// real name with no special-casing, and so the choice is replay-
+/// deterministic (baked into the `JobSpec` the WAL entry carries).
+///
+/// An explicit `--qos` naming a QOS that doesn't exist is rejected outright
+/// — the user asked for something specific and got it wrong. An
+/// association's default that no longer exists (e.g. the QOS was deleted
+/// after being set as a default) degrades silently to no QOS instead,
+/// since that's an admin-configuration issue, not a user submission error.
+fn apply_default_qos(
+    spec: &mut JobSpec,
+    assoc_cache: &AssociationCache,
+    qos_cache: &QosCache,
+) -> anyhow::Result<()> {
+    if let Some(name) = spec.qos.as_deref().filter(|n| !n.is_empty()) {
+        if qos_cache.get(name).is_none() {
+            anyhow::bail!("QOS '{}' does not exist", name);
+        }
+        return Ok(());
+    }
+
+    let Some(account) = spec
+        .account
+        .clone()
+        .filter(|a| !a.is_empty())
+        .or_else(|| assoc_cache.default_account(&spec.user))
+    else {
+        return Ok(());
+    };
+
+    if let Some(default_qos) = assoc_cache.default_qos(&spec.user, &account) {
+        if qos_cache.get(&default_qos).is_some() {
+            spec.qos = Some(default_qos);
+        } else {
+            warn!(
+                user = %spec.user,
+                account = %account,
+                qos = %default_qos,
+                "association default QOS no longer exists, ignoring"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Expand a job spec into one or more submittable specs. For non-array jobs,
@@ -7056,6 +7112,61 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn association_default_qos_reaches_real_enforcement() {
+        // End-to-end: an association default isn't just cosmetic — a job
+        // submitted with no --qos inherits it at submission and is then
+        // actually subject to that QOS's limits, exactly as if --qos had
+        // been passed explicitly.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.qos_cache().insert(Qos {
+            name: "highprio".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_jobs_per_user: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        cm.association_cache()
+            .insert_default_qos("testuser", "research", "highprio");
+
+        let mut s1 = basic_spec("h1");
+        s1.account = Some("research".into());
+        let j1 = submit_and_wait(&cm, s1);
+        // The default was resolved and baked into the job at submission —
+        // not merely applied ephemerally during scheduling.
+        assert_eq!(
+            cm.get_job(j1).unwrap().spec.qos.as_deref(),
+            Some("highprio")
+        );
+
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            j1,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, j1, JobState::Running);
+
+        let mut s2 = basic_spec("h2");
+        s2.account = Some("research".into());
+        let j2 = submit_and_wait(&cm, s2);
+        assert_eq!(
+            cm.get_job(j2).unwrap().spec.qos.as_deref(),
+            Some("highprio")
+        );
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::QoSMaxJobsPerUser
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn running_job_license_consumption_blocks_next_job() {
         // Concurrent license accounting: a running job holding all of a license
         // must make a second job requesting that license ineligible, even though
@@ -7980,6 +8091,91 @@ mod tests {
         }];
         super::apply_default_partition(&mut spec, &partitions);
         assert_eq!(spec.partition.as_deref(), Some("mypart"));
+    }
+
+    // --- apply_default_qos tests ---
+
+    fn qos_cache_with(names: &[&str]) -> QosCache {
+        let cache = QosCache::new();
+        for name in names {
+            cache.insert(Qos {
+                name: (*name).into(),
+                ..Default::default()
+            });
+        }
+        cache
+    }
+
+    #[test]
+    fn apply_default_qos_explicit_valid_passes_through() {
+        let assoc = AssociationCache::new();
+        let qos = qos_cache_with(&["highprio"]);
+        let mut spec = basic_spec("j");
+        spec.qos = Some("highprio".into());
+
+        super::apply_default_qos(&mut spec, &assoc, &qos).unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("highprio"));
+    }
+
+    #[test]
+    fn apply_default_qos_explicit_invalid_is_rejected() {
+        let assoc = AssociationCache::new();
+        let qos = qos_cache_with(&["normal"]);
+        let mut spec = basic_spec("j");
+        spec.qos = Some("doesnotexist".into());
+
+        let err = super::apply_default_qos(&mut spec, &assoc, &qos).unwrap_err();
+        assert!(err.to_string().contains("doesnotexist"));
+    }
+
+    #[test]
+    fn apply_default_qos_inherits_association_default_with_explicit_account() {
+        let assoc = AssociationCache::new();
+        assoc.insert_default_qos("testuser", "research", "highprio");
+        let qos = qos_cache_with(&["highprio"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        super::apply_default_qos(&mut spec, &assoc, &qos).unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("highprio"));
+    }
+
+    #[test]
+    fn apply_default_qos_inherits_via_users_default_account_when_no_dash_a() {
+        let assoc = AssociationCache::new();
+        assoc.insert_default_account("testuser", "research");
+        assoc.insert_default_qos("testuser", "research", "highprio");
+        let qos = qos_cache_with(&["highprio"]);
+        let mut spec = basic_spec("j");
+        // No --account given at all.
+        assert!(spec.account.is_none());
+
+        super::apply_default_qos(&mut spec, &assoc, &qos).unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("highprio"));
+    }
+
+    #[test]
+    fn apply_default_qos_no_association_default_leaves_qos_unset() {
+        let assoc = AssociationCache::new();
+        let qos = QosCache::new();
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        super::apply_default_qos(&mut spec, &assoc, &qos).unwrap();
+        assert_eq!(spec.qos, None);
+    }
+
+    #[test]
+    fn apply_default_qos_stale_association_default_degrades_silently() {
+        let assoc = AssociationCache::new();
+        // Association still points at a QOS that has since been deleted.
+        assoc.insert_default_qos("testuser", "research", "deleted-qos");
+        let qos = QosCache::new(); // empty: "deleted-qos" is not there
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        super::apply_default_qos(&mut spec, &assoc, &qos).unwrap();
+        assert_eq!(spec.qos, None, "must not fail submission on stale data");
     }
 
     // ── array-parent dependency: cancel + display synthesis ──────

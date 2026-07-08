@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod accounting;
+mod association_cache;
 mod cluster;
 mod fairshare_cache;
 mod limits_cache;
@@ -172,6 +173,11 @@ async fn main() -> anyhow::Result<()> {
                     );
 
                     cluster.qos_cache().spawn_refresh_loop(
+                        pool.clone(),
+                        config.accounting.fairshare_refresh_secs as u64,
+                    );
+
+                    cluster.association_cache().spawn_refresh_loop(
                         pool.clone(),
                         config.accounting.fairshare_refresh_secs as u64,
                     );
