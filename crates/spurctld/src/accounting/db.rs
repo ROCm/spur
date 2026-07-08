@@ -510,14 +510,20 @@ pub async fn add_user(
     .execute(pool)
     .await?;
 
-    // Also create association.
-    sqlx::query(
+    // Also create/update the association. Deliberately NOT an `INSERT ...
+    // ON CONFLICT (user_name, account, partition_name)`: that constraint's
+    // partition_name is nullable, and Postgres never treats NULL = NULL for
+    // uniqueness, so ON CONFLICT silently fails to match and would insert a
+    // new duplicate row on every call instead of updating the existing one
+    // (pre-existing databases may already carry such duplicates from before
+    // this fix). UPDATE explicitly instead — on a database with duplicates
+    // this updates all of them identically (self-healing: they converge to
+    // the same values instead of disagreeing), and does not delete anything.
+    let updated = sqlx::query(
         r#"
-        INSERT INTO associations (user_name, account, is_default, default_qos)
-        VALUES ($1, $2, $3, NULLIF($4, ''))
-        ON CONFLICT (user_name, account, partition_name) DO UPDATE SET
-            is_default = $3,
-            default_qos = NULLIF($4, '')
+        UPDATE associations SET is_default = $3, default_qos = NULLIF($4, '')
+        WHERE user_name = $1 AND account = $2
+          AND (partition_name IS NULL OR partition_name = '')
         "#,
     )
     .bind(user)
@@ -526,6 +532,21 @@ pub async fn add_user(
     .bind(default_qos)
     .execute(pool)
     .await?;
+
+    if updated.rows_affected() == 0 {
+        sqlx::query(
+            r#"
+            INSERT INTO associations (user_name, account, is_default, default_qos)
+            VALUES ($1, $2, $3, NULLIF($4, ''))
+            "#,
+        )
+        .bind(user)
+        .bind(account)
+        .bind(is_default)
+        .bind(default_qos)
+        .execute(pool)
+        .await?;
+    }
 
     Ok(())
 }
@@ -548,16 +569,25 @@ pub async fn remove_user(pool: &PgPool, user: &str, account: &str) -> anyhow::Re
 /// List users, optionally filtered by account. Joins each user's own
 /// association row (`partition_name IS NULL`, the only kind `add_user`
 /// creates) to surface its `default_qos`.
+///
+/// `DISTINCT ON` + `a.id DESC`: a database predating the `add_user` upsert
+/// fix above may still carry duplicate association rows for the same
+/// (user, account) with disagreeing `default_qos` values (from before that
+/// fix). Rather than leaving the join's row selection to be
+/// nondeterministic, always surface the most-recently-written one. This is
+/// a read-side accommodation only — it does not touch or delete the older
+/// rows.
 pub async fn list_users(pool: &PgPool, account: Option<&str>) -> anyhow::Result<Vec<UserRecord>> {
     let rows = if let Some(acct) = account {
         sqlx::query(
             r#"
-            SELECT u.name, u.account, u.admin_level, u.default_account, a.default_qos
+            SELECT DISTINCT ON (u.name, u.account)
+                u.name, u.account, u.admin_level, u.default_account, a.default_qos
             FROM users u
             LEFT JOIN associations a
                 ON a.user_name = u.name AND a.account = u.account AND a.partition_name IS NULL
             WHERE u.account = $1
-            ORDER BY u.name
+            ORDER BY u.name, u.account, a.id DESC NULLS LAST
             "#,
         )
         .bind(acct)
@@ -566,11 +596,12 @@ pub async fn list_users(pool: &PgPool, account: Option<&str>) -> anyhow::Result<
     } else {
         sqlx::query(
             r#"
-            SELECT u.name, u.account, u.admin_level, u.default_account, a.default_qos
+            SELECT DISTINCT ON (u.name, u.account)
+                u.name, u.account, u.admin_level, u.default_account, a.default_qos
             FROM users u
             LEFT JOIN associations a
                 ON a.user_name = u.name AND a.account = u.account AND a.partition_name IS NULL
-            ORDER BY u.name, u.account
+            ORDER BY u.name, u.account, a.id DESC NULLS LAST
             "#,
         )
         .fetch_all(pool)
@@ -967,6 +998,74 @@ mod job_history_tests {
             .await?;
         sqlx::query("DELETE FROM qos WHERE name = $1")
             .bind(&qos_name)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn add_user_never_creates_a_duplicate_association_row() -> anyhow::Result<()> {
+        // Regression: associations.partition_name is nullable, and Postgres
+        // never treats NULL = NULL for uniqueness, so an `INSERT ... ON
+        // CONFLICT (user_name, account, partition_name)` silently fails to
+        // match and inserts a new row every time instead of updating the
+        // existing one. Repeated add_user calls (exactly what `sacctmgr
+        // modify user` now does) must converge on ONE row, not accumulate.
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let user = format!("spur_nodupe_user_{pid}");
+        let account = format!("spur_nodupe_acct_{pid}");
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+
+        upsert_account(&pool, &account, "d", "o", None, 1, None).await?;
+
+        add_user(&pool, &user, &account, "none", true, "").await?;
+        add_user(&pool, &user, &account, "none", true, "").await?;
+        add_user(
+            &pool,
+            &user,
+            &account,
+            "none",
+            true,
+            "highprio-does-not-need-to-exist",
+        )
+        .await?;
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM associations WHERE user_name = $1 AND account = $2",
+        )
+        .bind(&user)
+        .bind(&account)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            count, 1,
+            "repeated add_user must update in place, not accumulate rows"
+        );
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
             .execute(&pool)
             .await?;
         Ok(())
