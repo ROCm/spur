@@ -173,7 +173,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 // "no suitable nodes at all".
                 cluster.update_pending_reasons(&unscheduled, &cluster_state);
 
-                try_preempt(&cluster, &unscheduled);
+                try_preempt(&cluster, &partitions, &unscheduled).await;
 
                 // Federation: forward still-unschedulable jobs to peer clusters.
                 if !cluster.config.federation.clusters.is_empty() {
@@ -408,9 +408,35 @@ pub(crate) fn compute_job_allocation(
     }
 }
 
-/// Try to preempt lower-priority running jobs to make room for higher-priority pending jobs.
-fn try_preempt(cluster: &Arc<ClusterManager>, unscheduled: &[&spur_core::job::Job]) {
+/// Resolve the effective PreemptMode for a job from its partition config.
+fn job_preempt_mode(
+    job: &spur_core::job::Job,
+    partitions: &[spur_core::partition::Partition],
+) -> spur_core::partition::PreemptMode {
+    use spur_core::partition::PreemptMode;
+    let Some(name) = job.spec.partition.as_deref().filter(|p| !p.is_empty()) else {
+        return PreemptMode::Off;
+    };
+    partitions
+        .iter()
+        .find(|p| p.name == name)
+        .map(|p| p.preempt_mode)
+        .unwrap_or(PreemptMode::Off)
+}
+
+/// Try to preempt lower-priority running jobs to make room for higher-priority
+/// pending jobs. Honors the running job's partition PreemptMode: cancel and
+/// requeue kill the process on every node (requeue also returns the job to
+/// Pending); suspend stops it in place. Jobs whose partition has PreemptMode
+/// Off are never preempted.
+async fn try_preempt(
+    cluster: &Arc<ClusterManager>,
+    partitions: &[spur_core::partition::Partition],
+    unscheduled: &[&spur_core::job::Job],
+) {
+    use crate::cluster::PreemptOutcome;
     use spur_core::job::JobState;
+    use spur_core::partition::PreemptMode;
 
     // Get running jobs sorted by priority (lowest first = best preemption candidates)
     let mut running: Vec<spur_core::job::Job> = cluster
@@ -422,24 +448,41 @@ fn try_preempt(cluster: &Arc<ClusterManager>, unscheduled: &[&spur_core::job::Jo
     for pending in unscheduled {
         // Only preempt if pending job has significantly higher priority
         for candidate in &running {
-            if candidate.priority < pending.priority / 2 {
-                // Preempt: cancel the lower-priority job
-                info!(
-                    preempted_job = candidate.job_id,
-                    preempted_priority = candidate.priority,
-                    pending_job = pending.job_id,
-                    pending_priority = pending.priority,
-                    "preempting lower-priority job"
-                );
-                if let Err(e) = cluster.complete_job(candidate.job_id, -1, JobState::Preempted) {
+            if candidate.priority >= pending.priority / 2 {
+                continue;
+            }
+            let mode = job_preempt_mode(candidate, partitions);
+            if mode == PreemptMode::Off {
+                continue;
+            }
+            info!(
+                preempted_job = candidate.job_id,
+                preempted_priority = candidate.priority,
+                pending_job = pending.job_id,
+                pending_priority = pending.priority,
+                mode = ?mode,
+                "preempting lower-priority job"
+            );
+            match cluster.preempt_job(candidate.job_id, mode) {
+                Ok(PreemptOutcome::Killed) => {
+                    // Signal 0 = graceful cancel (SIGTERM, then SIGKILL after a
+                    // grace period), giving the preempted job a chance to
+                    // checkpoint — matches Slurm's default preemption grace.
+                    send_cancel_to_agents(cluster, candidate, 0).await;
+                }
+                Ok(PreemptOutcome::Suspended) => {
+                    send_suspend_to_agents(cluster, candidate, false).await;
+                }
+                Err(e) => {
                     warn!(
                         job_id = candidate.job_id,
                         error = %e,
                         "failed to preempt job"
                     );
+                    continue;
                 }
-                break; // One preemption per cycle, re-evaluate next cycle
             }
+            break; // One preemption per cycle, re-evaluate next cycle
         }
     }
 }

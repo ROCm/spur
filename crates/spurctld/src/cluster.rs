@@ -14,9 +14,11 @@ use tracing::{debug, info, warn};
 use spur_core::accounting::{Qos, TresRecord, TresType};
 use spur_core::burst_buffer::BbStageState;
 use spur_core::config::SlurmConfig;
-use spur_core::job::{Job, JobId, JobSpec, JobState, NodeCompleteError, PendingReason};
+use spur_core::job::{
+    Job, JobId, JobSpec, JobState, NodeCompleteError, PendingReason, TransitionOutcome,
+};
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
-use spur_core::partition::Partition;
+use spur_core::partition::{Partition, PreemptMode};
 use spur_core::qos::{check_qos_limits, QosCheckResult};
 use spur_core::reservation::Reservation;
 use spur_core::resource::{ResourceAllocations, ResourceSet};
@@ -40,6 +42,15 @@ pub enum NodeCompleteResult {
     AllDone { state: JobState, exit_code: i32 },
     /// Job was already in a terminal state (duplicate or race with cancel/timeout).
     AlreadyTerminal,
+}
+
+/// What the caller must dispatch to node agents after `preempt_job`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreemptOutcome {
+    /// Kill the job's processes on every allocated node (cancel or requeue mode).
+    Killed,
+    /// Stop (SIGSTOP) the job's processes; allocation is retained (suspend mode).
+    Suspended,
 }
 
 /// Central cluster state manager.
@@ -592,6 +603,63 @@ impl ClusterManager {
 
         debug!(job_id, exit_code, "job completed");
         Ok(())
+    }
+
+    /// Preempt a running job according to its partition's PreemptMode.
+    ///
+    /// Performs the controller-side state change and, for requeue mode, returns
+    /// the job to Pending so it is rescheduled once resources free up. The
+    /// caller is responsible for dispatching the matching signal to node agents
+    /// (kill for cancel/requeue, SIGSTOP for suspend); the returned
+    /// `PreemptOutcome` says which. `Off` is rejected so the caller never
+    /// preempts a job whose partition forbids it.
+    pub fn preempt_job(&self, job_id: JobId, mode: PreemptMode) -> anyhow::Result<PreemptOutcome> {
+        {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            if job.state != JobState::Running {
+                anyhow::bail!("job {} is not running (state {:?})", job_id, job.state);
+            }
+        }
+
+        match mode {
+            PreemptMode::Off => anyhow::bail!("preemption disabled for job {}", job_id),
+            PreemptMode::Suspend => {
+                self.suspend_job(job_id, "")?;
+                info!(job_id, "job preempted (suspend)");
+                Ok(PreemptOutcome::Suspended)
+            }
+            PreemptMode::Cancel => {
+                self.complete_job(job_id, -1, JobState::Cancelled)?;
+                info!(job_id, "job preempted (cancel)");
+                Ok(PreemptOutcome::Killed)
+            }
+            PreemptMode::Requeue => {
+                // Complete as Preempted first: this deallocates nodes, returns
+                // licenses, fires accounting, and — for --requeue jobs — already
+                // routes back to Pending via notify_job_finished/maybe_requeue.
+                self.complete_job(job_id, -1, JobState::Preempted)?;
+                // Requeue preempt mode returns the job to the queue regardless of
+                // the job's own --requeue flag, so force Pending if it stranded
+                // in the terminal Preempted state.
+                let needs_requeue = self
+                    .jobs
+                    .read()
+                    .get(&job_id)
+                    .is_some_and(|j| j.state == JobState::Preempted);
+                if needs_requeue {
+                    self.propose(WalOperation::JobStateChange {
+                        job_id,
+                        old_state: JobState::Preempted,
+                        new_state: JobState::Pending,
+                    })?;
+                }
+                info!(job_id, "job preempted (requeue)");
+                Ok(PreemptOutcome::Killed)
+            }
+        }
     }
 
     fn run_job_finalized_side_effects(&self, finalized: JobFinalized) {
@@ -2268,11 +2336,17 @@ impl ClusterManager {
                 job_id, new_state, ..
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
-                    if let Err(e) = job.transition(*new_state) {
-                        warn!(job_id = *job_id, error = %e, "invalid state transition in WAL apply");
-                    }
-                    // Requeue: reset allocation fields when returning to Pending
-                    if *new_state == JobState::Pending {
+                    let outcome = match job.apply_transition(*new_state) {
+                        Ok(outcome) => outcome,
+                        Err(e) => {
+                            warn!(job_id = *job_id, error = %e, "invalid state transition in WAL apply");
+                            TransitionOutcome::NoOp
+                        }
+                    };
+                    // Requeue: reset allocation fields when returning to Pending.
+                    // Gated on a real transition so a replayed (already-Pending)
+                    // entry doesn't double-count requeue_count or re-wipe fields.
+                    if outcome == TransitionOutcome::Applied && *new_state == JobState::Pending {
                         job.requeue_count += 1;
                         job.start_time = None;
                         job.exit_code = None;
@@ -2285,21 +2359,24 @@ impl ClusterManager {
             }
             WalOperation::JobSuspend { job_id, at } => {
                 if let Some(job) = jobs.get_mut(job_id) {
-                    if let Err(e) = job.transition(JobState::Suspended) {
-                        warn!(job_id = *job_id, error = %e, "invalid suspend transition in WAL apply");
-                    } else {
-                        job.suspended_at = Some(*at);
+                    match job.apply_transition(JobState::Suspended) {
+                        Ok(TransitionOutcome::Applied) => job.suspended_at = Some(*at),
+                        Ok(TransitionOutcome::NoOp) => {}
+                        Err(e) => {
+                            warn!(job_id = *job_id, error = %e, "invalid suspend transition in WAL apply")
+                        }
                     }
                 }
             }
             WalOperation::JobResume { job_id, at } => {
                 if let Some(job) = jobs.get_mut(job_id) {
-                    match job.transition(JobState::Running) {
-                        Ok(()) => {
+                    match job.apply_transition(JobState::Running) {
+                        Ok(TransitionOutcome::Applied) => {
                             if let Some(since) = job.suspended_at.take() {
                                 job.suspended_secs += (*at - since).num_seconds().max(0);
                             }
                         }
+                        Ok(TransitionOutcome::NoOp) => {}
                         Err(e) => {
                             warn!(job_id = *job_id, error = %e, "invalid resume transition in WAL apply")
                         }
@@ -4608,6 +4685,187 @@ mod tests {
 
         let job = cm.get_job(job_id).unwrap();
         assert_eq!(job.state, JobState::Cancelled);
+    }
+
+    /// Drive a fresh job all the way to RUNNING on `node`, returning its id.
+    fn run_job_on(cm: &ClusterManager, name: &str, node: &str) -> JobId {
+        let job_id = submit_and_wait(cm, basic_spec(name));
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec![node.into()],
+            resources.clone(),
+            per_node_for(&[node], resources),
+        )
+        .unwrap();
+        settle(cm, job_id, JobState::Running);
+        job_id
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_job_requeue_returns_job_to_pending_and_frees_nodes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        // --requeue not set on the spec: requeue preempt mode must still
+        // return the job to the queue rather than stranding it in PREEMPTED.
+        let job_id = run_job_on(&cm, "preempt-requeue", "worker1");
+        assert_eq!(cm.node_metrics().alloc_cpus, 2);
+
+        let outcome = cm.preempt_job(job_id, PreemptMode::Requeue).unwrap();
+        assert_eq!(outcome, PreemptOutcome::Killed);
+        settle(&cm, job_id, JobState::Pending);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.allocated_nodes.is_empty());
+        assert_eq!(cm.node_metrics().alloc_cpus, 0, "nodes must be freed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_job_cancel_terminates_and_frees_nodes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "preempt-cancel", "worker1");
+        let outcome = cm.preempt_job(job_id, PreemptMode::Cancel).unwrap();
+        assert_eq!(outcome, PreemptOutcome::Killed);
+        settle(&cm, job_id, JobState::Cancelled);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(cm.node_metrics().alloc_cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_job_suspend_retains_allocation() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "preempt-suspend", "worker1");
+        let outcome = cm.preempt_job(job_id, PreemptMode::Suspend).unwrap();
+        assert_eq!(outcome, PreemptOutcome::Suspended);
+        settle(&cm, job_id, JobState::Suspended);
+
+        // Suspend retains the allocation (the process is only SIGSTOP'd).
+        assert_eq!(cm.node_metrics().alloc_cpus, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_job_off_mode_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "preempt-off", "worker1");
+        assert!(cm.preempt_job(job_id, PreemptMode::Off).is_err());
+        // Job keeps running; nothing was preempted.
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_job_rejects_non_running() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let job_id = submit_and_wait(&cm, basic_spec("still-pending"));
+        assert!(cm.preempt_job(job_id, PreemptMode::Requeue).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_job_state_change_idempotent_on_replay() {
+        // WAL replay re-applies committed entries. A terminal job whose
+        // completion entry is replayed must stay terminal without erroring or
+        // re-running finalize side effects.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("replay")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+
+        // Re-applying the same running transition is a NoOp, not an error.
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Running);
+
+        let alloc = scalar_alloc(2, 4000);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["worker1".into()],
+            resources: alloc.clone(),
+            per_node_alloc: per_node_for(&["worker1"], alloc),
+        });
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Completed,
+        });
+
+        // Replaying the terminal complete: still Completed, resources still freed.
+        let replayed = cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Completed,
+        });
+        assert!(replayed.jobs_finalized.is_empty());
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Completed);
+        assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_requeue_state_change_not_double_counted_on_replay() {
+        // A replayed Preempted->Pending entry must not double-increment
+        // requeue_count or re-wipe allocation fields.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("requeue-replay")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: -1,
+            state: JobState::Preempted,
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Preempted,
+            new_state: JobState::Pending,
+        });
+        assert_eq!(cm.get_job(1).unwrap().requeue_count, 1);
+
+        // Replay the same requeue transition (job already Pending): NoOp.
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Preempted,
+            new_state: JobState::Pending,
+        });
+        assert_eq!(
+            cm.get_job(1).unwrap().requeue_count,
+            1,
+            "replayed requeue must not double-count"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -742,6 +742,17 @@ impl NodeCompleteError {
     }
 }
 
+/// Result of applying a transition through the tolerant apply path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionOutcome {
+    /// The state changed from its previous value to the requested one.
+    Applied,
+    /// The requested state equalled the current state; nothing changed.
+    /// Expected on WAL replay / HA follower catch-up where an entry may be
+    /// re-applied after it has already taken effect.
+    NoOp,
+}
+
 impl Job {
     /// Attempt a state transition, enforcing the state machine.
     pub fn transition(&mut self, to: JobState) -> Result<(), JobTransitionError> {
@@ -799,6 +810,23 @@ impl Job {
                 to,
             })
         }
+    }
+
+    /// Transition tolerant of already-applied entries, for the WAL apply path.
+    ///
+    /// A request to move to the state the job is already in is a `NoOp` rather
+    /// than an error: replaying a committed log or catching up an HA follower
+    /// legitimately re-applies entries, and those must not surface as invalid
+    /// transitions. Genuine illegal moves (e.g. Completed -> Running) still
+    /// error. Live command paths use the strict `transition()` instead.
+    pub fn apply_transition(
+        &mut self,
+        to: JobState,
+    ) -> Result<TransitionOutcome, JobTransitionError> {
+        if self.state == to {
+            return Ok(TransitionOutcome::NoOp);
+        }
+        self.transition(to).map(|()| TransitionOutcome::Applied)
     }
 }
 
@@ -1058,6 +1086,51 @@ mod tests {
     fn test_invalid_transition() {
         let mut job = make_job();
         assert!(job.transition(JobState::Completed).is_err());
+    }
+
+    #[test]
+    fn apply_transition_idempotent_terminal_is_noop() {
+        // WAL replay / HA follower catch-up re-applies committed entries. A
+        // completed job re-completing must be a silent NoOp, not an error.
+        let mut job = make_job();
+        job.transition(JobState::Running).unwrap();
+        job.transition(JobState::Completed).unwrap();
+
+        let outcome = job
+            .apply_transition(JobState::Completed)
+            .expect("re-applying the current terminal state must not error");
+        assert_eq!(outcome, TransitionOutcome::NoOp);
+        assert_eq!(job.state, JobState::Completed);
+    }
+
+    #[test]
+    fn apply_transition_reports_applied_for_real_move() {
+        let mut job = make_job();
+        let outcome = job
+            .apply_transition(JobState::Running)
+            .expect("Pending -> Running is legal");
+        assert_eq!(outcome, TransitionOutcome::Applied);
+        assert_eq!(job.state, JobState::Running);
+    }
+
+    #[test]
+    fn apply_transition_still_rejects_illegal_move() {
+        // Idempotency tolerance must not weaken the state machine: a genuinely
+        // illegal move (Completed -> Running) still errors on the apply path.
+        let mut job = make_job();
+        job.transition(JobState::Running).unwrap();
+        job.transition(JobState::Completed).unwrap();
+        assert!(job.apply_transition(JobState::Running).is_err());
+        assert_eq!(job.state, JobState::Completed);
+    }
+
+    #[test]
+    fn apply_transition_noop_on_non_terminal_repeat() {
+        let mut job = make_job();
+        job.transition(JobState::Running).unwrap();
+        let outcome = job.apply_transition(JobState::Running).unwrap();
+        assert_eq!(outcome, TransitionOutcome::NoOp);
+        assert_eq!(job.state, JobState::Running);
     }
 
     #[test]
