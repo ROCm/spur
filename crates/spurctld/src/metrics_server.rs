@@ -12,8 +12,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use spur_metrics::{
-    encode_job_metrics, encode_nodes_metrics, encode_partitions_metrics, encode_rpc_metrics,
-    encode_scheduler_metrics, CONTENT_TYPE,
+    encode_job_metrics, encode_jobs_users_accts_metrics, encode_nodes_metrics,
+    encode_partitions_metrics, encode_rpc_metrics, encode_scheduler_metrics, CONTENT_TYPE,
 };
 use tracing::info;
 
@@ -79,7 +79,9 @@ async fn metrics_partitions(State(state): State<Arc<MetricsState>>) -> Response 
     if !state.raft.is_leader() {
         return not_leader_response();
     }
-    metrics_response(encode_partitions_metrics())
+    metrics_response(encode_partitions_metrics(
+        &state.cluster.partition_metrics(),
+    ))
 }
 
 async fn metrics_rpc(State(state): State<Arc<MetricsState>>) -> Response {
@@ -107,11 +109,9 @@ async fn metrics_jobs_users_accts(State(state): State<Arc<MetricsState>>) -> Res
     if !state.raft.is_leader() {
         return not_leader_response();
     }
-    (
-        StatusCode::NOT_FOUND,
-        "jobs-users-accts metrics deferred to a follow-up PR",
-    )
-        .into_response()
+    metrics_response(encode_jobs_users_accts_metrics(
+        &state.cluster.user_acct_metrics(),
+    ))
 }
 
 fn not_leader_response() -> Response {
@@ -386,5 +386,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn metrics_jobs_users_accts_returns_ok_when_enabled() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.metrics.high_cardinality = true;
+        let cm = Arc::new(ClusterManager::new(config, dir.path()).unwrap());
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .expect("single-node raft did not self-elect within 5s");
+        let state = Arc::new(MetricsState {
+            cluster: cm,
+            raft: Arc::new(handle),
+            rpc_stats: Arc::new(RpcStatsCollector::new()),
+            sched_stats: Arc::new(SchedStatsCollector::new("backfill")),
+        });
+        let resp = metrics_jobs_users_accts(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            CONTENT_TYPE
+        );
     }
 }

@@ -14,6 +14,11 @@ pub struct SchedStatsSnapshot {
     pub jobs_started: u64,
     pub jobs_finalized: u64,
     pub jobs_started_last_cycle: u64,
+    /// Cycles that considered every pending job (not depth-limited).
+    pub exit_end: u64,
+    /// Cycles that stopped early because more jobs were pending than
+    /// `scheduler.max_jobs_per_cycle` allows considering in one pass.
+    pub exit_max_depth: u64,
 }
 
 impl SchedStatsSnapshot {

@@ -26,6 +26,8 @@ use spur_core::step::{JobStep, StepState, STEP_BATCH, STEP_RESERVED_MIN};
 use spur_core::wal::WalOperation;
 use spur_metrics::job::JobMetricsSnapshot;
 use spur_metrics::node::NodeMetricsSnapshot;
+use spur_metrics::partition::PartitionMetricsSnapshot;
+use spur_metrics::user_acct::UserAcctMetricsSnapshot;
 
 use crate::accounting::AccountingNotifier;
 use crate::fairshare_cache::FairshareCache;
@@ -265,6 +267,29 @@ impl ClusterManager {
     pub fn node_metrics(&self) -> NodeMetricsSnapshot {
         let nodes = self.nodes.read();
         NodeMetricsSnapshot::collect(nodes.values())
+    }
+
+    /// Aggregated per-partition metrics from the current job, node, and partition maps.
+    pub fn partition_metrics(&self) -> PartitionMetricsSnapshot {
+        let names: Vec<String> = self
+            .partitions
+            .read()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        let jobs = self.jobs.read();
+        let nodes = self.nodes.read();
+        PartitionMetricsSnapshot::collect(
+            names.iter().map(|s| s.as_str()),
+            jobs.values(),
+            nodes.values(),
+        )
+    }
+
+    /// Aggregated per-user and per-account job metrics from the current job map.
+    pub fn user_acct_metrics(&self) -> UserAcctMetricsSnapshot {
+        let jobs = self.jobs.read();
+        UserAcctMetricsSnapshot::collect(jobs.values())
     }
 
     /// Get jobs matching filters.
@@ -2154,9 +2179,15 @@ impl ClusterManager {
         cycle_time_us: u64,
         schedule_time_us: u64,
         jobs_started: u64,
+        hit_depth_limit: bool,
     ) {
         if let Some(stats) = self.sched_stats.get() {
-            stats.record_cycle(cycle_time_us, schedule_time_us, jobs_started);
+            stats.record_cycle(
+                cycle_time_us,
+                schedule_time_us,
+                jobs_started,
+                hit_depth_limit,
+            );
         }
     }
 
@@ -4045,7 +4076,7 @@ mod tests {
             per_node_for(&["worker1"], resources),
         )
         .unwrap();
-        cm.record_sched_cycle(0, 0, 1);
+        cm.record_sched_cycle(0, 0, 1, false);
         assert_eq!(stats.snapshot().jobs_started, 1);
 
         cm.complete_job(job_id, 0, JobState::Completed).unwrap();

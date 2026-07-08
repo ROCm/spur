@@ -115,6 +115,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         if pending.is_empty() {
             continue;
         }
+        let hit_depth_limit = pending.len() > max_jobs;
 
         let nodes = cluster.get_nodes();
         let partitions = cluster.get_partitions();
@@ -153,7 +154,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 let cycle_time_us = cycle_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
                 let schedule_time_us =
                     schedule_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
-                cluster.record_sched_cycle(cycle_time_us, schedule_time_us, 0);
+                cluster.record_sched_cycle(cycle_time_us, schedule_time_us, 0, hit_depth_limit);
                 continue;
             }
         };
@@ -357,7 +358,12 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         }
 
         let cycle_time_us = cycle_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
-        cluster.record_sched_cycle(cycle_time_us, schedule_time_us, jobs_started_cycle);
+        cluster.record_sched_cycle(
+            cycle_time_us,
+            schedule_time_us,
+            jobs_started_cycle,
+            hit_depth_limit,
+        );
     }
 }
 

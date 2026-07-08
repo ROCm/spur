@@ -28,4 +28,10 @@ spur_scheduler_jobs_started_total 30
 # HELP spur_scheduler_jobs_finalized Jobs reaching a terminal state since reset.
 # TYPE spur_scheduler_jobs_finalized counter
 spur_scheduler_jobs_finalized_total 28
+# HELP spur_scheduler_exit_end Cycles that considered every pending job.
+# TYPE spur_scheduler_exit_end counter
+spur_scheduler_exit_end_total 8
+# HELP spur_scheduler_exit_max_depth Cycles that stopped early at scheduler.max_jobs_per_cycle.
+# TYPE spur_scheduler_exit_max_depth counter
+spur_scheduler_exit_max_depth_total 2
 # EOF
