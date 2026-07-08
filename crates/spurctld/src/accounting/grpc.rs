@@ -320,6 +320,9 @@ impl SlurmAccounting for AccountingService {
 
     async fn add_user(&self, request: Request<AddUserRequest>) -> Result<Response<()>, Status> {
         let req = request.into_inner();
+        // Validated against the live DB, not QosCache: a QOS created just
+        // now may not have reached the cache's next refresh yet, same
+        // inherent lag job submission already accepts for QosCache reads.
         if !req.default_qos.is_empty() {
             let exists = db::qos_exists(&self.pool, &req.default_qos)
                 .await

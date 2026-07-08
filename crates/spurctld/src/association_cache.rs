@@ -9,31 +9,43 @@ use parking_lot::RwLock;
 use sqlx::PgPool;
 use tracing::{info, warn};
 
+struct Snapshot {
+    default_qos: HashMap<(String, String), String>,
+    default_account: HashMap<String, String>,
+}
+
 /// Controller-side cache of user/account association defaults. Mirrors
-/// `FairshareCache`/`QosCache`.
+/// `FairshareCache`/`QosCache`: one lock guards one atomic snapshot, so a
+/// refresh can never be observed half-applied.
 pub struct AssociationCache {
-    default_qos: RwLock<HashMap<(String, String), String>>,
-    default_account: RwLock<HashMap<String, String>>,
+    snapshot: RwLock<Snapshot>,
 }
 
 impl AssociationCache {
     pub fn new() -> Self {
         Self {
-            default_qos: RwLock::new(HashMap::new()),
-            default_account: RwLock::new(HashMap::new()),
+            snapshot: RwLock::new(Snapshot {
+                default_qos: HashMap::new(),
+                default_account: HashMap::new(),
+            }),
         }
     }
 
-    /// The default QOS for a user's association with `account`, if set.
-    pub fn default_qos(&self, user: &str, account: &str) -> Option<String> {
-        let key = (user.to_owned(), account.to_owned());
-        self.default_qos.read().get(&key).cloned()
-    }
-
-    /// The user's default account, if one is set (mirrors Slurm's
-    /// `DefaultAccount`, used when a job omits `--account`).
-    pub fn default_account(&self, user: &str) -> Option<String> {
-        self.default_account.read().get(user).cloned()
+    /// The effective account (given, or the user's default) and that
+    /// association's default QOS, resolved under a single read lock so a
+    /// concurrent refresh can't yield a torn old/new combination.
+    pub fn resolve(&self, user: &str, account: Option<&str>) -> (Option<String>, Option<String>) {
+        let snapshot = self.snapshot.read();
+        let effective_account = account
+            .map(str::to_owned)
+            .or_else(|| snapshot.default_account.get(user).cloned());
+        let default_qos = effective_account.as_ref().and_then(|acct| {
+            snapshot
+                .default_qos
+                .get(&(user.to_owned(), acct.clone()))
+                .cloned()
+        });
+        (effective_account, default_qos)
     }
 
     fn replace(
@@ -41,22 +53,26 @@ impl AssociationCache {
         default_qos: HashMap<(String, String), String>,
         default_account: HashMap<String, String>,
     ) {
-        *self.default_qos.write() = default_qos;
-        *self.default_account.write() = default_account;
+        *self.snapshot.write() = Snapshot {
+            default_qos,
+            default_account,
+        };
     }
 
     /// Test-only seam: populates the cache without a database.
     #[cfg(test)]
     pub(crate) fn insert_default_qos(&self, user: &str, account: &str, qos: &str) {
-        self.default_qos
+        self.snapshot
             .write()
+            .default_qos
             .insert((user.to_owned(), account.to_owned()), qos.to_owned());
     }
 
     #[cfg(test)]
     pub(crate) fn insert_default_account(&self, user: &str, account: &str) {
-        self.default_account
+        self.snapshot
             .write()
+            .default_account
             .insert(user.to_owned(), account.to_owned());
     }
 
@@ -112,46 +128,96 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_qos_missing_returns_none() {
+    fn resolve_unknown_association_has_no_default_qos() {
         let cache = AssociationCache::new();
-        assert_eq!(cache.default_qos("alice", "research"), None);
+        // The given account is echoed back even for an unknown user; only
+        // the qos half is None when there's no matching association.
+        assert_eq!(
+            cache.resolve("alice", Some("research")),
+            (Some("research".into()), None)
+        );
     }
 
     #[test]
-    fn default_qos_hit_after_insert() {
+    fn resolve_unknown_user_with_no_account_given_resolves_nothing() {
+        let cache = AssociationCache::new();
+        assert_eq!(cache.resolve("alice", None), (None, None));
+    }
+
+    #[test]
+    fn resolve_hit_after_insert() {
         let cache = AssociationCache::new();
         cache.insert_default_qos("alice", "research", "highprio");
         assert_eq!(
-            cache.default_qos("alice", "research"),
-            Some("highprio".into())
+            cache.resolve("alice", Some("research")),
+            (Some("research".into()), Some("highprio".into()))
         );
-        // Different account, same user: no match.
-        assert_eq!(cache.default_qos("alice", "other"), None);
+        // Different account, same user: no qos match, but the given
+        // account is still echoed back as the resolved one.
+        assert_eq!(
+            cache.resolve("alice", Some("other")),
+            (Some("other".into()), None)
+        );
     }
 
     #[test]
-    fn default_account_missing_returns_none() {
-        let cache = AssociationCache::new();
-        assert_eq!(cache.default_account("alice"), None);
-    }
-
-    #[test]
-    fn default_account_hit_after_insert() {
-        let cache = AssociationCache::new();
-        cache.insert_default_account("alice", "research");
-        assert_eq!(cache.default_account("alice"), Some("research".into()));
-    }
-
-    #[test]
-    fn replace_swaps_both_maps_atomically_from_the_readers_perspective() {
+    fn replace_swaps_the_whole_snapshot() {
         let cache = AssociationCache::new();
         cache.insert_default_qos("alice", "research", "old");
         cache.replace(
             HashMap::from([(("bob".to_string(), "eng".to_string()), "new".to_string())]),
             HashMap::from([("bob".to_string(), "eng".to_string())]),
         );
-        assert_eq!(cache.default_qos("alice", "research"), None);
-        assert_eq!(cache.default_qos("bob", "eng"), Some("new".into()));
-        assert_eq!(cache.default_account("bob"), Some("eng".into()));
+        assert_eq!(
+            cache.resolve("alice", Some("research")),
+            (Some("research".into()), None)
+        );
+        assert_eq!(
+            cache.resolve("bob", Some("eng")),
+            (Some("eng".into()), Some("new".into()))
+        );
+        assert_eq!(
+            cache.resolve("bob", None),
+            (Some("eng".into()), Some("new".into()))
+        );
+    }
+
+    #[test]
+    fn resolve_uses_given_account_over_default_account() {
+        let cache = AssociationCache::new();
+        cache.insert_default_account("alice", "research");
+        cache.insert_default_qos("alice", "other", "highprio");
+        let (account, qos) = cache.resolve("alice", Some("other"));
+        assert_eq!(account.as_deref(), Some("other"));
+        assert_eq!(qos.as_deref(), Some("highprio"));
+    }
+
+    #[test]
+    fn resolve_falls_back_to_default_account_when_none_given() {
+        let cache = AssociationCache::new();
+        cache.insert_default_account("alice", "research");
+        cache.insert_default_qos("alice", "research", "highprio");
+        let (account, qos) = cache.resolve("alice", None);
+        assert_eq!(account.as_deref(), Some("research"));
+        assert_eq!(qos.as_deref(), Some("highprio"));
+    }
+
+    #[test]
+    fn resolve_reads_account_and_qos_from_the_same_snapshot() {
+        // Structural guarantee, not a concurrency test: a stale account must
+        // not survive a replace() that wiped it, proving both halves come
+        // from the same snapshot rather than two independently-locked maps.
+        let cache = AssociationCache::new();
+        cache.insert_default_account("alice", "research");
+        cache.replace(
+            HashMap::from([(("bob".to_string(), "eng".to_string()), "new".to_string())]),
+            HashMap::new(), // default_account wiped in the same swap
+        );
+        let (account, qos) = cache.resolve("alice", None);
+        assert_eq!(
+            account, None,
+            "old default_account must not survive the swap"
+        );
+        assert_eq!(qos, None);
     }
 }

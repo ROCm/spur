@@ -73,7 +73,7 @@ explicitly out of scope (see below):
 - **Account-level `DefaultQOS`** (`sacctmgr modify account ... set
   DefaultQOS=`) and cascading/recursive semantics to existing child
   associations. Real Slurm's account-level default interacts with
-  parent/child account hieraromanchy in ways that deserve their own design
+  parent/child account hierarchy in ways that deserve their own design
   pass. Note it as explicit follow-up in the issue when this ships.
 - **Cluster-wide default QOS** (Slurm's `sacctmgr modify cluster set
   DefaultQOS=`). Spur has no "cluster" entity/table; if wanted, the

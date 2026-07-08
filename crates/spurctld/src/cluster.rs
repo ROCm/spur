@@ -3931,26 +3931,21 @@ fn apply_default_qos(
         return Ok(());
     }
 
-    let Some(account) = spec
-        .account
-        .clone()
-        .filter(|a| !a.is_empty())
-        .or_else(|| assoc_cache.default_account(&spec.user))
-    else {
+    let given_account = spec.account.as_deref().filter(|a| !a.is_empty());
+    let (account, default_qos) = assoc_cache.resolve(&spec.user, given_account);
+    let Some(default_qos) = default_qos else {
         return Ok(());
     };
 
-    if let Some(default_qos) = assoc_cache.default_qos(&spec.user, &account) {
-        if qos_cache.get(&default_qos).is_some() {
-            spec.qos = Some(default_qos);
-        } else {
-            warn!(
-                user = %spec.user,
-                account = %account,
-                qos = %default_qos,
-                "association default QOS no longer exists, ignoring"
-            );
-        }
+    if qos_cache.get(&default_qos).is_some() {
+        spec.qos = Some(default_qos);
+    } else {
+        warn!(
+            user = %spec.user,
+            account = account.as_deref().unwrap_or_default(),
+            qos = %default_qos,
+            "association default QOS no longer exists, ignoring"
+        );
     }
     Ok(())
 }
