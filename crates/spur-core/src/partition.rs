@@ -73,6 +73,22 @@ pub enum PreemptMode {
     Suspend,
 }
 
+impl PreemptMode {
+    /// Ranking used to pick a single mode when a job spans multiple partitions
+    /// (comma-separated OR list). Higher = more disruptive to the preempted
+    /// job. A job occupying a node in a partition that permits a harder
+    /// preemption can be preempted that hard, so the most aggressive matched
+    /// mode wins — maximizing the scheduler's ability to free resources.
+    pub fn aggressiveness(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Suspend => 1,
+            Self::Requeue => 2,
+            Self::Cancel => 3,
+        }
+    }
+}
+
 impl Default for Partition {
     fn default() -> Self {
         Self {
@@ -95,5 +111,17 @@ impl Default for Partition {
             preempt_mode: PreemptMode::Off,
             priority_tier: 1,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preempt_mode_aggressiveness_orders_cancel_over_requeue_over_suspend_over_off() {
+        assert!(PreemptMode::Cancel.aggressiveness() > PreemptMode::Requeue.aggressiveness());
+        assert!(PreemptMode::Requeue.aggressiveness() > PreemptMode::Suspend.aggressiveness());
+        assert!(PreemptMode::Suspend.aggressiveness() > PreemptMode::Off.aggressiveness());
     }
 }

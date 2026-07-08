@@ -14,7 +14,6 @@
 //! | 5     | squeue        | spur queue   | t05_queue |
 //! | 6     | scancel       | spur cancel  | t06_cancel |
 //! | 7     | scheduling    | scheduler    | t07_sched |
-//! | 12    | sacct         | spur history | t12_history |
 //! | 17    | sbatch        | spur submit  | t17_submit |
 //! | 21    | sacctmgr      | accounting   | t21_acctmgr |
 //! | 24    | priority      | fair-share   | t24_priority |

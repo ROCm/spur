@@ -3,6 +3,7 @@
 
 pub mod backfill;
 pub mod cons_tres;
+pub mod node_match;
 pub mod priority;
 pub mod timeline;
 pub mod traits;

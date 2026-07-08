@@ -3,8 +3,8 @@
 
 """E2E tests for accounting: sacct exit reporting and QoS pending reasons.
 
-Requires spurdbd + Postgres on node 0 (the accounting_cluster fixture, which
-skips when Docker or the accounting binaries are unavailable).
+Requires Postgres on node 0 (the accounting_cluster fixture, which skips
+when Docker is unavailable).
 """
 
 import re

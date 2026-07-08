@@ -14,14 +14,14 @@ pub struct SacctmgrArgs {
     #[command(subcommand)]
     pub command: SacctmgrCommand,
 
-    /// Accounting daemon address
+    /// Controller address (accounting is served on the same port)
     #[arg(
         long,
-        env = "SPUR_ACCOUNTING_ADDR",
-        default_value = "http://localhost:6819",
+        env = "SPUR_CONTROLLER_ADDR",
+        default_value = "http://localhost:6817",
         global = true
     )]
-    pub accounting: String,
+    pub controller: String,
 
     /// Immediate mode (no confirmation)
     #[arg(short = 'i', long, global = true)]
@@ -76,7 +76,7 @@ pub async fn main() -> Result<()> {
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = SacctmgrArgs::try_parse_from(&args)?;
-    let addr = args.accounting.clone();
+    let addr = args.controller.clone();
 
     match args.command {
         SacctmgrCommand::Add { entity, params } => add(&entity, &params, &addr).await,
@@ -112,7 +112,7 @@ fn parse_params(params: &[String]) -> std::collections::HashMap<String, String> 
 async fn connect(addr: &str) -> Result<SlurmAccountingClient<tonic::transport::Channel>> {
     SlurmAccountingClient::connect(addr.to_string())
         .await
-        .context("failed to connect to spurdbd")
+        .context("failed to connect to controller")
 }
 
 async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {

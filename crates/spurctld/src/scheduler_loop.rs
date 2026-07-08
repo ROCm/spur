@@ -117,6 +117,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         if pending.is_empty() {
             continue;
         }
+        let hit_depth_limit = pending.len() > max_jobs;
 
         let nodes = cluster.get_nodes();
         let partitions = cluster.get_partitions();
@@ -155,7 +156,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 let cycle_time_us = cycle_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
                 let schedule_time_us =
                     schedule_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
-                cluster.record_sched_cycle(cycle_time_us, schedule_time_us, 0);
+                cluster.record_sched_cycle(cycle_time_us, schedule_time_us, 0, hit_depth_limit);
                 continue;
             }
         };
@@ -175,7 +176,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 // "no suitable nodes at all".
                 cluster.update_pending_reasons(&unscheduled, &cluster_state);
 
-                try_preempt(&cluster, &unscheduled);
+                try_preempt(&cluster, &partitions, &unscheduled).await;
 
                 // Federation: forward still-unschedulable jobs to peer clusters.
                 if !cluster.config.federation.clusters.is_empty() {
@@ -359,7 +360,12 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         }
 
         let cycle_time_us = cycle_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
-        cluster.record_sched_cycle(cycle_time_us, schedule_time_us, jobs_started_cycle);
+        cluster.record_sched_cycle(
+            cycle_time_us,
+            schedule_time_us,
+            jobs_started_cycle,
+            hit_depth_limit,
+        );
     }
 }
 
@@ -410,22 +416,53 @@ pub(crate) fn compute_job_allocation(
     }
 }
 
-/// Try to preempt lower-priority running jobs to make room for higher-priority pending jobs.
-pub(crate) fn try_preempt(cluster: &Arc<ClusterManager>, unscheduled: &[&spur_core::job::Job]) {
+/// Resolve the effective PreemptMode for a job from its partition config.
+///
+/// `job.spec.partition` is a comma-separated OR list (same convention as the
+/// backfill scheduler's node matching), so a job may span several partitions.
+/// The most aggressive mode among the matched partitions wins.
+fn job_preempt_mode(
+    job: &spur_core::job::Job,
+    partitions: &[spur_core::partition::Partition],
+) -> spur_core::partition::PreemptMode {
+    use spur_core::partition::PreemptMode;
+    let Some(name) = job.spec.partition.as_deref().filter(|p| !p.is_empty()) else {
+        return PreemptMode::Off;
+    };
+    name.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|req| partitions.iter().find(|p| p.name == req))
+        .map(|p| p.preempt_mode)
+        .max_by_key(|m| m.aggressiveness())
+        .unwrap_or(PreemptMode::Off)
+}
+
+/// Preempt lower-priority running jobs per their partition PreemptMode
+/// (Off jobs are never preempted).
+pub(crate) async fn try_preempt(
+    cluster: &Arc<ClusterManager>,
+    partitions: &[spur_core::partition::Partition],
+    unscheduled: &[&spur_core::job::Job],
+) {
+    use crate::cluster::PreemptOutcome;
     use spur_core::job::JobState;
     use spur_core::partition::{Partition, PreemptMode};
     use spur_core::reservation::job_runs_in_active_reservation;
 
     let now = chrono::Utc::now();
     let reservations = cluster.get_reservations();
-    let partitions = cluster.get_partitions();
     let cluster_nodes = cluster.get_nodes();
 
     let partition_for = |job: &spur_core::job::Job| -> Option<&Partition> {
-        job.spec
-            .partition
-            .as_ref()
-            .and_then(|pname| partitions.iter().find(|p| p.name == *pname))
+        job.spec.partition.as_deref().and_then(|pname| {
+            pname
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .filter_map(|req| partitions.iter().find(|p| p.name == req))
+                .max_by_key(|p| p.preempt_mode.aggressiveness())
+        })
     };
 
     let mut running: Vec<spur_core::job::Job> = cluster
@@ -438,8 +475,7 @@ pub(crate) fn try_preempt(cluster: &Arc<ClusterManager>, unscheduled: &[&spur_co
         let Some(pending_part) = partition_for(pending) else {
             continue;
         };
-        let preempt_mode = pending_part.preempt_mode;
-        if preempt_mode == PreemptMode::Off {
+        if pending_part.preempt_mode == PreemptMode::Off {
             continue;
         }
         let pending_tier = pending_part.priority_tier;
@@ -462,35 +498,36 @@ pub(crate) fn try_preempt(cluster: &Arc<ClusterManager>, unscheduled: &[&spur_co
                 }
             }
 
+            let mode = job_preempt_mode(candidate, partitions);
+            if mode == PreemptMode::Off {
+                continue;
+            }
             info!(
                 preempted_job = candidate.job_id,
                 preempted_priority = candidate.priority,
                 pending_job = pending.job_id,
                 pending_priority = pending.priority,
-                preempt_mode = ?preempt_mode,
+                mode = ?mode,
                 "preempting lower-priority job"
             );
-
-            let result = match preempt_mode {
-                PreemptMode::Suspend => cluster.suspend_job(candidate.job_id, "scheduler"),
-                PreemptMode::Cancel => cluster
-                    .complete_job(candidate.job_id, -1, JobState::Preempted)
-                    .and_then(|_| cluster.requeue_preempted_job(candidate.job_id, false)),
-                PreemptMode::Requeue => cluster
-                    .complete_job(candidate.job_id, -1, JobState::Preempted)
-                    .and_then(|_| cluster.requeue_preempted_job(candidate.job_id, true)),
-                PreemptMode::Off => unreachable!("filtered above"),
-            };
-
-            if let Err(e) = result {
-                warn!(
-                    job_id = candidate.job_id,
-                    error = %e,
-                    "failed to preempt job"
-                );
-            } else {
-                break;
+            match cluster.preempt_job(candidate.job_id, mode) {
+                Ok(PreemptOutcome::Killed) => {
+                    // Signal 0 = graceful cancel (SIGTERM then SIGKILL).
+                    send_cancel_to_agents(cluster, candidate, 0).await;
+                }
+                Ok(PreemptOutcome::Suspended) => {
+                    send_suspend_to_agents(cluster, candidate, false).await;
+                }
+                Err(e) => {
+                    warn!(
+                        job_id = candidate.job_id,
+                        error = %e,
+                        "failed to preempt job"
+                    );
+                    continue;
+                }
             }
+            break; // One preemption per cycle, re-evaluate next cycle
         }
     }
 }
@@ -1394,5 +1431,75 @@ mod tests {
         let alloc = compute_job_allocation(&job, &nodes, &per_node);
 
         assert_eq!(alloc.cpus, 64);
+    }
+
+    fn partition_with_mode(
+        name: &str,
+        mode: spur_core::partition::PreemptMode,
+    ) -> spur_core::partition::Partition {
+        spur_core::partition::Partition {
+            name: name.into(),
+            preempt_mode: mode,
+            ..Default::default()
+        }
+    }
+
+    fn job_in_partitions(partition: &str) -> Job {
+        job_with_spec(JobSpec {
+            partition: Some(partition.into()),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn job_preempt_mode_single_partition() {
+        use spur_core::partition::PreemptMode;
+        let parts = vec![partition_with_mode("gpu", PreemptMode::Requeue)];
+        assert_eq!(
+            job_preempt_mode(&job_in_partitions("gpu"), &parts),
+            PreemptMode::Requeue
+        );
+    }
+
+    #[test]
+    fn job_preempt_mode_unset_or_unknown_is_off() {
+        use spur_core::partition::PreemptMode;
+        let parts = vec![partition_with_mode("gpu", PreemptMode::Cancel)];
+        assert_eq!(
+            job_preempt_mode(&job_with_spec(JobSpec::default()), &parts),
+            PreemptMode::Off
+        );
+        assert_eq!(
+            job_preempt_mode(&job_in_partitions("nope"), &parts),
+            PreemptMode::Off
+        );
+    }
+
+    #[test]
+    fn job_preempt_mode_multi_partition_picks_most_aggressive() {
+        use spur_core::partition::PreemptMode;
+        // A job spanning gpu,cpu must resolve a mode (was Off before the fix,
+        // making multi-partition jobs unpreemptable). Cancel > Requeue.
+        let parts = vec![
+            partition_with_mode("gpu", PreemptMode::Requeue),
+            partition_with_mode("cpu", PreemptMode::Cancel),
+        ];
+        assert_eq!(
+            job_preempt_mode(&job_in_partitions("gpu, cpu"), &parts),
+            PreemptMode::Cancel
+        );
+    }
+
+    #[test]
+    fn job_preempt_mode_multi_partition_off_when_none_configured() {
+        use spur_core::partition::PreemptMode;
+        let parts = vec![
+            partition_with_mode("gpu", PreemptMode::Off),
+            partition_with_mode("cpu", PreemptMode::Off),
+        ];
+        assert_eq!(
+            job_preempt_mode(&job_in_partitions("gpu,cpu"), &parts),
+            PreemptMode::Off
+        );
     }
 }

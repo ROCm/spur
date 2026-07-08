@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -438,9 +438,25 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let _req = request.into_inner();
+        let req = request.into_inner();
         let nodes = self.cluster.get_nodes();
-        let mut proto_nodes: Vec<NodeInfo> = nodes.iter().map(node_to_proto).collect();
+
+        let nodelist = req.nodelist.trim();
+        let allowed_names: Option<HashSet<String>> = (!nodelist.is_empty()).then(|| {
+            spur_sched::node_match::expand_hostlist_or_split(nodelist)
+                .into_iter()
+                .collect()
+        });
+
+        // Honour the request filters; without this, `scontrol show node X` and
+        // `sinfo -n X` return the whole cluster.
+        let mut proto_nodes: Vec<NodeInfo> = nodes
+            .iter()
+            .filter(|n| node_matches_filter(n, allowed_names.as_ref(), &req.partition))
+            .map(node_to_proto)
+            .filter(|n| req.states.is_empty() || req.states.contains(&n.state))
+            .collect();
+
         let reservations = self.cluster.get_reservations();
         annotate_nodes_with_reservations(&mut proto_nodes, &reservations, Utc::now());
         Ok(Response::new(GetNodesResponse { nodes: proto_nodes }))
@@ -1452,6 +1468,7 @@ pub async fn serve(
     raft_handle: Arc<RaftHandle>,
     rpc_stats: Arc<RpcStatsCollector>,
     sched_stats: Arc<SchedStatsCollector>,
+    accounting_pool: Option<sqlx::PgPool>,
 ) -> anyhow::Result<()> {
     let client_addrs: BTreeMap<u64, String> = raft_handle
         .peers
@@ -1479,11 +1496,14 @@ pub async fn serve(
 
     let stats_layer = RpcStatsLayer::new(rpc_stats, raft_handle);
 
-    tonic::transport::Server::builder()
-        .layer(stats_layer)
-        .add_service(SlurmControllerServer::new(service))
-        .serve(addr)
-        .await?;
+    let mut builder = tonic::transport::Server::builder().layer(stats_layer);
+
+    let mut router = builder.add_service(SlurmControllerServer::new(service));
+    if let Some(pool) = accounting_pool {
+        router = router.add_service(crate::accounting::accounting_server(pool));
+    }
+
+    router.serve(addr).await?;
 
     Ok(())
 }
@@ -1916,6 +1936,30 @@ pub(crate) fn datetime_to_proto(dt: chrono::DateTime<chrono::Utc>) -> prost_type
     }
 }
 
+/// Whether a node passes a GetNodes request's name/partition filters. A `None`
+/// name set matches every name; an empty `partition` matches every partition.
+/// `allowed_names` is the caller-expanded Slurm hostlist. `partition` accepts a
+/// Slurm-style comma-separated list, matching if any token names a node partition.
+fn node_matches_filter(
+    node: &spur_core::node::Node,
+    allowed_names: Option<&HashSet<String>>,
+    partition: &str,
+) -> bool {
+    if let Some(allowed) = allowed_names {
+        if !allowed.contains(&node.name) {
+            return false;
+        }
+    }
+    let mut tokens = partition
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    if partition.trim().is_empty() {
+        return true;
+    }
+    tokens.any(|req| node.partitions.iter().any(|p| p == req))
+}
+
 fn annotate_nodes_with_reservations(
     nodes: &mut [NodeInfo],
     reservations: &[Reservation],
@@ -1996,6 +2040,65 @@ mod tests {
             users: Vec::new(),
             flags: Default::default(),
         }
+    }
+
+    fn core_node(name: &str, partition: &str) -> spur_core::node::Node {
+        let mut n =
+            spur_core::node::Node::new(name.into(), spur_core::resource::ResourceSet::default());
+        n.partitions = vec![partition.into()];
+        n
+    }
+
+    fn names(pattern: &str) -> Option<HashSet<String>> {
+        let pattern = pattern.trim();
+        (!pattern.is_empty()).then(|| {
+            spur_sched::node_match::expand_hostlist_or_split(pattern)
+                .into_iter()
+                .collect()
+        })
+    }
+
+    #[test]
+    fn test_node_filter_empty_matches_all() {
+        let n = core_node("gpu01", "batch");
+        assert!(node_matches_filter(&n, names("").as_ref(), ""));
+        assert!(node_matches_filter(&n, names("  ").as_ref(), "  "));
+    }
+
+    #[test]
+    fn test_node_filter_by_name() {
+        let n = core_node("gpu01", "batch");
+        assert!(node_matches_filter(&n, names("gpu01").as_ref(), ""));
+        assert!(!node_matches_filter(&n, names("gpu02").as_ref(), ""));
+    }
+
+    #[test]
+    fn test_node_filter_hostlist_bracket() {
+        let n = core_node("gpu03", "batch");
+        assert!(node_matches_filter(&n, names("gpu[01-04]").as_ref(), ""));
+        assert!(!node_matches_filter(&n, names("gpu[05-08]").as_ref(), ""));
+    }
+
+    #[test]
+    fn test_node_filter_by_partition() {
+        let n = core_node("gpu01", "batch");
+        assert!(node_matches_filter(&n, names("").as_ref(), "batch"));
+        assert!(!node_matches_filter(&n, names("").as_ref(), "debug"));
+    }
+
+    #[test]
+    fn test_node_filter_name_and_partition_both_apply() {
+        let n = core_node("gpu01", "batch");
+        // Right name, wrong partition -> excluded.
+        assert!(!node_matches_filter(&n, names("gpu01").as_ref(), "debug"));
+        assert!(node_matches_filter(&n, names("gpu01").as_ref(), "batch"));
+    }
+
+    #[test]
+    fn test_node_filter_partition_comma_list() {
+        let n = core_node("gpu01", "gpu");
+        assert!(node_matches_filter(&n, names("").as_ref(), "gpu,cpu"));
+        assert!(!node_matches_filter(&n, names("").as_ref(), "cpu,fpga"));
     }
 
     #[test]

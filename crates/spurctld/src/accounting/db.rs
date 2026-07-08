@@ -2,20 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use chrono::{DateTime, Utc};
-use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, QueryBuilder, Row};
-use tracing::{info, warn};
-
-/// Connect to PostgreSQL and return a connection pool.
-pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
-    let pool = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(database_url)
-        .await?;
-
-    info!("connected to database");
-    Ok(pool)
-}
 
 /// Run database migrations (create tables if they don't exist).
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
@@ -152,6 +139,13 @@ pub async fn record_job_start(
         INSERT INTO jobs (job_id, user_name, account, partition_name, num_nodes, num_tasks, cpus_per_task, memory_mb, start_time, state, reservation)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'RUNNING', $10)
         ON CONFLICT (job_id) DO UPDATE SET
+            user_name = $2,
+            account = $3,
+            partition_name = $4,
+            num_nodes = $5,
+            num_tasks = $6,
+            cpus_per_task = $7,
+            memory_mb = $8,
             start_time = $9,
             state = 'RUNNING',
             reservation = $10
@@ -169,6 +163,19 @@ pub async fn record_job_start(
     .bind(reservation)
     .execute(pool)
     .await?;
+
+    // If end_time is already set, the end notification arrived first and skipped
+    // usage computation (start_time was NULL at that point). Compute it now.
+    let end_time: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT end_time FROM jobs WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await?;
+
+    if let Some(end_time) = end_time {
+        update_usage(pool, job_id, end_time).await?;
+    }
+
     Ok(())
 }
 
@@ -183,10 +190,16 @@ pub async fn record_job_end(
     exit_signal: i32,
     derived_exit_code: i32,
 ) -> anyhow::Result<()> {
-    let result = sqlx::query(
+    sqlx::query(
         r#"
-        UPDATE jobs SET state = $2, exit_code = $3, end_time = $4, exit_signal = $5, derived_exit_code = $6
-        WHERE job_id = $1
+        INSERT INTO jobs (job_id, user_name, state, exit_code, end_time, exit_signal, derived_exit_code)
+        VALUES ($1, '', $2, $3, $4, $5, $6)
+        ON CONFLICT (job_id) DO UPDATE SET
+            state = $2,
+            exit_code = $3,
+            end_time = $4,
+            exit_signal = $5,
+            derived_exit_code = $6
         "#,
     )
     .bind(job_id)
@@ -198,14 +211,6 @@ pub async fn record_job_end(
     .execute(pool)
     .await?;
 
-    if result.rows_affected() == 0 {
-        warn!(
-            job_id,
-            "RecordJobEnd for unknown job; start was likely missed"
-        );
-        return Ok(());
-    }
-
     update_usage(pool, job_id, end_time).await?;
 
     Ok(())
@@ -213,7 +218,6 @@ pub async fn record_job_end(
 
 /// Update usage accounting for a completed job.
 async fn update_usage(pool: &PgPool, job_id: i32, end_time: DateTime<Utc>) -> anyhow::Result<()> {
-    // Get job details
     let row = sqlx::query(
         "SELECT user_name, account, start_time, num_tasks, cpus_per_task FROM jobs WHERE job_id = $1",
     )
@@ -227,7 +231,11 @@ async fn update_usage(pool: &PgPool, job_id: i32, end_time: DateTime<Utc>) -> an
 
     let user: String = row.get("user_name");
     let account: String = row.get("account");
-    let start_time: DateTime<Utc> = row.get("start_time");
+    let start_time: Option<DateTime<Utc>> = row.get("start_time");
+    let Some(start_time) = start_time else {
+        // End arrived before start; usage will be computed when start lands.
+        return Ok(());
+    };
     let num_tasks: i32 = row.get("num_tasks");
     let cpus_per_task: i32 = row.get("cpus_per_task");
 
@@ -665,7 +673,10 @@ mod job_history_tests {
 
     async fn test_pool() -> anyhow::Result<PgPool> {
         let url = std::env::var("DATABASE_URL")?;
-        let pool = connect(&url).await?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&url)
+            .await?;
         migrate(&pool).await?;
         Ok(pool)
     }

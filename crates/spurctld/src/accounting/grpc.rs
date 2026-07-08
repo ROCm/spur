@@ -1,21 +1,28 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::net::SocketAddr;
-
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tonic::{Request, Response, Status};
 
 use spur_proto::proto::slurm_accounting_server::{SlurmAccounting, SlurmAccountingServer};
 use spur_proto::proto::*;
-#[allow(unused_imports)]
-use tracing::info;
 
-use crate::{db, fairshare};
+use super::{db, fairshare};
 
-pub struct AccountingService {
+pub(crate) struct AccountingService {
     pool: PgPool,
+}
+
+impl AccountingService {
+    pub(super) fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+/// Build a ready-to-register tonic service for embedding in another server.
+pub fn accounting_server(pool: PgPool) -> SlurmAccountingServer<AccountingService> {
+    SlurmAccountingServer::new(AccountingService::new(pool))
 }
 
 #[tonic::async_trait]
@@ -311,10 +318,6 @@ impl SlurmAccounting for AccountingService {
         Ok(Response::new(ListAccountsResponse { accounts }))
     }
 
-    // ============================================================
-    // User management
-    // ============================================================
-
     async fn add_user(&self, request: Request<AddUserRequest>) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         db::add_user(
@@ -366,10 +369,6 @@ impl SlurmAccounting for AccountingService {
 
         Ok(Response::new(ListUsersResponse { users }))
     }
-
-    // ============================================================
-    // QOS management
-    // ============================================================
 
     async fn create_qos(&self, request: Request<CreateQosRequest>) -> Result<Response<()>, Status> {
         let req = request.into_inner();
@@ -466,10 +465,6 @@ impl SlurmAccounting for AccountingService {
         Ok(Response::new(ListQosResponse { qos_list }))
     }
 
-    // ============================================================
-    // Fairshare
-    // ============================================================
-
     async fn get_fairshare_factors(
         &self,
         request: Request<GetFairshareFactorsRequest>,
@@ -511,17 +506,6 @@ impl SlurmAccounting for AccountingService {
 
         Ok(Response::new(GetFairshareFactorsResponse { entries }))
     }
-}
-
-pub async fn serve(addr: SocketAddr, pool: PgPool) -> anyhow::Result<()> {
-    let service = AccountingService { pool };
-
-    tonic::transport::Server::builder()
-        .add_service(SlurmAccountingServer::new(service))
-        .serve(addr)
-        .await?;
-
-    Ok(())
 }
 
 fn datetime_to_proto(dt: DateTime<Utc>) -> prost_types::Timestamp {

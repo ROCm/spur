@@ -339,7 +339,7 @@ service SlurmAgent {
   rpc AttachJob(stream AttachJobInput) returns (stream AttachJobOutput);
 }
 
-// -- Accounting service (slurmdbd) --
+// -- Accounting service --
 
 service SlurmAccounting {
   rpc RecordJobStart(RecordJobStartRequest) returns (google.protobuf.Empty);
@@ -553,6 +553,8 @@ message SchedStats {
   uint64 jobs_started = 10;
   uint64 jobs_finalized = 11;
   uint64 jobs_started_last_cycle = 12;
+  uint64 exit_end = 13;
+  uint64 exit_max_depth = 14;
 }
 
 message RegisterAgentRequest {

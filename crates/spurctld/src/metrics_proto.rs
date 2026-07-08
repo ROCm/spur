@@ -43,6 +43,8 @@ pub fn sched_stats_to_proto(snap: &SchedStatsSnapshot) -> SchedStats {
         jobs_started: snap.jobs_started,
         jobs_finalized: snap.jobs_finalized,
         jobs_started_last_cycle: snap.jobs_started_last_cycle,
+        exit_end: snap.exit_end,
+        exit_max_depth: snap.exit_max_depth,
     }
 }
 
@@ -307,6 +309,8 @@ mod tests {
             jobs_started: 30,
             jobs_finalized: 28,
             jobs_started_last_cycle: 3,
+            exit_end: 8,
+            exit_max_depth: 2,
         };
         let proto = sched_stats_to_proto(&snap);
         let body = encode_scheduler_metrics(&snap);
@@ -346,6 +350,14 @@ mod tests {
         assert_eq!(
             proto.schedule_total_time_us,
             gauge_value(&body, "spur_scheduler_schedule_total_time_us")
+        );
+        assert_eq!(
+            proto.exit_end,
+            gauge_value(&body, "spur_scheduler_exit_end_total")
+        );
+        assert_eq!(
+            proto.exit_max_depth,
+            gauge_value(&body, "spur_scheduler_exit_max_depth_total")
         );
         assert!(!body.contains("_avg_time_us"));
     }
