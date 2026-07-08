@@ -409,6 +409,10 @@ pub(crate) fn compute_job_allocation(
 }
 
 /// Resolve the effective PreemptMode for a job from its partition config.
+///
+/// `job.spec.partition` is a comma-separated OR list (same convention as the
+/// backfill scheduler's node matching), so a job may span several partitions.
+/// The most aggressive mode among the matched partitions wins.
 fn job_preempt_mode(
     job: &spur_core::job::Job,
     partitions: &[spur_core::partition::Partition],
@@ -417,10 +421,12 @@ fn job_preempt_mode(
     let Some(name) = job.spec.partition.as_deref().filter(|p| !p.is_empty()) else {
         return PreemptMode::Off;
     };
-    partitions
-        .iter()
-        .find(|p| p.name == name)
+    name.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|req| partitions.iter().find(|p| p.name == req))
         .map(|p| p.preempt_mode)
+        .max_by_key(|m| m.aggressiveness())
         .unwrap_or(PreemptMode::Off)
 }
 
@@ -1339,5 +1345,75 @@ mod tests {
         let alloc = compute_job_allocation(&job, &nodes, &per_node);
 
         assert_eq!(alloc.cpus, 64);
+    }
+
+    fn partition_with_mode(
+        name: &str,
+        mode: spur_core::partition::PreemptMode,
+    ) -> spur_core::partition::Partition {
+        spur_core::partition::Partition {
+            name: name.into(),
+            preempt_mode: mode,
+            ..Default::default()
+        }
+    }
+
+    fn job_in_partitions(partition: &str) -> Job {
+        job_with_spec(JobSpec {
+            partition: Some(partition.into()),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn job_preempt_mode_single_partition() {
+        use spur_core::partition::PreemptMode;
+        let parts = vec![partition_with_mode("gpu", PreemptMode::Requeue)];
+        assert_eq!(
+            job_preempt_mode(&job_in_partitions("gpu"), &parts),
+            PreemptMode::Requeue
+        );
+    }
+
+    #[test]
+    fn job_preempt_mode_unset_or_unknown_is_off() {
+        use spur_core::partition::PreemptMode;
+        let parts = vec![partition_with_mode("gpu", PreemptMode::Cancel)];
+        assert_eq!(
+            job_preempt_mode(&job_with_spec(JobSpec::default()), &parts),
+            PreemptMode::Off
+        );
+        assert_eq!(
+            job_preempt_mode(&job_in_partitions("nope"), &parts),
+            PreemptMode::Off
+        );
+    }
+
+    #[test]
+    fn job_preempt_mode_multi_partition_picks_most_aggressive() {
+        use spur_core::partition::PreemptMode;
+        // A job spanning gpu,cpu must resolve a mode (was Off before the fix,
+        // making multi-partition jobs unpreemptable). Cancel > Requeue.
+        let parts = vec![
+            partition_with_mode("gpu", PreemptMode::Requeue),
+            partition_with_mode("cpu", PreemptMode::Cancel),
+        ];
+        assert_eq!(
+            job_preempt_mode(&job_in_partitions("gpu, cpu"), &parts),
+            PreemptMode::Cancel
+        );
+    }
+
+    #[test]
+    fn job_preempt_mode_multi_partition_off_when_none_configured() {
+        use spur_core::partition::PreemptMode;
+        let parts = vec![
+            partition_with_mode("gpu", PreemptMode::Off),
+            partition_with_mode("cpu", PreemptMode::Off),
+        ];
+        assert_eq!(
+            job_preempt_mode(&job_in_partitions("gpu,cpu"), &parts),
+            PreemptMode::Off
+        );
     }
 }

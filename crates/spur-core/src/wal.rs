@@ -58,11 +58,16 @@ pub enum WalOperation {
         old_priority: u32,
         new_priority: u32,
     },
-    /// Requeue a preempted job to Pending with an eligibility hold until
-    /// `begin_time` (leader-stamped once, applied verbatim for deterministic replay).
-    JobRequeueHold {
+    /// Preempt a running job and requeue it in one atomic step: free its node
+    /// allocation, end the prior run for accounting (as PREEMPTED), return it to
+    /// Pending, and hold it ineligible until `begin_time` so the scheduler can't
+    /// re-dispatch it into its own in-flight kill. A single committed entry
+    /// leaves the job Pending-with-hold and nodes freed, so a leadership change
+    /// or restart mid-sequence cannot strand it in PREEMPTED. `begin_time` is
+    /// the leader-computed absolute instant (already max'd against any user
+    /// `--begin`); followers apply it verbatim and re-apply is a NoOp.
+    JobPreemptRequeue {
         job_id: JobId,
-        /// Absolute instant before which the requeued job stays ineligible.
         begin_time: chrono::DateTime<chrono::Utc>,
     },
     JobSuspend {
@@ -203,16 +208,16 @@ mod suspend_wal_tests {
     use super::*;
 
     #[test]
-    fn requeue_hold_op_round_trips() {
+    fn preempt_requeue_op_round_trips() {
         let begin_time = chrono::Utc::now();
-        let op = WalOperation::JobRequeueHold {
+        let op = WalOperation::JobPreemptRequeue {
             job_id: 42,
             begin_time,
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
-            WalOperation::JobRequeueHold {
+            WalOperation::JobPreemptRequeue {
                 job_id,
                 begin_time: b,
             } => {

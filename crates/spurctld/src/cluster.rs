@@ -632,13 +632,28 @@ impl ClusterManager {
                 Ok(PreemptOutcome::Killed)
             }
             PreemptMode::Requeue => {
-                self.complete_job(job_id, -1, JobState::Preempted)?;
-                // Return to Pending with a short eligibility hold, else the
-                // scheduler re-dispatches the job into its own in-flight cancel.
-                // Stamped once on the leader, applied verbatim on followers.
+                // Single atomic op: free nodes, end the run for accounting, and
+                // return to Pending with an eligibility hold. A two-proposal
+                // sequence could strand the job in PREEMPTED if the second
+                // proposal failed after the first committed (leadership change /
+                // restart), which nothing scans for or recovers.
+                //
+                // Requeue-by-preemption intentionally ignores spec.requeue and
+                // the maybe_requeue MAX_REQUEUE cap: Slurm always requeues a
+                // preempted job regardless of its --requeue flag. This is a
+                // deliberate divergence from the ordinary requeue path.
                 let hold_secs = (self.config.scheduler.interval_secs as i64 * 2 + 3).max(5);
-                let begin_time = Utc::now() + chrono::Duration::seconds(hold_secs);
-                self.propose(WalOperation::JobRequeueHold { job_id, begin_time })?;
+                let hold = Utc::now() + chrono::Duration::seconds(hold_secs);
+                // Honor a later user --begin: compute the max on the leader so
+                // followers apply one verbatim instant (no per-replica clock).
+                let begin_time = self
+                    .jobs
+                    .read()
+                    .get(&job_id)
+                    .and_then(|j| j.spec.begin_time)
+                    .map_or(hold, |user_begin| user_begin.max(hold));
+                let resp = self.propose(WalOperation::JobPreemptRequeue { job_id, begin_time })?;
+                self.run_all_finalized_side_effects(&resp);
                 info!(job_id, hold_secs, "job preempted (requeue)");
                 Ok(PreemptOutcome::Killed)
             }
@@ -2356,21 +2371,79 @@ impl ClusterManager {
                     }
                 }
             }
-            WalOperation::JobRequeueHold { job_id, begin_time } => {
-                if let Some(job) = jobs.get_mut(job_id) {
-                    match job.apply_transition(JobState::Pending) {
-                        Ok(TransitionOutcome::Applied) => {
-                            Self::reset_job_for_requeue(job);
-                            // Ineligible until begin_time (Slurm parity: BeginTime).
-                            job.spec.begin_time = Some(*begin_time);
-                            job.pending_reason = PendingReason::BeginTime;
-                        }
-                        Ok(TransitionOutcome::NoOp) => {}
-                        Err(e) => {
-                            warn!(job_id = *job_id, error = %e, "invalid requeue-hold transition in WAL apply")
+            WalOperation::JobPreemptRequeue { job_id, begin_time } => {
+                // Only a running job is preempted; on replay the job is already
+                // Pending, so this is a NoOp (no re-dealloc, no double requeue).
+                let freed_nodes;
+                let allocated_resources;
+                let per_node_map;
+                {
+                    let Some(job) = jobs.get_mut(job_id) else {
+                        return ClientResponse::default();
+                    };
+                    if job.state != JobState::Running {
+                        return ClientResponse::default();
+                    }
+                    // Route through Preempted so the state machine and accounting
+                    // see a finished run, then requeue to Pending — one atomic
+                    // apply; the intermediate Preempted never escapes the lock.
+                    if let Err(e) = job.transition(JobState::Preempted) {
+                        warn!(job_id = *job_id, error = %e, "invalid preempt transition in WAL apply");
+                        return ClientResponse::default();
+                    }
+                    job.exit_code = Some(-1);
+                    job.end_time = Some(timestamp);
+                    if let Some(since) = job.suspended_at.take() {
+                        job.suspended_secs += (timestamp - since).num_seconds().max(0);
+                    }
+                    freed_nodes = job.allocated_nodes.clone();
+                    allocated_resources = job.allocated_resources.clone();
+                    per_node_map = job.per_node_alloc.clone();
+                    job.node_completions.clear();
+
+                    if let Err(e) = job.transition(JobState::Pending) {
+                        warn!(job_id = *job_id, error = %e, "invalid requeue transition in WAL apply");
+                        return ClientResponse::default();
+                    }
+                    Self::reset_job_for_requeue(job);
+                    job.spec.begin_time = Some(*begin_time);
+                    job.pending_reason = PendingReason::BeginTime;
+                }
+                if let Some(ref total) = allocated_resources {
+                    let node_count = freed_nodes.len().max(1) as u32;
+                    for name in &freed_nodes {
+                        if let Some(node) = nodes.get_mut(name) {
+                            let slice = per_node_map.get(name).cloned().unwrap_or_else(|| {
+                                warn!(job_id = *job_id, node = %name, "per_node_alloc missing at preempt deallocation, using scalar fallback");
+                                ResourceAllocations::with_scalar(
+                                    total.cpus / node_count,
+                                    total.memory_mb / node_count as u64,
+                                )
+                            });
+                            node.alloc_resources.subtract(&slice);
+                            node.update_state_from_alloc();
+                            if node.state == NodeState::Draining
+                                && node.alloc_resources.cpus == 0
+                                && !node.alloc_resources.has_devices()
+                            {
+                                node.state = NodeState::Drain;
+                            }
                         }
                     }
                 }
+                drop(jobs);
+                drop(nodes);
+                // Complete steps and fire accounting for the terminated run as
+                // PREEMPTED, even though the job itself is now Pending-with-hold.
+                self.complete_job_steps(job_id, -1, timestamp);
+                self.next_job_id.store(next_id, Ordering::Relaxed);
+                return ClientResponse {
+                    jobs_finalized: vec![JobFinalized {
+                        job_id: *job_id,
+                        state: JobState::Preempted,
+                        exit_code: -1,
+                    }],
+                };
             }
             WalOperation::JobSuspend { job_id, at } => {
                 if let Some(job) = jobs.get_mut(job_id) {
@@ -4759,6 +4832,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_requeue_preserves_later_user_begin() {
+        // A user --begin further out than the preemption hold must win: the
+        // requeue must not shorten the user's constraint.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let user_begin = Utc::now() + chrono::Duration::hours(1);
+        let mut spec = basic_spec("user-begin");
+        spec.begin_time = Some(user_begin);
+        let job_id = submit_and_wait(&cm, spec);
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            resources.clone(),
+            per_node_for(&["worker1"], resources),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        cm.preempt_job(job_id, PreemptMode::Requeue).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+
+        assert_eq!(
+            cm.get_job(job_id).unwrap().spec.begin_time,
+            Some(user_begin),
+            "user --begin beyond the hold must be preserved"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn preempt_requeue_hold_reason_survives_pending_reason_passes() {
         // The BeginTime hold reason must not be clobbered by the pending-reason
         // maintenance passes while the hold is still active.
@@ -4965,45 +5070,59 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn apply_requeue_hold_is_replay_deterministic() {
-        // JobRequeueHold carries an absolute begin_time; followers/replay apply
-        // that exact instant and a re-applied entry is a NoOp (no double-count,
-        // no drifting timestamp).
+    async fn apply_preempt_requeue_is_atomic_and_replay_deterministic() {
+        // A single JobPreemptRequeue op takes a RUNNING job to Pending-with-hold
+        // AND frees its nodes AND finalizes the prior run as PREEMPTED for
+        // accounting — no intermediate state. Replay applies the exact begin_time
+        // and is a NoOp (no double-count, no drift, no re-dealloc).
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "worker1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
             job_id: 1,
-            spec: Box::new(basic_spec("hold-replay")),
+            spec: Box::new(basic_spec("preempt-replay")),
         });
         cm.apply_operation(&WalOperation::JobStateChange {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
         });
-        cm.apply_operation(&WalOperation::JobComplete {
+        let alloc = scalar_alloc(2, 4000);
+        cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
-            exit_code: -1,
-            state: JobState::Preempted,
+            nodes: vec!["worker1".into()],
+            resources: alloc.clone(),
+            per_node_alloc: per_node_for(&["worker1"], alloc),
         });
+        assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
 
         let begin_time = Utc::now() + chrono::Duration::seconds(5);
-        cm.apply_operation(&WalOperation::JobRequeueHold {
+        let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
             job_id: 1,
             begin_time,
         });
+        // One op finalizes the prior run as PREEMPTED (drives accounting) ...
+        assert_eq!(resp.jobs_finalized.len(), 1);
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Preempted);
+        // ... and the job is Pending-with-hold with nodes freed.
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Pending);
         assert_eq!(job.spec.begin_time, Some(begin_time));
         assert_eq!(job.pending_reason, PendingReason::BeginTime);
         assert_eq!(job.requeue_count, 1);
+        assert!(job.allocated_nodes.is_empty());
+        assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
 
-        // Replay the identical entry: exact same begin_time, no double-count.
-        cm.apply_operation(&WalOperation::JobRequeueHold {
+        // Replay the identical entry: job is already Pending -> NoOp.
+        let replay = cm.apply_operation(&WalOperation::JobPreemptRequeue {
             job_id: 1,
             begin_time,
         });
+        assert!(
+            replay.jobs_finalized.is_empty(),
+            "replayed preempt-requeue must not re-finalize"
+        );
         let job = cm.get_job(1).unwrap();
         assert_eq!(
             job.spec.begin_time,
@@ -5012,8 +5131,9 @@ mod tests {
         );
         assert_eq!(
             job.requeue_count, 1,
-            "replayed requeue-hold must not double-count"
+            "replayed preempt-requeue must not double-count"
         );
+        assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
     }
 
     /// Drive a job to RUNNING on `node` then finalize it as PREEMPTED via the
