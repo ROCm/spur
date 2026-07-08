@@ -510,15 +510,18 @@ pub async fn add_user(
     .execute(pool)
     .await?;
 
-    // Also create/update the association. Deliberately NOT an `INSERT ...
-    // ON CONFLICT (user_name, account, partition_name)`: that constraint's
-    // partition_name is nullable, and Postgres never treats NULL = NULL for
-    // uniqueness, so ON CONFLICT silently fails to match and would insert a
-    // new duplicate row on every call instead of updating the existing one
-    // (pre-existing databases may already carry such duplicates from before
-    // this fix). UPDATE explicitly instead — on a database with duplicates
-    // this updates all of them identically (self-healing: they converge to
-    // the same values instead of disagreeing), and does not delete anything.
+    // partition_name is nullable and Postgres never treats NULL = NULL for
+    // uniqueness, so `ON CONFLICT (user_name, account, partition_name)`
+    // can't be used to upsert here (it silently inserts a duplicate every
+    // time instead of matching). Update explicitly instead, serialized per
+    // (user, account) so two concurrent first-time calls can't both insert.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1 || ':' || $2)::bigint)")
+        .bind(user)
+        .bind(account)
+        .execute(&mut *tx)
+        .await?;
+
     let updated = sqlx::query(
         r#"
         UPDATE associations SET is_default = $3, default_qos = NULLIF($4, '')
@@ -530,7 +533,7 @@ pub async fn add_user(
     .bind(account)
     .bind(is_default)
     .bind(default_qos)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     if updated.rows_affected() == 0 {
@@ -544,10 +547,11 @@ pub async fn add_user(
         .bind(account)
         .bind(is_default)
         .bind(default_qos)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
 
+    tx.commit().await?;
     Ok(())
 }
 
