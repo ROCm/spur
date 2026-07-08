@@ -196,6 +196,7 @@ impl AgentService {
                 for c in &completed {
                     jobs.remove(&c.job_id);
                     crate::container::cleanup_rootfs(c.job_id, &c.rootfs_mode);
+                    crate::executor::cleanup_job_spool(c.job_id);
                     if let Some(ref cgroup) = c.cgroup {
                         crate::executor::cleanup_cgroup(cgroup);
                     }

@@ -43,6 +43,11 @@ use crate::container::ContainerConfig;
 /// Cgroup root for slurmd-managed jobs.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup/spur";
 
+/// Node-local spool root for spurd's per-job scratch (job script, namespace
+/// wrapper). Deliberately off the user's work_dir so these root-side writes
+/// never hit an NFS root_squash mount. Mirrors Slurm's SlurmdSpoolDir.
+const SPOOL_ROOT: &str = "/var/spool/spur";
+
 pub struct ContainerLaunchConfig {
     pub config: ContainerConfig,
     pub rootfs: PathBuf,
@@ -291,19 +296,11 @@ async fn spawn_job_process(
     };
     let script = script.as_str();
 
-    // Write script to temp file
-    let script_path = PathBuf::from(work_dir).join(format!(".spur_job_{}.sh", job_id));
-    tokio::fs::write(&script_path, script)
-        .await
-        .context("failed to write job script")?;
-
-    // Make executable
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&script_path, perms)?;
-    }
+    // Script + wrapper live in the node-local spool dir, not work_dir (see
+    // SPOOL_ROOT), so root-side writes survive NFS root_squash work_dirs.
+    let spool_dir = create_job_spool_dir(job_id, uid, gid).context("create job spool dir")?;
+    let script_path = spool_dir.join("spur_job.sh");
+    write_job_scratch(&script_path, script, uid, gid).context("failed to write job script")?;
 
     // Resolve stdout/stderr paths
     let stdout_resolved = resolve_output_path(stdout_path, job_id, work_dir);
@@ -368,19 +365,14 @@ async fn spawn_job_process(
     // Issue #99: If root, wrap job with namespace isolation.
     let use_namespaces = nix::unistd::geteuid().is_root();
     let (launch_cmd, launch_args) = if use_namespaces {
-        let wrapper_path = PathBuf::from(work_dir).join(format!(".spur_ns_{}.sh", job_id));
+        let wrapper_path = spool_dir.join("spur_ns.sh");
         let visible_devices = cfg
             .host_device_plan
             .as_ref()
             .map(|p| p.visible_devices.as_slice())
             .unwrap_or(&[]);
         let wrapper = build_namespace_wrapper(uid, gid, visible_devices, &script_path);
-        tokio::fs::write(&wrapper_path, &wrapper).await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755))?;
-        }
+        write_job_scratch(&wrapper_path, &wrapper, uid, gid)?;
         debug!(job_id, "namespace isolation wrapper created");
         (
             "/usr/bin/unshare".to_string(),
@@ -889,6 +881,59 @@ fn create_dir_as_user(dir: &Path, uid: u32, gid: u32) -> bool {
     }
 }
 
+/// Create a node-local spool directory for a job's scratch files. Prefers
+/// `SPOOL_ROOT`; falls back to a temp dir when it isn't writable (e.g. non-root
+/// dev runs). When spurd is root and the job targets a user, the dir is handed
+/// to that user so the job — which runs as the user — can traverse it.
+fn create_job_spool_dir(job_id: JobId, uid: u32, gid: u32) -> anyhow::Result<PathBuf> {
+    let mut last_err = None;
+    for base in [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")] {
+        let dir = base.join(format!("job{}", job_id));
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => {
+                if should_run_as_user(uid) {
+                    use nix::unistd::{Gid, Uid};
+                    // Path-based chown is safe here: the spool tree is
+                    // root-owned, not user-controlled, so no symlink TOCTOU.
+                    let _ = nix::unistd::chown(
+                        &dir,
+                        Some(Uid::from_raw(uid)),
+                        Some(Gid::from_raw(gid)),
+                    );
+                }
+                return Ok(dir);
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    bail!("failed to create job spool dir: {last_err:?}")
+}
+
+/// Write a scratch file (job script, namespace wrapper) executable. When spurd
+/// is root and the job targets a user, hand ownership to that user and keep the
+/// file private (0700), so only the job and root can read it — matching Slurm's
+/// batch script handling.
+fn write_job_scratch(path: &Path, content: &str, uid: u32, gid: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, content).with_context(|| format!("write {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    if should_run_as_user(uid) {
+        use nix::unistd::{Gid, Uid};
+        nix::unistd::chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+            .with_context(|| format!("chown {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Remove a job's spool directory (best-effort), mirroring Slurm purging its
+/// batchdir after completion. Tries both candidate roots since the fallback
+/// location isn't recorded.
+pub fn cleanup_job_spool(job_id: JobId) {
+    for base in [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")] {
+        let _ = std::fs::remove_dir_all(base.join(format!("job{}", job_id)));
+    }
+}
+
 /// Resolve output path patterns (%j → job_id, etc.)
 fn resolve_output_path(pattern: &str, job_id: JobId, work_dir: &str) -> String {
     let resolved = if pattern.is_empty() {
@@ -1297,6 +1342,36 @@ mod tests {
         drop(of);
 
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "new");
+    }
+
+    #[test]
+    fn write_job_scratch_is_executable_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spur_job.sh");
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        write_job_scratch(&path, "#!/bin/bash\necho hi\n", uid, gid).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "#!/bin/bash\necho hi\n"
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn job_spool_dir_round_trips_create_and_cleanup() {
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        // A job id unlikely to collide with a real job on the test host; as a
+        // non-root runner this resolves to the temp-dir fallback.
+        let job_id: JobId = 987_654_321;
+        let dir = create_job_spool_dir(job_id, uid, gid).unwrap();
+        assert!(dir.is_dir());
+        write_job_scratch(&dir.join("spur_job.sh"), "x", uid, gid).unwrap();
+        cleanup_job_spool(job_id);
+        assert!(!dir.exists());
     }
 
     // send_fds/recv_fds are process-agnostic: they pass fds over any Unix
