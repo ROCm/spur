@@ -177,14 +177,16 @@ pub async fn record_job_start(
 
     // If end_time is already set, the end notification arrived first and skipped
     // usage computation (start_time was NULL at that point). Compute it now.
-    let end_time: Option<DateTime<Utc>> =
-        sqlx::query_scalar("SELECT end_time FROM jobs WHERE job_id = $1")
-            .bind(job_id)
-            .fetch_one(pool)
-            .await?;
+    let row = sqlx::query(
+        "SELECT user_name, account, start_time, num_tasks, cpus_per_task, end_time FROM jobs WHERE job_id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await?;
 
+    let end_time: Option<DateTime<Utc>> = row.get("end_time");
     if let Some(end_time) = end_time {
-        update_usage(pool, job_id, end_time).await?;
+        update_usage(pool, row, end_time).await?;
     }
 
     Ok(())
