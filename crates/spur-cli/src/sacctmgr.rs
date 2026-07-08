@@ -626,12 +626,12 @@ mod tests {
     #[test]
     fn build_add_user_request_parses_defaultqos() {
         let p = parse_params(&[
-            "name=vm".into(),
+            "name=testuser".into(),
             "account=testacct".into(),
             "defaultqos=highprio".into(),
         ]);
         let (name, account, admin, default_qos) = build_add_user_request(&p).unwrap();
-        assert_eq!(name, "vm");
+        assert_eq!(name, "testuser");
         assert_eq!(account, "testacct");
         assert_eq!(admin, "none");
         assert_eq!(default_qos, "highprio");
@@ -639,7 +639,7 @@ mod tests {
 
     #[test]
     fn build_add_user_request_defaultqos_absent_is_empty() {
-        let p = parse_params(&["name=vm".into(), "account=testacct".into()]);
+        let p = parse_params(&["name=testuser".into(), "account=testacct".into()]);
         let (_, _, _, default_qos) = build_add_user_request(&p).unwrap();
         assert_eq!(default_qos, "");
     }
@@ -652,7 +652,7 @@ mod tests {
 
     #[test]
     fn build_add_user_request_missing_account_errors() {
-        let p = parse_params(&["name=vm".into()]);
+        let p = parse_params(&["name=testuser".into()]);
         assert!(build_add_user_request(&p).is_err());
     }
 
@@ -662,12 +662,12 @@ mod tests {
         // add user name=X account=Y defaultqos=Z` and `sacctmgr modify user
         // name=X account=Y set defaultqos=Z` build identical requests.
         let add_params = parse_params(&[
-            "name=vm".into(),
+            "name=testuser".into(),
             "account=testacct".into(),
             "defaultqos=highprio".into(),
         ]);
         let modify_params = parse_params(&[
-            "name=vm".into(),
+            "name=testuser".into(),
             "account=testacct".into(),
             "set".into(),
             "defaultqos=highprio".into(),
