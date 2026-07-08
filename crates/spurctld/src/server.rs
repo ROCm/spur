@@ -17,7 +17,7 @@ use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::slurm_controller_server::{SlurmController, SlurmControllerServer};
 use spur_proto::proto::*;
 
-use crate::cluster::ClusterManager;
+use crate::cluster::{ClusterManager, ReservationError};
 use crate::raft::RaftHandle;
 use crate::rpc_middleware::RpcStatsLayer;
 use crate::rpc_stats::RpcStatsCollector;
@@ -1198,6 +1198,9 @@ impl SlurmController for ControllerService {
 
         let end_time = start_time + chrono::Duration::minutes(req.duration_minutes as i64);
 
+        let flags = spur_core::reservation::ReservationFlags::parse_list(&req.flags)
+            .map_err(Status::invalid_argument)?;
+
         let reservation = spur_core::reservation::Reservation {
             name: req.name,
             start_time,
@@ -1205,11 +1208,12 @@ impl SlurmController for ControllerService {
             nodes: req.nodes,
             accounts: req.accounts,
             users: req.users,
+            flags,
         };
 
         self.cluster
             .create_reservation(reservation)
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(reservation_rpc_status)?;
 
         Ok(Response::new(()))
     }
@@ -1245,7 +1249,7 @@ impl SlurmController for ControllerService {
                 &req.add_accounts,
                 &req.remove_accounts,
             )
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(reservation_rpc_status)?;
         Ok(Response::new(()))
     }
 
@@ -1271,7 +1275,7 @@ impl SlurmController for ControllerService {
         let name = request.into_inner().name;
         self.cluster
             .delete_reservation(&name)
-            .map_err(|e| Status::not_found(e.to_string()))?;
+            .map_err(reservation_rpc_status)?;
         Ok(Response::new(()))
     }
 
@@ -1289,6 +1293,7 @@ impl SlurmController for ControllerService {
             }
         }
         let reservations = self.cluster.get_reservations();
+        let now = Utc::now();
         let infos: Vec<ReservationInfo> = reservations
             .iter()
             .map(|r| ReservationInfo {
@@ -1298,6 +1303,8 @@ impl SlurmController for ControllerService {
                 nodes: r.nodes.join(","),
                 accounts: r.accounts.join(","),
                 users: r.users.join(","),
+                flags: r.flags.display_csv(),
+                state: r.state_label(now).into(),
             })
             .collect();
         Ok(Response::new(ListReservationsResponse {
@@ -1782,6 +1789,7 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         qos: job.spec.qos.clone().unwrap_or_default(),
         array_job_id: job.spec.array_job_id.unwrap_or(0),
         array_task_id: job.spec.array_task_id.unwrap_or(0),
+        reservation: job.spec.reservation.clone().unwrap_or_default(),
     }
 }
 
@@ -1803,6 +1811,7 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         switch_name: node.switch_name.clone().unwrap_or_default(),
         active_reservation: String::new(),
         labels: node.labels.clone(),
+        reservation_maint: false,
     }
 }
 
@@ -1957,12 +1966,27 @@ fn annotate_nodes_with_reservations(
     now: DateTime<Utc>,
 ) {
     for node_info in nodes.iter_mut() {
+        node_info.reservation_maint = false;
+        node_info.active_reservation.clear();
         for res in reservations {
             if res.is_active(now) && res.covers_node(&node_info.name) {
-                node_info.active_reservation = res.name.clone();
-                break;
+                if node_info.active_reservation.is_empty() {
+                    node_info.active_reservation = res.name.clone();
+                }
+                if res.flags.maint {
+                    node_info.reservation_maint = true;
+                }
             }
         }
+    }
+}
+
+fn reservation_rpc_status(err: ReservationError) -> Status {
+    match err {
+        ReservationError::InvalidArgument(m) => Status::invalid_argument(m),
+        ReservationError::NotFound(m) => Status::not_found(m),
+        ReservationError::AlreadyExists(m) => Status::already_exists(m),
+        ReservationError::Raft(m) => Status::internal(m),
     }
 }
 
@@ -1990,6 +2014,7 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use spur_core::job::{JobState, NodeCompleteError};
+    use spur_core::reservation::ReservationFlags;
     use tonic::Code;
 
     fn make_node_info(name: &str) -> NodeInfo {
@@ -2013,6 +2038,7 @@ mod tests {
             nodes: nodes.iter().map(|s| s.to_string()).collect(),
             accounts: Vec::new(),
             users: Vec::new(),
+            flags: Default::default(),
         }
     }
 
@@ -2131,6 +2157,41 @@ mod tests {
         ];
         annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now());
         assert_eq!(nodes[0].active_reservation, "first");
+    }
+
+    #[test]
+    fn test_annotate_maint_flag_with_overlapping_reservations() {
+        let mut nodes = vec![make_node_info("n1")];
+        let now = Utc::now();
+        let plain = Reservation {
+            name: "plain".into(),
+            start_time: now - Duration::hours(1),
+            end_time: now + Duration::hours(1),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: ReservationFlags {
+                overlap: true,
+                ..Default::default()
+            },
+        };
+        let maint = Reservation {
+            name: "maint".into(),
+            start_time: now - Duration::hours(1),
+            end_time: now + Duration::hours(1),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: ReservationFlags {
+                maint: true,
+                overlap: true,
+                ..Default::default()
+            },
+        };
+        let reservations = vec![plain, maint];
+        annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now());
+        assert_eq!(nodes[0].active_reservation, "plain");
+        assert!(nodes[0].reservation_maint);
     }
 
     #[test]

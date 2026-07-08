@@ -8,7 +8,7 @@ use tracing::debug;
 
 use spur_core::job::{Job, JobId};
 use spur_core::node::Node;
-use spur_core::reservation::Reservation;
+use spur_core::reservation::{self, Reservation};
 use spur_core::resource::{build_exclusive_allocation, build_node_allocation, ResourceSet};
 
 use crate::node_match::NodePlacement;
@@ -44,6 +44,20 @@ impl BackfillScheduler {
             .iter()
             .map(|n| NodeTimeline::new(n.name.clone(), n.total_resources.clone()))
             .collect();
+    }
+
+    /// Returns true when `[start, start+duration)` intersects a reservation on `node`
+    /// and the job is not authorized for that reservation.
+    fn start_overlaps_reservation(
+        job: &Job,
+        node: &str,
+        reservations: &[Reservation],
+        start: chrono::DateTime<Utc>,
+        duration: chrono::Duration,
+    ) -> bool {
+        reservations
+            .iter()
+            .any(|res| reservation::prospective_overlap_at(job, res, node, start, duration))
     }
 
     /// Find nodes that satisfy a job's resource requirements.
@@ -165,6 +179,16 @@ impl Scheduler for BackfillScheduler {
                     (ni, start)
                 })
                 .collect();
+
+            node_starts.retain(|(ni, start)| {
+                !Self::start_overlaps_reservation(
+                    job,
+                    &cluster.nodes[*ni].name,
+                    cluster.reservations,
+                    *start,
+                    duration,
+                )
+            });
 
             // For --spread-job, sort by least-loaded (ascending alloc) so we
             // prefer nodes with the most available resources. For normal jobs,
@@ -1030,10 +1054,11 @@ mod tests {
         Reservation {
             name: name.into(),
             start_time: now - Duration::hours(1),
-            end_time: now + Duration::hours(1),
+            end_time: now + Duration::hours(2),
             nodes,
             accounts: Vec::new(),
             users,
+            flags: Default::default(),
         }
     }
 
@@ -1153,6 +1178,7 @@ mod tests {
             nodes: vec!["node001".into()],
             accounts: Vec::new(),
             users: vec!["alice".into()],
+            flags: Default::default(),
         };
 
         // Non-reservation job should be able to use node001 since reservation is inactive
@@ -1169,6 +1195,44 @@ mod tests {
         assert_eq!(assignments.len(), 1);
         // node001 should be available since the reservation hasn't started
         // (scheduler picks by weight/time, node001 is a valid target)
+    }
+
+    #[test]
+    fn test_prospective_reservation_blocks_long_job() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(1);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let now = Utc::now();
+        let future_reservation = Reservation {
+            name: "upcoming".into(),
+            start_time: now + Duration::minutes(30),
+            end_time: now + Duration::hours(2),
+            nodes: vec!["node001".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: Default::default(),
+        };
+
+        let mut job = make_job(1, 1, 1);
+        job.spec.time_limit = Some(Duration::hours(2));
+
+        let pending = vec![job];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[future_reservation],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert!(
+            assignments.is_empty(),
+            "job that would overlap upcoming reservation must not schedule"
+        );
     }
 
     #[test]

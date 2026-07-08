@@ -20,7 +20,7 @@ use spur_core::job::{
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::{Partition, PreemptMode};
 use spur_core::qos::{check_qos_limits, QosCheckResult};
-use spur_core::reservation::Reservation;
+use spur_core::reservation::{self, normalize_node_list, running_jobs_overlap_start, Reservation};
 use spur_core::resource::{ResourceAllocations, ResourceSet};
 use spur_core::step::{JobStep, StepState, STEP_BATCH, STEP_RESERVED_MIN};
 use spur_core::wal::WalOperation;
@@ -29,7 +29,7 @@ use spur_metrics::node::NodeMetricsSnapshot;
 use spur_metrics::partition::PartitionMetricsSnapshot;
 use spur_metrics::user_acct::UserAcctMetricsSnapshot;
 
-use crate::accounting::AccountingNotifier;
+use crate::accounting::{AccountingNotifier, JobStartRecord};
 use crate::fairshare_cache::FairshareCache;
 use crate::limits_cache::QosCache;
 use crate::raft::{ClientResponse, JobFinalized, SpurRaft, StateMachineApply};
@@ -44,6 +44,46 @@ pub enum NodeCompleteResult {
     AllDone { state: JobState, exit_code: i32 },
     /// Job was already in a terminal state (duplicate or race with cancel/timeout).
     AlreadyTerminal,
+}
+
+/// Reservation CRUD errors for the gRPC boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReservationError {
+    InvalidArgument(String),
+    NotFound(String),
+    AlreadyExists(String),
+    Raft(String),
+}
+
+impl std::fmt::Display for ReservationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidArgument(m)
+            | Self::NotFound(m)
+            | Self::AlreadyExists(m)
+            | Self::Raft(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for ReservationError {}
+
+impl ReservationError {
+    pub fn invalid(msg: impl Into<String>) -> Self {
+        Self::InvalidArgument(msg.into())
+    }
+
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self::NotFound(msg.into())
+    }
+
+    pub fn already_exists(msg: impl Into<String>) -> Self {
+        Self::AlreadyExists(msg.into())
+    }
+
+    pub fn raft(msg: impl Into<String>) -> Self {
+        Self::Raft(msg.into())
+    }
 }
 
 /// What the caller must dispatch to node agents after `preempt_job`.
@@ -489,11 +529,11 @@ impl ClusterManager {
         }
 
         // propose() handles: state transition, resource allocation, license subtraction
-        self.propose(WalOperation::JobStateChange {
+        self.propose(WalOperation::job_state_change(
             job_id,
             old_state,
-            new_state: JobState::Running,
-        })?;
+            JobState::Running,
+        ))?;
         self.propose(WalOperation::JobStart {
             job_id,
             nodes: node_names.clone(),
@@ -536,17 +576,18 @@ impl ClusterManager {
         }
 
         if let Some(ref notifier) = *self.accounting.read() {
-            notifier.notify_job_start(
+            notifier.notify_job_start(JobStartRecord {
                 job_id,
-                spec_for_notify.user.clone(),
-                spec_for_notify.account.clone().unwrap_or_default(),
-                spec_for_notify.partition.clone().unwrap_or_default(),
-                spec_for_notify.num_nodes,
-                spec_for_notify.num_tasks,
-                spec_for_notify.cpus_per_task,
-                resources.memory_mb,
-                Utc::now(),
-            );
+                user: spec_for_notify.user.clone(),
+                account: spec_for_notify.account.clone().unwrap_or_default(),
+                partition: spec_for_notify.partition.clone().unwrap_or_default(),
+                num_nodes: spec_for_notify.num_nodes,
+                num_tasks: spec_for_notify.num_tasks,
+                cpus_per_task: spec_for_notify.cpus_per_task,
+                memory_mb: resources.memory_mb,
+                start_time: Utc::now(),
+                reservation: spec_for_notify.reservation.clone(),
+            });
         }
 
         debug!(job_id, "job started");
@@ -782,13 +823,23 @@ impl ClusterManager {
 
     /// Requeue a job if spec.requeue is set and attempt limit not exceeded.
     fn maybe_requeue(&self, job_id: JobId) -> anyhow::Result<()> {
-        const MAX_REQUEUE: u32 = 3;
+        let max = self.config.controller.max_batch_requeue;
         let (should_requeue, old_state) = {
             let jobs = self.jobs.read();
             let Some(job) = jobs.get(&job_id) else {
                 return Ok(());
             };
-            if !job.spec.requeue || job.requeue_count >= MAX_REQUEUE {
+            if job.requeue_count >= max {
+                if matches!(
+                    job.state,
+                    JobState::Preempted | JobState::Timeout | JobState::NodeFail
+                ) {
+                    drop(jobs);
+                    return self.hold_job_at_max_requeue(job_id);
+                }
+                return Ok(());
+            }
+            if !job.spec.requeue {
                 return Ok(());
             }
             (true, job.state)
@@ -797,11 +848,11 @@ impl ClusterManager {
             return Ok(());
         }
 
-        self.propose(WalOperation::JobStateChange {
+        self.propose(WalOperation::job_state_change(
             job_id,
             old_state,
-            new_state: JobState::Pending,
-        })?;
+            JobState::Pending,
+        ))?;
 
         info!(job_id, from = %old_state, "job requeued");
         Ok(())
@@ -821,6 +872,10 @@ impl ClusterManager {
             if job.state.is_terminal() {
                 return Ok(());
             }
+            if job.requeue_count >= self.config.controller.max_batch_requeue {
+                drop(jobs);
+                return self.hold_job_at_max_requeue(job_id);
+            }
             job.state
         };
 
@@ -834,11 +889,11 @@ impl ClusterManager {
 
         // Failed → Pending resets allocation fields and makes
         // the job schedulable again.
-        self.propose(WalOperation::JobStateChange {
+        self.propose(WalOperation::job_state_change(
             job_id,
-            old_state: JobState::Failed,
-            new_state: JobState::Pending,
-        })?;
+            JobState::Failed,
+            JobState::Pending,
+        ))?;
 
         info!(job_id, from = %old_state, "job requeued after dispatch failure");
         Ok(())
@@ -1014,35 +1069,102 @@ impl ClusterManager {
             job_id,
             old_priority,
             new_priority: 0,
+            pending_reason: Some(PendingReason::Held),
+            reset_requeue_count: false,
+            clear_reservation: false,
         })?;
-        // Set held reason (not WAL-tracked)
-        if let Some(job) = self.jobs.write().get_mut(&job_id) {
-            job.pending_reason = PendingReason::Held;
-        }
         info!(job_id, "job held");
+        Ok(())
+    }
+
+    /// Hold a job that exhausted automatic requeues (`JobHoldMaxRequeue`).
+    fn hold_job_at_max_requeue(&self, job_id: JobId) -> anyhow::Result<()> {
+        let mut state = {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            job.state
+        };
+
+        if state == JobState::Running {
+            self.propose(WalOperation::JobComplete {
+                job_id,
+                exit_code: -1,
+                state: JobState::Failed,
+            })?;
+            state = JobState::Failed;
+        }
+
+        if matches!(
+            state,
+            JobState::Preempted | JobState::Timeout | JobState::NodeFail | JobState::Failed
+        ) {
+            self.propose(WalOperation::job_state_change_held_pending(
+                job_id,
+                state,
+                PendingReason::JobHoldMaxRequeue,
+            ))?;
+            info!(job_id, "job held at max requeue limit");
+            return Ok(());
+        }
+
+        if state != JobState::Pending {
+            anyhow::bail!(
+                "cannot hold job {} at max requeue from state {:?}",
+                job_id,
+                state
+            );
+        }
+
+        let needs_hold = self.jobs.read().get(&job_id).is_some_and(|j| {
+            j.pending_reason != PendingReason::JobHoldMaxRequeue || j.priority != 0
+        });
+        if needs_hold {
+            let old_priority = self
+                .jobs
+                .read()
+                .get(&job_id)
+                .map(|j| j.priority)
+                .unwrap_or(0);
+            self.propose(WalOperation::JobPriorityChange {
+                job_id,
+                old_priority,
+                new_priority: 0,
+                pending_reason: Some(PendingReason::JobHoldMaxRequeue),
+                reset_requeue_count: false,
+                clear_reservation: false,
+            })?;
+        }
+        info!(job_id, "job held at max requeue limit");
         Ok(())
     }
 
     /// Release a held job.
     pub fn release_job(&self, job_id: JobId) -> anyhow::Result<()> {
-        {
+        let (reset_requeue, clear_reservation, old_priority) = {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
                 .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
-            if job.pending_reason != PendingReason::Held {
+            if !job.pending_reason.is_scheduling_hold() {
                 anyhow::bail!("job {} is not held", job_id);
             }
-        }
+            (
+                job.pending_reason == PendingReason::JobHoldMaxRequeue,
+                job.pending_reason == PendingReason::ReservationDeleted,
+                job.priority,
+            )
+        };
 
         self.propose(WalOperation::JobPriorityChange {
             job_id,
-            old_priority: 0,
+            old_priority,
             new_priority: 1000,
+            pending_reason: Some(PendingReason::Priority),
+            reset_requeue_count: reset_requeue,
+            clear_reservation,
         })?;
-        if let Some(job) = self.jobs.write().get_mut(&job_id) {
-            job.pending_reason = PendingReason::Priority;
-        }
         info!(job_id, "job released");
         Ok(())
     }
@@ -1077,6 +1199,9 @@ impl ClusterManager {
                 job_id,
                 old_priority: old,
                 new_priority: p,
+                pending_reason: None,
+                reset_requeue_count: false,
+                clear_reservation: false,
             })?;
         }
 
@@ -1344,7 +1469,7 @@ impl ClusterManager {
         let jobs = self.jobs.read();
         let mut pending: Vec<Job> = jobs
             .values()
-            .filter(|j| j.state == JobState::Pending && j.pending_reason != PendingReason::Held)
+            .filter(|j| j.state == JobState::Pending && !j.pending_reason.is_scheduling_hold())
             .cloned()
             .collect();
 
@@ -1439,6 +1564,7 @@ impl ClusterManager {
         // Recompute effective priority with age + partition tier
         let now = Utc::now();
         let partitions = self.partitions.read();
+        let reservations = self.get_reservations();
         for job in &mut pending {
             let age_minutes = (now - job.submit_time).num_minutes().max(0);
             let partition_tier = job
@@ -1458,8 +1584,13 @@ impl ClusterManager {
                 partition_tier,
             );
         }
+        drop(partitions);
 
-        pending.sort_by_key(|j| std::cmp::Reverse(j.priority));
+        pending.sort_by(|a, b| {
+            let a_res = reservation::job_has_active_reservation(a, &reservations, now);
+            let b_res = reservation::job_has_active_reservation(b, &reservations, now);
+            b_res.cmp(&a_res).then(b.priority.cmp(&a.priority))
+        });
 
         // License reservation, in priority order. `remaining` starts from current
         // availability (config total minus licenses held by running jobs) and each
@@ -1621,7 +1752,7 @@ impl ClusterManager {
             .filter(|j| {
                 j.state == JobState::Pending
                     && j.bb_stage_state == BbStageState::None
-                    && j.pending_reason != PendingReason::Held
+                    && !j.pending_reason.is_scheduling_hold()
                     && j.pending_reason != PendingReason::DeadLine
                     && extract_bb_requirement(&j.spec) > 0
             })
@@ -1727,7 +1858,7 @@ impl ClusterManager {
             for job in jobs.values() {
                 if job.state != JobState::Pending
                     || job.spec.dependency.is_empty()
-                    || job.pending_reason == PendingReason::Held
+                    || job.pending_reason.is_scheduling_hold()
                 {
                     continue;
                 }
@@ -1748,7 +1879,7 @@ impl ClusterManager {
                     // Don't clobber Held or DeadLine — matches
                     // update_pending_reasons().
                     if j.state == JobState::Pending
-                        && j.pending_reason != PendingReason::Held
+                        && !j.pending_reason.is_scheduling_hold()
                         && j.pending_reason != PendingReason::DeadLine
                     {
                         j.pending_reason = PendingReason::Dependency;
@@ -1844,7 +1975,7 @@ impl ClusterManager {
                     let begin_held = job.pending_reason == PendingReason::BeginTime
                         && job.spec.begin_time.is_some_and(|b| now < b);
                     job.state == JobState::Pending
-                        && job.pending_reason != PendingReason::Held
+                        && !job.pending_reason.is_scheduling_hold()
                         && job.pending_reason != PendingReason::DeadLine
                         && !begin_held
                 })
@@ -1876,7 +2007,7 @@ impl ClusterManager {
                 let begin_held = j.pending_reason == PendingReason::BeginTime
                     && j.spec.begin_time.is_some_and(|b| now < b);
                 if j.state == JobState::Pending
-                    && j.pending_reason != PendingReason::Held
+                    && !j.pending_reason.is_scheduling_hold()
                     && j.pending_reason != PendingReason::DeadLine
                     && !begin_held
                 {
@@ -1886,18 +2017,34 @@ impl ClusterManager {
         }
     }
 
-    /// Create a new reservation.
-    pub fn create_reservation(&self, res: Reservation) -> anyhow::Result<()> {
-        let mut reservations = self.reservations.write();
-        if reservations.iter().any(|r| r.name == res.name) {
-            anyhow::bail!("reservation '{}' already exists", res.name);
+    /// Create a new reservation (validated, persisted via Raft).
+    pub fn create_reservation(&self, mut res: Reservation) -> Result<(), ReservationError> {
+        if self.reservations.read().iter().any(|r| r.name == res.name) {
+            return Err(ReservationError::already_exists(format!(
+                "reservation '{}' already exists",
+                res.name
+            )));
         }
-        info!(name = %res.name, "reservation created");
-        reservations.push(res);
+        let known: std::collections::HashSet<String> = self.nodes.read().keys().cloned().collect();
+        res.nodes = normalize_node_list(&res.nodes, &known).map_err(ReservationError::invalid)?;
+        self.validate_reservation_job_overlap(&res, None)
+            .map_err(|e| ReservationError::invalid(e.to_string()))?;
+        self.validate_reservation_storage_overlap(&res, None)
+            .map_err(|e| ReservationError::invalid(e.to_string()))?;
+        let name = res.name.clone();
+        let resp = self
+            .propose(WalOperation::ReservationCreate { reservation: res })
+            .map_err(|e| ReservationError::raft(e.to_string()))?;
+        if !resp.reservation_created {
+            return Err(ReservationError::already_exists(format!(
+                "reservation '{}' already exists",
+                name
+            )));
+        }
         Ok(())
     }
 
-    /// Update an existing reservation.
+    /// Update an existing reservation (validated, persisted via Raft).
     #[allow(clippy::too_many_arguments)]
     pub fn update_reservation(
         &self,
@@ -1909,13 +2056,250 @@ impl ClusterManager {
         remove_users: &[String],
         add_accounts: &[String],
         remove_accounts: &[String],
-    ) -> anyhow::Result<()> {
-        let mut reservations = self.reservations.write();
-        let res = reservations
-            .iter_mut()
+    ) -> Result<(), ReservationError> {
+        let mut preview = self
+            .reservations
+            .read()
+            .iter()
             .find(|r| r.name == name)
-            .ok_or_else(|| anyhow::anyhow!("reservation '{}' not found", name))?;
+            .cloned()
+            .ok_or_else(|| {
+                ReservationError::not_found(format!("reservation '{}' not found", name))
+            })?;
 
+        if duration_minutes > 0 {
+            preview.end_time =
+                preview.start_time + chrono::Duration::minutes(duration_minutes as i64);
+        }
+        let known: std::collections::HashSet<String> = self.nodes.read().keys().cloned().collect();
+        let mut add_expanded = Vec::new();
+        for n in add_nodes {
+            add_expanded.extend(
+                normalize_node_list(std::slice::from_ref(n), &known)
+                    .map_err(ReservationError::invalid)?,
+            );
+        }
+        for node in &add_expanded {
+            if !preview.nodes.contains(node) {
+                preview.nodes.push(node.clone());
+            }
+        }
+        preview.nodes.retain(|n| !remove_nodes.contains(n));
+        for user in add_users {
+            if !preview.users.contains(user) {
+                preview.users.push(user.clone());
+            }
+        }
+        preview.users.retain(|u| !remove_users.contains(u));
+        for account in add_accounts {
+            if !preview.accounts.contains(account) {
+                preview.accounts.push(account.clone());
+            }
+        }
+        preview.accounts.retain(|a| !remove_accounts.contains(a));
+
+        self.validate_reservation_job_overlap(&preview, Some(name))
+            .map_err(|e| ReservationError::invalid(e.to_string()))?;
+        self.validate_reservation_storage_overlap(&preview, Some(name))
+            .map_err(|e| ReservationError::invalid(e.to_string()))?;
+
+        self.propose(WalOperation::ReservationUpdate {
+            name: name.to_string(),
+            duration_minutes,
+            add_nodes: add_expanded,
+            remove_nodes: remove_nodes.to_vec(),
+            add_users: add_users.to_vec(),
+            remove_users: remove_users.to_vec(),
+            add_accounts: add_accounts.to_vec(),
+            remove_accounts: remove_accounts.to_vec(),
+        })
+        .map_err(|e| ReservationError::raft(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Delete a reservation by name (persisted via Raft).
+    pub fn delete_reservation(&self, name: &str) -> Result<(), ReservationError> {
+        if !self.reservations.read().iter().any(|r| r.name == name) {
+            return Err(ReservationError::not_found(format!(
+                "reservation '{}' not found",
+                name
+            )));
+        }
+
+        for job in self.jobs.read().values() {
+            if !matches!(
+                job.state,
+                JobState::Running | JobState::Completing | JobState::Suspended
+            ) {
+                continue;
+            }
+            if job.spec.reservation.as_deref() == Some(name) {
+                return Err(ReservationError::invalid(format!(
+                    "reservation '{}' in use by running job {}",
+                    name, job.job_id
+                )));
+            }
+        }
+
+        self.propose(WalOperation::ReservationDelete {
+            name: name.to_string(),
+        })
+        .map_err(|e| ReservationError::raft(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Remove reservations past their end time when no jobs still reference them.
+    pub fn purge_expired_reservations(&self) {
+        let now = Utc::now();
+        let expired: Vec<String> = self
+            .reservations
+            .read()
+            .iter()
+            .filter(|r| r.is_expired(now))
+            .map(|r| r.name.clone())
+            .collect();
+        for name in expired {
+            let in_use = self.jobs.read().values().any(|job| {
+                matches!(
+                    job.state,
+                    JobState::Running | JobState::Completing | JobState::Suspended
+                ) && job.spec.reservation.as_deref() == Some(name.as_str())
+            });
+            if in_use {
+                continue;
+            }
+            if let Err(e) = self.propose(WalOperation::ReservationDelete { name: name.clone() }) {
+                warn!(name = %name, error = %e, "failed to purge expired reservation");
+            }
+        }
+    }
+
+    /// Cancel running jobs whose reservation window has ended (after optional grace).
+    pub fn enforce_reservation_end_times(&self) {
+        let now = Utc::now();
+        let grace = chrono::Duration::minutes(self.config.scheduler.resv_overrun_minutes as i64);
+        let reservations: std::collections::HashMap<String, Reservation> = self
+            .get_reservations()
+            .into_iter()
+            .map(|r| (r.name.clone(), r))
+            .collect();
+        let to_cancel: Vec<JobId> = self
+            .jobs
+            .read()
+            .values()
+            .filter_map(|job| {
+                if !matches!(
+                    job.state,
+                    JobState::Running | JobState::Completing | JobState::Suspended
+                ) {
+                    return None;
+                }
+                let res_name = job.spec.reservation.as_ref()?;
+                let res = reservations.get(res_name)?;
+                if now > res.end_time + grace {
+                    Some(job.job_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for job_id in to_cancel {
+            if let Err(e) = self.complete_job(job_id, -1, JobState::Cancelled) {
+                warn!(job_id, error = %e, "failed to cancel job after reservation ended");
+            }
+        }
+    }
+
+    fn validate_reservation_job_overlap(
+        &self,
+        res: &Reservation,
+        except_name: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if res.flags.ignore_jobs {
+            return Ok(());
+        }
+        let jobs = self.jobs.read();
+        if let Some((job_id, node)) =
+            running_jobs_overlap_start(&jobs, &res.nodes, res.start_time, except_name)
+        {
+            anyhow::bail!(
+                "requested nodes are busy (job {} on {} until after reservation start)",
+                job_id,
+                node
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_reservation_storage_overlap(
+        &self,
+        res: &Reservation,
+        except_name: Option<&str>,
+    ) -> anyhow::Result<()> {
+        for existing in self.reservations.read().iter() {
+            if except_name == Some(existing.name.as_str()) {
+                continue;
+            }
+            if !reservation::reservations_overlap(res, existing) {
+                continue;
+            }
+            if reservation::overlap_allowed(res, existing) {
+                continue;
+            }
+            anyhow::bail!(
+                "reservation overlaps with existing reservation '{}'",
+                existing.name
+            );
+        }
+        Ok(())
+    }
+
+    fn hold_jobs_for_deleted_reservation_jobs(jobs: &mut HashMap<JobId, Job>, name: &str) {
+        for job in jobs.values_mut() {
+            if job.state != JobState::Pending {
+                continue;
+            }
+            if job.spec.reservation.as_deref() != Some(name) {
+                continue;
+            }
+            if job.pending_reason.is_scheduling_hold() {
+                continue;
+            }
+            job.priority = 0;
+            job.pending_reason = PendingReason::ReservationDeleted;
+        }
+    }
+
+    fn detach_jobs_from_deleted_reservation_jobs(jobs: &mut HashMap<JobId, Job>, name: &str) {
+        for job in jobs.values_mut() {
+            if job.state != JobState::Pending {
+                continue;
+            }
+            if job.spec.reservation.as_deref() != Some(name) {
+                continue;
+            }
+            job.spec.reservation = None;
+            if job.pending_reason == PendingReason::ReservationDeleted {
+                job.pending_reason = PendingReason::None;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_reservation_update_locked(
+        reservations: &mut [Reservation],
+        name: &str,
+        duration_minutes: u32,
+        add_nodes: &[String],
+        remove_nodes: &[String],
+        add_users: &[String],
+        remove_users: &[String],
+        add_accounts: &[String],
+        remove_accounts: &[String],
+    ) {
+        let Some(res) = reservations.iter_mut().find(|r| r.name == name) else {
+            return;
+        };
         if duration_minutes > 0 {
             res.end_time = res.start_time + chrono::Duration::minutes(duration_minutes as i64);
         }
@@ -1937,21 +2321,6 @@ impl ClusterManager {
             }
         }
         res.accounts.retain(|a| !remove_accounts.contains(a));
-
-        info!(name, "reservation updated");
-        Ok(())
-    }
-
-    /// Delete a reservation by name.
-    pub fn delete_reservation(&self, name: &str) -> anyhow::Result<()> {
-        let mut reservations = self.reservations.write();
-        let len_before = reservations.len();
-        reservations.retain(|r| r.name != name);
-        if reservations.len() == len_before {
-            anyhow::bail!("reservation '{}' not found", name);
-        }
-        info!(name, "reservation deleted");
-        Ok(())
     }
 
     /// Get all reservations.
@@ -1985,7 +2354,7 @@ impl ClusterManager {
             };
 
             // Don't overwrite held jobs
-            if job_entry.pending_reason == PendingReason::Held {
+            if job_entry.pending_reason.is_scheduling_hold() {
                 continue;
             }
             // Don't overwrite a DeadLine reason set by the deadline-enforcement
@@ -2000,6 +2369,11 @@ impl ClusterManager {
             if job_entry.pending_reason == PendingReason::BeginTime
                 && job_entry.spec.begin_time.is_some_and(|b| Utc::now() < b)
             {
+                continue;
+            }
+
+            if let Some(reason) = reservation_fence_reason(job, cluster_state) {
+                job_entry.pending_reason = reason;
                 continue;
             }
 
@@ -2374,7 +2748,11 @@ impl ClusterManager {
                 next_id = next_id.max(job_id + 1);
             }
             WalOperation::JobStateChange {
-                job_id, new_state, ..
+                job_id,
+                new_state,
+                pending_reason,
+                pending_priority,
+                ..
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
                     let outcome = match job.apply_transition(*new_state) {
@@ -2387,7 +2765,20 @@ impl ClusterManager {
                     // Gated on a real transition so a replay doesn't re-wipe
                     // fields or double-count requeue_count.
                     if outcome == TransitionOutcome::Applied && *new_state == JobState::Pending {
-                        Self::reset_job_for_requeue(job);
+                        let max = self.config.controller.max_batch_requeue;
+                        if job.requeue_count < max {
+                            Self::reset_job_for_requeue(job);
+                        } else {
+                            job.start_time = None;
+                            job.exit_code = None;
+                            job.allocated_nodes.clear();
+                            job.allocated_resources = None;
+                            job.per_node_alloc.clear();
+                        }
+                        job.pending_reason = pending_reason.clone().unwrap_or(PendingReason::None);
+                        if let Some(priority) = pending_priority {
+                            job.priority = *priority;
+                        }
                     }
                 }
             }
@@ -2463,6 +2854,7 @@ impl ClusterManager {
                         state: JobState::Preempted,
                         exit_code: -1,
                     }],
+                    ..Default::default()
                 };
             }
             WalOperation::JobSuspend { job_id, at } => {
@@ -2645,6 +3037,7 @@ impl ClusterManager {
                             state: final_state,
                             exit_code: final_exit,
                         }],
+                        ..Default::default()
                     };
                 }
             }
@@ -2659,7 +3052,10 @@ impl ClusterManager {
                 if let Some(job) = jobs.get_mut(job_id) {
                     // is_finalized (incl. Preempted): a stale/replayed complete
                     // is a silent no-op, not a rejected-transition warning.
-                    if job.state.is_finalized() {
+                    // Preempted is finalized for the ended run but may still cancel.
+                    if job.state.is_finalized()
+                        && !(job.state == JobState::Preempted && *state == JobState::Cancelled)
+                    {
                         return ClientResponse::default();
                     }
                     if let Err(e) = job.transition(*state) {
@@ -2756,10 +3152,22 @@ impl ClusterManager {
             WalOperation::JobPriorityChange {
                 job_id,
                 new_priority,
+                pending_reason,
+                reset_requeue_count,
+                clear_reservation,
                 ..
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.priority = *new_priority;
+                    if let Some(reason) = pending_reason {
+                        job.pending_reason = reason.clone();
+                    }
+                    if *reset_requeue_count {
+                        job.requeue_count = 0;
+                    }
+                    if *clear_reservation {
+                        job.spec.reservation = None;
+                    }
                 }
             }
             WalOperation::NodeRegister {
@@ -2916,6 +3324,62 @@ impl ClusterManager {
                     t.revoked = true;
                 }
             }
+            WalOperation::ReservationCreate { reservation } => {
+                let mut reservations = self.reservations.write();
+                if reservations.iter().any(|r| r.name == reservation.name) {
+                    warn!(
+                        name = %reservation.name,
+                        "duplicate reservation create in WAL apply, ignoring"
+                    );
+                } else {
+                    reservations.push(reservation.clone());
+                    response.reservation_created = true;
+                    info!(name = %reservation.name, "reservation created");
+                }
+            }
+            WalOperation::ReservationUpdate {
+                name,
+                duration_minutes,
+                add_nodes,
+                remove_nodes,
+                add_users,
+                remove_users,
+                add_accounts,
+                remove_accounts,
+            } => {
+                let mut reservations = self.reservations.write();
+                Self::apply_reservation_update_locked(
+                    reservations.as_mut(),
+                    name,
+                    *duration_minutes,
+                    add_nodes,
+                    remove_nodes,
+                    add_users,
+                    remove_users,
+                    add_accounts,
+                    remove_accounts,
+                );
+                info!(name, "reservation updated");
+            }
+            WalOperation::ReservationDelete { name } => {
+                let deleted = {
+                    let reservations = self.reservations.read();
+                    reservations.iter().find(|r| r.name == *name).cloned()
+                };
+                let mut reservations = self.reservations.write();
+                let len_before = reservations.len();
+                reservations.retain(|r| r.name != *name);
+                if reservations.len() < len_before {
+                    if let Some(res) = deleted {
+                        if res.flags.no_hold_jobs {
+                            Self::detach_jobs_from_deleted_reservation_jobs(&mut jobs, name);
+                        } else {
+                            Self::hold_jobs_for_deleted_reservation_jobs(&mut jobs, name);
+                        }
+                        info!(name, "reservation deleted");
+                    }
+                }
+            }
         }
         self.next_job_id.store(next_id, Ordering::Relaxed);
         response
@@ -3039,6 +3503,104 @@ impl StateMachineApply for ClusterManager {
                 "restored cluster state from Raft snapshot"
             );
         }
+    }
+}
+
+fn job_candidate_node_names(job: &Job, nodes: &[spur_core::node::Node]) -> Vec<String> {
+    let partitions = self_partitions_for_job(job);
+    let nodelist: Option<Vec<&str>> = job.spec.nodelist.as_deref().map(|s| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect()
+    });
+    let exclude: std::collections::HashSet<&str> = job
+        .spec
+        .exclude
+        .as_deref()
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    nodes
+        .iter()
+        .filter(|node| {
+            if exclude.contains(node.name.as_str()) {
+                return false;
+            }
+            if let Some(ref nl) = nodelist {
+                if !nl.iter().any(|n| *n == node.name) {
+                    return false;
+                }
+            }
+            if !partitions.is_empty()
+                && !partitions
+                    .iter()
+                    .any(|p| node.partitions.iter().any(|np| np == p))
+            {
+                return false;
+            }
+            true
+        })
+        .map(|n| n.name.clone())
+        .collect()
+}
+
+fn self_partitions_for_job(job: &Job) -> Vec<String> {
+    job.spec
+        .partition
+        .as_deref()
+        .map(|p| {
+            p.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn reservation_fence_reason(
+    job: &Job,
+    cluster_state: &spur_sched::traits::ClusterState,
+) -> Option<PendingReason> {
+    let candidates = job_candidate_node_names(job, cluster_state.nodes);
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let now = Utc::now();
+    let duration = job.spec.time_limit.unwrap_or(chrono::Duration::hours(1));
+    let mut maint_block = false;
+    let mut all_blocked = true;
+
+    for node_name in &candidates {
+        let mut node_blocked = false;
+        for res in cluster_state.reservations {
+            if reservation::prospective_overlap(job, res, node_name, now, duration) {
+                node_blocked = true;
+                if res.flags.maint {
+                    maint_block = true;
+                }
+            }
+        }
+        if !node_blocked {
+            all_blocked = false;
+            break;
+        }
+    }
+
+    if !all_blocked {
+        return None;
+    }
+    if maint_block {
+        Some(PendingReason::ReservedMaintenance)
+    } else {
+        Some(PendingReason::ReqNodeNotAvail)
     }
 }
 
@@ -3575,6 +4137,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -3623,6 +4187,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
         let alloc = scalar_alloc(4, 8000);
         cm.apply_operation(&WalOperation::JobStart {
@@ -3661,6 +4227,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
         let t0 = chrono::Utc::now();
         cm.apply_operation(&WalOperation::JobSuspend { job_id: 1, at: t0 });
@@ -3825,6 +4393,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
         let t0 = chrono::Utc::now();
         // Cycle 1: 10s suspended.
@@ -3862,6 +4432,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
         // Suspended 30s ago, then cancelled now (JobComplete stamps Utc::now()).
         let since = chrono::Utc::now() - chrono::Duration::seconds(30);
@@ -3984,6 +4556,9 @@ mod tests {
             job_id: 1,
             old_priority: 1000,
             new_priority: 5000,
+            pending_reason: None,
+            reset_requeue_count: false,
+            clear_reservation: false,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -4098,6 +4673,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
@@ -4137,6 +4714,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
@@ -4177,6 +4756,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
@@ -4241,6 +4822,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
@@ -4300,6 +4883,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
 
         cm.apply_operation(&WalOperation::JobStepComplete {
@@ -4328,6 +4913,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
@@ -4376,6 +4963,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
@@ -4413,6 +5002,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
@@ -4468,6 +5059,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
@@ -4503,6 +5096,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
@@ -4543,6 +5138,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
@@ -4576,6 +5173,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
@@ -4612,6 +5211,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
@@ -4677,6 +5278,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
@@ -5013,6 +5616,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
 
         // Re-applying the same running transition is a NoOp, not an error.
@@ -5020,6 +5625,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Running);
 
@@ -5063,6 +5670,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
@@ -5073,6 +5682,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Preempted,
             new_state: JobState::Pending,
+            pending_reason: None,
+            pending_priority: None,
         });
         assert_eq!(cm.get_job(1).unwrap().requeue_count, 1);
 
@@ -5081,6 +5692,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Preempted,
             new_state: JobState::Pending,
+            pending_reason: None,
+            pending_priority: None,
         });
         assert_eq!(
             cm.get_job(1).unwrap().requeue_count,
@@ -5107,6 +5720,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
@@ -5535,6 +6150,824 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reservation_overlap_rejected_without_flag() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        let base = Reservation {
+            name: String::new(),
+            start_time: now,
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: Default::default(),
+        };
+        let mut r1 = base.clone();
+        r1.name = "r1".into();
+        cm.create_reservation(r1).unwrap();
+        let mut r2 = base;
+        r2.name = "r2".into();
+        r2.start_time = now + chrono::Duration::hours(1);
+        assert!(cm.create_reservation(r2).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reservation_overlap_allowed_with_overlap_flag() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        let base = Reservation {
+            name: String::new(),
+            start_time: now,
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: Default::default(),
+        };
+        let mut r1 = base.clone();
+        r1.name = "r1".into();
+        cm.create_reservation(r1).unwrap();
+        let mut r2 = base;
+        r2.name = "r2".into();
+        r2.start_time = now + chrono::Duration::hours(1);
+        r2.flags.overlap = true;
+        assert!(cm.create_reservation(r2).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_prioritize_active_reservation_targets() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "r1".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["testuser".into()],
+            flags: Default::default(),
+        })
+        .unwrap();
+
+        let mut plain = basic_spec("plain");
+        plain.priority = Some(5000);
+        let plain_id = submit_and_wait(&cm, plain);
+
+        let mut resv = basic_spec("resv");
+        resv.priority = Some(1000);
+        resv.reservation = Some("r1".into());
+        let resv_id = submit_and_wait(&cm, resv);
+
+        let pending = cm.pending_jobs();
+        assert_eq!(pending.first().map(|j| j.job_id), Some(resv_id));
+        assert!(pending.iter().any(|j| j.job_id == plain_id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resv_overrun_grace_delays_cancel() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.scheduler.resv_overrun_minutes = 30;
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "r1".into(),
+            start_time: now - chrono::Duration::hours(1),
+            end_time: now - chrono::Duration::minutes(5),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["testuser".into()],
+            flags: Default::default(),
+        })
+        .unwrap();
+
+        let mut spec = basic_spec("resv-run");
+        spec.reservation = Some("r1".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            job_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        cm.enforce_reservation_end_times();
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_skips_jobs_in_active_reservation_at_same_tier() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].preempt_mode = "cancel".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "r1".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["testuser".into()],
+            flags: Default::default(),
+        })
+        .unwrap();
+
+        let mut low = basic_spec("low");
+        low.priority = Some(100);
+        low.reservation = Some("r1".into());
+        let low_id = submit_and_wait(&cm, low);
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            low_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, low_id, JobState::Running);
+
+        let mut high = basic_spec("high");
+        high.priority = Some(10_000);
+        let high_id = submit_and_wait(&cm, high);
+        let high_job = cm.get_job(high_id).unwrap();
+        let partitions = cm.get_partitions();
+
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job]).await;
+        assert_eq!(cm.get_job(low_id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_skips_jobs_on_unrelated_nodes() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].preempt_mode = "cancel".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+
+        let mut low = basic_spec("low");
+        low.priority = Some(100);
+        low.nodelist = Some("n2".into());
+        let low_id = submit_and_wait(&cm, low);
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            low_id,
+            vec!["n2".into()],
+            res.clone(),
+            per_node_for(&["n2"], res),
+        )
+        .unwrap();
+        settle(&cm, low_id, JobState::Running);
+
+        let mut high = basic_spec("high");
+        high.priority = Some(10_000);
+        high.nodelist = Some("n1".into());
+        let high_id = submit_and_wait(&cm, high);
+        let high_job = cm.get_job(high_id).unwrap();
+        let partitions = cm.get_partitions();
+
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job]).await;
+        assert_eq!(cm.get_job(low_id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn purge_expired_holds_pending_reservation_jobs() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.apply_operation(&WalOperation::ReservationCreate {
+            reservation: Reservation {
+                name: "r1".into(),
+                start_time: now - chrono::Duration::hours(2),
+                end_time: now - chrono::Duration::minutes(1),
+                nodes: vec!["n1".into()],
+                accounts: Vec::new(),
+                users: vec!["testuser".into()],
+                flags: Default::default(),
+            },
+        });
+
+        let mut spec = basic_spec("resv-pending");
+        spec.reservation = Some("r1".into());
+        let job_id = submit_and_wait(&cm, spec);
+
+        cm.purge_expired_reservations();
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.pending_reason, PendingReason::ReservationDeleted);
+        assert_eq!(job.priority, 0);
+        assert!(cm.get_reservations().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_reservation_create_update_delete() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        let res = Reservation {
+            name: "r1".into(),
+            start_time: now,
+            end_time: now + chrono::Duration::hours(1),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: Default::default(),
+        };
+        cm.apply_operation(&WalOperation::ReservationCreate {
+            reservation: res.clone(),
+        });
+        assert_eq!(cm.get_reservations().len(), 1);
+        assert_eq!(cm.get_reservations()[0].name, "r1");
+
+        cm.apply_operation(&WalOperation::ReservationUpdate {
+            name: "r1".into(),
+            duration_minutes: 120,
+            add_nodes: Vec::new(),
+            remove_nodes: Vec::new(),
+            add_users: vec!["bob".into()],
+            remove_users: Vec::new(),
+            add_accounts: Vec::new(),
+            remove_accounts: Vec::new(),
+        });
+        let updated = cm
+            .get_reservations()
+            .into_iter()
+            .find(|r| r.name == "r1")
+            .unwrap();
+        assert!(updated.users.contains(&"bob".into()));
+        assert_eq!(
+            updated.end_time,
+            updated.start_time + chrono::Duration::minutes(120)
+        );
+
+        cm.apply_operation(&WalOperation::ReservationDelete { name: "r1".into() });
+        assert!(cm.get_reservations().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_reservation_create_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        let res = Reservation {
+            name: "r1".into(),
+            start_time: now,
+            end_time: now + chrono::Duration::hours(1),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: Default::default(),
+        };
+        cm.apply_operation(&WalOperation::ReservationCreate {
+            reservation: res.clone(),
+        });
+        cm.apply_operation(&WalOperation::ReservationCreate { reservation: res });
+        assert_eq!(cm.get_reservations().len(), 1);
+        assert_eq!(cm.get_reservations()[0].name, "r1");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_reservation_create_keeps_single_entry() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        let base = Reservation {
+            name: "r1".into(),
+            start_time: now,
+            end_time: now + chrono::Duration::hours(1),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: Default::default(),
+        };
+        let cm1 = cm.clone();
+        let cm2 = cm.clone();
+        let r1 = base.clone();
+        let r2 = base;
+        let (first, second) = tokio::join!(
+            tokio::task::spawn_blocking(move || cm1.create_reservation(r1)),
+            tokio::task::spawn_blocking(move || cm2.create_reservation(r2)),
+        );
+        let outcomes = [first.unwrap(), second.unwrap()];
+        assert_eq!(
+            outcomes.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "exactly one concurrent create must succeed"
+        );
+        assert_eq!(cm.get_reservations().len(), 1);
+        assert_eq!(cm.get_reservations()[0].name, "r1");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reservation_survives_wal_replay() {
+        let dir = TempDir::new().unwrap();
+        {
+            let cm = test_cluster(&dir).await;
+            register_node(&cm, "n1", 8, 16000);
+            let now = chrono::Utc::now();
+            cm.create_reservation(Reservation {
+                name: "r1".into(),
+                start_time: now,
+                end_time: now + chrono::Duration::hours(1),
+                nodes: vec!["n1".into()],
+                accounts: Vec::new(),
+                users: vec!["alice".into()],
+                flags: Default::default(),
+            })
+            .unwrap();
+            assert_eq!(cm.get_reservations().len(), 1);
+        }
+
+        let cm2 = test_cluster(&dir).await;
+        wait_for("reservation replayed from WAL", || {
+            cm2.get_reservations().iter().any(|r| r.name == "r1")
+        });
+        assert_eq!(cm2.get_reservations().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_hold_jobs_reservation_delete_does_not_permanently_block_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "r1".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["testuser".into()],
+            flags: spur_core::reservation::ReservationFlags {
+                no_hold_jobs: true,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+
+        let mut spec = basic_spec("resv-pending");
+        spec.reservation = Some("r1".into());
+        let job_id = submit_and_wait(&cm, spec);
+
+        cm.delete_reservation("r1").unwrap();
+        wait_for("reservation deleted", || cm.get_reservations().is_empty());
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.spec.reservation, None);
+        assert_ne!(job.pending_reason, PendingReason::Held);
+        assert_ne!(job.priority, 0);
+        assert!(
+            cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "job must remain schedulable after no_hold_jobs delete"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_hold_jobs_purge_does_not_permanently_block_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.apply_operation(&WalOperation::ReservationCreate {
+            reservation: Reservation {
+                name: "r1".into(),
+                start_time: now - chrono::Duration::hours(2),
+                end_time: now - chrono::Duration::minutes(1),
+                nodes: vec!["n1".into()],
+                accounts: Vec::new(),
+                users: vec!["testuser".into()],
+                flags: spur_core::reservation::ReservationFlags {
+                    no_hold_jobs: true,
+                    ..Default::default()
+                },
+            },
+        });
+
+        let mut spec = basic_spec("resv-pending");
+        spec.reservation = Some("r1".into());
+        let job_id = submit_and_wait(&cm, spec);
+
+        cm.purge_expired_reservations();
+        wait_for("reservation purged", || cm.get_reservations().is_empty());
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.spec.reservation, None);
+        assert!(
+            cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "job must remain schedulable after no_hold_jobs purge"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reservation_fence_reason_requires_all_candidates_blocked() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "r1".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: Default::default(),
+        })
+        .unwrap();
+
+        let job_id = submit_and_wait(&cm, basic_spec("fence"));
+        cm.tag_blocked_pending_reasons();
+        let job = cm.get_job(job_id).unwrap();
+        assert_ne!(
+            job.pending_reason,
+            PendingReason::ReqNodeNotAvail,
+            "n2 is an unblocked candidate; must not fence the job"
+        );
+        assert_ne!(job.pending_reason, PendingReason::ReservedMaintenance);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_state_change_held_pending_apply_is_atomic() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = submit_and_wait(&cm, basic_spec("hold-atomic"));
+        cm.apply_operation(&WalOperation::job_state_change(
+            job_id,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id,
+            exit_code: -1,
+            state: JobState::Preempted,
+        });
+        for _ in 0..5 {
+            cm.apply_operation(&WalOperation::job_state_change(
+                job_id,
+                JobState::Preempted,
+                JobState::Pending,
+            ));
+            cm.apply_operation(&WalOperation::job_state_change(
+                job_id,
+                JobState::Pending,
+                JobState::Running,
+            ));
+            cm.apply_operation(&WalOperation::JobComplete {
+                job_id,
+                exit_code: -1,
+                state: JobState::Preempted,
+            });
+        }
+        assert_eq!(cm.get_job(job_id).unwrap().requeue_count, 5);
+
+        cm.apply_operation(&WalOperation::job_state_change_held_pending(
+            job_id,
+            JobState::Preempted,
+            PendingReason::JobHoldMaxRequeue,
+        ));
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.priority, 0);
+        assert_eq!(job.pending_reason, PendingReason::JobHoldMaxRequeue);
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "hold must apply priority and reason in one WAL entry"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeue_preempted_job_holds_at_max_requeue() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let job_id = submit_and_wait(&cm, basic_spec("preempt-me"));
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
+        });
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id,
+            exit_code: -1,
+            state: JobState::Preempted,
+        });
+        for _ in 0..5 {
+            cm.apply_operation(&WalOperation::JobStateChange {
+                job_id,
+                old_state: JobState::Preempted,
+                new_state: JobState::Pending,
+                pending_reason: None,
+                pending_priority: None,
+            });
+            cm.apply_operation(&WalOperation::JobStateChange {
+                job_id,
+                old_state: JobState::Pending,
+                new_state: JobState::Running,
+                pending_reason: None,
+                pending_priority: None,
+            });
+            cm.apply_operation(&WalOperation::JobComplete {
+                job_id,
+                exit_code: -1,
+                state: JobState::Preempted,
+            });
+        }
+        assert_eq!(cm.get_job(job_id).unwrap().requeue_count, 5);
+
+        cm.hold_job_at_max_requeue(job_id).unwrap();
+        wait_for("job held at max requeue", || {
+            cm.get_job(job_id).is_some_and(|j| {
+                j.state == JobState::Pending && j.pending_reason == PendingReason::JobHoldMaxRequeue
+            })
+        });
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.priority, 0);
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "held job must not be schedulable"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reservation_delete_hold_survives_wal_replay() {
+        let dir = TempDir::new().unwrap();
+        {
+            let cm = test_cluster(&dir).await;
+            register_node(&cm, "n1", 8, 16000);
+            let now = chrono::Utc::now();
+            cm.create_reservation(Reservation {
+                name: "r1".into(),
+                start_time: now - chrono::Duration::minutes(5),
+                end_time: now + chrono::Duration::hours(2),
+                nodes: vec!["n1".into()],
+                accounts: Vec::new(),
+                users: vec!["testuser".into()],
+                flags: Default::default(),
+            })
+            .unwrap();
+
+            let mut spec = basic_spec("resv-hold");
+            spec.reservation = Some("r1".into());
+            let job_id = submit_and_wait(&cm, spec);
+            cm.delete_reservation("r1").unwrap();
+            wait_for("job held after delete", || {
+                cm.get_job(job_id).is_some_and(|j| {
+                    j.pending_reason == PendingReason::ReservationDeleted && j.priority == 0
+                })
+            });
+        }
+
+        let cm2 = test_cluster(&dir).await;
+        wait_for("held job replayed from WAL", || {
+            cm2.jobs
+                .read()
+                .values()
+                .any(|j| j.pending_reason == PendingReason::ReservationDeleted && j.priority == 0)
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reservation_delete_no_hold_survives_wal_replay() {
+        let dir = TempDir::new().unwrap();
+        let job_id;
+        {
+            let cm = test_cluster(&dir).await;
+            register_node(&cm, "n1", 8, 16000);
+            let now = chrono::Utc::now();
+            cm.create_reservation(Reservation {
+                name: "r1".into(),
+                start_time: now - chrono::Duration::minutes(5),
+                end_time: now + chrono::Duration::hours(2),
+                nodes: vec!["n1".into()],
+                accounts: Vec::new(),
+                users: vec!["testuser".into()],
+                flags: spur_core::reservation::ReservationFlags {
+                    no_hold_jobs: true,
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+
+            let mut spec = basic_spec("resv-no-hold");
+            spec.reservation = Some("r1".into());
+            job_id = submit_and_wait(&cm, spec);
+            cm.delete_reservation("r1").unwrap();
+            wait_for("reservation detached from job", || {
+                cm.get_job(job_id)
+                    .is_some_and(|j| j.spec.reservation.is_none() && j.priority > 0)
+            });
+        }
+
+        let cm2 = test_cluster(&dir).await;
+        wait_for("detached job replayed from WAL", || {
+            cm2.get_job(job_id)
+                .is_some_and(|j| j.spec.reservation.is_none() && j.priority > 0)
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_job_after_reservation_delete_unblocks_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "r1".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["testuser".into()],
+            flags: Default::default(),
+        })
+        .unwrap();
+
+        let mut spec = basic_spec("release-me");
+        spec.reservation = Some("r1".into());
+        let job_id = submit_and_wait(&cm, spec);
+        cm.delete_reservation("r1").unwrap();
+        wait_for("job held after delete", || {
+            cm.get_job(job_id).is_some_and(|j| {
+                j.pending_reason == PendingReason::ReservationDeleted && j.priority == 0
+            })
+        });
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "held job must not be schedulable before release"
+        );
+
+        cm.release_job(job_id).unwrap();
+        wait_for("job released after reservation delete", || {
+            cm.get_job(job_id).is_some_and(|j| {
+                j.spec.reservation.is_none()
+                    && j.priority > 0
+                    && j.pending_reason == PendingReason::Priority
+            })
+        });
+        assert!(
+            cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "released job must be schedulable"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_preserves_reservation_deleted_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let mut spec = basic_spec("resv-deleted");
+        spec.reservation = Some("gone".into());
+        let job_id = submit_and_wait(&cm, spec);
+        {
+            let mut jobs = cm.jobs.write();
+            jobs.get_mut(&job_id).unwrap().pending_reason = PendingReason::ReservationDeleted;
+            jobs.get_mut(&job_id).unwrap().priority = 0;
+        }
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::ReservationDeleted
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn maybe_requeue_holds_at_max_for_timeout() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        let mut spec = basic_spec("timeout-requeue");
+        spec.requeue = true;
+        let job_id = submit_and_wait(&cm, spec);
+        let alloc = scalar_alloc(1, 1000);
+        let nodes = vec!["n1".into()];
+        let per_node = per_node_for(&["n1"], alloc.clone());
+
+        for _ in 0..5 {
+            cm.start_job(job_id, nodes.clone(), alloc.clone(), per_node.clone())
+                .unwrap();
+            settle(&cm, job_id, JobState::Running);
+            cm.complete_job(job_id, -1, JobState::Timeout).unwrap();
+            settle(&cm, job_id, JobState::Pending);
+        }
+        assert_eq!(cm.get_job(job_id).unwrap().requeue_count, 5);
+
+        cm.start_job(job_id, nodes, alloc, per_node).unwrap();
+        settle(&cm, job_id, JobState::Running);
+        cm.complete_job(job_id, -1, JobState::Timeout).unwrap();
+        wait_for("job held at max requeue after timeout", || {
+            cm.get_job(job_id).is_some_and(|j| {
+                j.state == JobState::Pending && j.pending_reason == PendingReason::JobHoldMaxRequeue
+            })
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_job_resets_requeue_count_after_max_hold() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let job_id = submit_and_wait(&cm, basic_spec("release-me"));
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
+        });
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id,
+            exit_code: -1,
+            state: JobState::Preempted,
+        });
+        for _ in 0..5 {
+            cm.apply_operation(&WalOperation::JobStateChange {
+                job_id,
+                old_state: JobState::Preempted,
+                new_state: JobState::Pending,
+                pending_reason: None,
+                pending_priority: None,
+            });
+            cm.apply_operation(&WalOperation::JobStateChange {
+                job_id,
+                old_state: JobState::Pending,
+                new_state: JobState::Running,
+                pending_reason: None,
+                pending_priority: None,
+            });
+            cm.apply_operation(&WalOperation::JobComplete {
+                job_id,
+                exit_code: -1,
+                state: JobState::Preempted,
+            });
+        }
+        cm.hold_job_at_max_requeue(job_id).unwrap();
+        wait_for("job held at max requeue", || {
+            cm.get_job(job_id)
+                .is_some_and(|j| j.pending_reason == PendingReason::JobHoldMaxRequeue)
+        });
+        assert_eq!(cm.get_job(job_id).unwrap().requeue_count, 5);
+
+        cm.release_job(job_id).unwrap();
+        wait_for("release resets requeue budget", || {
+            cm.get_job(job_id).is_some_and(|j| {
+                j.requeue_count == 0
+                    && j.priority > 0
+                    && j.pending_reason == PendingReason::Priority
+            })
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_preempted_job_uses_cancelled_state() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = submit_and_wait(&cm, basic_spec("cancel-preempted"));
+
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
+        });
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id,
+            exit_code: -1,
+            state: JobState::Preempted,
+        });
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Preempted);
+
+        cm.cancel_job(job_id, "testuser").unwrap();
+        wait_for("preempted job cancelled", || {
+            cm.get_job(job_id)
+                .is_some_and(|j| j.state == JobState::Cancelled)
+        });
+        let job = cm.get_job(job_id).unwrap();
+        assert_ne!(job.pending_reason, PendingReason::JobHoldMaxRequeue);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tag_blocked_sets_licenses_reason() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -5917,6 +7350,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
 
         let mut child = basic_spec("child");
@@ -6185,6 +7620,8 @@ mod tests {
             job_id: id,
             old_state: JobState::Timeout,
             new_state: JobState::Pending,
+            pending_reason: None,
+            pending_priority: None,
         });
 
         let job = cm.get_job(id).unwrap();
@@ -6567,6 +8004,8 @@ mod tests {
                 job_id: id,
                 old_state: JobState::Pending,
                 new_state: JobState::Running,
+                pending_reason: None,
+                pending_priority: None,
             });
         }
         cm.apply_operation(&WalOperation::JobComplete {
@@ -6625,6 +8064,8 @@ mod tests {
             job_id: 2,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
 
         let cancelled = cm.cancel_unsatisfiable_dependency_jobs();
@@ -6646,6 +8087,8 @@ mod tests {
             job_id: 1,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
 
         let mut child = basic_spec("child");
@@ -7205,6 +8648,8 @@ mod tests {
             job_id: id,
             old_state: JobState::Pending,
             new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
         });
         cm.apply_operation(&WalOperation::JobStart {
             job_id: id,

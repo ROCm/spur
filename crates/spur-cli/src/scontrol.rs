@@ -87,6 +87,9 @@ pub enum ScontrolCommand {
         /// Comma-separated users (optional)
         #[arg(long, default_value = "")]
         users: String,
+        /// Comma-separated flags (maint, ignore_jobs, no_hold_jobs, overlap)
+        #[arg(long, default_value = "")]
+        flags: String,
     },
     /// Update a reservation
     #[command(name = "update-reservation")]
@@ -221,6 +224,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             nodes,
             accounts,
             users,
+            flags,
         } => {
             create_reservation(
                 &args.controller,
@@ -230,6 +234,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 &nodes,
                 &accounts,
                 &users,
+                &flags,
             )
             .await
         }
@@ -376,6 +381,9 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                     label_str.sort();
                     println!("   Labels={}", label_str.join(","));
                 }
+                if !node.active_reservation.is_empty() {
+                    println!("   ActiveReservation={}", node.active_reservation);
+                }
                 println!("   CpuLoad={}", node.cpu_load as f64 / 100.0);
                 println!();
             }
@@ -426,6 +434,12 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 println!("   StartTime={}", res.start_time);
                 println!("   EndTime={}", res.end_time);
                 println!("   Nodes={}", res.nodes);
+                if !res.state.is_empty() {
+                    println!("   State={}", res.state);
+                }
+                if !res.flags.is_empty() {
+                    println!("   Flags={}", res.flags);
+                }
                 if !res.accounts.is_empty() {
                     println!("   Accounts={}", res.accounts);
                 }
@@ -665,6 +679,7 @@ async fn update_node(
 }
 
 /// Create a reservation via the controller.
+#[allow(clippy::too_many_arguments)]
 async fn create_reservation(
     controller: &str,
     name: &str,
@@ -673,6 +688,7 @@ async fn create_reservation(
     nodes: &str,
     accounts: &str,
     users: &str,
+    flags: &str,
 ) -> Result<()> {
     let channel = spur_client::connect_channel(controller)
         .await
@@ -694,6 +710,11 @@ async fn create_reservation(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+    let flag_list: Vec<String> = flags
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     client
         .create_reservation(spur_proto::proto::CreateReservationRequest {
@@ -703,6 +724,7 @@ async fn create_reservation(
             nodes: node_list,
             accounts: account_list,
             users: user_list,
+            flags: flag_list,
         })
         .await
         .context("failed to create reservation")?;

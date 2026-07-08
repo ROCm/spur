@@ -196,6 +196,9 @@ message JobInfo {
   // Array jobs
   uint32 array_job_id = 50;
   uint32 array_task_id = 51;
+
+  // Reservation
+  string reservation = 52;
 }
 
 message NodeInfo {
@@ -220,6 +223,7 @@ message NodeInfo {
 
   string active_reservation = 50;
   map<string, string> labels = 51;
+  bool reservation_maint = 52;
 }
 
 message PartitionInfo {
@@ -700,6 +704,7 @@ message RecordJobStartRequest {
   string partition = 4;
   ResourceAllocations resources = 5;
   google.protobuf.Timestamp start_time = 6;
+  string reservation = 7;
 }
 
 message RecordJobEndRequest {
@@ -915,6 +920,7 @@ message CreateReservationRequest {
   repeated string nodes = 4;
   repeated string accounts = 5;
   repeated string users = 6;
+  repeated string flags = 7;
 }
 
 message UpdateReservationRequest {
@@ -945,6 +951,8 @@ message ReservationInfo {
   string nodes = 4;
   string accounts = 5;
   string users = 6;
+  string flags = 7;
+  string state = 8;
 }
 
 // ============================================================

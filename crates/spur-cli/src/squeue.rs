@@ -153,6 +153,7 @@ fn resolve_job_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
         'o' => job.command.clone(),
         'S' => format_timestamp(job.start_time.as_ref()),
         'V' => format_timestamp(job.submit_time.as_ref()),
+        'v' => job.reservation.clone(),
         'e' => format_timestamp(job.end_time.as_ref()),
         _ => "?".into(),
     }

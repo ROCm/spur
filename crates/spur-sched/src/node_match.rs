@@ -293,6 +293,7 @@ mod tests {
             nodes: vec!["node001".into()],
             accounts: Vec::new(),
             users: vec!["alice".into()],
+            flags: Default::default(),
         };
         assert!(!p.matches(&node("node001"), std::slice::from_ref(&res), now));
         assert!(p.matches(&node("node002"), &[res], now));

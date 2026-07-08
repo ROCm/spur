@@ -7,7 +7,7 @@ mod grpc;
 mod notifier;
 
 pub use grpc::accounting_server;
-pub use notifier::AccountingNotifier;
+pub use notifier::{AccountingNotifier, JobStartRecord};
 
 use std::collections::HashMap;
 

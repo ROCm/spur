@@ -283,6 +283,15 @@ pub struct ControllerConfig {
     /// Defaults to 90 when absent.
     #[serde(default)]
     pub heartbeat_timeout_secs: Option<u64>,
+
+    /// Maximum automatic requeues before a job is held with `JobHoldMaxRequeue`.
+    /// Configured in TOML as `[controller] max_batch_requeue` (default: 5).
+    #[serde(default = "default_max_batch_requeue")]
+    pub max_batch_requeue: u32,
+}
+
+fn default_max_batch_requeue() -> u32 {
+    5
 }
 
 fn default_listen_addr() -> String {
@@ -317,6 +326,7 @@ impl Default for ControllerConfig {
             node_id: None,
             raft_listen_addr: "[::]:6821".into(),
             heartbeat_timeout_secs: None,
+            max_batch_requeue: default_max_batch_requeue(),
         }
     }
 }
@@ -385,6 +395,9 @@ pub struct SchedulerConfig {
     /// Max seconds to wait in COMPLETING before force-finishing the job.
     #[serde(default = "default_complete_wait")]
     pub complete_wait_secs: u32,
+    /// Grace minutes after a reservation ends before cancelling its running jobs.
+    #[serde(default)]
+    pub resv_overrun_minutes: u32,
 }
 
 fn default_scheduler_plugin() -> String {
@@ -412,6 +425,7 @@ impl Default for SchedulerConfig {
             fairshare_halflife_days: 14,
             default_time_limit_minutes: 60,
             complete_wait_secs: 300,
+            resv_overrun_minutes: 0,
         }
     }
 }
@@ -793,6 +807,12 @@ impl SlurmConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         if self.cluster_name.is_empty() {
             return Err(ConfigError::MissingField("cluster_name".into()));
+        }
+        if self.controller.max_batch_requeue == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.max_batch_requeue".into(),
+                value: "0 (must be at least 1)".into(),
+            });
         }
         Ok(())
     }
@@ -1229,6 +1249,34 @@ memory_mb = 1024000
     fn controller_config_defaults_for_new_fields() {
         let config = ControllerConfig::default();
         assert_eq!(config.heartbeat_timeout_secs, None);
+        assert_eq!(config.max_batch_requeue, 5);
+    }
+
+    #[test]
+    fn controller_config_parses_max_batch_requeue() {
+        let toml = r#"
+cluster_name = "test"
+
+[controller]
+max_batch_requeue = 7
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.controller.max_batch_requeue, 7);
+    }
+
+    #[test]
+    fn controller_config_rejects_zero_max_batch_requeue() {
+        let toml = r#"
+cluster_name = "test"
+
+[controller]
+max_batch_requeue = 0
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("max_batch_requeue"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

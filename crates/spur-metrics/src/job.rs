@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use spur_core::job::{Job, JobState, PendingReason};
+use spur_core::job::{Job, JobState};
 
 /// Number of [`JobState`] variants (index for `by_state`).
 pub const JOB_STATE_COUNT: usize = JobState::COUNT;
@@ -16,7 +16,7 @@ pub struct JobMetricsSnapshot {
     pub total: u64,
     /// Count per [`JobState`]; index via [`job_state_index`].
     pub by_state: [u64; JOB_STATE_COUNT],
-    /// Pending jobs with `pending_reason == Held`.
+    /// Pending jobs held from scheduling (`Held`, `JobHeldAdmin`, `JobHoldMaxRequeue`).
     pub held_pending: u64,
     /// Sum of allocated CPUs for jobs in Running or Completing.
     pub running_cpus: u64,
@@ -46,7 +46,7 @@ impl JobMetricsSnapshot {
             snap.total += 1;
             snap.by_state[job_state_index(job.state)] += 1;
 
-            if job.state == JobState::Pending && job.pending_reason == PendingReason::Held {
+            if job.state == JobState::Pending && job.pending_reason.is_scheduling_hold() {
                 snap.held_pending += 1;
             }
 
@@ -119,6 +119,23 @@ mod tests {
         assert_eq!(snap.held_pending, 1);
         assert_eq!(snap.count_state(JobState::Running), 1);
         assert_eq!(snap.count_state(JobState::Completed), 1);
+    }
+
+    #[test]
+    fn counts_reservation_deleted_as_held() {
+        let mut job = job_with_state(1, JobState::Pending, false);
+        job.pending_reason = PendingReason::ReservationDeleted;
+        job.priority = 0;
+        let snap = JobMetricsSnapshot::collect([&job]);
+        assert_eq!(snap.held_pending, 1);
+    }
+
+    #[test]
+    fn counts_job_hold_max_requeue_as_held() {
+        let mut job = job_with_state(1, JobState::Pending, false);
+        job.pending_reason = PendingReason::JobHoldMaxRequeue;
+        let snap = JobMetricsSnapshot::collect([&job]);
+        assert_eq!(snap.held_pending, 1);
     }
 
     #[test]

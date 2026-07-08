@@ -7,6 +7,19 @@ use tracing::warn;
 
 use spur_core::job::{JobId, JobState};
 
+pub struct JobStartRecord {
+    pub job_id: JobId,
+    pub user: String,
+    pub account: String,
+    pub partition: String,
+    pub num_nodes: u32,
+    pub num_tasks: u32,
+    pub cpus_per_task: u32,
+    pub memory_mb: u64,
+    pub start_time: DateTime<Utc>,
+    pub reservation: Option<String>,
+}
+
 pub struct AccountingNotifier {
     pool: PgPool,
 }
@@ -16,24 +29,18 @@ impl AccountingNotifier {
         Self { pool }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn notify_job_start(
-        &self,
-        job_id: JobId,
-        user: String,
-        account: String,
-        partition: String,
-        num_nodes: u32,
-        num_tasks: u32,
-        cpus_per_task: u32,
-        memory_mb: u64,
-        start_time: DateTime<Utc>,
-    ) {
+    pub fn notify_job_start(&self, record: JobStartRecord) {
         let pool = self.pool.clone();
-        let num_nodes = num_nodes as i32;
-        let num_tasks = num_tasks as i32;
-        let cpus_per_task = cpus_per_task as i32;
-        let memory_mb = memory_mb as i64;
+        let job_id = record.job_id;
+        let user = record.user;
+        let account = record.account;
+        let partition = record.partition;
+        let num_nodes = record.num_nodes as i32;
+        let num_tasks = record.num_tasks as i32;
+        let cpus_per_task = record.cpus_per_task as i32;
+        let memory_mb = record.memory_mb as i64;
+        let start_time = record.start_time;
+        let reservation = record.reservation.unwrap_or_default();
         tokio::spawn(async move {
             if let Err(e) = super::db::record_job_start(
                 &pool,
@@ -46,6 +53,7 @@ impl AccountingNotifier {
                 cpus_per_task,
                 memory_mb,
                 start_time,
+                &reservation,
             )
             .await
             {

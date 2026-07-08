@@ -349,6 +349,9 @@ class SpurCluster:
     def sbatch(self, args: list[str]) -> str:
         return self.cli(["sbatch"] + args)
 
+    def squeue(self, args: list[str]) -> str:
+        return self.cli(["squeue"] + args)
+
     def squeue_all(self) -> str:
         return self.cli(["squeue", "-t", "all"])
 
@@ -892,6 +895,21 @@ def job_state(squeue_output: str, job_id: int) -> str | None:
             if field in valid_states:
                 return field
     return None
+
+
+def wait_job_state(
+    cluster: SpurCluster, job_id: int, state: str, timeout: int = 120
+) -> None:
+    """Wait until the job reaches the given squeue state (e.g. PD, R)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        sq = cluster.squeue_all()
+        if job_state(sq, job_id) == state:
+            return
+        time.sleep(2)
+    raise TimeoutError(
+        f"Job {job_id} did not reach state {state} within {timeout}s"
+    )
 
 
 def wait_job(cluster: SpurCluster, job_id: int, timeout: int = 120) -> str:

@@ -103,6 +103,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // a follow-up; drive_bb_stage_in() is the controller-side seam only.
         cluster.drive_bb_stage_in();
         cluster.advance_bb_staging();
+        cluster.purge_expired_reservations();
+        cluster.enforce_reservation_end_times();
 
         // Tag jobs pending_jobs() will drop (QoS/license/reservation/BB) with
         // their real reason, since they never reach update_pending_reasons().
@@ -438,16 +440,31 @@ fn job_preempt_mode(
 
 /// Preempt lower-priority running jobs per their partition PreemptMode
 /// (Off jobs are never preempted).
-async fn try_preempt(
+pub(crate) async fn try_preempt(
     cluster: &Arc<ClusterManager>,
     partitions: &[spur_core::partition::Partition],
     unscheduled: &[&spur_core::job::Job],
 ) {
     use crate::cluster::PreemptOutcome;
     use spur_core::job::JobState;
-    use spur_core::partition::PreemptMode;
+    use spur_core::partition::{Partition, PreemptMode};
+    use spur_core::reservation::job_runs_in_active_reservation;
 
-    // Get running jobs sorted by priority (lowest first = best preemption candidates)
+    let now = chrono::Utc::now();
+    let reservations = cluster.get_reservations();
+    let cluster_nodes = cluster.get_nodes();
+
+    let partition_for = |job: &spur_core::job::Job| -> Option<&Partition> {
+        job.spec.partition.as_deref().and_then(|pname| {
+            pname
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .filter_map(|req| partitions.iter().find(|p| p.name == req))
+                .max_by_key(|p| p.preempt_mode.aggressiveness())
+        })
+    };
+
     let mut running: Vec<spur_core::job::Job> = cluster
         .get_jobs(&[JobState::Running], None, None, None, &[])
         .into_iter()
@@ -455,11 +472,32 @@ async fn try_preempt(
     running.sort_by_key(|j| j.priority);
 
     for pending in unscheduled {
-        // Only preempt if pending job has significantly higher priority
+        let Some(pending_part) = partition_for(pending) else {
+            continue;
+        };
+        if pending_part.preempt_mode == PreemptMode::Off {
+            continue;
+        }
+        let pending_tier = pending_part.priority_tier;
+
         for candidate in &running {
             if candidate.priority >= pending.priority / 2 {
                 continue;
             }
+
+            if !preempt_overlaps_pending_nodes(pending, candidate, &cluster_nodes) {
+                continue;
+            }
+
+            if job_runs_in_active_reservation(candidate, &reservations, now) {
+                let candidate_tier = partition_for(candidate)
+                    .map(|p| p.priority_tier)
+                    .unwrap_or(1);
+                if pending_tier <= candidate_tier {
+                    continue;
+                }
+            }
+
             let mode = job_preempt_mode(candidate, partitions);
             if mode == PreemptMode::Off {
                 continue;
@@ -492,6 +530,48 @@ async fn try_preempt(
             break; // One preemption per cycle, re-evaluate next cycle
         }
     }
+}
+
+/// True when `candidate` occupies a node the pending job could target.
+fn preempt_overlaps_pending_nodes(
+    pending: &spur_core::job::Job,
+    candidate: &spur_core::job::Job,
+    nodes: &[spur_core::node::Node],
+) -> bool {
+    if candidate.allocated_nodes.is_empty() {
+        return false;
+    }
+    let occupied: HashSet<&str> = candidate
+        .allocated_nodes
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    if let Some(ref nodelist) = pending.spec.nodelist {
+        return nodelist
+            .split(',')
+            .map(str::trim)
+            .any(|n| occupied.contains(n));
+    }
+
+    let partitions: Vec<&str> = pending
+        .spec
+        .partition
+        .as_deref()
+        .map(|p| p.split(',').map(str::trim).collect())
+        .unwrap_or_default();
+
+    nodes.iter().any(|node| {
+        if !occupied.contains(node.name.as_str()) {
+            return false;
+        }
+        if partitions.is_empty() {
+            return true;
+        }
+        partitions
+            .iter()
+            .any(|p| node.partitions.iter().any(|np| np == p))
+    })
 }
 
 /// Forward unschedulable jobs to federation peer clusters.

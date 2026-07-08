@@ -289,6 +289,9 @@ fn effective_state_str(node: &NodeInfo) -> String {
     if !node.active_reservation.is_empty()
         && node.state == spur_proto::proto::NodeState::NodeIdle as i32
     {
+        if node.reservation_maint {
+            return "maint".into();
+        }
         return "resv".into();
     }
     spur_core::node::NodeState::from_proto_i32(node.state)
