@@ -100,6 +100,7 @@ message JobSpec {
   string stdout_path = 23;
   string stderr_path = 24;
   map<string, string> environment = 25;
+  string stdin_path = 26;
 
   // Time limits
   google.protobuf.Duration time_limit = 30;
@@ -188,6 +189,7 @@ message JobInfo {
   string stderr_path = 32;
   int32 exit_signal = 33;       // Terminating signal of primary node (0 = none)
   int32 derived_exit_code = 34; // Running max over srun step exit codes (0 if no steps)
+  string stdin_path = 35;
 
   ResourceAllocations resources = 40;
   uint32 priority = 41;
@@ -405,12 +407,12 @@ message CancelJobRequest {
 
 message SuspendJobRequest {
   uint32 job_id = 1;
-  string user = 2;   // Advisory (parity/forward-compat), not enforced.
+  string user = 2;   // For authorization (owner or root required).
 }
 
 message ResumeJobRequest {
   uint32 job_id = 1;
-  string user = 2;
+  string user = 2;   // For authorization (owner or root required).
 }
 
 message UpdateJobRequest {

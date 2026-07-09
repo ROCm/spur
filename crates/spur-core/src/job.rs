@@ -349,6 +349,7 @@ pub struct JobSpec {
     pub work_dir: String,
     pub stdout_path: Option<String>,
     pub stderr_path: Option<String>,
+    pub stdin_path: Option<String>,
     pub environment: HashMap<String, String>,
 
     // Time
@@ -456,6 +457,7 @@ impl Default for JobSpec {
             work_dir: String::from("/tmp"),
             stdout_path: None,
             stderr_path: None,
+            stdin_path: None,
             environment: HashMap::new(),
             time_limit: None,
             time_min: None,
@@ -692,6 +694,14 @@ impl Job {
     /// Resolve stderr path.
     pub fn resolved_stderr(&self) -> String {
         self.resolve_path(self.spec.stderr_path.as_deref().unwrap_or("spur-%j.out"))
+    }
+
+    /// Resolve stdin path, if set.
+    pub fn resolved_stdin(&self) -> Option<String> {
+        self.spec
+            .stdin_path
+            .as_deref()
+            .map(|p| self.resolve_path(p))
     }
 
     fn resolve_path(&self, pattern: &str) -> String {
@@ -1398,5 +1408,21 @@ mod tests {
             assert_eq!(JobState::from_code_or_name(state.code()), Some(state));
             assert_eq!(JobState::from_code_or_name(state.display()), Some(state));
         }
+    }
+
+    #[test]
+    fn resolved_stdin_expands_pattern() {
+        let spec = JobSpec {
+            stdin_path: Some("input-%j.txt".into()),
+            ..Default::default()
+        };
+        let job = Job::new(42, spec);
+        assert_eq!(job.resolved_stdin(), Some("input-42.txt".into()));
+    }
+
+    #[test]
+    fn resolved_stdin_none_when_unset() {
+        let job = Job::new(1, JobSpec::default());
+        assert_eq!(job.resolved_stdin(), None);
     }
 }

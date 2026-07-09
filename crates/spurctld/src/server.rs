@@ -292,7 +292,7 @@ impl SlurmController for ControllerService {
 
         self.cluster
             .cancel_job(job_id, &req.user)
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(cluster_err_to_status)?;
 
         // Send cancel signal to agents so the process is actually killed
         if let Some(job) = job {
@@ -333,7 +333,7 @@ impl SlurmController for ControllerService {
             .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
         self.cluster
             .suspend_job(job_id, &req.user)
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            .map_err(cluster_err_to_precondition_status)?;
         let cluster = self.cluster.clone();
         tokio::spawn(async move {
             crate::scheduler_loop::send_suspend_to_agents(&cluster, &job, false).await;
@@ -367,7 +367,7 @@ impl SlurmController for ControllerService {
             .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
         self.cluster
             .resume_job(job_id, &req.user)
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            .map_err(cluster_err_to_precondition_status)?;
         let cluster = self.cluster.clone();
         tokio::spawn(async move {
             crate::scheduler_loop::send_suspend_to_agents(&cluster, &job, true).await;
@@ -1573,6 +1573,11 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         } else {
             Some(spec.stderr_path)
         },
+        stdin_path: if spec.stdin_path.is_empty() {
+            None
+        } else {
+            Some(spec.stdin_path)
+        },
         environment: spec.environment,
         time_limit: spec
             .time_limit
@@ -1784,6 +1789,7 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         derived_exit_code: job.derived_exit_code,
         stdout_path: job.resolved_stdout(),
         stderr_path: job.resolved_stderr(),
+        stdin_path: job.resolved_stdin().unwrap_or_default(),
         resources: job.allocated_resources.as_ref().map(allocations_to_proto),
         priority: job.priority,
         qos: job.spec.qos.clone().unwrap_or_default(),
@@ -1996,6 +2002,20 @@ fn submit_rpc_status(err: crate::cluster::SubmitError) -> Status {
         crate::cluster::SubmitError::InvalidArgument(m) => Status::invalid_argument(m),
         crate::cluster::SubmitError::Internal(m) => Status::internal(m),
     }
+}
+
+fn cluster_err_to_status(err: anyhow::Error) -> Status {
+    if err.downcast_ref::<spur_core::auth::AuthError>().is_some() {
+        return Status::permission_denied(err.to_string());
+    }
+    Status::internal(err.to_string())
+}
+
+fn cluster_err_to_precondition_status(err: anyhow::Error) -> Status {
+    if err.downcast_ref::<spur_core::auth::AuthError>().is_some() {
+        return Status::permission_denied(err.to_string());
+    }
+    Status::failed_precondition(err.to_string())
 }
 
 fn node_complete_to_status(err: NodeCompleteError) -> Status {

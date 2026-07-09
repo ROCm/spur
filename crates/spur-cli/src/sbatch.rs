@@ -758,6 +758,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         work_dir,
         stdout_path: args.output.unwrap_or_default(),
         stderr_path: args.error.unwrap_or_default(),
+        stdin_path: String::new(),
         environment,
         time_limit,
         time_min: None,

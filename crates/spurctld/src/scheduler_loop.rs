@@ -653,6 +653,7 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
         work_dir: s.work_dir.clone(),
         stdout_path: s.stdout_path.clone().unwrap_or_default(),
         stderr_path: s.stderr_path.clone().unwrap_or_default(),
+        stdin_path: s.stdin_path.clone().unwrap_or_default(),
         environment: s.environment.clone(),
         time_limit: s.time_limit.map(|d| prost_types::Duration {
             seconds: d.num_seconds(),
@@ -748,6 +749,7 @@ async fn dispatch_to_agent(
         work_dir: spec.work_dir.clone(),
         stdout_path: spec.stdout_path.clone().unwrap_or_default(),
         stderr_path: spec.stderr_path.clone().unwrap_or_default(),
+        stdin_path: spec.stdin_path.clone().unwrap_or_default(),
         environment: spec.environment.clone(),
         time_limit: spec.time_limit.map(|d| prost_types::Duration {
             seconds: d.num_seconds(),

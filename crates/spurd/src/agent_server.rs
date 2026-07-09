@@ -764,6 +764,7 @@ impl SlurmAgent for AgentService {
             environment: env,
             stdout_path: spec.stdout_path.clone(),
             stderr_path: spec.stderr_path.clone(),
+            stdin_path: spec.stdin_path.clone(),
             cpus: spec.cpus_per_task.max(1),
             memory_mb: spec.memory_per_node_mb,
             gpu_devices: allocated_device_ids,
