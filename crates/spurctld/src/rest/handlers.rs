@@ -95,10 +95,7 @@ pub async fn submit_job(
         ..Default::default()
     };
 
-    let job_id = state
-        .cluster
-        .submit_job(spec)
-        .map_err(submit_rest_error)?;
+    let job_id = state.cluster.submit_job(spec).map_err(submit_rest_error)?;
 
     Ok(ApiResponse::ok(SubmitResponse { job_id }))
 }
@@ -106,9 +103,7 @@ pub async fn submit_job(
 fn submit_rest_error(err: crate::cluster::SubmitError) -> RestError {
     match err {
         crate::cluster::SubmitError::InvalidArgument(m) => bad_request_response(&m),
-        crate::cluster::SubmitError::Internal(m) => {
-            error_response(&format!("submit failed: {m}"))
-        }
+        crate::cluster::SubmitError::Internal(m) => error_response(&format!("submit failed: {m}")),
     }
 }
 

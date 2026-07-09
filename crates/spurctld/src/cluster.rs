@@ -209,8 +209,8 @@ impl ClusterManager {
         }
 
         let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
-        let specs = expand_job_specs(spec, job_id)
-            .map_err(|e| SubmitError::invalid(e.to_string()))?;
+        let specs =
+            expand_job_specs(spec, job_id).map_err(|e| SubmitError::invalid(e.to_string()))?;
 
         for task_spec in specs {
             let task_id = if task_spec.array_job_id.is_some() {
@@ -238,7 +238,7 @@ impl ClusterManager {
     fn validate_partition(&self, spec: &JobSpec) -> Result<(), SubmitError> {
         let partition_name = match spec.partition.as_ref() {
             Some(p) if !p.is_empty() => p,
-            _ => return Ok(()), // No partition specified — default, no restrictions
+            _ => return Ok(()), // Unset or empty partition name — nothing to validate
         };
 
         let partitions = self.partitions.read();
@@ -3955,6 +3955,9 @@ pub(crate) fn evaluate_node_health(
 }
 
 fn apply_default_partition(spec: &mut JobSpec, partitions: &[Partition]) {
+    if spec.partition.as_deref().is_some_and(|p| p.is_empty()) {
+        spec.partition = None;
+    }
     if spec.partition.is_none() {
         if let Some(default_part) = partitions.iter().find(|p| p.is_default) {
             spec.partition = Some(default_part.name.clone());
@@ -6283,6 +6286,23 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_empty_partition_string_applies_default_and_enforces_allow_accounts() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.partitions[0].allow_accounts = vec!["research".into()];
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        let mut spec = basic_spec("emptypart");
+        spec.partition = Some(String::new());
+        spec.account = Some("student".into());
+        let err = cm.submit_job(spec).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid("account 'student' not allowed on partition 'default'")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_rejects_allow_accounts_when_account_unresolved() {
         let dir = TempDir::new().unwrap();
         let mut cfg = test_config();
@@ -8387,6 +8407,19 @@ mod tests {
         }];
         super::apply_default_partition(&mut spec, &partitions);
         assert_eq!(spec.partition.as_deref(), Some("mypart"));
+    }
+
+    #[test]
+    fn apply_default_partition_treats_empty_string_as_unset() {
+        let mut spec = basic_spec("j");
+        spec.partition = Some(String::new());
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            is_default: true,
+            ..Default::default()
+        }];
+        super::apply_default_partition(&mut spec, &partitions);
+        assert_eq!(spec.partition.as_deref(), Some("gpu"));
     }
 
     // --- apply_default_qos tests ---
