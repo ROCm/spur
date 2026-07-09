@@ -196,7 +196,7 @@ impl SlurmController for ControllerService {
         let job_id = self
             .cluster
             .submit_job(core_spec)
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(submit_rpc_status)?;
 
         Ok(Response::new(SubmitJobResponse { job_id }))
     }
@@ -1838,6 +1838,7 @@ fn partition_to_proto(part: &spur_core::partition::Partition) -> PartitionInfo {
         allow_accounts: part.allow_accounts.join(","),
         allow_groups: part.allow_groups.join(","),
         allow_qos: part.allow_qos.join(","),
+        deny_accounts: part.deny_accounts.join(","),
         preempt_mode: format!("{:?}", part.preempt_mode),
         priority_tier: part.priority_tier,
     }
@@ -1990,6 +1991,13 @@ fn reservation_rpc_status(err: ReservationError) -> Status {
     }
 }
 
+fn submit_rpc_status(err: crate::cluster::SubmitError) -> Status {
+    match err {
+        crate::cluster::SubmitError::InvalidArgument(m) => Status::invalid_argument(m),
+        crate::cluster::SubmitError::Internal(m) => Status::internal(m),
+    }
+}
+
 fn node_complete_to_status(err: NodeCompleteError) -> Status {
     let message = err.to_string();
     let code = match err {
@@ -2016,6 +2024,23 @@ mod tests {
     use spur_core::job::{JobState, NodeCompleteError};
     use spur_core::reservation::ReservationFlags;
     use tonic::Code;
+
+    #[test]
+    fn submit_rpc_status_maps_invalid_argument() {
+        use crate::cluster::SubmitError;
+
+        let status = submit_rpc_status(SubmitError::invalid("partition 'gpu' not found"));
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(status.message(), "partition 'gpu' not found");
+    }
+
+    #[test]
+    fn submit_rpc_status_maps_internal() {
+        use crate::cluster::SubmitError;
+
+        let status = submit_rpc_status(SubmitError::internal("raft propose failed"));
+        assert_eq!(status.code(), Code::Internal);
+    }
 
     fn make_node_info(name: &str) -> NodeInfo {
         NodeInfo {

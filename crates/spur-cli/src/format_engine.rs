@@ -217,6 +217,7 @@ pub fn sinfo_header(spec: char) -> &'static str {
         'n' => "HOSTNAMES",
         'O' => "CPU_LOAD",
         'e' => "FREE_MEM",
+        'u' => "ALLOW_ACCOUNTS",
         _ => "?",
     }
 }
@@ -224,6 +225,11 @@ pub fn sinfo_header(spec: char) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sinfo_header_includes_allow_accounts() {
+        assert_eq!(super::sinfo_header('u'), "ALLOW_ACCOUNTS");
+    }
 
     #[test]
     fn test_parse_default_squeue_format() {

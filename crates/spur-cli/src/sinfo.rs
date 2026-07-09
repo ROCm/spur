@@ -235,6 +235,7 @@ fn resolve_partition_field(
             }
         }
         'a' => part.state.clone(),
+        'u' => part.allow_accounts.clone(),
         'l' => {
             if let Some(ref mt) = part.max_time {
                 spur_core::config::format_time(Some((mt.seconds / 60) as u32))
@@ -318,6 +319,15 @@ mod tests {
             name: name.into(),
             state: "up".into(),
             is_default,
+            ..Default::default()
+        }
+    }
+
+    fn make_partition_with_allow_accounts(name: &str, allow_accounts: &str) -> PartitionInfo {
+        PartitionInfo {
+            name: name.into(),
+            state: "up".into(),
+            allow_accounts: allow_accounts.into(),
             ..Default::default()
         }
     }
@@ -641,5 +651,14 @@ mod tests {
         let lines = render_sinfo_output(&fields, &partitions, &nodes, true);
         assert_eq!(lines.len(), 1, "orphan node still gets one row");
         assert!(lines[0].contains("orphan"));
+    }
+
+    #[test]
+    fn resolve_partition_field_allow_accounts_format() {
+        let fields = format_engine::parse_format("%.16u", &format_engine::sinfo_header);
+        let part = make_partition_with_allow_accounts("gpu", "research,faculty");
+        let lines = render_sinfo_output(&fields, &[part], &[], false);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("research,faculty"));
     }
 }
