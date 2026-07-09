@@ -196,9 +196,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         }
     }
 
-    let stdout_path = args.output.clone().unwrap_or_default();
-    let stderr_path = args.error.clone().unwrap_or_default();
-    let stdin_path = args.input.clone().unwrap_or_default();
+    let io = resolve_io_paths(&args);
 
     let name = args.job_name.unwrap_or_else(|| args.command[0].clone());
 
@@ -261,9 +259,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         gres,
         script,
         work_dir: work_dir.clone(),
-        stdout_path: stdout_path.clone(),
-        stderr_path: stderr_path.clone(),
-        stdin_path: stdin_path.clone(),
+        stdout_path: io.stdout.clone(),
+        stderr_path: io.stderr.clone(),
+        stdin_path: io.stdin.clone(),
         environment,
         time_limit,
         constraint: args.constraint.unwrap_or_default(),
@@ -349,7 +347,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                             job_id,
                             job.exit_code,
                             &work_dir,
-                            &stdout_path,
+                            &io.stdout,
                             &hooks,
                             false,
                         )
@@ -374,7 +372,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     }
 
     // Stream output to terminal only when the user didn't ask for file output.
-    let output_streamed = if stdout_path.is_empty() {
+    let output_streamed = if io.stdout.is_empty() {
         try_stream_output(&mut client, &nodelist, job_id).await
     } else {
         false
@@ -383,7 +381,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         &mut client,
         job_id,
         &work_dir,
-        &stdout_path,
+        &io.stdout,
         &hooks,
         output_streamed,
     )
@@ -588,6 +586,56 @@ fn resolve_output_path_client(pattern: &str, job_id: u32, work_dir: &str) -> Str
     }
 }
 
+struct ResolvedIoPaths {
+    stdout: String,
+    stderr: String,
+    stdin: String,
+}
+
+/// Resolve I/O paths from CLI args. When `-o` is set but `-e` is not,
+/// stderr follows stdout (Slurm default behavior).
+fn resolve_io_paths(args: &SrunArgs) -> ResolvedIoPaths {
+    let stdout = args.output.clone().unwrap_or_default();
+    let stderr = args.error.clone().unwrap_or_else(|| {
+        if stdout.is_empty() {
+            String::new()
+        } else {
+            stdout.clone()
+        }
+    });
+    let stdin = args.input.clone().unwrap_or_default();
+    ResolvedIoPaths {
+        stdout,
+        stderr,
+        stdin,
+    }
+}
+
+/// Write step output to a file, used by `run_as_step` for both stdout and stderr.
+async fn write_step_file(content: &str, pattern: &str, job_id: u32, work_dir: &str, append: bool) {
+    let resolved = resolve_output_path_client(pattern, job_id, work_dir);
+    if let Some(parent) = std::path::Path::new(&resolved).parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+    let result = if append {
+        use tokio::io::AsyncWriteExt;
+        match tokio::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&resolved)
+            .await
+        {
+            Ok(mut f) => f.write_all(content.as_bytes()).await,
+            Err(e) => Err(e),
+        }
+    } else {
+        tokio::fs::write(&resolved, content).await
+    };
+    if let Err(e) = result {
+        eprintln!("srun: warning: failed to write to {}: {}", resolved, e);
+    }
+}
+
 /// When srun runs inside an allocation (SPUR_JOB_ID is set, e.g. inside an
 /// `salloc` interactive shell or sbatch script on the submit host), it
 /// dispatches the command to one of the allocation's nodes via the
@@ -628,6 +676,8 @@ async fn run_as_step(
         eprintln!("srun: warning: --input is not supported in step mode, ignoring");
     }
 
+    let io = resolve_io_paths(args);
+
     let env: std::collections::HashMap<String, String> = std::env::vars().collect();
 
     let resp = client
@@ -648,36 +698,20 @@ async fn run_as_step(
         eprintln!("srun: dispatched to node {}", resp.node);
     }
 
+    let stderr_appends = !io.stderr.is_empty() && io.stderr == io.stdout;
+
     if !resp.stdout.is_empty() {
-        if let Some(ref path) = args.output {
-            let resolved = resolve_output_path_client(path, job_id, work_dir);
-            if let Some(parent) = std::path::Path::new(&resolved).parent() {
-                tokio::fs::create_dir_all(parent).await.ok();
-            }
-            if let Err(e) = tokio::fs::write(&resolved, &resp.stdout).await {
-                eprintln!(
-                    "srun: warning: failed to write stdout to {}: {}",
-                    resolved, e
-                );
-            }
-        } else {
+        if io.stdout.is_empty() {
             print!("{}", resp.stdout);
+        } else {
+            write_step_file(&resp.stdout, &io.stdout, job_id, work_dir, false).await;
         }
     }
     if !resp.stderr.is_empty() {
-        if let Some(ref path) = args.error {
-            let resolved = resolve_output_path_client(path, job_id, work_dir);
-            if let Some(parent) = std::path::Path::new(&resolved).parent() {
-                tokio::fs::create_dir_all(parent).await.ok();
-            }
-            if let Err(e) = tokio::fs::write(&resolved, &resp.stderr).await {
-                eprintln!(
-                    "srun: warning: failed to write stderr to {}: {}",
-                    resolved, e
-                );
-            }
-        } else {
+        if io.stderr.is_empty() {
             eprint!("{}", resp.stderr);
+        } else {
+            write_step_file(&resp.stderr, &io.stderr, job_id, work_dir, stderr_appends).await;
         }
     }
 
@@ -831,5 +865,40 @@ mod tests {
             resolve_output_path_client("/shared/output-%j.txt", 7, "/work"),
             "/shared/output-7.txt"
         );
+    }
+
+    #[test]
+    fn resolve_io_paths_stderr_follows_stdout() {
+        let args =
+            SrunArgs::try_parse_from(["srun", "-o", "/tmp/out.txt", "hostname"]).expect("parse");
+        let io = resolve_io_paths(&args);
+        assert_eq!(io.stdout, "/tmp/out.txt");
+        assert_eq!(io.stderr, "/tmp/out.txt");
+        assert!(io.stdin.is_empty());
+    }
+
+    #[test]
+    fn resolve_io_paths_explicit_stderr_overrides() {
+        let args = SrunArgs::try_parse_from([
+            "srun",
+            "-o",
+            "/tmp/out.txt",
+            "-e",
+            "/tmp/err.txt",
+            "hostname",
+        ])
+        .expect("parse");
+        let io = resolve_io_paths(&args);
+        assert_eq!(io.stdout, "/tmp/out.txt");
+        assert_eq!(io.stderr, "/tmp/err.txt");
+    }
+
+    #[test]
+    fn resolve_io_paths_no_flags() {
+        let args = SrunArgs::try_parse_from(["srun", "hostname"]).expect("parse");
+        let io = resolve_io_paths(&args);
+        assert!(io.stdout.is_empty());
+        assert!(io.stderr.is_empty());
+        assert!(io.stdin.is_empty());
     }
 }

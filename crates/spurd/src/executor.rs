@@ -317,6 +317,17 @@ async fn spawn_job_process(
         tokio::fs::create_dir_all(parent).await.ok();
     }
 
+    // Guard: stdin must not overlap stdout/stderr (truncation would destroy input)
+    if !stdin_path.is_empty() {
+        let stdin_resolved = resolve_output_path(stdin_path, job_id, work_dir);
+        if stdin_resolved == stdout_resolved || stdin_resolved == stderr_resolved {
+            anyhow::bail!(
+                "stdin path {} overlaps with an output path; this would truncate the input",
+                stdin_resolved
+            );
+        }
+    }
+
     let use_append = open_mode
         .as_deref()
         .map(|m| m.eq_ignore_ascii_case("append"))
@@ -334,7 +345,13 @@ async fn spawn_job_process(
             .await
             .context("failed to create stdout file")?
     };
-    let stderr_file = if use_append {
+    let stderr_file = if stderr_resolved == stdout_resolved {
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&stdout_resolved)
+            .await
+            .context("failed to open stderr file (same as stdout)")?
+    } else if use_append {
         tokio::fs::OpenOptions::new()
             .append(true)
             .create(true)
@@ -366,6 +383,12 @@ async fn spawn_job_process(
 
     // Container jobs: use explicit fork() + container_init() instead of bash wrapper.
     if let Some(ctn) = container {
+        if !stdin_path.is_empty() {
+            warn!(
+                job_id,
+                "stdin redirection is not supported for container jobs, ignoring"
+            );
+        }
         let job = launch_container_job(
             cfg,
             ctn,
@@ -424,6 +447,21 @@ async fn spawn_job_process(
         Stdio::null()
     } else {
         let resolved = resolve_output_path(stdin_path, job_id, work_dir);
+        // spurd runs as root; check owner/group/other read bits against
+        // the job's uid/gid so users cannot exfiltrate root-readable files.
+        // Supplementary groups and ACLs are not checked.
+        if uid > 0 {
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::metadata(&resolved)
+                .with_context(|| format!("stdin file not found: {}", resolved))?;
+            let (fuid, fgid, mode) = (meta.uid(), meta.gid(), meta.mode());
+            let readable = (fuid == uid && mode & 0o400 != 0)
+                || (fgid == gid && mode & 0o040 != 0)
+                || (mode & 0o004 != 0);
+            if !readable {
+                anyhow::bail!("stdin file {} is not readable by uid {}", resolved, uid);
+            }
+        }
         let f = std::fs::File::open(&resolved)
             .with_context(|| format!("failed to open stdin file: {}", resolved))?;
         Stdio::from(f)
