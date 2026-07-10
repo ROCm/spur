@@ -64,6 +64,126 @@ pub enum ScontrolCommand {
         /// Job ID
         job_id: u32,
     },
+    /// Create a partition
+    #[command(name = "create-partition")]
+    CreatePartition {
+        /// Partition name
+        #[arg(long)]
+        name: String,
+        /// Hostlist of nodes (mutually exclusive with --selector)
+        #[arg(long, default_value = "")]
+        nodes: String,
+        /// Label selector as KEY=VALUE pairs, comma-separated (mutually exclusive with --nodes)
+        #[arg(long, default_value = "")]
+        selector: String,
+        /// Partition state: UP (default), DOWN, DRAIN, INACTIVE
+        #[arg(long, default_value = "UP")]
+        state: String,
+        /// Mark as the cluster default partition
+        #[arg(long)]
+        default: bool,
+        /// Maximum job wall-clock time (e.g. "24:00:00" or "INFINITE")
+        #[arg(long, default_value = "")]
+        max_time: String,
+        /// Default job wall-clock time (e.g. "01:00:00")
+        #[arg(long, default_value = "")]
+        default_time: String,
+        /// Maximum number of nodes per job
+        #[arg(long)]
+        max_nodes: Option<u32>,
+        /// Minimum number of nodes per job
+        #[arg(long, default_value = "1")]
+        min_nodes: u32,
+        /// Comma-separated accounts allowed (empty = all)
+        #[arg(long, default_value = "")]
+        allow_accounts: String,
+        /// Comma-separated groups allowed (empty = all)
+        #[arg(long, default_value = "")]
+        allow_groups: String,
+        /// Comma-separated accounts denied
+        #[arg(long, default_value = "")]
+        deny_accounts: String,
+        /// Comma-separated QoS names denied
+        #[arg(long, default_value = "")]
+        deny_qos: String,
+        /// Scheduling priority tier
+        #[arg(long, default_value = "1")]
+        priority_tier: u32,
+        /// Preemption mode: OFF (default), CANCEL, REQUEUE, SUSPEND
+        #[arg(long, default_value = "OFF")]
+        preempt_mode: String,
+    },
+    /// Update a partition
+    #[command(name = "update-partition")]
+    UpdatePartition {
+        /// Partition name to update
+        #[arg(long)]
+        name: String,
+        /// New hostlist of nodes
+        #[arg(long)]
+        nodes: Option<String>,
+        /// New label selector as KEY=VALUE pairs, comma-separated
+        #[arg(long)]
+        selector: Option<String>,
+        /// New partition state: UP, DOWN, DRAIN, INACTIVE
+        #[arg(long)]
+        state: Option<String>,
+        /// Set as the cluster default partition
+        #[arg(long)]
+        default: Option<bool>,
+        /// New maximum job wall-clock time ("INFINITE" to clear)
+        #[arg(long)]
+        max_time: Option<String>,
+        /// New default job wall-clock time
+        #[arg(long)]
+        default_time: Option<String>,
+        /// New maximum nodes per job (0 = clear limit)
+        #[arg(long)]
+        max_nodes: Option<u32>,
+        /// Clear the maximum nodes limit
+        #[arg(long)]
+        clear_max_nodes: bool,
+        /// New minimum nodes per job
+        #[arg(long)]
+        min_nodes: Option<u32>,
+        /// Replace allowed-accounts list (comma-separated; requires --set-allow-accounts)
+        #[arg(long, default_value = "")]
+        allow_accounts: String,
+        /// Apply the --allow-accounts value (even if empty, to clear the list)
+        #[arg(long)]
+        set_allow_accounts: bool,
+        /// Replace allowed-groups list (comma-separated; requires --set-allow-groups)
+        #[arg(long, default_value = "")]
+        allow_groups: String,
+        /// Apply the --allow-groups value (even if empty, to clear the list)
+        #[arg(long)]
+        set_allow_groups: bool,
+        /// Replace denied-accounts list (comma-separated; requires --set-deny-accounts)
+        #[arg(long, default_value = "")]
+        deny_accounts: String,
+        /// Apply the --deny-accounts value
+        #[arg(long)]
+        set_deny_accounts: bool,
+        /// Replace denied-QoS list (comma-separated; requires --set-deny-qos)
+        #[arg(long, default_value = "")]
+        deny_qos: String,
+        /// Apply the --deny-qos value
+        #[arg(long)]
+        set_deny_qos: bool,
+        /// New priority tier
+        #[arg(long)]
+        priority_tier: Option<u32>,
+        /// New preemption mode: OFF, CANCEL, REQUEUE, SUSPEND
+        #[arg(long)]
+        preempt_mode: Option<String>,
+    },
+    /// Delete a partition
+    #[command(name = "delete-partition")]
+    DeletePartition {
+        /// Partition name
+        #[arg(long)]
+        name: String,
+    },
     /// Create a reservation
     #[command(name = "create-reservation")]
     CreateReservation {
@@ -215,6 +335,93 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             Ok(())
         }
         ScontrolCommand::Update { params } => parse_and_update(&args.controller, &params).await,
+        ScontrolCommand::CreatePartition {
+            name,
+            nodes,
+            selector,
+            state,
+            default,
+            max_time,
+            default_time,
+            max_nodes,
+            min_nodes,
+            allow_accounts,
+            allow_groups,
+            deny_accounts,
+            deny_qos,
+            priority_tier,
+            preempt_mode,
+        } => {
+            create_partition(
+                &args.controller,
+                &name,
+                &nodes,
+                &selector,
+                &state,
+                default,
+                &max_time,
+                &default_time,
+                max_nodes,
+                min_nodes,
+                &allow_accounts,
+                &allow_groups,
+                &deny_accounts,
+                &deny_qos,
+                priority_tier,
+                &preempt_mode,
+            )
+            .await
+        }
+        ScontrolCommand::UpdatePartition {
+            name,
+            nodes,
+            selector,
+            state,
+            default,
+            max_time,
+            default_time,
+            max_nodes,
+            clear_max_nodes,
+            min_nodes,
+            allow_accounts,
+            allow_groups,
+            set_allow_accounts,
+            set_allow_groups,
+            deny_accounts,
+            deny_qos,
+            set_deny_accounts,
+            set_deny_qos,
+            priority_tier,
+            preempt_mode,
+        } => {
+            update_partition(
+                &args.controller,
+                &name,
+                nodes,
+                selector,
+                state,
+                default,
+                max_time,
+                default_time,
+                max_nodes,
+                clear_max_nodes,
+                min_nodes,
+                if set_allow_accounts { Some(&allow_accounts) } else { None },
+                if set_allow_groups { Some(&allow_groups) } else { None },
+                set_allow_accounts,
+                set_allow_groups,
+                if set_deny_accounts { Some(&deny_accounts) } else { None },
+                if set_deny_qos { Some(&deny_qos) } else { None },
+                set_deny_accounts,
+                set_deny_qos,
+                priority_tier,
+                preempt_mode,
+            )
+            .await
+        }
+        ScontrolCommand::DeletePartition { name } => {
+            delete_partition(&args.controller, &name).await
+        }
         ScontrolCommand::CreateReservation {
             name,
             start_time,
@@ -408,7 +615,19 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                     part.name,
                     if part.is_default { " Default=YES" } else { "" }
                 );
-                println!("   State={}", part.state);
+                println!(
+                    "   AllowGroups={} AllowAccounts={} AllowQos={}",
+                    if part.allow_groups.is_empty() { "ALL".into() } else { part.allow_groups.clone() },
+                    if part.allow_accounts.is_empty() { "ALL".into() } else { part.allow_accounts.clone() },
+                    if part.allow_qos.is_empty() { "ALL".into() } else { part.allow_qos.clone() },
+                );
+                if !part.deny_accounts.is_empty() {
+                    println!("   DenyAccounts={}", part.deny_accounts);
+                }
+                if !part.deny_qos.is_empty() {
+                    println!("   DenyQos={}", part.deny_qos);
+                }
+                println!("   State={}", part.state.to_uppercase());
                 println!("   Nodes={}", part.nodes);
                 println!(
                     "   TotalNodes={} TotalCPUs={}",
@@ -425,13 +644,16 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                         .map(|t| spur_core::config::format_time(Some((t.seconds / 60) as u32)))
                         .unwrap_or_else(|| "UNLIMITED".into()),
                 );
-                println!("   PriorityTier={}", part.priority_tier);
-                if !part.allow_accounts.is_empty() {
-                    println!("   AllowAccounts={}", part.allow_accounts);
-                }
-                if !part.deny_accounts.is_empty() {
-                    println!("   DenyAccounts={}", part.deny_accounts);
-                }
+                println!(
+                    "   MinNodes={} MaxNodes={}",
+                    part.min_nodes,
+                    if part.max_nodes == 0 { "UNLIMITED".into() } else { part.max_nodes.to_string() },
+                );
+                println!(
+                    "   PreemptMode={} PriorityTier={}",
+                    part.preempt_mode.to_uppercase(),
+                    part.priority_tier
+                );
                 println!();
             }
         }
@@ -690,6 +912,167 @@ async fn update_node(
         .context("node update failed")?;
 
     println!("node {} updated", name);
+    Ok(())
+}
+
+/// Parse "KEY=VALUE,KEY2=VALUE2" into a HashMap.
+fn parse_selector(s: &str) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+    for pair in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').context(format!(
+            "selector entry '{}' is not in KEY=VALUE format",
+            pair
+        ))?;
+        map.insert(k.to_string(), v.to_string());
+    }
+    Ok(map)
+}
+
+/// Create a partition via the controller.
+#[allow(clippy::too_many_arguments)]
+async fn create_partition(
+    controller: &str,
+    name: &str,
+    nodes: &str,
+    selector: &str,
+    state: &str,
+    is_default: bool,
+    max_time: &str,
+    default_time: &str,
+    max_nodes: Option<u32>,
+    min_nodes: u32,
+    allow_accounts: &str,
+    allow_groups: &str,
+    deny_accounts: &str,
+    deny_qos: &str,
+    priority_tier: u32,
+    preempt_mode: &str,
+) -> Result<()> {
+    let channel = spur_client::connect_channel(controller)
+        .await
+        .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
+
+    let split_csv = |s: &str| -> Vec<String> {
+        s.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+
+    client
+        .create_partition(spur_proto::proto::CreatePartitionRequest {
+            name: name.to_string(),
+            nodes: nodes.to_string(),
+            selector: parse_selector(selector)?,
+            state: state.to_string(),
+            is_default,
+            max_time: max_time.to_string(),
+            default_time: default_time.to_string(),
+            max_nodes,
+            min_nodes,
+            allow_accounts: split_csv(allow_accounts),
+            allow_groups: split_csv(allow_groups),
+            deny_accounts: split_csv(deny_accounts),
+            deny_qos: split_csv(deny_qos),
+            priority_tier,
+            preempt_mode: preempt_mode.to_string(),
+        })
+        .await
+        .context("failed to create partition")?;
+
+    println!("Partition {} created", name);
+    Ok(())
+}
+
+/// Update a partition via the controller.
+#[allow(clippy::too_many_arguments)]
+async fn update_partition(
+    controller: &str,
+    name: &str,
+    nodes: Option<String>,
+    selector: Option<String>,
+    state: Option<String>,
+    is_default: Option<bool>,
+    max_time: Option<String>,
+    default_time: Option<String>,
+    max_nodes: Option<u32>,
+    clear_max_nodes: bool,
+    min_nodes: Option<u32>,
+    allow_accounts: Option<&str>,
+    allow_groups: Option<&str>,
+    set_allow_accounts: bool,
+    set_allow_groups: bool,
+    deny_accounts: Option<&str>,
+    deny_qos: Option<&str>,
+    set_deny_accounts: bool,
+    set_deny_qos: bool,
+    priority_tier: Option<u32>,
+    preempt_mode: Option<String>,
+) -> Result<()> {
+    let channel = spur_client::connect_channel(controller)
+        .await
+        .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
+
+    let split_csv = |s: &str| -> Vec<String> {
+        s.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+
+    let selector_map = if let Some(ref s) = selector {
+        parse_selector(s)?
+    } else {
+        HashMap::new()
+    };
+
+    client
+        .update_partition(spur_proto::proto::UpdatePartitionRequest {
+            name: name.to_string(),
+            nodes,
+            selector: selector_map,
+            state,
+            is_default,
+            max_time,
+            default_time,
+            max_nodes_value: max_nodes,
+            clear_max_nodes,
+            min_nodes,
+            allow_accounts: allow_accounts.map(split_csv).unwrap_or_default(),
+            set_allow_accounts,
+            allow_groups: allow_groups.map(split_csv).unwrap_or_default(),
+            set_allow_groups,
+            deny_accounts: deny_accounts.map(split_csv).unwrap_or_default(),
+            set_deny_accounts,
+            deny_qos: deny_qos.map(split_csv).unwrap_or_default(),
+            set_deny_qos,
+            priority_tier,
+            preempt_mode,
+        })
+        .await
+        .context("failed to update partition")?;
+
+    println!("Partition {} updated", name);
+    Ok(())
+}
+
+/// Delete a partition via the controller.
+async fn delete_partition(controller: &str, name: &str) -> Result<()> {
+    let channel = spur_client::connect_channel(controller)
+        .await
+        .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
+
+    client
+        .delete_partition(spur_proto::proto::DeletePartitionRequest {
+            name: name.to_string(),
+        })
+        .await
+        .context("failed to delete partition")?;
+
+    println!("Partition {} deleted", name);
     Ok(())
 }
 

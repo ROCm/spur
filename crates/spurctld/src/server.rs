@@ -18,7 +18,7 @@ use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::slurm_controller_server::SlurmController;
 use spur_proto::proto::*;
 
-use crate::cluster::{ClusterManager, ReservationError};
+use crate::cluster::{ClusterManager, PartitionError, ReservationError};
 use crate::raft::RaftHandle;
 use crate::rpc_middleware::RpcStatsLayer;
 use crate::rpc_stats::RpcStatsCollector;
@@ -1250,6 +1250,207 @@ impl SlurmController for ControllerService {
         Ok(Response::new(CreateJobStepResponse { step_id }))
     }
 
+    async fn create_partition(
+        &self,
+        request: Request<CreatePartitionRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.create_partition(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward create_partition to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+
+        let req = request.into_inner();
+
+        let max_time_minutes = if req.max_time.is_empty()
+            || req.max_time.eq_ignore_ascii_case("INFINITE")
+            || req.max_time.eq_ignore_ascii_case("UNLIMITED")
+        {
+            None
+        } else {
+            Some(
+                spur_core::config::parse_time_minutes(&req.max_time)
+                    .ok_or_else(|| Status::invalid_argument(format!("invalid max_time: {}", req.max_time)))?,
+            )
+        };
+
+        let default_time_minutes = if req.default_time.is_empty() {
+            None
+        } else {
+            Some(
+                spur_core::config::parse_time_minutes(&req.default_time).ok_or_else(|| {
+                    Status::invalid_argument(format!("invalid default_time: {}", req.default_time))
+                })?,
+            )
+        };
+
+        let state = match req.state.to_uppercase().as_str() {
+            "" | "UP" => spur_core::partition::PartitionState::Up,
+            "DOWN" => spur_core::partition::PartitionState::Down,
+            "DRAIN" => spur_core::partition::PartitionState::Drain,
+            "INACTIVE" => spur_core::partition::PartitionState::Inactive,
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown partition state '{}'; expected UP, DOWN, DRAIN, or INACTIVE",
+                    other
+                )))
+            }
+        };
+
+        let preempt_mode = match req.preempt_mode.to_uppercase().as_str() {
+            "" | "OFF" => spur_core::partition::PreemptMode::Off,
+            "CANCEL" => spur_core::partition::PreemptMode::Cancel,
+            "REQUEUE" => spur_core::partition::PreemptMode::Requeue,
+            "SUSPEND" => spur_core::partition::PreemptMode::Suspend,
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown preempt_mode '{}'; expected OFF, CANCEL, REQUEUE, or SUSPEND",
+                    other
+                )))
+            }
+        };
+
+        let partition = spur_core::partition::Partition {
+            name: req.name,
+            state,
+            is_default: req.is_default,
+            nodes: req.nodes,
+            selector: req.selector.into_iter().collect(),
+            max_time_minutes,
+            default_time_minutes,
+            max_nodes: req.max_nodes,
+            min_nodes: if req.min_nodes == 0 { 1 } else { req.min_nodes },
+            allow_accounts: req.allow_accounts,
+            allow_groups: req.allow_groups,
+            deny_accounts: req.deny_accounts,
+            deny_qos: req.deny_qos,
+            priority_tier: req.priority_tier,
+            preempt_mode,
+            ..Default::default()
+        };
+
+        self.cluster
+            .create_partition(partition)
+            .map_err(partition_rpc_status)?;
+
+        Ok(Response::new(()))
+    }
+
+    async fn update_partition(
+        &self,
+        request: Request<UpdatePartitionRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.update_partition(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward update_partition to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+
+        let req = request.into_inner();
+
+        let max_time = req.max_time.map(|s| s);
+        let allow_accounts = if req.set_allow_accounts {
+            Some(req.allow_accounts)
+        } else {
+            None
+        };
+        let allow_groups = if req.set_allow_groups {
+            Some(req.allow_groups)
+        } else {
+            None
+        };
+        let deny_accounts = if req.set_deny_accounts {
+            Some(req.deny_accounts)
+        } else {
+            None
+        };
+        let deny_qos = if req.set_deny_qos {
+            Some(req.deny_qos)
+        } else {
+            None
+        };
+        let max_nodes = if req.clear_max_nodes {
+            None
+        } else {
+            req.max_nodes_value
+        };
+
+        let selector = if req.selector.is_empty() {
+            None
+        } else {
+            Some(req.selector.into_iter().collect())
+        };
+
+        self.cluster
+            .update_partition(
+                &req.name,
+                req.nodes,
+                selector,
+                req.state,
+                req.is_default,
+                max_time,
+                req.default_time,
+                false,
+                max_nodes,
+                req.clear_max_nodes,
+                req.min_nodes,
+                allow_accounts,
+                allow_groups,
+                deny_accounts,
+                deny_qos,
+                req.priority_tier,
+                req.preempt_mode,
+            )
+            .map_err(partition_rpc_status)?;
+
+        Ok(Response::new(()))
+    }
+
+    async fn delete_partition(
+        &self,
+        request: Request<DeletePartitionRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.delete_partition(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward delete_partition to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+
+        let name = request.into_inner().name;
+        self.cluster
+            .delete_partition(&name)
+            .map_err(partition_rpc_status)?;
+
+        Ok(Response::new(()))
+    }
+
     async fn create_reservation(
         &self,
         request: Request<CreateReservationRequest>,
@@ -2159,6 +2360,7 @@ fn partition_to_proto(part: &spur_core::partition::Partition) -> PartitionInfo {
         allow_groups: part.allow_groups.join(","),
         allow_qos: part.allow_qos.join(","),
         deny_accounts: part.deny_accounts.join(","),
+        deny_qos: part.deny_qos.join(","),
         preempt_mode: format!("{:?}", part.preempt_mode),
         priority_tier: part.priority_tier,
     }
@@ -2316,6 +2518,15 @@ fn submit_rpc_status(err: crate::cluster::SubmitError) -> Status {
     match err {
         crate::cluster::SubmitError::InvalidArgument(m) => Status::invalid_argument(m),
         crate::cluster::SubmitError::Internal(m) => Status::internal(m),
+    }
+}
+
+fn partition_rpc_status(err: PartitionError) -> Status {
+    match err {
+        PartitionError::InvalidArgument(m) => Status::invalid_argument(m),
+        PartitionError::NotFound(m) => Status::not_found(m),
+        PartitionError::AlreadyExists(m) => Status::already_exists(m),
+        PartitionError::Raft(m) => Status::internal(m),
     }
 }
 

@@ -7,6 +7,7 @@ use crate::admission::AdmissionToken;
 use crate::job::{JobId, JobSpec, JobState, PendingReason};
 use crate::k0s::{K0sPhase, K0sRole};
 use crate::node::NodeState;
+use crate::partition::Partition;
 use crate::reservation::Reservation;
 use std::collections::HashMap;
 
@@ -163,6 +164,31 @@ pub enum WalOperation {
     },
     TokenRevoke {
         token_id: String,
+    },
+
+    PartitionCreate {
+        partition: Partition,
+    },
+    PartitionUpdate {
+        name: String,
+        /// Fields present in the update; absent fields are left unchanged.
+        nodes: Option<String>,
+        selector: Option<HashMap<String, String>>,
+        state: Option<String>,
+        max_time_minutes: Option<Option<u32>>,
+        default_time_minutes: Option<Option<u32>>,
+        max_nodes: Option<Option<u32>>,
+        min_nodes: Option<u32>,
+        allow_accounts: Option<Vec<String>>,
+        allow_groups: Option<Vec<String>>,
+        deny_accounts: Option<Vec<String>>,
+        deny_qos: Option<Vec<String>>,
+        priority_tier: Option<u32>,
+        preempt_mode: Option<String>,
+        is_default: Option<bool>,
+    },
+    PartitionDelete {
+        name: String,
     },
 
     ReservationCreate {
