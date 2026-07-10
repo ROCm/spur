@@ -209,6 +209,8 @@ pub enum ScontrolCommand {
         #[arg(long)]
         name: String,
     },
+    /// Re-read spur.conf and reconcile the live partition table to match it
+    Reconfigure,
     /// Create a reservation
     #[command(name = "create-reservation")]
     CreateReservation {
@@ -449,6 +451,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         ScontrolCommand::DeletePartition { name } => {
             delete_partition(&args.controller, &name).await
         }
+        ScontrolCommand::Reconfigure => reconfigure(&args.controller).await,
         ScontrolCommand::CreateReservation {
             name,
             start_time,
@@ -1386,6 +1389,22 @@ async fn delete_partition(controller: &str, name: &str) -> Result<()> {
         .context("failed to delete partition")?;
 
     println!("Partition {} deleted", name);
+    Ok(())
+}
+
+/// Reload spur.conf and reconcile partition state to match it.
+async fn reconfigure(controller: &str) -> Result<()> {
+    let channel = spur_client::connect_channel(controller)
+        .await
+        .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
+
+    client
+        .reconfigure(())
+        .await
+        .context("reconfigure failed")?;
+
+    println!("Reconfiguration complete");
     Ok(())
 }
 

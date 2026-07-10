@@ -2671,6 +2671,91 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Re-read spur.conf and reconcile the live partition table to match it.
+    ///
+    /// Makes the config file authoritative, matching `scontrol reconfigure`
+    /// semantics in Slurm: runtime-only changes not reflected in the conf are
+    /// overwritten by the incoming conf values.
+    pub fn reconfigure(&self) -> Result<(), anyhow::Error> {
+        let Some(ref path) = self.config_path else {
+            anyhow::bail!("no config file path configured — reconfigure is a no-op");
+        };
+        let new_config = spur_core::config::SlurmConfig::load_from_file(path)?;
+        let conf_partitions = new_config.build_partitions();
+
+        let conf_names: std::collections::HashSet<String> =
+            conf_partitions.iter().map(|p| p.name.clone()).collect();
+        let current_names: std::collections::HashSet<String> =
+            self.partitions.read().iter().map(|p| p.name.clone()).collect();
+
+        // Delete partitions absent from the new conf.
+        for name in current_names.difference(&conf_names) {
+            // Skip if active jobs are running on the partition — callers should
+            // drain first, matching Slurm's behaviour.
+            let in_use = self.jobs.read().values().any(|j| {
+                matches!(
+                    j.state,
+                    JobState::Running | JobState::Completing | JobState::Suspended
+                ) && j.spec.partition.as_deref() == Some(name.as_str())
+            });
+            if in_use {
+                warn!(
+                    partition = %name,
+                    "reconfigure: partition removed from conf but has active jobs; skipping deletion"
+                );
+                continue;
+            }
+            self.propose(WalOperation::PartitionDelete { name: name.clone() })
+                .map_err(|e| anyhow::anyhow!("reconfigure: delete {name}: {e}"))?;
+        }
+
+        // Clear tombstones for partitions that reappear in conf so they are
+        // re-seeded by build_partitions() on the next restart.
+        {
+            let mut deleted = self.deleted_partition_names.write();
+            for name in &conf_names {
+                deleted.remove(name);
+            }
+        }
+
+        // Create partitions present in conf but absent from current WAL state.
+        for part in conf_partitions.iter().filter(|p| !current_names.contains(&p.name)) {
+            self.propose(WalOperation::PartitionCreate { partition: part.clone() })
+                .map_err(|e| anyhow::anyhow!("reconfigure: create {}: {e}", part.name))?;
+        }
+
+        // Update partitions present in both — conf wins unconditionally.
+        for part in conf_partitions.iter().filter(|p| current_names.contains(&p.name)) {
+            let preempt_str = match part.preempt_mode {
+                spur_core::partition::PreemptMode::Cancel => "cancel",
+                spur_core::partition::PreemptMode::Requeue => "requeue",
+                spur_core::partition::PreemptMode::Suspend => "suspend",
+                spur_core::partition::PreemptMode::Off => "off",
+            };
+            self.propose(WalOperation::PartitionUpdate {
+                name: part.name.clone(),
+                nodes: Some(part.nodes.clone()),
+                selector: Some(part.selector.clone()),
+                state: Some(part.state.to_string()),
+                max_time_minutes: Some(part.max_time_minutes),
+                default_time_minutes: Some(part.default_time_minutes),
+                max_nodes: Some(part.max_nodes),
+                min_nodes: Some(part.min_nodes),
+                allow_accounts: Some(part.allow_accounts.clone()),
+                allow_groups: Some(part.allow_groups.clone()),
+                deny_accounts: Some(part.deny_accounts.clone()),
+                deny_qos: Some(part.deny_qos.clone()),
+                priority_tier: Some(part.priority_tier),
+                preempt_mode: Some(preempt_str.to_string()),
+                is_default: Some(part.is_default),
+            })
+            .map_err(|e| anyhow::anyhow!("reconfigure: update {}: {e}", part.name))?;
+        }
+
+        self.sync_partitions_to_config();
+        Ok(())
+    }
+
     /// Create a new reservation (validated, persisted via Raft).
     pub fn create_reservation(&self, mut res: Reservation) -> Result<(), ReservationError> {
         if self.reservations.read().iter().any(|r| r.name == res.name) {

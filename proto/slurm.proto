@@ -333,6 +333,7 @@ service SlurmController {
   rpc CreatePartition(CreatePartitionRequest) returns (google.protobuf.Empty);
   rpc UpdatePartition(UpdatePartitionRequest) returns (google.protobuf.Empty);
   rpc DeletePartition(DeletePartitionRequest) returns (google.protobuf.Empty);
+  rpc Reconfigure(google.protobuf.Empty) returns (google.protobuf.Empty);
 
   // Reservation management
   rpc CreateReservation(CreateReservationRequest) returns (google.protobuf.Empty);

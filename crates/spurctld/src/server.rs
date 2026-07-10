@@ -1451,6 +1451,32 @@ impl SlurmController for ControllerService {
         Ok(Response::new(()))
     }
 
+    async fn reconfigure(
+        &self,
+        request: Request<()>,
+    ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.reconfigure(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward reconfigure to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+
+        self.cluster
+            .reconfigure()
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(()))
+    }
+
     async fn create_reservation(
         &self,
         request: Request<CreateReservationRequest>,
