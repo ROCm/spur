@@ -1,8 +1,9 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::env_defaults::{apply_csv, apply_flag, apply_num, apply_str, apply_string};
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use spur_core::config::HooksConfig;
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
@@ -50,7 +51,9 @@ pub struct SrunArgs {
     pub time: Option<String>,
 
     /// GRES
-    #[arg(long)]
+    // Slurm semantics: comma-lists expand to multiple GRES; a repeated --gres
+    // replaces rather than accumulates (last wins).
+    #[arg(long, value_delimiter = ',', overrides_with = "gres")]
     pub gres: Vec<String>,
 
     /// Licenses (e.g., "fluent:5", "matlab:1")
@@ -160,7 +163,9 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = SrunArgs::try_parse_from(&args)?;
+    let matches = SrunArgs::command().try_get_matches_from(&args)?;
+    let mut args = SrunArgs::from_arg_matches(&matches)?;
+    resolve_srun_env(&matches, &mut args)?;
 
     if args.command.is_empty() {
         eprintln!("srun: no command specified");
@@ -384,6 +389,163 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         output_streamed,
     )
     .await;
+
+    Ok(())
+}
+
+/// Apply environment-variable defaults to any flag not set on the command
+/// line. srun mirrors real Slurm: most flags read `SLURM_*` (inherited from an
+/// allocation's output vars), a few read genuine `SRUN_*`, and each also
+/// accepts its `SPUR_*` native twin. CLI always overrides env.
+fn resolve_srun_env(matches: &ArgMatches, args: &mut SrunArgs) -> Result<()> {
+    apply_str(
+        matches,
+        "job_name",
+        &["SPUR_JOB_NAME", "SLURM_JOB_NAME"],
+        &mut args.job_name,
+    );
+    apply_str(
+        matches,
+        "partition",
+        &["SPUR_PARTITION", "SLURM_PARTITION"],
+        &mut args.partition,
+    );
+    apply_str(
+        matches,
+        "account",
+        &["SPUR_ACCOUNT", "SLURM_ACCOUNT"],
+        &mut args.account,
+    );
+    apply_num(
+        matches,
+        "nodes",
+        &[
+            "SPUR_NNODES",
+            "SPUR_JOB_NUM_NODES",
+            "SLURM_NNODES",
+            "SLURM_JOB_NUM_NODES",
+        ],
+        &mut args.nodes,
+    )?;
+    apply_num(
+        matches,
+        "ntasks",
+        &["SPUR_NTASKS", "SPUR_NPROCS", "SLURM_NTASKS", "SLURM_NPROCS"],
+        &mut args.ntasks,
+    )?;
+    apply_num(
+        matches,
+        "cpus_per_task",
+        &["SPUR_CPUS_PER_TASK", "SLURM_CPUS_PER_TASK"],
+        &mut args.cpus_per_task,
+    )?;
+    apply_str(
+        matches,
+        "mem",
+        &["SPUR_MEM_PER_NODE", "SLURM_MEM_PER_NODE"],
+        &mut args.mem,
+    );
+    apply_str(
+        matches,
+        "time",
+        &["SPUR_TIMELIMIT", "SLURM_TIMELIMIT"],
+        &mut args.time,
+    );
+    apply_csv(
+        matches,
+        "gres",
+        &["SPUR_GRES", "SLURM_GRES"],
+        &mut args.gres,
+    );
+    apply_str(
+        matches,
+        "gpus",
+        &["SPUR_GPUS", "SLURM_GPUS"],
+        &mut args.gpus,
+    );
+    apply_str(
+        matches,
+        "chdir",
+        &[
+            "SPUR_REMOTE_CWD",
+            "SPUR_WORKING_DIR",
+            "SLURM_REMOTE_CWD",
+            "SLURM_WORKING_DIR",
+        ],
+        &mut args.chdir,
+    );
+    apply_str(
+        matches,
+        "cpu_bind",
+        &["SPUR_CPU_BIND", "SLURM_CPU_BIND"],
+        &mut args.cpu_bind,
+    );
+    apply_str(
+        matches,
+        "gpu_bind",
+        &["SPUR_GPU_BIND", "SLURM_GPU_BIND"],
+        &mut args.gpu_bind,
+    );
+    apply_str(
+        matches,
+        "constraint",
+        &["SPUR_CONSTRAINT", "SLURM_CONSTRAINT"],
+        &mut args.constraint,
+    );
+    apply_str(
+        matches,
+        "reservation",
+        &["SPUR_RESERVATION", "SLURM_RESERVATION"],
+        &mut args.reservation,
+    );
+    apply_string(
+        matches,
+        "mpi",
+        &["SPUR_MPI_TYPE", "SLURM_MPI_TYPE"],
+        &mut args.mpi,
+    );
+    apply_flag(
+        matches,
+        "label",
+        &["SPUR_LABELIO", "SLURM_LABELIO"],
+        &mut args.label,
+    );
+    apply_str(
+        matches,
+        "output",
+        &["SPUR_OUTPUT", "SRUN_OUTPUT"],
+        &mut args.output,
+    );
+    apply_str(
+        matches,
+        "error",
+        &["SPUR_ERROR", "SRUN_ERROR"],
+        &mut args.error,
+    );
+    apply_str(
+        matches,
+        "input",
+        &["SPUR_INPUT", "SRUN_INPUT"],
+        &mut args.input,
+    );
+    apply_str(
+        matches,
+        "container_image",
+        &["SPUR_CONTAINER", "SRUN_CONTAINER"],
+        &mut args.container_image,
+    );
+    apply_str(
+        matches,
+        "prolog",
+        &["SPUR_PROLOG", "SLURM_PROLOG"],
+        &mut args.prolog,
+    );
+    apply_str(
+        matches,
+        "epilog",
+        &["SPUR_EPILOG", "SLURM_EPILOG"],
+        &mut args.epilog,
+    );
 
     Ok(())
 }
@@ -958,5 +1120,190 @@ mod tests {
     #[test]
     fn build_command_script_preserves_quotes_in_arg() {
         assert_script_round_trips(&["echo", "it's a \"test\""]);
+    }
+
+    // These tests mutate process-global env vars, so they run serially and use
+    // the shared EnvGuard, which clears every SPUR_/SLURM_/SALLOC_/SRUN_-prefixed
+    // var on construction and drop, keeping them independent of the runner's
+    // environment (which may inject SLURM_* vars) and of each other.
+    use crate::env_defaults::EnvGuard;
+    use serial_test::serial;
+
+    /// Run the real matches-parse + env-resolve pipeline used by `main_with_args`.
+    fn resolve_from(cli: &[&str]) -> SrunArgs {
+        let matches = SrunArgs::command()
+            .try_get_matches_from(cli)
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        resolve_srun_env(&matches, &mut args).expect("resolve failed");
+        args
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn env_provides_default() {
+        let env = EnvGuard::new();
+        env.set("SLURM_PARTITION", "gpu");
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(args.partition.as_deref(), Some("gpu"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn cli_overrides_env() {
+        let env = EnvGuard::new();
+        env.set("SLURM_PARTITION", "gpu");
+        let args = resolve_from(&["srun", "--partition=cpu", "hostname"]);
+        assert_eq!(args.partition.as_deref(), Some("cpu"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn spur_native_alias_works() {
+        let env = EnvGuard::new();
+        env.set("SPUR_PARTITION", "spur-part");
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(args.partition.as_deref(), Some("spur-part"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn spur_alias_precedes_slurm_twin() {
+        let env = EnvGuard::new();
+        env.set("SPUR_PARTITION", "from-spur");
+        env.set("SLURM_PARTITION", "from-slurm");
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(args.partition.as_deref(), Some("from-spur"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn nodes_alias_fallback_and_precedence() {
+        let env = EnvGuard::new();
+        env.set("SLURM_JOB_NUM_NODES", "3");
+        assert_eq!(resolve_from(&["srun", "hostname"]).nodes, 3);
+
+        // SLURM_NNODES is listed before SLURM_JOB_NUM_NODES, so it wins.
+        env.set("SLURM_NNODES", "5");
+        assert_eq!(resolve_from(&["srun", "hostname"]).nodes, 5);
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn ntasks_nprocs_fallback() {
+        let env = EnvGuard::new();
+        env.set("SLURM_NPROCS", "7");
+        assert_eq!(resolve_from(&["srun", "hostname"]).ntasks, 7);
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn numeric_env_parsed() {
+        let env = EnvGuard::new();
+        env.set("SLURM_NNODES", "4");
+        assert_eq!(resolve_from(&["srun", "hostname"]).nodes, 4);
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn invalid_numeric_env_errors() {
+        let env = EnvGuard::new();
+        env.set("SLURM_NNODES", "abc");
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "hostname"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        assert!(resolve_srun_env(&matches, &mut args).is_err());
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn genuine_srun_vars() {
+        let env = EnvGuard::new();
+        env.set("SRUN_OUTPUT", "out-%j.log");
+        env.set("SRUN_ERROR", "err-%j.log");
+        env.set("SRUN_INPUT", "/dev/null");
+        env.set("SRUN_CONTAINER", "img.sqsh");
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(args.output.as_deref(), Some("out-%j.log"));
+        assert_eq!(args.error.as_deref(), Some("err-%j.log"));
+        assert_eq!(args.input.as_deref(), Some("/dev/null"));
+        assert_eq!(args.container_image.as_deref(), Some("img.sqsh"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn label_flag_semantics() {
+        let env = EnvGuard::new();
+
+        env.set("SLURM_LABELIO", "yes");
+        assert!(resolve_from(&["srun", "hostname"]).label);
+
+        env.set("SLURM_LABELIO", "1");
+        assert!(resolve_from(&["srun", "hostname"]).label);
+
+        env.set("SLURM_LABELIO", "0");
+        assert!(!resolve_from(&["srun", "hostname"]).label);
+
+        env.set("SLURM_LABELIO", "maybe");
+        assert!(!resolve_from(&["srun", "hostname"]).label);
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn gres_comma_split() {
+        let env = EnvGuard::new();
+        env.set("SLURM_GRES", "gpu:1,fpga:2");
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(args.gres, vec!["gpu:1", "fpga:2"]);
+    }
+
+    #[test]
+    fn cli_gres_comma_list_splits_into_multiple() {
+        let args = SrunArgs::try_parse_from(["srun", "--gres=gpu:1,fpga:2", "hostname"])
+            .expect("parse failed");
+        assert_eq!(args.gres, vec!["gpu:1", "fpga:2"]);
+    }
+
+    #[test]
+    fn cli_repeated_gres_last_wins() {
+        let args = SrunArgs::try_parse_from(["srun", "--gres=gpu:1", "--gres=fpga:2", "hostname"])
+            .expect("parse failed");
+        assert_eq!(args.gres, vec!["fpga:2"]);
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn defaults_unchanged_without_env() {
+        let _env = EnvGuard::new();
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(args.nodes, 1);
+        assert_eq!(args.ntasks, 1);
+        assert_eq!(args.cpus_per_task, 1);
+        assert!(args.partition.is_none());
+        assert_eq!(args.mpi, "none");
+        assert!(!args.label);
+    }
+
+    /// srun launched inside an allocation inherits the allocation's task and
+    /// CPU counts: salloc/sbatch export SLURM_NTASKS and SLURM_CPUS_PER_TASK,
+    /// and srun reads them as defaults (matching Slurm). This is what feeds
+    /// `create_job_step` in step mode, so the step sizes to the allocation
+    /// rather than the bare `-n 1 -c 1` defaults.
+    #[test]
+    #[serial(env_injection)]
+    fn inherits_allocation_task_and_cpu_counts() {
+        let env = EnvGuard::new();
+        env.set("SLURM_NTASKS", "4");
+        env.set("SLURM_CPUS_PER_TASK", "2");
+        env.set("SLURM_JOB_NUM_NODES", "3");
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(args.ntasks, 4);
+        assert_eq!(args.cpus_per_task, 2);
+        assert_eq!(args.nodes, 3);
+
+        // An explicit CLI value still wins over the inherited allocation env.
+        let overridden = resolve_from(&["srun", "-n", "1", "hostname"]);
+        assert_eq!(overridden.ntasks, 1);
     }
 }

@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod env_defaults;
 mod exec;
 mod exit_fmt;
 mod format_engine;
