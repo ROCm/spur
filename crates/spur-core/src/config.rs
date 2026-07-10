@@ -41,6 +41,9 @@ pub struct SlurmConfig {
     pub auth: AuthConfig,
 
     #[serde(default)]
+    pub security: SecurityConfig,
+
+    #[serde(default)]
     pub partitions: Vec<PartitionConfig>,
 
     #[serde(default)]
@@ -447,6 +450,33 @@ impl Default for AuthConfig {
     }
 }
 
+/// Development-only fallback used for node admission JWTs when security.mode = "dev".
+pub const DEV_ADMISSION_JWT_KEY: &str = "spur-default-key";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecurityConfig {
+    /// Security boundary for config validation: "dev" keeps local defaults,
+    /// "production" fails fast on insecure settings.
+    #[serde(default)]
+    pub mode: SecurityMode,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            mode: SecurityMode::Dev,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SecurityMode {
+    #[default]
+    Dev,
+    Production,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartitionConfig {
     pub name: String,
@@ -816,6 +846,48 @@ impl SlurmConfig {
                 value: "0 (must be at least 1)".into(),
             });
         }
+        if matches!(self.security.mode, SecurityMode::Production) {
+            self.validate_production_security()?;
+        }
+        Ok(())
+    }
+
+    fn validate_production_security(&self) -> Result<(), ConfigError> {
+        let auth_plugin = self.auth.plugin.trim().to_ascii_lowercase();
+        if auth_plugin == "none" {
+            return Err(ConfigError::InvalidValue {
+                field: "auth.plugin".into(),
+                value: "none is only allowed when security.mode = \"dev\"".into(),
+            });
+        }
+
+        if !matches!(auth_plugin.as_str(), "jwt" | "munge") {
+            return Err(ConfigError::InvalidValue {
+                field: "auth.plugin".into(),
+                value: self.auth.plugin.clone(),
+            });
+        }
+
+        if matches!(self.admission.mode, AdmissionMode::Open) {
+            return Err(ConfigError::InvalidValue {
+                field: "admission.mode".into(),
+                value: "open is only allowed when security.mode = \"dev\"".into(),
+            });
+        }
+
+        if auth_plugin == "jwt" || matches!(self.admission.mode, AdmissionMode::Token) {
+            let jwt_key = self.auth.jwt_key.as_deref().map(str::trim).unwrap_or("");
+            if jwt_key.is_empty() {
+                return Err(ConfigError::MissingField("auth.jwt_key".into()));
+            }
+            if jwt_key == DEV_ADMISSION_JWT_KEY {
+                return Err(ConfigError::InvalidValue {
+                    field: "auth.jwt_key".into(),
+                    value: format!("{DEV_ADMISSION_JWT_KEY} is a development-only fallback"),
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -1104,6 +1176,121 @@ high_cardinality = true
         assert_eq!(
             config.metrics.effective_listen_addr().unwrap(),
             "127.0.0.1:6822".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn security_mode_defaults_to_dev() {
+        let config = SlurmConfig::load_from_str(r#"cluster_name = "x""#).unwrap();
+        assert_eq!(config.security.mode, SecurityMode::Dev);
+    }
+
+    #[test]
+    fn production_security_accepts_token_admission_with_jwt_key() {
+        let toml = r#"
+cluster_name = "prod"
+
+[security]
+mode = "production"
+
+[auth]
+plugin = "jwt"
+jwt_key = "replace-with-a-generated-secret"
+
+[admission]
+mode = "token"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.security.mode, SecurityMode::Production);
+        assert_eq!(config.admission.mode, AdmissionMode::Token);
+    }
+
+    #[test]
+    fn production_security_rejects_auth_none() {
+        let toml = r#"
+cluster_name = "prod"
+
+[security]
+mode = "production"
+
+[auth]
+plugin = "none"
+jwt_key = "replace-with-a-generated-secret"
+
+[admission]
+mode = "token"
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("auth.plugin"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn production_security_rejects_missing_jwt_key_for_token_auth() {
+        let toml = r#"
+cluster_name = "prod"
+
+[security]
+mode = "production"
+
+[auth]
+plugin = "jwt"
+
+[admission]
+mode = "token"
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("auth.jwt_key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn production_security_rejects_open_admission() {
+        let toml = r#"
+cluster_name = "prod"
+
+[security]
+mode = "production"
+
+[auth]
+plugin = "jwt"
+jwt_key = "replace-with-a-generated-secret"
+
+[admission]
+mode = "open"
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("admission.mode"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn production_security_rejects_dev_admission_jwt_key() {
+        let toml = format!(
+            r#"
+cluster_name = "prod"
+
+[security]
+mode = "production"
+
+[auth]
+plugin = "jwt"
+jwt_key = "{DEV_ADMISSION_JWT_KEY}"
+
+[admission]
+mode = "token"
+"#
+        );
+        let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("development-only fallback"),
+            "unexpected error: {err}"
         );
     }
 

@@ -58,6 +58,33 @@ Create ``/etc/spur/spur.conf``. The repository includes ``examples/spur.conf``. 
    memory_mb = 512000
    gres = ["gpu:mi300x:8"]
 
+Production Security Baseline
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The example config above and ``examples/spur.conf`` are development-oriented.
+For production, opt into the security validation boundary so Spur fails fast
+instead of accepting local-only defaults:
+
+.. code-block:: toml
+
+   [security]
+   mode = "production"
+
+   [auth]
+   plugin = "jwt"
+   jwt_key = "<generated high-entropy secret>"
+
+   [admission]
+   mode = "token"
+
+Before starting ``spurctld`` in production:
+
+- Do not use ``auth.plugin = "none"``.
+- Set ``auth.jwt_key`` to a generated secret from your secret-management workflow.
+- Use ``admission.mode = "token"`` and issue join tokens for worker registration.
+- Do not use the development fallback key ``spur-default-key``.
+- Keep mTLS, Raft peer authentication, and broader authorization hardening on your deployment roadmap; they are not covered by this baseline.
+
 Start the controller:
 
 .. code-block:: bash

@@ -26,6 +26,38 @@ use crate::sched_stats::SchedStatsCollector;
 const FORWARDED_HEADER: &str = "x-spur-forwarded";
 const LEADER_HEADER: &str = "x-spur-leader";
 
+#[allow(clippy::result_large_err)]
+fn admission_jwt_key_for_config(
+    config: &spur_core::config::SlurmConfig,
+) -> Result<&str, Status> {
+    use spur_core::config::{DEV_ADMISSION_JWT_KEY, SecurityMode};
+
+    if let Some(jwt_key) = config
+        .auth
+        .jwt_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    {
+        if matches!(config.security.mode, SecurityMode::Production)
+            && jwt_key == DEV_ADMISSION_JWT_KEY
+        {
+            return Err(Status::failed_precondition(
+                "production admission token mode cannot use the development JWT fallback key",
+            ));
+        }
+        return Ok(jwt_key);
+    }
+
+    if matches!(config.security.mode, SecurityMode::Dev) {
+        return Ok(DEV_ADMISSION_JWT_KEY);
+    }
+
+    Err(Status::failed_precondition(
+        "production admission token mode requires auth.jwt_key",
+    ))
+}
+
 pub struct ControllerService {
     cluster: Arc<ClusterManager>,
     raft: Arc<RaftHandle>,
@@ -153,13 +185,7 @@ impl ControllerService {
         spur_core::admission::validate_token(token_id, secret, &token_store)
             .map_err(|e| Status::permission_denied(e.to_string()))?;
 
-        let jwt_key = self
-            .cluster
-            .config
-            .auth
-            .jwt_key
-            .as_deref()
-            .unwrap_or("spur-default-key");
+        let jwt_key = admission_jwt_key_for_config(&self.cluster.config)?;
 
         spur_core::admission::generate_node_token(hostname, jwt_key.as_bytes())
             .map_err(|e| Status::internal(e.to_string()))
@@ -628,13 +654,7 @@ impl SlurmController for ControllerService {
             if req.node_token.is_empty() {
                 return Err(Status::unauthenticated("node token required"));
             }
-            let jwt_key = self
-                .cluster
-                .config
-                .auth
-                .jwt_key
-                .as_deref()
-                .unwrap_or("spur-default-key");
+            let jwt_key = admission_jwt_key_for_config(&self.cluster.config)?;
             let identity =
                 spur_core::admission::verify_node_token(&req.node_token, jwt_key.as_bytes())
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
@@ -973,13 +993,7 @@ impl SlurmController for ControllerService {
             if req.node_token.is_empty() {
                 return Err(Status::unauthenticated("node token required"));
             }
-            let jwt_key = self
-                .cluster
-                .config
-                .auth
-                .jwt_key
-                .as_deref()
-                .unwrap_or("spur-default-key");
+            let jwt_key = admission_jwt_key_for_config(&self.cluster.config)?;
             let identity =
                 spur_core::admission::verify_node_token(&req.node_token, jwt_key.as_bytes())
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
@@ -2041,9 +2055,52 @@ fn validate_completion_report_state_for_rpc(
 mod tests {
     use super::*;
     use chrono::Duration;
+    use spur_core::config::{DEV_ADMISSION_JWT_KEY, SecurityMode};
     use spur_core::job::{JobState, NodeCompleteError};
     use spur_core::reservation::ReservationFlags;
     use tonic::Code;
+
+    fn token_admission_config() -> spur_core::config::SlurmConfig {
+        spur_core::config::SlurmConfig::load_from_str(
+            r#"
+cluster_name = "test"
+
+[admission]
+mode = "token"
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn dev_admission_jwt_key_uses_fallback_when_missing() {
+        let config = token_admission_config();
+        assert_eq!(
+            admission_jwt_key_for_config(&config).unwrap(),
+            DEV_ADMISSION_JWT_KEY
+        );
+    }
+
+    #[test]
+    fn production_admission_jwt_key_requires_configured_secret() {
+        let mut config = token_admission_config();
+        config.security.mode = SecurityMode::Production;
+
+        let status = admission_jwt_key_for_config(&config).unwrap_err();
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert!(status.message().contains("auth.jwt_key"));
+    }
+
+    #[test]
+    fn production_admission_jwt_key_rejects_dev_fallback_secret() {
+        let mut config = token_admission_config();
+        config.security.mode = SecurityMode::Production;
+        config.auth.jwt_key = Some(DEV_ADMISSION_JWT_KEY.into());
+
+        let status = admission_jwt_key_for_config(&config).unwrap_err();
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert!(status.message().contains("development JWT fallback"));
+    }
 
     #[test]
     fn submit_rpc_status_maps_invalid_argument() {

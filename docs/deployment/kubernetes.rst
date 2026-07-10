@@ -27,7 +27,9 @@ Components
 - **spurd** — Node agent. Runs on each compute node (DaemonSet or Deployment).
 - **spur-k8s-operator** — Watches ``SpurJob`` custom resources and submits them to the controller.
 
-Example manifests for production-style deployment live in ``examples/k8s/``.
+Example manifests for a starter deployment live in ``examples/k8s/``. They
+keep development security defaults until you wire secrets and admission tokens
+for your cluster.
 
 Deploy
 ------
@@ -58,6 +60,9 @@ The ConfigMap (``examples/k8s/configmap.yaml``) embeds ``spur.conf``:
 
    cluster_name = "spur-k8s"
 
+   [security]
+   mode = "dev"
+
    [controller]
    peers = [
      "spurctld-0.spurctld.spur.svc.cluster.local:6821",
@@ -77,6 +82,9 @@ The ConfigMap (``examples/k8s/configmap.yaml``) embeds ``spur.conf``:
 Raft peers use StatefulSet DNS names. The node ID is auto-detected from the pod hostname ordinal.
 
 Adjust partition definitions and node resources to match your cluster hardware.
+For production, set ``security.mode = "production"``, supply a generated
+``auth.jwt_key`` through your secret-management workflow, and set
+``admission.mode = "token"`` before enabling worker registration.
 
 Submitting Jobs
 ---------------

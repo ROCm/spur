@@ -303,6 +303,7 @@ fn default_config() -> spur_core::config::SlurmConfig {
         accounting: Default::default(),
         scheduler: Default::default(),
         auth: Default::default(),
+        security: Default::default(),
         partitions: vec![spur_core::config::PartitionConfig {
             name: "default".into(),
             default: true,

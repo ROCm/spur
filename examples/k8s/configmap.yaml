@@ -7,6 +7,12 @@ data:
   spur.conf: |
     cluster_name = "spur-k8s"
 
+    # Development defaults for example manifests. Production deployments should
+    # set mode = "production", configure auth.jwt_key from your
+    # secret-management workflow, and use [admission] mode = "token".
+    [security]
+    mode = "dev"
+
     [controller]
     # Raft peers use StatefulSet DNS names on the dedicated Raft port.
     # node_id is auto-detected from the pod hostname ordinal (spurctld-N → N+1).
