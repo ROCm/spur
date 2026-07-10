@@ -585,3 +585,260 @@ class TestPartitionAllowDenyQos:
         assert "denied" in out.lower() or "error" in out.lower(), (
             f"expected rejection after deny_qos update, got: {out}"
         )
+
+
+class TestSlurmsyntax:
+    """
+    Verify that the Slurm-compatible inline key=value syntax works:
+      scontrol create PartitionName=<n> Nodes=... MaxTime=...
+      scontrol update PartitionName=<n> MaxTime=... State=...
+      scontrol delete PartitionName=<n>
+
+    These are in addition to the spur-native --flag subcommands.
+    """
+
+    def test_slurm_create_partition(self, cluster):
+        name = _unique("slurm-crt")
+        nodes_list = ",".join(cluster.node_names)
+
+        out = cluster.scontrol(
+            "create",
+            f"PartitionName={name}",
+            f"Nodes={nodes_list}",
+            "MaxTime=02:00:00",
+            "State=UP",
+            "PriorityTier=3",
+        )
+        assert "created" in out.lower(), f"expected created, got: {out}"
+
+        show = cluster.scontrol("show", "partition")
+        assert name in show
+        assert "02:00:00" in show or "2:00:00" in show
+
+    def test_slurm_create_partition_with_all_keys(self, cluster):
+        name = _unique("slurm-crt-full")
+        nodes_list = ",".join(cluster.node_names)
+
+        out = cluster.scontrol(
+            "create",
+            f"PartitionName={name}",
+            f"Nodes={nodes_list}",
+            "MaxTime=24:00:00",
+            "DefaultTime=01:00:00",
+            "MinNodes=1",
+            "MaxNodes=4",
+            "State=DOWN",
+            "Default=NO",
+            "AllowAccounts=acct1,acct2",
+            "DenyAccounts=badacct",
+            "AllowGroups=grp1",
+            "PriorityTier=5",
+            "PreemptMode=CANCEL",
+        )
+        assert "created" in out.lower()
+
+        show = cluster.scontrol("show", "partition")
+        assert name in show
+        assert "CANCEL" in show or "cancel" in show.lower()
+
+    def test_slurm_update_partition_maxtime(self, cluster):
+        name = _unique("slurm-upd")
+        nodes_list = ",".join(cluster.node_names)
+
+        cluster.scontrol(
+            "create",
+            f"PartitionName={name}",
+            f"Nodes={nodes_list}",
+            "MaxTime=01:00:00",
+        )
+
+        out = cluster.scontrol(
+            "update",
+            f"PartitionName={name}",
+            "MaxTime=08:00:00",
+        )
+        assert "updated" in out.lower(), f"expected updated, got: {out}"
+
+        show = cluster.scontrol("show", "partition")
+        assert name in show
+        assert "08:00:00" in show
+
+    def test_slurm_update_partition_state(self, cluster):
+        name = _unique("slurm-upd-state")
+        nodes_list = ",".join(cluster.node_names)
+
+        cluster.scontrol(
+            "create",
+            f"PartitionName={name}",
+            f"Nodes={nodes_list}",
+            "State=UP",
+        )
+
+        out = cluster.scontrol(
+            "update",
+            f"PartitionName={name}",
+            "State=DOWN",
+        )
+        assert "updated" in out.lower()
+
+        show = cluster.scontrol("show", "partition")
+        assert name in show
+        # State should now be DOWN
+        for line in show.splitlines():
+            if name in line:
+                # PartitionName line found; next line has State
+                break
+        assert "DOWN" in show or "down" in show.lower()
+
+    def test_slurm_update_partition_multiple_fields(self, cluster):
+        name = _unique("slurm-upd-multi")
+        nodes_list = ",".join(cluster.node_names)
+
+        cluster.scontrol(
+            "create",
+            f"PartitionName={name}",
+            f"Nodes={nodes_list}",
+            "MaxTime=01:00:00",
+            "PriorityTier=1",
+        )
+
+        out = cluster.scontrol(
+            "update",
+            f"PartitionName={name}",
+            "MaxTime=12:00:00",
+            "PriorityTier=10",
+            "State=DRAIN",
+        )
+        assert "updated" in out.lower()
+
+        show = cluster.scontrol("show", "partition")
+        assert name in show
+        assert "12:00:00" in show
+
+    def test_slurm_update_partition_allow_accounts(self, cluster):
+        name = _unique("slurm-upd-acct")
+        nodes_list = ",".join(cluster.node_names)
+
+        cluster.scontrol(
+            "create",
+            f"PartitionName={name}",
+            f"Nodes={nodes_list}",
+        )
+
+        out = cluster.scontrol(
+            "update",
+            f"PartitionName={name}",
+            "AllowAccounts=team1,team2",
+        )
+        assert "updated" in out.lower()
+
+        show = cluster.scontrol("show", "partition")
+        assert name in show
+        assert "team1" in show or "team2" in show
+
+    def test_slurm_update_partition_deny_accounts(self, cluster):
+        name = _unique("slurm-upd-deny")
+        nodes_list = ",".join(cluster.node_names)
+
+        cluster.scontrol(
+            "create",
+            f"PartitionName={name}",
+            f"Nodes={nodes_list}",
+        )
+
+        out = cluster.scontrol(
+            "update",
+            f"PartitionName={name}",
+            "DenyAccounts=blocked",
+        )
+        assert "updated" in out.lower()
+
+        show = cluster.scontrol("show", "partition")
+        assert name in show
+        assert "blocked" in show
+
+    def test_slurm_delete_partition(self, cluster):
+        name = _unique("slurm-del")
+        nodes_list = ",".join(cluster.node_names)
+
+        cluster.scontrol(
+            "create",
+            f"PartitionName={name}",
+            f"Nodes={nodes_list}",
+        )
+
+        show_before = cluster.scontrol("show", "partition")
+        assert name in show_before
+
+        out = cluster.scontrol("delete", f"PartitionName={name}")
+        assert "deleted" in out.lower(), f"expected deleted, got: {out}"
+
+        show_after = cluster.scontrol("show", "partition")
+        assert name not in show_after
+
+    def test_slurm_delete_nonexistent_partition_fails(self, cluster):
+        out = cluster.cli_allow_fail(
+            ["scontrol", "delete", "PartitionName=no-such-partition-xyz"]
+        )
+        assert "not found" in out.lower() or "error" in out.lower(), (
+            f"expected not-found error, got: {out}"
+        )
+
+    def test_slurm_create_duplicate_fails(self, cluster):
+        name = _unique("slurm-dup")
+        nodes_list = ",".join(cluster.node_names)
+
+        cluster.scontrol(
+            "create",
+            f"PartitionName={name}",
+            f"Nodes={nodes_list}",
+        )
+
+        out = cluster.cli_allow_fail(
+            ["scontrol", "create", f"PartitionName={name}", f"Nodes={nodes_list}"]
+        )
+        assert "already exists" in out.lower() or "error" in out.lower(), (
+            f"expected duplicate-create error, got: {out}"
+        )
+
+    def test_slurm_update_nonexistent_fails(self, cluster):
+        out = cluster.cli_allow_fail(
+            ["scontrol", "update", "PartitionName=no-such-partition-xyz", "State=DOWN"]
+        )
+        assert "not found" in out.lower() or "error" in out.lower(), (
+            f"expected not-found error, got: {out}"
+        )
+
+    def test_slurm_create_update_delete_round_trip(self, cluster):
+        """Full lifecycle using only Slurm-compatible scontrol syntax."""
+        name = _unique("slurm-rt")
+        nodes_list = ",".join(cluster.node_names)
+        node = cluster.node_names[0]
+
+        # Create
+        cluster.scontrol(
+            "create",
+            f"PartitionName={name}",
+            f"Nodes={nodes_list}",
+            "MaxTime=04:00:00",
+            "PriorityTier=3",
+            "State=UP",
+        )
+        show = cluster.scontrol("show", "partition")
+        assert name in show
+
+        # Update
+        cluster.scontrol(
+            "update",
+            f"PartitionName={name}",
+            "MaxTime=08:00:00",
+            "State=DRAIN",
+            "PriorityTier=5",
+        )
+        show = cluster.scontrol("show", "partition")
+        assert "08:00:00" in show
+
+        # Delete
+        cluster.scontrol("delete", f"PartitionName={name}")
+        show = cluster.scontrol("show", "partition")
+        assert name not in show
