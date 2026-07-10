@@ -110,9 +110,10 @@ fn parse_params(params: &[String]) -> std::collections::HashMap<String, String> 
 }
 
 async fn connect(addr: &str) -> Result<SlurmAccountingClient<tonic::transport::Channel>> {
-    SlurmAccountingClient::connect(addr.to_string())
+    let channel = spur_client::connect_channel(addr)
         .await
-        .context("failed to connect to controller")
+        .context("failed to connect to controller")?;
+    Ok(SlurmAccountingClient::new(channel))
 }
 
 /// Extract the fields shared by `add user` and `modify user` (both upsert

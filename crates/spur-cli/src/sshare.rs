@@ -42,9 +42,10 @@ pub async fn main() -> Result<()> {
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = SshareArgs::try_parse_from(&args)?;
 
-    let mut client = SlurmAccountingClient::connect(args.controller.clone())
+    let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to controller")?;
+    let mut client = SlurmAccountingClient::new(channel);
 
     // Get accounts
     let accounts_resp = client

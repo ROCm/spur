@@ -153,9 +153,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         })
         .unwrap_or_default();
 
-    let mut client = SlurmAccountingClient::connect(args.controller)
+    let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to controller")?;
+    let mut client = SlurmAccountingClient::new(channel);
 
     let start_after = args
         .starttime
