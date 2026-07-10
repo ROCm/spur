@@ -33,9 +33,34 @@ pub enum ScontrolCommand {
         /// Entity name or ID
         name: Option<String>,
     },
-    /// Update job/node/partition properties
+    /// Create a partition or reservation (Slurm-compatible inline syntax)
+    ///
+    /// Examples:
+    ///   scontrol create PartitionName=gpu Nodes=n[1-4] MaxTime=24:00:00 State=UP
+    ///   scontrol create ReservationName=maint StartTime=now Duration=60 Nodes=n1
+    Create {
+        /// key=value pairs (e.g. PartitionName=gpu Nodes=n1 MaxTime=4:00:00)
+        #[arg(trailing_var_arg = true)]
+        params: Vec<String>,
+    },
+    /// Update job/node/partition properties (Slurm-compatible inline syntax)
+    ///
+    /// Examples:
+    ///   scontrol update PartitionName=gpu MaxTime=48:00:00 State=DOWN
+    ///   scontrol update JobId=42 Priority=100
+    ///   scontrol update NodeName=n1 State=drain Reason=maintenance
     Update {
         /// key=value pairs
+        #[arg(trailing_var_arg = true)]
+        params: Vec<String>,
+    },
+    /// Delete a partition or reservation (Slurm-compatible inline syntax)
+    ///
+    /// Examples:
+    ///   scontrol delete PartitionName=gpu
+    ///   scontrol delete ReservationName=maint
+    Delete {
+        /// key=value pairs (e.g. PartitionName=gpu)
         #[arg(trailing_var_arg = true)]
         params: Vec<String>,
     },
@@ -334,7 +359,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             println!("job {} resumed", job_id);
             Ok(())
         }
+        ScontrolCommand::Create { params } => parse_and_create(&args.controller, &params).await,
         ScontrolCommand::Update { params } => parse_and_update(&args.controller, &params).await,
+        ScontrolCommand::Delete { params } => parse_and_delete(&args.controller, &params).await,
         ScontrolCommand::CreatePartition {
             name,
             nodes,
@@ -811,8 +838,191 @@ async fn send_job_update(controller: &str, req: spur_proto::proto::UpdateJobRequ
     Ok(())
 }
 
+/// Parse key=value pairs from a Slurm-style `scontrol create` command and
+/// dispatch to the appropriate create handler (partition or reservation).
+async fn parse_and_create(controller: &str, params: &[String]) -> Result<()> {
+    // Find the entity type from the first key.
+    let entity = params.iter().find_map(|p| {
+        let (k, _) = p.split_once('=')?;
+        Some(k.to_lowercase())
+    });
+
+    match entity.as_deref() {
+        Some("partitionname") => parse_and_create_partition(controller, params).await,
+        Some("reservationname") => parse_and_create_reservation(controller, params).await,
+        other => anyhow::bail!(
+            "scontrol create: unknown entity '{}';\n\
+             expected PartitionName=<name> or ReservationName=<name>",
+            other.unwrap_or("<none>")
+        ),
+    }
+}
+
+/// Parse Slurm key=value pairs and call create_partition.
+///
+/// Slurm keys (case-insensitive): PartitionName, Nodes, State, Default,
+/// MaxTime, DefaultTime, MaxNodes, MinNodes, AllowAccounts, AllowGroups,
+/// AllowQos, DenyAccounts, DenyQos, PriorityTier, PreemptMode.
+async fn parse_and_create_partition(controller: &str, params: &[String]) -> Result<()> {
+    let mut name = String::new();
+    let mut nodes = String::new();
+    let mut state = "UP".to_string();
+    let mut is_default = false;
+    let mut max_time = String::new();
+    let mut default_time = String::new();
+    let mut max_nodes: Option<u32> = None;
+    let mut min_nodes: u32 = 1;
+    let mut allow_accounts = String::new();
+    let mut allow_groups = String::new();
+    let mut allow_qos = String::new();
+    let mut deny_accounts = String::new();
+    let mut deny_qos = String::new();
+    let mut priority_tier: u32 = 1;
+    let mut preempt_mode = "OFF".to_string();
+
+    for param in params {
+        if let Some((key, value)) = param.split_once('=') {
+            match key.to_lowercase().as_str() {
+                "partitionname" => name = value.into(),
+                "nodes" => nodes = value.into(),
+                "state" => state = value.to_uppercase(),
+                "default" => is_default = value.eq_ignore_ascii_case("yes"),
+                "maxtime" => max_time = value.into(),
+                "defaulttime" => default_time = value.into(),
+                "maxnodes" => max_nodes = value.parse().ok(),
+                "minnodes" => min_nodes = value.parse().unwrap_or(1),
+                "allowaccounts" => allow_accounts = value.into(),
+                "allowgroups" => allow_groups = value.into(),
+                "allowqos" => allow_qos = value.into(),
+                "denyaccounts" => deny_accounts = value.into(),
+                "denyqos" => deny_qos = value.into(),
+                "prioritytier" | "priorityjobfactor" => {
+                    priority_tier = value.parse().unwrap_or(1)
+                }
+                "preemptmode" => preempt_mode = value.to_uppercase(),
+                // silently ignore Slurm-only keys that don't map to spur fields
+                "allocnodes" | "hidden" | "rootonly" | "reqresv"
+                | "oversubscribe" | "overtimelimit" | "gracetime"
+                | "disablerootjobs" | "exclusiveuser" | "exclusivetopo"
+                | "lln" | "maxcpuspernode" | "maxcpuspersocket"
+                | "jobdefaults" | "defmempernode" | "maxmempernode"
+                | "qos" | "tres" => {}
+                other => eprintln!("scontrol create partition: unknown key '{}'", other),
+            }
+        }
+    }
+
+    if name.is_empty() {
+        anyhow::bail!("scontrol create: PartitionName= is required");
+    }
+
+    create_partition(
+        controller,
+        &name,
+        &nodes,
+        "",
+        &state,
+        is_default,
+        &max_time,
+        &default_time,
+        max_nodes,
+        min_nodes,
+        &allow_accounts,
+        &allow_groups,
+        &deny_accounts,
+        &deny_qos,
+        priority_tier,
+        &preempt_mode,
+    )
+    .await?;
+
+    if !allow_qos.is_empty() {
+        // AllowQos is stored on the partition but not yet exposed in the
+        // update RPC. Log a notice so the admin knows it was ignored.
+        eprintln!(
+            "scontrol create partition: AllowQos= is not yet settable at runtime (ignored); \
+             set it in spur.conf and restart, or file a feature request"
+        );
+    }
+
+    Ok(())
+}
+
+/// Parse Slurm key=value pairs and call create_reservation.
+async fn parse_and_create_reservation(controller: &str, params: &[String]) -> Result<()> {
+    let mut name = String::new();
+    let mut start_time = "now".to_string();
+    let mut duration: u32 = 0;
+    let mut nodes = String::new();
+    let mut accounts = String::new();
+    let mut users = String::new();
+    let mut flags = String::new();
+
+    for param in params {
+        if let Some((key, value)) = param.split_once('=') {
+            match key.to_lowercase().as_str() {
+                "reservationname" => name = value.into(),
+                "starttime" => start_time = value.into(),
+                "duration" => duration = value.parse().unwrap_or(0),
+                "nodes" => nodes = value.into(),
+                "accounts" => accounts = value.into(),
+                "users" => users = value.into(),
+                "flags" => flags = value.into(),
+                other => eprintln!("scontrol create reservation: unknown key '{}'", other),
+            }
+        }
+    }
+
+    if name.is_empty() {
+        anyhow::bail!("scontrol create: ReservationName= is required");
+    }
+
+    create_reservation(controller, &name, &start_time, duration, &nodes, &accounts, &users, &flags).await
+}
+
+/// Parse key=value pairs from a Slurm-style `scontrol delete` command and
+/// dispatch to the appropriate delete handler.
+async fn parse_and_delete(controller: &str, params: &[String]) -> Result<()> {
+    let entity = params.iter().find_map(|p| {
+        let (k, _) = p.split_once('=')?;
+        Some(k.to_lowercase())
+    });
+
+    match entity.as_deref() {
+        Some("partitionname") => {
+            let name = params.iter().find_map(|p| {
+                let (k, v) = p.split_once('=')?;
+                (k.to_lowercase() == "partitionname").then(|| v.to_string())
+            }).ok_or_else(|| anyhow::anyhow!("scontrol delete: PartitionName= value missing"))?;
+            delete_partition(controller, &name).await
+        }
+        Some("reservationname") => {
+            let name = params.iter().find_map(|p| {
+                let (k, v) = p.split_once('=')?;
+                (k.to_lowercase() == "reservationname").then(|| v.to_string())
+            }).ok_or_else(|| anyhow::anyhow!("scontrol delete: ReservationName= value missing"))?;
+            delete_reservation(controller, &name).await
+        }
+        other => anyhow::bail!(
+            "scontrol delete: unknown entity '{}';\n\
+             expected PartitionName=<name> or ReservationName=<name>",
+            other.unwrap_or("<none>")
+        ),
+    }
+}
+
 /// Parse "key=value" params from `scontrol update` command.
 async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
+    // Check entity type first.
+    let entity = params.iter().find_map(|p| {
+        let (k, _) = p.split_once('=')?;
+        Some(k.to_lowercase())
+    });
+
+    if let Some("partitionname") = entity.as_deref() {
+        return parse_and_update_partition(controller, params).await;
+    }
+
     let mut job_id: Option<u32> = None;
     let mut priority: Option<u32> = None;
     let mut time_limit: Option<String> = None;
@@ -850,7 +1060,7 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
     }
 
     let jid =
-        job_id.ok_or_else(|| anyhow::anyhow!("scontrol update: JobId= or NodeName= required"))?;
+        job_id.ok_or_else(|| anyhow::anyhow!("scontrol update: JobId=, NodeName=, or PartitionName= required"))?;
 
     let tl = time_limit.as_ref().and_then(|t| {
         spur_core::config::parse_time_minutes(t).map(|m| prost_types::Duration {
@@ -871,6 +1081,109 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
             qos,
             ..Default::default()
         },
+    )
+    .await
+}
+
+/// Parse Slurm key=value pairs for `scontrol update PartitionName=...`.
+///
+/// Slurm keys accepted (all case-insensitive): PartitionName (required),
+/// Nodes, State, Default, MaxTime, DefaultTime, MaxNodes, MinNodes,
+/// AllowAccounts, AllowGroups, DenyAccounts, DenyQos, AllowQos,
+/// PriorityTier, PreemptMode.
+async fn parse_and_update_partition(controller: &str, params: &[String]) -> Result<()> {
+    let mut name = String::new();
+    let mut nodes: Option<String> = None;
+    let mut state: Option<String> = None;
+    let mut is_default: Option<bool> = None;
+    let mut max_time: Option<String> = None;
+    let mut default_time: Option<String> = None;
+    let mut max_nodes: Option<u32> = None;
+    let mut clear_max_nodes = false;
+    let mut min_nodes: Option<u32> = None;
+    let mut allow_accounts: Option<String> = None;
+    let mut allow_groups: Option<String> = None;
+    let mut deny_accounts: Option<String> = None;
+    let mut deny_qos: Option<String> = None;
+    let mut priority_tier: Option<u32> = None;
+    let mut preempt_mode: Option<String> = None;
+
+    for param in params {
+        if let Some((key, value)) = param.split_once('=') {
+            match key.to_lowercase().as_str() {
+                "partitionname" => name = value.into(),
+                "nodes" => nodes = Some(value.into()),
+                "state" => state = Some(value.to_uppercase()),
+                "default" => is_default = Some(value.eq_ignore_ascii_case("yes")),
+                "maxtime" => {
+                    if value.eq_ignore_ascii_case("INFINITE") || value.eq_ignore_ascii_case("UNLIMITED") {
+                        clear_max_nodes = false; // MaxTime INFINITE clears the limit
+                        max_time = Some(value.into());
+                    } else {
+                        max_time = Some(value.into());
+                    }
+                }
+                "defaulttime" => default_time = Some(value.into()),
+                "maxnodes" => {
+                    if value.eq_ignore_ascii_case("UNLIMITED") || value == "0" {
+                        clear_max_nodes = true;
+                    } else {
+                        max_nodes = value.parse().ok();
+                    }
+                }
+                "minnodes" => min_nodes = value.parse().ok(),
+                "allowaccounts" => allow_accounts = Some(value.into()),
+                "allowgroups" => allow_groups = Some(value.into()),
+                "denyaccounts" => deny_accounts = Some(value.into()),
+                "denyqos" => deny_qos = Some(value.into()),
+                "allowqos" => {} // stored but not yet in update path; silently skip
+                "prioritytier" | "priorityjobfactor" => {
+                    priority_tier = value.parse().ok()
+                }
+                "preemptmode" => preempt_mode = Some(value.to_uppercase()),
+                // silently ignore Slurm-only keys
+                "allocnodes" | "hidden" | "rootonly" | "reqresv"
+                | "oversubscribe" | "overtimelimit" | "gracetime"
+                | "disablerootjobs" | "exclusiveuser" | "exclusivetopo"
+                | "lln" | "maxcpuspernode" | "maxcpuspersocket"
+                | "jobdefaults" | "defmempernode" | "maxmempernode"
+                | "qos" | "tres" => {}
+                other => eprintln!("scontrol update partition: unknown key '{}'", other),
+            }
+        }
+    }
+
+    if name.is_empty() {
+        anyhow::bail!("scontrol update: PartitionName= is required");
+    }
+
+    let set_allow_accounts = allow_accounts.is_some();
+    let set_allow_groups = allow_groups.is_some();
+    let set_deny_accounts = deny_accounts.is_some();
+    let set_deny_qos = deny_qos.is_some();
+
+    update_partition(
+        controller,
+        &name,
+        nodes,
+        None, // selector not supported in inline syntax
+        state,
+        is_default,
+        max_time,
+        default_time,
+        max_nodes,
+        clear_max_nodes,
+        min_nodes,
+        if set_allow_accounts { allow_accounts.as_deref() } else { None },
+        if set_allow_groups { allow_groups.as_deref() } else { None },
+        set_allow_accounts,
+        set_allow_groups,
+        if set_deny_accounts { deny_accounts.as_deref() } else { None },
+        if set_deny_qos { deny_qos.as_deref() } else { None },
+        set_deny_accounts,
+        set_deny_qos,
+        priority_tier,
+        preempt_mode,
     )
     .await
 }
