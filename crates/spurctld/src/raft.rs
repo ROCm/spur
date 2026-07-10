@@ -57,7 +57,7 @@ pub struct ClientResponse {
 pub trait StateMachineApply: Send + Sync {
     fn apply_operation(&self, op: &WalOperation) -> ClientResponse;
     fn snapshot_state(&self) -> Result<Vec<u8>, anyhow::Error>;
-    fn restore_from_snapshot(&self, data: &[u8]);
+    fn restore_from_snapshot(&self, data: &[u8]) -> Result<(), anyhow::Error>;
 }
 
 /// Disk-backed Raft storage.
@@ -94,21 +94,60 @@ struct PersistedSnapshot {
 }
 
 impl SpurStore {
+    /// Recover storage with `strict = true`: any unreadable/undeserializable vote,
+    /// log entry, or snapshot is a hard error. This is the safe default — see
+    /// `new_with_recovery_mode` for why silently skipping such records is
+    /// dangerous and should only ever be an explicit, deliberate choice.
     pub fn new(state_dir: &Path, applier: Arc<dyn StateMachineApply>) -> anyhow::Result<Self> {
+        Self::new_with_recovery_mode(state_dir, applier, true)
+    }
+
+    /// Recover storage from `{state_dir}/raft/`.
+    ///
+    /// `strict` controls what happens when a vote, log entry, or snapshot record
+    /// exists but cannot be deserialized (disk corruption, or a restart with a
+    /// `spurctld` build whose `WalOperation`/state schema has drifted from
+    /// whatever wrote the record). These are records of already-committed
+    /// cluster state — nodes, jobs, reservations — so losing one is a
+    /// correctness violation, not a cosmetic issue.
+    ///
+    /// `strict = true` (default, via `new`) refuses to start: the affected
+    /// record is named in the error so an operator can roll back to a
+    /// compatible binary. `strict = false` preserves the old behavior of
+    /// logging and skipping the record, for deliberate forensic recovery
+    /// when the loss has already been assessed as acceptable.
+    pub fn new_with_recovery_mode(
+        state_dir: &Path,
+        applier: Arc<dyn StateMachineApply>,
+        strict: bool,
+    ) -> anyhow::Result<Self> {
         let raft_dir = state_dir.join("raft");
         let log_dir = raft_dir.join("log");
         std::fs::create_dir_all(&log_dir)?;
 
         let mut inner = StoreInner::default();
+        let mut skipped_records = 0u64;
 
         let vote_path = raft_dir.join("vote.json");
         if vote_path.exists() {
             match std::fs::read_to_string(&vote_path) {
                 Ok(data) => match serde_json::from_str(&data) {
                     Ok(v) => inner.vote = Some(v),
-                    Err(e) => warn!("failed to parse vote.json: {e}"),
+                    Err(e) => {
+                        if strict {
+                            anyhow::bail!("failed to parse vote.json: {e}");
+                        }
+                        warn!("failed to parse vote.json: {e}");
+                        skipped_records += 1;
+                    }
                 },
-                Err(e) => warn!("failed to read vote.json: {e}"),
+                Err(e) => {
+                    if strict {
+                        anyhow::bail!("failed to read vote.json: {e}");
+                    }
+                    warn!("failed to read vote.json: {e}");
+                    skipped_records += 1;
+                }
             }
         }
 
@@ -121,9 +160,21 @@ impl SpurStore {
                             Ok(e) => {
                                 inner.log.insert(e.log_id.index, e);
                             }
-                            Err(e) => warn!("failed to parse log entry {:?}: {e}", path),
+                            Err(e) => {
+                                if strict {
+                                    anyhow::bail!("failed to parse log entry {path:?}: {e}");
+                                }
+                                warn!("failed to parse log entry {:?}: {e}", path);
+                                skipped_records += 1;
+                            }
                         },
-                        Err(e) => warn!("failed to read log entry {:?}: {e}", path),
+                        Err(e) => {
+                            if strict {
+                                anyhow::bail!("failed to read log entry {path:?}: {e}");
+                            }
+                            warn!("failed to read log entry {:?}: {e}", path);
+                            skipped_records += 1;
+                        }
                     }
                 }
             }
@@ -131,23 +182,43 @@ impl SpurStore {
 
         let snap_path = raft_dir.join("snapshot.json");
         if snap_path.exists() {
-            // Soft-fail: a corrupt snapshot triggers re-snapshot on the next leader term.
             match std::fs::read_to_string(&snap_path) {
                 Ok(data) => match serde_json::from_str::<PersistedSnapshot>(&data) {
-                    Ok(ps) => {
-                        inner.last_applied = ps.meta.last_log_id;
-                        inner.last_membership = ps.meta.last_membership.clone();
-                        applier.restore_from_snapshot(&ps.data);
+                    Ok(ps) => match applier.restore_from_snapshot(&ps.data) {
+                        Ok(()) => {
+                            inner.last_applied = ps.meta.last_log_id;
+                            inner.last_membership = ps.meta.last_membership.clone();
+                        }
+                        Err(e) => {
+                            if strict {
+                                anyhow::bail!("failed to restore state from snapshot.json: {e}");
+                            }
+                            warn!("failed to restore state from snapshot.json: {e}");
+                            skipped_records += 1;
+                        }
+                    },
+                    Err(e) => {
+                        if strict {
+                            anyhow::bail!("failed to parse snapshot.json: {e}");
+                        }
+                        warn!("failed to parse snapshot.json: {e}");
+                        skipped_records += 1;
                     }
-                    Err(e) => warn!("failed to parse snapshot.json: {e}"),
                 },
-                Err(e) => warn!("failed to read snapshot.json: {e}"),
+                Err(e) => {
+                    if strict {
+                        anyhow::bail!("failed to read snapshot.json: {e}");
+                    }
+                    warn!("failed to read snapshot.json: {e}");
+                    skipped_records += 1;
+                }
             }
         }
 
         let purged_path = raft_dir.join("purged.json");
         if purged_path.exists() {
-            // Hard-fail: a corrupt purged.json cannot be recovered safely.
+            // Always hard-fail: a corrupt purged.json cannot be recovered safely
+            // even in lenient mode, since it would silently un-purge history.
             let data = std::fs::read_to_string(&purged_path)?;
             inner.last_purged = Some(
                 serde_json::from_str::<LogId<NodeId>>(&data)
@@ -160,6 +231,14 @@ impl SpurStore {
             vote = ?inner.vote,
             "raft store recovered from disk"
         );
+        if skipped_records > 0 {
+            tracing::error!(
+                skipped_records,
+                "raft store recovered with GAPS: {skipped_records} record(s) could not be \
+                 deserialized and were dropped (lenient recovery mode) — cluster state may be \
+                 missing nodes, jobs, or other committed changes"
+            );
+        }
 
         Ok(Self {
             inner: RwLock::new(inner),
@@ -408,6 +487,22 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let data = snapshot.into_inner();
+
+        // Unlike startup recovery (SpurStore::new), there is no lenient option
+        // here: this is a live snapshot pushed by the current Raft leader, not
+        // a one-time operator recovery decision. A follower that can't apply it
+        // must reject it rather than silently mark itself caught up while
+        // actually missing whatever the leader just sent. Validate before
+        // persisting: writing an unparseable snapshot to disk first would make
+        // the next (strict-by-default) startup hard-fail permanently on it.
+        self.applier.restore_from_snapshot(&data).map_err(|e| {
+            StorageError::from_io_error(
+                openraft::ErrorSubject::Store,
+                openraft::ErrorVerb::Write,
+                std::io::Error::other(e),
+            )
+        })?;
+
         self.persist_snapshot(meta, &data).map_err(|e| {
             StorageError::from_io_error(
                 openraft::ErrorSubject::Store,
@@ -415,8 +510,6 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
                 e,
             )
         })?;
-
-        self.applier.restore_from_snapshot(&data);
 
         let mut inner = self.inner.write();
         inner.last_applied = meta.last_log_id;
@@ -657,11 +750,26 @@ pub fn build_peer_map(peers: &[String]) -> BTreeMap<NodeId, String> {
         .collect()
 }
 
+/// Test-only convenience wrapper around `start_raft_with_recovery_mode` with
+/// strict WAL/snapshot recovery (see `SpurStore::new`). Production startup
+/// (main.rs) calls `start_raft_with_recovery_mode` directly since it needs to
+/// thread through the `--allow-partial-wal-recovery` CLI flag.
+#[cfg(test)]
 pub async fn start_raft(
     node_id: NodeId,
     peers: &[String],
     state_dir: &Path,
     applier: Arc<dyn StateMachineApply>,
+) -> anyhow::Result<RaftHandle> {
+    start_raft_with_recovery_mode(node_id, peers, state_dir, applier, true).await
+}
+
+pub async fn start_raft_with_recovery_mode(
+    node_id: NodeId,
+    peers: &[String],
+    state_dir: &Path,
+    applier: Arc<dyn StateMachineApply>,
+    strict_wal_recovery: bool,
 ) -> anyhow::Result<RaftHandle> {
     let config = Config {
         heartbeat_interval: 500,
@@ -671,7 +779,11 @@ pub async fn start_raft(
     };
     let config = Arc::new(config.validate().map_err(|e| anyhow::anyhow!("{e}"))?);
 
-    let store = Arc::new(SpurStore::new(state_dir, applier)?);
+    let store = Arc::new(SpurStore::new_with_recovery_mode(
+        state_dir,
+        applier,
+        strict_wal_recovery,
+    )?);
     let peer_map = build_peer_map(peers);
     let network = Arc::new(SpurNetwork {
         peers: peer_map.clone(),
@@ -680,17 +792,22 @@ pub async fn start_raft(
     let (log_store, state_machine) = openraft::storage::Adaptor::new(store.clone());
     let raft = Raft::new(node_id, config, network, log_store, state_machine).await?;
 
-    // Symmetric bootstrap: every node calls initialize with the full
-    // membership. Openraft guarantees that when all nodes use the same
-    // membership, the voting protocol picks exactly one leader. On
-    // subsequent restarts initialize() returns "already initialized"
-    // (benign) and normal Raft elections take over.
-    let members: BTreeMap<NodeId, BasicNode> = peer_map
-        .iter()
-        .map(|(id, addr)| (*id, BasicNode::new(addr.clone())))
-        .collect();
-    if let Err(e) = raft.initialize(members).await {
-        debug!("raft initialize: {e} (already initialized)");
+    // Symmetric bootstrap only applies on first-ever startup; skip it once we
+    // have prior state, else openraft logs an ERROR rejecting it every restart.
+    let already_initialized = {
+        let inner = store.inner.read();
+        inner.vote.is_some() || !inner.log.is_empty() || inner.last_applied.is_some()
+    };
+    if already_initialized {
+        debug!("raft store has prior state; skipping redundant initialize()");
+    } else {
+        let members: BTreeMap<NodeId, BasicNode> = peer_map
+            .iter()
+            .map(|(id, addr)| (*id, BasicNode::new(addr.clone())))
+            .collect();
+        if let Err(e) = raft.initialize(members).await {
+            debug!("raft initialize: {e} (already initialized)");
+        }
     }
 
     info!(node_id, peers = ?peer_map, "raft node started");
@@ -714,7 +831,9 @@ mod tests {
         fn snapshot_state(&self) -> Result<Vec<u8>, anyhow::Error> {
             Ok(Vec::new())
         }
-        fn restore_from_snapshot(&self, _data: &[u8]) {}
+        fn restore_from_snapshot(&self, _data: &[u8]) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
     }
 
     fn noop_applier() -> Arc<dyn StateMachineApply> {
@@ -925,5 +1044,210 @@ mod tests {
         .unwrap();
 
         assert!(SpurStore::new(dir.path(), noop_applier()).is_err());
+    }
+
+    /// Mirrors a real restart with a schema-incompatible binary: a WAL entry
+    /// whose payload variant this build's `WalOperation` enum doesn't know
+    /// about (e.g. written by a newer/older `spurctld`).
+    fn write_raw_log_entry(dir: &std::path::Path, index: u64, json: &str) {
+        std::fs::write(
+            dir.join("raft")
+                .join("log")
+                .join(format!("{index:020}.json")),
+            json,
+        )
+        .unwrap();
+    }
+
+    const UNKNOWN_VARIANT_ENTRY: &str = r#"{"log_id":{"leader_id":{"term":1,"node_id":1},"index":0},"payload":{"Normal":{"SomeFutureVariant":{}}}}"#;
+
+    #[test]
+    fn store_unknown_wal_variant_hard_fails_by_default() {
+        let dir = TempDir::new().unwrap();
+        SpurStore::new(dir.path(), noop_applier()).unwrap();
+        write_raw_log_entry(dir.path(), 0, UNKNOWN_VARIANT_ENTRY);
+
+        assert!(SpurStore::new(dir.path(), noop_applier()).is_err());
+    }
+
+    #[test]
+    fn store_unknown_wal_variant_lenient_mode_skips_and_continues() {
+        let dir = TempDir::new().unwrap();
+        SpurStore::new(dir.path(), noop_applier()).unwrap();
+        write_raw_log_entry(dir.path(), 0, UNKNOWN_VARIANT_ENTRY);
+
+        let store = SpurStore::new_with_recovery_mode(dir.path(), noop_applier(), false).unwrap();
+        assert!(store.inner.read().log.is_empty());
+    }
+
+    #[test]
+    fn store_corrupt_snapshot_hard_fails_by_default() {
+        let dir = TempDir::new().unwrap();
+        SpurStore::new(dir.path(), noop_applier()).unwrap();
+        std::fs::write(
+            dir.path().join("raft").join("snapshot.json"),
+            "not valid json",
+        )
+        .unwrap();
+
+        assert!(SpurStore::new(dir.path(), noop_applier()).is_err());
+    }
+
+    #[test]
+    fn store_corrupt_snapshot_lenient_mode_skips_and_continues() {
+        let dir = TempDir::new().unwrap();
+        SpurStore::new(dir.path(), noop_applier()).unwrap();
+        std::fs::write(
+            dir.path().join("raft").join("snapshot.json"),
+            "not valid json",
+        )
+        .unwrap();
+
+        assert!(SpurStore::new_with_recovery_mode(dir.path(), noop_applier(), false).is_ok());
+    }
+
+    #[test]
+    fn store_corrupt_vote_file_hard_fails_by_default() {
+        let dir = TempDir::new().unwrap();
+        SpurStore::new(dir.path(), noop_applier()).unwrap();
+        std::fs::write(dir.path().join("raft").join("vote.json"), "not valid json").unwrap();
+
+        assert!(SpurStore::new(dir.path(), noop_applier()).is_err());
+    }
+
+    #[test]
+    fn store_corrupt_vote_file_lenient_mode_skips_and_continues() {
+        let dir = TempDir::new().unwrap();
+        SpurStore::new(dir.path(), noop_applier()).unwrap();
+        std::fs::write(dir.path().join("raft").join("vote.json"), "not valid json").unwrap();
+
+        let store = SpurStore::new_with_recovery_mode(dir.path(), noop_applier(), false).unwrap();
+        assert!(store.inner.read().vote.is_none());
+    }
+
+    struct FailingRestoreApplier;
+    impl StateMachineApply for FailingRestoreApplier {
+        fn apply_operation(&self, _op: &WalOperation) -> ClientResponse {
+            ClientResponse::default()
+        }
+        fn snapshot_state(&self) -> Result<Vec<u8>, anyhow::Error> {
+            Ok(Vec::new())
+        }
+        fn restore_from_snapshot(&self, _data: &[u8]) -> Result<(), anyhow::Error> {
+            Err(anyhow::anyhow!("applier rejected snapshot payload"))
+        }
+    }
+
+    #[test]
+    fn store_snapshot_restore_failure_hard_fails_by_default() {
+        let dir = TempDir::new().unwrap();
+        let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
+        let meta = SnapshotMeta {
+            last_log_id: Some(LogId {
+                leader_id: openraft::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index: 5,
+            }),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "snap-5".into(),
+        };
+        store.persist_snapshot(&meta, b"opaque state").unwrap();
+
+        assert!(SpurStore::new(dir.path(), Arc::new(FailingRestoreApplier)).is_err());
+    }
+
+    #[test]
+    fn store_snapshot_restore_failure_lenient_mode_skips_and_continues() {
+        let dir = TempDir::new().unwrap();
+        let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
+        let meta = SnapshotMeta {
+            last_log_id: Some(LogId {
+                leader_id: openraft::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index: 5,
+            }),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "snap-5".into(),
+        };
+        store.persist_snapshot(&meta, b"opaque state").unwrap();
+
+        let store =
+            SpurStore::new_with_recovery_mode(dir.path(), Arc::new(FailingRestoreApplier), false)
+                .unwrap();
+        // A rejected restore must not advance last_applied/last_membership —
+        // otherwise Raft believes the state machine is caught up to the
+        // snapshot when it never actually restored anything.
+        let inner = store.inner.read();
+        assert!(inner.last_applied.is_none());
+        assert_eq!(inner.last_membership, StoredMembership::default());
+    }
+
+    #[tokio::test]
+    async fn start_raft_skips_redundant_initialize_on_restart() {
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+
+        let handle = start_raft(1, &["[::1]:0".into()], dir.path(), noop_applier())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .expect("single-node raft did not self-elect within 5s");
+        handle.raft.shutdown().await.unwrap();
+
+        // Restart against the same state_dir: prior vote/log on disk means
+        // already_initialized is true, so initialize() must be skipped, yet
+        // the node must still become leader and be usable.
+        let handle = start_raft(1, &["[::1]:0".into()], dir.path(), noop_applier())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .expect("restarted single-node raft did not resume leadership within 5s");
+    }
+
+    /// The HA follower-catch-up path: a leader pushes a snapshot via the Raft
+    /// `install_snapshot` RPC. If this node's applier can't apply it (e.g. a
+    /// schema-incompatible build in a multi-controller cluster), the RPC must
+    /// fail rather than mark the follower caught up on state it doesn't have.
+    #[tokio::test]
+    async fn install_snapshot_rejects_when_applier_cannot_restore() {
+        use openraft::RaftStorage;
+
+        let dir = TempDir::new().unwrap();
+        let mut store =
+            Arc::new(SpurStore::new(dir.path(), Arc::new(FailingRestoreApplier)).unwrap());
+
+        let meta = SnapshotMeta {
+            last_log_id: Some(LogId {
+                leader_id: openraft::LeaderId {
+                    term: 1,
+                    node_id: 2,
+                },
+                index: 10,
+            }),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "snap-10".into(),
+        };
+
+        let result = store
+            .install_snapshot(&meta, Box::new(Cursor::new(b"opaque state".to_vec())))
+            .await;
+
+        assert!(result.is_err());
+        // A rejected snapshot must never reach disk: persisting it first would
+        // make the next (strict-by-default) startup hard-fail on it forever.
+        assert!(!dir.path().join("raft").join("snapshot.json").exists());
     }
 }

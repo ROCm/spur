@@ -3489,54 +3489,55 @@ impl StateMachineApply for ClusterManager {
         serde_json::to_vec(&snap).map_err(Into::into)
     }
 
-    fn restore_from_snapshot(&self, data: &[u8]) {
-        if let Ok(snap) = serde_json::from_slice::<ClusterSnapshot>(data) {
-            let mut next_id = self.config.controller.first_job_id;
-            let mut jobs = self.jobs.write();
-            jobs.clear();
-            for job in snap.jobs {
-                next_id = next_id.max(job.job_id + 1);
-                jobs.insert(job.job_id, job);
-            }
+    fn restore_from_snapshot(&self, data: &[u8]) -> Result<(), anyhow::Error> {
+        let snap = serde_json::from_slice::<ClusterSnapshot>(data)?;
 
-            let mut nodes = self.nodes.write();
-            nodes.clear();
-            for node in snap.nodes {
-                nodes.insert(node.name.clone(), node);
-            }
-
-            *self.reservations.write() = snap.reservations;
-
-            let mut steps = self.steps.write();
-            steps.clear();
-            for step in snap.steps {
-                steps.insert((step.job_id, step.step_id), step);
-            }
-
-            // license_pool is the configured total (immutable); it is intentionally
-            // NOT restored from the snapshot so config stays authoritative and any
-            // historical drift in old snapshots is discarded. Availability is
-            // derived from the restored jobs. burst_buffer_total_gb follows the
-            // same rule; per-job BB staging phase rides along on each restored Job.
-
-            let mut tokens = self.tokens.write();
-            tokens.clear();
-            for token in snap.tokens {
-                tokens.insert(token.id.clone(), token);
-            }
-
-            self.next_job_id.store(next_id, Ordering::Relaxed);
-
-            // Re-evaluate partition membership and NodeConfig policy
-            // for all nodes against the current config.
-            self.reconcile_partitions(&mut nodes);
-
-            info!(
-                jobs = jobs.len(),
-                nodes = nodes.len(),
-                "restored cluster state from Raft snapshot"
-            );
+        let mut next_id = self.config.controller.first_job_id;
+        let mut jobs = self.jobs.write();
+        jobs.clear();
+        for job in snap.jobs {
+            next_id = next_id.max(job.job_id + 1);
+            jobs.insert(job.job_id, job);
         }
+
+        let mut nodes = self.nodes.write();
+        nodes.clear();
+        for node in snap.nodes {
+            nodes.insert(node.name.clone(), node);
+        }
+
+        *self.reservations.write() = snap.reservations;
+
+        let mut steps = self.steps.write();
+        steps.clear();
+        for step in snap.steps {
+            steps.insert((step.job_id, step.step_id), step);
+        }
+
+        // license_pool is the configured total (immutable); it is intentionally
+        // NOT restored from the snapshot so config stays authoritative and any
+        // historical drift in old snapshots is discarded. Availability is
+        // derived from the restored jobs. burst_buffer_total_gb follows the
+        // same rule; per-job BB staging phase rides along on each restored Job.
+
+        let mut tokens = self.tokens.write();
+        tokens.clear();
+        for token in snap.tokens {
+            tokens.insert(token.id.clone(), token);
+        }
+
+        self.next_job_id.store(next_id, Ordering::Relaxed);
+
+        // Re-evaluate partition membership and NodeConfig policy
+        // for all nodes against the current config.
+        self.reconcile_partitions(&mut nodes);
+
+        info!(
+            jobs = jobs.len(),
+            nodes = nodes.len(),
+            "restored cluster state from Raft snapshot"
+        );
+        Ok(())
     }
 }
 
@@ -7712,10 +7713,18 @@ mod tests {
         // Create a fresh cluster and restore
         let dir2 = TempDir::new().unwrap();
         let cm2 = test_cluster(&dir2).await;
-        cm2.restore_from_snapshot(&data);
+        cm2.restore_from_snapshot(&data).unwrap();
 
         assert!(cm2.get_job(1).is_some());
         assert!(cm2.get_node("n1").is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_from_snapshot_rejects_corrupt_data() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        assert!(cm.restore_from_snapshot(b"not valid json").is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

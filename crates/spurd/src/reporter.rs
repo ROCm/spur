@@ -128,6 +128,15 @@ impl NodeReporter {
                         .await
                     {
                         Ok(_) => debug!(load, free_mem, "heartbeat sent"),
+                        Err(e) if should_reregister(&e) => {
+                            warn!(
+                                error = %e,
+                                "controller does not recognize this node; re-registering"
+                            );
+                            if let Err(e) = self.register().await {
+                                warn!(error = %e, "re-registration after heartbeat rejection failed");
+                            }
+                        }
                         Err(e) => warn!(error = %e, "heartbeat failed"),
                     }
                 }
@@ -135,6 +144,14 @@ impl NodeReporter {
             }
         }
     }
+}
+
+/// A `NOT_FOUND` heartbeat means the controller lost this node's registration
+/// (e.g. it restarted and dropped the record) while this agent kept running.
+/// The controller never proactively tells an agent to re-register, so without
+/// this the agent would heartbeat into the same rejection forever.
+fn should_reregister(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::NotFound
 }
 
 /// Discover local node resources from sysfs / /proc + device registry.
@@ -492,5 +509,23 @@ mod tests {
 
         let resources = discover_resources(&reg);
         assert_eq!(resources.generic.get("bandwidth:lustre"), Some(&4096));
+    }
+
+    #[test]
+    fn should_reregister_on_not_found() {
+        assert!(should_reregister(&tonic::Status::not_found(
+            "node x not found — is the node registered?"
+        )));
+    }
+
+    #[test]
+    fn should_not_reregister_on_other_errors() {
+        assert!(!should_reregister(&tonic::Status::unavailable(
+            "transport error"
+        )));
+        assert!(!should_reregister(&tonic::Status::unauthenticated(
+            "node token required"
+        )));
+        assert!(!should_reregister(&tonic::Status::internal("boom")));
     }
 }

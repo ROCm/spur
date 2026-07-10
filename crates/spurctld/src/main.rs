@@ -49,6 +49,15 @@ struct Args {
     /// Foreground mode (don't daemonize)
     #[arg(short = 'D', long)]
     foreground: bool,
+
+    /// Tolerate unreadable/undeserializable Raft WAL entries, votes, or
+    /// snapshots during startup recovery by skipping them, instead of
+    /// refusing to start. These records represent already-committed cluster
+    /// state (nodes, jobs, ...), so a skipped record is silent data loss —
+    /// only pass this for deliberate forensic recovery once that loss has
+    /// been assessed as acceptable.
+    #[arg(long)]
+    allow_partial_wal_recovery: bool,
 }
 
 #[tokio::main]
@@ -129,7 +138,14 @@ async fn main() -> anyhow::Result<()> {
         (config.controller.peers.clone(), id)
     };
 
-    let handle = raft::start_raft(node_id, &peers, &args.state_dir, cluster.clone()).await?;
+    let handle = raft::start_raft_with_recovery_mode(
+        node_id,
+        &peers,
+        &args.state_dir,
+        cluster.clone(),
+        !args.allow_partial_wal_recovery,
+    )
+    .await?;
     info!(node_id, "Raft node started");
 
     let raft_addr: std::net::SocketAddr = config.controller.raft_listen_addr.parse()?;
