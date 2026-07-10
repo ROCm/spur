@@ -195,6 +195,7 @@ impl ClusterManager {
     pub fn submit_job(&self, mut spec: JobSpec) -> Result<JobId, SubmitError> {
         apply_default_partition(&mut spec, &self.partitions.read());
         apply_default_account(&mut spec, &self.association_cache);
+        validate_user_account(&spec, &self.association_cache)?;
         self.validate_partition(&spec)?;
         apply_default_qos(&mut spec, &self.association_cache, &self.qos_cache)?;
 
@@ -251,17 +252,37 @@ impl ClusterManager {
             }
         };
 
-        let account = spec.account.as_deref().unwrap_or("");
-
-        // Check allow_accounts (if non-empty, user's account must be in the list)
-        if !part.allow_accounts.is_empty() && !part.allow_accounts.iter().any(|a| a == account) {
-            return Err(SubmitError::invalid(format!(
-                "account '{account}' not allowed on partition '{partition_name}'"
-            )));
+        let needs_acl = !part.allow_accounts.is_empty() || !part.deny_accounts.is_empty();
+        if !needs_acl {
+            return Ok(());
         }
 
-        // Check deny_accounts
-        if !account.is_empty() && part.deny_accounts.iter().any(|a| a == account) {
+        if !self.association_cache.is_loaded() {
+            warn!(
+                user = %spec.user,
+                partition = %partition_name,
+                "association cache unavailable; skipping partition account access checks"
+            );
+            return Ok(());
+        }
+
+        let account = match spec.account.as_deref().filter(|a| !a.is_empty()) {
+            Some(a) => a,
+            None => {
+                return Err(SubmitError::invalid(format!(
+                    "no account for user '{}' on partition '{partition_name}'",
+                    spec.user
+                )));
+            }
+        };
+
+        if !part.allow_accounts.is_empty() {
+            if !part.allow_accounts.iter().any(|a| a == account) {
+                return Err(SubmitError::invalid(format!(
+                    "account '{account}' not allowed on partition '{partition_name}'"
+                )));
+            }
+        } else if part.deny_accounts.iter().any(|a| a == account) {
             return Err(SubmitError::invalid(format!(
                 "account '{account}' denied on partition '{partition_name}'"
             )));
@@ -3970,6 +3991,9 @@ fn apply_default_partition(spec: &mut JobSpec, partitions: &[Partition]) {
 /// Resolve the submitting user's default account from the association cache
 /// when `--account` was not provided (mirrors `apply_default_partition`).
 fn apply_default_account(spec: &mut JobSpec, assoc_cache: &AssociationCache) {
+    if !assoc_cache.is_loaded() {
+        return;
+    }
     if spec.account.as_deref().is_some_and(|a| !a.is_empty()) {
         return;
     }
@@ -3977,6 +4001,26 @@ fn apply_default_account(spec: &mut JobSpec, assoc_cache: &AssociationCache) {
     if let Some(acct) = account.filter(|a| !a.is_empty()) {
         spec.account = Some(acct);
     }
+}
+
+/// Reject a client-supplied account that is not a real user→account association.
+fn validate_user_account(
+    spec: &JobSpec,
+    assoc_cache: &AssociationCache,
+) -> Result<(), SubmitError> {
+    let Some(account) = spec.account.as_deref().filter(|a| !a.is_empty()) else {
+        return Ok(());
+    };
+    if !assoc_cache.is_loaded() {
+        return Ok(());
+    }
+    if !assoc_cache.has_membership(&spec.user, account) {
+        return Err(SubmitError::invalid(format!(
+            "user '{}' is not associated with account '{account}'",
+            spec.user
+        )));
+    }
+    Ok(())
 }
 
 /// Resolve a job's effective QOS at submission time (mirrors
@@ -6234,6 +6278,8 @@ mod tests {
         let mut cfg = test_config();
         cfg.partitions[0].allow_accounts = vec!["research".into(), "faculty".into()];
         let cm = test_cluster_with_config(&dir, cfg).await;
+        cm.association_cache()
+            .insert_association("testuser", "student");
 
         let mut spec = basic_spec("badacct");
         spec.account = Some("student".into());
@@ -6250,6 +6296,8 @@ mod tests {
         let mut cfg = test_config();
         cfg.partitions[0].allow_accounts = vec!["research".into(), "faculty".into()];
         let cm = test_cluster_with_config(&dir, cfg).await;
+        cm.association_cache()
+            .insert_association("testuser", "research");
 
         let mut spec = basic_spec("goodacct");
         spec.account = Some("research".into());
@@ -6262,6 +6310,8 @@ mod tests {
         let mut cfg = test_config();
         cfg.partitions[0].deny_accounts = vec!["student".into()];
         let cm = test_cluster_with_config(&dir, cfg).await;
+        cm.association_cache()
+            .insert_association("testuser", "student");
 
         let mut spec = basic_spec("denied");
         spec.account = Some("student".into());
@@ -6291,6 +6341,8 @@ mod tests {
         let mut cfg = test_config();
         cfg.partitions[0].allow_accounts = vec!["research".into()];
         let cm = test_cluster_with_config(&dir, cfg).await;
+        cm.association_cache()
+            .insert_association("testuser", "student");
 
         let mut spec = basic_spec("emptypart");
         spec.partition = Some(String::new());
@@ -6308,12 +6360,13 @@ mod tests {
         let mut cfg = test_config();
         cfg.partitions[0].allow_accounts = vec!["research".into()];
         let cm = test_cluster_with_config(&dir, cfg).await;
+        cm.association_cache().set_loaded_without_associations();
 
         let spec = basic_spec("noacct");
         let err = cm.submit_job(spec).unwrap_err();
         assert_eq!(
             err,
-            SubmitError::invalid("account '' not allowed on partition 'default'")
+            SubmitError::invalid("no account for user 'testuser' on partition 'default'")
         );
     }
 
@@ -6332,6 +6385,51 @@ mod tests {
             err,
             SubmitError::invalid("account 'student' denied on partition 'default'")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_rejects_spoofed_account_not_in_membership() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.partitions[0].allow_accounts = vec!["research".into()];
+        let cm = test_cluster_with_config(&dir, cfg).await;
+        cm.association_cache()
+            .insert_association("testuser", "student");
+
+        let mut spec = basic_spec("spoof");
+        spec.account = Some("research".into());
+        let err = cm.submit_job(spec).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid("user 'testuser' is not associated with account 'research'")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_allow_accounts_ignores_deny_when_both_list_account() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.partitions[0].allow_accounts = vec!["research".into()];
+        cfg.partitions[0].deny_accounts = vec!["research".into()];
+        let cm = test_cluster_with_config(&dir, cfg).await;
+        cm.association_cache()
+            .insert_association("testuser", "research");
+
+        let mut spec = basic_spec("overlap");
+        spec.account = Some("research".into());
+        assert!(cm.submit_job(spec).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_skips_allow_accounts_when_association_cache_unavailable() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.partitions[0].allow_accounts = vec!["research".into()];
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        let mut spec = basic_spec("nocache");
+        spec.account = Some("student".into());
+        assert!(cm.submit_job(spec).is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8481,6 +8579,14 @@ mod tests {
 
         super::apply_default_account(&mut spec, &assoc);
         assert_eq!(spec.account.as_deref(), Some("research"));
+    }
+
+    #[test]
+    fn apply_default_account_skips_when_cache_not_loaded() {
+        let assoc = AssociationCache::new();
+        let mut spec = basic_spec("j");
+        super::apply_default_account(&mut spec, &assoc);
+        assert!(spec.account.is_none());
     }
 
     #[test]

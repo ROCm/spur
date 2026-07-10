@@ -146,6 +146,7 @@ pub struct SubmitRequest {
 #[derive(Deserialize)]
 pub struct SubmitJobFields {
     pub name: Option<String>,
+    pub user: Option<String>,
     pub partition: Option<String>,
     pub account: Option<String>,
     pub nodes: Option<u32>,
@@ -160,4 +161,17 @@ pub struct SubmitJobFields {
 #[derive(Serialize)]
 pub struct SubmitResponse {
     pub job_id: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submit_job_fields_deserialize_user() {
+        let body: SubmitRequest =
+            serde_json::from_str(r#"{"job":{"user":"alice","account":"research"}}"#).unwrap();
+        assert_eq!(body.job.user.as_deref(), Some("alice"));
+        assert_eq!(body.job.account.as_deref(), Some("research"));
+    }
 }

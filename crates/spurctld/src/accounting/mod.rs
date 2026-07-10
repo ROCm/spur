@@ -9,7 +9,7 @@ mod notifier;
 pub use grpc::accounting_server;
 pub use notifier::{AccountingNotifier, JobStartRecord};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sqlx::PgPool;
 
@@ -45,16 +45,22 @@ pub async fn fairshare_factors(
     ))
 }
 
-/// Load the (user, account) -> default QOS and user -> default account maps
-/// backing the controller's `AssociationCache`.
+/// Load association defaults and the full user→account membership set backing
+/// the controller's `AssociationCache`.
 pub async fn association_maps(
     pool: &PgPool,
-) -> anyhow::Result<(HashMap<(String, String), String>, HashMap<String, String>)> {
+) -> anyhow::Result<(
+    HashMap<(String, String), String>,
+    HashMap<String, String>,
+    HashSet<(String, String)>,
+)> {
     let users = db::list_users(pool, None).await?;
 
     let mut default_qos = HashMap::new();
     let mut default_account = HashMap::new();
+    let mut memberships = HashSet::new();
     for u in users {
+        memberships.insert((u.name.clone(), u.account.clone()));
         if let Some(qos) = u.default_qos {
             default_qos.insert((u.name.clone(), u.account), qos);
         }
@@ -63,5 +69,5 @@ pub async fn association_maps(
         }
     }
 
-    Ok((default_qos, default_account))
+    Ok((default_qos, default_account, memberships))
 }

@@ -84,6 +84,7 @@ pub async fn submit_job(
 
     let spec = spur_core::job::JobSpec {
         name: body.job.name.unwrap_or_default(),
+        user: body.job.user.unwrap_or_default(),
         partition: body.job.partition,
         account: body.job.account,
         num_nodes: body.job.nodes.unwrap_or(1),
