@@ -1,0 +1,59 @@
+# Goes in the sglang fork at .github/workflows/fork-ci.yml (github.com/powderluv/sglang).
+# Reuses sglang's own scripts/ci/amd/*.sh unchanged; adds a gated deploy of the serving pod.
+#
+# Two jobs:
+#   amd-gpu-test  — the working M5-full run: GPU runner (linux-mi35x-gpu-1) -> dind -> mi35x ROCm
+#                   container -> ungated subset of stage-a-test-1-gpu-small-amd (no HF token needed).
+#   deploy        — gated on a green amd-gpu-test. Runs on the NON-GPU linux-cpu-deploy scale set as
+#                   ServiceAccount sglang-deployer (in-cluster token, RBAC scoped to ns sglang) and
+#                   kubectl-applies the vendored serving manifest, then waits for the rollout.
+#
+# Cluster prereqs (already live, see spur-examples/gpu-k8s-arc-sglang/): the linux-cpu-deploy ARC
+# scale set (30-arc/cpu-deploy-values.yaml) + the deployer RBAC (40-serving/rbac-deployer.yaml).
+# Fork prereqs: vendor 40-serving/sglang-service-amd.yaml + ingress.yaml to deploy/k8s/ in the fork.
+name: Fork AMD CI (M5-full + gated deploy)
+on:
+  workflow_dispatch: {}
+  push: { branches: [main] }
+
+jobs:
+  amd-gpu-test:
+    runs-on: linux-mi35x-gpu-1                 # == runnerScaleSetName; ^linux-(mi..)-gpu-[0-9]+ -> gfx950
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clear VRAM (runner has rocm-smi via the full-ROCm image)
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm || echo "vram-clear best-effort skipped"
+      - name: Start ROCm container (mi35x, bypass LOCAL_DOCKER_REGISTRY)
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --custom-image lmsysorg/sglang:v0.5.14-rocm700-mi35x
+      - name: Assert GPU arch = gfx950 (inside ci_sglang)
+        run: bash scripts/ci/amd/amd_ci_exec.sh rocminfo | grep -q gfx950 && echo "gfx950 confirmed in ci_sglang"
+      - name: Install deps
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+      # Ungated subset of stage-a-test-1-gpu-small-amd (the full suite also serves gated
+      # meta-llama/Llama-3.1-8B-Instruct, which 401s without an accepted HF license). To restore the
+      # full suite: add an HF_TOKEN secret + `env: HF_TOKEN: ${{ secrets.HF_TOKEN }}` and switch this
+      # step to: python3 run_suite.py --hw amd --suite stage-a-test-1-gpu-small-amd
+      - name: Run small AMD suite (ungated subset — Llama-3.1 gated tests skipped)
+        run: |
+          set -e
+          E="bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test python3"
+          $E registered/quant/test_awq_dequant.py
+          $E registered/quant/test_fused_rms_fp8_group_quant.py
+          $E registered/attention/test_wave_attention_kernels.py
+          $E registered/models/test_vit_pos_embed_interpolate.py
+
+  deploy:
+    needs: [amd-gpu-test]
+    if: success()
+    runs-on: linux-cpu-deploy                  # non-GPU scale set; runs as SA sglang-deployer
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy sglang serving to the cluster (in-cluster SA token, RBAC-scoped to ns sglang)
+        run: |
+          set -euo pipefail
+          # kubectl uses the auto-mounted in-cluster config (no kubeconfig); the sglang-deployer SA
+          # is authorized only for deploy/svc/pvc/pods/configmaps/ingress in ns sglang.
+          kubectl apply -f deploy/k8s/sglang-service-amd.yaml
+          # ingress is M7-ops (external access); don't fail the gated deploy if ingress-nginx isn't installed yet
+          kubectl apply -f deploy/k8s/ingress.yaml || echo "ingress apply skipped (ingress-nginx not installed — M7-ops)"
+          kubectl -n sglang rollout status deploy/sglang --timeout=20m
