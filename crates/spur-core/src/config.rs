@@ -470,6 +470,8 @@ pub struct PartitionConfig {
     #[serde(default)]
     pub deny_accounts: Vec<String>,
     #[serde(default)]
+    pub deny_qos: Vec<String>,
+    #[serde(default)]
     pub priority_tier: u32,
     #[serde(default)]
     pub preempt_mode: String,
@@ -819,6 +821,18 @@ impl SlurmConfig {
         Ok(())
     }
 
+    /// Atomically write the config to `path` (write to `.tmp` then rename).
+    ///
+    /// Errors are non-fatal for callers — log and continue if this fails.
+    pub fn save_to_file(&self, path: &Path) -> Result<(), ConfigError> {
+        let content = toml::to_string_pretty(self)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let tmp = path.with_extension("conf.tmp");
+        std::fs::write(&tmp, content)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
     /// Convert partition configs to Partition structs.
     pub fn build_partitions(&self) -> Vec<Partition> {
         self.partitions
@@ -838,6 +852,10 @@ impl SlurmConfig {
                 default_time_minutes: pc.default_time.as_ref().and_then(|t| parse_time_minutes(t)),
                 max_nodes: pc.max_nodes,
                 min_nodes: pc.min_nodes,
+                allow_accounts: pc.allow_accounts.clone(),
+                allow_groups: pc.allow_groups.clone(),
+                deny_accounts: pc.deny_accounts.clone(),
+                deny_qos: pc.deny_qos.clone(),
                 priority_tier: pc.priority_tier,
                 preempt_mode: match pc.preempt_mode.to_lowercase().as_str() {
                     "cancel" => PreemptMode::Cancel,
@@ -845,12 +863,49 @@ impl SlurmConfig {
                     "suspend" => PreemptMode::Suspend,
                     _ => PreemptMode::Off,
                 },
-                allow_accounts: pc.allow_accounts.clone(),
-                deny_accounts: pc.deny_accounts.clone(),
                 ..Default::default()
             })
             .collect()
     }
+}
+
+/// Convert a runtime `Partition` back to a `PartitionConfig` suitable for serialization.
+/// This is the inverse of `build_partitions()`.
+pub fn partition_to_config(p: &Partition) -> PartitionConfig {
+    PartitionConfig {
+        name: p.name.clone(),
+        default: p.is_default,
+        state: match p.state {
+            PartitionState::Up => "UP".into(),
+            PartitionState::Down => "DOWN".into(),
+            PartitionState::Drain => "DRAIN".into(),
+            PartitionState::Inactive => "INACTIVE".into(),
+        },
+        nodes: p.nodes.clone(),
+        selector: p.selector.clone(),
+        max_time: p.max_time_minutes.map(format_time_minutes),
+        default_time: p.default_time_minutes.map(format_time_minutes),
+        max_nodes: p.max_nodes,
+        min_nodes: p.min_nodes,
+        allow_accounts: p.allow_accounts.clone(),
+        allow_groups: p.allow_groups.clone(),
+        deny_accounts: p.deny_accounts.clone(),
+        deny_qos: p.deny_qos.clone(),
+        priority_tier: p.priority_tier,
+        preempt_mode: match p.preempt_mode {
+            PreemptMode::Off => "OFF".into(),
+            PreemptMode::Cancel => "CANCEL".into(),
+            PreemptMode::Requeue => "REQUEUE".into(),
+            PreemptMode::Suspend => "SUSPEND".into(),
+        },
+    }
+}
+
+/// Format a minute count as `"HH:MM:00"`, e.g. 90 → `"01:30:00"`.
+pub fn format_time_minutes(minutes: u32) -> String {
+    let h = minutes / 60;
+    let m = minutes % 60;
+    format!("{h:02}:{m:02}:00")
 }
 
 /// Parse a time string like "72:00:00", "4-00:00:00", "INFINITE", "60" (minutes).

@@ -248,6 +248,7 @@ message PartitionInfo {
   string allow_groups = 33;
   string allow_qos = 34;
   string deny_accounts = 42;
+  string deny_qos = 43;
 
   string preempt_mode = 40;
   uint32 priority_tier = 41;
@@ -311,6 +312,11 @@ service SlurmController {
 
   // K8s operator callback: report job completion from Pod watcher
   rpc ReportJobStatus(ReportJobStatusRequest) returns (google.protobuf.Empty);
+
+  // Partition management
+  rpc CreatePartition(CreatePartitionRequest) returns (google.protobuf.Empty);
+  rpc UpdatePartition(UpdatePartitionRequest) returns (google.protobuf.Empty);
+  rpc DeletePartition(DeletePartitionRequest) returns (google.protobuf.Empty);
 
   // Reservation management
   rpc CreateReservation(CreateReservationRequest) returns (google.protobuf.Empty);
@@ -917,6 +923,55 @@ message CreateJobStepRequest {
 
 message CreateJobStepResponse {
   uint32 step_id = 1;
+}
+
+// ============================================================
+// Partition Management
+// ============================================================
+
+message CreatePartitionRequest {
+  string name = 1;
+  string nodes = 2;               // hostlist pattern (mutually exclusive with selector)
+  map<string, string> selector = 3; // label selector (mutually exclusive with nodes)
+  string state = 4;               // "UP" | "DOWN" | "DRAIN" | "INACTIVE" (default "UP")
+  bool is_default = 5;
+  string max_time = 6;            // e.g. "24:00:00" or "INFINITE" (empty = INFINITE)
+  string default_time = 7;        // e.g. "01:00:00" (empty = no default)
+  optional uint32 max_nodes = 8;
+  uint32 min_nodes = 9;
+  repeated string allow_accounts = 10;
+  repeated string allow_groups = 11;
+  uint32 priority_tier = 12;
+  string preempt_mode = 13;       // "OFF" | "CANCEL" | "REQUEUE" | "SUSPEND"
+  repeated string deny_accounts = 14;
+  repeated string deny_qos = 15;
+}
+
+message UpdatePartitionRequest {
+  string name = 1;                // Required: partition to update
+  optional string nodes = 2;
+  map<string, string> selector = 3;
+  optional string state = 4;
+  optional bool is_default = 5;
+  optional string max_time = 6;   // "INFINITE" clears the limit
+  optional string default_time = 7;
+  optional uint32 max_nodes_value = 8;  // 0 = clear limit
+  bool clear_max_nodes = 9;
+  optional uint32 min_nodes = 10;
+  repeated string allow_accounts = 11;  // replaces; empty = no change
+  bool set_allow_accounts = 12;         // true = apply allow_accounts (even if empty)
+  repeated string allow_groups = 13;
+  bool set_allow_groups = 14;
+  optional uint32 priority_tier = 15;
+  optional string preempt_mode = 16;
+  repeated string deny_accounts = 17;
+  bool set_deny_accounts = 18;
+  repeated string deny_qos = 19;
+  bool set_deny_qos = 20;
+}
+
+message DeletePartitionRequest {
+  string name = 1;
 }
 
 // ============================================================

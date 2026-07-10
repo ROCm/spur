@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -115,6 +115,46 @@ impl ReservationError {
     }
 }
 
+/// Partition CRUD errors for the gRPC boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartitionError {
+    InvalidArgument(String),
+    NotFound(String),
+    AlreadyExists(String),
+    Raft(String),
+}
+
+impl std::fmt::Display for PartitionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidArgument(m)
+            | Self::NotFound(m)
+            | Self::AlreadyExists(m)
+            | Self::Raft(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for PartitionError {}
+
+impl PartitionError {
+    pub fn invalid(msg: impl Into<String>) -> Self {
+        Self::InvalidArgument(msg.into())
+    }
+
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self::NotFound(msg.into())
+    }
+
+    pub fn already_exists(msg: impl Into<String>) -> Self {
+        Self::AlreadyExists(msg.into())
+    }
+
+    pub fn raft(msg: impl Into<String>) -> Self {
+        Self::Raft(msg.into())
+    }
+}
+
 /// What the caller must dispatch to node agents after `preempt_job`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreemptOutcome {
@@ -130,9 +170,15 @@ pub enum PreemptOutcome {
 /// State recovery happens through Raft log replay (via `StateMachineApply`).
 pub struct ClusterManager {
     pub config: SlurmConfig,
+    /// Path to the spur.conf file, used for best-effort writeback after partition CRUD.
+    /// None when running without a config file (e.g. in tests).
+    config_path: Option<PathBuf>,
     jobs: RwLock<HashMap<JobId, Job>>,
     nodes: RwLock<HashMap<String, Node>>,
     partitions: RwLock<Vec<Partition>>,
+    /// Names of partitions that were runtime-deleted. Used to suppress config-file
+    /// partitions with the same name from re-appearing on restart.
+    deleted_partition_names: RwLock<HashSet<String>>,
     next_job_id: AtomicU32,
     reservations: RwLock<Vec<Reservation>>,
     steps: RwLock<HashMap<(JobId, u32), JobStep>>,
@@ -158,6 +204,14 @@ pub struct ClusterManager {
 
 impl ClusterManager {
     pub fn new(config: SlurmConfig, _state_dir: &Path) -> anyhow::Result<Self> {
+        Self::new_with_config_path(config, _state_dir, None)
+    }
+
+    pub fn new_with_config_path(
+        config: SlurmConfig,
+        _state_dir: &Path,
+        config_path: Option<PathBuf>,
+    ) -> anyhow::Result<Self> {
         let partitions = config.build_partitions();
         let license_pool = config.licenses.clone();
         let burst_buffer_total_gb = config.burst_buffer.total_gb;
@@ -168,9 +222,11 @@ impl ClusterManager {
 
         let cm = Self {
             config,
+            config_path,
             jobs: RwLock::new(HashMap::new()),
             nodes: RwLock::new(HashMap::new()),
             partitions: RwLock::new(partitions),
+            deleted_partition_names: RwLock::new(HashSet::new()),
             reservations: RwLock::new(Vec::new()),
             steps: RwLock::new(HashMap::new()),
             next_job_id: AtomicU32::new(first_job_id),
@@ -236,7 +292,7 @@ impl ClusterManager {
     }
 
     /// Validate partition constraints: access control and node limits.
-    fn validate_partition(&self, spec: &JobSpec) -> Result<(), SubmitError> {
+    pub(crate) fn validate_partition(&self, spec: &JobSpec) -> Result<(), SubmitError> {
         let partition_name = match spec.partition.as_ref() {
             Some(p) if !p.is_empty() => p,
             _ => return Ok(()), // Unset or empty partition name — nothing to validate
@@ -251,6 +307,23 @@ impl ClusterManager {
                 )));
             }
         };
+
+        if !part.allow_qos.is_empty() {
+            let qos = spec.qos.as_deref().unwrap_or("");
+            if !part.allow_qos.iter().any(|q| q == qos) {
+                return Err(SubmitError::invalid(format!(
+                    "QoS '{qos}' not allowed on partition '{partition_name}'"
+                )));
+            }
+        }
+
+        if let Some(ref qos) = spec.qos {
+            if part.deny_qos.iter().any(|q| q == qos) {
+                return Err(SubmitError::invalid(format!(
+                    "QoS '{qos}' denied on partition '{partition_name}'"
+                )));
+            }
+        }
 
         let needs_acl = !part.allow_accounts.is_empty() || !part.deny_accounts.is_empty();
         if !needs_acl {
@@ -2095,6 +2168,171 @@ impl ClusterManager {
         }
     }
 
+    /// Create a new partition (validated, persisted via Raft).
+    /// Write the current runtime partition list back to spur.conf for human
+    /// visibility. Best-effort: errors are logged but never propagated — the
+    /// Raft WAL/snapshot is the authoritative source of truth.
+    ///
+    /// Only the leader calls this; followers replay via Raft and don't need
+    /// to write the file (they may not even have write access to the same path).
+    fn sync_partitions_to_config(&self) {
+        let Some(ref path) = self.config_path else {
+            return;
+        };
+        let partitions = self.partitions.read();
+        let mut updated = self.config.clone();
+        updated.partitions = partitions
+            .iter()
+            .map(spur_core::config::partition_to_config)
+            .collect();
+        drop(partitions);
+        if let Err(e) = updated.save_to_file(path) {
+            warn!(path = %path.display(), error = %e, "failed to write partition changes to spur.conf");
+        }
+    }
+
+    pub fn create_partition(&self, partition: Partition) -> Result<(), PartitionError> {
+        if partition.name.is_empty() {
+            return Err(PartitionError::invalid("partition name must not be empty"));
+        }
+        if self
+            .partitions
+            .read()
+            .iter()
+            .any(|p| p.name == partition.name)
+        {
+            return Err(PartitionError::already_exists(format!(
+                "partition '{}' already exists",
+                partition.name
+            )));
+        }
+        let resp = self
+            .propose(WalOperation::PartitionCreate { partition })
+            .map_err(|e| PartitionError::raft(e.to_string()))?;
+        if !resp.partition_created {
+            return Err(PartitionError::already_exists(
+                "partition already exists".to_string(),
+            ));
+        }
+        self.sync_partitions_to_config();
+        Ok(())
+    }
+
+    /// Update fields of an existing partition (persisted via Raft).
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_partition(
+        &self,
+        name: &str,
+        nodes: Option<String>,
+        selector: Option<std::collections::HashMap<String, String>>,
+        state: Option<String>,
+        is_default: Option<bool>,
+        max_time: Option<String>,
+        default_time: Option<String>,
+        clear_max_time: bool,
+        max_nodes: Option<u32>,
+        clear_max_nodes: bool,
+        min_nodes: Option<u32>,
+        allow_accounts: Option<Vec<String>>,
+        allow_groups: Option<Vec<String>>,
+        deny_accounts: Option<Vec<String>>,
+        deny_qos: Option<Vec<String>>,
+        priority_tier: Option<u32>,
+        preempt_mode: Option<String>,
+    ) -> Result<(), PartitionError> {
+        if !self.partitions.read().iter().any(|p| p.name == name) {
+            return Err(PartitionError::not_found(format!(
+                "partition '{}' not found",
+                name
+            )));
+        }
+
+        let max_time_minutes = if clear_max_time {
+            Some(None)
+        } else if let Some(ref t) = max_time {
+            if t.eq_ignore_ascii_case("INFINITE") || t.eq_ignore_ascii_case("UNLIMITED") {
+                Some(None)
+            } else {
+                let m = spur_core::config::parse_time_minutes(t)
+                    .ok_or_else(|| PartitionError::invalid(format!("invalid time: {}", t)))?;
+                Some(Some(m))
+            }
+        } else {
+            None
+        };
+
+        let default_time_minutes = if let Some(ref t) = default_time {
+            if t.eq_ignore_ascii_case("INFINITE") || t.eq_ignore_ascii_case("UNLIMITED") {
+                Some(None)
+            } else {
+                let m = spur_core::config::parse_time_minutes(t)
+                    .ok_or_else(|| PartitionError::invalid(format!("invalid default_time: {}", t)))?;
+                Some(Some(m))
+            }
+        } else {
+            None
+        };
+
+        let max_nodes_wal = if clear_max_nodes {
+            Some(None)
+        } else {
+            max_nodes.map(Some)
+        };
+
+        self.propose(WalOperation::PartitionUpdate {
+            name: name.to_string(),
+            nodes,
+            selector,
+            state,
+            max_time_minutes,
+            default_time_minutes,
+            max_nodes: max_nodes_wal,
+            min_nodes,
+            allow_accounts,
+            allow_groups,
+            deny_accounts,
+            deny_qos,
+            priority_tier,
+            preempt_mode,
+            is_default,
+        })
+        .map_err(|e| PartitionError::raft(e.to_string()))?;
+        self.sync_partitions_to_config();
+        Ok(())
+    }
+
+    /// Delete a partition by name (persisted via Raft).
+    ///
+    /// Refuses if any running jobs are using the partition.
+    pub fn delete_partition(&self, name: &str) -> Result<(), PartitionError> {
+        if !self.partitions.read().iter().any(|p| p.name == name) {
+            return Err(PartitionError::not_found(format!(
+                "partition '{}' not found",
+                name
+            )));
+        }
+        for job in self.jobs.read().values() {
+            if !matches!(
+                job.state,
+                JobState::Running | JobState::Completing | JobState::Suspended
+            ) {
+                continue;
+            }
+            if job.spec.partition.as_deref() == Some(name) {
+                return Err(PartitionError::invalid(format!(
+                    "partition '{}' in use by running job {}",
+                    name, job.job_id
+                )));
+            }
+        }
+        self.propose(WalOperation::PartitionDelete {
+            name: name.to_string(),
+        })
+        .map_err(|e| PartitionError::raft(e.to_string()))?;
+        self.sync_partitions_to_config();
+        Ok(())
+    }
+
     /// Create a new reservation (validated, persisted via Raft).
     pub fn create_reservation(&self, mut res: Reservation) -> Result<(), ReservationError> {
         if self.reservations.read().iter().any(|r| r.name == res.name) {
@@ -3406,6 +3644,118 @@ impl ClusterManager {
                     t.revoked = true;
                 }
             }
+            WalOperation::PartitionCreate { partition } => {
+                // A create always clears any tombstone for this name — the admin
+                // is explicitly recreating a previously-deleted partition.
+                self.deleted_partition_names.write().remove(&partition.name);
+                let mut partitions = self.partitions.write();
+                if partitions.iter().any(|p| p.name == partition.name) {
+                    warn!(
+                        name = %partition.name,
+                        "duplicate partition create in WAL apply, ignoring"
+                    );
+                } else {
+                    partitions.push(partition.clone());
+                    response.partition_created = true;
+                    info!(name = %partition.name, "partition created");
+                }
+            }
+            WalOperation::PartitionUpdate {
+                name,
+                nodes,
+                selector,
+                state,
+                max_time_minutes,
+                default_time_minutes,
+                max_nodes,
+                min_nodes,
+                allow_accounts,
+                allow_groups,
+                deny_accounts,
+                deny_qos,
+                priority_tier,
+                preempt_mode,
+                is_default,
+            } => {
+                let mut partitions = self.partitions.write();
+                let set_as_default = *is_default == Some(true);
+                if let Some(part) = partitions.iter_mut().find(|p| p.name == *name) {
+                    if let Some(n) = nodes {
+                        part.nodes = n.clone();
+                    }
+                    if let Some(sel) = selector {
+                        part.selector = sel.clone();
+                    }
+                    if let Some(s) = state {
+                        part.state = match s.to_uppercase().as_str() {
+                            "UP" => spur_core::partition::PartitionState::Up,
+                            "DOWN" => spur_core::partition::PartitionState::Down,
+                            "DRAIN" => spur_core::partition::PartitionState::Drain,
+                            _ => spur_core::partition::PartitionState::Inactive,
+                        };
+                    }
+                    if let Some(mt) = max_time_minutes {
+                        part.max_time_minutes = *mt;
+                    }
+                    if let Some(dt) = default_time_minutes {
+                        part.default_time_minutes = *dt;
+                    }
+                    if let Some(mn) = max_nodes {
+                        part.max_nodes = *mn;
+                    }
+                    if let Some(mn) = min_nodes {
+                        part.min_nodes = *mn;
+                    }
+                    if let Some(aa) = allow_accounts {
+                        part.allow_accounts = aa.clone();
+                    }
+                    if let Some(ag) = allow_groups {
+                        part.allow_groups = ag.clone();
+                    }
+                    if let Some(da) = deny_accounts {
+                        part.deny_accounts = da.clone();
+                    }
+                    if let Some(dq) = deny_qos {
+                        part.deny_qos = dq.clone();
+                    }
+                    if let Some(pt) = priority_tier {
+                        part.priority_tier = *pt;
+                    }
+                    if let Some(pm) = preempt_mode {
+                        part.preempt_mode = match pm.to_lowercase().as_str() {
+                            "cancel" => spur_core::partition::PreemptMode::Cancel,
+                            "requeue" => spur_core::partition::PreemptMode::Requeue,
+                            "suspend" => spur_core::partition::PreemptMode::Suspend,
+                            _ => spur_core::partition::PreemptMode::Off,
+                        };
+                    }
+                    if let Some(def) = is_default {
+                        part.is_default = *def;
+                    }
+                    info!(name, "partition updated");
+                } else {
+                    warn!(name, "partition update for unknown partition, ignoring");
+                }
+                // Promote exactly one default: clear all others when this one was set.
+                if set_as_default {
+                    for p in partitions.iter_mut() {
+                        if p.name != *name {
+                            p.is_default = false;
+                        }
+                    }
+                }
+            }
+            WalOperation::PartitionDelete { name } => {
+                let mut partitions = self.partitions.write();
+                let len_before = partitions.len();
+                partitions.retain(|p| p.name != *name);
+                if partitions.len() < len_before {
+                    // Record the tombstone so this name is suppressed from the
+                    // spur.conf baseline on the next restart.
+                    self.deleted_partition_names.write().insert(name.clone());
+                    info!(name, "partition deleted");
+                }
+            }
             WalOperation::ReservationCreate { reservation } => {
                 let mut reservations = self.reservations.write();
                 if reservations.iter().any(|r| r.name == reservation.name) {
@@ -3475,6 +3825,15 @@ struct ClusterSnapshot {
     jobs: Vec<Job>,
     nodes: Vec<Node>,
     reservations: Vec<Reservation>,
+    /// Runtime-created/modified partitions. On restore these overlay the
+    /// config-file baseline; names in `deleted_partition_names` are skipped
+    /// from the baseline entirely.
+    #[serde(default)]
+    partitions: Vec<Partition>,
+    /// Names of partitions deleted at runtime. Suppresses config-file
+    /// partitions with the same name from re-seeding on restart.
+    #[serde(default)]
+    deleted_partition_names: HashSet<String>,
     steps: Vec<JobStep>,
     license_pool: HashMap<String, u64>,
     #[serde(default)]
@@ -3529,6 +3888,8 @@ impl StateMachineApply for ClusterManager {
             jobs: self.jobs.read().values().cloned().collect(),
             nodes: self.nodes.read().values().cloned().collect(),
             reservations: self.reservations.read().clone(),
+            partitions: self.partitions.read().clone(),
+            deleted_partition_names: self.deleted_partition_names.read().clone(),
             steps: self.steps.read().values().cloned().collect(),
             license_pool: self.license_pool.read().clone(),
             tokens: self.tokens.read().values().cloned().collect(),
@@ -3555,6 +3916,28 @@ impl StateMachineApply for ClusterManager {
         }
 
         *self.reservations.write() = snap.reservations;
+
+        // Restore tombstone set first — used below to filter the config baseline.
+        *self.deleted_partition_names.write() = snap.deleted_partition_names.clone();
+
+        // Rebuild partition table:
+        //   1. Start from the config-file baseline, skipping any name the
+        //      operator deleted at runtime (tombstone set).
+        //   2. Overlay snapshot entries: if a snapshot entry matches a config
+        //      partition by name, snapshot wins (runtime edits survive restart).
+        //      If no config entry exists for a snapshot entry, it is appended
+        //      (runtime-created partitions survive restart).
+        {
+            let mut partitions = self.partitions.write();
+            partitions.retain(|p| !snap.deleted_partition_names.contains(&p.name));
+            for snap_part in snap.partitions {
+                if let Some(existing) = partitions.iter_mut().find(|p| p.name == snap_part.name) {
+                    *existing = snap_part;
+                } else {
+                    partitions.push(snap_part);
+                }
+            }
+        }
 
         let mut steps = self.steps.write();
         steps.clear();
@@ -4126,6 +4509,7 @@ mod tests {
                 allow_accounts: Vec::new(),
                 allow_groups: Vec::new(),
                 deny_accounts: Vec::new(),
+                deny_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
             }],
@@ -9007,6 +9391,7 @@ mod tests {
                 allow_accounts: Vec::new(),
                 allow_groups: Vec::new(),
                 deny_accounts: Vec::new(),
+                deny_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
             },
@@ -9023,6 +9408,7 @@ mod tests {
                 allow_accounts: Vec::new(),
                 allow_groups: Vec::new(),
                 deny_accounts: Vec::new(),
+                deny_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
             },
@@ -9080,6 +9466,7 @@ mod tests {
             allow_accounts: Vec::new(),
             allow_groups: Vec::new(),
             deny_accounts: Vec::new(),
+            deny_qos: Vec::new(),
             priority_tier: 1,
             preempt_mode: String::new(),
         }];
@@ -9679,5 +10066,527 @@ mod tests {
         ClusterManager::evict_job(1, &mut jobs, &mut nodes, Utc::now());
 
         assert_eq!(nodes["n1"].state, NodeState::Drain);
+    }
+
+    // ---------------------------------------------------------------
+    // Partition CRUD tests
+    // ---------------------------------------------------------------
+
+    fn gpu_partition() -> spur_core::partition::Partition {
+        spur_core::partition::Partition {
+            name: "gpu".into(),
+            state: spur_core::partition::PartitionState::Up,
+            is_default: false,
+            nodes: "gpu[01-04]".into(),
+            max_time_minutes: Some(1440),
+            allow_accounts: vec!["ml-team".into()],
+            priority_tier: 2,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_partition_create_update_delete() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&WalOperation::PartitionCreate {
+            partition: gpu_partition(),
+        });
+
+        let parts = cm.get_partitions();
+        assert!(parts.iter().any(|p| p.name == "gpu"), "gpu partition missing after create");
+        let gpu = parts.iter().find(|p| p.name == "gpu").unwrap();
+        assert_eq!(gpu.max_time_minutes, Some(1440));
+        assert_eq!(gpu.allow_accounts, vec!["ml-team"]);
+        assert_eq!(gpu.priority_tier, 2);
+
+        cm.apply_operation(&WalOperation::PartitionUpdate {
+            name: "gpu".into(),
+            nodes: None,
+            selector: None,
+            state: Some("DRAIN".into()),
+            max_time_minutes: Some(Some(2880)),
+            default_time_minutes: None,
+            max_nodes: None,
+            min_nodes: None,
+            allow_accounts: Some(vec!["ml-team".into(), "infra".into()]),
+            allow_groups: None,
+            deny_accounts: None,
+            deny_qos: None,
+            priority_tier: None,
+            preempt_mode: None,
+            is_default: None,
+        });
+
+        let gpu = cm.get_partitions().into_iter().find(|p| p.name == "gpu").unwrap();
+        assert_eq!(gpu.state, spur_core::partition::PartitionState::Drain);
+        assert_eq!(gpu.max_time_minutes, Some(2880));
+        assert!(gpu.allow_accounts.contains(&"infra".into()));
+
+        cm.apply_operation(&WalOperation::PartitionDelete { name: "gpu".into() });
+        assert!(
+            !cm.get_partitions().iter().any(|p| p.name == "gpu"),
+            "gpu partition still present after delete"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_partition_create_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&WalOperation::PartitionCreate {
+            partition: gpu_partition(),
+        });
+        cm.apply_operation(&WalOperation::PartitionCreate {
+            partition: gpu_partition(),
+        });
+
+        let gpu_count = cm.get_partitions().iter().filter(|p| p.name == "gpu").count();
+        assert_eq!(gpu_count, 1, "duplicate PartitionCreate must not add a second entry");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_partition_update_unknown_is_a_noop() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let before = cm.get_partitions().len();
+
+        cm.apply_operation(&WalOperation::PartitionUpdate {
+            name: "does-not-exist".into(),
+            nodes: Some("n1".into()),
+            selector: None,
+            state: None,
+            max_time_minutes: None,
+            default_time_minutes: None,
+            max_nodes: None,
+            min_nodes: None,
+            allow_accounts: None,
+            allow_groups: None,
+            deny_accounts: None,
+            deny_qos: None,
+            priority_tier: None,
+            preempt_mode: None,
+            is_default: None,
+        });
+
+        assert_eq!(cm.get_partitions().len(), before, "unknown partition update must not add an entry");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_partition_set_default_clears_others() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        // Baseline: the "default" partition created by test_config() is already is_default=true.
+        cm.apply_operation(&WalOperation::PartitionCreate {
+            partition: gpu_partition(),
+        });
+        assert!(!cm.get_partitions().iter().find(|p| p.name == "gpu").unwrap().is_default);
+
+        // Make "gpu" the default.
+        cm.apply_operation(&WalOperation::PartitionUpdate {
+            name: "gpu".into(),
+            nodes: None,
+            selector: None,
+            state: None,
+            max_time_minutes: None,
+            default_time_minutes: None,
+            max_nodes: None,
+            min_nodes: None,
+            allow_accounts: None,
+            allow_groups: None,
+            deny_accounts: None,
+            deny_qos: None,
+            priority_tier: None,
+            preempt_mode: None,
+            is_default: Some(true),
+        });
+
+        let parts = cm.get_partitions();
+        let defaults: Vec<&str> = parts.iter().filter(|p| p.is_default).map(|p| p.name.as_str()).collect();
+        assert_eq!(defaults, vec!["gpu"], "exactly one partition must be default after promotion");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_partition_rejects_duplicate_name() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.create_partition(gpu_partition()).unwrap();
+        let err = cm.create_partition(gpu_partition()).unwrap_err();
+        assert!(
+            matches!(err, PartitionError::AlreadyExists(_)),
+            "expected AlreadyExists, got {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_partition_rejects_not_found() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let err = cm.delete_partition("no-such-partition").unwrap_err();
+        assert!(
+            matches!(err, PartitionError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_partition_rejects_when_running_job_uses_it() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        // Use an open partition (no account restriction) so basic_spec's testuser can submit.
+        let open_part = spur_core::partition::Partition {
+            name: "gpu".into(),
+            nodes: "ALL".into(),
+            ..Default::default()
+        };
+        cm.create_partition(open_part).unwrap();
+        wait_for("gpu partition created", || {
+            cm.get_partitions().iter().any(|p| p.name == "gpu")
+        });
+
+        let mut spec = basic_spec("gpu-job");
+        spec.partition = Some("gpu".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let alloc = scalar_alloc(1, 1000);
+        cm.start_job(job_id, vec!["n1".into()], alloc.clone(), per_node_for(&["n1"], alloc))
+            .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        let err = cm.delete_partition("gpu").unwrap_err();
+        assert!(
+            matches!(err, PartitionError::InvalidArgument(_)),
+            "expected InvalidArgument for in-use partition, got {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partition_survives_wal_replay() {
+        let dir = TempDir::new().unwrap();
+        {
+            let cm = test_cluster(&dir).await;
+            cm.create_partition(gpu_partition()).unwrap();
+            wait_for("gpu created", || {
+                cm.get_partitions().iter().any(|p| p.name == "gpu")
+            });
+        }
+
+        let cm2 = test_cluster(&dir).await;
+        wait_for("gpu replayed from WAL", || {
+            cm2.get_partitions().iter().any(|p| p.name == "gpu")
+        });
+        let gpu = cm2.get_partitions().into_iter().find(|p| p.name == "gpu").unwrap();
+        assert_eq!(gpu.allow_accounts, vec!["ml-team"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_partition_create_keeps_single_entry() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let cm1 = cm.clone();
+        let cm2 = cm.clone();
+        let (first, second) = tokio::join!(
+            tokio::task::spawn_blocking(move || cm1.create_partition(gpu_partition())),
+            tokio::task::spawn_blocking(move || cm2.create_partition(gpu_partition())),
+        );
+        let outcomes = [first.unwrap(), second.unwrap()];
+        assert_eq!(
+            outcomes.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "exactly one concurrent create must succeed"
+        );
+        let gpu_count = cm.get_partitions().iter().filter(|p| p.name == "gpu").count();
+        assert_eq!(gpu_count, 1);
+    }
+
+    // ---------------------------------------------------------------
+    // Tombstone and spur.conf writeback tests
+    // ---------------------------------------------------------------
+
+    /// Helper: build a test ClusterManager that writes config to a temp file.
+    async fn test_cluster_with_conf_file(
+        state_dir: &TempDir,
+        conf_path: &std::path::Path,
+    ) -> Arc<ClusterManager> {
+        let config = test_config();
+        // Write initial config so the file exists.
+        config.save_to_file(conf_path).unwrap();
+        let cm = Arc::new(
+            ClusterManager::new_with_config_path(
+                config,
+                state_dir.path(),
+                Some(conf_path.to_path_buf()),
+            )
+            .unwrap(),
+        );
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], state_dir.path(), cm.clone())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .expect("single-node raft did not self-elect within 5s");
+        cm.set_raft(handle.raft);
+        cm
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleted_partition_does_not_resurface_after_snapshot_restore() {
+        let state_dir = TempDir::new().unwrap();
+        let cm = test_cluster(&state_dir).await;
+
+        // Create then delete "gpu" via the public API (goes through Raft).
+        cm.create_partition(gpu_partition()).unwrap();
+        wait_for("gpu created", || {
+            cm.get_partitions().iter().any(|p| p.name == "gpu")
+        });
+        cm.delete_partition("gpu").unwrap();
+        wait_for("gpu deleted", || {
+            !cm.get_partitions().iter().any(|p| p.name == "gpu")
+        });
+
+        // Tombstone set must contain "gpu".
+        assert!(
+            cm.deleted_partition_names.read().contains("gpu"),
+            "tombstone not recorded after delete"
+        );
+
+        // Simulate snapshot + restore: take a snapshot, apply it to a fresh manager.
+        let snap_bytes = cm.snapshot_state().unwrap();
+
+        let cm2 = Arc::new(ClusterManager::new(test_config(), state_dir.path()).unwrap());
+        cm2.restore_from_snapshot(&snap_bytes);
+
+        assert!(
+            !cm2.get_partitions().iter().any(|p| p.name == "gpu"),
+            "deleted partition must not re-appear after snapshot restore"
+        );
+        assert!(
+            cm2.deleted_partition_names.read().contains("gpu"),
+            "tombstone must survive snapshot round-trip"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recreating_tombstoned_partition_clears_tombstone() {
+        let state_dir = TempDir::new().unwrap();
+        let cm = test_cluster(&state_dir).await;
+
+        cm.create_partition(gpu_partition()).unwrap();
+        wait_for("gpu created", || cm.get_partitions().iter().any(|p| p.name == "gpu"));
+
+        cm.delete_partition("gpu").unwrap();
+        wait_for("gpu deleted", || !cm.get_partitions().iter().any(|p| p.name == "gpu"));
+        assert!(cm.deleted_partition_names.read().contains("gpu"));
+
+        // Recreate.
+        cm.create_partition(gpu_partition()).unwrap();
+        wait_for("gpu recreated", || cm.get_partitions().iter().any(|p| p.name == "gpu"));
+
+        assert!(
+            !cm.deleted_partition_names.read().contains("gpu"),
+            "tombstone must be cleared when the partition is recreated"
+        );
+
+        // After another snapshot round-trip the partition must be present.
+        let snap_bytes = cm.snapshot_state().unwrap();
+        let cm2 = Arc::new(ClusterManager::new(test_config(), state_dir.path()).unwrap());
+        cm2.restore_from_snapshot(&snap_bytes);
+        assert!(
+            cm2.get_partitions().iter().any(|p| p.name == "gpu"),
+            "recreated partition must survive snapshot round-trip"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn config_partition_not_touched_by_runtime_stays_after_snapshot_restore() {
+        // Verify that the existing deployment path is unaffected: a partition that
+        // was only ever defined in spur.conf and never touched at runtime must
+        // still be present after snapshot restore.
+        let state_dir = TempDir::new().unwrap();
+        let cm = test_cluster(&state_dir).await;
+
+        // test_config() includes a "default" partition — never touch it at runtime.
+        // Take a snapshot and restore.
+        let snap_bytes = cm.snapshot_state().unwrap();
+        let cm2 = Arc::new(ClusterManager::new(test_config(), state_dir.path()).unwrap());
+        cm2.restore_from_snapshot(&snap_bytes);
+
+        assert!(
+            cm2.get_partitions().iter().any(|p| p.name == "default"),
+            "config-only partition must survive snapshot restore untouched"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_partition_writes_spur_conf() {
+        let state_dir = TempDir::new().unwrap();
+        let conf_file = state_dir.path().join("spur.conf");
+        let cm = test_cluster_with_conf_file(&state_dir, &conf_file).await;
+
+        cm.create_partition(gpu_partition()).unwrap();
+        wait_for("gpu created", || cm.get_partitions().iter().any(|p| p.name == "gpu"));
+
+        let content = std::fs::read_to_string(&conf_file).unwrap();
+        assert!(
+            content.contains("gpu"),
+            "spur.conf must contain new partition after create"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_partition_removes_it_from_spur_conf() {
+        let state_dir = TempDir::new().unwrap();
+        let conf_file = state_dir.path().join("spur.conf");
+        let cm = test_cluster_with_conf_file(&state_dir, &conf_file).await;
+
+        cm.create_partition(gpu_partition()).unwrap();
+        wait_for("gpu created", || cm.get_partitions().iter().any(|p| p.name == "gpu"));
+
+        cm.delete_partition("gpu").unwrap();
+        wait_for("gpu deleted", || !cm.get_partitions().iter().any(|p| p.name == "gpu"));
+
+        let content = std::fs::read_to_string(&conf_file).unwrap();
+        assert!(
+            !content.contains("\"gpu\"") && !content.contains("name = \"gpu\""),
+            "spur.conf must not contain deleted partition"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn format_and_parse_time_minutes_round_trip() {
+        // Ensure format_time_minutes → parse_time_minutes is lossless.
+        use spur_core::config::{format_time_minutes, parse_time_minutes};
+        for minutes in [0u32, 1, 59, 60, 90, 1440, 2880, 10080] {
+            let s = format_time_minutes(minutes);
+            let parsed = parse_time_minutes(&s)
+                .unwrap_or_else(|| panic!("failed to parse back '{s}' (from {minutes} min)"));
+            assert_eq!(parsed, minutes, "round-trip failed for {minutes} minutes");
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // QoS enforcement tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn validate_partition_rejects_qos_not_in_allow_qos() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let part = spur_core::partition::Partition {
+            name: "restricted".into(),
+            nodes: "ALL".into(),
+            allow_qos: vec!["premium".into()],
+            ..Default::default()
+        };
+        cm.create_partition(part).unwrap();
+        wait_for("restricted created", || {
+            cm.get_partitions().iter().any(|p| p.name == "restricted")
+        });
+
+        // QoS not in allow list → rejected.
+        let mut spec = basic_spec("bad-qos");
+        spec.partition = Some("restricted".into());
+        spec.qos = Some("cheap".into());
+        assert!(
+            cm.validate_partition(&spec).is_err(),
+            "QoS not in allow_qos must fail validation"
+        );
+
+        // QoS in allow list → accepted.
+        let mut spec = basic_spec("good-qos");
+        spec.partition = Some("restricted".into());
+        spec.qos = Some("premium".into());
+        assert!(
+            cm.validate_partition(&spec).is_ok(),
+            "QoS in allow_qos must pass validation"
+        );
+
+        // No QoS with allow_qos set → rejected (empty string not in list).
+        let mut spec = basic_spec("no-qos");
+        spec.partition = Some("restricted".into());
+        spec.qos = None;
+        assert!(
+            cm.validate_partition(&spec).is_err(),
+            "absent QoS must fail when allow_qos is non-empty"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn validate_partition_rejects_qos_in_deny_qos() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let part = spur_core::partition::Partition {
+            name: "nodebug".into(),
+            nodes: "ALL".into(),
+            deny_qos: vec!["debug".into()],
+            ..Default::default()
+        };
+        cm.create_partition(part).unwrap();
+        wait_for("nodebug created", || {
+            cm.get_partitions().iter().any(|p| p.name == "nodebug")
+        });
+
+        // Denied QoS → rejected.
+        let mut spec = basic_spec("denied-qos");
+        spec.partition = Some("nodebug".into());
+        spec.qos = Some("debug".into());
+        assert!(
+            cm.validate_partition(&spec).is_err(),
+            "denied QoS must fail validation"
+        );
+
+        // Non-denied QoS → allowed.
+        let mut spec = basic_spec("other-qos");
+        spec.partition = Some("nodebug".into());
+        spec.qos = Some("premium".into());
+        assert!(
+            cm.validate_partition(&spec).is_ok(),
+            "non-denied QoS must pass validation"
+        );
+
+        // None QoS → allowed (deny_qos only blocks explicitly-named values).
+        let mut spec = basic_spec("no-qos");
+        spec.partition = Some("nodebug".into());
+        spec.qos = None;
+        assert!(
+            cm.validate_partition(&spec).is_ok(),
+            "absent QoS must not be blocked by deny_qos"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn validate_partition_passes_any_qos_when_allow_qos_empty() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let part = spur_core::partition::Partition {
+            name: "open".into(),
+            nodes: "ALL".into(),
+            allow_qos: vec![],
+            ..Default::default()
+        };
+        cm.create_partition(part).unwrap();
+        wait_for("open created", || {
+            cm.get_partitions().iter().any(|p| p.name == "open")
+        });
+
+        let mut spec = basic_spec("any-qos");
+        spec.partition = Some("open".into());
+        spec.qos = Some("whatever".into());
+        assert!(
+            cm.validate_partition(&spec).is_ok(),
+            "empty allow_qos must not restrict any QoS"
+        );
     }
 }

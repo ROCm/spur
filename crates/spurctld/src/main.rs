@@ -109,8 +109,18 @@ async fn main() -> anyhow::Result<()> {
         spur_update::SPUR_BINARIES,
     );
 
-    // Initialize cluster manager first so Raft recovery can apply entries
-    let cluster = Arc::new(ClusterManager::new(config.clone(), &args.state_dir)?);
+    // Initialize cluster manager first so Raft recovery can apply entries.
+    // Pass the config path for best-effort writeback after partition CRUD ops.
+    let config_path = if args.config.exists() {
+        Some(args.config.clone())
+    } else {
+        None
+    };
+    let cluster = Arc::new(ClusterManager::new_with_config_path(
+        config.clone(),
+        &args.state_dir,
+        config_path,
+    )?);
 
     // Raft is always-on. When no peers are configured, run a single-node
     // cluster that self-elects instantly (same pattern as Apache Kudu).
@@ -316,6 +326,7 @@ fn default_config() -> spur_core::config::SlurmConfig {
             allow_accounts: Vec::new(),
             allow_groups: Vec::new(),
             deny_accounts: Vec::new(),
+            deny_qos: Vec::new(),
             priority_tier: 1,
             preempt_mode: String::new(),
         }],
