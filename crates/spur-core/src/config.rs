@@ -468,6 +468,8 @@ pub struct PartitionConfig {
     #[serde(default)]
     pub allow_groups: Vec<String>,
     #[serde(default)]
+    pub deny_accounts: Vec<String>,
+    #[serde(default)]
     pub priority_tier: u32,
     #[serde(default)]
     pub preempt_mode: String,
@@ -843,6 +845,8 @@ impl SlurmConfig {
                     "suspend" => PreemptMode::Suspend,
                     _ => PreemptMode::Off,
                 },
+                allow_accounts: pc.allow_accounts.clone(),
+                deny_accounts: pc.deny_accounts.clone(),
                 ..Default::default()
             })
             .collect()
@@ -1243,6 +1247,26 @@ memory_mb = 1024000
         let parts = config.build_partitions();
         assert_eq!(parts[0].name, "gpu");
         assert_eq!(parts[0].max_time_minutes, Some(4320));
+    }
+
+    #[test]
+    fn build_partitions_propagates_partition_access_control() {
+        let toml = r#"
+cluster_name = "test"
+
+[[partitions]]
+name = "gpu"
+allow_accounts = ["research", "faculty"]
+deny_accounts = ["student"]
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        let parts = config.build_partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0].allow_accounts,
+            vec!["research".to_string(), "faculty".to_string()]
+        );
+        assert_eq!(parts[0].deny_accounts, vec!["student".to_string()]);
     }
 
     #[test]

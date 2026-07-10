@@ -247,6 +247,7 @@ message PartitionInfo {
   string allow_accounts = 32;
   string allow_groups = 33;
   string allow_qos = 34;
+  string deny_accounts = 42;
 
   string preempt_mode = 40;
   uint32 priority_tier = 41;

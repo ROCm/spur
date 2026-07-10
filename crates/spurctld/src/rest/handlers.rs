@@ -84,6 +84,7 @@ pub async fn submit_job(
 
     let spec = spur_core::job::JobSpec {
         name: body.job.name.unwrap_or_default(),
+        user: body.job.user.unwrap_or_default(),
         partition: body.job.partition,
         account: body.job.account,
         num_nodes: body.job.nodes.unwrap_or(1),
@@ -95,12 +96,16 @@ pub async fn submit_job(
         ..Default::default()
     };
 
-    let job_id = state
-        .cluster
-        .submit_job(spec)
-        .map_err(|e| error_response(&format!("submit failed: {e}")))?;
+    let job_id = state.cluster.submit_job(spec).map_err(submit_rest_error)?;
 
     Ok(ApiResponse::ok(SubmitResponse { job_id }))
+}
+
+fn submit_rest_error(err: crate::cluster::SubmitError) -> RestError {
+    match err {
+        crate::cluster::SubmitError::InvalidArgument(m) => bad_request_response(&m),
+        crate::cluster::SubmitError::Internal(m) => error_response(&format!("submit failed: {m}")),
+    }
 }
 
 pub async fn cancel_job(

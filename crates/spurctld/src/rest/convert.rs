@@ -67,6 +67,8 @@ pub fn partition_to_json(part: &Partition) -> serde_json::Value {
         "max_time": part.max_time_minutes,
         "default_time": part.default_time_minutes,
         "priority_tier": part.priority_tier,
+        "allow_accounts": part.allow_accounts,
+        "deny_accounts": part.deny_accounts,
     })
 }
 
@@ -98,6 +100,19 @@ pub fn parse_states_query(s: &str) -> Result<Vec<JobState>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partition_to_json_includes_access_control_fields() {
+        let part = Partition {
+            name: "gpu".into(),
+            allow_accounts: vec!["research".into()],
+            deny_accounts: vec!["student".into()],
+            ..Default::default()
+        };
+        let json = partition_to_json(&part);
+        assert_eq!(json["allow_accounts"], serde_json::json!(["research"]));
+        assert_eq!(json["deny_accounts"], serde_json::json!(["student"]));
+    }
 
     #[test]
     fn parse_states_query_accepts_valid_tokens() {

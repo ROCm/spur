@@ -424,6 +424,12 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                         .unwrap_or_else(|| "UNLIMITED".into()),
                 );
                 println!("   PriorityTier={}", part.priority_tier);
+                if !part.allow_accounts.is_empty() {
+                    println!("   AllowAccounts={}", part.allow_accounts);
+                }
+                if !part.deny_accounts.is_empty() {
+                    println!("   DenyAccounts={}", part.deny_accounts);
+                }
                 println!();
             }
         }

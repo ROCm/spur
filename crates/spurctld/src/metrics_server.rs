@@ -160,6 +160,7 @@ mod tests {
                 min_nodes: 1,
                 allow_accounts: Vec::new(),
                 allow_groups: Vec::new(),
+                deny_accounts: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
             }],
