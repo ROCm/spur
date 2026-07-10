@@ -791,9 +791,20 @@ fn open_job_output(
     stdout_path: &str,
     stderr_path: &str,
 ) -> anyhow::Result<(std::fs::File, std::fs::File)> {
+    // When stderr follows stdout (same resolved path, e.g. `srun -o` with no
+    // `-e`), stderr must share stdout's open file description via dup so both
+    // streams advance a single shared write offset and interleave correctly.
+    // Opening the path a second time would give stderr an independent offset,
+    // and subsequent stdout writes would clobber whatever stderr wrote.
+    let shared = stderr_path == stdout_path;
+
     if !should_run_as_user(uid) {
         let out = open_output_file(stdout_path, use_append).context("open stdout")?;
-        let err = open_output_file(stderr_path, use_append).context("open stderr")?;
+        let err = if shared {
+            out.try_clone().context("clone stdout fd for stderr")?
+        } else {
+            open_output_file(stderr_path, use_append).context("open stderr")?
+        };
         return Ok((out, err));
     }
 
@@ -823,8 +834,18 @@ fn open_job_output(
                 let Ok(out) = open_output_file(stdout_path, use_append) else {
                     break 'open 2;
                 };
-                let Ok(err) = open_output_file(stderr_path, use_append) else {
-                    break 'open 3;
+                // Same fd (dup) when stderr follows stdout; SCM_RIGHTS preserves
+                // the shared open file description, so both land one offset.
+                let err = if shared {
+                    match out.try_clone() {
+                        Ok(f) => f,
+                        Err(_) => break 'open 3,
+                    }
+                } else {
+                    match open_output_file(stderr_path, use_append) {
+                        Ok(f) => f,
+                        Err(_) => break 'open 3,
+                    }
                 };
                 if send_fds(child_sock.as_raw_fd(), &[out.as_raw_fd(), err.as_raw_fd()]).is_err() {
                     break 'open 4;
@@ -1342,6 +1363,36 @@ mod tests {
         drop(of);
 
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "new");
+    }
+
+    #[test]
+    fn open_job_output_shared_path_shares_offset() {
+        // `srun -o file` with no `-e` makes stderr follow stdout (same path).
+        // stderr must share stdout's fd (dup) so the two streams advance one
+        // offset and interleave; independent offsets would clobber each other.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("job.out");
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let p = shared.to_str().unwrap();
+
+        let (mut of, mut ef) = open_job_output(uid, gid, false, p, p).unwrap();
+        // Interleave: an out write after an err write must not overwrite it.
+        of.write_all(b"out1\n").unwrap();
+        of.flush().unwrap();
+        ef.write_all(b"err1\n").unwrap();
+        ef.flush().unwrap();
+        of.write_all(b"out2\n").unwrap();
+        of.flush().unwrap();
+        ef.write_all(b"err2\n").unwrap();
+        ef.flush().unwrap();
+
+        let contents = std::fs::read_to_string(&shared).unwrap();
+        assert_eq!(
+            contents, "out1\nerr1\nout2\nerr2\n",
+            "streams clobbered: {contents:?}"
+        );
     }
 
     #[test]

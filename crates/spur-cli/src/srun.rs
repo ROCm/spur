@@ -200,9 +200,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     let name = args.job_name.unwrap_or_else(|| args.command[0].clone());
 
-    // Build a wrapper script from the command
-    let cmd_line = args.command.join(" ");
-    let script = format!("#!/bin/bash\n{}\n", cmd_line);
+    let script = build_command_script(&args.command)?;
 
     // Build GRES list
     let mut gres = args.gres;
@@ -592,6 +590,19 @@ struct ResolvedIoPaths {
     stdin: String,
 }
 
+/// Wrap the command argv in a bash script for batch submission.
+///
+/// Each argv element is shell-escaped so metacharacters (spaces, quotes, `;`,
+/// `>`, `$`, globs) stay literal arguments instead of being reinterpreted by
+/// the wrapper shell. This matches Slurm's semantics, where `srun` execs the
+/// argv directly with no shell: `srun touch "my file"` creates one file, and
+/// `srun bash -c 'a; b'` passes the whole script as a single `-c` argument.
+fn build_command_script(command: &[String]) -> Result<String> {
+    let cmd_line = shlex::try_join(command.iter().map(String::as_str))
+        .context("command contains a NUL byte and cannot be run")?;
+    Ok(format!("#!/bin/bash\n{}\n", cmd_line))
+}
+
 /// Resolve I/O paths from CLI args. When `-o` is set but `-e` is not,
 /// stderr follows stdout (Slurm default behavior).
 fn resolve_io_paths(args: &SrunArgs) -> ResolvedIoPaths {
@@ -900,5 +911,52 @@ mod tests {
         assert!(io.stdout.is_empty());
         assert!(io.stderr.is_empty());
         assert!(io.stdin.is_empty());
+    }
+
+    /// The generated script must reconstruct the exact argv after one pass of
+    /// shell parsing — i.e. metacharacters stay data, matching Slurm's direct
+    /// exec of the argv (no top-level shell interpretation).
+    fn assert_script_round_trips(argv: &[&str]) {
+        let command: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        let script = build_command_script(&command).expect("build script");
+        let body = script
+            .strip_prefix("#!/bin/bash\n")
+            .expect("shebang")
+            .trim_end();
+        let reparsed = shlex::split(body).expect("generated script must be shell-parseable");
+        assert_eq!(reparsed, command, "argv did not round-trip: {body:?}");
+    }
+
+    #[test]
+    fn build_command_script_simple_argv() {
+        assert_eq!(
+            build_command_script(&["hostname".to_string()]).unwrap(),
+            "#!/bin/bash\nhostname\n"
+        );
+    }
+
+    #[test]
+    fn build_command_script_preserves_spaces_in_arg() {
+        // `srun touch "my file.txt"` must stay a single argument, not two.
+        assert_script_round_trips(&["touch", "my file.txt"]);
+    }
+
+    #[test]
+    fn build_command_script_keeps_shell_metacharacters_literal() {
+        // Redirections, pipes, globs, and var refs are literal args, not shell
+        // syntax — Slurm would pass them verbatim to the exec'd program.
+        assert_script_round_trips(&["mytool", "a>b", "x|y", "*", "$HOME"]);
+    }
+
+    #[test]
+    fn build_command_script_nested_bash_c_stays_one_arg() {
+        // `srun bash -c 'echo A; echo B >&2'`: the `;` and `>&2` must remain
+        // inside the single -c argument, not leak to the wrapper shell.
+        assert_script_round_trips(&["bash", "-c", "echo A; echo B >&2"]);
+    }
+
+    #[test]
+    fn build_command_script_preserves_quotes_in_arg() {
+        assert_script_round_trips(&["echo", "it's a \"test\""]);
     }
 }

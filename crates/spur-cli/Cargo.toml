@@ -30,6 +30,7 @@ nix = { workspace = true, features = ["user"] }
 libc = "0.2"
 flate2 = { workspace = true }
 tar = { workspace = true }
+shlex = "2"
 
 [dev-dependencies]
 serial_test = { workspace = true }

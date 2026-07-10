@@ -3475,6 +3475,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "shlex",
  "spur-client",
  "spur-core",
  "spur-net",
