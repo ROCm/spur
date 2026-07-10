@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.1](https://github.com/ROCm/spur/compare/v0.4.0...v0.4.1) (2026-07-10)
+
+
+### Bug Fixes
+
+* **spur-cli:** use connect_channel for accounting CLI commands ([#415](https://github.com/ROCm/spur/issues/415)) ([1256ea2](https://github.com/ROCm/spur/commit/1256ea2e2129a63d89f10ed281b80e4bce022e70))
+* **spurd:** chown job stdout/stderr and output dirs to submitting user ([#401](https://github.com/ROCm/spur/issues/401)) ([ce7dcfd](https://github.com/ROCm/spur/commit/ce7dcfdba92971972ab294acc27d26f362c48adb))
+
 ## [0.4.0](https://github.com/ROCm/spur/compare/v0.3.0...v0.4.0) (2026-07-10)
 
 
