@@ -299,8 +299,9 @@ pub struct ClusterManager {
 }
 
 impl ClusterManager {
-    pub fn new(config: SlurmConfig, _state_dir: &Path) -> anyhow::Result<Self> {
-        Self::new_with_config_path(config, _state_dir, None)
+    #[cfg(test)]
+    pub fn new(config: SlurmConfig, state_dir: &Path) -> anyhow::Result<Self> {
+        Self::new_with_config_path(config, state_dir, None)
     }
 
     pub fn new_with_config_path(
@@ -2506,29 +2507,6 @@ impl ClusterManager {
         }
     }
 
-    /// Create a new partition (validated, persisted via Raft).
-    /// Write the current runtime partition list back to spur.conf for human
-    /// visibility. Best-effort: errors are logged but never propagated — the
-    /// Raft WAL/snapshot is the authoritative source of truth.
-    ///
-    /// Only the leader calls this; followers replay via Raft and don't need
-    /// to write the file (they may not even have write access to the same path).
-    fn sync_partitions_to_config(&self) {
-        let Some(ref path) = self.config_path else {
-            return;
-        };
-        let partitions = self.partitions.read();
-        let mut updated = self.config.clone();
-        updated.partitions = partitions
-            .iter()
-            .map(spur_core::config::partition_to_config)
-            .collect();
-        drop(partitions);
-        if let Err(e) = updated.save_to_file(path) {
-            warn!(path = %path.display(), error = %e, "failed to write partition changes to spur.conf");
-        }
-    }
-
     pub fn create_partition(&self, partition: Partition) -> Result<(), PartitionError> {
         if partition.name.is_empty() {
             return Err(PartitionError::invalid("partition name must not be empty"));
@@ -2552,7 +2530,6 @@ impl ClusterManager {
                 "partition already exists".to_string(),
             ));
         }
-        self.sync_partitions_to_config();
         Ok(())
     }
 
@@ -2635,7 +2612,6 @@ impl ClusterManager {
             is_default,
         })
         .map_err(|e| PartitionError::raft(e.to_string()))?;
-        self.sync_partitions_to_config();
         Ok(())
     }
 
@@ -2667,7 +2643,6 @@ impl ClusterManager {
             name: name.to_string(),
         })
         .map_err(|e| PartitionError::raft(e.to_string()))?;
-        self.sync_partitions_to_config();
         Ok(())
     }
 
@@ -2752,7 +2727,6 @@ impl ClusterManager {
             .map_err(|e| anyhow::anyhow!("reconfigure: update {}: {e}", part.name))?;
         }
 
-        self.sync_partitions_to_config();
         Ok(())
     }
 
@@ -12762,37 +12736,8 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Tombstone and spur.conf writeback tests
+    // Tombstone tests
     // ---------------------------------------------------------------
-
-    /// Helper: build a test ClusterManager that writes config to a temp file.
-    async fn test_cluster_with_conf_file(
-        state_dir: &TempDir,
-        conf_path: &std::path::Path,
-    ) -> Arc<ClusterManager> {
-        let config = test_config();
-        // Write initial config so the file exists.
-        config.save_to_file(conf_path).unwrap();
-        let cm = Arc::new(
-            ClusterManager::new_with_config_path(
-                config,
-                state_dir.path(),
-                Some(conf_path.to_path_buf()),
-            )
-            .unwrap(),
-        );
-        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], state_dir.path(), cm.clone())
-            .await
-            .unwrap();
-        handle
-            .raft
-            .wait(Some(std::time::Duration::from_secs(5)))
-            .metrics(|m| m.current_leader == Some(1), "leader elected")
-            .await
-            .expect("single-node raft did not self-elect within 5s");
-        cm.set_raft(handle.raft);
-        cm
-    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deleted_partition_does_not_resurface_after_snapshot_restore() {
@@ -12819,7 +12764,7 @@ mod tests {
         let snap_bytes = cm.snapshot_state().unwrap();
 
         let cm2 = Arc::new(ClusterManager::new(test_config(), state_dir.path()).unwrap());
-        cm2.restore_from_snapshot(&snap_bytes);
+        cm2.restore_from_snapshot(&snap_bytes).unwrap();
 
         assert!(
             !cm2.get_partitions().iter().any(|p| p.name == "gpu"),
@@ -12855,7 +12800,7 @@ mod tests {
         // After another snapshot round-trip the partition must be present.
         let snap_bytes = cm.snapshot_state().unwrap();
         let cm2 = Arc::new(ClusterManager::new(test_config(), state_dir.path()).unwrap());
-        cm2.restore_from_snapshot(&snap_bytes);
+        cm2.restore_from_snapshot(&snap_bytes).unwrap();
         assert!(
             cm2.get_partitions().iter().any(|p| p.name == "gpu"),
             "recreated partition must survive snapshot round-trip"
@@ -12874,59 +12819,12 @@ mod tests {
         // Take a snapshot and restore.
         let snap_bytes = cm.snapshot_state().unwrap();
         let cm2 = Arc::new(ClusterManager::new(test_config(), state_dir.path()).unwrap());
-        cm2.restore_from_snapshot(&snap_bytes);
+        cm2.restore_from_snapshot(&snap_bytes).unwrap();
 
         assert!(
             cm2.get_partitions().iter().any(|p| p.name == "default"),
             "config-only partition must survive snapshot restore untouched"
         );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn create_partition_writes_spur_conf() {
-        let state_dir = TempDir::new().unwrap();
-        let conf_file = state_dir.path().join("spur.conf");
-        let cm = test_cluster_with_conf_file(&state_dir, &conf_file).await;
-
-        cm.create_partition(gpu_partition()).unwrap();
-        wait_for("gpu created", || cm.get_partitions().iter().any(|p| p.name == "gpu"));
-
-        let content = std::fs::read_to_string(&conf_file).unwrap();
-        assert!(
-            content.contains("gpu"),
-            "spur.conf must contain new partition after create"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn delete_partition_removes_it_from_spur_conf() {
-        let state_dir = TempDir::new().unwrap();
-        let conf_file = state_dir.path().join("spur.conf");
-        let cm = test_cluster_with_conf_file(&state_dir, &conf_file).await;
-
-        cm.create_partition(gpu_partition()).unwrap();
-        wait_for("gpu created", || cm.get_partitions().iter().any(|p| p.name == "gpu"));
-
-        cm.delete_partition("gpu").unwrap();
-        wait_for("gpu deleted", || !cm.get_partitions().iter().any(|p| p.name == "gpu"));
-
-        let content = std::fs::read_to_string(&conf_file).unwrap();
-        assert!(
-            !content.contains("\"gpu\"") && !content.contains("name = \"gpu\""),
-            "spur.conf must not contain deleted partition"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn format_and_parse_time_minutes_round_trip() {
-        // Ensure format_time_minutes → parse_time_minutes is lossless.
-        use spur_core::config::{format_time_minutes, parse_time_minutes};
-        for minutes in [0u32, 1, 59, 60, 90, 1440, 2880, 10080] {
-            let s = format_time_minutes(minutes);
-            let parsed = parse_time_minutes(&s)
-                .unwrap_or_else(|| panic!("failed to parse back '{s}' (from {minutes} min)"));
-            assert_eq!(parsed, minutes, "round-trip failed for {minutes} minutes");
-        }
     }
 
     // ---------------------------------------------------------------

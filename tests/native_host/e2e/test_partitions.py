@@ -842,3 +842,161 @@ class TestSlurmsyntax:
         cluster.scontrol("delete", f"PartitionName={name}")
         show = cluster.scontrol("show", "partition")
         assert name not in show
+
+
+class TestConfReadOnly:
+    """Verify spur.conf is never written by any runtime partition operation.
+
+    Slurm's slurmctld never writes slurm.conf; runtime changes live only in
+    memory. Spur must match this: the config file is a read-only input to the
+    daemon and the Raft WAL/snapshot is the authoritative runtime store.
+    """
+
+    def _conf_mtime(self, cluster) -> str:
+        return cluster.nodes[0].exec(
+            f"stat -c %Y '{cluster.etc_dir}/spur.conf'"
+        ).strip()
+
+    def test_create_partition_does_not_write_conf(self, cluster):
+        name = _unique("conf-crt")
+        node = cluster.node_names[0]
+
+        mtime_before = self._conf_mtime(cluster)
+        cluster.scontrol("create-partition", f"--name={name}", f"--nodes={node}")
+        mtime_after = self._conf_mtime(cluster)
+
+        assert mtime_before == mtime_after, (
+            f"spur.conf was modified by create-partition: "
+            f"mtime {mtime_before} → {mtime_after}"
+        )
+
+    def test_update_partition_does_not_write_conf(self, cluster):
+        name = _unique("conf-upd")
+        node = cluster.node_names[0]
+
+        cluster.scontrol("create-partition", f"--name={name}", f"--nodes={node}")
+        mtime_before = self._conf_mtime(cluster)
+
+        cluster.scontrol("update-partition", f"--name={name}", "--state=DRAIN")
+        mtime_after = self._conf_mtime(cluster)
+
+        assert mtime_before == mtime_after, (
+            f"spur.conf was modified by update-partition: "
+            f"mtime {mtime_before} → {mtime_after}"
+        )
+
+    def test_delete_partition_does_not_write_conf(self, cluster):
+        name = _unique("conf-del")
+        node = cluster.node_names[0]
+
+        cluster.scontrol("create-partition", f"--name={name}", f"--nodes={node}")
+        mtime_before = self._conf_mtime(cluster)
+
+        cluster.scontrol("delete-partition", f"--name={name}")
+        mtime_after = self._conf_mtime(cluster)
+
+        assert mtime_before == mtime_after, (
+            f"spur.conf was modified by delete-partition: "
+            f"mtime {mtime_before} → {mtime_after}"
+        )
+
+
+class TestPartitionPersistence:
+    """Verify WAL-backed partition state survives a controller restart.
+
+    Runtime partitions are persisted via Raft WAL/snapshot — not spur.conf.
+    A restarted controller must see the same partition table the Raft log
+    recorded, regardless of what spur.conf contains.
+    """
+
+    def test_runtime_partition_survives_restart(self, cluster):
+        """A partition created at runtime must still be present after the
+        controller is restarted from its Raft state directory."""
+        name = _unique("persist-rt")
+        node = cluster.node_names[0]
+
+        cluster.scontrol("create-partition", f"--name={name}", f"--nodes={node}")
+        show_before = cluster.scontrol("show", "partition")
+        assert name in show_before
+
+        cluster.restart_controller()
+
+        show_after = cluster.scontrol("show", "partition")
+        assert name in show_after, (
+            f"runtime partition '{name}' must survive controller restart via WAL"
+        )
+
+    def test_deleted_partition_absent_after_restart(self, cluster):
+        """A partition created and then deleted at runtime must remain absent
+        after a controller restart — the WAL deletion must not be undone."""
+        name = _unique("persist-del")
+        node = cluster.node_names[0]
+
+        cluster.scontrol("create-partition", f"--name={name}", f"--nodes={node}")
+        cluster.scontrol("delete-partition", f"--name={name}")
+
+        show_before_restart = cluster.scontrol("show", "partition")
+        assert name not in show_before_restart
+
+        cluster.restart_controller()
+
+        show_after = cluster.scontrol("show", "partition")
+        assert name not in show_after, (
+            f"deleted partition '{name}' must stay absent after controller restart"
+        )
+
+
+class TestReconfigure:
+    """Verify scontrol reconfigure matches Slurm's semantics.
+
+    Slurm: reconfigure re-reads slurm.conf and makes the live state match it.
+    Partitions present only in the WAL (not in conf) are dropped. Partitions
+    defined in conf survive and are not touched. scontrol reconfigure does NOT
+    write to spur.conf.
+    """
+
+    def _conf_mtime(self, cluster) -> str:
+        return cluster.nodes[0].exec(
+            f"stat -c %Y '{cluster.etc_dir}/spur.conf'"
+        ).strip()
+
+    def test_reconfigure_drops_runtime_only_partition(self, cluster):
+        """A partition created via scontrol (not in spur.conf) must be removed
+        by scontrol reconfigure, matching Slurm's conf-wins semantics."""
+        name = _unique("reconf-rt")
+        node = cluster.node_names[0]
+
+        cluster.scontrol("create-partition", f"--name={name}", f"--nodes={node}")
+        show_before = cluster.scontrol("show", "partition")
+        assert name in show_before, "partition must appear before reconfigure"
+
+        cluster.scontrol("reconfigure")
+
+        show_after = cluster.scontrol("show", "partition")
+        assert name not in show_after, (
+            f"runtime-only partition '{name}' must be dropped by reconfigure "
+            f"(not in spur.conf)"
+        )
+
+    def test_reconfigure_preserves_conf_partitions(self, cluster):
+        """scontrol reconfigure must not remove partitions defined in spur.conf."""
+        show_before = cluster.scontrol("show", "partition")
+        assert "default" in show_before
+
+        cluster.scontrol("reconfigure")
+
+        show_after = cluster.scontrol("show", "partition")
+        assert "default" in show_after, (
+            "conf-defined 'default' partition must survive reconfigure"
+        )
+
+    def test_reconfigure_does_not_write_conf(self, cluster):
+        """scontrol reconfigure reads conf but must never write it back."""
+        mtime_before = self._conf_mtime(cluster)
+        cluster.scontrol("reconfigure")
+        mtime_after = self._conf_mtime(cluster)
+
+        assert mtime_before == mtime_after, (
+            f"spur.conf was modified by reconfigure: "
+            f"mtime {mtime_before} → {mtime_after}"
+        )

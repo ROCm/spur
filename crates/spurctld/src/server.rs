@@ -1366,7 +1366,7 @@ impl SlurmController for ControllerService {
 
         let req = request.into_inner();
 
-        let max_time = req.max_time.map(|s| s);
+        let max_time = req.max_time;
         let allow_accounts = if req.set_allow_accounts {
             Some(req.allow_accounts)
         } else {
