@@ -1135,8 +1135,8 @@ message CreateJobStepResponse {
 
 message CreatePartitionRequest {
   string name = 1;
-  string nodes = 2;               // hostlist pattern (mutually exclusive with selector)
-  map<string, string> selector = 3; // label selector (mutually exclusive with nodes)
+  string nodes = 2;               // hostlist pattern; a node matches if it satisfies this OR selector
+  map<string, string> selector = 3; // label selector; a node matches if it satisfies this OR nodes
   string state = 4;               // "UP" | "DOWN" | "DRAIN" | "INACTIVE" (default "UP")
   bool is_default = 5;
   string max_time = 6;            // e.g. "24:00:00" or "INFINITE" (empty = INFINITE)
@@ -1149,12 +1149,14 @@ message CreatePartitionRequest {
   string preempt_mode = 13;       // "OFF" | "CANCEL" | "REQUEUE" | "SUSPEND"
   repeated string deny_accounts = 14;
   repeated string deny_qos = 15;
+  repeated string allow_qos = 16;
 }
 
 message UpdatePartitionRequest {
   string name = 1;                // Required: partition to update
   optional string nodes = 2;
-  map<string, string> selector = 3;
+  map<string, string> selector = 3;     // replaces; empty = no change unless set_selector
+  bool set_selector = 21;               // true = apply selector (even if empty, to clear it)
   optional string state = 4;
   optional bool is_default = 5;
   optional string max_time = 6;   // "INFINITE" clears the limit
@@ -1172,6 +1174,8 @@ message UpdatePartitionRequest {
   bool set_deny_accounts = 18;
   repeated string deny_qos = 19;
   bool set_deny_qos = 20;
+  repeated string allow_qos = 22;
+  bool set_allow_qos = 23;
 }
 
 message DeletePartitionRequest {

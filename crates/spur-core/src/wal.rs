@@ -183,6 +183,7 @@ pub enum WalOperation {
         allow_groups: Option<Vec<String>>,
         deny_accounts: Option<Vec<String>>,
         deny_qos: Option<Vec<String>>,
+        allow_qos: Option<Vec<String>>,
         priority_tier: Option<u32>,
         preempt_mode: Option<String>,
         is_default: Option<bool>,

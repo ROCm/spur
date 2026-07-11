@@ -1271,6 +1271,12 @@ impl SlurmController for ControllerService {
 
         let req = request.into_inner();
 
+        if req.nodes.is_empty() && req.selector.is_empty() {
+            return Err(Status::invalid_argument(
+                "partition must specify at least one of nodes or selector",
+            ));
+        }
+
         let max_time_minutes = if req.max_time.is_empty()
             || req.max_time.eq_ignore_ascii_case("INFINITE")
             || req.max_time.eq_ignore_ascii_case("UNLIMITED")
@@ -1278,8 +1284,9 @@ impl SlurmController for ControllerService {
             None
         } else {
             Some(
-                spur_core::config::parse_time_minutes(&req.max_time)
-                    .ok_or_else(|| Status::invalid_argument(format!("invalid max_time: {}", req.max_time)))?,
+                spur_core::config::parse_time_minutes(&req.max_time).ok_or_else(|| {
+                    Status::invalid_argument(format!("invalid max_time: {}", req.max_time))
+                })?,
             )
         };
 
@@ -1327,12 +1334,15 @@ impl SlurmController for ControllerService {
             selector: req.selector.into_iter().collect(),
             max_time_minutes,
             default_time_minutes,
-            max_nodes: req.max_nodes,
+            // A literal 0 means "no limit" (matches the update-partition
+            // contract) rather than a partition that can never run a job.
+            max_nodes: req.max_nodes.filter(|&n| n != 0),
             min_nodes: if req.min_nodes == 0 { 1 } else { req.min_nodes },
             allow_accounts: req.allow_accounts,
             allow_groups: req.allow_groups,
             deny_accounts: req.deny_accounts,
             deny_qos: req.deny_qos,
+            allow_qos: req.allow_qos,
             priority_tier: req.priority_tier,
             preempt_mode,
             ..Default::default()
@@ -1366,6 +1376,28 @@ impl SlurmController for ControllerService {
 
         let req = request.into_inner();
 
+        let state = req
+            .state
+            .map(|s| match s.to_uppercase().as_str() {
+                v @ ("UP" | "DOWN" | "DRAIN" | "INACTIVE") => Ok(v.to_string()),
+                other => Err(Status::invalid_argument(format!(
+                    "unknown partition state '{}'; expected UP, DOWN, DRAIN, or INACTIVE",
+                    other
+                ))),
+            })
+            .transpose()?;
+
+        let preempt_mode = req
+            .preempt_mode
+            .map(|pm| match pm.to_uppercase().as_str() {
+                v @ ("OFF" | "CANCEL" | "REQUEUE" | "SUSPEND") => Ok(v.to_string()),
+                other => Err(Status::invalid_argument(format!(
+                    "unknown preempt_mode '{}'; expected OFF, CANCEL, REQUEUE, or SUSPEND",
+                    other
+                ))),
+            })
+            .transpose()?;
+
         let max_time = req.max_time;
         let allow_accounts = if req.set_allow_accounts {
             Some(req.allow_accounts)
@@ -1387,37 +1419,46 @@ impl SlurmController for ControllerService {
         } else {
             None
         };
-        let max_nodes = if req.clear_max_nodes {
+        let allow_qos = if req.set_allow_qos {
+            Some(req.allow_qos)
+        } else {
+            None
+        };
+        // `clear_max_nodes` and a literal 0 both mean "no limit" (0 documented
+        // as "clear limit" in the proto); neither can express a real 0-node cap.
+        let max_nodes = if req.clear_max_nodes || req.max_nodes_value == Some(0) {
             None
         } else {
             req.max_nodes_value
         };
 
-        let selector = if req.selector.is_empty() {
-            None
-        } else {
+        let selector = if req.set_selector || !req.selector.is_empty() {
             Some(req.selector.into_iter().collect())
+        } else {
+            None
         };
+        // Match create_partition's "0 means unset, not literally zero" rule.
+        let min_nodes = req.min_nodes.map(|mn| if mn == 0 { 1 } else { mn });
 
         self.cluster
             .update_partition(
                 &req.name,
                 req.nodes,
                 selector,
-                req.state,
+                state,
                 req.is_default,
                 max_time,
                 req.default_time,
-                false,
                 max_nodes,
                 req.clear_max_nodes,
-                req.min_nodes,
+                min_nodes,
                 allow_accounts,
                 allow_groups,
                 deny_accounts,
                 deny_qos,
+                allow_qos,
                 req.priority_tier,
-                req.preempt_mode,
+                preempt_mode,
             )
             .map_err(partition_rpc_status)?;
 
@@ -1451,10 +1492,7 @@ impl SlurmController for ControllerService {
         Ok(Response::new(()))
     }
 
-    async fn reconfigure(
-        &self,
-        request: Request<()>,
-    ) -> Result<Response<()>, Status> {
+    async fn reconfigure(&self, request: Request<()>) -> Result<Response<()>, Status> {
         if let Err(status) = self.check_leader(&request) {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {

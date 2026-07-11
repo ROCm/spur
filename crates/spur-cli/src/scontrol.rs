@@ -95,10 +95,10 @@ pub enum ScontrolCommand {
         /// Partition name
         #[arg(long)]
         name: String,
-        /// Hostlist of nodes (mutually exclusive with --selector)
+        /// Hostlist of nodes; a node matches if it satisfies this OR --selector
         #[arg(long, default_value = "")]
         nodes: String,
-        /// Label selector as KEY=VALUE pairs, comma-separated (mutually exclusive with --nodes)
+        /// Label selector as KEY=VALUE pairs, comma-separated; a node matches if it satisfies this OR --nodes
         #[arg(long, default_value = "")]
         selector: String,
         /// Partition state: UP (default), DOWN, DRAIN, INACTIVE
@@ -131,6 +131,9 @@ pub enum ScontrolCommand {
         /// Comma-separated QoS names denied
         #[arg(long, default_value = "")]
         deny_qos: String,
+        /// Comma-separated QoS names allowed (empty = all)
+        #[arg(long, default_value = "")]
+        allow_qos: String,
         /// Scheduling priority tier
         #[arg(long, default_value = "1")]
         priority_tier: u32,
@@ -150,6 +153,9 @@ pub enum ScontrolCommand {
         /// New label selector as KEY=VALUE pairs, comma-separated
         #[arg(long)]
         selector: Option<String>,
+        /// Clear the label selector
+        #[arg(long)]
+        clear_selector: bool,
         /// New partition state: UP, DOWN, DRAIN, INACTIVE
         #[arg(long)]
         state: Option<String>,
@@ -195,6 +201,12 @@ pub enum ScontrolCommand {
         /// Apply the --deny-qos value
         #[arg(long)]
         set_deny_qos: bool,
+        /// Replace allowed-QoS list (comma-separated; requires --set-allow-qos)
+        #[arg(long, default_value = "")]
+        allow_qos: String,
+        /// Apply the --allow-qos value (even if empty, to clear the list)
+        #[arg(long)]
+        set_allow_qos: bool,
         /// New priority tier
         #[arg(long)]
         priority_tier: Option<u32>,
@@ -378,6 +390,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             allow_groups,
             deny_accounts,
             deny_qos,
+            allow_qos,
             priority_tier,
             preempt_mode,
         } => {
@@ -396,6 +409,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 &allow_groups,
                 &deny_accounts,
                 &deny_qos,
+                &allow_qos,
                 priority_tier,
                 &preempt_mode,
             )
@@ -405,6 +419,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             name,
             nodes,
             selector,
+            clear_selector,
             state,
             default,
             max_time,
@@ -420,6 +435,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             deny_qos,
             set_deny_accounts,
             set_deny_qos,
+            allow_qos,
+            set_allow_qos,
             priority_tier,
             preempt_mode,
         } => {
@@ -428,6 +445,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 &name,
                 nodes,
                 selector,
+                clear_selector,
                 state,
                 default,
                 max_time,
@@ -435,14 +453,32 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 max_nodes,
                 clear_max_nodes,
                 min_nodes,
-                if set_allow_accounts { Some(&allow_accounts) } else { None },
-                if set_allow_groups { Some(&allow_groups) } else { None },
+                if set_allow_accounts {
+                    Some(&allow_accounts)
+                } else {
+                    None
+                },
+                if set_allow_groups {
+                    Some(&allow_groups)
+                } else {
+                    None
+                },
                 set_allow_accounts,
                 set_allow_groups,
-                if set_deny_accounts { Some(&deny_accounts) } else { None },
+                if set_deny_accounts {
+                    Some(&deny_accounts)
+                } else {
+                    None
+                },
                 if set_deny_qos { Some(&deny_qos) } else { None },
                 set_deny_accounts,
                 set_deny_qos,
+                if set_allow_qos {
+                    Some(&allow_qos)
+                } else {
+                    None
+                },
+                set_allow_qos,
                 priority_tier,
                 preempt_mode,
             )
@@ -647,9 +683,21 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 );
                 println!(
                     "   AllowGroups={} AllowAccounts={} AllowQos={}",
-                    if part.allow_groups.is_empty() { "ALL".into() } else { part.allow_groups.clone() },
-                    if part.allow_accounts.is_empty() { "ALL".into() } else { part.allow_accounts.clone() },
-                    if part.allow_qos.is_empty() { "ALL".into() } else { part.allow_qos.clone() },
+                    if part.allow_groups.is_empty() {
+                        "ALL".into()
+                    } else {
+                        part.allow_groups.clone()
+                    },
+                    if part.allow_accounts.is_empty() {
+                        "ALL".into()
+                    } else {
+                        part.allow_accounts.clone()
+                    },
+                    if part.allow_qos.is_empty() {
+                        "ALL".into()
+                    } else {
+                        part.allow_qos.clone()
+                    },
                 );
                 if !part.deny_accounts.is_empty() {
                     println!("   DenyAccounts={}", part.deny_accounts);
@@ -677,7 +725,11 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 println!(
                     "   MinNodes={} MaxNodes={}",
                     part.min_nodes,
-                    if part.max_nodes == 0 { "UNLIMITED".into() } else { part.max_nodes.to_string() },
+                    if part.max_nodes == 0 {
+                        "UNLIMITED".into()
+                    } else {
+                        part.max_nodes.to_string()
+                    },
                 );
                 println!(
                     "   PreemptMode={} PriorityTier={}",
@@ -899,17 +951,13 @@ async fn parse_and_create_partition(controller: &str, params: &[String]) -> Resu
                 "allowqos" => allow_qos = value.into(),
                 "denyaccounts" => deny_accounts = value.into(),
                 "denyqos" => deny_qos = value.into(),
-                "prioritytier" | "priorityjobfactor" => {
-                    priority_tier = value.parse().unwrap_or(1)
-                }
+                "prioritytier" | "priorityjobfactor" => priority_tier = value.parse().unwrap_or(1),
                 "preemptmode" => preempt_mode = value.to_uppercase(),
                 // silently ignore Slurm-only keys that don't map to spur fields
-                "allocnodes" | "hidden" | "rootonly" | "reqresv"
-                | "oversubscribe" | "overtimelimit" | "gracetime"
-                | "disablerootjobs" | "exclusiveuser" | "exclusivetopo"
-                | "lln" | "maxcpuspernode" | "maxcpuspersocket"
-                | "jobdefaults" | "defmempernode" | "maxmempernode"
-                | "qos" | "tres" => {}
+                "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
+                | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser"
+                | "exclusivetopo" | "lln" | "maxcpuspernode" | "maxcpuspersocket"
+                | "jobdefaults" | "defmempernode" | "maxmempernode" | "qos" | "tres" => {}
                 other => eprintln!("scontrol create partition: unknown key '{}'", other),
             }
         }
@@ -934,19 +982,11 @@ async fn parse_and_create_partition(controller: &str, params: &[String]) -> Resu
         &allow_groups,
         &deny_accounts,
         &deny_qos,
+        &allow_qos,
         priority_tier,
         &preempt_mode,
     )
     .await?;
-
-    if !allow_qos.is_empty() {
-        // AllowQos is stored on the partition but not yet exposed in the
-        // update RPC. Log a notice so the admin knows it was ignored.
-        eprintln!(
-            "scontrol create partition: AllowQos= is not yet settable at runtime (ignored); \
-             set it in spur.conf and restart, or file a feature request"
-        );
-    }
 
     Ok(())
 }
@@ -980,7 +1020,17 @@ async fn parse_and_create_reservation(controller: &str, params: &[String]) -> Re
         anyhow::bail!("scontrol create: ReservationName= is required");
     }
 
-    create_reservation(controller, &name, &start_time, duration, &nodes, &accounts, &users, &flags).await
+    create_reservation(
+        controller,
+        &name,
+        &start_time,
+        duration,
+        &nodes,
+        &accounts,
+        &users,
+        &flags,
+    )
+    .await
 }
 
 /// Parse key=value pairs from a Slurm-style `scontrol delete` command and
@@ -993,17 +1043,25 @@ async fn parse_and_delete(controller: &str, params: &[String]) -> Result<()> {
 
     match entity.as_deref() {
         Some("partitionname") => {
-            let name = params.iter().find_map(|p| {
-                let (k, v) = p.split_once('=')?;
-                (k.to_lowercase() == "partitionname").then(|| v.to_string())
-            }).ok_or_else(|| anyhow::anyhow!("scontrol delete: PartitionName= value missing"))?;
+            let name = params
+                .iter()
+                .find_map(|p| {
+                    let (k, v) = p.split_once('=')?;
+                    (k.to_lowercase() == "partitionname").then(|| v.to_string())
+                })
+                .ok_or_else(|| anyhow::anyhow!("scontrol delete: PartitionName= value missing"))?;
             delete_partition(controller, &name).await
         }
         Some("reservationname") => {
-            let name = params.iter().find_map(|p| {
-                let (k, v) = p.split_once('=')?;
-                (k.to_lowercase() == "reservationname").then(|| v.to_string())
-            }).ok_or_else(|| anyhow::anyhow!("scontrol delete: ReservationName= value missing"))?;
+            let name = params
+                .iter()
+                .find_map(|p| {
+                    let (k, v) = p.split_once('=')?;
+                    (k.to_lowercase() == "reservationname").then(|| v.to_string())
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("scontrol delete: ReservationName= value missing")
+                })?;
             delete_reservation(controller, &name).await
         }
         other => anyhow::bail!(
@@ -1062,8 +1120,9 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
         return update_node(controller, &name, node_state.as_deref(), node_reason).await;
     }
 
-    let jid =
-        job_id.ok_or_else(|| anyhow::anyhow!("scontrol update: JobId=, NodeName=, or PartitionName= required"))?;
+    let jid = job_id.ok_or_else(|| {
+        anyhow::anyhow!("scontrol update: JobId=, NodeName=, or PartitionName= required")
+    })?;
 
     let tl = time_limit.as_ref().and_then(|t| {
         spur_core::config::parse_time_minutes(t).map(|m| prost_types::Duration {
@@ -1108,6 +1167,7 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
     let mut allow_groups: Option<String> = None;
     let mut deny_accounts: Option<String> = None;
     let mut deny_qos: Option<String> = None;
+    let mut allow_qos: Option<String> = None;
     let mut priority_tier: Option<u32> = None;
     let mut preempt_mode: Option<String> = None;
 
@@ -1118,14 +1178,7 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
                 "nodes" => nodes = Some(value.into()),
                 "state" => state = Some(value.to_uppercase()),
                 "default" => is_default = Some(value.eq_ignore_ascii_case("yes")),
-                "maxtime" => {
-                    if value.eq_ignore_ascii_case("INFINITE") || value.eq_ignore_ascii_case("UNLIMITED") {
-                        clear_max_nodes = false; // MaxTime INFINITE clears the limit
-                        max_time = Some(value.into());
-                    } else {
-                        max_time = Some(value.into());
-                    }
-                }
+                "maxtime" => max_time = Some(value.into()),
                 "defaulttime" => default_time = Some(value.into()),
                 "maxnodes" => {
                     if value.eq_ignore_ascii_case("UNLIMITED") || value == "0" {
@@ -1139,18 +1192,14 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
                 "allowgroups" => allow_groups = Some(value.into()),
                 "denyaccounts" => deny_accounts = Some(value.into()),
                 "denyqos" => deny_qos = Some(value.into()),
-                "allowqos" => {} // stored but not yet in update path; silently skip
-                "prioritytier" | "priorityjobfactor" => {
-                    priority_tier = value.parse().ok()
-                }
+                "allowqos" => allow_qos = Some(value.into()),
+                "prioritytier" | "priorityjobfactor" => priority_tier = value.parse().ok(),
                 "preemptmode" => preempt_mode = Some(value.to_uppercase()),
                 // silently ignore Slurm-only keys
-                "allocnodes" | "hidden" | "rootonly" | "reqresv"
-                | "oversubscribe" | "overtimelimit" | "gracetime"
-                | "disablerootjobs" | "exclusiveuser" | "exclusivetopo"
-                | "lln" | "maxcpuspernode" | "maxcpuspersocket"
-                | "jobdefaults" | "defmempernode" | "maxmempernode"
-                | "qos" | "tres" => {}
+                "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
+                | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser"
+                | "exclusivetopo" | "lln" | "maxcpuspernode" | "maxcpuspersocket"
+                | "jobdefaults" | "defmempernode" | "maxmempernode" | "qos" | "tres" => {}
                 other => eprintln!("scontrol update partition: unknown key '{}'", other),
             }
         }
@@ -1164,12 +1213,14 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
     let set_allow_groups = allow_groups.is_some();
     let set_deny_accounts = deny_accounts.is_some();
     let set_deny_qos = deny_qos.is_some();
+    let set_allow_qos = allow_qos.is_some();
 
     update_partition(
         controller,
         &name,
         nodes,
         None, // selector not supported in inline syntax
+        false,
         state,
         is_default,
         max_time,
@@ -1177,14 +1228,36 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
         max_nodes,
         clear_max_nodes,
         min_nodes,
-        if set_allow_accounts { allow_accounts.as_deref() } else { None },
-        if set_allow_groups { allow_groups.as_deref() } else { None },
+        if set_allow_accounts {
+            allow_accounts.as_deref()
+        } else {
+            None
+        },
+        if set_allow_groups {
+            allow_groups.as_deref()
+        } else {
+            None
+        },
         set_allow_accounts,
         set_allow_groups,
-        if set_deny_accounts { deny_accounts.as_deref() } else { None },
-        if set_deny_qos { deny_qos.as_deref() } else { None },
+        if set_deny_accounts {
+            deny_accounts.as_deref()
+        } else {
+            None
+        },
+        if set_deny_qos {
+            deny_qos.as_deref()
+        } else {
+            None
+        },
         set_deny_accounts,
         set_deny_qos,
+        if set_allow_qos {
+            allow_qos.as_deref()
+        } else {
+            None
+        },
+        set_allow_qos,
         priority_tier,
         preempt_mode,
     )
@@ -1261,6 +1334,7 @@ async fn create_partition(
     allow_groups: &str,
     deny_accounts: &str,
     deny_qos: &str,
+    allow_qos: &str,
     priority_tier: u32,
     preempt_mode: &str,
 ) -> Result<()> {
@@ -1291,6 +1365,7 @@ async fn create_partition(
             allow_groups: split_csv(allow_groups),
             deny_accounts: split_csv(deny_accounts),
             deny_qos: split_csv(deny_qos),
+            allow_qos: split_csv(allow_qos),
             priority_tier,
             preempt_mode: preempt_mode.to_string(),
         })
@@ -1308,6 +1383,7 @@ async fn update_partition(
     name: &str,
     nodes: Option<String>,
     selector: Option<String>,
+    clear_selector: bool,
     state: Option<String>,
     is_default: Option<bool>,
     max_time: Option<String>,
@@ -1323,6 +1399,8 @@ async fn update_partition(
     deny_qos: Option<&str>,
     set_deny_accounts: bool,
     set_deny_qos: bool,
+    allow_qos: Option<&str>,
+    set_allow_qos: bool,
     priority_tier: Option<u32>,
     preempt_mode: Option<String>,
 ) -> Result<()> {
@@ -1349,6 +1427,7 @@ async fn update_partition(
             name: name.to_string(),
             nodes,
             selector: selector_map,
+            set_selector: clear_selector || selector.is_some(),
             state,
             is_default,
             max_time,
@@ -1364,6 +1443,8 @@ async fn update_partition(
             set_deny_accounts,
             deny_qos: deny_qos.map(split_csv).unwrap_or_default(),
             set_deny_qos,
+            allow_qos: allow_qos.map(split_csv).unwrap_or_default(),
+            set_allow_qos,
             priority_tier,
             preempt_mode,
         })
@@ -1399,10 +1480,7 @@ async fn reconfigure(controller: &str) -> Result<()> {
         .context("failed to connect to spurctld")?;
     let mut client = SlurmControllerClient::new(channel);
 
-    client
-        .reconfigure(())
-        .await
-        .context("reconfigure failed")?;
+    client.reconfigure(()).await.context("reconfigure failed")?;
 
     println!("Reconfiguration complete");
     Ok(())

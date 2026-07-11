@@ -14,6 +14,20 @@ def _unique(prefix: str) -> str:
     return f"{prefix}-{int(time.time())}"
 
 
+def _sbatch_when_qos_ready(cluster, args: list[str], timeout: int = 15) -> str:
+    """Retry sbatch until the accounting QoS cache picks up a QoS created
+    moments earlier via sacctmgr — the cache refreshes on a fixed interval
+    (see accounting_cluster's fairshare_refresh_secs), not on write."""
+    deadline = time.time() + timeout
+    while True:
+        try:
+            return cluster.sbatch(args)
+        except RuntimeError as e:
+            if "does not exist" not in str(e) or time.time() >= deadline:
+                raise
+            time.sleep(1)
+
+
 class TestPartitionCreate:
     def test_create_and_show_partition(self, cluster):
         name = _unique("part")
@@ -83,7 +97,9 @@ class TestPartitionCreate:
                 f"--nodes={cluster.node_names[0]}",
             ]
         )
-        assert out.strip() != "" or True  # CLI may reject at arg-parse level; just must not crash
+        assert "empty" in out.lower() or "invalid" in out.lower() or "error" in out.lower(), (
+            f"expected error for empty partition name, got: {out}"
+        )
 
 
 class TestPartitionUpdate:
@@ -210,24 +226,57 @@ class TestPartitionDelete:
         )
 
     def test_delete_partition_with_running_job_fails(self, cluster):
-        """Structural test: the in-use guard is enforced by unit tests
-        (validate_partition + delete_partition in cluster.rs). Here we verify
-        the CLI path: deleting an idle partition while another partition has
-        running jobs does NOT block the idle partition's deletion."""
-        name = _unique("part-idle")
-        nodes_list = ",".join(cluster.node_names)
+        """Deleting a partition with a job actively running on it must be
+        rejected (the in-use guard in ClusterManager::delete_partition).
+        Once the job is cancelled, deletion must succeed."""
+        name = _unique("part-inuse")
+        node = cluster.node_names[0]
 
         cluster.scontrol(
             "create-partition",
             f"--name={name}",
-            f"--nodes={nodes_list}",
+            f"--nodes={node}",
         )
 
-        # Confirm partition exists.
+        script = cluster.write_file("part-inuse.sh", "#!/bin/bash\nsleep 60\n")
+        sb = cluster.sbatch(["-N", "1", "-w", node, "-p", name, "-t", "5", script])
+        job_id = parse_job_id(sb)
+        assert job_id is not None
+        wait_job_state(cluster, job_id, "R", timeout=60)
+
+        try:
+            out = cluster.cli_allow_fail(
+                ["scontrol", "delete-partition", f"--name={name}"]
+            )
+            assert "in use" in out.lower() or "error" in out.lower(), (
+                f"expected in-use rejection while job {job_id} is running, got: {out}"
+            )
+
+            show = cluster.scontrol("show", "partition")
+            assert name in show, "partition must still exist after rejected delete"
+        finally:
+            cluster.scancel(str(job_id))
+            wait_job(cluster, job_id, timeout=60)
+
+        out = cluster.scontrol("delete-partition", f"--name={name}")
+        assert "deleted" in out.lower(), f"expected deletion to succeed after cancel, got: {out}"
+
+        show_after = cluster.scontrol("show", "partition")
+        assert name not in show_after
+
+    def test_delete_idle_partition_succeeds(self, cluster):
+        name = _unique("part-idle")
+        node = cluster.node_names[0]
+
+        cluster.scontrol(
+            "create-partition",
+            f"--name={name}",
+            f"--nodes={node}",
+        )
+
         show = cluster.scontrol("show", "partition")
         assert name in show
 
-        # No jobs on this partition — deletion must succeed.
         out = cluster.scontrol("delete-partition", f"--name={name}")
         assert "deleted" in out.lower(), f"expected deletion to succeed, got: {out}"
 
@@ -261,9 +310,12 @@ class TestPartitionLifecycle:
         show_after = cluster.scontrol("show", "partition")
         assert name not in show_after
 
-    def test_jobs_on_default_partition_schedule_after_create(self, cluster):
-        """Create a new partition, then verify jobs on the DEFAULT partition
-        still schedule normally (partition CRUD does not disrupt other partitions)."""
+    def test_jobs_schedule_on_newly_created_partition(self, cluster):
+        """A partition created at runtime must be immediately usable by
+        already-registered nodes — not just visible in `show partition`.
+        Submits directly to the new partition (not the default) and waits
+        for actual completion, exercising the scheduler's node-eligibility
+        path end to end rather than just the partition table."""
         name = _unique("part-sched")
         nodes_list = ",".join(cluster.node_names)
         node = cluster.node_names[0]
@@ -278,15 +330,18 @@ class TestPartitionLifecycle:
         show = cluster.scontrol("show", "partition")
         assert name in show
 
-        # Submit to the default partition to confirm the cluster is healthy.
         script = cluster.write_file("part-sched.sh", "#!/bin/bash\necho PARTITION_OK\n")
         out_path = f"{cluster.remote_dir}/part-sched.out"
-        sb = cluster.sbatch(["-N", "1", "-w", node, "-t", "1", "-o", out_path, script])
+        sb = cluster.sbatch(["-N", "1", "-w", node, "-p", name, "-t", "1", "-o", out_path, script])
         job_id = parse_job_id(sb)
         assert job_id is not None
 
         state = wait_job(cluster, job_id, timeout=60)
-        assert state in ("CD", "GONE"), f"expected completed, got {state}"
+        assert state in ("CD", "GONE"), (
+            f"expected job on newly-created partition '{name}' to complete, got {state} "
+            "(a stuck/pending state here means the node's cached partition "
+            "membership was not refreshed after partition creation)"
+        )
 
         content = cluster.read_output_on_any_node(out_path)
         assert "PARTITION_OK" in content
@@ -483,8 +538,8 @@ class TestPartitionAllowDenyQos:
         script = c.write_file("allow-qos2.sh", "#!/bin/bash\necho ALLOW_QOS_OK\n")
         out_path = f"{c.remote_dir}/allow-qos2.out"
 
-        sb = c.sbatch(
-            ["-N", "1", "-p", name, "-q", "premium", "-t", "1", "-o", out_path, script]
+        sb = _sbatch_when_qos_ready(
+            c, ["-N", "1", "-p", name, "-q", "premium", "-t", "1", "-o", out_path, script]
         )
         job_id = parse_job_id(sb)
         assert job_id is not None
@@ -536,8 +591,8 @@ class TestPartitionAllowDenyQos:
         script = c.write_file("deny-qos2.sh", "#!/bin/bash\necho DENY_QOS_OK\n")
         out_path = f"{c.remote_dir}/deny-qos2.out"
 
-        sb = c.sbatch(
-            ["-N", "1", "-p", name, "-q", "normal", "-t", "1", "-o", out_path, script]
+        sb = _sbatch_when_qos_ready(
+            c, ["-N", "1", "-p", name, "-q", "normal", "-t", "1", "-o", out_path, script]
         )
         job_id = parse_job_id(sb)
         assert job_id is not None
@@ -567,7 +622,7 @@ class TestPartitionAllowDenyQos:
         script = c.write_file("upd-qos.sh", "#!/bin/bash\necho DONE\n")
 
         # Before update: lowpri QoS is accepted.
-        sb = c.sbatch(["-N", "1", "-p", name, "-q", "lowpri", "-t", "1", script])
+        sb = _sbatch_when_qos_ready(c, ["-N", "1", "-p", name, "-q", "lowpri", "-t", "1", script])
         assert parse_job_id(sb) is not None, "lowpri should be accepted before deny update"
 
         # Add lowpri to deny list at runtime.

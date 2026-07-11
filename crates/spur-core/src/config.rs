@@ -494,6 +494,8 @@ pub struct PartitionConfig {
     #[serde(default)]
     pub deny_qos: Vec<String>,
     #[serde(default)]
+    pub allow_qos: Vec<String>,
+    #[serde(default)]
     pub priority_tier: u32,
     #[serde(default)]
     pub preempt_mode: String,
@@ -1154,6 +1156,7 @@ impl SlurmConfig {
                 allow_groups: pc.allow_groups.clone(),
                 deny_accounts: pc.deny_accounts.clone(),
                 deny_qos: pc.deny_qos.clone(),
+                allow_qos: pc.allow_qos.clone(),
                 priority_tier: pc.priority_tier,
                 preempt_mode: match pc.preempt_mode.to_lowercase().as_str() {
                     "cancel" => PreemptMode::Cancel,

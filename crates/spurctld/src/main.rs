@@ -119,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Initialize cluster manager first so Raft recovery can apply entries.
-    // Pass the config path for best-effort writeback after partition CRUD ops.
+    // Pass the config path so `scontrol reconfigure` can re-read spur.conf.
     let config_path = if args.config.exists() {
         Some(args.config.clone())
     } else {
@@ -357,6 +357,7 @@ fn default_config() -> spur_core::config::SlurmConfig {
             allow_groups: Vec::new(),
             deny_accounts: Vec::new(),
             deny_qos: Vec::new(),
+            allow_qos: Vec::new(),
             priority_tier: 1,
             preempt_mode: String::new(),
         }],
