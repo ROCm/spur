@@ -111,3 +111,55 @@ class TestQosLimitReasons:
         assert reason == "QOSMaxWallDurationPerJobLimit", (
             f"fallback QOS limit not enforced, got {reason!r}"
         )
+
+    def test_node_cap_sets_qos_pending_reason(self, accounting_cluster):
+        c = accounting_cluster
+
+        # Define a QoS that caps a user to 1 node.
+        c.sacctmgr(["add", "qos", "name=nodecap", "maxtresperuser=node=1"])
+        time.sleep(15)
+
+        # A job in that QoS asking for 2 nodes exceeds the per-user cap.
+        script = c.write_file("qos-node-job.sh", "#!/bin/bash\nsleep 30\n")
+        job_id = parse_job_id(
+            c.sbatch(["-J", "qos-node", "-N", "2", "-q", "nodecap", script])
+        )
+        assert job_id is not None
+
+        deadline = time.time() + 30
+        reason = ""
+        while time.time() < deadline:
+            reason = _reason(c, job_id)
+            if reason == "QOSMaxNodePerUserLimit":
+                break
+            time.sleep(2)
+        assert reason == "QOSMaxNodePerUserLimit", (
+            f"expected QOSMaxNodePerUserLimit, got {reason!r}"
+        )
+
+    def test_memory_cap_sets_qos_pending_reason(self, accounting_cluster):
+        c = accounting_cluster
+
+        # Define a QoS that caps a user to 1G of memory.
+        c.sacctmgr(["add", "qos", "name=memcap", "maxtresperuser=mem=1G"])
+        time.sleep(15)
+
+        # A job in that QoS asking for 2G exceeds the per-user cap.
+        script = c.write_file("qos-mem-job.sh", "#!/bin/bash\nsleep 30\n")
+        job_id = parse_job_id(
+            c.sbatch(
+                ["-J", "qos-mem", "-N", "1", "--mem=2G", "-q", "memcap", script]
+            )
+        )
+        assert job_id is not None
+
+        deadline = time.time() + 30
+        reason = ""
+        while time.time() < deadline:
+            reason = _reason(c, job_id)
+            if reason == "QOSMaxMemoryPerUser":
+                break
+            time.sleep(2)
+        assert reason == "QOSMaxMemoryPerUser", (
+            f"expected QOSMaxMemoryPerUser, got {reason!r}"
+        )
