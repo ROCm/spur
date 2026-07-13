@@ -18,7 +18,7 @@ use spur_proto::proto::*;
 
 use spur_sched::cons_tres::{AllocationResult, NodeAllocation};
 
-use spur_spank::{SpankHook, SpankHost};
+use spur_spank::{SpankContext, SpankHandle, SpankHook, SpankHost};
 
 use spur_core::config::HooksConfig;
 use spur_core::spur_env::SpurEnv;
@@ -94,7 +94,7 @@ impl AgentService {
                 Ok(entries) => {
                     let mut host = SpankHost::new();
                     for entry in &entries {
-                        if let Err(e) = host.load_plugin(&entry.path) {
+                        if let Err(e) = host.load_plugin(&entry.path, &entry.args) {
                             if entry.required {
                                 warn!(
                                     plugin = %entry.path.display(),
@@ -249,10 +249,15 @@ impl AgentService {
                 // Invoke SPANK TaskExit and JobEpilog hooks for completed jobs
                 if let Some(ref spank_host) = *spank {
                     for c in &completed {
-                        if let Err(e) = spank_host.invoke_hook(SpankHook::TaskExit) {
+                        let context = SpankContext {
+                            job_id: c.job_id,
+                            ..Default::default()
+                        };
+                        let mut handle = SpankHandle::new(context, HashMap::new());
+                        if let Err(e) = spank_host.invoke_hook(SpankHook::TaskExit, &mut handle) {
                             warn!(c.job_id, error = %e, "SPANK TaskExit hook failed");
                         }
-                        if let Err(e) = spank_host.invoke_hook(SpankHook::JobEpilog) {
+                        if let Err(e) = spank_host.invoke_hook(SpankHook::JobEpilog, &mut handle) {
                             warn!(c.job_id, error = %e, "SPANK JobEpilog hook failed");
                         }
                     }

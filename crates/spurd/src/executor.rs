@@ -15,7 +15,7 @@ use tokio::process::Command;
 use tracing::{debug, info, warn};
 
 use spur_core::job::JobId;
-use spur_spank::SpankHost;
+use spur_spank::{SpankContext, SpankHandle, SpankHost};
 
 /// Typed launch errors so callers can distinguish prolog failure from other failures.
 pub enum LaunchError {
@@ -257,16 +257,6 @@ async fn spawn_job_process(
     } = *cfg;
     info!(job_id, work_dir, "launching job");
 
-    // Invoke SPANK Init hook (after prolog, before process spawn)
-    if let Some(spank) = spank {
-        if let Err(e) = spank.invoke_hook(spur_spank::SpankHook::Init) {
-            warn!(job_id, error = %e, "SPANK Init hook failed");
-        }
-        if let Err(e) = spank.invoke_hook(spur_spank::SpankHook::TaskInit) {
-            warn!(job_id, error = %e, "SPANK TaskInit hook failed");
-        }
-    }
-
     // Set up cgroup for isolation
     let cgroup_path = setup_cgroup(job_id, cpus, memory_mb, cpu_ids)?;
 
@@ -343,6 +333,25 @@ async fn spawn_job_process(
     env.insert("OPENBLAS_NUM_THREADS".into(), cpus.to_string());
     env.insert("VECLIB_MAXIMUM_THREADS".into(), cpus.to_string());
     env.insert("NUMEXPR_NUM_THREADS".into(), cpus.to_string());
+
+    // Run SPANK Init/TaskInit against a handle seeded with the assembled env,
+    // then fold plugin edits back so both the container and command paths pick
+    // them up. Hooks run in the spurd (root) process, not the forked task.
+    if let Some(spank) = spank {
+        let context = SpankContext {
+            job_id,
+            uid,
+            gid,
+            ..Default::default()
+        };
+        let mut handle = SpankHandle::new(context, env);
+        for hook in [spur_spank::SpankHook::Init, spur_spank::SpankHook::TaskInit] {
+            if let Err(e) = spank.invoke_hook(hook, &mut handle) {
+                warn!(job_id, error = %e, "SPANK hook failed");
+            }
+        }
+        env = handle.env;
+    }
 
     // Container jobs: use explicit fork() + container_init() instead of bash wrapper.
     if let Some(ctn) = container {

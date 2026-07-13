@@ -36,9 +36,11 @@ mod tests {
     #[test]
     fn t58_3_empty_host_invoke() {
         let host = SpankHost::new();
-        assert!(host.invoke_hook(SpankHook::Init).is_ok());
-        assert!(host.invoke_hook(SpankHook::TaskExit).is_ok());
-        assert!(host.invoke_hook(SpankHook::JobEpilog).is_ok());
+        let mut handle =
+            SpankHandle::new(SpankContext::default(), std::collections::HashMap::new());
+        assert!(host.invoke_hook(SpankHook::Init, &mut handle).is_ok());
+        assert!(host.invoke_hook(SpankHook::TaskExit, &mut handle).is_ok());
+        assert!(host.invoke_hook(SpankHook::JobEpilog, &mut handle).is_ok());
     }
 
     // -- T58.4: Missing plugstack file returns error ----------------------
@@ -78,12 +80,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // -- T58.6: Context can be set ----------------------------------------
+    // -- T58.6: Handle carries job context --------------------------------
 
     #[test]
-    fn t58_6_set_context() {
-        let mut host = SpankHost::new();
-        host.set_context(SpankContext {
+    fn t58_6_handle_context() {
+        let ctx = SpankContext {
             job_id: 100,
             uid: 1000,
             gid: 1000,
@@ -93,9 +94,10 @@ mod tests {
             local_task_count: 4,
             total_task_count: 8,
             task_pid: 54321,
-        });
-        // No panic, context accepted
-        assert_eq!(host.plugin_count(), 0);
+        };
+        let handle = SpankHandle::new(ctx, std::collections::HashMap::new());
+        assert_eq!(handle.context.job_id, 100);
+        assert_eq!(handle.context.task_pid, 54321);
     }
 
     // -- T58.7: Load nonexistent plugin fails -----------------------------
@@ -103,7 +105,7 @@ mod tests {
     #[test]
     fn t58_7_load_nonexistent_plugin() {
         let mut host = SpankHost::new();
-        let result = host.load_plugin(Path::new("/nonexistent/plugin.so"));
+        let result = host.load_plugin(Path::new("/nonexistent/plugin.so"), &[]);
         assert!(result.is_err());
         assert_eq!(host.plugin_count(), 0);
     }
@@ -126,11 +128,8 @@ mod tests {
         use std::ffi::{CStr, CString};
         use std::os::raw::c_int;
 
-        let mut handle = SpankHandle {
-            context: SpankContext::default(),
-            env: std::collections::HashMap::new(),
-            job_control_env: std::collections::HashMap::new(),
-        };
+        let mut handle =
+            SpankHandle::new(SpankContext::default(), std::collections::HashMap::new());
         let var = CString::new("SPANK_TEST").unwrap();
         let val = CString::new("hello").unwrap();
 
@@ -151,5 +150,31 @@ mod tests {
         );
         let out = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap();
         assert_eq!(out, "hello");
+    }
+
+    // -- T58.10: job env seeded into the handle is readable via getenv ----
+
+    #[test]
+    fn t58_10_seeded_env_visible_to_getenv() {
+        use std::ffi::{CStr, CString};
+        use std::os::raw::c_int;
+
+        let mut env = std::collections::HashMap::new();
+        env.insert("SLURM_JOB_ID".to_string(), "4242".to_string());
+        let mut handle = SpankHandle::new(SpankContext::default(), env);
+
+        let var = CString::new("SLURM_JOB_ID").unwrap();
+        let mut buf = [0i8; 16];
+        assert_eq!(
+            spank_getenv(
+                &mut handle,
+                var.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len() as c_int
+            ),
+            ESPANK_SUCCESS
+        );
+        let out = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap();
+        assert_eq!(out, "4242");
     }
 }

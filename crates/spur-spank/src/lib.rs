@@ -7,7 +7,7 @@
 //! the `spank_*`/`slurm_*` callback API expected by `spank.h`.
 
 use std::collections::HashMap;
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 
@@ -93,13 +93,14 @@ struct SpankPlugin {
     #[cfg(unix)]
     lib: libloading::Library,
     name: String,
+    /// Plugstack arguments, passed to every hook as `argv` (owned so the
+    /// pointers handed to the plugin stay valid for its lifetime).
+    argv: Vec<CString>,
 }
 
 /// The SPANK plugin host — manages loading and invoking plugins.
 pub struct SpankHost {
     plugins: Vec<SpankPlugin>,
-    /// Current job context for spank_get_item.
-    context: SpankContext,
 }
 
 /// Job context available to SPANK plugins.
@@ -124,18 +125,14 @@ impl Default for SpankHost {
 
 impl SpankHost {
     pub fn new() -> Self {
-        // Reachable from every host that constructs a SpankHost, keeping the
-        // exported symbols in the binary (see retain_exported_symbols).
-        retain_exported_symbols();
         Self {
             plugins: Vec::new(),
-            context: SpankContext::default(),
         }
     }
 
-    /// Load a SPANK plugin from a .so file.
+    /// Load a SPANK plugin from a .so file, with its plugstack arguments.
     #[cfg(unix)]
-    pub fn load_plugin(&mut self, path: &Path) -> anyhow::Result<()> {
+    pub fn load_plugin(&mut self, path: &Path, args: &[String]) -> anyhow::Result<()> {
         use anyhow::Context;
 
         let lib = unsafe {
@@ -149,12 +146,25 @@ impl SpankHost {
             .unwrap_or("unknown")
             .to_string();
 
+        // Drop args containing interior NUL rather than failing the load.
+        let argv = args
+            .iter()
+            .filter_map(|a| match CString::new(a.as_str()) {
+                Ok(c) => Some(c),
+                Err(_) => {
+                    warn!(plugin = %name, arg = %a, "skipping SPANK arg with interior NUL");
+                    None
+                }
+            })
+            .collect();
+
         info!(plugin = %name, path = %path.display(), "loaded SPANK plugin");
 
         self.plugins.push(SpankPlugin {
             path: path.to_path_buf(),
             lib,
             name,
+            argv,
         });
 
         Ok(())
@@ -162,25 +172,18 @@ impl SpankHost {
 
     /// Not available on non-unix platforms.
     #[cfg(not(unix))]
-    pub fn load_plugin(&mut self, path: &Path) -> anyhow::Result<()> {
+    pub fn load_plugin(&mut self, path: &Path, args: &[String]) -> anyhow::Result<()> {
         anyhow::bail!("SPANK plugins only supported on Unix");
     }
 
-    /// Set the job context for subsequent hook calls.
-    pub fn set_context(&mut self, ctx: SpankContext) {
-        self.context = ctx;
-    }
-
-    /// Invoke a hook across all loaded plugins.
-    pub fn invoke_hook(&self, hook: SpankHook) -> Result<(), SpankError> {
+    /// Invoke a hook across all loaded plugins against a caller-owned handle.
+    ///
+    /// The handle is threaded through every plugin (and reused across hooks by
+    /// the caller), so env changes made by one plugin are visible to the next
+    /// and can be read back after the call returns.
+    pub fn invoke_hook(&self, hook: SpankHook, handle: &mut SpankHandle) -> Result<(), SpankError> {
         let symbol = hook.symbol_name();
-
-        let mut handle = SpankHandle {
-            context: self.context.clone(),
-            env: HashMap::new(),
-            job_control_env: HashMap::new(),
-        };
-        let handle_ptr = &mut handle as *mut SpankHandle;
+        let handle_ptr = handle as *mut SpankHandle;
 
         for plugin in &self.plugins {
             #[cfg(unix)]
@@ -196,7 +199,13 @@ impl SpankHost {
                 match func {
                     Ok(f) => {
                         debug!(plugin = %plugin.name, path = %plugin.path.display(), hook = symbol, "invoking SPANK hook");
-                        let rc = unsafe { f(handle_ptr, 0, std::ptr::null_mut()) };
+                        // Slurm passes exactly `ac` argv elements (no NULL terminator).
+                        let mut argv: Vec<*mut c_char> = plugin
+                            .argv
+                            .iter()
+                            .map(|a| a.as_ptr() as *mut c_char)
+                            .collect();
+                        let rc = unsafe { f(handle_ptr, argv.len() as c_int, argv.as_mut_ptr()) };
                         if rc != 0 {
                             warn!(
                                 plugin = %plugin.name,
@@ -244,6 +253,17 @@ pub struct SpankHandle {
     pub job_control_env: HashMap<String, String>,
 }
 
+impl SpankHandle {
+    /// Create a handle seeded with the job context and its environment.
+    pub fn new(context: SpankContext, env: HashMap<String, String>) -> Self {
+        Self {
+            context,
+            env,
+            job_control_env: HashMap::new(),
+        }
+    }
+}
+
 /// Retrieve a job context item from the SPANK handle.
 ///
 /// Matches Slurm's `spank_get_item(spank_t, spank_item_t, ...)`. Slurm
@@ -269,6 +289,17 @@ pub extern "C" fn spank_get_item(handle: *mut SpankHandle, item: c_int, val: *mu
         x if x == SpankItem::JobLocalTaskCount as c_int => handle.context.local_task_count,
         x if x == SpankItem::JobTotalTaskCount as c_int => handle.context.total_task_count,
         x if x == SpankItem::TaskPid as c_int => handle.context.task_pid,
+        // Known Slurm items we don't source from the handle yet: report
+        // "not available" rather than conflating with an invalid id.
+        x if x == SpankItem::JobNcpus as c_int
+            || x == SpankItem::JobArgv as c_int
+            || x == SpankItem::JobEnv as c_int
+            || x == SpankItem::TaskId as c_int
+            || x == SpankItem::TaskGlobalId as c_int
+            || x == SpankItem::TaskExitStatus as c_int =>
+        {
+            return ESPANK_NOT_AVAIL
+        }
         _ => return ESPANK_BAD_ARG,
     };
     unsafe {
@@ -311,6 +342,8 @@ pub extern "C" fn spank_getenv(
     buf: *mut c_char,
     len: c_int,
 ) -> c_int {
+    // spank.h defines the bad-arg bound as `len < 0` here but `len <= 0` for
+    // spank_job_control_getenv; the asymmetry is intentional to match Slurm.
     if handle.is_null() || var.is_null() || buf.is_null() || len < 0 {
         return ESPANK_BAD_ARG;
     }
@@ -415,7 +448,8 @@ pub extern "C" fn spank_strerror(err: c_int) -> *const c_char {
 
 /// Copy `map[key]` into the C buffer `buf` of size `len`, NUL-terminating.
 ///
-/// Returns `ESPANK_ENV_NOEXIST` if absent, `ESPANK_NOSPACE` if truncated.
+/// Returns `ESPANK_ENV_NOEXIST` if the key is absent, or `ESPANK_NOSPACE` if
+/// the value plus its NUL would not fit (in which case nothing is written).
 fn copy_env_value(map: &HashMap<String, String>, key: &str, buf: *mut c_char, len: c_int) -> c_int {
     let Some(value) = map.get(key) else {
         return ESPANK_ENV_NOEXIST;
@@ -461,30 +495,6 @@ spank_log_fn!(slurm_debug, debug);
 spank_log_fn!(slurm_debug2, debug);
 spank_log_fn!(slurm_debug3, debug);
 spank_log_fn!(slurm_spank_log, info);
-
-/// Reference every exported SPANK symbol so the linker cannot drop them from
-/// the host binary (see `SpankHost::new`). Pairs with `-Wl,--export-dynamic`
-/// so `dlsym` in loaded plugins can resolve them.
-fn retain_exported_symbols() {
-    let anchors: &[*const c_void] = &[
-        spank_get_item as *const c_void,
-        spank_setenv as *const c_void,
-        spank_getenv as *const c_void,
-        spank_unsetenv as *const c_void,
-        spank_job_control_setenv as *const c_void,
-        spank_job_control_getenv as *const c_void,
-        spank_job_control_unsetenv as *const c_void,
-        spank_strerror as *const c_void,
-        slurm_error as *const c_void,
-        slurm_info as *const c_void,
-        slurm_verbose as *const c_void,
-        slurm_debug as *const c_void,
-        slurm_debug2 as *const c_void,
-        slurm_debug3 as *const c_void,
-        slurm_spank_log as *const c_void,
-    ];
-    std::hint::black_box(anchors);
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpankError {
@@ -590,10 +600,11 @@ mod tests {
     #[test]
     fn test_spank_host_empty_invoke() {
         let host = SpankHost::new();
+        let mut handle = SpankHandle::new(SpankContext::default(), HashMap::new());
         // Invoking hooks on empty host should succeed (no plugins to fail)
-        assert!(host.invoke_hook(SpankHook::Init).is_ok());
-        assert!(host.invoke_hook(SpankHook::TaskExit).is_ok());
-        assert!(host.invoke_hook(SpankHook::JobEpilog).is_ok());
+        assert!(host.invoke_hook(SpankHook::Init, &mut handle).is_ok());
+        assert!(host.invoke_hook(SpankHook::TaskExit, &mut handle).is_ok());
+        assert!(host.invoke_hook(SpankHook::JobEpilog, &mut handle).is_ok());
     }
 
     #[test]
@@ -685,6 +696,18 @@ mod tests {
         assert_eq!(get_item_u32(&mut handle, SpankItem::JobUid), Some(1000));
         assert_eq!(get_item_u32(&mut handle, SpankItem::JobGid), Some(1001));
         assert_eq!(get_item_u32(&mut handle, SpankItem::TaskPid), Some(12345));
+    }
+
+    #[test]
+    fn test_spank_get_item_not_available_vs_bad_arg() {
+        let mut handle = test_handle();
+        let mut out: u32 = 0;
+        let out_ptr = &mut out as *mut u32 as *mut std::ffi::c_void;
+        assert_eq!(
+            spank_get_item(&mut handle, SpankItem::JobNcpus as c_int, out_ptr),
+            ESPANK_NOT_AVAIL
+        );
+        assert_eq!(spank_get_item(&mut handle, 9999, out_ptr), ESPANK_BAD_ARG);
     }
 
     #[test]
@@ -783,20 +806,16 @@ mod tests {
     }
 
     #[test]
-    fn test_spank_host_set_context() {
-        let mut host = SpankHost::new();
-        host.set_context(SpankContext {
-            job_id: 42,
-            uid: 1000,
-            gid: 1000,
-            step_id: 0,
-            num_nodes: 1,
-            node_id: 0,
-            local_task_count: 1,
-            total_task_count: 1,
-            task_pid: 12345,
-        });
-        // Context is set without panicking
-        assert_eq!(host.plugin_count(), 0);
+    fn test_spank_handle_new_seeds_context_and_env() {
+        let mut env = HashMap::new();
+        env.insert("A".to_string(), "1".to_string());
+        let ctx = SpankContext {
+            job_id: 7,
+            ..Default::default()
+        };
+        let handle = SpankHandle::new(ctx, env);
+        assert_eq!(handle.context.job_id, 7);
+        assert_eq!(handle.env.get("A").map(String::as_str), Some("1"));
+        assert!(handle.job_control_env.is_empty());
     }
 }
