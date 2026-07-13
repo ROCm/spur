@@ -2701,7 +2701,7 @@ impl ClusterManager {
     }
 
     /// Resolve a job's QoS from the cache; unknown/absent name → limitless default.
-    fn resolve_qos(&self, job: &Job) -> Qos {
+    pub(crate) fn resolve_qos(&self, job: &Job) -> Qos {
         match job.spec.qos.as_deref() {
             Some(name) => self.qos_cache.get(name).unwrap_or_default(),
             None => Qos::default(),

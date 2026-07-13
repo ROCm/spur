@@ -5,8 +5,34 @@
 //!
 //! Checks per-QOS limits before allowing a job to be scheduled.
 
-use crate::accounting::{Qos, TresRecord, TresType};
+use crate::accounting::{Qos, QosPreemptMode, TresRecord, TresType};
 use crate::job::{Job, PendingReason};
+use crate::partition::PreemptMode;
+
+impl From<QosPreemptMode> for PreemptMode {
+    fn from(mode: QosPreemptMode) -> Self {
+        match mode {
+            QosPreemptMode::Off => PreemptMode::Off,
+            QosPreemptMode::Cancel => PreemptMode::Cancel,
+            QosPreemptMode::Requeue => PreemptMode::Requeue,
+            QosPreemptMode::Suspend => PreemptMode::Suspend,
+        }
+    }
+}
+
+/// A QOS-level preempt mode override for a running job, or `None` if the
+/// QOS carries no override.
+///
+/// `QosPreemptMode::Off` is both the wire format's "unset" default and a
+/// legitimate explicit choice — there is no way to tell them apart — so
+/// `Off` is treated as "no override" here, deferring to whatever the
+/// caller would otherwise resolve (e.g. partition-level `PreemptMode`).
+pub fn qos_preempt_override(qos: &Qos) -> Option<PreemptMode> {
+    match qos.preempt_mode {
+        QosPreemptMode::Off => None,
+        other => Some(other.into()),
+    }
+}
 
 /// Result of QOS limit check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -391,5 +417,35 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(qos_adjusted_priority(1000, &qos), 1); // Floor at 1
+    }
+
+    #[test]
+    fn test_qos_preempt_override_off_is_none() {
+        let qos = Qos {
+            preempt_mode: QosPreemptMode::Off,
+            ..Default::default()
+        };
+        assert_eq!(qos_preempt_override(&qos), None);
+    }
+
+    #[test]
+    fn test_qos_preempt_override_maps_variants() {
+        let requeue = Qos {
+            preempt_mode: QosPreemptMode::Requeue,
+            ..Default::default()
+        };
+        assert_eq!(qos_preempt_override(&requeue), Some(PreemptMode::Requeue));
+
+        let cancel = Qos {
+            preempt_mode: QosPreemptMode::Cancel,
+            ..Default::default()
+        };
+        assert_eq!(qos_preempt_override(&cancel), Some(PreemptMode::Cancel));
+
+        let suspend = Qos {
+            preempt_mode: QosPreemptMode::Suspend,
+            ..Default::default()
+        };
+        assert_eq!(qos_preempt_override(&suspend), Some(PreemptMode::Suspend));
     }
 }
