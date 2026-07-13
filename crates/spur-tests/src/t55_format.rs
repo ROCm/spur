@@ -141,6 +141,11 @@ mod tests {
                 PendingReason::QosMaxSubmitJobPerUserLimit,
                 "QOSMaxSubmitJobPerUserLimit",
             ),
+            (
+                PendingReason::QosMaxNodePerUserLimit,
+                "QOSMaxNodePerUserLimit",
+            ),
+            (PendingReason::QosMaxMemoryPerUser, "QOSMaxMemoryPerUser"),
         ];
         for (reason, display) in expected {
             assert_eq!(reason.display(), display);

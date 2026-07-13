@@ -141,7 +141,7 @@ class TestQosLimitReasons:
         c = accounting_cluster
 
         # Define a QoS that caps a user to 1G of memory.
-        c.sacctmgr(["add", "qos", "name=memcap", "maxtresperuser=mem=1G"])
+        c.sacctmgr(["add", "qos", "name=memcap", "maxtresperuser=mem=1024"])
         time.sleep(15)
 
         # A job in that QoS asking for 2G exceeds the per-user cap.
