@@ -186,7 +186,7 @@ def multi_node_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
 
 
 @pytest.fixture
-def accounting_cluster(ssh_nodes, remote_bin_dir):
+def accounting_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     """
     Per-test fixture: a running cluster with Postgres on node 0.
 
@@ -206,7 +206,7 @@ def accounting_cluster(ssh_nodes, remote_bin_dir):
     except RuntimeError as e:
         pytest.skip(str(e))
     try:
-        c.deploy()
+        c.deploy(config_overrides=cluster_config_overrides)
     except Exception:
         c.teardown()
         raise

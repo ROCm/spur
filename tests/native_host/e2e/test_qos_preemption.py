@@ -7,7 +7,10 @@ E2E tests for QOS-driven priority and preemption (SPUR-40).
 Covers the fix where a QOS's `priority` delta is wired into a job's
 effective priority and a QOS's `preempt_mode` can override the partition's,
 letting a plain `sacctmgr`-configured QOS (no `scontrol update Priority=`
-trickery, no partition `preempt_mode`) drive real preemption over the wire.
+trickery) drive real preemption over the wire, on top of a partition that
+has already opted into preemption at all (`preempt_mode` != Off, the
+partition-level gate `try_preempt` checks before any QOS override is
+ever consulted).
 
 Requires Postgres on node 0 (the accounting_cluster fixture, which skips
 when Docker is unavailable).
@@ -15,21 +18,47 @@ when Docker is unavailable).
 
 import time
 
+import pytest
+
 from cluster import parse_job_id, wait_job, wait_job_state
 
 
 class TestQosPriorityPreemption:
     """A low-QOS running job must be preempted by a high-QOS pending job
     contending for the same exclusive node, driven purely by the QOS
-    priority delta and the low QOS's preempt_mode override."""
+    priority delta and the low QOS's preempt_mode override, once the
+    partition has opted into preemption at all."""
+
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        # preempt_mode must be non-Off for the scheduler to attempt
+        # preemption at all (a partition-level gate checked before any
+        # QOS override is consulted). Set to `cancel` here, deliberately
+        # different from `low`'s QOS-level `preemptmode=requeue` below, so
+        # the final assertion (low comes back as R, not cancelled) actually
+        # exercises the QOS override rather than just the partition default.
+        return {
+            "partitions": [
+                {
+                    "name": "default",
+                    "state": "UP",
+                    "default": True,
+                    "nodes": "ALL",
+                    "max_time": "24:00:00",
+                    "default_time": "10:00",
+                    "preempt_mode": "cancel",
+                }
+            ],
+        }
 
     def test_high_qos_preempts_low_qos_job(self, accounting_cluster):
         c = accounting_cluster
         node0 = c.node_names[0]
 
         # `low`'s negative priority delta keeps its effective priority at
-        # the floor, and its preempt_mode override makes it preemptable
-        # without needing a partition-level preempt_mode at all.
+        # the floor, and its preempt_mode override changes the eviction
+        # action from the partition's `cancel` to `requeue` (see
+        # cluster_config_overrides above for the partition-level opt-in).
         c.sacctmgr(["add", "qos", "name=low", "priority=-1000", "preemptmode=requeue"])
         c.sacctmgr(["add", "qos", "name=high", "priority=100000"])
         # Wait past the QoS cache refresh floor (10s) before submitting.
