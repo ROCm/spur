@@ -777,6 +777,7 @@ async fn dispatch_job_to_nodes(
 ) {
     let mut successes = 0u32;
     let mut failures = 0u32;
+    let mut succeeded_nodes: Vec<String> = Vec::new();
     let total = dispatch_nodes.len() as u32;
 
     let mut set = tokio::task::JoinSet::new();
@@ -800,10 +801,11 @@ async fn dispatch_job_to_nodes(
         let peer_addrs = peer_addrs.clone();
         let task_offset = node_idx as u32 * tasks_per_node;
         let target_node = node_name.clone();
+        let result_node = node_name.clone();
         let allocated = per_node_allocs.get(node_name).cloned().unwrap_or_default();
         let allocated_nodelist = allocated_nodelist.clone();
         set.spawn(async move {
-            dispatch_to_agent(
+            let result = dispatch_to_agent(
                 &agent_addr,
                 &AgentDispatchParams {
                     job_id,
@@ -815,15 +817,19 @@ async fn dispatch_job_to_nodes(
                     allocated_nodelist: &allocated_nodelist,
                 },
             )
-            .await
+            .await;
+            (result_node, result)
         });
     }
 
     while let Some(result) = set.join_next().await {
         match result {
-            Ok(Ok(())) => successes += 1,
-            Ok(Err(e)) => {
-                error!(job_id, error = %e, "dispatch to agent failed");
+            Ok((node_name, Ok(()))) => {
+                successes += 1;
+                succeeded_nodes.push(node_name);
+            }
+            Ok((node_name, Err(e))) => {
+                error!(job_id, node = %node_name, error = %e, "dispatch to agent failed");
                 failures += 1;
             }
             Err(e) => {
@@ -853,13 +859,18 @@ async fn dispatch_job_to_nodes(
             job_id,
             successes, failures, "partial dispatch failure — evicting job to NodeFail"
         );
+        // Capture the nodes that actually launched the job before eviction: if the
+        // job has `requeue` set, evict_job's requeue side effect resets the job to
+        // Pending and clears `allocated_nodes`, so reading it back afterward would
+        // silently skip the cancel RPC and leave the process running unmanaged.
         if let Err(e) = cluster.evict_job(job_id) {
             error!(job_id, error = %e, "failed to evict job after partial dispatch failure");
-        } else if let Some(job) = cluster.get_job(job_id) {
+        } else {
             // Nodes that did launch the job are now orphaned processes: the
             // eviction above only freed allocations and marked the job
-            // NodeFail, it never told the agents that ran it to stop.
-            send_cancel_to_agents(&cluster, &job, 9).await;
+            // NodeFail (or Pending, if requeued), it never told the agents
+            // that ran it to stop.
+            send_cancel_to_nodes(&cluster, job_id, &succeeded_nodes, 9).await;
         }
     }
 }
@@ -1138,13 +1149,27 @@ pub async fn send_cancel_to_agents(
     job: &spur_core::job::Job,
     signal: i32,
 ) {
-    for node_name in &job.allocated_nodes {
+    send_cancel_to_nodes(cluster, job.job_id, &job.allocated_nodes, signal).await;
+}
+
+/// Send CancelJob RPC to an explicit set of nodes for a job with a specific
+/// signal. Callers that already know which nodes ran the job (e.g. a dispatch
+/// loop) should use this instead of `send_cancel_to_agents` so the cancel
+/// isn't at the mercy of `job.allocated_nodes` having been mutated in the
+/// meantime (e.g. cleared by a requeue-on-eviction side effect).
+pub async fn send_cancel_to_nodes(
+    cluster: &Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    node_names: &[String],
+    signal: i32,
+) {
+    for node_name in node_names {
         let node_info = cluster.get_node(node_name);
         let (addr, port) = match node_info {
             Some(ref n) if n.address.is_some() => (n.address.clone().unwrap(), n.port),
             _ => {
                 warn!(
-                    job_id = job.job_id,
+                    job_id,
                     node = %node_name,
                     "no agent address — cannot cancel job on node"
                 );
@@ -1153,7 +1178,6 @@ pub async fn send_cancel_to_agents(
         };
 
         let agent_addr = format!("http://{}:{}", addr, port);
-        let job_id = job.job_id;
         tokio::spawn(async move {
             match SlurmAgentClient::connect(agent_addr.clone()).await {
                 Ok(mut client) => {
@@ -1836,6 +1860,73 @@ mod tests {
 
             // n1 actually launched the job, so the controller must tell its
             // agent to stop it instead of leaving an orphaned process behind.
+            wait_for("cancel RPC sent to n1", || {
+                cancel_calls.load(Ordering::SeqCst) >= 1
+            });
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn partial_dispatch_with_requeue_still_cancels_the_node_that_launched() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (good_addr, cancel_calls) = spawn_mock_agent().await;
+            let bad_addr = unreachable_addr().await;
+            register_node_at(&cm, "n1", good_addr);
+            register_node_at(&cm, "n2", bad_addr);
+
+            let mut spec = JobSpec {
+                name: "partial-dispatch-requeue".into(),
+                user: "testuser".into(),
+                num_nodes: 2,
+                num_tasks: 2,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                requeue: true,
+                ..Default::default()
+            };
+            let job_id = submit_and_wait(&cm, spec.clone());
+            spec = cm.get_job(job_id).unwrap().spec;
+
+            let nodes = vec!["n1".to_string(), "n2".to_string()];
+            let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
+                .iter()
+                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+            cm.start_job(
+                job_id,
+                nodes.clone(),
+                ResourceAllocations::with_scalar(2, 0),
+                per_node_allocs.clone(),
+            )
+            .unwrap();
+            settle(&cm, job_id, JobState::Running);
+
+            // Same as the non-requeue case, but `spec.requeue` is set: eviction's
+            // requeue side effect resets the job to Pending and clears
+            // `allocated_nodes` before this function returns, so the cancel RPC
+            // must not depend on reading `job.allocated_nodes` afterward.
+            dispatch_job_to_nodes(
+                cm.clone(),
+                job_id,
+                nodes,
+                spec,
+                Vec::new(),
+                per_node_allocs,
+                "n1,n2".into(),
+                1,
+            )
+            .await;
+
+            // The requeue side effect puts the job back to Pending instead of
+            // leaving it in NodeFail.
+            settle(&cm, job_id, JobState::Pending);
+            assert!(cm.get_job(job_id).unwrap().allocated_nodes.is_empty());
+
+            // n1 actually launched the job, so the controller must still tell
+            // its agent to stop it, even though the job itself was requeued.
             wait_for("cancel RPC sent to n1", || {
                 cancel_calls.load(Ordering::SeqCst) >= 1
             });
