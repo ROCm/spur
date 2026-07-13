@@ -65,6 +65,14 @@ fn main() -> anyhow::Result<()> {
         let _ = signal(Signal::SIGPIPE, SigHandler::SigDfl);
     }
 
+    // Applies to every entry point (native `spur` and all Slurm-compatible
+    // symlinks alike), ahead of per-subcommand clap parsing that doesn't
+    // otherwise register -V/--version.
+    if std::env::args().any(|a| a == "-V" || a == "--version") {
+        println!("{}", spur_core::version::version_string());
+        std::process::exit(0);
+    }
+
     load_controller_addr_from_config();
 
     // Multi-call binary: dispatch based on argv[0] (symlink name).
@@ -197,7 +205,7 @@ fn main() -> anyhow::Result<()> {
 
     match args[1].as_str() {
         "version" | "--version" | "-V" => {
-            println!("spur {}", env!("CARGO_PKG_VERSION"));
+            println!("{}", spur_core::version::version_string());
             if args.len() > 2 && args[2] == "--check" {
                 runtime.block_on(async {
                     print!("Checking for updates... ");
