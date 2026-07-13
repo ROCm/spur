@@ -5,6 +5,7 @@ mod exec;
 mod exit_fmt;
 mod format_engine;
 mod image;
+mod k8s;
 mod net;
 mod node;
 mod sacct;
@@ -98,6 +99,7 @@ fn main() -> anyhow::Result<()> {
         "smd" => return runtime.block_on(smd::main()),
         "net" => return runtime.block_on(net::main()),
         "node" => return runtime.block_on(node::main()),
+        "k8s" => return runtime.block_on(k8s::main()),
         "image" => return runtime.block_on(image::main()),
         "exec" => return runtime.block_on(exec::main()),
         "token" => return runtime.block_on(token::main()),
@@ -137,7 +139,7 @@ fn main() -> anyhow::Result<()> {
         "sbatch" | "srun" | "squeue" | "scancel" | "sinfo" | "sacct" | "sacctmgr" | "scontrol"
         | "sprio" | "sshare" | "sstat" | "sdiag" | "sreport" | "strigger" | "sattach"
         | "scrontab" | "smd" => Some(args[1].as_str()),
-        "net" | "node" | "image" | "exec" | "token" => Some(args[1].as_str()),
+        "net" | "node" | "k8s" | "image" | "exec" | "token" => Some(args[1].as_str()),
         _ => None,
     };
 
@@ -187,6 +189,7 @@ fn main() -> anyhow::Result<()> {
             "smd" | "health" | "monitor" => runtime.block_on(smd::main_with_args(rewritten)),
             "net" => runtime.block_on(net::main_with_args(rewritten)),
             "node" => runtime.block_on(node::main_with_args(rewritten)),
+            "k8s" => runtime.block_on(k8s::main_with_args(rewritten)),
             "image" => runtime.block_on(image::main_with_args(rewritten)),
             "exec" => runtime.block_on(exec::main_with_args(rewritten)),
             "token" => runtime.block_on(token::main_with_args(rewritten)),
@@ -258,6 +261,7 @@ fn print_usage() {
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  net         Manage WireGuard mesh network (init/join/status)");
+    eprintln!("  k8s         Manage the SPUR-provisioned k0s cluster (up/down/status/kubeconfig)");
     eprintln!("  image       Manage container images (import/list/remove)");
     eprintln!("  exec        Execute a command inside a running container job");
     eprintln!("  submit      Submit a batch job script");

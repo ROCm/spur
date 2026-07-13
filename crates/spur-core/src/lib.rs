@@ -11,6 +11,7 @@ pub mod dependency;
 pub mod hooks;
 pub mod hostlist;
 pub mod job;
+pub mod k0s;
 pub mod node;
 pub mod partition;
 pub mod qos;

@@ -13,6 +13,7 @@ path = "src/main.rs"
 spur-proto = { path = "../spur-proto" }
 spur-core = { path = "../spur-core" }
 spur-sched = { path = "../spur-sched" }
+spur-net = { path = "../spur-net" }
 spur-metrics = { path = "../spur-metrics" }
 spur-update = { path = "../spur-update" }
 sqlx = { workspace = true }

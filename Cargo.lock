@@ -3700,6 +3700,7 @@ dependencies = [
  "serde_json",
  "spur-core",
  "spur-metrics",
+ "spur-net",
  "spur-proto",
  "spur-sched",
  "spur-update",

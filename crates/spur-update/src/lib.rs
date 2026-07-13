@@ -13,6 +13,7 @@ pub mod cache;
 pub mod check;
 pub mod download;
 pub mod install;
+pub mod k0s;
 
 use std::path::PathBuf;
 

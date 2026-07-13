@@ -168,6 +168,7 @@ mod tests {
             network: Default::default(),
             logging: Default::default(),
             kubernetes: Default::default(),
+            cluster: Default::default(),
             notifications: Default::default(),
             power: Default::default(),
             federation: Default::default(),

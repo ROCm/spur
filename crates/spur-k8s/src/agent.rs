@@ -678,6 +678,60 @@ impl SlurmAgent for VirtualAgent {
             "interactive attach not supported for K8s agent",
         ))
     }
+
+    // -- Native cluster component control. The virtual K8s agent does not run k0s
+    //    systemd units, so these are permanently unsupported here. --
+    async fn start_cluster_component(
+        &self,
+        _request: Request<StartClusterComponentRequest>,
+    ) -> Result<Response<StartClusterComponentResponse>, Status> {
+        Err(Status::unimplemented(
+            "cluster components not supported for K8s agent",
+        ))
+    }
+
+    async fn stop_cluster_component(
+        &self,
+        _request: Request<StopClusterComponentRequest>,
+    ) -> Result<Response<StopClusterComponentResponse>, Status> {
+        Err(Status::unimplemented(
+            "cluster components not supported for K8s agent",
+        ))
+    }
+
+    async fn get_cluster_component_status(
+        &self,
+        _request: Request<GetClusterComponentStatusRequest>,
+    ) -> Result<Response<GetClusterComponentStatusResponse>, Status> {
+        Err(Status::unimplemented(
+            "cluster components not supported for K8s agent",
+        ))
+    }
+
+    async fn create_k0s_join_token(
+        &self,
+        _request: Request<CreateK0sJoinTokenRequest>,
+    ) -> Result<Response<CreateK0sJoinTokenResponse>, Status> {
+        Err(Status::unimplemented(
+            "cluster components not supported for K8s agent",
+        ))
+    }
+
+    async fn get_admin_kubeconfig(
+        &self,
+        _request: Request<GetAdminKubeconfigRequest>,
+    ) -> Result<Response<GetAdminKubeconfigResponse>, Status> {
+        Err(Status::unimplemented(
+            "cluster components not supported for K8s agent",
+        ))
+    }
+
+    async fn apply_mesh(
+        &self,
+        _request: Request<MeshMembership>,
+    ) -> Result<Response<ApplyMeshResponse>, Status> {
+        Err(Status::unimplemented("mesh not supported for K8s agent"))
+    }
 }
 
 impl VirtualAgent {
