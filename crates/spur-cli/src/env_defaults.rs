@@ -92,7 +92,13 @@ pub fn apply_csv(matches: &ArgMatches, id: &str, names: &[&str], target: &mut Ve
         return;
     }
     if let Some(v) = env_first(names) {
-        *target = v.split(',').map(str::to_string).collect();
+        // Trim and drop empties so a padded or trailing-comma list stays clean.
+        *target = v
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
     }
 }
 
@@ -118,7 +124,10 @@ where
         return Ok(());
     }
     if let Some((name, v)) = first_set(names) {
-        *target = v
+        // Trim so values with incidental whitespace (e.g. `SLURM_NTASKS="4 "`)
+        // parse instead of erroring.
+        let trimmed = v.trim();
+        *target = trimmed
             .parse()
             .map_err(|e| anyhow!("invalid value {:?} for {}: {}", v, name, e))?;
     }

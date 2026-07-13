@@ -407,13 +407,23 @@ fn resolve_srun_env(matches: &ArgMatches, args: &mut SrunArgs) -> Result<()> {
     apply_str(
         matches,
         "partition",
-        &["SPUR_PARTITION", "SLURM_PARTITION"],
+        &[
+            "SPUR_PARTITION",
+            "SPUR_JOB_PARTITION",
+            "SLURM_PARTITION",
+            "SLURM_JOB_PARTITION",
+        ],
         &mut args.partition,
     );
     apply_str(
         matches,
         "account",
-        &["SPUR_ACCOUNT", "SLURM_ACCOUNT"],
+        &[
+            "SPUR_ACCOUNT",
+            "SPUR_JOB_ACCOUNT",
+            "SLURM_ACCOUNT",
+            "SLURM_JOB_ACCOUNT",
+        ],
         &mut args.account,
     );
     apply_num(
@@ -1206,6 +1216,14 @@ mod tests {
 
     #[test]
     #[serial(env_injection)]
+    fn numeric_env_trims_whitespace() {
+        let env = EnvGuard::new();
+        env.set("SLURM_NTASKS", " 4 ");
+        assert_eq!(resolve_from(&["srun", "hostname"]).ntasks, 4);
+    }
+
+    #[test]
+    #[serial(env_injection)]
     fn invalid_numeric_env_errors() {
         let env = EnvGuard::new();
         env.set("SLURM_NNODES", "abc");
@@ -1259,6 +1277,15 @@ mod tests {
     }
 
     #[test]
+    #[serial(env_injection)]
+    fn gres_env_trims_whitespace_and_drops_empties() {
+        let env = EnvGuard::new();
+        env.set("SLURM_GRES", "gpu:1, fpga:2 ,");
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(args.gres, vec!["gpu:1", "fpga:2"]);
+    }
+
+    #[test]
     fn cli_gres_comma_list_splits_into_multiple() {
         let args = SrunArgs::try_parse_from(["srun", "--gres=gpu:1,fpga:2", "hostname"])
             .expect("parse failed");
@@ -1305,5 +1332,28 @@ mod tests {
         // An explicit CLI value still wins over the inherited allocation env.
         let overridden = resolve_from(&["srun", "-n", "1", "hostname"]);
         assert_eq!(overridden.ntasks, 1);
+    }
+
+    /// Allocation context is exported under the `*_JOB_*` names
+    /// (SLURM_JOB_PARTITION / SLURM_JOB_ACCOUNT), so srun must read those to
+    /// inherit partition/account when run inside a Spur allocation.
+    #[test]
+    #[serial(env_injection)]
+    fn inherits_allocation_partition_and_account() {
+        let env = EnvGuard::new();
+        env.set("SLURM_JOB_PARTITION", "alloc-part");
+        env.set("SLURM_JOB_ACCOUNT", "alloc-acct");
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(args.partition.as_deref(), Some("alloc-part"));
+        assert_eq!(args.account.as_deref(), Some("alloc-acct"));
+
+        // The direct input var takes precedence over the allocation twin.
+        env.set("SLURM_PARTITION", "input-part");
+        let direct = resolve_from(&["srun", "hostname"]);
+        assert_eq!(direct.partition.as_deref(), Some("input-part"));
+
+        // An explicit CLI value still wins over both.
+        let overridden = resolve_from(&["srun", "-p", "cli-part", "hostname"]);
+        assert_eq!(overridden.partition.as_deref(), Some("cli-part"));
     }
 }
