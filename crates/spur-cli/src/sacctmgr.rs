@@ -148,6 +148,20 @@ async fn connect(addr: &str) -> Result<SlurmAccountingClient<tonic::transport::C
     Ok(spur_proto::accounting_client(channel))
 }
 
+/// Parse a numeric limit value where `0` is a keyword meaning "no limit".
+/// Fails loudly instead of silently defaulting to `0` so a typo or
+/// out-of-range value never accidentally lifts a limit.
+fn parse_limit(key: &str, val: &str) -> Result<u32> {
+    val.parse()
+        .map_err(|_| anyhow::anyhow!("invalid value for {key}=: '{val}'"))
+}
+
+/// Same as `parse_limit`, but for wall-time fields that also accept Slurm's
+/// `d-hh:mm:ss`/`hh:mm:ss` duration syntax (see `parse_wall_time`).
+fn parse_wall_limit(key: &str, val: &str) -> Result<u32> {
+    parse_wall_time(val).ok_or_else(|| anyhow::anyhow!("invalid value for {key}=: '{val}'"))
+}
+
 /// Fields shared by `add user` and `modify user` (both upsert via the same
 /// `AddUserRequest`).
 #[derive(Debug, PartialEq)]
@@ -188,18 +202,21 @@ fn build_add_user_request(
     let max_running_jobs: u32 = p
         .get("maxrunningjobs")
         .or_else(|| p.get("maxjobs"))
-        .and_then(|v| v.parse().ok())
+        .map(|v| parse_limit("maxjobs", v))
+        .transpose()?
         .unwrap_or(0);
     let max_submit_jobs: u32 = p
         .get("maxsubmitjobs")
-        .and_then(|v| v.parse().ok())
+        .map(|v| parse_limit("maxsubmitjobs", v))
+        .transpose()?
         .unwrap_or(0);
     let max_tres_per_job = p.get("maxtresperjob").cloned().unwrap_or_default();
     let grp_tres = p.get("grptres").cloned().unwrap_or_default();
     let max_wall_minutes: u32 = p
         .get("maxwall")
         .or_else(|| p.get("maxwallduration"))
-        .and_then(|v| parse_wall_time(v))
+        .map(|v| parse_wall_limit("maxwall", v))
+        .transpose()?
         .unwrap_or(0);
 
     Ok(UserUpsertFields {
@@ -234,7 +251,8 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
             let max_jobs: u32 = p
                 .get("maxrunningjobs")
                 .or_else(|| p.get("maxjobs"))
-                .and_then(|v| v.parse().ok())
+                .map(|v| parse_limit("maxjobs", v))
+                .transpose()?
                 .unwrap_or(0);
 
             let mut client = connect(addr).await?;
@@ -328,16 +346,19 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
             let max_jobs: u32 = p
                 .get("maxjobsperuser")
                 .or_else(|| p.get("maxjobspu"))
-                .and_then(|v| v.parse().ok())
+                .map(|v| parse_limit("maxjobsperuser", v))
+                .transpose()?
                 .unwrap_or(0);
             let max_wall: u32 = p
                 .get("maxwall")
-                .and_then(|v| parse_wall_time(v))
+                .map(|v| parse_wall_limit("maxwall", v))
+                .transpose()?
                 .unwrap_or(0);
             let max_tres = p.get("maxtresperjob").cloned().unwrap_or_default();
             let grp_wall: u32 = p
                 .get("grpwall")
-                .and_then(|v| parse_wall_time(v))
+                .map(|v| parse_wall_limit("grpwall", v))
+                .transpose()?
                 .unwrap_or(0);
 
             let mut client = connect(addr).await?;
@@ -353,7 +374,8 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     max_tres_per_job: max_tres,
                     max_submit_jobs_per_user: p
                         .get("maxsubmitjobsperuser")
-                        .and_then(|v| v.parse().ok())
+                        .map(|v| parse_limit("maxsubmitjobsperuser", v))
+                        .transpose()?
                         .unwrap_or(0),
                     max_tres_per_user: p.get("maxtresperuser").cloned().unwrap_or_default(),
                     grp_tres: p.get("grptres").cloned().unwrap_or_default(),
@@ -468,7 +490,8 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     max_running_jobs: p
                         .get("maxrunningjobs")
                         .or_else(|| p.get("maxjobs"))
-                        .and_then(|v| v.parse().ok())
+                        .map(|v| parse_limit("maxjobs", v))
+                        .transpose()?
                         .unwrap_or(0),
                 })
                 .await
@@ -501,22 +524,26 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     max_jobs_per_user: p
                         .get("maxjobsperuser")
                         .or_else(|| p.get("maxjobspu"))
-                        .and_then(|v| v.parse().ok())
+                        .map(|v| parse_limit("maxjobsperuser", v))
+                        .transpose()?
                         .unwrap_or(0),
                     max_wall_minutes: p
                         .get("maxwall")
-                        .and_then(|v| parse_wall_time(v))
+                        .map(|v| parse_wall_limit("maxwall", v))
+                        .transpose()?
                         .unwrap_or(0),
                     max_tres_per_job: p.get("maxtresperjob").cloned().unwrap_or_default(),
                     max_submit_jobs_per_user: p
                         .get("maxsubmitjobsperuser")
-                        .and_then(|v| v.parse().ok())
+                        .map(|v| parse_limit("maxsubmitjobsperuser", v))
+                        .transpose()?
                         .unwrap_or(0),
                     max_tres_per_user: p.get("maxtresperuser").cloned().unwrap_or_default(),
                     grp_tres: p.get("grptres").cloned().unwrap_or_default(),
                     grp_wall_minutes: p
                         .get("grpwall")
-                        .and_then(|v| parse_wall_time(v))
+                        .map(|v| parse_wall_limit("grpwall", v))
+                        .transpose()?
                         .unwrap_or(0),
                 })
                 .await
@@ -769,7 +796,13 @@ fn format_tres(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
     }
-    spur_core::accounting::TresRecord::parse(raw).format()
+    // Display-only: values are validated at write time (add user/create qos),
+    // so a parse failure here means pre-existing/out-of-band data. Show the
+    // raw string rather than silently dropping tokens.
+    match spur_core::accounting::TresRecord::parse(raw) {
+        Ok(rec) => rec.format(),
+        Err(_) => raw.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -883,6 +916,69 @@ mod tests {
     }
 
     #[test]
+    fn parse_limit_rejects_non_numeric_value() {
+        let err = parse_limit("maxjobs", "abc").unwrap_err();
+        assert!(err.to_string().contains("maxjobs"));
+        assert!(err.to_string().contains("abc"));
+    }
+
+    #[test]
+    fn parse_limit_rejects_negative_value() {
+        assert!(parse_limit("maxjobs", "-5").is_err());
+    }
+
+    #[test]
+    fn parse_limit_rejects_overflowing_value() {
+        assert!(parse_limit("maxjobs", "99999999999999999999").is_err());
+    }
+
+    #[test]
+    fn parse_limit_accepts_valid_value() {
+        assert_eq!(parse_limit("maxjobs", "5").unwrap(), 5);
+    }
+
+    #[test]
+    fn parse_wall_limit_rejects_non_numeric_value() {
+        assert!(parse_wall_limit("maxwall", "abc").is_err());
+    }
+
+    #[test]
+    fn parse_wall_limit_accepts_duration_syntax() {
+        assert_eq!(parse_wall_limit("maxwall", "1:30").unwrap(), 90);
+    }
+
+    #[test]
+    fn build_add_user_request_rejects_invalid_maxjobs() {
+        let p = parse_params(&[
+            "name=testuser".into(),
+            "account=testacct".into(),
+            "maxjobs=abc".into(),
+        ]);
+        let err = build_add_user_request(&p).unwrap_err();
+        assert!(err.to_string().contains("maxjobs"));
+    }
+
+    #[test]
+    fn build_add_user_request_rejects_negative_maxsubmitjobs() {
+        let p = parse_params(&[
+            "name=testuser".into(),
+            "account=testacct".into(),
+            "maxsubmitjobs=-1".into(),
+        ]);
+        assert!(build_add_user_request(&p).is_err());
+    }
+
+    #[test]
+    fn build_add_user_request_rejects_invalid_maxwall() {
+        let p = parse_params(&[
+            "name=testuser".into(),
+            "account=testacct".into(),
+            "maxwall=notatime".into(),
+        ]);
+        assert!(build_add_user_request(&p).is_err());
+    }
+
+    #[test]
     fn build_add_user_request_add_and_modify_produce_the_same_shape() {
         // add and modify both funnel through the same helper, so `sacctmgr
         // add user name=X account=Y defaultqos=Z` and `sacctmgr modify user
@@ -927,7 +1023,7 @@ mod tests {
     }
 
     #[test]
-    fn format_tres_drops_unparseable_tokens() {
-        assert_eq!(format_tres("cpu=4,bogus=nope"), "cpu=4");
+    fn format_tres_shows_raw_string_when_unparseable() {
+        assert_eq!(format_tres("cpu=4,bogus=nope"), "cpu=4,bogus=nope");
     }
 }
