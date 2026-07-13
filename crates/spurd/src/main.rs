@@ -79,6 +79,11 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|a| a == "-V" || a == "--version") {
+        println!("{}", spur_core::version::version_string());
+        return Ok(());
+    }
+
     let args = Args::parse();
 
     tracing_subscriber::fmt()
@@ -103,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(6818);
 
     info!(
-        version = env!("CARGO_PKG_VERSION"),
+        version = %spur_core::version::version_string(),
         hostname = %hostname,
         controller = %args.controller,
         listen = %args.listen,
