@@ -116,13 +116,13 @@ pub struct Account {
 /// Per-account resource limits.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AccountLimits {
-    /// Max running jobs across all users in this account.
+    /// Max running jobs for a single user within this account.
     pub max_running_jobs: Option<u32>,
-    /// Max submitted (pending + running) jobs.
+    /// Max submitted (pending + running) jobs for a single user within this account.
     pub max_submit_jobs: Option<u32>,
     /// Max TRES per job.
     pub max_tres_per_job: Option<TresRecord>,
-    /// Max total TRES across all running jobs.
+    /// Max total TRES across all running jobs in this account, summed over every user.
     pub grp_tres: Option<TresRecord>,
     /// Max wall time per job (minutes).
     pub max_wall_minutes: Option<u32>,

@@ -3927,10 +3927,13 @@ fn qos_block_for(
                 && j.spec.qos.as_deref() == Some(qos_name.as_str())
         })
         .count() as u32;
+    // Count only earlier-submitted jobs (lower job_id) so a later job never
+    // makes an earlier, within-limit job retroactively blocked.
     let submitted_count = jobs
         .values()
         .filter(|j| {
-            (j.state == JobState::Pending || j.state == JobState::Running)
+            j.job_id < job.job_id
+                && (j.state == JobState::Pending || j.state == JobState::Running)
                 && j.spec.user == *user
                 && j.spec.qos.as_deref() == Some(qos_name.as_str())
         })
@@ -3975,10 +3978,13 @@ fn account_block_for(
                 && j.spec.account.as_deref() == Some(account)
         })
         .count() as u32;
+    // Count only earlier-submitted jobs (lower job_id) so a later job never
+    // makes an earlier, within-limit job retroactively blocked.
     let submitted_count = jobs
         .values()
         .filter(|j| {
-            (j.state == JobState::Pending || j.state == JobState::Running)
+            j.job_id < job.job_id
+                && (j.state == JobState::Pending || j.state == JobState::Running)
                 && j.spec.user == *user
                 && j.spec.account.as_deref() == Some(account)
         })
@@ -8140,16 +8146,52 @@ mod tests {
 
         let mut s1 = basic_spec("b1");
         s1.account = Some("research".into());
-        submit_and_wait(&cm, s1);
+        let j1 = submit_and_wait(&cm, s1);
 
         let mut s2 = basic_spec("b2");
         s2.account = Some("research".into());
         let j2 = submit_and_wait(&cm, s2);
 
         cm.tag_blocked_pending_reasons();
+        // j1 alone is within the limit (max_submit_jobs=1) and must not be
+        // blocked by counting itself; only j2, which pushes the count over
+        // the cap, should be blocked.
+        assert_eq!(cm.get_job(j1).unwrap().pending_reason, PendingReason::None);
         assert_eq!(
             cm.get_job(j2).unwrap().pending_reason,
             PendingReason::AssocMaxSubmitJobLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_sets_qos_max_submit_jobs_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache().insert(Qos {
+            name: "capped".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_submit_jobs_per_user: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut s1 = basic_spec("c1");
+        s1.qos = Some("capped".into());
+        let j1 = submit_and_wait(&cm, s1);
+
+        let mut s2 = basic_spec("c2");
+        s2.qos = Some("capped".into());
+        let j2 = submit_and_wait(&cm, s2);
+
+        cm.tag_blocked_pending_reasons();
+        // j1 alone is within the limit (max_submit_jobs_per_user=1) and must
+        // not be blocked by counting itself; only j2, which pushes the count
+        // over the cap, should be blocked.
+        assert_eq!(cm.get_job(j1).unwrap().pending_reason, PendingReason::None);
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::QosMaxSubmitJobPerUserLimit
         );
     }
 
