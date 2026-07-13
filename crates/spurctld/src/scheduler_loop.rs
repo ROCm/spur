@@ -349,12 +349,15 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                         error!(job_id, error = %e, "failed to requeue job after dispatch failure");
                     }
                 } else if failures > 0 {
+                    // A node that never got the dispatch will never report completion, so evict
+                    // the whole job to NodeFail (same as a node dying mid-run) instead of hanging.
                     warn!(
                         job_id,
-                        successes,
-                        failures,
-                        "partial dispatch failure — job continues on successful nodes"
+                        successes, failures, "partial dispatch failure — evicting job to NodeFail"
                     );
+                    if let Err(e) = cluster_ref.evict_job(job_id) {
+                        error!(job_id, error = %e, "failed to evict job after partial dispatch failure");
+                    }
                 }
             });
         }

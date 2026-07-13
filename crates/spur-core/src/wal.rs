@@ -96,6 +96,13 @@ pub enum WalOperation {
         /// Controller-stamped instant of resume.
         at: chrono::DateTime<chrono::Utc>,
     },
+    /// Evict a single job to NodeFail: same effect as a node health-check
+    /// failure (frees allocations, feeds the auto-requeue path), but scoped
+    /// to one job instead of every job on a node. Used when a subset of a
+    /// job's assigned nodes never received the launch dispatch.
+    JobEvict {
+        job_id: JobId,
+    },
 
     // Node operations
     NodeRegister {
@@ -422,6 +429,17 @@ mod suspend_wal_tests {
                 }
                 _ => panic!("variant mismatch after round-trip"),
             }
+        }
+    }
+
+    #[test]
+    fn job_evict_op_round_trips() {
+        let op = WalOperation::JobEvict { job_id: 9 };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobEvict { job_id } => assert_eq!(job_id, 9),
+            _ => panic!("wrong variant"),
         }
     }
 }

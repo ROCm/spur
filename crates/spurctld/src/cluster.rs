@@ -977,6 +977,27 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Evict a running job to NodeFail: same effect as the health-check path
+    /// (`evict_jobs_on_node`) that runs when an entire node goes Down, but
+    /// scoped to a single job. Used when only some of a job's assigned nodes
+    /// could be dispatched to, since a node that never launched the job will
+    /// never report completion. NodeFail feeds the existing auto-requeue path
+    /// in `notify_job_finished`.
+    pub fn evict_job(&self, job_id: JobId) -> anyhow::Result<()> {
+        {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            if job.state.is_terminal() {
+                return Ok(());
+            }
+        }
+        let resp = self.propose(WalOperation::JobEvict { job_id })?;
+        self.run_all_finalized_side_effects(&resp);
+        Ok(())
+    }
+
     /// Register a node agent.
     #[allow(clippy::too_many_arguments)]
     pub fn register_node(
@@ -2719,7 +2740,7 @@ impl ClusterManager {
     /// Evict a single job by ID: transition to NodeFail, then free its
     /// allocations on every node it spans. Transition is validated first
     /// so allocations are never freed for a job that can't be evicted.
-    fn evict_job(
+    fn evict_job_locked(
         job_id: JobId,
         jobs: &mut HashMap<JobId, Job>,
         nodes: &mut HashMap<String, Node>,
@@ -2794,7 +2815,7 @@ impl ClusterManager {
             .collect();
 
         for jid in affected {
-            if let Some(fin) = Self::evict_job(jid, jobs, nodes, timestamp) {
+            if let Some(fin) = Self::evict_job_locked(jid, jobs, nodes, timestamp) {
                 response.jobs_finalized.push(fin);
             }
         }
@@ -2963,6 +2984,12 @@ impl ClusterManager {
                             warn!(job_id = *job_id, error = %e, "invalid resume transition in WAL apply")
                         }
                     }
+                }
+            }
+            WalOperation::JobEvict { job_id } => {
+                if let Some(fin) = Self::evict_job_locked(*job_id, &mut jobs, &mut nodes, timestamp)
+                {
+                    response.jobs_finalized.push(fin);
                 }
             }
             WalOperation::JobStart {
@@ -8233,6 +8260,50 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_job_transitions_partial_dispatch_failure_to_nodefail() {
+        // A multi-node job where the dispatch RPC only reaches some of the
+        // assigned nodes must not be left running forever waiting on
+        // completions from a node that never launched it.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+
+        let mut spec = basic_spec("partial-dispatch-fail");
+        spec.num_nodes = 2;
+        let id = submit_and_wait(&cm, spec);
+
+        let alloc = scalar_alloc(2, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into(), "n2".into()],
+            scalar_alloc(4, 8000),
+            per_node_for(&["n1", "n2"], alloc),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+
+        // n1's dispatch succeeded, n2's never reached the agent.
+        cm.evict_job(id).unwrap();
+        settle(&cm, id, JobState::NodeFail);
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::NodeFail);
+        assert!(
+            job.node_completions.is_empty(),
+            "node_completions must be cleared so a stray late report can't reopen the job"
+        );
+
+        for name in ["n1", "n2"] {
+            let node = cm.get_node(name).unwrap();
+            assert_eq!(
+                node.alloc_resources.cpus, 0,
+                "allocation on {name} must be freed on eviction"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn register_node_gets_partition_via_propose() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -9583,7 +9654,7 @@ mod tests {
     fn evict_job_returns_none_for_missing_job() {
         let mut jobs = HashMap::new();
         let mut nodes = HashMap::new();
-        let result = ClusterManager::evict_job(999, &mut jobs, &mut nodes, Utc::now());
+        let result = ClusterManager::evict_job_locked(999, &mut jobs, &mut nodes, Utc::now());
         assert!(result.is_none());
     }
 
@@ -9594,7 +9665,7 @@ mod tests {
         jobs.insert(1, make_running_job(1, &["n1"], 2));
         nodes.insert("n1".into(), make_test_node("n1", 4, 2));
 
-        let fin = ClusterManager::evict_job(1, &mut jobs, &mut nodes, Utc::now()).unwrap();
+        let fin = ClusterManager::evict_job_locked(1, &mut jobs, &mut nodes, Utc::now()).unwrap();
         assert_eq!(fin.job_id, 1);
         assert_eq!(fin.state, JobState::NodeFail);
         assert_eq!(fin.exit_code, -1);
@@ -9614,7 +9685,7 @@ mod tests {
         nodes.insert("n1".into(), make_test_node("n1", 4, 2));
         nodes.insert("n2".into(), make_test_node("n2", 4, 2));
 
-        ClusterManager::evict_job(1, &mut jobs, &mut nodes, Utc::now());
+        ClusterManager::evict_job_locked(1, &mut jobs, &mut nodes, Utc::now());
 
         assert_eq!(nodes["n1"].alloc_resources.cpus, 0);
         assert_eq!(nodes["n2"].alloc_resources.cpus, 0);
@@ -9629,7 +9700,7 @@ mod tests {
         jobs.insert(1, job);
         nodes.insert("n1".into(), make_test_node("n1", 4, 2));
 
-        let result = ClusterManager::evict_job(1, &mut jobs, &mut nodes, Utc::now());
+        let result = ClusterManager::evict_job_locked(1, &mut jobs, &mut nodes, Utc::now());
         assert!(result.is_none());
     }
 
@@ -9645,7 +9716,7 @@ mod tests {
         jobs.insert(1, job);
         nodes.insert("n1".into(), make_test_node("n1", 4, 2));
 
-        ClusterManager::evict_job(1, &mut jobs, &mut nodes, Utc::now());
+        ClusterManager::evict_job_locked(1, &mut jobs, &mut nodes, Utc::now());
 
         let job = &jobs[&1];
         assert!(job.suspended_at.is_none());
@@ -9661,7 +9732,7 @@ mod tests {
         jobs.insert(1, job);
         nodes.insert("n1".into(), make_test_node("n1", 4, 2));
 
-        let fin = ClusterManager::evict_job(1, &mut jobs, &mut nodes, Utc::now()).unwrap();
+        let fin = ClusterManager::evict_job_locked(1, &mut jobs, &mut nodes, Utc::now()).unwrap();
         assert_eq!(fin.state, JobState::NodeFail);
         assert_eq!(jobs[&1].state, JobState::NodeFail);
         assert_eq!(nodes["n1"].alloc_resources.cpus, 0);
@@ -9676,7 +9747,7 @@ mod tests {
         node.state = NodeState::Draining;
         nodes.insert("n1".into(), node);
 
-        ClusterManager::evict_job(1, &mut jobs, &mut nodes, Utc::now());
+        ClusterManager::evict_job_locked(1, &mut jobs, &mut nodes, Utc::now());
 
         assert_eq!(nodes["n1"].state, NodeState::Drain);
     }
