@@ -27,6 +27,12 @@ impl From<QosPreemptMode> for PreemptMode {
 /// legitimate explicit choice — there is no way to tell them apart — so
 /// `Off` is treated as "no override" here, deferring to whatever the
 /// caller would otherwise resolve (e.g. partition-level `PreemptMode`).
+///
+/// This means a QOS can't express "never preempt this job regardless of
+/// partition" — the most protective use case is exactly the one this
+/// override can't reach. Doing so would need a wire-format change (e.g.
+/// `optional string preempt_mode` in the proto) to distinguish "explicitly
+/// Off" from "unset"; out of scope here.
 pub fn qos_preempt_override(qos: &Qos) -> Option<PreemptMode> {
     match qos.preempt_mode {
         QosPreemptMode::Off => None,

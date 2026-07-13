@@ -2709,14 +2709,20 @@ impl ClusterManager {
     }
 
     /// Recompute a job's effective priority (fairshare + age + partition
-    /// tier + QoS) as of right now.
+    /// tier + QoS) as of right now, given an already-resolved `Qos`.
     ///
     /// Running jobs never pass back through `pending_jobs()`, so their
     /// stored `priority` stays at the raw base value forever. This lets
     /// callers like the preemption gate compare a running job's *current*
     /// effective priority against a pending job's fully adjusted one
     /// instead of comparing raw and adjusted values against each other.
-    pub(crate) fn current_effective_priority(&self, job: &Job) -> u32 {
+    ///
+    /// Takes `qos` instead of resolving it internally so callers that also
+    /// need the job's QoS for another decision (e.g. preempt-mode
+    /// resolution) can resolve it once and reuse the same snapshot for
+    /// both, rather than hitting `QosCache` twice for the same job in one
+    /// scheduling pass.
+    pub(crate) fn current_effective_priority_with_qos(&self, job: &Job, qos: &Qos) -> u32 {
         let now = Utc::now();
         let age_minutes = (now - job.submit_time).num_minutes().max(0);
         let partition_tier = {
@@ -2731,13 +2737,7 @@ impl ClusterManager {
         let fair_share = self
             .fairshare_cache
             .get(&job.spec.user, job.spec.account.as_deref().unwrap_or(""));
-        compute_effective_priority(
-            job.priority,
-            fair_share,
-            age_minutes,
-            partition_tier,
-            &self.resolve_qos(job),
-        )
+        compute_effective_priority(job.priority, fair_share, age_minutes, partition_tier, qos)
     }
 
     /// Persist a mutation via Raft consensus. The apply callback
@@ -6943,6 +6943,48 @@ mod tests {
         crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs).await;
 
         settle(&cm, low_id, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_uses_candidate_qos_preempt_mode_over_partition() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        // Partition says Cancel; the candidate's QoS overrides it to Suspend.
+        config.partitions[0].preempt_mode = "cancel".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.qos_cache().insert(Qos {
+            name: "suspend-me".into(),
+            preempt_mode: spur_core::accounting::QosPreemptMode::Suspend,
+            ..Default::default()
+        });
+
+        let mut low = basic_spec("low");
+        low.priority = Some(100);
+        low.qos = Some("suspend-me".into());
+        let low_id = submit_and_wait(&cm, low);
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            low_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, low_id, JobState::Running);
+
+        let mut high = basic_spec("high");
+        high.priority = Some(10_000);
+        let high_id = submit_and_wait(&cm, high);
+        let high_job = cm.get_job(high_id).unwrap();
+        let partitions = cm.get_partitions();
+
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job]).await;
+
+        // Suspended, not Cancelled: proves the QoS override reached the real
+        // preemption action, not just the pure job_preempt_mode() decision.
+        settle(&cm, low_id, JobState::Suspended);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

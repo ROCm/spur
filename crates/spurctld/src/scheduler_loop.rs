@@ -413,13 +413,27 @@ pub(crate) async fn try_preempt(
         .get_jobs(&[JobState::Running], None, None, None, None, &[])
         .into_iter()
         .collect();
+    // Resolve each running job's QoS once and reuse it for both the priority
+    // recompute below and the preempt-mode decision further down, instead of
+    // hitting QosCache once per candidate for priority and again per
+    // (pending, candidate) pair for preempt-mode.
+    let running_qos: std::collections::HashMap<spur_core::job::JobId, spur_core::accounting::Qos> =
+        running
+            .iter()
+            .map(|j| (j.job_id, cluster.resolve_qos(j)))
+            .collect();
     // Running jobs never pass back through pending_jobs(), so their stored
     // `priority` is the raw base value, not the fairshare/age/tier/QoS
     // adjusted value `pending` jobs carry. Recompute a comparable priority
     // here rather than comparing raw and adjusted values against each other.
     let running_priority: std::collections::HashMap<spur_core::job::JobId, u32> = running
         .iter()
-        .map(|j| (j.job_id, cluster.current_effective_priority(j)))
+        .map(|j| {
+            (
+                j.job_id,
+                cluster.current_effective_priority_with_qos(j, &running_qos[&j.job_id]),
+            )
+        })
         .collect();
     running.sort_by_key(|j| running_priority[&j.job_id]);
 
@@ -451,8 +465,7 @@ pub(crate) async fn try_preempt(
                 }
             }
 
-            let candidate_qos = cluster.resolve_qos(candidate);
-            let mode = job_preempt_mode(candidate, partitions, &candidate_qos);
+            let mode = job_preempt_mode(candidate, partitions, &running_qos[&candidate.job_id]);
             if mode == PreemptMode::Off {
                 continue;
             }
