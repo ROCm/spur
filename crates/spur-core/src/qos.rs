@@ -20,19 +20,8 @@ impl From<QosPreemptMode> for PreemptMode {
     }
 }
 
-/// A QOS-level preempt mode override for a running job, or `None` if the
-/// QOS carries no override.
-///
-/// `QosPreemptMode::Off` is both the wire format's "unset" default and a
-/// legitimate explicit choice — there is no way to tell them apart — so
-/// `Off` is treated as "no override" here, deferring to whatever the
-/// caller would otherwise resolve (e.g. partition-level `PreemptMode`).
-///
-/// This means a QOS can't express "never preempt this job regardless of
-/// partition" — the most protective use case is exactly the one this
-/// override can't reach. Doing so would need a wire-format change (e.g.
-/// `optional string preempt_mode` in the proto) to distinguish "explicitly
-/// Off" from "unset"; out of scope here.
+/// A QOS-level preempt mode override, or `None` if unset. `Off` can't be
+/// told apart from "unset" on the wire, so it's treated as no override.
 pub fn qos_preempt_override(qos: &Qos) -> Option<PreemptMode> {
     match qos.preempt_mode {
         QosPreemptMode::Off => None,
@@ -147,13 +136,8 @@ pub fn check_qos_limits(
     QosCheckResult::Allowed
 }
 
-/// Add a QOS's priority delta on top of an already-computed priority.
-///
-/// Callers should pass the fully weighted priority (fairshare/age/partition
-/// tier already applied) as `base_priority`, not a job's raw submitted
-/// priority: the QOS delta is a flat addition, so applying it before those
-/// multiplicative factors would let them amplify or dilute it in proportion
-/// to values that have nothing to do with QOS.
+/// Add a QOS's flat priority delta on top of an already fairshare/age/tier
+/// weighted priority; applying it earlier would let those factors amplify it.
 pub fn qos_adjusted_priority(base_priority: u32, qos: &Qos) -> u32 {
     let adjusted = base_priority as i64 + qos.priority as i64;
     adjusted.clamp(1, u32::MAX as i64) as u32

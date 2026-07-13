@@ -350,15 +350,8 @@ pub(crate) fn compute_job_allocation(
     }
 }
 
-/// Resolve the effective PreemptMode for a job.
-///
-/// The job's QOS `preempt_mode` takes precedence when it carries an explicit
-/// override (anything but `Off` — see `qos_preempt_override`'s doc comment
-/// for why `Off` can't be told apart from "unset"). Otherwise falls back to
-/// the partition config: `job.spec.partition` is a comma-separated OR list
-/// (same convention as the backfill scheduler's node matching), so a job may
-/// span several partitions, and the most aggressive mode among the matched
-/// partitions wins.
+/// Resolve the effective PreemptMode for a job: QoS override wins if set
+/// (see `qos_preempt_override`), else the most aggressive matched partition.
 fn job_preempt_mode(
     job: &spur_core::job::Job,
     partitions: &[spur_core::partition::Partition],
@@ -370,13 +363,8 @@ fn job_preempt_mode(
         return mode;
     }
 
-    let Some(name) = job.spec.partition.as_deref().filter(|p| !p.is_empty()) else {
-        return PreemptMode::Off;
-    };
-    name.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter_map(|req| partitions.iter().find(|p| p.name == req))
+    spur_core::partition::matched_partitions(job.spec.partition.as_deref(), partitions)
+        .into_iter()
         .map(|p| p.preempt_mode)
         .max_by_key(|m| m.aggressiveness())
         .unwrap_or(PreemptMode::Off)
@@ -399,33 +387,24 @@ pub(crate) async fn try_preempt(
     let cluster_nodes = cluster.get_nodes();
 
     let partition_for = |job: &spur_core::job::Job| -> Option<&Partition> {
-        job.spec.partition.as_deref().and_then(|pname| {
-            pname
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .filter_map(|req| partitions.iter().find(|p| p.name == req))
-                .max_by_key(|p| p.preempt_mode.aggressiveness())
-        })
+        spur_core::partition::matched_partitions(job.spec.partition.as_deref(), partitions)
+            .into_iter()
+            .max_by_key(|p| p.preempt_mode.aggressiveness())
     };
 
     let mut running: Vec<spur_core::job::Job> = cluster
         .get_jobs(&[JobState::Running], None, None, None, None, &[])
         .into_iter()
         .collect();
-    // Resolve each running job's QoS once and reuse it for both the priority
-    // recompute below and the preempt-mode decision further down, instead of
-    // hitting QosCache once per candidate for priority and again per
-    // (pending, candidate) pair for preempt-mode.
+    // Resolve once, reuse for both the priority recompute and the
+    // preempt-mode decision below.
     let running_qos: std::collections::HashMap<spur_core::job::JobId, spur_core::accounting::Qos> =
         running
             .iter()
             .map(|j| (j.job_id, cluster.resolve_qos(j)))
             .collect();
-    // Running jobs never pass back through pending_jobs(), so their stored
-    // `priority` is the raw base value, not the fairshare/age/tier/QoS
-    // adjusted value `pending` jobs carry. Recompute a comparable priority
-    // here rather than comparing raw and adjusted values against each other.
+    // Running jobs' stored `priority` is the raw base value, unlike
+    // `pending`'s fully adjusted one; recompute a comparable value.
     let running_priority: std::collections::HashMap<spur_core::job::JobId, u32> = running
         .iter()
         .map(|j| {

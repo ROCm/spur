@@ -89,6 +89,32 @@ impl PreemptMode {
     }
 }
 
+/// Partitions a job requests, resolved by name. `spec` is a comma-separated
+/// OR list, matching the backfill scheduler's node-matching convention.
+pub fn matched_partitions<'a>(
+    spec: Option<&str>,
+    partitions: &'a [Partition],
+) -> Vec<&'a Partition> {
+    let Some(spec) = spec.filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+    spec.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|req| partitions.iter().find(|p| p.name == req))
+        .collect()
+}
+
+/// Highest `priority_tier` among a job's requested partitions (see
+/// `matched_partitions`), or 1 if none match.
+pub fn max_priority_tier(spec: Option<&str>, partitions: &[Partition]) -> u32 {
+    matched_partitions(spec, partitions)
+        .into_iter()
+        .map(|p| p.priority_tier)
+        .max()
+        .unwrap_or(1)
+}
+
 impl Default for Partition {
     fn default() -> Self {
         Self {
@@ -123,5 +149,30 @@ mod tests {
         assert!(PreemptMode::Cancel.aggressiveness() > PreemptMode::Requeue.aggressiveness());
         assert!(PreemptMode::Requeue.aggressiveness() > PreemptMode::Suspend.aggressiveness());
         assert!(PreemptMode::Suspend.aggressiveness() > PreemptMode::Off.aggressiveness());
+    }
+
+    fn partition_with_tier(name: &str, priority_tier: u32) -> Partition {
+        Partition {
+            name: name.into(),
+            priority_tier,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn max_priority_tier_picks_highest_among_matched_partitions() {
+        let parts = vec![
+            partition_with_tier("low", 1),
+            partition_with_tier("high", 9),
+        ];
+        assert_eq!(max_priority_tier(Some("low,high"), &parts), 9);
+        assert_eq!(max_priority_tier(Some("high, low"), &parts), 9);
+    }
+
+    #[test]
+    fn max_priority_tier_defaults_to_one_when_unset_or_unmatched() {
+        let parts = vec![partition_with_tier("gpu", 5)];
+        assert_eq!(max_priority_tier(None, &parts), 1);
+        assert_eq!(max_priority_tier(Some("nope"), &parts), 1);
     }
 }

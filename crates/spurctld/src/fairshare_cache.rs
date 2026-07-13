@@ -38,9 +38,7 @@ impl FairshareCache {
         *self.factors.write() = new_factors;
     }
 
-    /// Set a single user/account's fairshare factor directly, bypassing the
-    /// periodic DB refresh. Scheduling tests need non-neutral fairshare
-    /// without standing up a PostgreSQL-backed refresh loop.
+    /// Set a factor directly, bypassing the DB refresh loop; for tests only.
     #[cfg(test)]
     pub(crate) fn set_for_test(&self, user: &str, account: &str, factor: f64) {
         self.factors

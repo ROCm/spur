@@ -1653,9 +1653,8 @@ impl ClusterManager {
             true
         });
 
-        // Resolve each job's QoS once and reuse it for both the QoS-limit
-        // check below and the priority adjustment further down, instead of
-        // looking it up twice per job per scheduling cycle.
+        // Resolve once, reuse for both the QoS-limit check and the priority
+        // adjustment below, instead of looking it up twice per job.
         let qos_by_job: HashMap<JobId, Qos> = pending
             .iter()
             .map(|job| (job.job_id, self.resolve_qos(job)))
@@ -1683,13 +1682,8 @@ impl ClusterManager {
         let reservations = self.get_reservations();
         for job in &mut pending {
             let age_minutes = (now - job.submit_time).num_minutes().max(0);
-            let partition_tier = job
-                .spec
-                .partition
-                .as_ref()
-                .and_then(|pname| partitions.iter().find(|p| p.name == *pname))
-                .map(|p| p.priority_tier)
-                .unwrap_or(1);
+            let partition_tier =
+                spur_core::partition::max_priority_tier(job.spec.partition.as_deref(), &partitions);
             let fair_share = self
                 .fairshare_cache
                 .get(&job.spec.user, job.spec.account.as_deref().unwrap_or(""));
@@ -1703,9 +1697,8 @@ impl ClusterManager {
         }
         drop(partitions);
 
-        // Priority ties (more likely now that QoS floors low-priority jobs at
-        // 1) break on job_id so ordering is deterministic instead of
-        // depending on HashMap iteration order.
+        // QoS floors priority at 1, making ties more likely; break on job_id
+        // for deterministic ordering.
         pending.sort_by(|a, b| {
             let a_res = reservation::job_has_active_reservation(a, &reservations, now);
             let b_res = reservation::job_has_active_reservation(b, &reservations, now);
@@ -2708,31 +2701,14 @@ impl ClusterManager {
         }
     }
 
-    /// Recompute a job's effective priority (fairshare + age + partition
-    /// tier + QoS) as of right now, given an already-resolved `Qos`.
-    ///
-    /// Running jobs never pass back through `pending_jobs()`, so their
-    /// stored `priority` stays at the raw base value forever. This lets
-    /// callers like the preemption gate compare a running job's *current*
-    /// effective priority against a pending job's fully adjusted one
-    /// instead of comparing raw and adjusted values against each other.
-    ///
-    /// Takes `qos` instead of resolving it internally so callers that also
-    /// need the job's QoS for another decision (e.g. preempt-mode
-    /// resolution) can resolve it once and reuse the same snapshot for
-    /// both, rather than hitting `QosCache` twice for the same job in one
-    /// scheduling pass.
+    /// Recompute a job's live effective priority (a running job's stored
+    /// `priority` is stale). Takes `qos` pre-resolved so it can be reused.
     pub(crate) fn current_effective_priority_with_qos(&self, job: &Job, qos: &Qos) -> u32 {
         let now = Utc::now();
         let age_minutes = (now - job.submit_time).num_minutes().max(0);
         let partition_tier = {
             let partitions = self.partitions.read();
-            job.spec
-                .partition
-                .as_ref()
-                .and_then(|pname| partitions.iter().find(|p| p.name == *pname))
-                .map(|p| p.priority_tier)
-                .unwrap_or(1)
+            spur_core::partition::max_priority_tier(job.spec.partition.as_deref(), &partitions)
         };
         let fair_share = self
             .fairshare_cache
@@ -3818,10 +3794,8 @@ fn reservation_block(
     }
 }
 
-/// Combine fairshare/age/partition-tier and QoS into a job's effective
-/// priority. QoS is added on top of the fairshare/age/tier product rather
-/// than fed into it, so a job's QoS tier is a constant, predictable offset
-/// instead of being amplified or diluted by factors unrelated to QoS.
+/// QoS is added on top of the fairshare/age/tier product rather than fed
+/// into it, so it's a constant offset instead of an amplified/diluted one.
 fn compute_effective_priority(
     base_priority: u32,
     fair_share: f64,
@@ -6747,14 +6721,8 @@ mod tests {
             ..Default::default()
         });
 
-        // Realistic, non-maxed-out fairshare (3x) and age (6 days) on the
-        // low-QoS job; the high-QoS job is left neutral. Before this fix,
-        // applying QoS before the fairshare/age multiplication meant this
-        // exact combination let the low-QoS job's unrelated fairshare/age
-        // boost get multiplied into its QoS delta and outrank the high-QoS
-        // job: (1000 + 100) * 3.0 * ~1.857 ≈ 6128 vs (1000 + 5000) * 1 =
-        // 6000. Applying QoS on top instead keeps the two independent:
-        // 1000 * 3.0 * ~1.857 + 100 ≈ 5671 vs 1000 + 5000 = 6000.
+        // Non-neutral fairshare/age on the low-QoS job would previously let
+        // that unrelated boost amplify its QoS delta and outrank the high-QoS job.
         cm.fairshare_cache().set_for_test("low-user", "", 3.0);
 
         let mut low = basic_spec("low");
@@ -6787,6 +6755,43 @@ mod tests {
             high_priority > low_priority,
             "high-QoS job ({high_priority}) should still outrank low-QoS job ({low_priority}) \
              once fairshare/age no longer amplify the QoS delta"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn current_effective_priority_multi_partition_uses_highest_priority_tier() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        {
+            let mut partitions = cm.partitions.write();
+            partitions.push(Partition {
+                name: "low".into(),
+                priority_tier: 1,
+                ..Default::default()
+            });
+            partitions.push(Partition {
+                name: "high".into(),
+                priority_tier: 9,
+                ..Default::default()
+            });
+        }
+
+        // Built directly (not submitted) to isolate priority resolution from
+        // unrelated eligibility filters like partition_block().
+        let job = Job::new(
+            1,
+            JobSpec {
+                partition: Some("low,high".into()),
+                priority: Some(1000),
+                ..basic_spec("multi")
+            },
+        );
+
+        let priority = cm.current_effective_priority_with_qos(&job, &Qos::default());
+        assert_eq!(
+            priority, 9000,
+            "multi-partition job should use the highest matched priority_tier (9), \
+             not fall back to 1 because \"low,high\" isn't an exact partition name"
         );
     }
 
