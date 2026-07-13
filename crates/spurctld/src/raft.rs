@@ -718,9 +718,21 @@ pub struct RaftHandle {
 }
 
 impl RaftHandle {
+    /// Cheap, locally-cached leadership check. Can be stale for the length of
+    /// an election timeout after a partition — callers that need a
+    /// consensus-backed answer (e.g. before writes that bypass Raft, like
+    /// accounting reconciliation) must use `ensure_leader` instead.
     pub fn is_leader(&self) -> bool {
         let metrics = self.raft.metrics().borrow().clone();
         metrics.current_leader == Some(self.node_id)
+    }
+
+    /// Consensus-backed leadership check: confirms leadership by exchanging
+    /// heartbeats with a quorum of followers, so a partitioned former leader
+    /// gets `false` rather than a stale cached `true`. Costs a network
+    /// round-trip; use for periodic/batch operations, not on every request.
+    pub async fn ensure_leader(&self) -> bool {
+        self.raft.ensure_linearizable().await.is_ok()
     }
 
     pub fn current_leader(&self) -> Option<NodeId> {

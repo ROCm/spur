@@ -12,9 +12,14 @@ use spur_core::job::{JobId, JobState};
 
 const RETRY_ATTEMPTS: u32 = 3;
 const RETRY_BACKOFF: Duration = Duration::from_millis(200);
+// Bounds how long a single attempt can pin one of the pool's 8 connections.
+// Without this, a hung (not fully down) Postgres connection lets 3 retries
+// each hold a connection indefinitely, rather than failing fast and freeing it.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Retry a fallible async operation up to `attempts` times, doubling `backoff`
-/// between tries. Returns the last error if all attempts fail.
+/// between tries. Each attempt is bounded by `ATTEMPT_TIMEOUT`. Returns the
+/// last error (or a timeout error) if all attempts fail.
 async fn retry_with_backoff<F, Fut>(
     mut f: F,
     attempts: u32,
@@ -26,10 +31,16 @@ where
 {
     let mut attempt = 1;
     loop {
-        match f().await {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt >= attempts => return Err(e),
-            Err(_) => {
+        match tokio::time::timeout(ATTEMPT_TIMEOUT, f()).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(e)) if attempt >= attempts => return Err(e),
+            Err(_) if attempt >= attempts => {
+                return Err(anyhow::anyhow!(
+                    "operation timed out after {:?}",
+                    ATTEMPT_TIMEOUT
+                ));
+            }
+            Ok(Err(_)) | Err(_) => {
                 tokio::time::sleep(backoff).await;
                 backoff *= 2;
                 attempt += 1;

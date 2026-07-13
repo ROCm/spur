@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,12 +9,12 @@ use chrono::Utc;
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 
-use spur_core::job::{Job, JobId};
+use spur_core::job::{Job, JobId, JobState};
 
 use crate::cluster::ClusterManager;
 use crate::raft::RaftHandle;
 
-use super::db;
+use super::db::{self, AccountingRowState};
 
 /// Periodically re-issue accounting writes for jobs whose accounting DB
 /// record is missing or stale relative to the in-memory job store. Closes
@@ -30,7 +30,14 @@ pub fn spawn_loop(
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            if !raft.is_leader() {
+            // Consensus-backed check, not the cheap cached `is_leader()`:
+            // reconciliation writes bypass Raft entirely (they go straight to
+            // Postgres), so a partitioned former leader with a stale local
+            // view must not keep resyncing accounting state against a job
+            // store the rest of the cluster has moved on from. Residual risk:
+            // this only guards the start of a pass — leadership can still
+            // change during the writes `run_once` issues below.
+            if !raft.ensure_leader().await {
                 continue;
             }
             run_once(&pool, &cluster).await;
@@ -53,23 +60,33 @@ async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
 
     let expected: Vec<(JobId, String)> = candidates
         .iter()
-        .map(|j| (j.job_id, j.state.display().to_owned()))
+        .map(|j| (j.job_id, accounting_expected_state(j.state)))
         .collect();
 
-    let mut accounting_states = HashMap::new();
-    for job in &candidates {
-        match db::job_accounting_state(pool, job.job_id as i32).await {
-            Ok(Some(state)) => {
-                accounting_states.insert(job.job_id, state);
-            }
-            Ok(None) => {}
+    let job_ids: Vec<i32> = candidates.iter().map(|j| j.job_id as i32).collect();
+    let (accounting_states, unknown): (HashMap<JobId, AccountingRowState>, HashSet<JobId>) =
+        match db::job_accounting_states(pool, &job_ids).await {
+            Ok(rows) => (
+                rows.into_iter()
+                    .map(|(id, row)| (id as JobId, row))
+                    .collect(),
+                HashSet::new(),
+            ),
             Err(e) => {
-                warn!(job_id = job.job_id, error = %e, "reconciliation: failed to query accounting state");
+                // A failed read is not evidence the rows are absent. Treating
+                // it as "missing" would make resync_job call write_start,
+                // which unconditionally resets a possibly-correct terminal
+                // record to RUNNING — so every candidate is excluded from
+                // resync this pass and picked up again on the next one.
+                warn!(error = %e, "reconciliation: failed to query accounting state, skipping this cycle");
+                (
+                    HashMap::new(),
+                    candidates.iter().map(|j| j.job_id).collect(),
+                )
             }
-        }
-    }
+        };
 
-    let stale = jobs_needing_resync(&expected, &accounting_states);
+    let stale = jobs_needing_resync(&expected, &accounting_states, &unknown);
     if stale.is_empty() {
         return;
     }
@@ -79,29 +96,56 @@ async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
     );
 
     for job in candidates.iter().filter(|j| stale.contains(&j.job_id)) {
-        let row_missing = !accounting_states.contains_key(&job.job_id);
-        resync_job(pool, job, row_missing).await;
+        let row = accounting_states.get(&job.job_id);
+        let row_missing = row.is_none();
+        let needs_start_backfill = row.map(|r| r.needs_start_backfill).unwrap_or(false);
+        resync_job(pool, job, row_missing, needs_start_backfill).await;
+    }
+}
+
+/// What accounting should show for a job's current state. Accounting only
+/// ever models `RUNNING` or a terminal state (`record_job_start` always
+/// writes `RUNNING`; only `record_job_end` writes a terminal state), so
+/// in-memory states it has no representation for — `SUSPENDED`, `COMPLETING`
+/// — must map to `RUNNING` for comparison. Otherwise a suspended or
+/// completing job would be flagged stale on every single pass for as long as
+/// it stays in that state.
+fn accounting_expected_state(state: JobState) -> String {
+    if state.is_terminal() {
+        state.display().to_owned()
+    } else {
+        JobState::Running.display().to_owned()
     }
 }
 
 /// Diff in-memory job state against known accounting state. Pure so it can
-/// be unit tested without a database.
+/// be unit tested without a database. `unknown` holds jobs whose accounting
+/// read failed this pass — distinct from a confirmed-absent row, so they're
+/// skipped rather than treated as missing.
 fn jobs_needing_resync(
     expected: &[(JobId, String)],
-    accounting: &HashMap<JobId, String>,
+    accounting: &HashMap<JobId, AccountingRowState>,
+    unknown: &HashSet<JobId>,
 ) -> Vec<JobId> {
     expected
         .iter()
-        .filter(|(id, state)| accounting.get(id) != Some(state))
+        .filter(|(id, _)| !unknown.contains(id))
+        .filter(|(id, state)| match accounting.get(id) {
+            None => true,
+            Some(row) => row.needs_start_backfill || &row.state != state,
+        })
         .map(|(id, _)| *id)
         .collect()
 }
 
-async fn resync_job(pool: &PgPool, job: &Job, row_missing: bool) {
+async fn resync_job(pool: &PgPool, job: &Job, row_missing: bool, needs_start_backfill: bool) {
     // record_job_start unconditionally sets state='RUNNING', so only call it
-    // when the row doesn't exist yet or the job hasn't reached a terminal
-    // state — otherwise it would clobber a correct terminal state.
-    if row_missing || !job.state.is_terminal() {
+    // when the row doesn't exist yet, is missing start metadata a proper
+    // record_job_start would have populated (see AccountingRowState), or the
+    // job hasn't reached a terminal state — otherwise it would clobber a
+    // correct terminal state. The terminal case is corrected immediately
+    // below by write_end in the same pass.
+    if row_missing || needs_start_backfill || !job.state.is_terminal() {
         if let Err(e) = write_start(pool, job).await {
             error!(job_id = job.job_id, error = %e, "reconciliation: failed to resync job start");
             return;
@@ -158,13 +202,26 @@ async fn write_end(pool: &PgPool, job: &Job) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spur_core::job::JobSpec;
+    use sqlx::Row;
+
+    fn synced_row(state: &str) -> AccountingRowState {
+        AccountingRowState {
+            state: state.to_string(),
+            needs_start_backfill: false,
+        }
+    }
+
+    fn no_unknown() -> HashSet<JobId> {
+        HashSet::new()
+    }
 
     #[test]
     fn jobs_needing_resync_flags_missing_job() {
         let expected = vec![(1, "RUNNING".to_string())];
         let accounting = HashMap::new();
 
-        let stale = jobs_needing_resync(&expected, &accounting);
+        let stale = jobs_needing_resync(&expected, &accounting, &no_unknown());
 
         assert_eq!(stale, vec![1]);
     }
@@ -173,9 +230,9 @@ mod tests {
     fn jobs_needing_resync_flags_stale_state() {
         let expected = vec![(1, "COMPLETED".to_string())];
         let mut accounting = HashMap::new();
-        accounting.insert(1, "RUNNING".to_string());
+        accounting.insert(1, synced_row("RUNNING"));
 
-        let stale = jobs_needing_resync(&expected, &accounting);
+        let stale = jobs_needing_resync(&expected, &accounting, &no_unknown());
 
         assert_eq!(stale, vec![1]);
     }
@@ -184,9 +241,9 @@ mod tests {
     fn jobs_needing_resync_ignores_job_in_sync() {
         let expected = vec![(1, "RUNNING".to_string())];
         let mut accounting = HashMap::new();
-        accounting.insert(1, "RUNNING".to_string());
+        accounting.insert(1, synced_row("RUNNING"));
 
-        let stale = jobs_needing_resync(&expected, &accounting);
+        let stale = jobs_needing_resync(&expected, &accounting, &no_unknown());
 
         assert!(stale.is_empty());
     }
@@ -199,13 +256,222 @@ mod tests {
             (3, "FAILED".to_string()),
         ];
         let mut accounting = HashMap::new();
-        accounting.insert(1, "RUNNING".to_string()); // in sync
-        accounting.insert(2, "RUNNING".to_string()); // stale
+        accounting.insert(1, synced_row("RUNNING")); // in sync
+        accounting.insert(2, synced_row("RUNNING")); // stale
                                                      // job 3 missing entirely
 
-        let mut stale = jobs_needing_resync(&expected, &accounting);
+        let mut stale = jobs_needing_resync(&expected, &accounting, &no_unknown());
         stale.sort();
 
         assert_eq!(stale, vec![2, 3]);
+    }
+
+    // Finding 1: a row whose state matches but is missing start metadata
+    // (record_job_end created it from scratch because record_job_start's
+    // retries exhausted) must still be flagged, or the gap is permanent.
+    #[test]
+    fn jobs_needing_resync_flags_bare_row_even_when_state_matches() {
+        let expected = vec![(1, "COMPLETED".to_string())];
+        let mut accounting = HashMap::new();
+        accounting.insert(
+            1,
+            AccountingRowState {
+                state: "COMPLETED".to_string(),
+                needs_start_backfill: true,
+            },
+        );
+
+        let stale = jobs_needing_resync(&expected, &accounting, &no_unknown());
+
+        assert_eq!(stale, vec![1]);
+    }
+
+    // Finding 2: a job whose read failed this pass must never be flagged as
+    // needing resync, even though it's also absent from `accounting` — a
+    // confirmed-absent row and a failed read are not the same thing, and
+    // conflating them can clobber a correct terminal record via write_start.
+    #[test]
+    fn jobs_needing_resync_skips_jobs_with_unknown_read_status() {
+        let expected = vec![(1, "COMPLETED".to_string()), (2, "RUNNING".to_string())];
+        let accounting = HashMap::new();
+        let mut unknown = HashSet::new();
+        unknown.insert(1);
+
+        let stale = jobs_needing_resync(&expected, &accounting, &unknown);
+
+        assert_eq!(stale, vec![2]);
+    }
+
+    // Finding 3: accounting only ever models RUNNING or a terminal state, so
+    // states it can't represent must map to RUNNING for comparison —
+    // otherwise a suspended/completing job is flagged stale forever.
+    #[test]
+    fn accounting_expected_state_maps_non_terminal_states_to_running() {
+        assert_eq!(accounting_expected_state(JobState::Running), "RUNNING");
+        assert_eq!(accounting_expected_state(JobState::Suspended), "RUNNING");
+        assert_eq!(accounting_expected_state(JobState::Completing), "RUNNING");
+        assert_eq!(accounting_expected_state(JobState::Completed), "COMPLETED");
+        assert_eq!(accounting_expected_state(JobState::Failed), "FAILED");
+    }
+
+    #[test]
+    fn jobs_needing_resync_ignores_suspended_job_matching_running_row() {
+        let expected = vec![(1, accounting_expected_state(JobState::Suspended))];
+        let mut accounting = HashMap::new();
+        accounting.insert(1, synced_row("RUNNING"));
+
+        let stale = jobs_needing_resync(&expected, &accounting, &no_unknown());
+
+        assert!(stale.is_empty());
+    }
+
+    fn test_job_id(slot: u32) -> u32 {
+        const BASE: u32 = 9_500_000;
+        BASE + (std::process::id() % 10_000) * 10 + slot
+    }
+
+    fn test_job(job_id: JobId, state: JobState) -> Job {
+        let spec = JobSpec {
+            name: "reconcile-test".into(),
+            user: format!("spur_reconcile_user_{}", std::process::id()),
+            num_nodes: 1,
+            num_tasks: 2,
+            cpus_per_task: 3,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        let mut job = Job::new(job_id, spec);
+        let start = Utc::now() - chrono::Duration::hours(1);
+        job.start_time = Some(start);
+        job.state = state;
+        if state.is_terminal() {
+            job.end_time = Some(start + chrono::Duration::minutes(5));
+            job.exit_code = Some(0);
+        }
+        job
+    }
+
+    async fn test_pool() -> anyhow::Result<PgPool> {
+        let url = std::env::var("DATABASE_URL")?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&url)
+            .await?;
+        db::migrate(&pool).await?;
+        Ok(pool)
+    }
+
+    async fn delete_job(pool: &PgPool, job_id: i32) {
+        let _ = sqlx::query("DELETE FROM jobs WHERE job_id = $1")
+            .bind(job_id)
+            .execute(pool)
+            .await;
+    }
+
+    // Finding 1, end to end: simulate record_job_start's retries exhausting
+    // (only record_job_end ever lands, creating a bare row), then run the
+    // reconciliation resync path and confirm it backfills the row rather
+    // than leaving it permanently missing user_name/start_time.
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn resync_job_backfills_bare_row_left_by_a_missed_job_start() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let job_id = test_job_id(0);
+        delete_job(&pool, job_id as i32).await;
+
+        let job = test_job(job_id, JobState::Completed);
+
+        // Simulate the outage: only the end notification ever lands.
+        db::record_job_end(
+            &pool,
+            job_id as i32,
+            job.state.display(),
+            0,
+            job.end_time.unwrap(),
+            0,
+            0,
+        )
+        .await?;
+
+        let bare = db::job_accounting_states(&pool, &[job_id as i32])
+            .await?
+            .remove(&(job_id as i32))
+            .expect("bare row exists");
+        assert!(bare.needs_start_backfill);
+        assert_eq!(bare.state, "COMPLETED");
+
+        // The diff must flag this job even though state already matches.
+        let expected = vec![(job_id, accounting_expected_state(job.state))];
+        let mut accounting = HashMap::new();
+        accounting.insert(job_id, bare);
+        let stale = jobs_needing_resync(&expected, &accounting, &no_unknown());
+        assert_eq!(stale, vec![job_id]);
+
+        resync_job(&pool, &job, false, true).await;
+
+        let row = sqlx::query("SELECT user_name, start_time, state FROM jobs WHERE job_id = $1")
+            .bind(job_id as i32)
+            .fetch_one(&pool)
+            .await?;
+        let user_name: String = row.get("user_name");
+        let start_time: Option<chrono::DateTime<Utc>> = row.get("start_time");
+        let state: String = row.get("state");
+        assert_eq!(user_name, job.spec.user);
+        assert!(start_time.is_some(), "start_time must be backfilled");
+        assert_eq!(
+            state, "COMPLETED",
+            "terminal state must survive the backfill"
+        );
+
+        // Usage was skipped originally (start_time was NULL); the backfill
+        // must trigger it since end_time was already present.
+        let usage_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM usage WHERE user_name = $1 AND job_count > 0")
+                .bind(&job.spec.user)
+                .fetch_one(&pool)
+                .await?;
+        assert!(
+            usage_count > 0,
+            "usage must be backfilled along with the row"
+        );
+
+        delete_job(&pool, job_id as i32).await;
+        sqlx::query("DELETE FROM usage WHERE user_name = $1")
+            .bind(&job.spec.user)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    // Finding 3, end to end: a suspended job's accounting row correctly shows
+    // RUNNING (accounting has no SUSPENDED state); a resync pass must not
+    // treat that as stale and must not clobber the row.
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn suspended_job_is_not_flagged_stale_against_a_running_row() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let job_id = test_job_id(1);
+        delete_job(&pool, job_id as i32).await;
+
+        let running_job = test_job(job_id, JobState::Running);
+        resync_job(&pool, &running_job, true, false).await;
+
+        let suspended_job = test_job(job_id, JobState::Suspended);
+        let row = db::job_accounting_states(&pool, &[job_id as i32])
+            .await?
+            .remove(&(job_id as i32))
+            .expect("row exists");
+        let expected = vec![(job_id, accounting_expected_state(suspended_job.state))];
+        let mut accounting = HashMap::new();
+        accounting.insert(job_id, row);
+
+        let stale = jobs_needing_resync(&expected, &accounting, &no_unknown());
+        assert!(
+            stale.is_empty(),
+            "a suspended job matching a RUNNING row must not be flagged stale"
+        );
+
+        delete_job(&pool, job_id as i32).await;
+        Ok(())
     }
 }

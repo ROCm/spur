@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, QueryBuilder, Row};
@@ -234,14 +236,45 @@ pub async fn record_job_end(
     Ok(())
 }
 
-/// The accounting DB's current state for a job, or `None` if no row exists yet.
-/// Used by the reconciliation pass to detect jobs missing or stale in accounting.
-pub async fn job_accounting_state(pool: &PgPool, job_id: i32) -> anyhow::Result<Option<String>> {
-    let row = sqlx::query("SELECT state FROM jobs WHERE job_id = $1")
-        .bind(job_id)
-        .fetch_optional(pool)
-        .await?;
-    Ok(row.map(|r| r.get("state")))
+/// A job row's accounting state, as seen by the reconciliation pass.
+pub struct AccountingRowState {
+    pub state: String,
+    /// True when the row is missing metadata that a proper `record_job_start`
+    /// would have populated (e.g. `record_job_end` created a bare row from
+    /// scratch because `record_job_start` never landed). A row in this shape
+    /// needs a `record_job_start` backfill even if `state` already matches.
+    pub needs_start_backfill: bool,
+}
+
+/// The accounting DB's current state for a batch of jobs, in a single query.
+/// Jobs with no row in `jobs` are simply absent from the returned map. Used
+/// by the reconciliation pass to detect jobs missing or stale in accounting.
+pub async fn job_accounting_states(
+    pool: &PgPool,
+    job_ids: &[i32],
+) -> anyhow::Result<HashMap<i32, AccountingRowState>> {
+    if job_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows =
+        sqlx::query("SELECT job_id, state, user_name, start_time FROM jobs WHERE job_id = ANY($1)")
+            .bind(job_ids)
+            .fetch_all(pool)
+            .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let job_id: i32 = r.get("job_id");
+            let user_name: String = r.get("user_name");
+            let start_time: Option<DateTime<Utc>> = r.get("start_time");
+            let row = AccountingRowState {
+                state: r.get("state"),
+                needs_start_backfill: user_name.is_empty() || start_time.is_none(),
+            };
+            (job_id, row)
+        })
+        .collect())
 }
 
 /// Update usage accounting for a completed job, from the row `record_job_end` just wrote.
