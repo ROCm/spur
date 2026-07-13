@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS qos (
     max_tres_per_user TEXT,
     grp_tres        TEXT,
     max_wall_min    INTEGER,
+    grp_wall_min    INTEGER,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -123,6 +124,7 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reservation TEXT NOT NULL DEFAULT '';
 -- No FK to qos(name): a stale reference (QOS deleted after being set as a
 -- default) must degrade gracefully at read time, not be blocked here.
 ALTER TABLE associations ADD COLUMN IF NOT EXISTS default_qos TEXT;
+ALTER TABLE qos ADD COLUMN IF NOT EXISTS grp_wall_min INTEGER;
 "#;
 
 /// Record a job start in the database.
@@ -683,6 +685,49 @@ pub struct UserRecord {
     pub default_qos: Option<String>,
 }
 
+/// List every user-account association's resource limits, one row per
+/// partition-less association — the row the scheduler's admission check
+/// enforces against. `DISTINCT ON ... id DESC` mirrors `list_users`: it
+/// picks the newest row if legacy duplicates exist.
+pub async fn list_associations(pool: &PgPool) -> anyhow::Result<Vec<AssociationRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT ON (user_name, account)
+            user_name, account, max_running_jobs, max_submit_jobs,
+            max_tres_per_job, grp_tres, max_wall_min
+        FROM associations
+        WHERE partition_name IS NULL OR partition_name = ''
+        ORDER BY user_name, account, id DESC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| AssociationRecord {
+            user_name: r.get("user_name"),
+            account: r.get("account"),
+            max_running_jobs: r.get("max_running_jobs"),
+            max_submit_jobs: r.get("max_submit_jobs"),
+            max_tres_per_job: r.get("max_tres_per_job"),
+            grp_tres: r.get("grp_tres"),
+            max_wall_min: r.get("max_wall_min"),
+        })
+        .collect())
+}
+
+#[derive(Debug)]
+pub struct AssociationRecord {
+    pub user_name: String,
+    pub account: String,
+    pub max_running_jobs: Option<i32>,
+    pub max_submit_jobs: Option<i32>,
+    pub max_tres_per_job: Option<String>,
+    pub grp_tres: Option<String>,
+    pub max_wall_min: Option<i32>,
+}
+
 /// Create or update a QOS.
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_qos(
@@ -698,17 +743,19 @@ pub async fn upsert_qos(
     max_submit_per_user: Option<i32>,
     max_tres_per_user: Option<&str>,
     grp_tres: Option<&str>,
+    grp_wall_min: Option<i32>,
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"
         INSERT INTO qos (name, description, priority, preempt_mode, usage_factor,
                          max_jobs_per_user, max_wall_min, max_tres_per_job,
-                         max_submit_per_user, max_tres_per_user, grp_tres)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                         max_submit_per_user, max_tres_per_user, grp_tres, grp_wall_min)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         ON CONFLICT (name) DO UPDATE SET
             description = $2, priority = $3, preempt_mode = $4, usage_factor = $5,
             max_jobs_per_user = $6, max_wall_min = $7, max_tres_per_job = $8,
-            max_submit_per_user = $9, max_tres_per_user = $10, grp_tres = $11
+            max_submit_per_user = $9, max_tres_per_user = $10, grp_tres = $11,
+            grp_wall_min = $12
         "#,
     )
     .bind(name)
@@ -722,6 +769,7 @@ pub async fn upsert_qos(
     .bind(max_submit_per_user)
     .bind(max_tres_per_user)
     .bind(grp_tres)
+    .bind(grp_wall_min)
     .execute(pool)
     .await?;
     Ok(())
@@ -750,7 +798,7 @@ pub async fn qos_exists(pool: &PgPool, name: &str) -> anyhow::Result<bool> {
 /// List all QOS.
 pub async fn list_qos(pool: &PgPool) -> anyhow::Result<Vec<QosRecord>> {
     let rows = sqlx::query(
-        "SELECT name, description, priority, preempt_mode, usage_factor, max_jobs_per_user, max_wall_min, max_tres_per_job, max_submit_per_user, max_tres_per_user, grp_tres FROM qos ORDER BY name"
+        "SELECT name, description, priority, preempt_mode, usage_factor, max_jobs_per_user, max_wall_min, max_tres_per_job, max_submit_per_user, max_tres_per_user, grp_tres, grp_wall_min FROM qos ORDER BY name"
     ).fetch_all(pool).await?;
 
     Ok(rows
@@ -768,6 +816,7 @@ pub async fn list_qos(pool: &PgPool) -> anyhow::Result<Vec<QosRecord>> {
             max_submit_per_user: r.get("max_submit_per_user"),
             max_tres_per_user: r.get("max_tres_per_user"),
             grp_tres: r.get("grp_tres"),
+            grp_wall_min: r.get("grp_wall_min"),
         })
         .collect())
 }
@@ -785,6 +834,7 @@ pub struct QosRecord {
     pub max_submit_per_user: Option<i32>,
     pub max_tres_per_user: Option<String>,
     pub grp_tres: Option<String>,
+    pub grp_wall_min: Option<i32>,
 }
 
 #[cfg(test)]
@@ -1085,6 +1135,7 @@ mod job_history_tests {
             Some(4),
             Some("cpu=16"),
             Some("cpu=64"),
+            Some(120),
         )
         .await?;
 
@@ -1101,6 +1152,7 @@ mod job_history_tests {
         assert_eq!(got.max_submit_per_user, Some(4));
         assert_eq!(got.max_tres_per_user.as_deref(), Some("cpu=16"));
         assert_eq!(got.grp_tres.as_deref(), Some("cpu=64"));
+        assert_eq!(got.grp_wall_min, Some(120));
 
         sqlx::query("DELETE FROM qos WHERE name = $1")
             .bind(&name)
@@ -1137,7 +1189,7 @@ mod job_history_tests {
 
         upsert_account(&pool, &account, "d", "o", None, 1, None).await?;
         upsert_qos(
-            &pool, &qos_name, "d", 0, "off", 1.0, None, None, None, None, None, None,
+            &pool, &qos_name, "d", 0, "off", 1.0, None, None, None, None, None, None, None,
         )
         .await?;
 
@@ -1293,6 +1345,56 @@ mod job_history_tests {
             .execute(&pool)
             .await?;
         sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn list_associations_reads_limit_columns() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let user = format!("spur_assoclim_user_{pid}");
+        let account = format!("spur_assoclim_acct_{pid}");
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+
+        upsert_account(&pool, &account, "d", "o", None, 1, None).await?;
+        sqlx::query(
+            "INSERT INTO associations \
+             (user_name, account, max_running_jobs, max_submit_jobs, max_tres_per_job, grp_tres, max_wall_min) \
+             VALUES ($1, $2, 3, 5, 'cpu=2', 'cpu=16', 60)",
+        )
+        .bind(&user)
+        .bind(&account)
+        .execute(&pool)
+        .await?;
+
+        let got = list_associations(&pool)
+            .await?
+            .into_iter()
+            .find(|a| a.user_name == user && a.account == account)
+            .expect("association present");
+        assert_eq!(got.max_running_jobs, Some(3));
+        assert_eq!(got.max_submit_jobs, Some(5));
+        assert_eq!(got.max_tres_per_job.as_deref(), Some("cpu=2"));
+        assert_eq!(got.grp_tres.as_deref(), Some("cpu=16"));
+        assert_eq!(got.max_wall_min, Some(60));
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
             .bind(&user)
             .execute(&pool)
             .await?;

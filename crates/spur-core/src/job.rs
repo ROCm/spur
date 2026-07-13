@@ -262,6 +262,18 @@ pub enum PendingReason {
     ReservedMaintenance,
     ReservationDeleted,
     JobHoldMaxRequeue,
+
+    // Account/association-level limit parity (mirrors the QOS additions
+    // above, one layer up the hierarchy: `AccountLimits` on `Association`).
+    AssocMaxJobsLimit,
+    AssocMaxSubmitJobLimit,
+    AssocMaxCpuPerJobLimit,
+    AssocMaxNodePerJobLimit,
+    AssocMaxMemPerJob,
+    AssocGrpCpuLimit,
+    AssocGrpNodeLimit,
+    AssocGrpMemLimit,
+    AssocMaxWallDurationPerJobLimit,
 }
 
 impl PendingReason {
@@ -318,6 +330,15 @@ impl PendingReason {
             Self::ReservedMaintenance => "ReqNodeNotAvail, Reserved for maintenance",
             Self::ReservationDeleted => "ReservationDeleted",
             Self::JobHoldMaxRequeue => "JobHoldMaxRequeue",
+            Self::AssocMaxJobsLimit => "AssocMaxJobsLimit",
+            Self::AssocMaxSubmitJobLimit => "AssocMaxSubmitJobLimit",
+            Self::AssocMaxCpuPerJobLimit => "AssocMaxCpuPerJobLimit",
+            Self::AssocMaxNodePerJobLimit => "AssocMaxNodePerJobLimit",
+            Self::AssocMaxMemPerJob => "AssocMaxMemPerJob",
+            Self::AssocGrpCpuLimit => "AssocGrpCpuLimit",
+            Self::AssocGrpNodeLimit => "AssocGrpNodeLimit",
+            Self::AssocGrpMemLimit => "AssocGrpMemLimit",
+            Self::AssocMaxWallDurationPerJobLimit => "AssocMaxWallDurationPerJobLimit",
         }
     }
 }
@@ -1318,6 +1339,27 @@ mod tests {
         (PendingReason::BurstBufferResources, "BurstBufferResources"),
         (PendingReason::BurstBufferStageIn, "BurstBufferStageIn"),
         (PendingReason::JobHoldMaxRequeue, "JobHoldMaxRequeue"),
+        (PendingReason::AssocMaxJobsLimit, "AssocMaxJobsLimit"),
+        (
+            PendingReason::AssocMaxSubmitJobLimit,
+            "AssocMaxSubmitJobLimit",
+        ),
+        (
+            PendingReason::AssocMaxCpuPerJobLimit,
+            "AssocMaxCpuPerJobLimit",
+        ),
+        (
+            PendingReason::AssocMaxNodePerJobLimit,
+            "AssocMaxNodePerJobLimit",
+        ),
+        (PendingReason::AssocMaxMemPerJob, "AssocMaxMemPerJob"),
+        (PendingReason::AssocGrpCpuLimit, "AssocGrpCpuLimit"),
+        (PendingReason::AssocGrpNodeLimit, "AssocGrpNodeLimit"),
+        (PendingReason::AssocGrpMemLimit, "AssocGrpMemLimit"),
+        (
+            PendingReason::AssocMaxWallDurationPerJobLimit,
+            "AssocMaxWallDurationPerJobLimit",
+        ),
     ];
 
     #[test]

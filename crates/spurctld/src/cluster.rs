@@ -11,6 +11,7 @@ use parking_lot::RwLock;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
+use spur_core::account_limits::{check_account_limits, AccountCheckResult};
 use spur_core::accounting::{Qos, TresRecord, TresType};
 use spur_core::auth::AuthError;
 use spur_core::burst_buffer::BbStageState;
@@ -1725,6 +1726,11 @@ impl ClusterManager {
             true
         });
 
+        // Account/association enforcement: check per-user-per-account limits.
+        // Shares the eligibility logic with tag_blocked_pending_reasons() via
+        // account_block_for() so the drop decision and the displayed reason agree.
+        pending.retain(|job| account_block_for(job, &self.association_cache, &jobs).is_none());
+
         // Resolve once, reuse for both the QoS-limit check and the priority
         // adjustment below, instead of looking it up twice per job.
         let qos_by_job: HashMap<JobId, Qos> = pending
@@ -2168,11 +2174,12 @@ impl ClusterManager {
                         && !begin_held
                 })
                 .filter_map(|job| {
-                    // Same drop order as pending_jobs(): Part -> Dep -> QoS ->
-                    // Resv -> Lic -> BB (partition block is permanent, so first;
-                    // BB is last because staging runs just before dispatch).
+                    // Same drop order as pending_jobs(): Part -> Dep -> Assoc ->
+                    // QoS -> Resv -> Lic -> BB (partition block is permanent, so
+                    // first; BB is last because staging runs just before dispatch).
                     partition_block(job, &partitions)
                         .or_else(|| dependency_block(job))
+                        .or_else(|| account_block_for(job, &self.association_cache, &jobs))
                         .or_else(|| qos_block_for(job, &self.resolve_qos(job), &jobs))
                         .or_else(|| reservation_block(job, &reservations, now))
                         .or_else(|| license_block(job, &available))
@@ -3944,6 +3951,50 @@ fn qos_block_for(
     ) {
         QosCheckResult::Allowed => None,
         QosCheckResult::Blocked(reason) => Some(reason),
+    }
+}
+
+/// Shared by `pending_jobs()` and `tag_blocked_pending_reasons()` so the drop
+/// decision and displayed reason always agree. Looks up the job's (user,
+/// account) association limits from `AssociationCache`; a job with no account
+/// (or an association the cache has no limits for) is unconstrained.
+fn account_block_for(
+    job: &Job,
+    assoc_cache: &AssociationCache,
+    jobs: &HashMap<JobId, Job>,
+) -> Option<spur_core::job::PendingReason> {
+    let account = job.spec.account.as_deref().filter(|a| !a.is_empty())?;
+    let user = &job.spec.user;
+    let limits = assoc_cache.limits(user, account);
+
+    let running_count = jobs
+        .values()
+        .filter(|j| {
+            j.state == JobState::Running
+                && j.spec.user == *user
+                && j.spec.account.as_deref() == Some(account)
+        })
+        .count() as u32;
+    let submitted_count = jobs
+        .values()
+        .filter(|j| {
+            (j.state == JobState::Pending || j.state == JobState::Running)
+                && j.spec.user == *user
+                && j.spec.account.as_deref() == Some(account)
+        })
+        .count() as u32;
+    let account_running_tres =
+        sum_running_tres(jobs, |j| j.spec.account.as_deref() == Some(account));
+
+    match check_account_limits(
+        job,
+        &limits,
+        running_count,
+        submitted_count,
+        &account_running_tres,
+    ) {
+        AccountCheckResult::Allowed => None,
+        AccountCheckResult::Blocked(reason) => Some(reason),
     }
 }
 
@@ -8033,6 +8084,152 @@ mod tests {
             cm.get_job(j2).unwrap().pending_reason,
             PendingReason::QoSMaxJobsPerUser,
             "the fallback QOS's limits must actually enforce"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_sets_account_max_jobs_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.association_cache().insert_limits(
+            "testuser",
+            "research",
+            spur_core::accounting::AccountLimits {
+                max_running_jobs: Some(1),
+                ..Default::default()
+            },
+        );
+
+        let mut s1 = basic_spec("a1");
+        s1.account = Some("research".into());
+        let j1 = submit_and_wait(&cm, s1);
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            j1,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, j1, JobState::Running);
+
+        let mut s2 = basic_spec("a2");
+        s2.account = Some("research".into());
+        let j2 = submit_and_wait(&cm, s2);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::AssocMaxJobsLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_sets_account_max_submit_jobs_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.association_cache().insert_limits(
+            "testuser",
+            "research",
+            spur_core::accounting::AccountLimits {
+                max_submit_jobs: Some(1),
+                ..Default::default()
+            },
+        );
+
+        let mut s1 = basic_spec("b1");
+        s1.account = Some("research".into());
+        submit_and_wait(&cm, s1);
+
+        let mut s2 = basic_spec("b2");
+        s2.account = Some("research".into());
+        let j2 = submit_and_wait(&cm, s2);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::AssocMaxSubmitJobLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_sets_account_grp_cpu_reason_across_users() {
+        // GrpTRES aggregates across every user in the account, not just the
+        // requester: a different user's running job fills the cap so the next
+        // job in the same account blocks with AssocGrpCpuLimit.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Cpu, 4);
+        cm.association_cache().insert_limits(
+            "alice",
+            "research",
+            spur_core::accounting::AccountLimits {
+                grp_tres: Some(grp.clone()),
+                ..Default::default()
+            },
+        );
+        cm.association_cache().insert_limits(
+            "bob",
+            "research",
+            spur_core::accounting::AccountLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+        );
+
+        let mut s1 = basic_spec("c1");
+        s1.user = "alice".into();
+        s1.account = Some("research".into());
+        s1.num_tasks = 4;
+        let j1 = submit_and_wait(&cm, s1);
+        let res = scalar_alloc(4, 1000);
+        cm.start_job(
+            j1,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, j1, JobState::Running);
+
+        let mut s2 = basic_spec("c2");
+        s2.user = "bob".into();
+        s2.account = Some("research".into());
+        s2.num_tasks = 1;
+        let j2 = submit_and_wait(&cm, s2);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::AssocGrpCpuLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn account_limits_do_not_block_jobs_without_an_account() {
+        // A job with no account can't be constrained by an association it
+        // doesn't belong to.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.association_cache().insert_limits(
+            "testuser",
+            "research",
+            spur_core::accounting::AccountLimits {
+                max_running_jobs: Some(0),
+                ..Default::default()
+            },
+        );
+
+        let spec = basic_spec("d1");
+        let job_id = submit_and_wait(&cm, spec);
+
+        cm.tag_blocked_pending_reasons();
+        assert_ne!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::AssocMaxJobsLimit
         );
     }
 

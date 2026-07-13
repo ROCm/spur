@@ -146,6 +146,27 @@ mod tests {
                 "QOSMaxNodePerUserLimit",
             ),
             (PendingReason::QosMaxMemoryPerUser, "QOSMaxMemoryPerUser"),
+            (PendingReason::AssocMaxJobsLimit, "AssocMaxJobsLimit"),
+            (
+                PendingReason::AssocMaxSubmitJobLimit,
+                "AssocMaxSubmitJobLimit",
+            ),
+            (
+                PendingReason::AssocMaxCpuPerJobLimit,
+                "AssocMaxCpuPerJobLimit",
+            ),
+            (
+                PendingReason::AssocMaxNodePerJobLimit,
+                "AssocMaxNodePerJobLimit",
+            ),
+            (PendingReason::AssocMaxMemPerJob, "AssocMaxMemPerJob"),
+            (PendingReason::AssocGrpCpuLimit, "AssocGrpCpuLimit"),
+            (PendingReason::AssocGrpNodeLimit, "AssocGrpNodeLimit"),
+            (PendingReason::AssocGrpMemLimit, "AssocGrpMemLimit"),
+            (
+                PendingReason::AssocMaxWallDurationPerJobLimit,
+                "AssocMaxWallDurationPerJobLimit",
+            ),
         ];
         for (reason, display) in expected {
             assert_eq!(reason.display(), display);

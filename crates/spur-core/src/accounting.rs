@@ -46,7 +46,7 @@ impl TresType {
 }
 
 /// TRES usage/allocation record.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TresRecord {
     pub values: HashMap<TresType, u64>,
 }
@@ -114,7 +114,7 @@ pub struct Account {
 }
 
 /// Per-account resource limits.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AccountLimits {
     /// Max running jobs across all users in this account.
     pub max_running_jobs: Option<u32>,

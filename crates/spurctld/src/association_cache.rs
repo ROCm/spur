@@ -9,10 +9,13 @@ use parking_lot::RwLock;
 use sqlx::PgPool;
 use tracing::{info, warn};
 
+use spur_core::accounting::AccountLimits;
+
 struct Snapshot {
     default_qos: HashMap<(String, String), String>,
     default_account: HashMap<String, String>,
     memberships: HashSet<(String, String)>,
+    limits: HashMap<(String, String), AccountLimits>,
     loaded: bool,
 }
 
@@ -30,6 +33,7 @@ impl AssociationCache {
                 default_qos: HashMap::new(),
                 default_account: HashMap::new(),
                 memberships: HashSet::new(),
+                limits: HashMap::new(),
                 loaded: false,
             }),
         }
@@ -71,16 +75,29 @@ impl AssociationCache {
         (effective_account, default_qos)
     }
 
+    /// Resource limits for a (user, account) association; unset/unknown fields
+    /// default to `None` (limitless), matching `resolve_qos`'s unknown-QoS default.
+    pub fn limits(&self, user: &str, account: &str) -> AccountLimits {
+        self.snapshot
+            .read()
+            .limits
+            .get(&(user.to_owned(), account.to_owned()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn replace(
         &self,
         default_qos: HashMap<(String, String), String>,
         default_account: HashMap<String, String>,
         memberships: HashSet<(String, String)>,
+        limits: HashMap<(String, String), AccountLimits>,
     ) {
         *self.snapshot.write() = Snapshot {
             default_qos,
             default_account,
             memberships,
+            limits,
             loaded: true,
         };
     }
@@ -115,6 +132,16 @@ impl AssociationCache {
     }
 
     #[cfg(test)]
+    pub(crate) fn insert_limits(&self, user: &str, account: &str, limits: AccountLimits) {
+        let mut snap = self.snapshot.write();
+        snap.memberships
+            .insert((user.to_owned(), account.to_owned()));
+        snap.limits
+            .insert((user.to_owned(), account.to_owned()), limits);
+        snap.loaded = true;
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_loaded_without_associations(&self) {
         self.snapshot.write().loaded = true;
     }
@@ -130,14 +157,15 @@ impl AssociationCache {
             )
             .await
             {
-                Ok(Ok((qos, accounts, memberships))) => {
+                Ok(Ok((qos, accounts, memberships, limits))) => {
                     info!(
                         default_qos = qos.len(),
                         default_account = accounts.len(),
                         memberships = memberships.len(),
+                        limits = limits.len(),
                         "association cache initialized"
                     );
-                    cache.replace(qos, accounts, memberships);
+                    cache.replace(qos, accounts, memberships, limits);
                 }
                 Ok(Err(e)) => {
                     warn!(error = %e, "initial association fetch failed, will retry in background");
@@ -156,8 +184,8 @@ impl AssociationCache {
                 )
                 .await
                 {
-                    Ok(Ok((qos, accounts, memberships))) => {
-                        cache.replace(qos, accounts, memberships)
+                    Ok(Ok((qos, accounts, memberships, limits))) => {
+                        cache.replace(qos, accounts, memberships, limits)
                     }
                     Ok(Err(e)) => {
                         warn!(error = %e, "association refresh failed, retaining stale data")
@@ -207,6 +235,7 @@ mod tests {
             HashMap::from([(("bob".to_string(), "eng".to_string()), "new".to_string())]),
             HashMap::from([("bob".to_string(), "eng".to_string())]),
             HashSet::from([("bob".to_string(), "eng".to_string())]),
+            HashMap::new(),
         );
         assert_eq!(cache.resolve("alice", Some("research")), (None, None));
         assert_eq!(
@@ -247,6 +276,7 @@ mod tests {
             HashMap::from([(("bob".to_string(), "eng".to_string()), "new".to_string())]),
             HashMap::new(),
             HashSet::from([("bob".to_string(), "eng".to_string())]),
+            HashMap::new(),
         );
         let (account, qos) = cache.resolve("alice", None);
         assert_eq!(
@@ -263,5 +293,55 @@ mod tests {
         cache.insert_association("alice", "research");
         assert!(cache.has_membership("alice", "research"));
         assert!(!cache.has_membership("alice", "other"));
+    }
+
+    #[test]
+    fn limits_default_to_limitless_for_unknown_association() {
+        let cache = AssociationCache::new();
+        assert_eq!(cache.limits("alice", "research"), AccountLimits::default());
+    }
+
+    #[test]
+    fn limits_hit_after_insert() {
+        let cache = AssociationCache::new();
+        let limits = AccountLimits {
+            max_running_jobs: Some(3),
+            ..Default::default()
+        };
+        cache.insert_limits("alice", "research", limits.clone());
+        assert_eq!(cache.limits("alice", "research").max_running_jobs, Some(3));
+        assert_eq!(cache.limits("alice", "other"), AccountLimits::default());
+        assert_eq!(cache.limits("bob", "research"), AccountLimits::default());
+    }
+
+    #[test]
+    fn replace_swaps_limits_too() {
+        let cache = AssociationCache::new();
+        cache.insert_limits(
+            "alice",
+            "research",
+            AccountLimits {
+                max_running_jobs: Some(1),
+                ..Default::default()
+            },
+        );
+        cache.replace(
+            HashMap::new(),
+            HashMap::new(),
+            HashSet::new(),
+            HashMap::from([(
+                ("bob".to_string(), "eng".to_string()),
+                AccountLimits {
+                    max_submit_jobs: Some(2),
+                    ..Default::default()
+                },
+            )]),
+        );
+        assert_eq!(
+            cache.limits("alice", "research"),
+            AccountLimits::default(),
+            "old limits must not survive the swap"
+        );
+        assert_eq!(cache.limits("bob", "eng").max_submit_jobs, Some(2));
     }
 }
