@@ -4,14 +4,14 @@
 //! SPANK plugin host.
 //!
 //! Loads existing Slurm SPANK plugins (.so files) via dlopen and provides
-//! the spank_* callback API (11 hooks, ~12 API functions).
+//! the `spank_*`/`slurm_*` callback API expected by `spank.h`.
 
 use std::collections::HashMap;
 use std::ffi::CStr;
-use std::os::raw::{c_char, c_int};
+use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// SPANK callback hook points (matches Slurm's spank.h).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -48,20 +48,44 @@ impl SpankHook {
     }
 }
 
-/// SPANK item IDs for spank_get_item (10 common items).
+/// SPANK item IDs for `spank_get_item`.
+///
+/// Discriminants match Slurm's `enum spank_item` in `spank.h`; plugins pass
+/// these numeric values, so the ordering must stay identical.
 #[repr(C)]
 pub enum SpankItem {
-    JobId = 0,
-    JobUid = 1,
-    JobGid = 2,
+    JobUid = 0,
+    JobGid = 1,
+    JobId = 2,
     JobStepId = 3,
     JobNnodes = 4,
     JobNodeid = 5,
     JobLocalTaskCount = 6,
     JobTotalTaskCount = 7,
-    JobArgv = 8,
-    TaskPid = 9,
+    JobNcpus = 8,
+    JobArgv = 9,
+    JobEnv = 10,
+    TaskId = 11,
+    TaskGlobalId = 12,
+    TaskExitStatus = 13,
+    TaskPid = 14,
 }
+
+/// `spank_err_t` return codes (subset of `spank.h`).
+///
+/// Plugins primarily check for `ESPANK_SUCCESS`; the remaining codes let
+/// callers distinguish common failures.
+pub const ESPANK_SUCCESS: c_int = 0;
+pub const ESPANK_ERROR: c_int = 1;
+pub const ESPANK_BAD_ARG: c_int = 2;
+pub const ESPANK_NOT_TASK: c_int = 3;
+pub const ESPANK_ENV_EXISTS: c_int = 4;
+pub const ESPANK_ENV_NOEXIST: c_int = 5;
+pub const ESPANK_NOSPACE: c_int = 6;
+pub const ESPANK_NOT_REMOTE: c_int = 7;
+pub const ESPANK_NOEXIST: c_int = 8;
+pub const ESPANK_NOT_AVAIL: c_int = 10;
+pub const ESPANK_NOT_LOCAL: c_int = 11;
 
 /// A loaded SPANK plugin.
 struct SpankPlugin {
@@ -100,6 +124,9 @@ impl Default for SpankHost {
 
 impl SpankHost {
     pub fn new() -> Self {
+        // Reachable from every host that constructs a SpankHost, keeping the
+        // exported symbols in the binary (see retain_exported_symbols).
+        retain_exported_symbols();
         Self {
             plugins: Vec::new(),
             context: SpankContext::default(),
@@ -151,6 +178,7 @@ impl SpankHost {
         let mut handle = SpankHandle {
             context: self.context.clone(),
             env: HashMap::new(),
+            job_control_env: HashMap::new(),
         };
         let handle_ptr = &mut handle as *mut SpankHandle;
 
@@ -212,111 +240,250 @@ impl SpankHost {
 pub struct SpankHandle {
     pub context: SpankContext,
     pub env: HashMap<String, String>,
+    /// Job-control environment (Slurm prepends `SPANK_` to these keys).
+    pub job_control_env: HashMap<String, String>,
 }
 
 /// Retrieve a job context item from the SPANK handle.
 ///
-/// The `item` parameter corresponds to `SpankItem` variants (0=JobId,
-/// 1=JobUid, etc.).  On success the value is written through `val` and 0
-/// is returned; on error -1 is returned.
+/// Matches Slurm's `spank_get_item(spank_t, spank_item_t, ...)`. Slurm
+/// declares it variadic; stable Rust cannot define C-variadic functions, so
+/// we take the single trailing result pointer directly. This is ABI
+/// compatible on the SysV x86-64 varargs convention for the scalar items we
+/// support (a single pointer passed in a register). Multi-argument items such
+/// as `S_JOB_ARGV`/`S_JOB_ENV` and the pid-to-id lookups are not supported.
 #[no_mangle]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn spur_spank_get_item(
-    handle: *mut SpankHandle,
-    item: c_int,
-    val: *mut *mut std::ffi::c_void,
-) -> c_int {
+pub extern "C" fn spank_get_item(handle: *mut SpankHandle, item: c_int, val: *mut c_void) -> c_int {
     if handle.is_null() || val.is_null() {
-        return -1;
+        return ESPANK_BAD_ARG;
     }
     let handle = unsafe { &*handle };
-    match item {
-        0 => {
-            // SPANK_JOB_ID
-            unsafe {
-                *(val as *mut u32) = handle.context.job_id;
-            }
-            0
-        }
-        1 => {
-            // SPANK_JOB_UID
-            unsafe {
-                *(val as *mut u32) = handle.context.uid;
-            }
-            0
-        }
-        2 => {
-            // SPANK_JOB_GID
-            unsafe {
-                *(val as *mut u32) = handle.context.gid;
-            }
-            0
-        }
-        3 => {
-            // SPANK_JOB_STEPID
-            unsafe {
-                *(val as *mut u32) = handle.context.step_id;
-            }
-            0
-        }
-        4 => {
-            // SPANK_JOB_NNODES
-            unsafe {
-                *(val as *mut u32) = handle.context.num_nodes;
-            }
-            0
-        }
-        5 => {
-            // SPANK_JOB_NODEID
-            unsafe {
-                *(val as *mut u32) = handle.context.node_id;
-            }
-            0
-        }
-        6 => {
-            // SPANK_JOB_LOCAL_TASK_COUNT
-            unsafe {
-                *(val as *mut u32) = handle.context.local_task_count;
-            }
-            0
-        }
-        7 => {
-            // SPANK_JOB_TOTAL_TASK_COUNT
-            unsafe {
-                *(val as *mut u32) = handle.context.total_task_count;
-            }
-            0
-        }
-        // 8 = SPANK_JOB_ARGV — not yet implemented (requires pointer-to-array)
-        9 => {
-            // SPANK_TASK_PID
-            unsafe {
-                *(val as *mut u32) = handle.context.task_pid;
-            }
-            0
-        }
-        _ => -1,
+    let value = match item {
+        x if x == SpankItem::JobUid as c_int => handle.context.uid,
+        x if x == SpankItem::JobGid as c_int => handle.context.gid,
+        x if x == SpankItem::JobId as c_int => handle.context.job_id,
+        x if x == SpankItem::JobStepId as c_int => handle.context.step_id,
+        x if x == SpankItem::JobNnodes as c_int => handle.context.num_nodes,
+        x if x == SpankItem::JobNodeid as c_int => handle.context.node_id,
+        x if x == SpankItem::JobLocalTaskCount as c_int => handle.context.local_task_count,
+        x if x == SpankItem::JobTotalTaskCount as c_int => handle.context.total_task_count,
+        x if x == SpankItem::TaskPid as c_int => handle.context.task_pid,
+        _ => return ESPANK_BAD_ARG,
+    };
+    unsafe {
+        *(val as *mut u32) = value;
     }
+    ESPANK_SUCCESS
 }
 
-/// Set an environment variable in the SPANK handle's per-invocation map.
+/// Set an environment variable in the job's environment.
 ///
-/// Returns 0 on success, -1 if any pointer is null.
+/// Matches Slurm's `spank_setenv`. When `overwrite == 0` and the variable
+/// already exists, returns `ESPANK_ENV_EXISTS` without modifying it.
 #[no_mangle]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn spur_spank_set_var(
+pub extern "C" fn spank_setenv(
     handle: *mut SpankHandle,
-    key: *const c_char,
+    var: *const c_char,
     val: *const c_char,
+    overwrite: c_int,
 ) -> c_int {
-    if handle.is_null() || key.is_null() || val.is_null() {
-        return -1;
+    if handle.is_null() || var.is_null() || val.is_null() {
+        return ESPANK_BAD_ARG;
     }
     let handle = unsafe { &mut *handle };
-    let key = unsafe { CStr::from_ptr(key) }.to_string_lossy().to_string();
-    let val = unsafe { CStr::from_ptr(val) }.to_string_lossy().to_string();
-    handle.env.insert(key, val);
-    0
+    let key = unsafe { CStr::from_ptr(var) }.to_string_lossy().to_string();
+    let value = unsafe { CStr::from_ptr(val) }.to_string_lossy().to_string();
+    if overwrite == 0 && handle.env.contains_key(&key) {
+        return ESPANK_ENV_EXISTS;
+    }
+    handle.env.insert(key, value);
+    ESPANK_SUCCESS
+}
+
+/// Copy a job environment variable into `buf` (matches Slurm's `spank_getenv`).
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn spank_getenv(
+    handle: *mut SpankHandle,
+    var: *const c_char,
+    buf: *mut c_char,
+    len: c_int,
+) -> c_int {
+    if handle.is_null() || var.is_null() || buf.is_null() || len < 0 {
+        return ESPANK_BAD_ARG;
+    }
+    let handle = unsafe { &*handle };
+    let key = unsafe { CStr::from_ptr(var) }.to_string_lossy().to_string();
+    copy_env_value(&handle.env, &key, buf, len)
+}
+
+/// Unset a job environment variable (matches Slurm's `spank_unsetenv`).
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn spank_unsetenv(handle: *mut SpankHandle, var: *const c_char) -> c_int {
+    if handle.is_null() || var.is_null() {
+        return ESPANK_BAD_ARG;
+    }
+    let handle = unsafe { &mut *handle };
+    let key = unsafe { CStr::from_ptr(var) }.to_string_lossy().to_string();
+    handle.env.remove(&key);
+    ESPANK_SUCCESS
+}
+
+/// Set a variable in the job-control environment (matches Slurm's
+/// `spank_job_control_setenv`). Slurm prepends `SPANK_` to the stored key.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn spank_job_control_setenv(
+    handle: *mut SpankHandle,
+    name: *const c_char,
+    value: *const c_char,
+    overwrite: c_int,
+) -> c_int {
+    if handle.is_null() || name.is_null() || value.is_null() {
+        return ESPANK_BAD_ARG;
+    }
+    let handle = unsafe { &mut *handle };
+    let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
+    let key = format!("SPANK_{name}");
+    let value = unsafe { CStr::from_ptr(value) }
+        .to_string_lossy()
+        .to_string();
+    if overwrite == 0 && handle.job_control_env.contains_key(&key) {
+        return ESPANK_ENV_EXISTS;
+    }
+    handle.job_control_env.insert(key, value);
+    ESPANK_SUCCESS
+}
+
+/// Copy a job-control environment variable into `buf` (matches Slurm's
+/// `spank_job_control_getenv`).
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn spank_job_control_getenv(
+    handle: *mut SpankHandle,
+    name: *const c_char,
+    buf: *mut c_char,
+    len: c_int,
+) -> c_int {
+    if handle.is_null() || name.is_null() || buf.is_null() || len <= 0 {
+        return ESPANK_BAD_ARG;
+    }
+    let handle = unsafe { &*handle };
+    let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
+    let key = format!("SPANK_{name}");
+    copy_env_value(&handle.job_control_env, &key, buf, len)
+}
+
+/// Unset a job-control environment variable (matches Slurm's
+/// `spank_job_control_unsetenv`).
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn spank_job_control_unsetenv(
+    handle: *mut SpankHandle,
+    name: *const c_char,
+) -> c_int {
+    if handle.is_null() || name.is_null() {
+        return ESPANK_BAD_ARG;
+    }
+    let handle = unsafe { &mut *handle };
+    let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
+    handle.job_control_env.remove(&format!("SPANK_{name}"));
+    ESPANK_SUCCESS
+}
+
+/// Return a static string for a `spank_err_t` code (matches `spank_strerror`).
+#[no_mangle]
+pub extern "C" fn spank_strerror(err: c_int) -> *const c_char {
+    let s: &CStr = match err {
+        ESPANK_SUCCESS => c"Success",
+        ESPANK_BAD_ARG => c"Bad argument",
+        ESPANK_NOT_TASK => c"Not in task context",
+        ESPANK_ENV_EXISTS => c"Environment variable exists",
+        ESPANK_ENV_NOEXIST => c"No such environment variable",
+        ESPANK_NOSPACE => c"Buffer too small",
+        ESPANK_NOT_REMOTE => c"Valid only in remote context",
+        ESPANK_NOEXIST => c"Id/pid does not exist on this node",
+        ESPANK_NOT_AVAIL => c"Item not available from this callback",
+        ESPANK_NOT_LOCAL => c"Valid only in local or allocator context",
+        _ => c"Generic error",
+    };
+    s.as_ptr()
+}
+
+/// Copy `map[key]` into the C buffer `buf` of size `len`, NUL-terminating.
+///
+/// Returns `ESPANK_ENV_NOEXIST` if absent, `ESPANK_NOSPACE` if truncated.
+fn copy_env_value(map: &HashMap<String, String>, key: &str, buf: *mut c_char, len: c_int) -> c_int {
+    let Some(value) = map.get(key) else {
+        return ESPANK_ENV_NOEXIST;
+    };
+    let bytes = value.as_bytes();
+    let cap = len as usize;
+    // Reserve one byte for the trailing NUL.
+    if bytes.len() + 1 > cap {
+        return ESPANK_NOSPACE;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, buf, bytes.len());
+        *buf.add(bytes.len()) = 0;
+    }
+    ESPANK_SUCCESS
+}
+
+/// Slurm logging functions exported to plugins.
+///
+/// Slurm declares these variadic (`printf`-style). Stable Rust cannot define
+/// C-variadic functions, so these take only the format string and log it
+/// verbatim via `tracing`. This keeps symbols resolvable and is ABI-safe on
+/// the SysV varargs convention (extra args are ignored); the trade-off is that
+/// `%`-style format specifiers are not expanded.
+macro_rules! spank_log_fn {
+    ($name:ident, $level:ident) => {
+        #[no_mangle]
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
+        pub extern "C" fn $name(fmt: *const c_char) {
+            if fmt.is_null() {
+                return;
+            }
+            let msg = unsafe { CStr::from_ptr(fmt) }.to_string_lossy();
+            $level!(target: "spank_plugin", "{msg}");
+        }
+    };
+}
+
+spank_log_fn!(slurm_error, error);
+spank_log_fn!(slurm_info, info);
+spank_log_fn!(slurm_verbose, info);
+spank_log_fn!(slurm_debug, debug);
+spank_log_fn!(slurm_debug2, debug);
+spank_log_fn!(slurm_debug3, debug);
+spank_log_fn!(slurm_spank_log, info);
+
+/// Reference every exported SPANK symbol so the linker cannot drop them from
+/// the host binary (see `SpankHost::new`). Pairs with `-Wl,--export-dynamic`
+/// so `dlsym` in loaded plugins can resolve them.
+fn retain_exported_symbols() {
+    let anchors: &[*const c_void] = &[
+        spank_get_item as *const c_void,
+        spank_setenv as *const c_void,
+        spank_getenv as *const c_void,
+        spank_unsetenv as *const c_void,
+        spank_job_control_setenv as *const c_void,
+        spank_job_control_getenv as *const c_void,
+        spank_job_control_unsetenv as *const c_void,
+        spank_strerror as *const c_void,
+        slurm_error as *const c_void,
+        slurm_info as *const c_void,
+        slurm_verbose as *const c_void,
+        slurm_debug as *const c_void,
+        slurm_debug2 as *const c_void,
+        slurm_debug3 as *const c_void,
+        slurm_spank_log as *const c_void,
+    ];
+    std::hint::black_box(anchors);
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -465,6 +632,154 @@ mod tests {
         assert_eq!(ctx.job_id, 0);
         assert_eq!(ctx.uid, 0);
         assert_eq!(ctx.task_pid, 0);
+    }
+
+    #[test]
+    fn test_spank_item_ids_match_slurm() {
+        // Discriminants must equal Slurm's enum spank_item values.
+        assert_eq!(SpankItem::JobUid as c_int, 0);
+        assert_eq!(SpankItem::JobGid as c_int, 1);
+        assert_eq!(SpankItem::JobId as c_int, 2);
+        assert_eq!(SpankItem::JobStepId as c_int, 3);
+        assert_eq!(SpankItem::JobNnodes as c_int, 4);
+        assert_eq!(SpankItem::JobNodeid as c_int, 5);
+        assert_eq!(SpankItem::JobLocalTaskCount as c_int, 6);
+        assert_eq!(SpankItem::JobTotalTaskCount as c_int, 7);
+        assert_eq!(SpankItem::JobNcpus as c_int, 8);
+        assert_eq!(SpankItem::JobArgv as c_int, 9);
+        assert_eq!(SpankItem::TaskPid as c_int, 14);
+    }
+
+    fn test_handle() -> SpankHandle {
+        SpankHandle {
+            context: SpankContext {
+                job_id: 42,
+                uid: 1000,
+                gid: 1001,
+                step_id: 3,
+                num_nodes: 2,
+                node_id: 1,
+                local_task_count: 4,
+                total_task_count: 8,
+                task_pid: 12345,
+            },
+            env: HashMap::new(),
+            job_control_env: HashMap::new(),
+        }
+    }
+
+    fn get_item_u32(handle: &mut SpankHandle, item: SpankItem) -> Option<u32> {
+        let mut out: u32 = 0;
+        let rc = spank_get_item(
+            handle,
+            item as c_int,
+            &mut out as *mut u32 as *mut std::ffi::c_void,
+        );
+        (rc == ESPANK_SUCCESS).then_some(out)
+    }
+
+    #[test]
+    fn test_spank_get_item_returns_correct_fields() {
+        let mut handle = test_handle();
+        assert_eq!(get_item_u32(&mut handle, SpankItem::JobId), Some(42));
+        assert_eq!(get_item_u32(&mut handle, SpankItem::JobUid), Some(1000));
+        assert_eq!(get_item_u32(&mut handle, SpankItem::JobGid), Some(1001));
+        assert_eq!(get_item_u32(&mut handle, SpankItem::TaskPid), Some(12345));
+    }
+
+    #[test]
+    fn test_spank_setenv_overwrite_semantics() {
+        let mut handle = test_handle();
+        let var = std::ffi::CString::new("FOO").unwrap();
+        let val1 = std::ffi::CString::new("one").unwrap();
+        let val2 = std::ffi::CString::new("two").unwrap();
+
+        assert_eq!(
+            spank_setenv(&mut handle, var.as_ptr(), val1.as_ptr(), 0),
+            ESPANK_SUCCESS
+        );
+        // overwrite = 0 on existing key must not clobber.
+        assert_eq!(
+            spank_setenv(&mut handle, var.as_ptr(), val2.as_ptr(), 0),
+            ESPANK_ENV_EXISTS
+        );
+        assert_eq!(handle.env.get("FOO").map(String::as_str), Some("one"));
+        // overwrite = 1 replaces it.
+        assert_eq!(
+            spank_setenv(&mut handle, var.as_ptr(), val2.as_ptr(), 1),
+            ESPANK_SUCCESS
+        );
+        assert_eq!(handle.env.get("FOO").map(String::as_str), Some("two"));
+    }
+
+    #[test]
+    fn test_spank_getenv_roundtrip_and_errors() {
+        let mut handle = test_handle();
+        let var = std::ffi::CString::new("BAR").unwrap();
+        let val = std::ffi::CString::new("baz").unwrap();
+        spank_setenv(&mut handle, var.as_ptr(), val.as_ptr(), 1);
+
+        let mut buf = [0i8; 16];
+        assert_eq!(
+            spank_getenv(
+                &mut handle,
+                var.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len() as c_int
+            ),
+            ESPANK_SUCCESS
+        );
+        let out = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap();
+        assert_eq!(out, "baz");
+
+        // Missing key.
+        let missing = std::ffi::CString::new("NOPE").unwrap();
+        assert_eq!(
+            spank_getenv(
+                &mut handle,
+                missing.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len() as c_int
+            ),
+            ESPANK_ENV_NOEXIST
+        );
+
+        // Buffer too small (value "baz" needs 4 bytes incl. NUL).
+        let mut tiny = [0i8; 2];
+        assert_eq!(
+            spank_getenv(
+                &mut handle,
+                var.as_ptr(),
+                tiny.as_mut_ptr(),
+                tiny.len() as c_int
+            ),
+            ESPANK_NOSPACE
+        );
+    }
+
+    #[test]
+    fn test_spank_job_control_setenv_prefixes_key() {
+        let mut handle = test_handle();
+        let name = std::ffi::CString::new("TOKEN").unwrap();
+        let val = std::ffi::CString::new("secret").unwrap();
+        assert_eq!(
+            spank_job_control_setenv(&mut handle, name.as_ptr(), val.as_ptr(), 0),
+            ESPANK_SUCCESS
+        );
+        assert_eq!(
+            handle
+                .job_control_env
+                .get("SPANK_TOKEN")
+                .map(String::as_str),
+            Some("secret")
+        );
+    }
+
+    #[test]
+    fn test_spank_strerror_success() {
+        let ptr = spank_strerror(ESPANK_SUCCESS);
+        let s = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
+        assert_eq!(s, "Success");
     }
 
     #[test]

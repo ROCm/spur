@@ -107,4 +107,49 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(host.plugin_count(), 0);
     }
+
+    // -- T58.8: Item IDs match Slurm's enum spank_item --------------------
+
+    #[test]
+    fn t58_8_item_ids_match_slurm() {
+        use std::os::raw::c_int;
+        assert_eq!(SpankItem::JobUid as c_int, 0);
+        assert_eq!(SpankItem::JobGid as c_int, 1);
+        assert_eq!(SpankItem::JobId as c_int, 2);
+        assert_eq!(SpankItem::TaskPid as c_int, 14);
+    }
+
+    // -- T58.9: spank_setenv / spank_getenv round-trip --------------------
+
+    #[test]
+    fn t58_9_setenv_getenv_roundtrip() {
+        use std::ffi::{CStr, CString};
+        use std::os::raw::c_int;
+
+        let mut handle = SpankHandle {
+            context: SpankContext::default(),
+            env: std::collections::HashMap::new(),
+            job_control_env: std::collections::HashMap::new(),
+        };
+        let var = CString::new("SPANK_TEST").unwrap();
+        let val = CString::new("hello").unwrap();
+
+        assert_eq!(
+            spank_setenv(&mut handle, var.as_ptr(), val.as_ptr(), 0),
+            ESPANK_SUCCESS
+        );
+
+        let mut buf = [0i8; 32];
+        assert_eq!(
+            spank_getenv(
+                &mut handle,
+                var.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len() as c_int
+            ),
+            ESPANK_SUCCESS
+        );
+        let out = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap();
+        assert_eq!(out, "hello");
+    }
 }
