@@ -88,7 +88,18 @@ pub async fn association_maps(
 
 fn account_limits_from_record(r: db::AssociationRecord) -> AccountLimits {
     let opt_u32 = |v: Option<i32>| v.filter(|&x| x > 0).map(|x| x as u32);
-    let opt_tres = |s: Option<String>| s.filter(|s| !s.is_empty()).map(|s| TresRecord::parse(&s));
+    // Values are validated by `add_user` before being stored, so a parse
+    // failure here means the DB row predates that check or was edited
+    // out-of-band; treat it as unset rather than poisoning the whole load.
+    let opt_tres = |s: Option<String>| {
+        s.filter(|s| !s.is_empty()).and_then(|s| {
+            TresRecord::parse(&s)
+                .inspect_err(
+                    |e| tracing::warn!(tres = %s, error = %e, "dropping unparseable stored TRES"),
+                )
+                .ok()
+        })
+    };
 
     AccountLimits {
         max_running_jobs: opt_u32(r.max_running_jobs),

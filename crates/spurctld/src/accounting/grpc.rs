@@ -5,10 +5,22 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tonic::{Request, Response, Status};
 
+use spur_core::accounting::TresRecord;
 use spur_proto::proto::slurm_accounting_server::{SlurmAccounting, SlurmAccountingServer};
 use spur_proto::proto::*;
 
 use super::{db, fairshare};
+
+/// Reject a TRES string (e.g. `grptres=`/`maxtresperjob=`/`maxtresperuser=`)
+/// that doesn't parse, instead of letting it silently become a no-op limit.
+fn validate_tres(field: &str, raw: &str) -> Result<(), Status> {
+    if raw.is_empty() {
+        return Ok(());
+    }
+    TresRecord::parse(raw)
+        .map(|_| ())
+        .map_err(|e| Status::invalid_argument(format!("invalid {field}: {e}")))
+}
 
 pub(crate) struct AccountingService {
     pool: PgPool,
@@ -368,6 +380,8 @@ impl SlurmAccounting for AccountingService {
                     .map_err(|_| Status::invalid_argument("max_submit_jobs exceeds i32::MAX"))?,
             )
         };
+        validate_tres("maxtresperjob", &req.max_tres_per_job)?;
+        validate_tres("grptres", &req.grp_tres)?;
         let max_tres_per_job = if req.max_tres_per_job.is_empty() {
             None
         } else {
@@ -445,6 +459,9 @@ impl SlurmAccounting for AccountingService {
 
     async fn create_qos(&self, request: Request<CreateQosRequest>) -> Result<Response<()>, Status> {
         let req = request.into_inner();
+        validate_tres("maxtresperjob", &req.max_tres_per_job)?;
+        validate_tres("maxtresperuser", &req.max_tres_per_user)?;
+        validate_tres("grptres", &req.grp_tres)?;
         let max_jobs = if req.max_jobs_per_user == 0 {
             None
         } else {
@@ -595,5 +612,33 @@ fn datetime_to_proto(dt: DateTime<Utc>) -> prost_types::Timestamp {
     prost_types::Timestamp {
         seconds: dt.timestamp(),
         nanos: dt.timestamp_subsec_nanos() as i32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_tres_accepts_empty() {
+        assert!(validate_tres("grptres", "").is_ok());
+    }
+
+    #[test]
+    fn validate_tres_accepts_well_formed() {
+        assert!(validate_tres("maxtresperjob", "cpu=8,mem=1024").is_ok());
+    }
+
+    #[test]
+    fn validate_tres_rejects_unit_suffixed_value() {
+        let err = validate_tres("grptres", "mem=1G").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("grptres"));
+    }
+
+    #[test]
+    fn validate_tres_rejects_unknown_type() {
+        let err = validate_tres("maxtresperuser", "bogus=5").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }
