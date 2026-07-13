@@ -104,14 +104,17 @@ async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
 }
 
 /// What accounting should show for a job's current state. Accounting only
-/// ever models `RUNNING` or a terminal state (`record_job_start` always
-/// writes `RUNNING`; only `record_job_end` writes a terminal state), so
+/// ever models `RUNNING` or a finalized state (`record_job_start` always
+/// writes `RUNNING`; only `record_job_end` writes a finalized state), so
 /// in-memory states it has no representation for — `SUSPENDED`, `COMPLETING`
 /// — must map to `RUNNING` for comparison. Otherwise a suspended or
 /// completing job would be flagged stale on every single pass for as long as
-/// it stays in that state.
+/// it stays in that state. Uses `is_finalized()`, not `is_terminal()`, so a
+/// durably `Preempted` job (which `is_terminal()` excludes but which can get
+/// stranded there on a partial-proposal failure) is compared against its own
+/// state rather than against `RUNNING`.
 fn accounting_expected_state(state: JobState) -> String {
-    if state.is_terminal() {
+    if state.is_finalized() {
         state.display().to_owned()
     } else {
         JobState::Running.display().to_owned()
@@ -146,7 +149,7 @@ fn jobs_needing_resync(
 /// code, and previously that reset was committed on its own statement, with
 /// `write_end` relied on to fix it back up immediately after. Any failure
 /// between the two — or a concurrent reader landing in the gap — could
-/// observe or permanently persist a correct terminal record clobbered back
+/// observe or permanently persist a correct finalized record clobbered back
 /// to `RUNNING`. The whole attempt is bounded by `ATTEMPT_TIMEOUT` so a
 /// wedged connection can't stall the reconciliation loop; a timed-out job is
 /// simply retried on the next pass.
@@ -154,18 +157,18 @@ async fn resync_job(pool: &PgPool, job: &Job, row_missing: bool, needs_start_bac
     // record_job_start unconditionally sets state='RUNNING', so only call it
     // when the row doesn't exist yet, is missing start metadata a proper
     // record_job_start would have populated (see AccountingRowState), or the
-    // job hasn't reached a terminal state — otherwise it would clobber a
-    // correct terminal state. The terminal case is corrected in the same
+    // job hasn't reached a finalized state — otherwise it would clobber a
+    // correct finalized state. The finalized case is corrected in the same
     // transaction by write_end below.
-    let needs_start = row_missing || needs_start_backfill || !job.state.is_terminal();
-    let is_terminal = job.state.is_terminal();
+    let needs_start = row_missing || needs_start_backfill || !job.state.is_finalized();
+    let is_finalized = job.state.is_finalized();
 
     let attempt = async {
         let mut tx = pool.begin().await?;
         if needs_start {
             write_start(&mut tx, job).await?;
         }
-        if is_terminal {
+        if is_finalized {
             write_end(&mut tx, job).await?;
         }
         tx.commit().await?;
@@ -293,9 +296,9 @@ mod tests {
         assert_eq!(stale, vec![2, 3]);
     }
 
-    // Finding 1: a row whose state matches but is missing start metadata
-    // (record_job_end created it from scratch because record_job_start's
-    // retries exhausted) must still be flagged, or the gap is permanent.
+    // A row whose state matches but is missing start metadata (record_job_end
+    // created it from scratch because record_job_start's retries exhausted)
+    // must still be flagged, or the gap is permanent.
     #[test]
     fn jobs_needing_resync_flags_bare_row_even_when_state_matches() {
         let expected = vec![(1, "COMPLETED".to_string())];
@@ -313,10 +316,10 @@ mod tests {
         assert_eq!(stale, vec![1]);
     }
 
-    // Finding 2: a job whose read failed this pass must never be flagged as
-    // needing resync, even though it's also absent from `accounting` — a
+    // A job whose read failed this pass must never be flagged as needing
+    // resync, even though it's also absent from `accounting` — a
     // confirmed-absent row and a failed read are not the same thing, and
-    // conflating them can clobber a correct terminal record via write_start.
+    // conflating them can clobber a correct finalized record via write_start.
     #[test]
     fn jobs_needing_resync_skips_jobs_with_unknown_read_status() {
         let expected = vec![(1, "COMPLETED".to_string()), (2, "RUNNING".to_string())];
@@ -329,16 +332,42 @@ mod tests {
         assert_eq!(stale, vec![2]);
     }
 
-    // Finding 3: accounting only ever models RUNNING or a terminal state, so
-    // states it can't represent must map to RUNNING for comparison —
-    // otherwise a suspended/completing job is flagged stale forever.
+    // Accounting only ever models RUNNING or a finalized state, so states it
+    // can't represent must map to RUNNING for comparison — otherwise a
+    // suspended/completing job is flagged stale forever.
     #[test]
-    fn accounting_expected_state_maps_non_terminal_states_to_running() {
+    fn accounting_expected_state_maps_non_finalized_states_to_running() {
         assert_eq!(accounting_expected_state(JobState::Running), "RUNNING");
         assert_eq!(accounting_expected_state(JobState::Suspended), "RUNNING");
         assert_eq!(accounting_expected_state(JobState::Completing), "RUNNING");
         assert_eq!(accounting_expected_state(JobState::Completed), "COMPLETED");
         assert_eq!(accounting_expected_state(JobState::Failed), "FAILED");
+    }
+
+    // is_finalized(), not is_terminal(): a durably Preempted job (which
+    // is_terminal() excludes) must compare against its own state, not get
+    // mapped to RUNNING — otherwise a resync pass would clobber a correct
+    // PREEMPTED record with RUNNING/no-end_time on every single cycle.
+    #[test]
+    fn accounting_expected_state_uses_is_finalized_for_preempted() {
+        assert!(!JobState::Preempted.is_terminal());
+        assert!(JobState::Preempted.is_finalized());
+        assert_eq!(accounting_expected_state(JobState::Preempted), "PREEMPTED");
+    }
+
+    #[test]
+    fn jobs_needing_resync_flags_stale_preempted_row_stuck_at_running() {
+        // A durably-Preempted job whose accounting row is still RUNNING (the
+        // pre-fix behavior, since is_terminal() excluded Preempted from ever
+        // getting write_end'd) must be flagged for resync so it converges on
+        // PREEMPTED rather than being ignored forever.
+        let expected = vec![(1, accounting_expected_state(JobState::Preempted))];
+        let mut accounting = HashMap::new();
+        accounting.insert(1, synced_row("RUNNING"));
+
+        let stale = jobs_needing_resync(&expected, &accounting, &no_unknown());
+
+        assert_eq!(stale, vec![1]);
     }
 
     #[test]
@@ -371,7 +400,7 @@ mod tests {
         let start = Utc::now() - chrono::Duration::hours(1);
         job.start_time = Some(start);
         job.state = state;
-        if state.is_terminal() {
+        if state.is_finalized() {
             job.end_time = Some(start + chrono::Duration::minutes(5));
             job.exit_code = Some(0);
         }
@@ -395,8 +424,8 @@ mod tests {
             .await;
     }
 
-    // Finding 1, end to end: simulate record_job_start's retries exhausting
-    // (only record_job_end ever lands, creating a bare row), then run the
+    // End to end: simulate record_job_start's retries exhausting (only
+    // record_job_end ever lands, creating a bare row), then run the
     // reconciliation resync path and confirm it backfills the row rather
     // than leaving it permanently missing user_name/start_time.
     #[tokio::test]
@@ -449,7 +478,7 @@ mod tests {
         assert!(start_time.is_some(), "start_time must be backfilled");
         assert_eq!(
             state, "COMPLETED",
-            "terminal state must survive the backfill"
+            "finalized state must survive the backfill"
         );
 
         // Usage was skipped originally (start_time was NULL); the backfill
@@ -472,9 +501,9 @@ mod tests {
         Ok(())
     }
 
-    // Finding 3, end to end: a suspended job's accounting row correctly shows
-    // RUNNING (accounting has no SUSPENDED state); a resync pass must not
-    // treat that as stale and must not clobber the row.
+    // End to end: a suspended job's accounting row correctly shows RUNNING
+    // (accounting has no SUSPENDED state); a resync pass must not treat that
+    // as stale and must not clobber the row.
     #[tokio::test]
     #[ignore = "requires DATABASE_URL and PostgreSQL"]
     async fn suspended_job_is_not_flagged_stale_against_a_running_row() -> anyhow::Result<()> {
