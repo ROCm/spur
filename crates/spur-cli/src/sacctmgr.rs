@@ -272,6 +272,10 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 .and_then(|v| parse_wall_time(v))
                 .unwrap_or(0);
             let max_tres = p.get("maxtresperjob").cloned().unwrap_or_default();
+            let grp_wall: u32 = p
+                .get("grpwall")
+                .and_then(|v| parse_wall_time(v))
+                .unwrap_or(0);
 
             let mut client = connect(addr).await?;
             client
@@ -290,6 +294,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                         .unwrap_or(0),
                     max_tres_per_user: p.get("maxtresperuser").cloned().unwrap_or_default(),
                     grp_tres: p.get("grptres").cloned().unwrap_or_default(),
+                    grp_wall_minutes: grp_wall,
                 })
                 .await
                 .context("CreateQos RPC failed")?;
@@ -446,6 +451,10 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
                         .unwrap_or(0),
                     max_tres_per_user: p.get("maxtresperuser").cloned().unwrap_or_default(),
                     grp_tres: p.get("grptres").cloned().unwrap_or_default(),
+                    grp_wall_minutes: p
+                        .get("grpwall")
+                        .and_then(|v| parse_wall_time(v))
+                        .unwrap_or(0),
                 })
                 .await
                 .context("CreateQos (modify) RPC failed")?;
@@ -557,37 +566,42 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
             let qos_list = resp.into_inner().qos_list;
 
             println!(
-                "{:<15} {:<8} {:<10} {:<12} {:<10} {:<10}",
-                "Name", "Prio", "Preempt", "UsageFactor", "MaxJobsPU", "MaxWall"
+                "{:<15} {:<8} {:<10} {:<12} {:<10} {:<12} {:<8} {:<8} {:<20} {:<20} {:<20}",
+                "Name",
+                "Priority",
+                "Preempt",
+                "UsageFactor",
+                "MaxJobsPU",
+                "MaxSubmitPU",
+                "MaxWall",
+                "GrpWall",
+                "MaxTRES",
+                "MaxTRESPU",
+                "GrpTRES",
             );
-            println!("{}", "-".repeat(65));
+            println!("{}", "-".repeat(140));
 
             if qos_list.is_empty() {
                 // Show default
                 println!(
-                    "{:<15} {:<8} {:<10} {:<12} {:<10} {:<10}",
-                    "normal", "0", "off", "1.0", "", ""
+                    "{:<15} {:<8} {:<10} {:<12} {:<10} {:<12} {:<8} {:<8} {:<20} {:<20} {:<20}",
+                    "normal", "0", "off", "1.0", "", "", "", "", "", "", "",
                 );
             } else {
                 for q in &qos_list {
-                    let max_jobs_str = if q.max_jobs_per_user == 0 {
-                        String::new()
-                    } else {
-                        q.max_jobs_per_user.to_string()
-                    };
-                    let max_wall_str = if q.max_wall_minutes == 0 {
-                        String::new()
-                    } else {
-                        q.max_wall_minutes.to_string()
-                    };
                     println!(
-                        "{:<15} {:<8} {:<10} {:<12} {:<10} {:<10}",
+                        "{:<15} {:<8} {:<10} {:<12} {:<10} {:<12} {:<8} {:<8} {:<20} {:<20} {:<20}",
                         q.name,
                         q.priority,
                         q.preempt_mode,
                         q.usage_factor,
-                        max_jobs_str,
-                        max_wall_str,
+                        opt_u32_str(q.max_jobs_per_user),
+                        opt_u32_str(q.max_submit_jobs_per_user),
+                        opt_u32_str(q.max_wall_minutes),
+                        opt_u32_str(q.grp_wall_minutes),
+                        format_tres(&q.max_tres_per_job),
+                        format_tres(&q.max_tres_per_user),
+                        format_tres(&q.grp_tres),
                     );
                 }
             }
@@ -654,6 +668,25 @@ fn parse_wall_time(s: &str) -> Option<u32> {
         }
         _ => None,
     }
+}
+
+/// Render an unset (0) proto limit as an empty column, matching Slurm's
+/// `sacctmgr show` style for absent limits.
+fn opt_u32_str(v: u32) -> String {
+    if v == 0 {
+        String::new()
+    } else {
+        v.to_string()
+    }
+}
+
+/// Canonicalize a raw TRES string (e.g. user-supplied `mem=10,cpu=5`) into
+/// Slurm's sorted, comma-joined display form via `TresRecord`; empty if unset.
+fn format_tres(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    spur_core::accounting::TresRecord::parse(raw).format()
 }
 
 #[cfg(test)]
@@ -734,5 +767,32 @@ mod tests {
             build_add_user_request(&add_params).unwrap(),
             build_add_user_request(&modify_params).unwrap()
         );
+    }
+
+    #[test]
+    fn opt_u32_str_renders_zero_as_empty() {
+        assert_eq!(opt_u32_str(0), "");
+        assert_eq!(opt_u32_str(42), "42");
+    }
+
+    #[test]
+    fn format_tres_renders_empty_input_as_empty() {
+        assert_eq!(format_tres(""), "");
+    }
+
+    #[test]
+    fn format_tres_canonicalizes_and_sorts() {
+        // Unsorted input, alias ("memory") normalized to Slurm's "mem" name.
+        assert_eq!(format_tres("memory=10,cpu=5"), "cpu=5,mem=10");
+    }
+
+    #[test]
+    fn format_tres_drops_zero_values() {
+        assert_eq!(format_tres("cpu=0,node=2"), "node=2");
+    }
+
+    #[test]
+    fn format_tres_drops_unparseable_tokens() {
+        assert_eq!(format_tres("cpu=4,bogus=nope"), "cpu=4");
     }
 }

@@ -444,6 +444,14 @@ impl SlurmAccounting for AccountingService {
         } else {
             Some(req.grp_tres.as_str())
         };
+        let grp_wall = if req.grp_wall_minutes == 0 {
+            None
+        } else {
+            Some(
+                i32::try_from(req.grp_wall_minutes)
+                    .map_err(|_| Status::invalid_argument("grp_wall_minutes exceeds i32::MAX"))?,
+            )
+        };
         db::upsert_qos(
             &self.pool,
             &req.name,
@@ -457,6 +465,7 @@ impl SlurmAccounting for AccountingService {
             max_submit,
             max_tres_user,
             grp_tres,
+            grp_wall,
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -493,6 +502,7 @@ impl SlurmAccounting for AccountingService {
                 max_submit_jobs_per_user: r.max_submit_per_user.unwrap_or(0) as u32,
                 max_tres_per_user: r.max_tres_per_user.unwrap_or_default(),
                 grp_tres: r.grp_tres.unwrap_or_default(),
+                grp_wall_minutes: r.grp_wall_min.unwrap_or(0) as u32,
             })
             .collect();
 

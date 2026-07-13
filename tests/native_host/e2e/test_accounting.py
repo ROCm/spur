@@ -163,3 +163,47 @@ class TestQosLimitReasons:
         assert reason == "QOSMaxMemoryPerUser", (
             f"expected QOSMaxMemoryPerUser, got {reason!r}"
         )
+
+
+class TestSacctmgrShowQos:
+    def test_show_qos_renders_all_limit_columns(self, accounting_cluster):
+        c = accounting_cluster
+
+        c.sacctmgr(
+            [
+                "add",
+                "qos",
+                "name=fullcap",
+                "maxjobsperuser=2",
+                "maxsubmitjobsperuser=4",
+                "maxwall=30",
+                "grpwall=60",
+                "maxtresperjob=cpu=8",
+                "maxtresperuser=cpu=16",
+                "grptres=cpu=32",
+            ]
+        )
+        time.sleep(15)
+
+        out = c.sacctmgr(["show", "qos"])
+        header, *rows = [line for line in out.splitlines() if line.strip()]
+        for column in (
+            "MaxJobsPU",
+            "MaxSubmitPU",
+            "MaxWall",
+            "GrpWall",
+            "MaxTRES",
+            "MaxTRESPU",
+            "GrpTRES",
+        ):
+            assert column in header, f"missing column {column!r} in header: {header!r}"
+
+        row = next((r for r in rows if r.startswith("fullcap")), None)
+        assert row is not None, f"fullcap row not found in: {rows!r}"
+        assert "2" in row.split()
+        assert "4" in row.split()
+        assert "30" in row.split()
+        assert "60" in row.split()
+        assert "cpu=8" in row
+        assert "cpu=16" in row
+        assert "cpu=32" in row

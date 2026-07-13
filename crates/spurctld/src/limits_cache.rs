@@ -104,7 +104,7 @@ fn qos_from_record(r: crate::accounting::db::QosRecord) -> Qos {
             max_tres_per_user: opt_tres(r.max_tres_per_user),
             grp_tres: opt_tres(r.grp_tres),
             max_wall_minutes: opt_u32(r.max_wall_min),
-            grp_wall_minutes: None,
+            grp_wall_minutes: opt_u32(r.grp_wall_min),
         },
         usage_factor: r.usage_factor,
     }
@@ -208,6 +208,7 @@ mod tests {
             max_submit_per_user: Some(50),
             max_tres_per_user: Some("cpu=64".into()),
             grp_tres: Some("gpu=8".into()),
+            grp_wall_min: Some(120),
         };
 
         let qos = qos_from_record(record);
@@ -218,6 +219,7 @@ mod tests {
         assert_eq!(qos.usage_factor, 2.0);
         assert_eq!(qos.limits.max_jobs_per_user, Some(10));
         assert_eq!(qos.limits.max_wall_minutes, Some(60));
+        assert_eq!(qos.limits.grp_wall_minutes, Some(120));
         assert_eq!(qos.limits.max_submit_jobs_per_user, Some(50));
         assert!(qos.limits.max_tres_per_job.is_some());
         assert_eq!(
@@ -254,6 +256,7 @@ mod tests {
             max_submit_per_user: Some(-1),
             max_tres_per_user: None,
             grp_tres: None,
+            grp_wall_min: Some(0),
         };
 
         let qos = qos_from_record(record);
@@ -264,5 +267,6 @@ mod tests {
         assert_eq!(qos.limits.max_submit_jobs_per_user, None);
         assert!(qos.limits.max_tres_per_user.is_none());
         assert!(qos.limits.grp_tres.is_none());
+        assert_eq!(qos.limits.grp_wall_minutes, None);
     }
 }
