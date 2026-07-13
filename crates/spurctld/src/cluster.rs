@@ -194,6 +194,8 @@ pub struct ClusterManager {
     /// `available_bb_with`), so it cannot drift from config.
     burst_buffer_total_gb: RwLock<u64>,
     tokens: RwLock<HashMap<String, spur_core::admission::AdmissionToken>>,
+    /// Native k0s cluster state (phase, control-plane node, join-token metadata).
+    k0s: RwLock<spur_core::k0s::K0sClusterState>,
     raft: RwLock<Option<SpurRaft>>,
     accounting: RwLock<Option<AccountingNotifier>>,
     fairshare_cache: Arc<FairshareCache>,
@@ -225,6 +227,7 @@ impl ClusterManager {
             license_pool: RwLock::new(license_pool),
             burst_buffer_total_gb: RwLock::new(burst_buffer_total_gb),
             tokens: RwLock::new(HashMap::new()),
+            k0s: RwLock::new(spur_core::k0s::K0sClusterState::default()),
             raft: RwLock::new(None),
             accounting: RwLock::new(None),
             fairshare_cache,
@@ -1476,6 +1479,72 @@ impl ClusterManager {
         })?;
         info!(node = %name, "node labels updated");
         Ok(())
+    }
+
+    /// assign a k0s role + allocated mesh IP + pod /24 to a node (replicated via Raft).
+    /// Callers never touch `self.nodes`/`self.k0s` directly — that would bypass Raft.
+    pub fn assign_node_k0s(
+        &self,
+        name: &str,
+        role: spur_core::k0s::K0sRole,
+        mesh_ip: &str,
+        pod_cidr: &str,
+    ) -> anyhow::Result<()> {
+        {
+            let nodes = self.nodes.read();
+            if !nodes.contains_key(name) {
+                anyhow::bail!("node {} not found", name);
+            }
+        }
+        self.propose(WalOperation::NodeK0sAssign {
+            name: name.to_string(),
+            role,
+            mesh_ip: mesh_ip.to_string(),
+            pod_cidr: pod_cidr.to_string(),
+        })?;
+        info!(node = %name, ?role, "node k0s role assigned");
+        Ok(())
+    }
+
+    /// set the cluster-wide k0s phase (+ optional control-plane node / reset flag).
+    pub fn set_k0s_phase(
+        &self,
+        phase: spur_core::k0s::K0sPhase,
+        control_plane_node: Option<String>,
+        reset_requested: bool,
+    ) -> anyhow::Result<()> {
+        self.propose(WalOperation::K0sSetPhase {
+            phase,
+            control_plane_node,
+            reset_requested,
+        })?;
+        info!(?phase, "k0s cluster phase set");
+        Ok(())
+    }
+
+    /// record minted join-token METADATA (never the plaintext secret) via Raft.
+    /// Consumer is the deferred worker join-token mint on the control-plane agent.
+    #[allow(dead_code)]
+    pub fn create_k0s_join_token(
+        &self,
+        token: spur_core::k0s::K0sJoinTokenRecord,
+    ) -> anyhow::Result<()> {
+        self.propose(WalOperation::K0sJoinTokenCreate { token })?;
+        Ok(())
+    }
+
+    /// mark a k0s join token revoked.
+    #[allow(dead_code)]
+    pub fn revoke_k0s_join_token(&self, token_id: &str) -> anyhow::Result<()> {
+        self.propose(WalOperation::K0sJoinTokenRevoke {
+            token_id: token_id.to_string(),
+        })?;
+        Ok(())
+    }
+
+    /// snapshot of the current cluster-wide k0s state.
+    pub fn k0s_state(&self) -> spur_core::k0s::K0sClusterState {
+        self.k0s.read().clone()
     }
 
     /// Reconcile node liveness state with heartbeat data.
@@ -3617,6 +3686,45 @@ impl ClusterManager {
                     }
                 }
             }
+
+            // Native k0s cluster operations. All idempotent/replay-safe: NodeK0sAssign is
+            // keyed by node name, token insert/revoke are keyed by id, phase is a last-write set.
+            WalOperation::NodeK0sAssign {
+                name,
+                role,
+                mesh_ip,
+                pod_cidr,
+            } => {
+                // Reuses the `nodes` write guard from the top of this fn.
+                if let Some(node) = nodes.get_mut(name) {
+                    node.k0s_role = Some(*role);
+                    node.k0s_mesh_ip = Some(mesh_ip.clone());
+                    node.k0s_pod_cidr = Some(pod_cidr.clone());
+                }
+            }
+            WalOperation::K0sSetPhase {
+                phase,
+                control_plane_node,
+                reset_requested,
+            } => {
+                let mut k0s = self.k0s.write();
+                k0s.phase = *phase;
+                if control_plane_node.is_some() {
+                    k0s.control_plane_node = control_plane_node.clone();
+                }
+                k0s.reset_requested = *reset_requested;
+            }
+            WalOperation::K0sJoinTokenCreate { token } => {
+                self.k0s
+                    .write()
+                    .join_tokens
+                    .insert(token.id.clone(), token.clone());
+            }
+            WalOperation::K0sJoinTokenRevoke { token_id } => {
+                if let Some(t) = self.k0s.write().join_tokens.get_mut(token_id) {
+                    t.revoked = true;
+                }
+            }
         }
         self.next_job_id.store(next_id, Ordering::Relaxed);
         response
@@ -3639,6 +3747,11 @@ struct ClusterSnapshot {
     /// staging phase rides along on each `Job`.
     #[serde(default)]
     burst_buffer_total_gb: u64,
+    /// cluster-wide k0s state (phase, control-plane node, join-token metadata). Unlike
+    /// license_pool/burst_buffer this is runtime-authoritative allocated state and MUST be
+    /// restored (see restore_from_snapshot).
+    #[serde(default)]
+    k0s: spur_core::k0s::K0sClusterState,
 }
 
 impl ClusterManager {
@@ -3696,6 +3809,7 @@ impl StateMachineApply for ClusterManager {
             license_pool: self.license_pool.read().clone(),
             tokens: self.tokens.read().values().cloned().collect(),
             burst_buffer_total_gb: *self.burst_buffer_total_gb.read(),
+            k0s: self.k0s.read().clone(),
         };
         serde_json::to_vec(&snap).map_err(Into::into)
     }
@@ -3736,6 +3850,10 @@ impl StateMachineApply for ClusterManager {
         for token in snap.tokens {
             tokens.insert(token.id.clone(), token);
         }
+
+        // k0s phase + join-token metadata are runtime-authoritative allocated state
+        // (NOT config-derived like license_pool/burst_buffer) — restore them.
+        *self.k0s.write() = snap.k0s;
 
         self.next_job_id.store(next_id, Ordering::Relaxed);
 
@@ -4418,6 +4536,7 @@ mod tests {
             network: Default::default(),
             logging: Default::default(),
             kubernetes: Default::default(),
+            cluster: Default::default(),
             notifications: Default::default(),
             power: Default::default(),
             federation: Default::default(),
@@ -8810,6 +8929,84 @@ mod tests {
 
         assert!(cm2.get_job(1).is_some());
         assert!(cm2.get_node("n1").is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn k0s_state_survives_snapshot() {
+        use spur_core::k0s::{K0sJoinTokenRecord, K0sPhase, K0sRole};
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+        cm.assign_node_k0s("n1", K0sRole::Worker, "10.44.0.2", "10.42.2.0/24")
+            .unwrap();
+        cm.set_k0s_phase(K0sPhase::Ready, Some("head-node".into()), false)
+            .unwrap();
+        cm.create_k0s_join_token(K0sJoinTokenRecord {
+            id: "tok-1".into(),
+            role: K0sRole::Worker,
+            created_at: chrono::Utc::now(),
+            expires_at: None,
+            revoked: false,
+        })
+        .unwrap();
+        wait_for("k0s state applied", || {
+            cm.k0s_state().phase == K0sPhase::Ready
+                && cm.get_node("n1").and_then(|n| n.k0s_role).is_some()
+        });
+
+        // snapshot -> restore into a fresh cluster (log-compaction / HA follower path)
+        let data = cm.snapshot_state().unwrap();
+        let dir2 = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dir2).await;
+        cm2.restore_from_snapshot(&data).unwrap();
+
+        // Cluster-wide k0s state must be restored (it is runtime-authoritative).
+        let st = cm2.k0s_state();
+        assert_eq!(st.phase, K0sPhase::Ready);
+        assert_eq!(st.control_plane_node.as_deref(), Some("head-node"));
+        assert!(st.join_tokens.contains_key("tok-1"));
+        // Per-node k0s fields ride snap.nodes.
+        let n1 = cm2.get_node("n1").unwrap();
+        assert_eq!(n1.k0s_role, Some(K0sRole::Worker));
+        assert_eq!(n1.k0s_mesh_ip.as_deref(), Some("10.44.0.2"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_assigns_controller_and_worker_for_two_nodes() {
+        use spur_core::k0s::K0sRole;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        register_node(&cm, "node-b", 4, 8000);
+        wait_for("both nodes registered", || {
+            cm.get_node("node-a").is_some() && cm.get_node("node-b").is_some()
+        });
+
+        let net = crate::cluster_k8s::ClusterNetworking {
+            mesh_cidr: "10.44.0.0/16".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni: "kuberouter".into(),
+            control_plane_node: None,
+        };
+        crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
+        wait_for("both nodes assigned k0s roles", || {
+            cm.get_node("node-a").and_then(|n| n.k0s_role).is_some()
+                && cm.get_node("node-b").and_then(|n| n.k0s_role).is_some()
+        });
+
+        // Two nodes -> the deterministic control-plane (lexically-first, node-a) is a Controller
+        // (NOT Single, which would never exercise the worker token-mint/join path); node-b is a
+        // Worker. Each gets a distinct mesh IP + pod /24, and the control-plane choice is recorded.
+        let a = cm.get_node("node-a").unwrap();
+        let b = cm.get_node("node-b").unwrap();
+        assert_eq!(a.k0s_role, Some(K0sRole::Controller));
+        assert_eq!(b.k0s_role, Some(K0sRole::Worker));
+        assert!(a.k0s_mesh_ip.is_some() && b.k0s_mesh_ip.is_some());
+        assert_ne!(a.k0s_mesh_ip, b.k0s_mesh_ip);
+        assert_ne!(a.k0s_pod_cidr, b.k0s_pod_cidr);
+        assert_eq!(cm.k0s_state().control_plane_node.as_deref(), Some("node-a"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

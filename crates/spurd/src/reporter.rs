@@ -21,6 +21,9 @@ pub struct NodeReporter {
     pub free_memory_mb: AtomicU64,
     pub cpu_load: AtomicU64,
     pub join_token: String,
+    /// This node's WireGuard public key (empty if not on a mesh). The controller uses it to
+    /// reconcile mesh peers.
+    pub wg_pubkey: String,
     node_token: RwLock<String>,
 }
 
@@ -32,6 +35,7 @@ impl NodeReporter {
         node_address: spur_net::NodeAddress,
         labels: HashMap<String, String>,
         join_token: String,
+        wg_pubkey: String,
     ) -> Self {
         Self {
             hostname,
@@ -42,6 +46,7 @@ impl NodeReporter {
             free_memory_mb: AtomicU64::new(0),
             cpu_load: AtomicU64::new(0),
             join_token,
+            wg_pubkey,
             node_token: RwLock::new(String::new()),
         }
     }
@@ -60,7 +65,7 @@ impl NodeReporter {
                 version: env!("CARGO_PKG_VERSION").into(),
                 address: self.node_address.ip.clone(),
                 port: self.node_address.port as u32,
-                wg_pubkey: String::new(),
+                wg_pubkey: self.wg_pubkey.clone(),
                 labels: self.labels.clone(),
                 join_token: self.join_token.clone(),
             })

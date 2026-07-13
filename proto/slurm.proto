@@ -328,6 +328,12 @@ service SlurmController {
   // `salloc` interactive shell. The controller picks an allocated node and
   // proxies to its agent's RunCommand RPC (#146).
   rpc RunStep(RunStepRequest) returns (RunStepResponse);
+
+  // -- Native cluster (k0s) lifecycle: SPUR owns the k0s cluster --
+  rpc ClusterUp(ClusterUpRequest) returns (ClusterUpResponse);
+  rpc ClusterDown(ClusterDownRequest) returns (ClusterDownResponse);
+  rpc ClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+  rpc ClusterKubeconfig(ClusterKubeconfigRequest) returns (ClusterKubeconfigResponse);
 }
 
 // -- Agent service (slurmd) --
@@ -343,6 +349,24 @@ service SlurmAgent {
   rpc StreamJobOutput(StreamJobOutputRequest) returns (stream StreamJobOutputChunk);
   // Interactive attach: bidirectional streaming for stdin/stdout forwarding
   rpc AttachJob(stream AttachJobInput) returns (stream AttachJobOutput);
+
+  // -- Native cluster component control: the controller drives each node's
+  //    spurd-owned k0s systemd unit through these. --
+  rpc StartClusterComponent(StartClusterComponentRequest) returns (StartClusterComponentResponse);
+  rpc StopClusterComponent(StopClusterComponentRequest) returns (StopClusterComponentResponse);
+  rpc GetClusterComponentStatus(GetClusterComponentStatusRequest) returns (GetClusterComponentStatusResponse);
+
+  // -- Control-plane-only cluster admin: the controller calls these on
+  //    the control-plane node's agent, which shells `k0s` against the running
+  //    controller. Worker joins need a fresh token; ClusterKubeconfig needs the
+  //    admin kubeconfig. Erroring on a non-control-plane node is expected. --
+  rpc CreateK0sJoinToken(CreateK0sJoinTokenRequest) returns (CreateK0sJoinTokenResponse);
+  rpc GetAdminKubeconfig(GetAdminKubeconfigRequest) returns (GetAdminKubeconfigResponse);
+
+  // Apply the full-mesh WireGuard membership on this node: the controller pushes the
+  // authoritative peer set so a native-routing CNI (Calico bird) can ride the mesh. Additive +
+  // idempotent — safe to re-push.
+  rpc ApplyMesh(MeshMembership) returns (ApplyMeshResponse);
 }
 
 // -- Accounting service --
@@ -662,6 +686,117 @@ message RunStepResponse {
   string stdout = 2;
   string stderr = 3;
   string node = 4;  // Hostname of the allocated node the command ran on
+}
+
+// -- Native cluster (k0s) lifecycle messages --
+
+message ClusterUpRequest {
+  // Override the control-plane node; empty = pick from [cluster] config / inventory.
+  optional string control_plane_node = 1;
+  // Also install the ARC CI runner scale sets.
+  bool install_arc = 2;
+}
+message ClusterUpResponse {
+  bool accepted = 1;
+  string message = 2;
+  repeated ClusterNodeStatus nodes = 3;
+}
+
+message ClusterDownRequest {
+  // Also `k0s reset` each node (destructive: wipes cluster state).
+  bool reset = 1;
+}
+message ClusterDownResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message ClusterStatusRequest {}
+message ClusterStatusResponse {
+  // "down" | "provisioning" | "ready" | "degraded"
+  string phase = 1;
+  string control_plane_node = 2;
+  repeated ClusterNodeStatus nodes = 3;
+}
+
+message ClusterNodeStatus {
+  string node = 1;
+  string role = 2;             // "controller" | "worker" | "single"
+  string component_state = 3;  // systemd active-state: "active" | "inactive" | "failed" | "unknown"
+  bool enabled = 4;
+}
+
+message ClusterKubeconfigRequest {}
+message ClusterKubeconfigResponse {
+  // Admin kubeconfig YAML (server rewritten to the control-plane's mesh IP).
+  string kubeconfig = 1;
+}
+
+// -- Agent-side cluster component control messages --
+
+message StartClusterComponentRequest {
+  string role = 1;             // "controller" | "worker" | "single"
+  // k0s join token (bearer secret — never log). Empty for single / first controller.
+  optional string join_token = 2;
+  // Rendered k0s config YAML. Empty = agent uses role defaults.
+  optional string k0s_config = 3;
+  // Worker kubelet --node-ip (its mesh IP) for native-routing CNIs. Empty = k0s picks the default.
+  optional string node_ip = 4;
+}
+message StartClusterComponentResponse {
+  bool started = 1;
+  string component_state = 2;  // systemd active-state after the action
+  string message = 3;
+}
+
+message StopClusterComponentRequest {
+  bool reset = 1;              // also `k0s reset` (destructive)
+}
+message StopClusterComponentResponse {
+  bool stopped = 1;
+  string message = 2;
+}
+
+message GetClusterComponentStatusRequest {}
+message GetClusterComponentStatusResponse {
+  string role = 1;
+  string component_state = 2;  // "active" | "inactive" | "failed" | "unknown"
+  bool enabled = 3;
+}
+
+// -- Control-plane-only cluster admin messages --
+
+message CreateK0sJoinTokenRequest {
+  string role = 1;             // "worker" | "controller"
+  uint64 expiry_seconds = 2;   // token lifetime; 0 = k0s default
+}
+message CreateK0sJoinTokenResponse {
+  // k0s join token (bearer secret — never log).
+  string join_token = 1;
+}
+
+message GetAdminKubeconfigRequest {}
+message GetAdminKubeconfigResponse {
+  // Admin kubeconfig YAML read from the control-plane node.
+  string kubeconfig = 1;
+}
+
+// -- Full-mesh membership: proto mirror of spur_net::mesh::MeshNode/MeshMembership --
+
+message MeshNode {
+  string hostname = 1;     // node name (used to resolve self + the agent endpoint)
+  string public_key = 2;   // WireGuard public key
+  string mesh_ip = 3;      // mesh address on spur0 (no prefix), e.g. 10.44.0.2
+  string endpoint = 4;     // underlay endpoint, e.g. 198.51.100.2:51820
+  optional string pod_cidr = 5; // node's pod /24 for native-routing CNIs
+}
+message MeshMembership {
+  repeated MeshNode nodes = 1;
+}
+message ApplyMeshResponse {
+  bool applied = 1;
+  uint32 peers = 2;        // number of peers applied (self excluded)
+  string message = 3;
 }
 
 // Agent-side request: run a command directly on this node (no namespace

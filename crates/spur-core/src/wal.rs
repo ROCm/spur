@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::admission::AdmissionToken;
 use crate::job::{JobId, JobSpec, JobState, PendingReason};
+use crate::k0s::{K0sJoinTokenRecord, K0sPhase, K0sRole};
 use crate::node::NodeState;
 use crate::reservation::Reservation;
 use std::collections::HashMap;
@@ -169,6 +170,28 @@ pub enum WalOperation {
     },
     ReservationDelete {
         name: String,
+    },
+
+    // Native k0s cluster operations. Appended at the end to keep externally-tagged
+    // WAL replay backward-compatible.
+    NodeK0sAssign {
+        name: String,
+        role: K0sRole,
+        mesh_ip: String,
+        pod_cidr: String,
+    },
+    K0sSetPhase {
+        phase: K0sPhase,
+        #[serde(default)]
+        control_plane_node: Option<String>,
+        #[serde(default)]
+        reset_requested: bool,
+    },
+    K0sJoinTokenCreate {
+        token: K0sJoinTokenRecord,
+    },
+    K0sJoinTokenRevoke {
+        token_id: String,
     },
 }
 
@@ -343,6 +366,52 @@ mod deregistration_wal_tests {
             WalOperation::NodeRemove { name, reason } => {
                 assert_eq!(name, "gpu01");
                 assert_eq!(reason.as_deref(), Some("decommission"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn k0s_wal_variants_round_trip() {
+        let op = WalOperation::NodeK0sAssign {
+            name: "gpu-node-1".into(),
+            role: K0sRole::Worker,
+            mesh_ip: "10.44.0.2".into(),
+            pod_cidr: "10.42.2.0/24".into(),
+        };
+        let back: WalOperation =
+            serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
+        match back {
+            WalOperation::NodeK0sAssign {
+                name,
+                role,
+                mesh_ip,
+                pod_cidr,
+            } => {
+                assert_eq!(name, "gpu-node-1");
+                assert_eq!(role, K0sRole::Worker);
+                assert_eq!(mesh_ip, "10.44.0.2");
+                assert_eq!(pod_cidr, "10.42.2.0/24");
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let op = WalOperation::K0sSetPhase {
+            phase: K0sPhase::Ready,
+            control_plane_node: Some("head-node".into()),
+            reset_requested: false,
+        };
+        let back: WalOperation =
+            serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
+        match back {
+            WalOperation::K0sSetPhase {
+                phase,
+                control_plane_node,
+                reset_requested,
+            } => {
+                assert_eq!(phase, K0sPhase::Ready);
+                assert_eq!(control_plane_node.as_deref(), Some("head-node"));
+                assert!(!reset_requested);
             }
             _ => panic!("wrong variant"),
         }

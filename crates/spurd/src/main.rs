@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod agent_server;
+mod cluster;
 pub mod container;
 mod executor;
 mod landlock;
@@ -220,6 +221,10 @@ async fn main() -> anyhow::Result<()> {
         })
         .collect();
 
+    // this node's WireGuard public key (best-effort) so the controller can reconcile mesh peers.
+    let wg_iface = std::env::var("SPUR_WG_INTERFACE").unwrap_or_else(|_| "spur0".into());
+    let wg_pubkey = spur_net::wireguard::interface_public_key(&wg_iface).unwrap_or_default();
+
     // Create the node reporter
     let reporter = Arc::new(NodeReporter::new(
         hostname.clone(),
@@ -228,6 +233,7 @@ async fn main() -> anyhow::Result<()> {
         node_address,
         labels,
         args.token.unwrap_or_default(),
+        wg_pubkey,
     ));
 
     // Register with controller
@@ -239,16 +245,35 @@ async fn main() -> anyhow::Result<()> {
         hb_reporter.heartbeat_loop().await;
     });
 
-    // Start agent gRPC server (receives job launches from spurctld)
+    // Start agent gRPC server (receives job launches + cluster-component RPCs from spurctld).
+    // Pass the [cluster] config so the K0sAgent uses the operator's k0s version + install path.
     let memlock = match config.as_ref() {
         Some(c) => c.rlimits.memlock_limit()?,
         None => spur_core::config::MemlockLimit::Unlimited,
     };
-
     log_memlock_status(memlock);
+    let cluster_config = config
+        .as_ref()
+        .map(|c| c.cluster.clone())
+        .unwrap_or_default();
+    let agent_service = agent_server::AgentService::with_cluster_config(
+        reporter.clone(),
+        hooks_config,
+        registry.clone(),
+        &cluster_config,
+        memlock,
+    );
 
-    let agent_service =
-        agent_server::AgentService::new(reporter.clone(), hooks_config, registry.clone(), memlock);
+    // the RPC-driven k0s component owner is idle until the controller sends
+    // StartClusterComponent; k0s then runs under its OWN systemd unit — never as a spurd job/child —
+    // so it survives spurd restart and stays out of the executor/monitor/time-limit job path. The
+    // background loop heals the unit; the SlurmAgent start/stop/status RPCs drive it.
+    // Re-adopt an already-running k0s unit (spurd restart leaves it running) so status/heal are
+    // correct immediately, then spawn the heal loop.
+    let k0s = agent_service.k0s();
+    k0s.adopt_running_unit().await;
+    tokio::spawn(k0s.supervise());
+
     agent_service.start_monitor(args.controller.clone());
 
     let addr = args.listen.parse()?;

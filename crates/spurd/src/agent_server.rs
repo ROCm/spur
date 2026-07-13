@@ -70,13 +70,36 @@ pub struct AgentService {
     memlock: spur_core::config::MemlockLimit,
     #[allow(dead_code)]
     device_registry: Arc<Mutex<DeviceRegistry>>,
+    /// RPC-driven owner of this node's k0s systemd unit.
+    k0s: Arc<crate::cluster::K0sAgent>,
 }
 
 impl AgentService {
+    /// Construct with default k0s settings (pinned version, `/usr/local/bin/k0s`). Test-only; the
+    /// binary uses `with_cluster_config` to honor the operator's `[cluster]` settings.
+    #[cfg(test)]
     pub fn new(
         reporter: Arc<NodeReporter>,
         hooks: HooksConfig,
         device_registry: Arc<Mutex<DeviceRegistry>>,
+        memlock: spur_core::config::MemlockLimit,
+    ) -> Self {
+        Self::with_cluster_config(
+            reporter,
+            hooks,
+            device_registry,
+            &spur_core::config::ClusterConfig::default(),
+            memlock,
+        )
+    }
+
+    /// Construct with the `[cluster]` config so this node's K0sAgent honors the operator's k0s
+    /// version + install path.
+    pub fn with_cluster_config(
+        reporter: Arc<NodeReporter>,
+        hooks: HooksConfig,
+        device_registry: Arc<Mutex<DeviceRegistry>>,
+        cluster: &spur_core::config::ClusterConfig,
         memlock: spur_core::config::MemlockLimit,
     ) -> Self {
         let allocation = NodeAllocation::new(
@@ -139,7 +162,13 @@ impl AgentService {
             hooks: Arc::new(hooks),
             memlock,
             device_registry,
+            k0s: Arc::new(crate::cluster::K0sAgent::from_config(cluster)),
         }
+    }
+
+    /// Handle to the RPC-driven k0s component owner. spurd `main()` spawns its supervise loop.
+    pub fn k0s(&self) -> Arc<crate::cluster::K0sAgent> {
+        self.k0s.clone()
     }
 
     /// Spawn a background task to monitor running jobs and report completions.
@@ -1442,6 +1471,167 @@ impl SlurmAgent for AgentService {
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
+
+    // -- Native cluster component control: drive this node's k0s systemd unit. --
+    async fn start_cluster_component(
+        &self,
+        request: Request<StartClusterComponentRequest>,
+    ) -> Result<Response<StartClusterComponentResponse>, Status> {
+        let req = request.into_inner();
+        let role = crate::cluster::ClusterRole::from_str(&req.role)
+            .ok_or_else(|| Status::invalid_argument(format!("unknown role: {}", req.role)))?;
+        match self
+            .k0s
+            .start(role, req.join_token, req.k0s_config, req.node_ip)
+            .await
+        {
+            Ok(state) => Ok(Response::new(StartClusterComponentResponse {
+                started: true,
+                component_state: state,
+                message: String::new(),
+            })),
+            Err(e) => Ok(Response::new(StartClusterComponentResponse {
+                started: false,
+                component_state: "failed".to_string(),
+                message: e.to_string(),
+            })),
+        }
+    }
+
+    async fn stop_cluster_component(
+        &self,
+        request: Request<StopClusterComponentRequest>,
+    ) -> Result<Response<StopClusterComponentResponse>, Status> {
+        match self.k0s.stop(request.into_inner().reset).await {
+            Ok(()) => Ok(Response::new(StopClusterComponentResponse {
+                stopped: true,
+                message: String::new(),
+            })),
+            Err(e) => Ok(Response::new(StopClusterComponentResponse {
+                stopped: false,
+                message: e.to_string(),
+            })),
+        }
+    }
+
+    async fn get_cluster_component_status(
+        &self,
+        _request: Request<GetClusterComponentStatusRequest>,
+    ) -> Result<Response<GetClusterComponentStatusResponse>, Status> {
+        let (role, component_state, enabled) = self.k0s.status().await;
+        Ok(Response::new(GetClusterComponentStatusResponse {
+            role,
+            component_state,
+            enabled,
+        }))
+    }
+
+    async fn create_k0s_join_token(
+        &self,
+        request: Request<CreateK0sJoinTokenRequest>,
+    ) -> Result<Response<CreateK0sJoinTokenResponse>, Status> {
+        let req = request.into_inner();
+        match self
+            .k0s
+            .create_join_token(&req.role, req.expiry_seconds)
+            .await
+        {
+            Ok(join_token) => Ok(Response::new(CreateK0sJoinTokenResponse { join_token })),
+            Err(e) => Err(Status::internal(format!("k0s token create failed: {e}"))),
+        }
+    }
+
+    async fn get_admin_kubeconfig(
+        &self,
+        _request: Request<GetAdminKubeconfigRequest>,
+    ) -> Result<Response<GetAdminKubeconfigResponse>, Status> {
+        match self.k0s.admin_kubeconfig().await {
+            Ok(kubeconfig) => Ok(Response::new(GetAdminKubeconfigResponse { kubeconfig })),
+            Err(e) => Err(Status::internal(format!(
+                "k0s kubeconfig admin failed: {e}"
+            ))),
+        }
+    }
+
+    async fn apply_mesh(
+        &self,
+        request: Request<MeshMembership>,
+    ) -> Result<Response<ApplyMeshResponse>, Status> {
+        let iface = std::env::var("SPUR_WG_INTERFACE").unwrap_or_else(|_| "spur0".into());
+        // proto -> spur-net mesh types.
+        let members: Vec<spur_net::mesh::MeshNode> = request
+            .into_inner()
+            .nodes
+            .into_iter()
+            .map(|n| spur_net::mesh::MeshNode {
+                hostname: n.hostname,
+                public_key: n.public_key,
+                mesh_ip: n.mesh_ip,
+                endpoint: n.endpoint,
+                pod_cidr: n.pod_cidr,
+            })
+            .collect();
+        let self_host = self.reporter.hostname.clone();
+
+        // All of this shells out to `wg` (blocking) — run it off the async runtime. Native-routing
+        // CNI owns the FIB routes, so program_routes = false.
+        let result =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<(bool, usize, String)> {
+                // Identify self in the membership (so it's excluded from the peer set): prefer the local
+                // WireGuard public key, fall back to hostname.
+                let self_pubkey = spur_net::wireguard::interface_public_key(&iface).ok();
+                let self_mesh_ip = members
+                    .iter()
+                    .find(|n| {
+                        self_pubkey.as_deref() == Some(n.public_key.as_str())
+                            || n.hostname == self_host
+                    })
+                    .map(|n| n.mesh_ip.clone());
+                let Some(self_mesh_ip) = self_mesh_ip else {
+                    return Ok((
+                        false,
+                        0,
+                        "this node is not in the pushed mesh membership".to_string(),
+                    ));
+                };
+                // Reconcile: prune peers no longer in the membership, then add/update the desired peers.
+                let current = spur_net::wireguard::list_peers(&iface).unwrap_or_default();
+                let (added, pruned) = spur_net::mesh::reconcile_mesh(
+                    &iface,
+                    &self_mesh_ip,
+                    &members,
+                    &current,
+                    false,
+                )?;
+                Ok((
+                    true,
+                    added,
+                    format!("reconciled mesh: {added} peers, {pruned} pruned"),
+                ))
+            })
+            .await
+            .map_err(|e| Status::internal(format!("apply_mesh task panicked: {e}")))?;
+
+        match result {
+            Ok((applied, peers, message)) => {
+                if applied {
+                    info!(peers, message = %message, "applied WireGuard mesh");
+                } else {
+                    warn!(message = %message, "mesh not applied");
+                }
+                Ok(Response::new(ApplyMeshResponse {
+                    applied,
+                    peers: peers as u32,
+                    message,
+                }))
+            }
+            Err(e) => Ok(Response::new(ApplyMeshResponse {
+                applied: false,
+                peers: 0,
+                message: e.to_string(),
+            })),
+        }
+    }
 }
 
 impl AgentService {
@@ -1760,6 +1950,7 @@ mod tests {
                 source: spur_net::AddressSource::Static,
             },
             std::collections::HashMap::new(),
+            String::new(),
             String::new(),
         ))
     }

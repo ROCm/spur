@@ -265,6 +265,15 @@ pub struct Node {
     /// Leaf switch this node belongs to (from topology config).
     #[serde(default)]
     pub switch_name: Option<String>,
+    /// Native k0s: role assigned to this node's spurd-owned unit.
+    #[serde(default)]
+    pub k0s_role: Option<crate::k0s::K0sRole>,
+    /// mesh IP allocated to this node for k0s (--node-ip / advertise address).
+    #[serde(default)]
+    pub k0s_mesh_ip: Option<String>,
+    /// per-node pod /24 carved from the cluster pod_cidr.
+    #[serde(default)]
+    pub k0s_pod_cidr: Option<String>,
 }
 
 fn default_weight() -> u32 {
@@ -301,6 +310,9 @@ impl Node {
             version: None,
             weight: Self::DEFAULT_WEIGHT,
             switch_name: None,
+            k0s_role: None,
+            k0s_mesh_ip: None,
+            k0s_pod_cidr: None,
         }
     }
 
