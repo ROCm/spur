@@ -431,6 +431,11 @@ mod suspend_wal_tests {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod evict_wal_tests {
+    use super::*;
 
     #[test]
     fn job_evict_op_round_trips() {
