@@ -164,6 +164,46 @@ class TestQosLimitReasons:
             f"expected QOSMaxMemoryPerUser, got {reason!r}"
         )
 
+    def test_memory_per_cpu_cap_sets_qos_pending_reason(self, accounting_cluster):
+        c = accounting_cluster
+
+        # Same cap as test_memory_cap_sets_qos_pending_reason, but the job
+        # requests memory via --mem-per-cpu instead of --mem: the QOS memory
+        # check must derive the same effective total (2 CPUs * 1024 MB = 2G)
+        # rather than treating a --mem-per-cpu job as requesting 0 memory.
+        c.sacctmgr(["add", "qos", "name=memcappercpu", "maxtresperuser=mem=1024"])
+        time.sleep(15)
+
+        script = c.write_file("qos-mem-per-cpu-job.sh", "#!/bin/bash\nsleep 30\n")
+        job_id = parse_job_id(
+            c.sbatch(
+                [
+                    "-J",
+                    "qos-mem-per-cpu",
+                    "-N",
+                    "1",
+                    "-c",
+                    "2",
+                    "--mem-per-cpu=1024",
+                    "-q",
+                    "memcappercpu",
+                    script,
+                ]
+            )
+        )
+        assert job_id is not None
+
+        deadline = time.time() + 30
+        reason = ""
+        while time.time() < deadline:
+            reason = _reason(c, job_id)
+            if reason == "QOSMaxMemoryPerUser":
+                break
+            time.sleep(2)
+        assert reason == "QOSMaxMemoryPerUser", (
+            f"expected QOSMaxMemoryPerUser, got {reason!r}"
+        )
+
 
 class TestSacctmgrShowQos:
     def test_show_qos_renders_all_limit_columns(self, accounting_cluster):
@@ -243,3 +283,29 @@ class TestSacctmgrUserAssociationLimits:
                 break
             time.sleep(2)
         assert reason == "AssocMaxJobsLimit", f"expected AssocMaxJobsLimit, got {reason!r}"
+
+
+class TestSacctmgrInvalidInput:
+    def test_add_qos_with_non_numeric_limit_fails_cleanly(self, accounting_cluster):
+        c = accounting_cluster
+
+        # A typo'd numeric limit must be rejected outright, not silently
+        # coerced to 0 ("unlimited").
+        out = c.cli_allow_fail(["sacctmgr", "add", "qos", "name=badlimit", "maxjobsperuser=abc"])
+        assert "maxjobsperuser" in out, f"expected error mentioning maxjobsperuser, got {out!r}"
+
+        show_out = c.sacctmgr(["show", "qos"])
+        assert "badlimit" not in show_out, "QOS should not have been created"
+
+    def test_add_qos_with_unit_suffixed_tres_fails_cleanly(self, accounting_cluster):
+        c = accounting_cluster
+
+        # Slurm's K/M/G unit-suffix TRES syntax isn't supported; it must be
+        # rejected rather than silently dropped into a no-op limit.
+        out = c.cli_allow_fail(
+            ["sacctmgr", "add", "qos", "name=badtres", "maxtresperjob=mem=1G"]
+        )
+        assert "mem" in out, f"expected error mentioning the bad TRES token, got {out!r}"
+
+        show_out = c.sacctmgr(["show", "qos"])
+        assert "badtres" not in show_out, "QOS should not have been created"
