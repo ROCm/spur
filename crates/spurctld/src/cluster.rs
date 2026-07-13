@@ -2705,15 +2705,29 @@ impl ClusterManager {
         .map_err(|e| anyhow::anyhow!("raft propose failed: {}", e))
     }
 
-    /// Clear a job's run-state so it is schedulable again after requeue.
-    fn reset_job_for_requeue(job: &mut Job) {
-        job.requeue_count += 1;
+    /// Clear a job's run-state fields so it's schedulable again after requeue.
+    /// Does not bump either counter; callers do that based on why they're requeuing.
+    fn clear_run_state_for_requeue(job: &mut Job) {
         job.start_time = None;
         job.exit_code = None;
         job.allocated_nodes.clear();
         job.allocated_resources = None;
         job.per_node_alloc.clear();
         job.pending_reason = PendingReason::None;
+    }
+
+    /// Requeue after a dispatch failure or Timeout/NodeFail: counts against
+    /// `max_batch_requeue`.
+    fn reset_job_for_requeue(job: &mut Job) {
+        job.requeue_count += 1;
+        Self::clear_run_state_for_requeue(job);
+    }
+
+    /// Requeue after preemption: tracked separately since it isn't a failure
+    /// signal and must never contribute to the `max_batch_requeue` hold.
+    fn reset_job_for_preempt_requeue(job: &mut Job) {
+        job.preempt_requeue_count += 1;
+        Self::clear_run_state_for_requeue(job);
     }
 
     /// Evict a single job by ID: transition to NodeFail, then free its
@@ -2851,11 +2865,7 @@ impl ClusterManager {
                         if job.requeue_count < max {
                             Self::reset_job_for_requeue(job);
                         } else {
-                            job.start_time = None;
-                            job.exit_code = None;
-                            job.allocated_nodes.clear();
-                            job.allocated_resources = None;
-                            job.per_node_alloc.clear();
+                            Self::clear_run_state_for_requeue(job);
                         }
                         job.pending_reason = pending_reason.clone().unwrap_or(PendingReason::None);
                         if let Some(priority) = pending_priority {
@@ -2898,7 +2908,7 @@ impl ClusterManager {
                         warn!(job_id = *job_id, error = %e, "invalid requeue transition in WAL apply");
                         return ClientResponse::default();
                     }
-                    Self::reset_job_for_requeue(job);
+                    Self::reset_job_for_preempt_requeue(job);
                     job.spec.begin_time = Some(*begin_time);
                     job.pending_reason = PendingReason::BeginTime;
                 }
@@ -5901,7 +5911,8 @@ mod tests {
         assert_eq!(job.state, JobState::Pending);
         assert_eq!(job.spec.begin_time, Some(begin_time));
         assert_eq!(job.pending_reason, PendingReason::BeginTime);
-        assert_eq!(job.requeue_count, 1);
+        assert_eq!(job.preempt_requeue_count, 1);
+        assert_eq!(job.requeue_count, 0);
         assert!(job.allocated_nodes.is_empty());
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
 
@@ -5921,7 +5932,7 @@ mod tests {
             "instant must not drift"
         );
         assert_eq!(
-            job.requeue_count, 1,
+            job.preempt_requeue_count, 1,
             "replayed preempt-requeue must not double-count"
         );
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
@@ -7176,6 +7187,108 @@ mod tests {
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::ReservationDeleted
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_requeue_never_holds_job_regardless_of_repeat_count() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let max = cm.config.controller.max_batch_requeue;
+
+        let job_id = run_job_on(&cm, "chronic-preempt", "worker1");
+        for _ in 0..(max + 3) {
+            cm.preempt_job(job_id, PreemptMode::Requeue).unwrap();
+            settle(&cm, job_id, JobState::Pending);
+            {
+                let mut jobs = cm.jobs.write();
+                jobs.get_mut(&job_id).unwrap().spec.begin_time =
+                    Some(Utc::now() - chrono::Duration::seconds(1));
+            }
+            let resources = scalar_alloc(2, 4000);
+            cm.start_job(
+                job_id,
+                vec!["worker1".into()],
+                resources.clone(),
+                per_node_for(&["worker1"], resources),
+            )
+            .unwrap();
+            settle(&cm, job_id, JobState::Running);
+        }
+        cm.preempt_job(job_id, PreemptMode::Requeue).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert!(
+            job.preempt_requeue_count > max,
+            "job must have been preempted more times than max_batch_requeue"
+        );
+        assert_eq!(
+            job.requeue_count, 0,
+            "repeated preemption must not touch the failure-requeue counter"
+        );
+        assert_ne!(
+            job.pending_reason,
+            PendingReason::JobHoldMaxRequeue,
+            "a chronically-preempted but otherwise healthy job must never be held"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chronic_preemption_does_not_exhaust_failure_requeue_budget() {
+        // A job preempted max_batch_requeue times must still get a full
+        // failure-requeue budget: the two counters are independent.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let max = cm.config.controller.max_batch_requeue;
+
+        let mut spec = basic_spec("chronic-then-timeout");
+        spec.requeue = true;
+        let job_id = submit_and_wait(&cm, spec);
+        let resources = scalar_alloc(2, 4000);
+
+        for _ in 0..max {
+            cm.start_job(
+                job_id,
+                vec!["worker1".into()],
+                resources.clone(),
+                per_node_for(&["worker1"], resources.clone()),
+            )
+            .unwrap();
+            settle(&cm, job_id, JobState::Running);
+            cm.preempt_job(job_id, PreemptMode::Requeue).unwrap();
+            settle(&cm, job_id, JobState::Pending);
+            {
+                let mut jobs = cm.jobs.write();
+                jobs.get_mut(&job_id).unwrap().spec.begin_time =
+                    Some(Utc::now() - chrono::Duration::seconds(1));
+            }
+        }
+        assert_eq!(cm.get_job(job_id).unwrap().preempt_requeue_count, max);
+        assert_eq!(cm.get_job(job_id).unwrap().requeue_count, 0);
+
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            resources.clone(),
+            per_node_for(&["worker1"], resources),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+        cm.complete_job(job_id, -1, JobState::Timeout).unwrap();
+
+        settle(&cm, job_id, JobState::Pending);
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(
+            job.requeue_count, 1,
+            "the first genuine failure must count, unaffected by prior preemptions"
+        );
+        assert_ne!(
+            job.pending_reason,
+            PendingReason::JobHoldMaxRequeue,
+            "one timeout after chronic preemption must not exhaust the failure budget"
         );
     }
 

@@ -284,8 +284,8 @@ pub struct ControllerConfig {
     #[serde(default)]
     pub heartbeat_timeout_secs: Option<u64>,
 
-    /// Maximum automatic requeues before a job is held with `JobHoldMaxRequeue`.
-    /// Configured in TOML as `[controller] max_batch_requeue` (default: 5).
+    /// Maximum automatic requeues (excluding preemption) before a job is held
+    /// with `JobHoldMaxRequeue`. Configured in TOML as `[controller] max_batch_requeue` (default: 5).
     #[serde(default = "default_max_batch_requeue")]
     pub max_batch_requeue: u32,
 }
