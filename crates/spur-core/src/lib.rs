@@ -19,4 +19,5 @@ pub mod resource;
 pub mod spur_env;
 pub mod step;
 pub mod topology;
+pub mod version;
 pub mod wal;
