@@ -115,10 +115,16 @@ pub fn check_qos_limits(
     QosCheckResult::Allowed
 }
 
-/// Calculate effective priority including QOS priority adjustment.
+/// Add a QOS's priority delta on top of an already-computed priority.
+///
+/// Callers should pass the fully weighted priority (fairshare/age/partition
+/// tier already applied) as `base_priority`, not a job's raw submitted
+/// priority: the QOS delta is a flat addition, so applying it before those
+/// multiplicative factors would let them amplify or dilute it in proportion
+/// to values that have nothing to do with QOS.
 pub fn qos_adjusted_priority(base_priority: u32, qos: &Qos) -> u32 {
     let adjusted = base_priority as i64 + qos.priority as i64;
-    adjusted.max(1) as u32
+    adjusted.clamp(1, u32::MAX as i64) as u32
 }
 
 #[cfg(test)]

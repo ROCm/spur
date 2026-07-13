@@ -403,7 +403,15 @@ pub(crate) async fn try_preempt(
         .get_jobs(&[JobState::Running], None, None, None, None, &[])
         .into_iter()
         .collect();
-    running.sort_by_key(|j| j.priority);
+    // Running jobs never pass back through pending_jobs(), so their stored
+    // `priority` is the raw base value, not the fairshare/age/tier/QoS
+    // adjusted value `pending` jobs carry. Recompute a comparable priority
+    // here rather than comparing raw and adjusted values against each other.
+    let running_priority: std::collections::HashMap<spur_core::job::JobId, u32> = running
+        .iter()
+        .map(|j| (j.job_id, cluster.current_effective_priority(j)))
+        .collect();
+    running.sort_by_key(|j| running_priority[&j.job_id]);
 
     for pending in unscheduled {
         let Some(pending_part) = partition_for(pending) else {
@@ -415,7 +423,8 @@ pub(crate) async fn try_preempt(
         let pending_tier = pending_part.priority_tier;
 
         for candidate in &running {
-            if candidate.priority >= pending.priority / 2 {
+            let candidate_priority = running_priority[&candidate.job_id];
+            if candidate_priority >= pending.priority / 2 {
                 continue;
             }
 
@@ -438,7 +447,7 @@ pub(crate) async fn try_preempt(
             }
             info!(
                 preempted_job = candidate.job_id,
-                preempted_priority = candidate.priority,
+                preempted_priority = candidate_priority,
                 pending_job = pending.job_id,
                 pending_priority = pending.priority,
                 mode = ?mode,

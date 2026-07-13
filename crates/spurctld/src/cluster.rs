@@ -1653,10 +1653,18 @@ impl ClusterManager {
             true
         });
 
+        // Resolve each job's QoS once and reuse it for both the QoS-limit
+        // check below and the priority adjustment further down, instead of
+        // looking it up twice per job per scheduling cycle.
+        let qos_by_job: HashMap<JobId, Qos> = pending
+            .iter()
+            .map(|job| (job.job_id, self.resolve_qos(job)))
+            .collect();
+
         // QoS enforcement: check per-user limits for jobs with a QoS. Shares
         // the eligibility logic with tag_blocked_pending_reasons() via
         // qos_block_for() so the drop decision and the displayed reason agree.
-        pending.retain(|job| qos_block_for(job, &self.resolve_qos(job), &jobs).is_none());
+        pending.retain(|job| qos_block_for(job, &qos_by_job[&job.job_id], &jobs).is_none());
 
         // License enforcement is applied after the priority sort below, so scarce
         // licenses are reserved highest-priority-first and a single pass cannot
@@ -1685,20 +1693,26 @@ impl ClusterManager {
             let fair_share = self
                 .fairshare_cache
                 .get(&job.spec.user, job.spec.account.as_deref().unwrap_or(""));
-            let qos_priority = qos_adjusted_priority(job.priority, &self.resolve_qos(job));
-            job.priority = spur_sched::priority::effective_priority(
-                qos_priority,
+            job.priority = compute_effective_priority(
+                job.priority,
                 fair_share,
                 age_minutes,
                 partition_tier,
+                &qos_by_job[&job.job_id],
             );
         }
         drop(partitions);
 
+        // Priority ties (more likely now that QoS floors low-priority jobs at
+        // 1) break on job_id so ordering is deterministic instead of
+        // depending on HashMap iteration order.
         pending.sort_by(|a, b| {
             let a_res = reservation::job_has_active_reservation(a, &reservations, now);
             let b_res = reservation::job_has_active_reservation(b, &reservations, now);
-            b_res.cmp(&a_res).then(b.priority.cmp(&a.priority))
+            b_res
+                .cmp(&a_res)
+                .then(b.priority.cmp(&a.priority))
+                .then(a.job_id.cmp(&b.job_id))
         });
 
         // License reservation, in priority order. `remaining` starts from current
@@ -2692,6 +2706,38 @@ impl ClusterManager {
             Some(name) => self.qos_cache.get(name).unwrap_or_default(),
             None => Qos::default(),
         }
+    }
+
+    /// Recompute a job's effective priority (fairshare + age + partition
+    /// tier + QoS) as of right now.
+    ///
+    /// Running jobs never pass back through `pending_jobs()`, so their
+    /// stored `priority` stays at the raw base value forever. This lets
+    /// callers like the preemption gate compare a running job's *current*
+    /// effective priority against a pending job's fully adjusted one
+    /// instead of comparing raw and adjusted values against each other.
+    pub(crate) fn current_effective_priority(&self, job: &Job) -> u32 {
+        let now = Utc::now();
+        let age_minutes = (now - job.submit_time).num_minutes().max(0);
+        let partition_tier = {
+            let partitions = self.partitions.read();
+            job.spec
+                .partition
+                .as_ref()
+                .and_then(|pname| partitions.iter().find(|p| p.name == *pname))
+                .map(|p| p.priority_tier)
+                .unwrap_or(1)
+        };
+        let fair_share = self
+            .fairshare_cache
+            .get(&job.spec.user, job.spec.account.as_deref().unwrap_or(""));
+        compute_effective_priority(
+            job.priority,
+            fair_share,
+            age_minutes,
+            partition_tier,
+            &self.resolve_qos(job),
+        )
     }
 
     /// Persist a mutation via Raft consensus. The apply callback
@@ -3770,6 +3816,26 @@ fn reservation_block(
         }
         _ => Some(PendingReason::Reservation),
     }
+}
+
+/// Combine fairshare/age/partition-tier and QoS into a job's effective
+/// priority. QoS is added on top of the fairshare/age/tier product rather
+/// than fed into it, so a job's QoS tier is a constant, predictable offset
+/// instead of being amplified or diluted by factors unrelated to QoS.
+fn compute_effective_priority(
+    base_priority: u32,
+    fair_share: f64,
+    age_minutes: i64,
+    partition_tier: u32,
+    qos: &Qos,
+) -> u32 {
+    let raw = spur_sched::priority::effective_priority(
+        base_priority,
+        fair_share,
+        age_minutes,
+        partition_tier,
+    );
+    qos_adjusted_priority(raw, qos)
 }
 
 /// Reason a job is ineligible because currently-available licenses cannot satisfy
@@ -6663,6 +6729,64 @@ mod tests {
             high_priority > low_priority,
             "high-QoS job ({high_priority}) should outrank low-QoS job ({low_priority}) \
              despite identical base priority"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_qos_ordering_holds_with_nonneutral_fairshare_and_age() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache().insert(Qos {
+            name: "low".into(),
+            priority: 100,
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 5000,
+            ..Default::default()
+        });
+
+        // Realistic, non-maxed-out fairshare (3x) and age (6 days) on the
+        // low-QoS job; the high-QoS job is left neutral. Before this fix,
+        // applying QoS before the fairshare/age multiplication meant this
+        // exact combination let the low-QoS job's unrelated fairshare/age
+        // boost get multiplied into its QoS delta and outrank the high-QoS
+        // job: (1000 + 100) * 3.0 * ~1.857 ≈ 6128 vs (1000 + 5000) * 1 =
+        // 6000. Applying QoS on top instead keeps the two independent:
+        // 1000 * 3.0 * ~1.857 + 100 ≈ 5671 vs 1000 + 5000 = 6000.
+        cm.fairshare_cache().set_for_test("low-user", "", 3.0);
+
+        let mut low = basic_spec("low");
+        low.user = "low-user".into();
+        low.priority = Some(1000);
+        low.qos = Some("low".into());
+        let low_id = submit_and_wait(&cm, low);
+        {
+            let mut jobs = cm.jobs.write();
+            jobs.get_mut(&low_id).unwrap().submit_time = Utc::now() - chrono::Duration::days(6);
+        }
+
+        let mut high = basic_spec("high");
+        high.priority = Some(1000);
+        high.qos = Some("high".into());
+        let high_id = submit_and_wait(&cm, high);
+
+        let pending = cm.pending_jobs();
+        let low_priority = pending
+            .iter()
+            .find(|j| j.job_id == low_id)
+            .unwrap()
+            .priority;
+        let high_priority = pending
+            .iter()
+            .find(|j| j.job_id == high_id)
+            .unwrap()
+            .priority;
+        assert!(
+            high_priority > low_priority,
+            "high-QoS job ({high_priority}) should still outrank low-QoS job ({low_priority}) \
+             once fairshare/age no longer amplify the QoS delta"
         );
     }
 
