@@ -5,9 +5,11 @@ pub(crate) mod db;
 mod fairshare;
 mod grpc;
 mod notifier;
+mod reconcile;
 
 pub use grpc::accounting_server;
 pub use notifier::{AccountingNotifier, JobStartRecord};
+pub use reconcile::spawn_loop as spawn_reconcile_loop;
 
 use std::collections::{HashMap, HashSet};
 

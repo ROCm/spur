@@ -234,6 +234,16 @@ pub async fn record_job_end(
     Ok(())
 }
 
+/// The accounting DB's current state for a job, or `None` if no row exists yet.
+/// Used by the reconciliation pass to detect jobs missing or stale in accounting.
+pub async fn job_accounting_state(pool: &PgPool, job_id: i32) -> anyhow::Result<Option<String>> {
+    let row = sqlx::query("SELECT state FROM jobs WHERE job_id = $1")
+        .bind(job_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| r.get("state")))
+}
+
 /// Update usage accounting for a completed job, from the row `record_job_end` just wrote.
 async fn update_usage(pool: &PgPool, row: PgRow, end_time: DateTime<Utc>) -> anyhow::Result<()> {
     let user: String = row.get("user_name");

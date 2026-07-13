@@ -182,6 +182,13 @@ async fn main() -> anyhow::Result<()> {
                     let notifier = accounting::AccountingNotifier::new(pool.clone());
                     cluster.set_accounting(notifier);
 
+                    accounting::spawn_reconcile_loop(
+                        pool.clone(),
+                        cluster.clone(),
+                        raft_handle.clone(),
+                        std::time::Duration::from_secs(120),
+                    );
+
                     cluster.fairshare_cache().spawn_refresh_loop(
                         pool.clone(),
                         config.scheduler.fairshare_halflife_days,
