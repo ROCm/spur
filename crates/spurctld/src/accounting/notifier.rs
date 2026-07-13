@@ -15,7 +15,9 @@ const RETRY_BACKOFF: Duration = Duration::from_millis(200);
 // Bounds how long a single attempt can pin one of the pool's 8 connections.
 // Without this, a hung (not fully down) Postgres connection lets 3 retries
 // each hold a connection indefinitely, rather than failing fast and freeing it.
-const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+// Shared with reconcile.rs, which has the same hung-connection exposure on
+// its resync writes.
+pub(super) const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Retry a fallible async operation up to `attempts` times, doubling `backoff`
 /// between tries. Each attempt is bounded by `ATTEMPT_TIMEOUT`. Returns the
@@ -88,9 +90,10 @@ impl AccountingNotifier {
         let start_time = record.start_time;
         let reservation = record.reservation.unwrap_or_default();
         tokio::spawn(async move {
-            let write = || {
+            let write = || async {
+                let mut conn = pool.acquire().await?;
                 super::db::record_job_start(
-                    &pool,
+                    &mut conn,
                     job_id as i32,
                     &name,
                     &user,
@@ -104,6 +107,7 @@ impl AccountingNotifier {
                     start_time,
                     &reservation,
                 )
+                .await
             };
             if let Err(e) = retry_with_backoff(write, RETRY_ATTEMPTS, RETRY_BACKOFF).await {
                 error!(job_id, error = %e, "failed to record job start in accounting after retries");
@@ -123,9 +127,10 @@ impl AccountingNotifier {
         let pool = self.pool.clone();
         let state_str = state.display().to_owned();
         tokio::spawn(async move {
-            let write = || {
+            let write = || async {
+                let mut conn = pool.acquire().await?;
                 super::db::record_job_end(
-                    &pool,
+                    &mut conn,
                     job_id as i32,
                     &state_str,
                     exit_code,
@@ -133,6 +138,7 @@ impl AccountingNotifier {
                     exit_signal,
                     derived_exit_code,
                 )
+                .await
             };
             if let Err(e) = retry_with_backoff(write, RETRY_ATTEMPTS, RETRY_BACKOFF).await {
                 error!(job_id, error = %e, "failed to record job end in accounting after retries");

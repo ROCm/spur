@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use sqlx::postgres::PgRow;
+use sqlx::postgres::{PgConnection, PgRow};
 use sqlx::{PgPool, QueryBuilder, Row};
 
 /// Run database migrations (create tables if they don't exist).
@@ -126,9 +126,15 @@ ALTER TABLE associations ADD COLUMN IF NOT EXISTS default_qos TEXT;
 "#;
 
 /// Record a job start in the database.
+///
+/// Takes a `&mut PgConnection` (not a hard `&PgPool`) so callers can either
+/// acquire a standalone connection from a pool (as the notifier does) or pass
+/// one borrowed from an open `Transaction` (`Transaction` derefs to
+/// `PgConnection`) to run this alongside other writes atomically, as
+/// reconciliation's backfill-then-finalize does.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_job_start(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     job_id: i32,
     name: &str,
     user: &str,
@@ -177,7 +183,7 @@ pub async fn record_job_start(
     .bind(submit_time)
     .bind(start_time)
     .bind(reservation)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     // If end_time is already set, the end notification arrived first and skipped
@@ -186,21 +192,22 @@ pub async fn record_job_start(
         "SELECT user_name, account, start_time, num_tasks, cpus_per_task, end_time FROM jobs WHERE job_id = $1",
     )
     .bind(job_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
 
     let end_time: Option<DateTime<Utc>> = row.get("end_time");
     if let Some(end_time) = end_time {
-        update_usage(pool, row, end_time).await?;
+        update_usage(conn, row, end_time).await?;
     }
 
     Ok(())
 }
 
-/// Record a job completion in the database.
+/// Record a job completion in the database. See `record_job_start` for why
+/// this takes a `&mut PgConnection` rather than a `&PgPool`.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_job_end(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     job_id: i32,
     state: &str,
     exit_code: i32,
@@ -228,10 +235,10 @@ pub async fn record_job_end(
     .bind(end_time)
     .bind(exit_signal)
     .bind(derived_exit_code)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
 
-    update_usage(pool, row, end_time).await?;
+    update_usage(conn, row, end_time).await?;
 
     Ok(())
 }
@@ -278,7 +285,11 @@ pub async fn job_accounting_states(
 }
 
 /// Update usage accounting for a completed job, from the row `record_job_end` just wrote.
-async fn update_usage(pool: &PgPool, row: PgRow, end_time: DateTime<Utc>) -> anyhow::Result<()> {
+async fn update_usage(
+    conn: &mut PgConnection,
+    row: PgRow,
+    end_time: DateTime<Utc>,
+) -> anyhow::Result<()> {
     let user: String = row.get("user_name");
     let account: String = row.get("account");
     let start_time: Option<DateTime<Utc>> = row.get("start_time");
@@ -314,7 +325,7 @@ async fn update_usage(pool: &PgPool, row: PgRow, end_time: DateTime<Utc>) -> any
     .bind(period_start)
     .bind(period_end)
     .bind(cpu_seconds)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     Ok(())
@@ -806,6 +817,66 @@ mod job_history_tests {
         Ok(())
     }
 
+    /// Standalone-pool wrappers around `record_job_start`/`record_job_end`,
+    /// which now take a `&mut PgConnection` so reconciliation can run them
+    /// inside a transaction. Tests exercise the pool-per-call path here.
+    #[allow(clippy::too_many_arguments)]
+    async fn start(
+        pool: &PgPool,
+        job_id: i32,
+        name: &str,
+        user: &str,
+        account: &str,
+        partition: &str,
+        num_nodes: i32,
+        num_tasks: i32,
+        cpus_per_task: i32,
+        memory_mb: i64,
+        submit_time: DateTime<Utc>,
+        start_time: DateTime<Utc>,
+        reservation: &str,
+    ) -> anyhow::Result<()> {
+        let mut conn = pool.acquire().await?;
+        record_job_start(
+            &mut conn,
+            job_id,
+            name,
+            user,
+            account,
+            partition,
+            num_nodes,
+            num_tasks,
+            cpus_per_task,
+            memory_mb,
+            submit_time,
+            start_time,
+            reservation,
+        )
+        .await
+    }
+
+    async fn end(
+        pool: &PgPool,
+        job_id: i32,
+        state: &str,
+        exit_code: i32,
+        end_time: DateTime<Utc>,
+        exit_signal: i32,
+        derived_exit_code: i32,
+    ) -> anyhow::Result<()> {
+        let mut conn = pool.acquire().await?;
+        record_job_end(
+            &mut conn,
+            job_id,
+            state,
+            exit_code,
+            end_time,
+            exit_signal,
+            derived_exit_code,
+        )
+        .await
+    }
+
     #[tokio::test]
     #[ignore = "requires DATABASE_URL and PostgreSQL"]
     async fn get_job_history_query_builder() -> anyhow::Result<()> {
@@ -826,7 +897,7 @@ mod job_history_tests {
 
         delete_jobs(&pool, &ids).await.ok();
 
-        record_job_start(
+        start(
             &pool,
             id0,
             "job-a",
@@ -842,9 +913,9 @@ mod job_history_tests {
             "",
         )
         .await?;
-        record_job_end(&pool, id0, "COMPLETED", 0, t1 + Duration::minutes(5), 0, 0).await?;
+        end(&pool, id0, "COMPLETED", 0, t1 + Duration::minutes(5), 0, 0).await?;
 
-        record_job_start(
+        start(
             &pool,
             id1,
             "job-b",
@@ -860,9 +931,9 @@ mod job_history_tests {
             "",
         )
         .await?;
-        record_job_end(&pool, id1, "FAILED", 137, t1 + Duration::minutes(5), 9, 137).await?;
+        end(&pool, id1, "FAILED", 137, t1 + Duration::minutes(5), 9, 137).await?;
 
-        record_job_start(
+        start(
             &pool,
             id2,
             "job-c",
@@ -878,7 +949,7 @@ mod job_history_tests {
             "",
         )
         .await?;
-        record_job_end(&pool, id2, "COMPLETED", 0, t2 + Duration::minutes(5), 0, 0).await?;
+        end(&pool, id2, "COMPLETED", 0, t2 + Duration::minutes(5), 0, 0).await?;
 
         let by_user = get_job_history(&pool, Some(&user_a), None, None, None, &[], 100).await?;
         assert_eq!(by_user.len(), 2);
@@ -942,11 +1013,11 @@ mod job_history_tests {
 
         let submit1 = Utc::now() - Duration::hours(3);
         let start1 = Utc::now() - Duration::hours(2);
-        record_job_start(
+        start(
             &pool, id, "old-job", "root", "acct-old", "debug", 2, 4, 2, 8192, submit1, start1, "",
         )
         .await?;
-        record_job_end(
+        end(
             &pool,
             id,
             "FAILED",
@@ -959,7 +1030,7 @@ mod job_history_tests {
 
         let submit2 = Utc::now() - Duration::minutes(90);
         let start2 = Utc::now() - Duration::hours(1);
-        record_job_start(
+        start(
             &pool, id, "new-job", "vm", "acct-new", "gpu", 1, 1, 1, 1024, submit2, start2, "",
         )
         .await?;

@@ -47,8 +47,13 @@ impl SlurmAccounting for AccountingService {
             .map(|r| (r.memory_mb as i64, r.cpus as i32))
             .unwrap_or((0, 1));
 
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
         db::record_job_start(
-            &self.pool,
+            &mut conn,
             req.job_id as i32,
             &req.name,
             &req.user,
@@ -88,8 +93,13 @@ impl SlurmAccounting for AccountingService {
             _ => "UNKNOWN",
         };
 
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
         db::record_job_end(
-            &self.pool,
+            &mut conn,
             req.job_id as i32,
             state_str,
             req.exit_code,

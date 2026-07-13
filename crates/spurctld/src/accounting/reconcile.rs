@@ -138,28 +138,55 @@ fn jobs_needing_resync(
         .collect()
 }
 
+/// Resync one job's accounting record. `write_start` and `write_end` (when
+/// both are needed) run inside a single transaction so a failure partway
+/// through — including `write_start` itself failing — rolls back cleanly
+/// instead of leaving the row in an intermediate state: `record_job_start`
+/// unconditionally sets `state='RUNNING'` with a wiped end time and exit
+/// code, and previously that reset was committed on its own statement, with
+/// `write_end` relied on to fix it back up immediately after. Any failure
+/// between the two — or a concurrent reader landing in the gap — could
+/// observe or permanently persist a correct terminal record clobbered back
+/// to `RUNNING`. The whole attempt is bounded by `ATTEMPT_TIMEOUT` so a
+/// wedged connection can't stall the reconciliation loop; a timed-out job is
+/// simply retried on the next pass.
 async fn resync_job(pool: &PgPool, job: &Job, row_missing: bool, needs_start_backfill: bool) {
     // record_job_start unconditionally sets state='RUNNING', so only call it
     // when the row doesn't exist yet, is missing start metadata a proper
     // record_job_start would have populated (see AccountingRowState), or the
     // job hasn't reached a terminal state — otherwise it would clobber a
-    // correct terminal state. The terminal case is corrected immediately
-    // below by write_end in the same pass.
-    if row_missing || needs_start_backfill || !job.state.is_terminal() {
-        if let Err(e) = write_start(pool, job).await {
-            error!(job_id = job.job_id, error = %e, "reconciliation: failed to resync job start");
-            return;
-        }
-    }
+    // correct terminal state. The terminal case is corrected in the same
+    // transaction by write_end below.
+    let needs_start = row_missing || needs_start_backfill || !job.state.is_terminal();
+    let is_terminal = job.state.is_terminal();
 
-    if job.state.is_terminal() {
-        if let Err(e) = write_end(pool, job).await {
-            error!(job_id = job.job_id, error = %e, "reconciliation: failed to resync job end");
+    let attempt = async {
+        let mut tx = pool.begin().await?;
+        if needs_start {
+            write_start(&mut tx, job).await?;
+        }
+        if is_terminal {
+            write_end(&mut tx, job).await?;
+        }
+        tx.commit().await?;
+        anyhow::Ok(())
+    };
+
+    match tokio::time::timeout(super::notifier::ATTEMPT_TIMEOUT, attempt).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            error!(job_id = job.job_id, error = %e, "reconciliation: failed to resync job accounting record");
+        }
+        Err(_) => {
+            error!(
+                job_id = job.job_id,
+                "reconciliation: resync timed out, will retry next cycle"
+            );
         }
     }
 }
 
-async fn write_start(pool: &PgPool, job: &Job) -> anyhow::Result<()> {
+async fn write_start(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result<()> {
     let spec = &job.spec;
     let memory_mb = job
         .allocated_resources
@@ -168,7 +195,7 @@ async fn write_start(pool: &PgPool, job: &Job) -> anyhow::Result<()> {
         .unwrap_or(0);
     let start_time = job.start_time.unwrap_or(job.submit_time);
     db::record_job_start(
-        pool,
+        conn,
         job.job_id as i32,
         &spec.name,
         &spec.user,
@@ -185,10 +212,10 @@ async fn write_start(pool: &PgPool, job: &Job) -> anyhow::Result<()> {
     .await
 }
 
-async fn write_end(pool: &PgPool, job: &Job) -> anyhow::Result<()> {
+async fn write_end(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result<()> {
     let end_time = job.end_time.unwrap_or_else(Utc::now);
     db::record_job_end(
-        pool,
+        conn,
         job.job_id as i32,
         job.state.display(),
         job.exit_code.unwrap_or(0),
@@ -382,8 +409,9 @@ mod tests {
         let job = test_job(job_id, JobState::Completed);
 
         // Simulate the outage: only the end notification ever lands.
+        let mut conn = pool.acquire().await?;
         db::record_job_end(
-            &pool,
+            &mut conn,
             job_id as i32,
             job.state.display(),
             0,
@@ -392,6 +420,7 @@ mod tests {
             0,
         )
         .await?;
+        drop(conn);
 
         let bare = db::job_accounting_states(&pool, &[job_id as i32])
             .await?
@@ -469,6 +498,101 @@ mod tests {
         assert!(
             stale.is_empty(),
             "a suspended job matching a RUNNING row must not be flagged stale"
+        );
+
+        delete_job(&pool, job_id as i32).await;
+        Ok(())
+    }
+
+    // Regression test for the core atomicity bug: record_job_start
+    // unconditionally resets state='RUNNING'/end_time=NULL, so a resync pass
+    // that backfills a job already holding a correct, complete terminal
+    // record must never leave that record clobbered if anything fails
+    // between write_start committing its (would-be-corrupting) write and
+    // write_end correcting it. write_start's own INSERT is single-statement
+    // atomic on its own — a bad value in it just fails outright without
+    // writing anything, old buggy code included — so this drives write_start
+    // to completion for real (proving it does flip the row to RUNNING with
+    // no end_time, exactly the corrupted shape the bug left behind) and then
+    // forces a real SQL failure on the same transaction before commit, the
+    // way a failing write_end or a dropped connection would. Only the
+    // transaction's rollback — not any additional application-level fixup —
+    // is what must protect the pre-existing terminal record here.
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn resync_job_transaction_rolls_back_a_partial_backfill() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let job_id = test_job_id(2);
+        delete_job(&pool, job_id as i32).await;
+
+        // Seed a correct, complete terminal record, as if a prior pass had
+        // already recorded it successfully.
+        let job = test_job(job_id, JobState::Completed);
+        {
+            let mut conn = pool.acquire().await?;
+            db::record_job_start(
+                &mut conn,
+                job_id as i32,
+                &job.spec.name,
+                &job.spec.user,
+                "",
+                "",
+                job.spec.num_nodes as i32,
+                job.spec.num_tasks as i32,
+                job.spec.cpus_per_task as i32,
+                0,
+                job.submit_time,
+                job.start_time.unwrap(),
+                "",
+            )
+            .await?;
+            db::record_job_end(
+                &mut conn,
+                job_id as i32,
+                "COMPLETED",
+                0,
+                job.end_time.unwrap(),
+                0,
+                0,
+            )
+            .await?;
+        }
+
+        // Run write_start (the real function resync_job calls) inside a
+        // transaction of our own, the same way resync_job's fix does.
+        let mut tx = pool.begin().await?;
+        write_start(&mut tx, &job).await?;
+
+        // Within the uncommitted transaction, the row is now exactly the
+        // corrupted shape the pre-fix bug used to leave committed: RUNNING
+        // with end_time wiped out.
+        let mid_row = sqlx::query("SELECT state, end_time FROM jobs WHERE job_id = $1")
+            .bind(job_id as i32)
+            .fetch_one(&mut *tx)
+            .await?;
+        let mid_state: String = mid_row.get("state");
+        let mid_end_time: Option<chrono::DateTime<Utc>> = mid_row.get("end_time");
+        assert_eq!(mid_state, "RUNNING");
+        assert!(mid_end_time.is_none());
+
+        // Simulate write_end failing (or a connection drop) before commit —
+        // any real SQL error on the same transaction has the same effect.
+        assert!(sqlx::query("SELECT 1/0").execute(&mut *tx).await.is_err());
+        drop(tx); // never committed: sqlx issues ROLLBACK
+
+        let row = sqlx::query("SELECT state, end_time FROM jobs WHERE job_id = $1")
+            .bind(job_id as i32)
+            .fetch_one(&pool)
+            .await?;
+        let state: String = row.get("state");
+        let end_time: Option<chrono::DateTime<Utc>> = row.get("end_time");
+        assert_eq!(
+            state, "COMPLETED",
+            "a rolled-back backfill must never leave the row RUNNING"
+        );
+        assert!(
+            end_time.is_some(),
+            "a rolled-back backfill must never wipe out end_time"
         );
 
         delete_job(&pool, job_id as i32).await;
