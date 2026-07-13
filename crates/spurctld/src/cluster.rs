@@ -20,7 +20,7 @@ use spur_core::job::{
 };
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::{Partition, PreemptMode};
-use spur_core::qos::{check_qos_limits, QosCheckResult};
+use spur_core::qos::{check_qos_limits, qos_adjusted_priority, QosCheckResult};
 use spur_core::reservation::{self, normalize_node_list, running_jobs_overlap_start, Reservation};
 use spur_core::resource::{ResourceAllocations, ResourceSet};
 use spur_core::step::{JobStep, StepState, STEP_BATCH, STEP_RESERVED_MIN};
@@ -1572,7 +1572,7 @@ impl ClusterManager {
     }
 
     /// Get pending jobs sorted by priority, filtering out held and dependency-blocked jobs.
-    /// Recomputes effective priority using age and partition tier before sorting.
+    /// Recomputes effective priority using QoS, age, and partition tier before sorting.
     pub fn pending_jobs(&self) -> Vec<Job> {
         let jobs = self.jobs.read();
         let mut pending: Vec<Job> = jobs
@@ -1685,8 +1685,9 @@ impl ClusterManager {
             let fair_share = self
                 .fairshare_cache
                 .get(&job.spec.user, job.spec.account.as_deref().unwrap_or(""));
+            let qos_priority = qos_adjusted_priority(job.priority, &self.resolve_qos(job));
             job.priority = spur_sched::priority::effective_priority(
-                job.priority,
+                qos_priority,
                 fair_share,
                 age_minutes,
                 partition_tier,
@@ -6623,6 +6624,49 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_applies_qos_priority_adjustment() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache().insert(Qos {
+            name: "low".into(),
+            priority: -500,
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 5000,
+            ..Default::default()
+        });
+
+        let mut low = basic_spec("low");
+        low.priority = Some(1000);
+        low.qos = Some("low".into());
+        let low_id = submit_and_wait(&cm, low);
+
+        let mut high = basic_spec("high");
+        high.priority = Some(1000);
+        high.qos = Some("high".into());
+        let high_id = submit_and_wait(&cm, high);
+
+        let pending = cm.pending_jobs();
+        let low_priority = pending
+            .iter()
+            .find(|j| j.job_id == low_id)
+            .unwrap()
+            .priority;
+        let high_priority = pending
+            .iter()
+            .find(|j| j.job_id == high_id)
+            .unwrap()
+            .priority;
+        assert!(
+            high_priority > low_priority,
+            "high-QoS job ({high_priority}) should outrank low-QoS job ({low_priority}) \
+             despite identical base priority"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resv_overrun_grace_delays_cancel() {
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
@@ -6733,6 +6777,48 @@ mod tests {
 
         crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job]).await;
         assert_eq!(cm.get_job(low_id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_triggers_when_qos_priority_differentiates_pending_job() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].preempt_mode = "cancel".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 5000,
+            ..Default::default()
+        });
+
+        // Same base priority on both jobs; only the QoS adjustment differentiates them.
+        let mut low = basic_spec("low");
+        low.priority = Some(1000);
+        let low_id = submit_and_wait(&cm, low);
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            low_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, low_id, JobState::Running);
+
+        let mut high = basic_spec("high");
+        high.priority = Some(1000);
+        high.qos = Some("high".into());
+        submit_and_wait(&cm, high);
+
+        // pending_jobs() applies the QoS adjustment, unlike a synthetic Job.
+        let pending = cm.pending_jobs();
+        let pending_refs: Vec<&Job> = pending.iter().collect();
+        let partitions = cm.get_partitions();
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs).await;
+
+        settle(&cm, low_id, JobState::Cancelled);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
