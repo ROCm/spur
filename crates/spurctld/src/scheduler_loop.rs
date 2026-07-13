@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tracing::{debug, error, info, warn};
@@ -19,6 +19,11 @@ use spur_sched::traits::{ClusterState, Scheduler};
 
 use crate::cluster::ClusterManager;
 use crate::raft::RaftHandle;
+
+/// Upper bound on a single CancelJob RPC (connect + call) when the caller
+/// awaits delivery. Best-effort cleanup must not stall eviction on an
+/// unreachable agent.
+const CANCEL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Spawn the time-limit enforcement watchdog and power manager alongside the scheduler loop.
 pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
@@ -841,9 +846,8 @@ async fn dispatch_job_to_nodes(
 
     // If ALL dispatches failed, requeue the job back to Pending
     // so the scheduler can retry (e.g., container image may be
-    // imported later, or a transient agent error may resolve).
-    // Issue #91: previously marked as Failed immediately, which
-    // didn't give users a chance to fix the problem.
+    // imported later, or a transient agent error may resolve) rather
+    // than failing it outright and denying the user a chance to fix it.
     if successes == 0 && total > 0 {
         error!(
             job_id,
@@ -859,18 +863,17 @@ async fn dispatch_job_to_nodes(
             job_id,
             successes, failures, "partial dispatch failure — evicting job to NodeFail"
         );
-        // Capture the nodes that actually launched the job before eviction: if the
-        // job has `requeue` set, evict_job's requeue side effect resets the job to
-        // Pending and clears `allocated_nodes`, so reading it back afterward would
-        // silently skip the cancel RPC and leave the process running unmanaged.
+        // Cancel the job on nodes that DID launch it *before* evicting, and wait
+        // for those cancels to be delivered. Eviction can synchronously requeue
+        // the job to Pending (when `spec.requeue` is set), making it eligible for
+        // immediate re-dispatch on the next scheduler cycle; because CancelJob is
+        // keyed only by job_id, a cancel still in flight would otherwise be able
+        // to terminate a freshly re-dispatched attempt on the same node. Ordering
+        // the awaited cancel ahead of the requeue closes that race — the launched
+        // processes are stopped before the job can be relaunched anywhere.
+        cancel_job_on_nodes(&cluster, job_id, &succeeded_nodes, 9).await;
         if let Err(e) = cluster.evict_job(job_id) {
             error!(job_id, error = %e, "failed to evict job after partial dispatch failure");
-        } else {
-            // Nodes that did launch the job are now orphaned processes: the
-            // eviction above only freed allocations and marked the job
-            // NodeFail (or Pending, if requeued), it never told the agents
-            // that ran it to stop.
-            send_cancel_to_nodes(&cluster, job_id, &succeeded_nodes, 9).await;
         }
     }
 }
@@ -1157,55 +1160,104 @@ pub async fn send_cancel_to_agents(
 /// loop) should use this instead of `send_cancel_to_agents` so the cancel
 /// isn't at the mercy of `job.allocated_nodes` having been mutated in the
 /// meantime (e.g. cleared by a requeue-on-eviction side effect).
+///
+/// Fire-and-forget: each node's cancel runs on its own task and this returns
+/// immediately. Use `cancel_job_on_nodes` when the cancel must be delivered
+/// before subsequent work (e.g. a requeue that could re-dispatch the job).
 pub async fn send_cancel_to_nodes(
     cluster: &Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
     node_names: &[String],
     signal: i32,
 ) {
+    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
+        tokio::spawn(cancel_one_agent(agent_addr, job_id, signal));
+    }
+}
+
+/// Like `send_cancel_to_nodes`, but awaits delivery of every cancel before
+/// returning so the caller can establish a happens-before ordering against
+/// later actions. Each RPC is bounded by `CANCEL_RPC_TIMEOUT` so an
+/// unreachable agent can't stall the caller indefinitely.
+pub async fn cancel_job_on_nodes(
+    cluster: &Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    node_names: &[String],
+    signal: i32,
+) {
+    let mut set = tokio::task::JoinSet::new();
+    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
+        set.spawn(cancel_one_agent(agent_addr, job_id, signal));
+    }
+    while set.join_next().await.is_some() {}
+}
+
+/// Resolve `node_names` to agent URLs, logging and skipping any node whose
+/// address is unknown.
+fn cancel_agent_addrs(
+    cluster: &Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    node_names: &[String],
+) -> Vec<String> {
+    let mut addrs = Vec::with_capacity(node_names.len());
     for node_name in node_names {
-        let node_info = cluster.get_node(node_name);
-        let (addr, port) = match node_info {
-            Some(ref n) if n.address.is_some() => (n.address.clone().unwrap(), n.port),
+        match cluster.get_node(node_name) {
+            Some(ref n) if n.address.is_some() => {
+                addrs.push(format!("http://{}:{}", n.address.clone().unwrap(), n.port));
+            }
             _ => {
                 warn!(
                     job_id,
                     node = %node_name,
                     "no agent address — cannot cancel job on node"
                 );
-                continue;
             }
-        };
+        }
+    }
+    addrs
+}
 
-        let agent_addr = format!("http://{}:{}", addr, port);
-        tokio::spawn(async move {
-            match SlurmAgentClient::connect(agent_addr.clone()).await {
-                Ok(mut client) => {
-                    if let Err(e) = client
-                        .cancel_job(AgentCancelJobRequest { job_id, signal })
-                        .await
-                    {
-                        warn!(
-                            job_id,
-                            signal,
-                            agent = %agent_addr,
-                            error = %e,
-                            "CancelJob RPC failed"
-                        );
-                    } else {
-                        info!(job_id, signal, agent = %agent_addr, "sent CancelJob");
-                    }
-                }
-                Err(e) => {
+/// Deliver one CancelJob RPC, bounded by `CANCEL_RPC_TIMEOUT`. Errors and
+/// timeouts are logged, never propagated: a cancel is best-effort cleanup and
+/// must not block the caller past the timeout.
+async fn cancel_one_agent(agent_addr: String, job_id: spur_core::job::JobId, signal: i32) {
+    let attempt = async {
+        match SlurmAgentClient::connect(agent_addr.clone()).await {
+            Ok(mut client) => {
+                if let Err(e) = client
+                    .cancel_job(AgentCancelJobRequest { job_id, signal })
+                    .await
+                {
                     warn!(
                         job_id,
+                        signal,
                         agent = %agent_addr,
                         error = %e,
-                        "failed to connect to agent for cancel"
+                        "CancelJob RPC failed"
                     );
+                } else {
+                    info!(job_id, signal, agent = %agent_addr, "sent CancelJob");
                 }
             }
-        });
+            Err(e) => {
+                warn!(
+                    job_id,
+                    agent = %agent_addr,
+                    error = %e,
+                    "failed to connect to agent for cancel"
+                );
+            }
+        }
+    };
+    if tokio::time::timeout(CANCEL_RPC_TIMEOUT, attempt)
+        .await
+        .is_err()
+    {
+        warn!(
+            job_id,
+            agent = %agent_addr,
+            "CancelJob RPC timed out"
+        );
     }
 }
 
@@ -1860,9 +1912,13 @@ mod tests {
 
             // n1 actually launched the job, so the controller must tell its
             // agent to stop it instead of leaving an orphaned process behind.
-            wait_for("cancel RPC sent to n1", || {
-                cancel_calls.load(Ordering::SeqCst) >= 1
-            });
+            // The cancel is awaited inside dispatch_job_to_nodes, so it has
+            // already been delivered by the time that call returned.
+            assert_eq!(
+                cancel_calls.load(Ordering::SeqCst),
+                1,
+                "n1 must have been cancelled before dispatch_job_to_nodes returned"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1906,8 +1962,11 @@ mod tests {
 
             // Same as the non-requeue case, but `spec.requeue` is set: eviction's
             // requeue side effect resets the job to Pending and clears
-            // `allocated_nodes` before this function returns, so the cancel RPC
-            // must not depend on reading `job.allocated_nodes` afterward.
+            // `allocated_nodes`. The cancel RPC must be delivered to n1 *before*
+            // that requeue makes the job eligible for re-dispatch, otherwise a
+            // job_id-keyed cancel still in flight could kill a fresh attempt.
+            // dispatch_job_to_nodes awaits the cancel before evicting, so by the
+            // time it returns both the cancel is delivered and the job is Pending.
             dispatch_job_to_nodes(
                 cm.clone(),
                 job_id,
@@ -1920,16 +1979,18 @@ mod tests {
             )
             .await;
 
-            // The requeue side effect puts the job back to Pending instead of
-            // leaving it in NodeFail.
-            settle(&cm, job_id, JobState::Pending);
-            assert!(cm.get_job(job_id).unwrap().allocated_nodes.is_empty());
-
-            // n1 actually launched the job, so the controller must still tell
-            // its agent to stop it, even though the job itself was requeued.
-            wait_for("cancel RPC sent to n1", || {
-                cancel_calls.load(Ordering::SeqCst) >= 1
-            });
+            // Cancel-before-requeue: the cancel is already delivered, and the
+            // requeue side effect has put the job back to Pending with its
+            // allocation cleared — no polling needed, both are guaranteed by the
+            // await ordering inside dispatch_job_to_nodes.
+            assert_eq!(
+                cancel_calls.load(Ordering::SeqCst),
+                1,
+                "n1 must have been cancelled before the requeue re-enabled dispatch"
+            );
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Pending);
+            assert!(job.allocated_nodes.is_empty());
         }
     }
 }
