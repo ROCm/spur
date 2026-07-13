@@ -17,7 +17,8 @@ use spur_core::auth::AuthError;
 use spur_core::burst_buffer::BbStageState;
 use spur_core::config::SlurmConfig;
 use spur_core::job::{
-    Job, JobId, JobSpec, JobState, NodeCompleteError, PendingReason, TransitionOutcome,
+    effective_memory_mb, Job, JobId, JobSpec, JobState, NodeCompleteError, PendingReason,
+    TransitionOutcome,
 };
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::{Partition, PreemptMode};
@@ -4044,9 +4045,7 @@ fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> 
         }
         cpu += (j.spec.num_tasks * j.spec.cpus_per_task) as u64;
         node += j.spec.num_nodes as u64;
-        if let Some(m) = j.spec.memory_per_node_mb {
-            mem += m * j.spec.num_nodes as u64;
-        }
+        mem += effective_memory_mb(&j.spec, j.spec.num_nodes);
     }
     tres.set(TresType::Cpu, cpu);
     tres.set(TresType::Node, node);

@@ -535,6 +535,20 @@ impl Default for JobSpec {
     }
 }
 
+/// Total memory (MB) a job of `num_nodes` nodes requests, derived from
+/// either an explicit per-node request or a per-CPU request applied across
+/// the job's total CPU count. Falls back to 0 (unconstrained) if neither is
+/// set.
+pub fn effective_memory_mb(spec: &JobSpec, num_nodes: u32) -> u64 {
+    spec.memory_per_node_mb
+        .map(|mem| mem * num_nodes as u64)
+        .or_else(|| {
+            spec.memory_per_cpu_mb
+                .map(|mem| mem * (spec.num_tasks * spec.cpus_per_task) as u64)
+        })
+        .unwrap_or(0)
+}
+
 /// One node's completion outcome for a job: the raw process wait status,
 /// split into exit code and terminating signal (0 = none).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -904,6 +918,46 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[test]
+    fn effective_memory_mb_defaults_to_zero_when_unset() {
+        let spec = JobSpec::default();
+        assert_eq!(effective_memory_mb(&spec, 1), 0);
+    }
+
+    #[test]
+    fn effective_memory_mb_uses_per_node_when_set() {
+        let spec = JobSpec {
+            memory_per_node_mb: Some(1024),
+            ..Default::default()
+        };
+        assert_eq!(effective_memory_mb(&spec, 3), 3072);
+    }
+
+    #[test]
+    fn effective_memory_mb_falls_back_to_per_cpu() {
+        let spec = JobSpec {
+            memory_per_node_mb: None,
+            memory_per_cpu_mb: Some(512),
+            num_tasks: 4,
+            cpus_per_task: 2,
+            ..Default::default()
+        };
+        // 4 tasks * 2 cpus/task * 512 MB/cpu
+        assert_eq!(effective_memory_mb(&spec, 1), 4096);
+    }
+
+    #[test]
+    fn effective_memory_mb_prefers_per_node_over_per_cpu() {
+        let spec = JobSpec {
+            memory_per_node_mb: Some(2048),
+            memory_per_cpu_mb: Some(512),
+            num_tasks: 4,
+            cpus_per_task: 2,
+            ..Default::default()
+        };
+        assert_eq!(effective_memory_mb(&spec, 1), 2048);
     }
 
     #[test]

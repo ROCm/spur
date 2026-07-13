@@ -11,7 +11,7 @@
 //! across all its users.
 
 use crate::accounting::{AccountLimits, TresRecord, TresType};
-use crate::job::{Job, PendingReason};
+use crate::job::{effective_memory_mb, Job, PendingReason};
 
 /// Result of an account/association limit check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,11 +65,9 @@ pub fn check_account_limits(
             return AccountCheckResult::Blocked(PendingReason::AssocMaxNodePerJobLimit);
         }
 
-        if let Some(mem) = job.spec.memory_per_node_mb {
-            let total_mem = mem * job.spec.num_nodes as u64;
-            if max_tres.get(TresType::Memory) > 0 && total_mem > max_tres.get(TresType::Memory) {
-                return AccountCheckResult::Blocked(PendingReason::AssocMaxMemPerJob);
-            }
+        let total_mem = effective_memory_mb(&job.spec, job.spec.num_nodes);
+        if max_tres.get(TresType::Memory) > 0 && total_mem > max_tres.get(TresType::Memory) {
+            return AccountCheckResult::Blocked(PendingReason::AssocMaxMemPerJob);
         }
     }
 
@@ -88,13 +86,11 @@ pub fn check_account_limits(
             return AccountCheckResult::Blocked(PendingReason::AssocGrpNodeLimit);
         }
 
-        if let Some(mem) = job.spec.memory_per_node_mb {
-            let job_mem = mem * job.spec.num_nodes as u64;
-            if grp.get(TresType::Memory) > 0
-                && account_running_tres.get(TresType::Memory) + job_mem > grp.get(TresType::Memory)
-            {
-                return AccountCheckResult::Blocked(PendingReason::AssocGrpMemLimit);
-            }
+        let job_mem = effective_memory_mb(&job.spec, job.spec.num_nodes);
+        if grp.get(TresType::Memory) > 0
+            && account_running_tres.get(TresType::Memory) + job_mem > grp.get(TresType::Memory)
+        {
+            return AccountCheckResult::Blocked(PendingReason::AssocGrpMemLimit);
         }
     }
 
@@ -234,6 +230,26 @@ mod tests {
     }
 
     #[test]
+    fn test_blocked_by_max_mem_per_job_with_mem_per_cpu() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Memory, 1024); // max 1 GiB per job
+        let limits = AccountLimits {
+            max_tres_per_job: Some(tres),
+            ..Default::default()
+        };
+        // 4 tasks * 1 cpu/task * 512 MB/cpu == 2 GiB total, same as the
+        // memory_per_node_mb equivalent above.
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.memory_per_cpu_mb = Some(512);
+        let result = check_account_limits(&job, &limits, 0, 0, &TresRecord::new());
+        assert_eq!(
+            result,
+            AccountCheckResult::Blocked(PendingReason::AssocMaxMemPerJob)
+        );
+    }
+
+    #[test]
     fn test_blocked_by_grp_cpu() {
         let mut grp = TresRecord::new();
         grp.set(TresType::Cpu, 8); // account-wide cap 8
@@ -281,6 +297,28 @@ mod tests {
         let mut job = make_test_job();
         job.spec.num_nodes = 1;
         job.spec.memory_per_node_mb = Some(3000); // job needs 3 GiB
+        let mut running = TresRecord::new();
+        running.set(TresType::Memory, 2000); // already using 2 GiB; 2000 + 3000 > 4096
+        let result = check_account_limits(&job, &limits, 0, 0, &running);
+        assert_eq!(
+            result,
+            AccountCheckResult::Blocked(PendingReason::AssocGrpMemLimit)
+        );
+    }
+
+    #[test]
+    fn test_blocked_by_grp_mem_with_mem_per_cpu() {
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Memory, 4096); // account-wide cap 4 GiB
+        let limits = AccountLimits {
+            grp_tres: Some(grp),
+            ..Default::default()
+        };
+        // 4 tasks * 1 cpu/task * 750 MB/cpu == 3 GiB, same as the
+        // memory_per_node_mb equivalent above.
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.memory_per_cpu_mb = Some(750);
         let mut running = TresRecord::new();
         running.set(TresType::Memory, 2000); // already using 2 GiB; 2000 + 3000 > 4096
         let result = check_account_limits(&job, &limits, 0, 0, &running);
