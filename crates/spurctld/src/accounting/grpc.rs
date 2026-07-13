@@ -352,6 +352,40 @@ impl SlurmAccounting for AccountingService {
                 )));
             }
         }
+        let max_running_jobs = if req.max_running_jobs == 0 {
+            None
+        } else {
+            Some(
+                i32::try_from(req.max_running_jobs)
+                    .map_err(|_| Status::invalid_argument("max_running_jobs exceeds i32::MAX"))?,
+            )
+        };
+        let max_submit_jobs = if req.max_submit_jobs == 0 {
+            None
+        } else {
+            Some(
+                i32::try_from(req.max_submit_jobs)
+                    .map_err(|_| Status::invalid_argument("max_submit_jobs exceeds i32::MAX"))?,
+            )
+        };
+        let max_tres_per_job = if req.max_tres_per_job.is_empty() {
+            None
+        } else {
+            Some(req.max_tres_per_job.as_str())
+        };
+        let grp_tres = if req.grp_tres.is_empty() {
+            None
+        } else {
+            Some(req.grp_tres.as_str())
+        };
+        let max_wall_minutes = if req.max_wall_minutes == 0 {
+            None
+        } else {
+            Some(
+                i32::try_from(req.max_wall_minutes)
+                    .map_err(|_| Status::invalid_argument("max_wall_minutes exceeds i32::MAX"))?,
+            )
+        };
         db::add_user(
             &self.pool,
             &req.user,
@@ -359,6 +393,11 @@ impl SlurmAccounting for AccountingService {
             &req.admin_level,
             req.is_default,
             &req.default_qos,
+            max_running_jobs,
+            max_submit_jobs,
+            max_tres_per_job,
+            grp_tres,
+            max_wall_minutes,
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;

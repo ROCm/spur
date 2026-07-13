@@ -831,6 +831,14 @@ message AddUserRequest {
   // other field here, this is a full resend on upsert, not a partial
   // patch: empty clears an existing default (matches modify account/qos).
   string default_qos = 5;
+  // Association-level resource limits for `user` within `account`. Same
+  // full-resend semantics as default_qos: 0/empty clears an existing
+  // limit rather than leaving it unchanged.
+  uint32 max_running_jobs = 6;
+  uint32 max_submit_jobs = 7;
+  string max_tres_per_job = 8;
+  string grp_tres = 9;
+  uint32 max_wall_minutes = 10;
 }
 
 message RemoveUserRequest {

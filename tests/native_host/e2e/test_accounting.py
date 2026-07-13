@@ -10,7 +10,7 @@ when Docker is unavailable).
 import re
 import time
 
-from cluster import deep_merge, parse_job_id, wait_job, wait_sacct_row
+from cluster import deep_merge, parse_job_id, wait_job, wait_job_state, wait_sacct_row
 
 
 class TestSacctExitReporting:
@@ -207,3 +207,39 @@ class TestSacctmgrShowQos:
         assert "cpu=8" in row
         assert "cpu=16" in row
         assert "cpu=32" in row
+
+
+class TestSacctmgrUserAssociationLimits:
+    def test_maxjobs_set_via_add_user_blocks_a_second_job(self, accounting_cluster):
+        c = accounting_cluster
+        user = c.nodes[0].user
+
+        # `sacctmgr add user ... maxjobs=1` is the real write path this test
+        # closes the gap on: previously the only way to set this limit was
+        # raw SQL against the associations table.
+        c.sacctmgr(["add", "account", "name=assoccap"])
+        c.sacctmgr(["add", "user", f"name={user}", "account=assoccap", "maxjobs=1"])
+        # Wait past the association cache refresh floor (10s) before
+        # submitting, else the job starts before the cap loads.
+        time.sleep(15)
+
+        script = c.write_file("assoc-maxjobs.sh", "#!/bin/bash\nsleep 30\n")
+        first_id = parse_job_id(
+            c.sbatch(["-J", "assoc-first", "-N", "1", "-A", "assoccap", script])
+        )
+        assert first_id is not None
+        wait_job_state(c, first_id, "R", timeout=30)
+
+        second_id = parse_job_id(
+            c.sbatch(["-J", "assoc-second", "-N", "1", "-A", "assoccap", script])
+        )
+        assert second_id is not None
+
+        deadline = time.time() + 30
+        reason = ""
+        while time.time() < deadline:
+            reason = _reason(c, second_id)
+            if reason == "AssocMaxJobsLimit":
+                break
+            time.sleep(2)
+        assert reason == "AssocMaxJobsLimit", f"expected AssocMaxJobsLimit, got {reason!r}"

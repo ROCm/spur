@@ -546,8 +546,11 @@ pub struct AccountRecord {
 }
 
 /// Add a user-account association. Like `upsert_account`/`upsert_qos`, this
-/// is a full resend on modify, not a partial patch: an empty `default_qos`
-/// clears any existing default rather than preserving it.
+/// is a full resend on modify, not a partial patch: an empty `default_qos`,
+/// or a `None`/zero limit, clears any existing value rather than preserving
+/// it. Numeric limits use `None` (not 0) for "no limit", matching how
+/// `list_associations`/`AssociationCache` read an unset limit back out.
+#[allow(clippy::too_many_arguments)]
 pub async fn add_user(
     pool: &PgPool,
     user: &str,
@@ -555,6 +558,11 @@ pub async fn add_user(
     admin_level: &str,
     is_default: bool,
     default_qos: &str,
+    max_running_jobs: Option<i32>,
+    max_submit_jobs: Option<i32>,
+    max_tres_per_job: Option<&str>,
+    grp_tres: Option<&str>,
+    max_wall_min: Option<i32>,
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"
@@ -582,7 +590,9 @@ pub async fn add_user(
 
     let updated = sqlx::query(
         r#"
-        UPDATE associations SET is_default = $3, default_qos = NULLIF($4, '')
+        UPDATE associations SET is_default = $3, default_qos = NULLIF($4, ''),
+            max_running_jobs = $5, max_submit_jobs = $6, max_tres_per_job = $7,
+            grp_tres = $8, max_wall_min = $9
         WHERE user_name = $1 AND account = $2
           AND (partition_name IS NULL OR partition_name = '')
         "#,
@@ -591,20 +601,31 @@ pub async fn add_user(
     .bind(account)
     .bind(is_default)
     .bind(default_qos)
+    .bind(max_running_jobs)
+    .bind(max_submit_jobs)
+    .bind(max_tres_per_job)
+    .bind(grp_tres)
+    .bind(max_wall_min)
     .execute(&mut *tx)
     .await?;
 
     if updated.rows_affected() == 0 {
         sqlx::query(
             r#"
-            INSERT INTO associations (user_name, account, is_default, default_qos)
-            VALUES ($1, $2, $3, NULLIF($4, ''))
+            INSERT INTO associations (user_name, account, is_default, default_qos,
+                max_running_jobs, max_submit_jobs, max_tres_per_job, grp_tres, max_wall_min)
+            VALUES ($1, $2, $3, NULLIF($4, ''), $5, $6, $7, $8, $9)
             "#,
         )
         .bind(user)
         .bind(account)
         .bind(is_default)
         .bind(default_qos)
+        .bind(max_running_jobs)
+        .bind(max_submit_jobs)
+        .bind(max_tres_per_job)
+        .bind(grp_tres)
+        .bind(max_wall_min)
         .execute(&mut *tx)
         .await?;
     }
@@ -1193,7 +1214,10 @@ mod job_history_tests {
         )
         .await?;
 
-        add_user(&pool, &user, &account, "none", true, &qos_name).await?;
+        add_user(
+            &pool, &user, &account, "none", true, &qos_name, None, None, None, None, None,
+        )
+        .await?;
         let got = list_users(&pool, Some(&account))
             .await?
             .into_iter()
@@ -1203,7 +1227,10 @@ mod job_history_tests {
 
         // Upsert again with an empty default_qos: clears it (full resend,
         // not a partial patch — matches modify account/qos semantics).
-        add_user(&pool, &user, &account, "none", true, "").await?;
+        add_user(
+            &pool, &user, &account, "none", true, "", None, None, None, None, None,
+        )
+        .await?;
         let got = list_users(&pool, Some(&account))
             .await?
             .into_iter()
@@ -1225,6 +1252,114 @@ mod job_history_tests {
             .await?;
         sqlx::query("DELETE FROM qos WHERE name = $1")
             .bind(&qos_name)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn add_user_round_trips_account_limits() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let user = format!("spur_assoclimru_user_{pid}");
+        let account = format!("spur_assoclimru_acct_{pid}");
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+
+        upsert_account(&pool, &account, "d", "o", None, 1, None).await?;
+
+        add_user(
+            &pool,
+            &user,
+            &account,
+            "none",
+            true,
+            "",
+            Some(2),
+            Some(4),
+            Some("cpu=8"),
+            Some("cpu=32"),
+            Some(60),
+        )
+        .await?;
+
+        let got = list_associations(&pool)
+            .await?
+            .into_iter()
+            .find(|a| a.user_name == user && a.account == account)
+            .expect("association present");
+        assert_eq!(got.max_running_jobs, Some(2));
+        assert_eq!(got.max_submit_jobs, Some(4));
+        assert_eq!(got.max_tres_per_job.as_deref(), Some("cpu=8"));
+        assert_eq!(got.grp_tres.as_deref(), Some("cpu=32"));
+        assert_eq!(got.max_wall_min, Some(60));
+
+        // Upsert again with different non-zero limits: the UPDATE branch
+        // must overwrite the existing values, not merge with them.
+        add_user(
+            &pool,
+            &user,
+            &account,
+            "none",
+            true,
+            "",
+            Some(10),
+            Some(20),
+            Some("cpu=16"),
+            Some("cpu=64"),
+            Some(120),
+        )
+        .await?;
+        let got = list_associations(&pool)
+            .await?
+            .into_iter()
+            .find(|a| a.user_name == user && a.account == account)
+            .expect("association present");
+        assert_eq!(got.max_running_jobs, Some(10));
+        assert_eq!(got.max_submit_jobs, Some(20));
+        assert_eq!(got.max_tres_per_job.as_deref(), Some("cpu=16"));
+        assert_eq!(got.grp_tres.as_deref(), Some("cpu=64"));
+        assert_eq!(got.max_wall_min, Some(120));
+
+        // Upsert again with no limits: clears them (full resend, not a
+        // partial patch — matches every other field on this association).
+        add_user(
+            &pool, &user, &account, "none", true, "", None, None, None, None, None,
+        )
+        .await?;
+        let got = list_associations(&pool)
+            .await?
+            .into_iter()
+            .find(|a| a.user_name == user && a.account == account)
+            .expect("association present");
+        assert_eq!(got.max_running_jobs, None);
+        assert_eq!(got.max_submit_jobs, None);
+        assert_eq!(got.max_tres_per_job, None);
+        assert_eq!(got.grp_tres, None);
+        assert_eq!(got.max_wall_min, None);
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
             .execute(&pool)
             .await?;
         Ok(())
@@ -1255,8 +1390,14 @@ mod job_history_tests {
 
         upsert_account(&pool, &account, "d", "o", None, 1, None).await?;
 
-        add_user(&pool, &user, &account, "none", true, "").await?;
-        add_user(&pool, &user, &account, "none", true, "").await?;
+        add_user(
+            &pool, &user, &account, "none", true, "", None, None, None, None, None,
+        )
+        .await?;
+        add_user(
+            &pool, &user, &account, "none", true, "", None, None, None, None, None,
+        )
+        .await?;
         add_user(
             &pool,
             &user,
@@ -1264,6 +1405,11 @@ mod job_history_tests {
             "none",
             true,
             "highprio-does-not-need-to-exist",
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .await?;
 
