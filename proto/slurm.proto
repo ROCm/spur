@@ -1027,6 +1027,7 @@ message RemoveUserRequest {
 
 message ListUsersRequest {
   string account = 1;
+  string user = 2;
 }
 
 message ListUsersResponse {

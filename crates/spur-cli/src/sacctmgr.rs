@@ -234,6 +234,16 @@ fn build_add_user_request(
     })
 }
 
+fn list_user_filters(p: &std::collections::HashMap<String, String>) -> (String, String) {
+    (
+        p.get("account").cloned().unwrap_or_default(),
+        p.get("name")
+            .or_else(|| p.get("user"))
+            .cloned()
+            .unwrap_or_default(),
+    )
+}
+
 async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
     let p = parse_params(params);
 
@@ -642,12 +652,13 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
             Ok(())
         }
         "user" | "users" => {
-            let account_filter = p.get("account").cloned().unwrap_or_default();
+            let (account_filter, user_filter) = list_user_filters(&p);
 
             let mut client = connect(addr).await?;
             let resp = client
                 .list_users(ListUsersRequest {
                     account: account_filter,
+                    user: user_filter,
                 })
                 .await
                 .context("ListUsers RPC failed")?;
@@ -1197,5 +1208,15 @@ mod tests {
     fn qos_empty_format_string_produces_no_fields() {
         let fields = format_engine::parse_named_format("", &qos_field_spec, &qos_header);
         assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn list_user_filters_include_name() {
+        let p = parse_params(&["name=testuser".into(), "account=testacct".into()]);
+
+        let (account, user) = list_user_filters(&p);
+
+        assert_eq!(account, "testacct");
+        assert_eq!(user, "testuser");
     }
 }

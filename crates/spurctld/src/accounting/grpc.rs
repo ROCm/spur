@@ -440,7 +440,12 @@ impl SlurmAccounting for AccountingService {
         } else {
             Some(req.account.as_str())
         };
-        let records = db::list_users(&self.pool, account)
+        let user = if req.user.is_empty() {
+            None
+        } else {
+            Some(req.user.as_str())
+        };
+        let records = db::list_users(&self.pool, account, user)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 

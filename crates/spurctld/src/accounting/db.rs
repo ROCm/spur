@@ -652,38 +652,28 @@ pub async fn remove_user(pool: &PgPool, user: &str, account: &str) -> anyhow::Re
 /// List users, joining each one's own association row for `default_qos`.
 /// `DISTINCT ON ... a.id DESC` picks the newest row if legacy duplicates
 /// exist (pre-dating the add_user upsert fix); it never touches the others.
-pub async fn list_users(pool: &PgPool, account: Option<&str>) -> anyhow::Result<Vec<UserRecord>> {
-    let rows = if let Some(acct) = account {
-        sqlx::query(
-            r#"
-            SELECT DISTINCT ON (u.name, u.account)
-                u.name, u.account, u.admin_level, u.default_account, a.default_qos
-            FROM users u
-            LEFT JOIN associations a
-                ON a.user_name = u.name AND a.account = u.account
-                    AND (a.partition_name IS NULL OR a.partition_name = '')
-            WHERE u.account = $1
-            ORDER BY u.name, u.account, a.id DESC NULLS LAST
-            "#,
-        )
-        .bind(acct)
-        .fetch_all(pool)
-        .await?
-    } else {
-        sqlx::query(
-            r#"
-            SELECT DISTINCT ON (u.name, u.account)
-                u.name, u.account, u.admin_level, u.default_account, a.default_qos
-            FROM users u
-            LEFT JOIN associations a
-                ON a.user_name = u.name AND a.account = u.account
-                    AND (a.partition_name IS NULL OR a.partition_name = '')
-            ORDER BY u.name, u.account, a.id DESC NULLS LAST
-            "#,
-        )
-        .fetch_all(pool)
-        .await?
-    };
+pub async fn list_users(
+    pool: &PgPool,
+    account: Option<&str>,
+    user: Option<&str>,
+) -> anyhow::Result<Vec<UserRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT ON (u.name, u.account)
+            u.name, u.account, u.admin_level, u.default_account, a.default_qos
+        FROM users u
+        LEFT JOIN associations a
+            ON a.user_name = u.name AND a.account = u.account
+                AND (a.partition_name IS NULL OR a.partition_name = '')
+        WHERE ($1::TEXT IS NULL OR u.account = $1)
+            AND ($2::TEXT IS NULL OR u.name = $2)
+        ORDER BY u.name, u.account, a.id DESC NULLS LAST
+        "#,
+    )
+    .bind(account)
+    .bind(user)
+    .fetch_all(pool)
+    .await?;
 
     Ok(rows
         .iter()
@@ -1218,7 +1208,7 @@ mod job_history_tests {
             &pool, &user, &account, "none", true, &qos_name, None, None, None, None, None,
         )
         .await?;
-        let got = list_users(&pool, Some(&account))
+        let got = list_users(&pool, Some(&account), None)
             .await?
             .into_iter()
             .find(|u| u.name == user)
@@ -1231,7 +1221,7 @@ mod job_history_tests {
             &pool, &user, &account, "none", true, "", None, None, None, None, None,
         )
         .await?;
-        let got = list_users(&pool, Some(&account))
+        let got = list_users(&pool, Some(&account), None)
             .await?
             .into_iter()
             .find(|u| u.name == user)
@@ -1367,6 +1357,88 @@ mod job_history_tests {
 
     #[tokio::test]
     #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn list_users_filters_by_user_name() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let account = format!("spur_userfilter_acct_{pid}");
+        let matching_user = format!("spur_userfilter_match_{pid}");
+        let other_user = format!("spur_userfilter_other_{pid}");
+
+        sqlx::query("DELETE FROM associations WHERE user_name IN ($1, $2)")
+            .bind(&matching_user)
+            .bind(&other_user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name IN ($1, $2)")
+            .bind(&matching_user)
+            .bind(&other_user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+
+        upsert_account(&pool, &account, "d", "o", None, 1, None).await?;
+        add_user(
+            &pool,
+            &matching_user,
+            &account,
+            "none",
+            true,
+            "",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        add_user(
+            &pool,
+            &other_user,
+            &account,
+            "none",
+            true,
+            "",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+        let users = list_users(&pool, None, Some(&matching_user)).await?;
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].name, matching_user);
+
+        let users = list_users(&pool, Some(&account), Some(&matching_user)).await?;
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].account, account);
+
+        let users = list_users(&pool, Some(&account), Some("missing-user")).await?;
+        assert!(users.is_empty());
+
+        sqlx::query("DELETE FROM associations WHERE user_name IN ($1, $2)")
+            .bind(&matching_user)
+            .bind(&other_user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name IN ($1, $2)")
+            .bind(&matching_user)
+            .bind(&other_user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
     async fn add_user_never_creates_a_duplicate_association_row() -> anyhow::Result<()> {
         // Repeated add_user calls (what `sacctmgr modify user` now does)
         // must converge on one row, not accumulate duplicates.
@@ -1479,7 +1551,7 @@ mod job_history_tests {
         .execute(&pool)
         .await?;
 
-        let got = list_users(&pool, Some(&account))
+        let got = list_users(&pool, Some(&account), None)
             .await?
             .into_iter()
             .find(|u| u.name == user)
