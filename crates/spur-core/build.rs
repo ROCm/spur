@@ -69,8 +69,10 @@ fn main() {
         }
     }
 
-    println!(
-        "cargo:rustc-env=SPUR_GIT_DESCRIBE={}",
-        git_describe(&manifest_dir)
-    );
+    // Docker builds don't ship `.git` (see `.dockerignore`), so CI passes the
+    // descriptor in directly; only shell out to git for local dev builds.
+    let describe =
+        std::env::var("SPUR_GIT_DESCRIBE").unwrap_or_else(|_| git_describe(&manifest_dir));
+
+    println!("cargo:rustc-env=SPUR_GIT_DESCRIBE={describe}");
 }

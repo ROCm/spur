@@ -33,6 +33,9 @@ COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
+ARG SPUR_GIT_DESCRIBE
+ENV SPUR_GIT_DESCRIBE=$SPUR_GIT_DESCRIBE
+
 COPY --from=planner /build/recipe.json recipe.json
 RUN cargo chef cook --release --locked --recipe-path recipe.json
 
