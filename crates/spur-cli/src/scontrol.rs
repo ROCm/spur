@@ -3,9 +3,9 @@
 
 use std::collections::HashMap;
 
+use crate::exit_fmt::{format_exit, render_reason};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use crate::exit_fmt::{format_exit, render_reason};
 
 /// Administrative control commands.
 #[derive(Parser, Debug)]

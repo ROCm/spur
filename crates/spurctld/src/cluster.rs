@@ -4287,8 +4287,8 @@ mod tests {
             argv: vec![big],
             ..Default::default()
         };
-        let err = check_submission_size(&spec)
-            .expect_err("env + argv over the cap must be rejected");
+        let err =
+            check_submission_size(&spec).expect_err("env + argv over the cap must be rejected");
         assert!(matches!(err, SubmitError::InvalidArgument(_)));
     }
 

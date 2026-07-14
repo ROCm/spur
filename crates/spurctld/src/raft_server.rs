@@ -198,8 +198,8 @@ mod tests {
     #[tokio::test]
     async fn default_limits_reject_message_over_4mb() {
         let addr = spawn(RaftInternalServer::new(EchoRaft)).await;
-        let mut client =
-            RaftInternalClient::new(connect(addr).await).max_encoding_message_size(64 * 1024 * 1024);
+        let mut client = RaftInternalClient::new(connect(addr).await)
+            .max_encoding_message_size(64 * 1024 * 1024);
 
         let payload = vec![0u8; 8 * 1024 * 1024];
         let err = client
