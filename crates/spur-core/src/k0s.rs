@@ -18,6 +18,47 @@ pub const K0S_DEFAULT_BINARY: &str = "/usr/local/bin/k0s";
 /// The GitHub repo k0s releases come from.
 pub const K0S_REPO: &str = "k0sproject/k0s";
 
+/// k0s's manifest-deployer directory (under the default data-dir). Any manifest written to a
+/// `<stack>/` subdirectory here is applied + reconciled by the k0s controller automatically, so SPUR
+/// ships cluster addons (e.g. local-path storage) by writing files here — no in-cluster kube client.
+pub const K0S_MANIFESTS_DIR: &str = "/var/lib/k0s/manifests";
+
+/// Vendored local-path-provisioner release (see `assets/local-path-provisioner.yaml`).
+pub const LOCAL_PATH_VERSION: &str = "v0.0.31";
+
+/// Default node directory the local-path provisioner stores PersistentVolumes in. Override via
+/// `[cluster] local_path_dir` — point it at a large scratch disk if PVCs will hold much data (the
+/// default lives under `/var/lib`, i.e. the root filesystem).
+pub const DEFAULT_LOCAL_PATH_DIR: &str = "/var/lib/local-path-provisioner";
+
+/// Render the local-path-provisioner manifest with `data_dir` as the on-node PV storage path. The
+/// result is a full k8s manifest (Namespace, RBAC, Deployment, default StorageClass, ConfigMap) that
+/// SPUR writes into k0s's manifest-deployer dir on the control-plane node; k0s applies it.
+///
+/// `data_dir` is interpolated verbatim into a JSON string in the ConfigMap, so it must be free of
+/// quotes/backslashes/whitespace — [`ClusterConfig::validate`](crate::config) enforces that for
+/// `[cluster] local_path_dir`, so callers pass a validated value.
+pub fn k0s_local_path_manifest(data_dir: &str) -> String {
+    include_str!("assets/local-path-provisioner.yaml").replace("__LOCAL_PATH_DIR__", data_dir)
+}
+
+#[cfg(test)]
+mod local_path_tests {
+    use super::k0s_local_path_manifest;
+
+    #[test]
+    fn renders_data_dir_and_default_storageclass() {
+        let m = k0s_local_path_manifest("/mnt/scratch/local-path");
+        // The placeholder is substituted and no literal placeholder survives.
+        assert!(m.contains("\"paths\":[\"/mnt/scratch/local-path\"]"));
+        assert!(!m.contains("__LOCAL_PATH_DIR__"));
+        // Shipped as the cluster default so unclassed PVCs bind.
+        assert!(m.contains("storageclass.kubernetes.io/is-default-class: \"true\""));
+        assert!(m.contains("kind: StorageClass"));
+        assert!(m.contains("provisioner: rancher.io/local-path"));
+    }
+}
+
 /// Generate a k0s controller config (YAML) for a mesh-native cluster: the API server is advertised
 /// on `api_address` (the control-plane's WireGuard mesh IP) and Calico runs in `bird` mode (native
 /// routing, no overlay) so pod traffic rides the mesh. `cni_mtu` sets Calico's MTU (typically below
