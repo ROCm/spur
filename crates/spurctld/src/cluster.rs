@@ -8956,7 +8956,6 @@ mod tests {
         // then re-registers as a fresh node with no k0s role. Re-running provisioning (which the
         // reconcile loop now does in Ready, not only Provisioning) must re-assign the un-roled node
         // its role + mesh IP + pod CIDR so it rejoins the mesh — without disturbing the others.
-        use spur_core::k0s::K0sRole;
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "node-a", 4, 8000);
