@@ -16,6 +16,13 @@ struct Snapshot {
     loaded: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum AccountMembership {
+    CacheUnavailable,
+    Member,
+    NotMember(Vec<String>),
+}
+
 /// Controller-side cache of user/account association defaults. Mirrors
 /// `FairshareCache`/`QosCache`: one lock guards one atomic snapshot, so a
 /// refresh can never be observed half-applied.
@@ -40,11 +47,26 @@ impl AssociationCache {
         self.snapshot.read().loaded
     }
 
-    pub fn has_membership(&self, user: &str, account: &str) -> bool {
-        self.snapshot
-            .read()
+    pub fn account_membership(&self, user: &str, account: &str) -> AccountMembership {
+        let snapshot = self.snapshot.read();
+        if !snapshot.loaded {
+            return AccountMembership::CacheUnavailable;
+        }
+        if snapshot
             .memberships
             .contains(&(user.to_owned(), account.to_owned()))
+        {
+            return AccountMembership::Member;
+        }
+
+        let mut accounts: Vec<_> = snapshot
+            .memberships
+            .iter()
+            .filter(|(member_user, _)| member_user == user)
+            .map(|(_, account)| account.clone())
+            .collect();
+        accounts.sort_unstable();
+        AccountMembership::NotMember(accounts)
     }
 
     /// The effective account (given, or the user's default) and that
@@ -257,11 +279,26 @@ mod tests {
     }
 
     #[test]
-    fn has_membership_tracks_inserted_associations() {
+    fn account_membership_returns_sorted_accounts_for_non_member() {
         let cache = AssociationCache::new();
-        assert!(!cache.has_membership("alice", "research"));
-        cache.insert_association("alice", "research");
-        assert!(cache.has_membership("alice", "research"));
-        assert!(!cache.has_membership("alice", "other"));
+        assert_eq!(
+            cache.account_membership("alice", "research"),
+            AccountMembership::CacheUnavailable
+        );
+        cache.insert_association("alice", "research-z");
+        cache.insert_association("alice", "research-a");
+        cache.insert_association("bob", "other");
+        assert_eq!(
+            cache.account_membership("alice", "research-a"),
+            AccountMembership::Member
+        );
+        assert_eq!(
+            cache.account_membership("alice", "missing"),
+            AccountMembership::NotMember(vec!["research-a".into(), "research-z".into()])
+        );
+        assert_eq!(
+            cache.account_membership("carol", "missing"),
+            AccountMembership::NotMember(Vec::new())
+        );
     }
 }

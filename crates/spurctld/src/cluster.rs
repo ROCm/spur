@@ -31,7 +31,7 @@ use spur_metrics::partition::PartitionMetricsSnapshot;
 use spur_metrics::user_acct::UserAcctMetricsSnapshot;
 
 use crate::accounting::{AccountingNotifier, JobStartRecord};
-use crate::association_cache::AssociationCache;
+use crate::association_cache::{AccountMembership, AssociationCache};
 use crate::fairshare_cache::FairshareCache;
 use crate::limits_cache::QosCache;
 use crate::raft::{ClientResponse, JobFinalized, SpurRaft, StateMachineApply};
@@ -4022,16 +4022,20 @@ fn validate_user_account(
     let Some(account) = spec.account.as_deref().filter(|a| !a.is_empty()) else {
         return Ok(());
     };
-    if !assoc_cache.is_loaded() {
-        return Ok(());
+    match assoc_cache.account_membership(&spec.user, account) {
+        AccountMembership::CacheUnavailable | AccountMembership::Member => Ok(()),
+        AccountMembership::NotMember(valid_accounts) if valid_accounts.is_empty() => {
+            Err(SubmitError::invalid(format!(
+                "user '{}' has no account associations. Contact your cluster admin to run: sacctmgr add user name={} account=<account>",
+                spec.user, spec.user
+            )))
+        }
+        AccountMembership::NotMember(valid_accounts) => Err(SubmitError::invalid(format!(
+            "user '{}' is not associated with account '{account}'. Valid accounts for this user: [{}]. Use --account=<account> to specify.",
+            spec.user,
+            valid_accounts.join(", ")
+        ))),
     }
-    if !assoc_cache.has_membership(&spec.user, account) {
-        return Err(SubmitError::invalid(format!(
-            "user '{}' is not associated with account '{account}'",
-            spec.user
-        )));
-    }
-    Ok(())
 }
 
 /// Resolve a job's effective QOS at submission time (mirrors
@@ -6407,14 +6411,35 @@ mod tests {
         cfg.partitions[0].allow_accounts = vec!["research".into()];
         let cm = test_cluster_with_config(&dir, cfg).await;
         cm.association_cache()
-            .insert_association("testuser", "student");
+            .insert_association("testuser", "student-z");
+        cm.association_cache()
+            .insert_association("testuser", "student-a");
 
         let mut spec = basic_spec("spoof");
         spec.account = Some("research".into());
         let err = cm.submit_job(spec).unwrap_err();
         assert_eq!(
             err,
-            SubmitError::invalid("user 'testuser' is not associated with account 'research'")
+            SubmitError::invalid(
+                "user 'testuser' is not associated with account 'research'. Valid accounts for this user: [student-a, student-z]. Use --account=<account> to specify."
+            )
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_rejects_account_when_user_has_no_associations() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.association_cache().set_loaded_without_associations();
+
+        let mut spec = basic_spec("unassociated");
+        spec.account = Some("research".into());
+        let err = cm.submit_job(spec).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid(
+                "user 'testuser' has no account associations. Contact your cluster admin to run: sacctmgr add user name=testuser account=<account>"
+            )
         );
     }
 
