@@ -185,9 +185,9 @@ async fn main() -> anyhow::Result<()> {
         })
         .collect();
 
-    // this node's WireGuard public key (best-effort) so the controller can reconcile mesh peers.
+    // The WireGuard interface this node's mesh key is read from; the reporter re-reads the key on
+    // every register/heartbeat so the controller learns a key that appears/changes after startup.
     let wg_iface = std::env::var("SPUR_WG_INTERFACE").unwrap_or_else(|_| "spur0".into());
-    let wg_pubkey = spur_net::wireguard::interface_public_key(&wg_iface).unwrap_or_default();
 
     // Create the node reporter
     let reporter = Arc::new(NodeReporter::new(
@@ -197,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
         node_address,
         labels,
         args.token.unwrap_or_default(),
-        wg_pubkey,
+        wg_iface,
     ));
 
     // Register with controller

@@ -9,7 +9,7 @@
 //! gated on Raft leadership. Phase transitions go through `ClusterManager::set_k0s_phase`
 //! (WAL-replicated) so a leadership change mid-provision is safe.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +43,8 @@ pub struct ClusterNetworking {
     pub pod_cidr: String,
     /// Service CIDR (cluster.service_cidr) — for the generated k0s config.
     pub service_cidr: String,
+    /// CNI MTU (cluster.cni_mtu) — emitted into the generated Calico config.
+    pub cni_mtu: u16,
     /// CNI mode (cluster.cni): "kuberouter" (default) or "calico" (mesh-native config + node-ip).
     pub cni: String,
     /// Operator-pinned control-plane node (cluster.control_plane_node), if any.
@@ -55,6 +57,10 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>, net: Clust
     info!(mesh = %net.mesh_cidr, pod = %net.pod_cidr, "k0s cluster reconcile loop started");
     let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
     let mut last_mesh: Vec<MeshNode> = Vec::new();
+    // Cache of the worker join token minted per node, so we mint once (not every tick) while a
+    // worker joins — re-minting each tick churns k0s server tokens and races the join. Cleared when
+    // the worker's component reports active.
+    let mut worker_tokens: HashMap<String, String> = HashMap::new();
     loop {
         interval.tick().await;
         if !raft.is_leader() {
@@ -92,7 +98,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>, net: Clust
                     warn!(error = %e, "k0s provisioning assignment failed; will retry next tick");
                     continue;
                 }
-                converge_provisioning(&cluster, &net).await;
+                converge_provisioning(&cluster, &net, &mut worker_tokens).await;
             }
             K0sPhase::Down => stop_all_components(&cluster, state.reset_requested).await,
             K0sPhase::Degraded => warn!("k0s cluster degraded"),
@@ -396,19 +402,26 @@ fn controller_k0s_config(net: &ClusterNetworking, node: &spur_core::node::Node) 
         &net.cni,
         &net.pod_cidr,
         &net.service_cidr,
+        net.cni_mtu,
         api,
         &sans,
     )
 }
 
 /// Start any assigned component that is not yet active; when all are active, mark the cluster Ready.
-async fn converge_provisioning(cluster: &ClusterManager, net: &ClusterNetworking) {
+/// `worker_tokens` caches each worker's minted join token across ticks so we mint once per join.
+async fn converge_provisioning(
+    cluster: &ClusterManager,
+    net: &ClusterNetworking,
+    worker_tokens: &mut HashMap<String, String>,
+) {
     let assigned: Vec<_> = cluster
         .get_nodes()
         .into_iter()
         .filter(|n| n.k0s_role.is_some())
         .collect();
     if assigned.is_empty() {
+        worker_tokens.clear();
         return;
     }
     let mut all_active = true;
@@ -435,6 +448,7 @@ async fn converge_provisioning(cluster: &ClusterManager, net: &ClusterNetworking
             continue;
         }
         if fetch_component_state(cluster, &node.name).await.as_deref() == Some("active") {
+            worker_tokens.remove(&node.name); // joined — drop the cached token
             continue;
         }
         all_active = false;
@@ -444,19 +458,29 @@ async fn converge_provisioning(cluster: &ClusterManager, net: &ClusterNetworking
         } else {
             None
         };
-        match mint_worker_token(cluster).await {
-            Ok(token) => spawn_start_component(
-                cluster,
-                &node.name,
-                K0sRole::Worker,
-                Some(token),
-                None,
-                node_ip,
-            ),
-            Err(e) => {
-                warn!(node = %node.name, error = %e, "could not mint worker join token yet; will retry")
-            }
-        }
+        // Mint the worker's join token once and cache it: re-minting every tick churns k0s server
+        // tokens and races the join. Reuse the cached token on later ticks until the worker joins.
+        let token = match worker_tokens.get(&node.name) {
+            Some(cached) => cached.clone(),
+            None => match mint_worker_token(cluster).await {
+                Ok(token) => {
+                    worker_tokens.insert(node.name.clone(), token.clone());
+                    token
+                }
+                Err(e) => {
+                    warn!(node = %node.name, error = %e, "could not mint worker join token yet; will retry");
+                    continue;
+                }
+            },
+        };
+        spawn_start_component(
+            cluster,
+            &node.name,
+            K0sRole::Worker,
+            Some(token),
+            None,
+            node_ip,
+        );
     }
     if all_active {
         match cluster.set_k0s_phase(K0sPhase::Ready, None, false) {
@@ -521,11 +545,24 @@ fn spawn_stop_component(cluster: &ClusterManager, node: &str, reset: bool) {
     tokio::spawn(async move {
         match SlurmAgentClient::connect(endpoint).await {
             Ok(mut client) => {
-                if let Err(e) = client
+                match client
                     .stop_cluster_component(StopClusterComponentRequest { reset })
                     .await
                 {
-                    warn!(node = %node, error = %e, "stop_cluster_component failed");
+                    Ok(resp) => {
+                        // The agent reports a failed stop/reset in-band (stopped=false): surface it
+                        // so `down --reset` isn't a false success. The component stays active, so the
+                        // reconcile loop retries and `spur k8s status` still shows the node.
+                        let r = resp.into_inner();
+                        if !r.stopped {
+                            warn!(
+                                node = %node,
+                                detail = %r.message,
+                                "k0s component stop/reset failed; teardown is partial — retrying"
+                            );
+                        }
+                    }
+                    Err(e) => warn!(node = %node, error = %e, "stop_cluster_component failed"),
                 }
             }
             Err(e) => warn!(node = %node, error = %e, "connect to agent failed"),

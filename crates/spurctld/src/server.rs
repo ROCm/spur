@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 use tonic::metadata::MetadataValue;
 use tonic::{Code, Request, Response, Status};
-use tracing::warn;
+use tracing::{info, warn};
 
 use spur_core::job::NodeCompleteError;
 use spur_core::reservation::Reservation;
@@ -992,6 +992,14 @@ impl SlurmController for ControllerService {
             .cluster
             .update_heartbeat(&req.hostname, req.cpu_load, req.free_memory_mb)
         {
+            // Learn a mesh key that appeared/changed after registration so the node joins ApplyMesh
+            // without a restart. Only meaningful once the node is known (heartbeat accepted).
+            if self
+                .cluster
+                .update_node_wg_pubkey(&req.hostname, &req.wg_pubkey)
+            {
+                info!(node = %req.hostname, "learned updated WireGuard mesh key from heartbeat");
+            }
             Ok(Response::new(HeartbeatResponse {}))
         } else {
             Err(Status::not_found(format!(
@@ -1481,6 +1489,25 @@ impl SlurmController for ControllerService {
             }
         }
         let req = request.into_inner();
+        // Reject a control-plane change once roles are assigned: provisioning skips already-assigned
+        // nodes, so moving the control plane here would only rewrite the recorded CP and leave the
+        // old controller a Controller and the new node a Worker (inconsistent topology). Tear the
+        // cluster down (`spur k8s down --reset`) to re-elect a control plane.
+        if let Some(new_cp) = req.control_plane_node.as_deref() {
+            let state = self.cluster.k0s_state();
+            let assigned = self
+                .cluster
+                .get_nodes()
+                .iter()
+                .any(|n| n.k0s_role.is_some());
+            if assigned && state.control_plane_node.as_deref() != Some(new_cp) {
+                return Err(Status::failed_precondition(format!(
+                    "control-plane node is already assigned ({}); tear the cluster down \
+                     (spur k8s down --reset) before changing it to {new_cp}",
+                    state.control_plane_node.as_deref().unwrap_or("<none>"),
+                )));
+            }
+        }
         self.cluster
             .set_k0s_phase(
                 spur_core::k0s::K0sPhase::Provisioning,
@@ -1488,18 +1515,9 @@ impl SlurmController for ControllerService {
                 false,
             )
             .map_err(|e| Status::internal(format!("set k0s phase: {e}")))?;
-        // ARC (actions-runner-controller) provisioning is not wired yet — don't silently drop the
-        // request: warn and tell the caller so `--install-arc` isn't a confusing no-op.
-        let mut message = "k0s cluster provisioning requested".to_string();
-        if req.install_arc {
-            warn!(
-                "cluster_up: --install-arc requested but ARC provisioning is not yet implemented"
-            );
-            message.push_str(" (note: --install-arc is not yet implemented and was ignored)");
-        }
         Ok(Response::new(ClusterUpResponse {
             accepted: true,
-            message,
+            message: "k0s cluster provisioning requested".to_string(),
             nodes: crate::cluster_k8s::node_statuses(&self.cluster),
         }))
     }

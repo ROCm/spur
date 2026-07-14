@@ -35,9 +35,6 @@ pub enum K8sCommand {
         /// Control-plane node (default: picked from inventory / [cluster] config).
         #[arg(long)]
         control_plane_node: Option<String>,
-        /// Also install the ARC CI runner scale sets.
-        #[arg(long)]
-        install_arc: bool,
     },
     /// Tear the k0s cluster down.
     Down {
@@ -72,10 +69,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let parsed = K8sArgs::try_parse_from(args)?;
     let controller = parsed.controller;
     match parsed.command {
-        K8sCommand::Up {
-            control_plane_node,
-            install_arc,
-        } => cmd_up(&controller, control_plane_node, install_arc).await,
+        K8sCommand::Up { control_plane_node } => cmd_up(&controller, control_plane_node).await,
         K8sCommand::Down { reset } => cmd_down(&controller, reset).await,
         K8sCommand::Status => cmd_status(&controller).await,
         K8sCommand::Kubeconfig => cmd_kubeconfig(&controller).await,
@@ -105,17 +99,10 @@ async fn cmd_install_k0s(version: &str, path: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_up(
-    controller: &str,
-    control_plane_node: Option<String>,
-    install_arc: bool,
-) -> Result<()> {
+async fn cmd_up(controller: &str, control_plane_node: Option<String>) -> Result<()> {
     let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
     let resp = client
-        .cluster_up(ClusterUpRequest {
-            control_plane_node,
-            install_arc,
-        })
+        .cluster_up(ClusterUpRequest { control_plane_node })
         .await?
         .into_inner();
     if resp.accepted {
@@ -179,21 +166,11 @@ mod tests {
 
     #[test]
     fn parses_up_with_control_plane() {
-        let args = K8sArgs::try_parse_from([
-            "k8s",
-            "up",
-            "--control-plane-node",
-            "head-node",
-            "--install-arc",
-        ])
-        .unwrap();
+        let args =
+            K8sArgs::try_parse_from(["k8s", "up", "--control-plane-node", "head-node"]).unwrap();
         match args.command {
-            K8sCommand::Up {
-                control_plane_node,
-                install_arc,
-            } => {
+            K8sCommand::Up { control_plane_node } => {
                 assert_eq!(control_plane_node.as_deref(), Some("head-node"));
-                assert!(install_arc);
             }
             _ => panic!("wrong command"),
         }

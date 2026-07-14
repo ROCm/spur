@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::admission::AdmissionToken;
 use crate::job::{JobId, JobSpec, JobState, PendingReason};
-use crate::k0s::{K0sJoinTokenRecord, K0sPhase, K0sRole};
+use crate::k0s::{K0sPhase, K0sRole};
 use crate::node::NodeState;
 use crate::reservation::Reservation;
 use std::collections::HashMap;
@@ -179,12 +179,6 @@ pub enum WalOperation {
         control_plane_node: Option<String>,
         #[serde(default)]
         reset_requested: bool,
-    },
-    K0sJoinTokenCreate {
-        token: K0sJoinTokenRecord,
-    },
-    K0sJoinTokenRevoke {
-        token_id: String,
     },
 }
 

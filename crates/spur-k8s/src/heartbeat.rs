@@ -62,6 +62,7 @@ impl HeartbeatManager {
                             free_memory_mb: 0,
                             running_jobs: vec![],
                             node_token: String::new(),
+                            wg_pubkey: String::new(), // virtual agents are not on the mesh
                         };
                         match client.heartbeat(req).await {
                             Ok(_) => debug!(node = %name, "heartbeat sent"),

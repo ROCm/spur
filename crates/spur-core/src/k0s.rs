@@ -6,9 +6,6 @@
 //! Named here so both the WAL (`spur_core::wal`) and node inventory (`spur_core::node`) can
 //! reference them, and the spurctld raft state machine can persist them across failover.
 
-use std::collections::HashMap;
-
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// k0s release SPUR installs/runs by default — pinned to a known-good version and bumped with each
@@ -23,13 +20,15 @@ pub const K0S_REPO: &str = "k0sproject/k0s";
 
 /// Generate a k0s controller config (YAML) for a mesh-native cluster: the API server is advertised
 /// on `api_address` (the control-plane's WireGuard mesh IP) and Calico runs in `bird` mode (native
-/// routing, no overlay) so pod traffic rides the mesh. Returns `None` for any `cni` other than
-/// `"calico"` (the k0s default, kube-router, needs no config file). `sans` are extra API-server
-/// certificate SANs (e.g. the control-plane's mesh + underlay IPs).
+/// routing, no overlay) so pod traffic rides the mesh. `cni_mtu` sets Calico's MTU (typically below
+/// the underlay to leave room for WireGuard's ~50-byte overhead, avoiding fragmentation). Returns
+/// `None` for any `cni` other than `"calico"` (the k0s default, kube-router, needs no config file).
+/// `sans` are extra API-server certificate SANs (e.g. the control-plane's mesh + underlay IPs).
 pub fn k0s_controller_config_yaml(
     cni: &str,
     pod_cidr: &str,
     service_cidr: &str,
+    cni_mtu: u16,
     api_address: &str,
     sans: &[String],
 ) -> Option<String> {
@@ -56,6 +55,7 @@ pub fn k0s_controller_config_yaml(
     y.push_str(&format!("    serviceCIDR: {service_cidr}\n"));
     y.push_str("    calico:\n");
     y.push_str("      mode: bird\n");
+    y.push_str(&format!("      mtu: {cni_mtu}\n"));
     Some(y)
 }
 
@@ -70,6 +70,7 @@ mod k0s_config_tests {
             "calico",
             "192.0.2.0/24",
             "198.51.100.0/24",
+            1450,
             "192.0.2.1",
             &["192.0.2.1".to_string(), "203.0.113.9".to_string()],
         )
@@ -78,6 +79,7 @@ mod k0s_config_tests {
         assert!(y.contains("      - 203.0.113.9"));
         assert!(y.contains("provider: calico"));
         assert!(y.contains("mode: bird"));
+        assert!(y.contains("mtu: 1450"));
         assert!(y.contains("podCIDR: 192.0.2.0/24"));
         assert!(y.contains("serviceCIDR: 198.51.100.0/24"));
     }
@@ -88,6 +90,7 @@ mod k0s_config_tests {
             "kuberouter",
             "192.0.2.0/24",
             "198.51.100.0/24",
+            1450,
             "192.0.2.1",
             &[]
         )
@@ -115,20 +118,6 @@ pub enum K0sPhase {
     Degraded,
 }
 
-/// Metadata for a minted k0s join token. Deliberately holds NO plaintext secret: k0s tokens are
-/// opaque bearer secrets from `k0s token create` and are handed to an agent only as the
-/// return-once value of a StartClusterComponent call — never persisted, snapshotted, or logged.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct K0sJoinTokenRecord {
-    pub id: String,
-    pub role: K0sRole,
-    pub created_at: DateTime<Utc>,
-    #[serde(default)]
-    pub expires_at: Option<DateTime<Utc>>,
-    #[serde(default)]
-    pub revoked: bool,
-}
-
 /// Cluster-wide k0s state held in the replicated raft state machine.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct K0sClusterState {
@@ -138,7 +127,4 @@ pub struct K0sClusterState {
     pub control_plane_node: Option<String>,
     #[serde(default)]
     pub reset_requested: bool,
-    /// Minted join-token metadata by id (never the plaintext secret).
-    #[serde(default)]
-    pub join_tokens: HashMap<String, K0sJoinTokenRecord>,
 }

@@ -59,9 +59,9 @@ choice):
    control_plane_node = "head-node"  # hostname of the k0s control plane (else: first node)
    pod_cidr = "10.42.0.0/16"         # per-node /24s are carved from this
    service_cidr = "10.43.0.0/16"
-   flannel_iface = "spur0"           # interface k0s/Calico use for node-IP autodetection
-   k0s_version = "v1.36.2+k0s.0"     # pinned; or "latest"
    cni = "kuberouter"                # "kuberouter" (default) or "calico" (see Networking)
+   cni_mtu = 1450                    # Calico MTU; headroom for WireGuard overhead on the mesh
+   k0s_version = "v1.36.2+k0s.0"     # pinned; or "latest"
 
 Installing k0s
 ~~~~~~~~~~~~~~~
@@ -243,9 +243,9 @@ Configuration reference (``[cluster]``)
    * - ``cni``
      - ``kuberouter``
      - ``kuberouter`` or ``calico`` (mesh-native bird routing).
-   * - ``flannel_iface``
-     - ``spur0``
-     - Interface k0s/Calico use for node-IP autodetection.
+   * - ``cni_mtu``
+     - ``1450``
+     - Calico MTU emitted into the generated k0s config (leaves WireGuard headroom).
    * - ``k0s_version``
      - pinned
      - k0s release to install/run (a tag or ``latest``).
