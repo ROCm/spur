@@ -752,10 +752,12 @@ impl Default for ClusterArcConfig {
 
 /// Basic dependency-free CIDR sanity check (`<ip>/<prefix>`), used by config validation.
 fn is_valid_cidr(s: &str) -> bool {
+    // IPv4 only: the native k0s provisioning paths (cluster_k8s IPAM, pod-CIDR carving, AddressPool)
+    // are all `Ipv4Addr`, so an IPv6 CIDR would validate here and then fail later at runtime.
     match s.split_once('/') {
         Some((ip, prefix)) => {
-            ip.parse::<std::net::IpAddr>().is_ok()
-                && prefix.parse::<u8>().map(|p| p <= 128).unwrap_or(false)
+            ip.parse::<std::net::Ipv4Addr>().is_ok()
+                && prefix.parse::<u8>().map(|p| p <= 32).unwrap_or(false)
         }
         None => false,
     }

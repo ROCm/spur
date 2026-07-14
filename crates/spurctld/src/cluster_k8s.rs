@@ -34,9 +34,6 @@ const AGENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
-/// WireGuard listen port every node's mesh endpoint uses (the `spur net join` default).
-const WG_LISTEN_PORT: u16 = 51820;
-
 /// Network CIDRs the reconcile loop needs (from `[network]` + `[cluster]` config).
 #[derive(Clone, Debug)]
 pub struct ClusterNetworking {
@@ -284,21 +281,29 @@ fn mesh_from_nodes(nodes: Vec<spur_core::node::Node>) -> MeshMembership {
         .filter_map(|n| {
             let mesh_ip = n.k0s_mesh_ip.clone()?;
             let public_key = n.wg_pubkey.clone().filter(|k| !k.is_empty())?;
-            let endpoint = n
-                .address
-                .clone()
-                .map(|a| format!("{a}:{WG_LISTEN_PORT}"))
-                .unwrap_or_default();
             Some(MeshNode {
                 hostname: n.name,
                 public_key,
                 mesh_ip,
-                endpoint,
+                // No endpoint: Node.address is the agent's advertised address, which
+                // `detect_node_address` makes the *mesh* IP when WireGuard is up — not a valid WG
+                // underlay endpoint (using it would clobber the working tunnel). Empty makes
+                // apply_mesh preserve the endpoint `spur net join` already established; membership
+                // reconciliation only maintains peers + AllowedIPs, not the underlay tunnel.
+                endpoint: String::new(),
                 pod_cidr: n.k0s_pod_cidr.clone(),
             })
         })
         .collect();
-    nodes.sort_by(|a, b| a.mesh_ip.cmp(&b.mesh_ip)); // deterministic ordering
+    // Sort numerically by IPv4 — a string sort orders "10.44.0.10" before "10.44.0.2", producing
+    // spurious membership diffs (and unnecessary ApplyMesh pushes) between ticks.
+    nodes.sort_by(|a, b| {
+        a.mesh_ip
+            .parse::<std::net::Ipv4Addr>()
+            .ok()
+            .cmp(&b.mesh_ip.parse::<std::net::Ipv4Addr>().ok())
+            .then_with(|| a.mesh_ip.cmp(&b.mesh_ip))
+    });
     MeshMembership { nodes }
 }
 
@@ -353,7 +358,7 @@ pub async fn fetch_admin_kubeconfig(cluster: &ClusterManager) -> anyhow::Result<
 
 /// Query a node's live k0s component state via its agent, with a timeout. Returns None if the node
 /// is unreachable or has no component yet.
-async fn fetch_component_state(cluster: &ClusterManager, node: &str) -> Option<String> {
+async fn fetch_component_status(cluster: &ClusterManager, node: &str) -> Option<(String, bool)> {
     let endpoint = agent_endpoint(cluster, node)?;
     let fut = async {
         let mut client = SlurmAgentClient::connect(endpoint).await.ok()?;
@@ -361,12 +366,19 @@ async fn fetch_component_state(cluster: &ClusterManager, node: &str) -> Option<S
             .get_cluster_component_status(GetClusterComponentStatusRequest {})
             .await
             .ok()?;
-        Some(resp.into_inner().component_state)
+        let r = resp.into_inner();
+        Some((r.component_state, r.enabled))
     };
     tokio::time::timeout(AGENT_TIMEOUT, fut)
         .await
         .ok()
         .flatten()
+}
+
+async fn fetch_component_state(cluster: &ClusterManager, node: &str) -> Option<String> {
+    fetch_component_status(cluster, node)
+        .await
+        .map(|(state, _)| state)
 }
 
 /// The mesh-native k0s controller config for `node` (api on its mesh IP + Calico bird), or None for
@@ -549,17 +561,23 @@ fn spawn_apply_mesh(cluster: &ClusterManager, node: &str, mesh: &MeshMembership)
     let node = node.to_string();
     let proto = to_proto_membership(mesh);
     tokio::spawn(async move {
-        match SlurmAgentClient::connect(endpoint).await {
-            Ok(mut client) => match client.apply_mesh(proto).await {
-                Ok(resp) => {
-                    let r = resp.into_inner();
-                    if !r.applied {
-                        warn!(node = %node, message = %r.message, "apply_mesh not applied");
-                    }
+        // Bound connect + RPC so a hung/blackholed agent can't leak accumulating detached tasks
+        // (this fires every reconcile tick).
+        let fut = async {
+            let mut client = SlurmAgentClient::connect(endpoint)
+                .await
+                .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
+            client.apply_mesh(proto).await
+        };
+        match tokio::time::timeout(AGENT_TIMEOUT, fut).await {
+            Ok(Ok(resp)) => {
+                let r = resp.into_inner();
+                if !r.applied {
+                    warn!(node = %node, message = %r.message, "apply_mesh not applied");
                 }
-                Err(e) => warn!(node = %node, error = %e, "apply_mesh RPC failed"),
-            },
-            Err(e) => warn!(node = %node, error = %e, "connect to agent for apply_mesh failed"),
+            }
+            Ok(Err(e)) => warn!(node = %node, error = %e, "apply_mesh RPC failed"),
+            Err(_) => warn!(node = %node, "apply_mesh timed out"),
         }
     });
 }
@@ -569,14 +587,15 @@ pub async fn live_node_statuses(cluster: &ClusterManager) -> Vec<ClusterNodeStat
     let mut out = Vec::new();
     for n in cluster.get_nodes() {
         let Some(role) = n.k0s_role else { continue };
-        let component_state = fetch_component_state(cluster, &n.name)
+        // Report the agent's real (state, enabled) — not a hard-coded enabled=true.
+        let (component_state, enabled) = fetch_component_status(cluster, &n.name)
             .await
-            .unwrap_or_else(|| "unknown".to_string());
+            .unwrap_or_else(|| ("unknown".to_string(), false));
         out.push(ClusterNodeStatus {
             node: n.name,
             role: role_str(role),
             component_state,
-            enabled: true,
+            enabled,
         });
     }
     out
@@ -676,7 +695,8 @@ mod tests {
         // sorted by mesh_ip
         assert_eq!(m.nodes[0].mesh_ip, "10.44.0.1");
         assert_eq!(m.nodes[0].public_key, "pk-cp");
-        assert_eq!(m.nodes[0].endpoint, "198.51.100.1:51820");
+        // endpoint is left empty on purpose — apply_mesh preserves the tunnel `spur net join` set.
+        assert_eq!(m.nodes[0].endpoint, "");
         assert_eq!(m.nodes[0].pod_cidr.as_deref(), Some("10.42.0.0/24"));
         assert_eq!(m.nodes[1].mesh_ip, "10.44.0.2");
         // the resulting membership feeds apply_mesh: pod CIDR folds into AllowedIPs

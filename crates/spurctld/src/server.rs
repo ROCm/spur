@@ -1488,9 +1488,18 @@ impl SlurmController for ControllerService {
                 false,
             )
             .map_err(|e| Status::internal(format!("set k0s phase: {e}")))?;
+        // ARC (actions-runner-controller) provisioning is not wired yet — don't silently drop the
+        // request: warn and tell the caller so `--install-arc` isn't a confusing no-op.
+        let mut message = "k0s cluster provisioning requested".to_string();
+        if req.install_arc {
+            warn!(
+                "cluster_up: --install-arc requested but ARC provisioning is not yet implemented"
+            );
+            message.push_str(" (note: --install-arc is not yet implemented and was ignored)");
+        }
         Ok(Response::new(ClusterUpResponse {
             accepted: true,
-            message: "k0s cluster provisioning requested".to_string(),
+            message,
             nodes: crate::cluster_k8s::node_statuses(&self.cluster),
         }))
     }
