@@ -89,20 +89,34 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>, net: Clust
         }
         last_mesh = mesh.nodes.clone();
 
-        match state.phase {
-            // Converged; ClusterStatus reports live component state on demand.
-            K0sPhase::Ready => {}
-            K0sPhase::Provisioning => {
-                // 5b assigns role/IP/CIDR; 5c starts each component and converges to Ready.
-                if let Err(e) = provision_assignments(&cluster, &net, &state) {
-                    warn!(error = %e, "k0s provisioning assignment failed; will retry next tick");
-                    continue;
-                }
-                converge_provisioning(&cluster, &net, &mut worker_tokens).await;
+        reconcile_phase(&cluster, &net, &state, &mut worker_tokens).await;
+    }
+}
+
+/// Run one reconcile tick for the current phase. Extracted from `run` so it is testable.
+///
+/// Ready and Provisioning both run the assignment + converge reconcile so the cluster self-heals: a
+/// node that is removed then re-added (a spurd restart deregisters on SIGTERM, dropping the node +
+/// its k0s assignment) or a node added while Ready gets (re)assigned a role/IP/CIDR, (re)joined, and
+/// rejoins the mesh membership on the next ApplyMesh tick. Idempotent — assigned + active nodes are
+/// skipped — so a converged cluster does no work beyond the per-node status probes. Without running
+/// this in Ready, a re-added node stays un-roled (out of the mesh) until the next manual `spur k8s up`.
+pub(crate) async fn reconcile_phase(
+    cluster: &ClusterManager,
+    net: &ClusterNetworking,
+    state: &K0sClusterState,
+    worker_tokens: &mut HashMap<String, String>,
+) {
+    match state.phase {
+        K0sPhase::Ready | K0sPhase::Provisioning => {
+            if let Err(e) = provision_assignments(cluster, net, state) {
+                warn!(error = %e, "k0s provisioning assignment failed; will retry next tick");
+                return;
             }
-            K0sPhase::Down => stop_all_components(&cluster, state.reset_requested).await,
-            K0sPhase::Degraded => warn!("k0s cluster degraded"),
+            converge_provisioning(cluster, net, worker_tokens).await;
         }
+        K0sPhase::Down => stop_all_components(cluster, state.reset_requested).await,
+        K0sPhase::Degraded => warn!("k0s cluster degraded"),
     }
 }
 
@@ -482,7 +496,9 @@ async fn converge_provisioning(
             node_ip,
         );
     }
-    if all_active {
+    // Only transition on the edge — this reconcile also runs every tick while already Ready (to
+    // heal re-added nodes), so an unconditional set would churn a WAL write + log line each tick.
+    if all_active && cluster.k0s_state().phase != K0sPhase::Ready {
         match cluster.set_k0s_phase(K0sPhase::Ready, None, false) {
             Ok(()) => info!("k0s cluster converged: all components active -> Ready"),
             Err(e) => warn!(error = %e, "failed to mark k0s cluster Ready"),

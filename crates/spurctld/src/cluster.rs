@@ -8118,6 +8118,96 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_reassigns_a_readded_node() {
+        // The Ready-phase self-heal: a spurd restart deregisters on SIGTERM (the node is REMOVED),
+        // then re-registers as a fresh node with no k0s role. Re-running provisioning (which the
+        // reconcile loop now does in Ready, not only Provisioning) must re-assign the un-roled node
+        // its role + mesh IP + pod CIDR so it rejoins the mesh — without disturbing the others.
+        use spur_core::k0s::K0sRole;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        register_node(&cm, "node-b", 4, 8000);
+        wait_for("both registered", || {
+            cm.get_node("node-a").is_some() && cm.get_node("node-b").is_some()
+        });
+        let net = crate::cluster_k8s::ClusterNetworking {
+            mesh_cidr: "10.44.0.0/16".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
+            cni: "kuberouter".into(),
+            control_plane_node: None,
+        };
+        crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
+        wait_for("both assigned", || {
+            cm.get_node("node-a").and_then(|n| n.k0s_role).is_some()
+                && cm.get_node("node-b").and_then(|n| n.k0s_role).is_some()
+        });
+        let b_role = cm.get_node("node-b").unwrap().k0s_role;
+        let b_ip = cm.get_node("node-b").unwrap().k0s_mesh_ip.clone();
+        let b_cidr = cm.get_node("node-b").unwrap().k0s_pod_cidr.clone();
+        assert!(b_ip.is_some() && b_cidr.is_some());
+
+        // spurd restart: deregister (remove) then re-register as a fresh, un-roled node.
+        cm.remove_node("node-b", true, Some("test restart".into()))
+            .unwrap();
+        wait_for("node-b removed", || cm.get_node("node-b").is_none());
+        register_node(&cm, "node-b", 4, 8000);
+        wait_for("node-b re-registered without a role", || {
+            cm.get_node("node-b")
+                .map(|n| n.k0s_role.is_none())
+                .unwrap_or(false)
+        });
+
+        // The Ready-phase reconcile re-runs provisioning and heals the un-roled node.
+        crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
+        wait_for("node-b re-assigned", || {
+            cm.get_node("node-b").and_then(|n| n.k0s_role).is_some()
+        });
+        let b = cm.get_node("node-b").unwrap();
+        assert_eq!(b.k0s_role, b_role, "same role after re-add");
+        assert_eq!(b.k0s_mesh_ip, b_ip, "same mesh IP reclaimed after re-add");
+        assert_eq!(b.k0s_pod_cidr, b_cidr, "same pod CIDR after re-add");
+        // The untouched node keeps its assignment (provisioning is idempotent).
+        assert!(cm.get_node("node-a").and_then(|n| n.k0s_role).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_phase_reconcile_assigns_unroled_node() {
+        // The loop wiring: reconcile_phase must run provisioning in the Ready phase, not only
+        // Provisioning. An un-roled node present while Ready (e.g. re-added after a spurd restart)
+        // must be assigned by a Ready-phase reconcile tick. If Ready were a no-op it would stay
+        // un-roled forever (out of the mesh) — the bug this fixes.
+        use spur_core::k0s::K0sPhase;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        wait_for("registered", || cm.get_node("node-a").is_some());
+        // Cluster is Ready with the control plane already recorded, but node-a has no k0s role.
+        cm.set_k0s_phase(K0sPhase::Ready, Some("node-a".into()), false)
+            .unwrap();
+        wait_for("phase ready", || cm.k0s_state().phase == K0sPhase::Ready);
+        assert!(cm.get_node("node-a").and_then(|n| n.k0s_role).is_none());
+
+        let net = crate::cluster_k8s::ClusterNetworking {
+            mesh_cidr: "10.44.0.0/16".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
+            cni: "kuberouter".into(),
+            control_plane_node: Some("node-a".into()),
+        };
+        let mut tokens = std::collections::HashMap::new();
+        crate::cluster_k8s::reconcile_phase(&cm, &net, &cm.k0s_state(), &mut tokens).await;
+
+        wait_for("un-roled node assigned by a Ready-phase tick", || {
+            cm.get_node("node-a").and_then(|n| n.k0s_role).is_some()
+        });
+        assert!(cm.get_node("node-a").and_then(|n| n.k0s_mesh_ip).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn provision_assigns_controller_and_worker_for_two_nodes() {
         use spur_core::k0s::K0sRole;
         let dir = TempDir::new().unwrap();
