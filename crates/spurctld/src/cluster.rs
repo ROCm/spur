@@ -2702,14 +2702,19 @@ impl ClusterManager {
     }
 
     /// Recompute a job's live effective priority (a running job's stored
-    /// `priority` is stale). Takes `qos` pre-resolved so it can be reused.
-    pub(crate) fn current_effective_priority_with_qos(&self, job: &Job, qos: &Qos) -> u32 {
+    /// `priority` is stale). Takes `qos` pre-resolved so it can be reused,
+    /// and `partitions` so callers iterating over multiple jobs don't pay
+    /// for a separate lock acquisition per call.
+    pub(crate) fn current_effective_priority_with_qos(
+        &self,
+        job: &Job,
+        qos: &Qos,
+        partitions: &[Partition],
+    ) -> u32 {
         let now = Utc::now();
         let age_minutes = (now - job.submit_time).num_minutes().max(0);
-        let partition_tier = {
-            let partitions = self.partitions.read();
-            spur_core::partition::max_priority_tier(job.spec.partition.as_deref(), &partitions)
-        };
+        let partition_tier =
+            spur_core::partition::max_priority_tier(job.spec.partition.as_deref(), partitions);
         let fair_share = self
             .fairshare_cache
             .get(&job.spec.user, job.spec.account.as_deref().unwrap_or(""));
@@ -6787,7 +6792,8 @@ mod tests {
             },
         );
 
-        let priority = cm.current_effective_priority_with_qos(&job, &Qos::default());
+        let priority =
+            cm.current_effective_priority_with_qos(&job, &Qos::default(), &cm.get_partitions());
         assert_eq!(
             priority, 9000,
             "multi-partition job should use the highest matched priority_tier (9), \

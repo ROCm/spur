@@ -410,6 +410,15 @@ mod tests {
     }
 
     #[test]
+    fn test_qos_priority_saturation() {
+        let qos = Qos {
+            priority: i32::MAX,
+            ..Default::default()
+        };
+        assert_eq!(qos_adjusted_priority(u32::MAX, &qos), u32::MAX); // Saturates instead of wrapping
+    }
+
+    #[test]
     fn test_qos_preempt_override_off_is_none() {
         let qos = Qos {
             preempt_mode: QosPreemptMode::Off,
