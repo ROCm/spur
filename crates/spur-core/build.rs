@@ -16,10 +16,14 @@ fn git_describe(manifest_dir: &Path) -> String {
         .unwrap_or_default()
 }
 
-// No `rerun-if-changed` is emitted: Cargo's default with none is to rerun
-// every build, which we want since `--dirty` reflects the whole tree, not
-// just this crate's files. Not unit tested; verified manually and in CI.
+// Not unit tested; verified manually and in CI.
 fn main() {
+    // `--dirty` reflects the whole working tree, not just this crate's
+    // files, so no `rerun-if-changed` path can scope this correctly.
+    // Watching a path that never exists forces Cargo to treat the build
+    // script as always out of date, so it reruns on every build.
+    println!("cargo:rerun-if-changed=__spur_always_rerun__");
+
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
     // Docker builds don't ship `.git` (see `.dockerignore`), so CI passes the
