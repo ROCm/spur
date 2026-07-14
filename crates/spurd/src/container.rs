@@ -1109,7 +1109,7 @@ pub fn container_init(
 /// umoci, or enroot. Only needs mksquashfs (squashfs-tools).
 pub async fn import_image(uri: &str) -> anyhow::Result<PathBuf> {
     let dir = image_dir();
-    spur_net::pull_image(uri, &dir).await
+    spur_net::pull_image(uri, &dir, std::env::consts::ARCH).await
 }
 
 /// List imported images.
@@ -1144,6 +1144,7 @@ pub fn remove_image(name: &str) -> anyhow::Result<()> {
         bail!("image '{}' not found", name);
     }
     std::fs::remove_file(&path)?;
+    let _ = std::fs::remove_file(path.with_extension("sqsh.arch"));
     info!(name, "image removed");
     Ok(())
 }

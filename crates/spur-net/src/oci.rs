@@ -47,6 +47,24 @@ struct Manifest {
 }
 
 #[derive(Deserialize)]
+struct ManifestList {
+    manifests: Vec<ManifestEntry>,
+}
+
+#[derive(Deserialize)]
+struct ManifestEntry {
+    digest: String,
+    #[serde(default)]
+    platform: Option<Platform>,
+}
+
+#[derive(Deserialize)]
+struct Platform {
+    architecture: String,
+    os: String,
+}
+
+#[derive(Deserialize)]
 struct LayerDescriptor {
     digest: String,
     size: u64,
@@ -101,31 +119,42 @@ pub fn parse_image_ref(image: &str) -> ImageRef {
 /// Pull an image from a registry and create a squashfs file.
 ///
 /// Returns the path to the squashfs file.
-pub async fn pull_image(image: &str, output_dir: &Path) -> anyhow::Result<PathBuf> {
+pub async fn pull_image(image: &str, output_dir: &Path, arch: &str) -> anyhow::Result<PathBuf> {
     let image_ref = parse_image_ref(image);
     info!(
         registry = %image_ref.registry,
         repository = %image_ref.repository,
         tag = %image_ref.tag,
+        architecture = arch,
         "pulling image"
     );
 
     let sanitized = sanitize_name(image);
     let sqsh_path = output_dir.join(format!("{}.sqsh", sanitized));
+    let arch_path = sqsh_path.with_extension("sqsh.arch");
 
     if sqsh_path.exists() {
-        info!(path = %sqsh_path.display(), "image already exists");
-        return Ok(sqsh_path);
+        let cached_arch = std::fs::read_to_string(&arch_path).ok();
+        if cached_architecture_matches(cached_arch.as_deref(), arch) {
+            info!(path = %sqsh_path.display(), architecture = arch, "image already exists");
+            return Ok(sqsh_path);
+        }
+        info!(path = %sqsh_path.display(), architecture = arch, "replacing image for requested architecture");
     }
 
     std::fs::create_dir_all(output_dir)?;
 
     // Create temp directory for rootfs assembly
     let tmp_dir = output_dir.join(format!(".pulling_{}", sanitized));
+    if tmp_dir.exists() {
+        std::fs::remove_dir_all(&tmp_dir)?;
+    }
     let rootfs_dir = tmp_dir.join("rootfs");
+    let staged_sqsh_path = tmp_dir.join("image.sqsh");
+    let staged_arch_path = tmp_dir.join("image.sqsh.arch");
     std::fs::create_dir_all(&rootfs_dir)?;
 
-    let result = pull_and_extract(&image_ref, &rootfs_dir).await;
+    let result = pull_and_extract(&image_ref, &rootfs_dir, arch).await;
     if let Err(e) = &result {
         let _ = std::fs::remove_dir_all(&tmp_dir);
         return Err(anyhow::anyhow!("{}", e));
@@ -136,7 +165,7 @@ pub async fn pull_image(image: &str, output_dir: &Path) -> anyhow::Result<PathBu
     let mksquashfs_result = std::process::Command::new("mksquashfs")
         .args([
             rootfs_dir.to_str().unwrap(),
-            sqsh_path.to_str().unwrap(),
+            staged_sqsh_path.to_str().unwrap(),
             "-noappend",
             "-comp",
             "zstd",
@@ -165,8 +194,20 @@ pub async fn pull_image(image: &str, output_dir: &Path) -> anyhow::Result<PathBu
         }
     }
 
-    // Clean up temp dir
+    let finalize_result = (|| -> anyhow::Result<()> {
+        std::fs::write(&staged_arch_path, oci_architecture(arch))?;
+        std::fs::rename(&staged_sqsh_path, &sqsh_path)
+            .with_context(|| format!("failed to install image at {}", sqsh_path.display()))?;
+        std::fs::rename(&staged_arch_path, &arch_path).with_context(|| {
+            format!(
+                "failed to record image architecture at {}",
+                arch_path.display()
+            )
+        })?;
+        Ok(())
+    })();
     let _ = std::fs::remove_dir_all(&tmp_dir);
+    finalize_result?;
 
     let size = std::fs::metadata(&sqsh_path).map(|m| m.len()).unwrap_or(0);
     info!(
@@ -179,7 +220,11 @@ pub async fn pull_image(image: &str, output_dir: &Path) -> anyhow::Result<PathBu
 }
 
 /// Download manifest and layers, extract to rootfs directory.
-async fn pull_and_extract(image_ref: &ImageRef, rootfs_dir: &Path) -> anyhow::Result<()> {
+async fn pull_and_extract(
+    image_ref: &ImageRef,
+    rootfs_dir: &Path,
+    arch: &str,
+) -> anyhow::Result<()> {
     let client = reqwest::Client::builder().user_agent("spur/0.1").build()?;
 
     // Get auth token
@@ -234,6 +279,7 @@ async fn pull_and_extract(image_ref: &ImageRef, rootfs_dir: &Path) -> anyhow::Re
                 &registry_url,
                 image_ref,
                 token.as_deref(),
+                arch,
             )
             .await?;
             index
@@ -515,50 +561,51 @@ async fn get_auth_token(
     Ok(None)
 }
 
-/// Resolve a manifest list (multi-arch) to a single amd64/linux manifest.
+fn oci_architecture(arch: &str) -> &str {
+    match arch {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "x86" => "386",
+        arch => arch,
+    }
+}
+
+fn cached_architecture_matches(cached_arch: Option<&str>, requested_arch: &str) -> bool {
+    cached_arch.is_some_and(|arch| arch.trim() == oci_architecture(requested_arch))
+}
+
+fn manifest_digest_for_arch(body: &str, arch: &str) -> anyhow::Result<String> {
+    let list: ManifestList = serde_json::from_str(body).context("failed to parse manifest list")?;
+    let oci_arch = oci_architecture(arch);
+
+    list.manifests
+        .iter()
+        .find(|manifest| {
+            manifest
+                .platform
+                .as_ref()
+                .is_some_and(|platform| platform.architecture == oci_arch && platform.os == "linux")
+        })
+        .map(|manifest| manifest.digest.clone())
+        .ok_or_else(|| anyhow::anyhow!("no linux/{arch} manifest found in manifest list"))
+}
+
+/// Resolve a manifest list (multi-arch) to a single Linux platform manifest.
 async fn resolve_manifest_list(
     client: &reqwest::Client,
     body: &str,
     registry_url: &str,
     image_ref: &ImageRef,
     token: Option<&str>,
+    arch: &str,
 ) -> anyhow::Result<Manifest> {
-    #[derive(Deserialize)]
-    struct ManifestList {
-        manifests: Vec<ManifestEntry>,
-    }
-    #[derive(Deserialize)]
-    struct ManifestEntry {
-        digest: String,
-        #[serde(default)]
-        platform: Option<Platform>,
-    }
-    #[derive(Deserialize)]
-    struct Platform {
-        architecture: String,
-        os: String,
-    }
+    let digest = manifest_digest_for_arch(body, arch)?;
 
-    let list: ManifestList = serde_json::from_str(body).context("failed to parse manifest list")?;
-
-    // Find linux/amd64
-    let entry = list
-        .manifests
-        .iter()
-        .find(|m| {
-            m.platform
-                .as_ref()
-                .map(|p| p.architecture == "amd64" && p.os == "linux")
-                .unwrap_or(false)
-        })
-        .or_else(|| list.manifests.first())
-        .ok_or_else(|| anyhow::anyhow!("no linux/amd64 manifest found in manifest list"))?;
-
-    debug!(digest = %entry.digest, "resolved manifest list to platform manifest");
+    debug!(digest = %digest, architecture = arch, "resolved manifest list to platform manifest");
 
     let url = format!(
         "{}/v2/{}/manifests/{}",
-        registry_url, image_ref.repository, entry.digest
+        registry_url, image_ref.repository, digest
     );
     let mut req = client.get(&url).header(
         ACCEPT,
@@ -644,6 +691,19 @@ mod tests {
 
     use super::*;
 
+    const MULTI_ARCH_MANIFEST: &str = r#"{
+        "manifests": [
+            {
+                "digest": "sha256:amd64",
+                "platform": { "architecture": "amd64", "os": "linux" }
+            },
+            {
+                "digest": "sha256:arm64",
+                "platform": { "architecture": "arm64", "os": "linux" }
+            }
+        ]
+    }"#;
+
     #[test]
     fn test_decode_registry_auth_b64_valid() {
         // echo -n 'alice:secret' | base64 -w0
@@ -682,6 +742,42 @@ mod tests {
         let cred = "myuser:mypassword";
         let enc = STANDARD.encode(cred);
         assert_eq!(super::decode_registry_auth_b64(&enc).as_deref(), Some(cred));
+    }
+
+    #[test]
+    fn test_manifest_digest_for_requested_arch() {
+        assert_eq!(
+            manifest_digest_for_arch(MULTI_ARCH_MANIFEST, "arm64").unwrap(),
+            "sha256:arm64"
+        );
+    }
+
+    #[test]
+    fn test_manifest_digest_normalizes_rust_arch_names() {
+        assert_eq!(
+            manifest_digest_for_arch(MULTI_ARCH_MANIFEST, "x86_64").unwrap(),
+            "sha256:amd64"
+        );
+        assert_eq!(
+            manifest_digest_for_arch(MULTI_ARCH_MANIFEST, "aarch64").unwrap(),
+            "sha256:arm64"
+        );
+    }
+
+    #[test]
+    fn test_cached_architecture_must_match_requested_arch() {
+        assert!(cached_architecture_matches(Some("arm64\n"), "aarch64"));
+        assert!(!cached_architecture_matches(Some("amd64"), "arm64"));
+        assert!(!cached_architecture_matches(None, "arm64"));
+    }
+
+    #[test]
+    fn test_manifest_digest_error_includes_requested_arch() {
+        let error = manifest_digest_for_arch(MULTI_ARCH_MANIFEST, "riscv64").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "no linux/riscv64 manifest found in manifest list"
+        );
     }
 
     #[test]
