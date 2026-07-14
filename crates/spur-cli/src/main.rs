@@ -69,8 +69,12 @@ fn main() -> anyhow::Result<()> {
     // symlinks alike), ahead of per-subcommand clap parsing that doesn't
     // otherwise register -V/--version. Only the first argument is checked so
     // that trailing args forwarded to a user program (srun, exec, scontrol
-    // update, sacctmgr, ...) can't be mistaken for this flag.
-    if matches!(std::env::args_os().nth(1).as_deref(), Some(a) if a == "-V" || a == "--version") {
+    // update, sacctmgr, ...) can't be mistaken for this flag. Requiring no
+    // further arguments lets `spur -V --check`/`spur --version --check` fall
+    // through to the native dispatch below, where `--check` is handled.
+    if std::env::args_os().len() <= 2
+        && matches!(std::env::args_os().nth(1).as_deref(), Some(a) if a == "-V" || a == "--version")
+    {
         println!("{}", spur_core::version::version_string());
         std::process::exit(0);
     }

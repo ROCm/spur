@@ -16,7 +16,6 @@ fn git_describe(manifest_dir: &Path) -> String {
         .unwrap_or_default()
 }
 
-// Not unit tested; verified manually and in CI.
 fn main() {
     // `--dirty` reflects the whole working tree, not just this crate's
     // files, so no `rerun-if-changed` path can scope this correctly.
