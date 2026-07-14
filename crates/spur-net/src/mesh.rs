@@ -89,7 +89,9 @@ pub fn mesh_peers_for(self_mesh_ip: &str, members: &[MeshNode]) -> Vec<WgPeer> {
         .map(|n| WgPeer {
             public_key: n.public_key.clone(),
             allowed_ips: peer_allowed_ips(n),
-            endpoint: Some(n.endpoint.clone()),
+            // Empty endpoint => leave the peer's endpoint untouched (`wg set` omits it), preserving
+            // the underlay tunnel `spur net join` established. Only override when one is supplied.
+            endpoint: Some(n.endpoint.clone()).filter(|e| !e.trim().is_empty()),
             persistent_keepalive: Some(25),
         })
         .collect()

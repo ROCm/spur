@@ -97,6 +97,11 @@ pub struct ClusterConfig {
 }
 
 /// Owns and reconciles a single spurd-managed k0s systemd unit.
+///
+/// `Clone` so `K0sAgent` can snapshot the current supervisor out from under its `active` mutex and
+/// then do the (blocking, seconds-long) systemctl/k0s IO WITHOUT holding the lock — otherwise a
+/// stop/reconcile would serialize concurrent status/start RPCs behind it.
+#[derive(Clone)]
 pub struct ClusterSupervisor {
     cfg: ClusterConfig,
     /// systemd unit directory (overridable in tests; `/etc/systemd/system` in production).
@@ -357,12 +362,23 @@ fn parse_execstart(exec: &str) -> anyhow::Result<ClusterConfig> {
 
 /// Write a bearer-secret file (0600). Content is never logged.
 async fn write_secret_file(path: &Path, content: &[u8]) -> anyhow::Result<()> {
-    tokio::fs::write(path, content).await?;
+    use tokio::io::AsyncWriteExt;
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    // Create with 0600 from the start so a bearer token is never briefly world-readable through
+    // the umask-dependent default (the previous write-then-chmod left such a window).
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut f = opts.open(path).await?;
     #[cfg(unix)]
     {
+        // Also tighten an already-existing file (mode() only applies on create).
         use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .await?;
     }
+    f.write_all(content).await?;
+    f.flush().await?;
     Ok(())
 }
 
@@ -497,7 +513,9 @@ impl K0sAgent {
             ),
         }
 
-        tokio::fs::create_dir_all(&self.config_dir).await.ok();
+        tokio::fs::create_dir_all(&self.config_dir)
+            .await
+            .with_context(|| format!("create k0s config dir {}", self.config_dir.display()))?;
         let join_token_file = match join_token {
             Some(tok) => {
                 let p = self.config_dir.join("token");
@@ -539,12 +557,13 @@ impl K0sAgent {
     /// component (e.g. spurd restarted and adoption found/parsed nothing), it still stops/resets any
     /// spurd-owned k0s unit present on the host — so `down --reset` is never silently a no-op.
     pub async fn stop(&self, reset: bool) -> anyhow::Result<()> {
-        let mut guard = self.active.lock().await;
-        match guard.as_ref() {
+        // Take the supervisor out under the lock, then do the (blocking) stop OUTSIDE it so
+        // concurrent status/start RPCs aren't serialized behind the seconds-long systemctl/k0s IO.
+        let taken = self.active.lock().await.take();
+        match taken {
             Some(sup) => sup.stop(reset).await?,
             None => self.stop_untracked(reset).await,
         }
-        *guard = None;
         remove_cdi_spec().await;
         info!(reset, "k0s component stopped");
         Ok(())
@@ -616,16 +635,15 @@ impl K0sAgent {
     /// it probes the actual spurd-owned units so a restarted spurd (before/without adoption) still
     /// reports the truth instead of a false `inactive`.
     pub async fn status(&self) -> (String, String, bool) {
-        {
-            let guard = self.active.lock().await;
-            if let Some(sup) = guard.as_ref() {
-                let enabled = sup.unit_status_is(&["is-enabled"], "enabled").await;
-                return (
-                    sup.role().as_str().to_string(),
-                    sup.component_state().await,
-                    enabled,
-                );
-            }
+        // Snapshot out of the lock, then query systemctl OUTSIDE it (avoids serializing RPCs).
+        let tracked = self.active.lock().await.clone();
+        if let Some(sup) = tracked {
+            let enabled = sup.unit_status_is(&["is-enabled"], "enabled").await;
+            return (
+                sup.role().as_str().to_string(),
+                sup.component_state().await,
+                enabled,
+            );
         }
         // Untracked: report a running spurd-owned unit if there is one (Controller/Single share a
         // unit name — reported as "controller").
@@ -646,8 +664,10 @@ impl K0sAgent {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
-            let guard = self.active.lock().await;
-            if let Some(sup) = guard.as_ref() {
+            // Snapshot the supervisor, then reconcile OUTSIDE the lock (reconcile shells out + does
+            // filesystem IO; holding the lock would serialize concurrent start/stop/status RPCs).
+            let sup = self.active.lock().await.clone();
+            if let Some(sup) = sup {
                 if let Err(e) = sup.reconcile_once().await {
                     warn!(error = %e, "k0s component reconcile failed");
                 }
