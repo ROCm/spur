@@ -433,6 +433,10 @@ pub struct K0sAgent {
     k0s_version: String,
     /// Directory k0s config + the join-token file are written to (`/etc/k0s`).
     config_dir: PathBuf,
+    /// Storage provisioner SPUR ships ("local-path" or "none"); [`ClusterConfig::storage_provisioner`].
+    storage_provisioner: String,
+    /// On-node PV directory for local-path; [`ClusterConfig::local_path_dir`].
+    local_path_dir: String,
     active: Mutex<Option<ClusterSupervisor>>,
 }
 
@@ -444,6 +448,8 @@ impl K0sAgent {
             k0s_binary: PathBuf::from(&cfg.k0s_binary),
             k0s_version: cfg.k0s_version.clone(),
             config_dir: PathBuf::from("/etc/k0s"),
+            storage_provisioner: cfg.storage_provisioner.clone(),
+            local_path_dir: cfg.local_path_dir.clone(),
             active: Mutex::new(None),
         }
     }
@@ -550,12 +556,43 @@ impl K0sAgent {
                 warn!(error = %e, "failed to write GPU CDI spec (continuing)");
             }
         }
+        // Control-plane nodes (controller/single) run k0s's manifest deployer, so ship the storage
+        // addon by writing its manifest there for k0s to apply (best-effort — a bad write must not
+        // block the control plane). k0s bundles no storage, so without this a PVC workload hangs.
+        if matches!(role, ClusterRole::Controller | ClusterRole::Single)
+            && self.storage_provisioner == "local-path"
+        {
+            if let Err(e) = self.write_local_path_manifest().await {
+                warn!(error = %e, "failed to write local-path storage manifest (continuing)");
+            }
+        }
         let sup = ClusterSupervisor::new(cfg);
         sup.reconcile_once().await?;
         let state = sup.component_state().await;
         *self.active.lock().await = Some(sup);
         info!(role = role.as_str(), state = %state, "k0s component started");
         Ok(state)
+    }
+
+    /// Ship the local-path storage provisioner: render the manifest with the configured PV directory
+    /// and write it into k0s's manifest-deployer dir, which the k0s controller applies + reconciles.
+    /// Control-plane only (that is where the manifest deployer runs). Idempotent — overwrites.
+    async fn write_local_path_manifest(&self) -> anyhow::Result<()> {
+        let dir = Path::new(spur_core::k0s::K0S_MANIFESTS_DIR).join("local-path");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .with_context(|| format!("create k0s manifests dir {}", dir.display()))?;
+        let manifest = spur_core::k0s::k0s_local_path_manifest(&self.local_path_dir);
+        let path = dir.join("local-path.yaml");
+        tokio::fs::write(&path, manifest)
+            .await
+            .with_context(|| format!("write {}", path.display()))?;
+        info!(
+            path = %path.display(),
+            data_dir = %self.local_path_dir,
+            "shipped local-path storage manifest to k0s manifest deployer"
+        );
+        Ok(())
     }
 
     /// Stop + disable this node's component (optionally `k0s reset`). If there is no tracked

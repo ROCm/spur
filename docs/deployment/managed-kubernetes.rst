@@ -61,6 +61,8 @@ choice):
    service_cidr = "10.43.0.0/16"
    cni = "kuberouter"                # "kuberouter" (default) or "calico" (see Networking)
    cni_mtu = 1450                    # Calico MTU; headroom for WireGuard overhead on the mesh
+   storage_provisioner = "local-path"  # default StorageClass for PVCs; or "none"
+   # local_path_dir = "/mnt/scratch/local-path"  # point local-path at a big disk (default /var/lib)
    k0s_version = "v1.36.2+k0s.0"     # pinned; or "latest"
 
 Installing k0s
@@ -125,6 +127,28 @@ the tunnel.
 The controller continuously reconciles the full-mesh membership to every node
 (pruning peers for departed nodes), so a reboot, a WireGuard restart, or a
 control-plane failover self-heals.
+
+Storage
+~~~~~~~
+
+k0s bundles no storage, so a plain cluster has no ``StorageClass`` and any
+``PersistentVolumeClaim`` stays ``Pending``. By default SPUR ships the
+`local-path-provisioner <https://github.com/rancher/local-path-provisioner>`_
+(``storage_provisioner = "local-path"``) as the cluster's **default**
+StorageClass — RWO, node-local — so PVC workloads bind out of the box. The
+control-plane agent writes the manifest into k0s's manifest-deployer directory,
+which k0s applies automatically (no in-cluster client).
+
+Local-path stores volumes under ``local_path_dir`` (default
+``/var/lib/local-path-provisioner``, on the root filesystem). If PVCs will hold
+much data — model caches, datasets — point it at a large scratch disk:
+
+.. code-block:: ini
+
+   [cluster]
+   local_path_dir = "/mnt/scratch/local-path"
+
+Set ``storage_provisioner = "none"`` to bring your own storage.
 
 Adding a node later
 ~~~~~~~~~~~~~~~~~~~~~
@@ -246,6 +270,12 @@ Configuration reference (``[cluster]``)
    * - ``cni_mtu``
      - ``1450``
      - Calico MTU emitted into the generated k0s config (leaves WireGuard headroom).
+   * - ``storage_provisioner``
+     - ``local-path``
+     - Storage SPUR ships as the default StorageClass (``local-path`` or ``none``).
+   * - ``local_path_dir``
+     - ``/var/lib/local-path-provisioner``
+     - On-node directory local-path stores PVs in; point at a big disk for data-heavy PVCs.
    * - ``k0s_version``
      - pinned
      - k0s release to install/run (a tag or ``latest``).

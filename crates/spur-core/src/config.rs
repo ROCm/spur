@@ -660,6 +660,15 @@ pub struct ClusterConfig {
     /// worker's kubelet `--node-ip` to its mesh IP.
     #[serde(default = "default_cni")]
     pub cni: String,
+    /// Storage provisioner SPUR ships so PVC workloads work out of the box (k0s bundles none).
+    /// "local-path" (default — RWO node-local, set as the default StorageClass) or "none" (bring your
+    /// own). Applied via k0s's manifest deployer on the control-plane node.
+    #[serde(default = "default_storage_provisioner")]
+    pub storage_provisioner: String,
+    /// On-node directory the local-path provisioner stores PersistentVolumes in. Point this at a
+    /// large scratch disk if PVCs will hold much data — the default lives under `/var/lib` (root fs).
+    #[serde(default = "default_local_path_dir")]
+    pub local_path_dir: String,
 }
 
 fn default_cluster_distro() -> String {
@@ -683,6 +692,12 @@ fn default_service_cidr() -> String {
 fn default_cni_mtu() -> u16 {
     1450
 }
+fn default_storage_provisioner() -> String {
+    "local-path".into()
+}
+fn default_local_path_dir() -> String {
+    crate::k0s::DEFAULT_LOCAL_PATH_DIR.into()
+}
 
 impl Default for ClusterConfig {
     fn default() -> Self {
@@ -696,6 +711,8 @@ impl Default for ClusterConfig {
             k0s_version: default_k0s_version(),
             k0s_binary: default_k0s_binary(),
             cni: default_cni(),
+            storage_provisioner: default_storage_provisioner(),
+            local_path_dir: default_local_path_dir(),
         }
     }
 }
@@ -1033,6 +1050,35 @@ impl SlurmConfig {
                     ),
                 });
             }
+            if !matches!(
+                self.cluster.storage_provisioner.as_str(),
+                "local-path" | "none"
+            ) {
+                return Err(ConfigError::InvalidValue {
+                    field: "cluster.storage_provisioner".into(),
+                    value: format!(
+                        "{} (expected \"local-path\" or \"none\")",
+                        self.cluster.storage_provisioner
+                    ),
+                });
+            }
+            // local_path_dir is interpolated verbatim into a JSON string in the generated manifest,
+            // so an absolute path free of quotes/backslashes/whitespace/control chars keeps the JSON
+            // valid and can't inject. Only meaningful when local-path is the chosen provisioner.
+            if self.cluster.storage_provisioner == "local-path" {
+                let d = &self.cluster.local_path_dir;
+                if !d.starts_with('/')
+                    || d.chars()
+                        .any(|c| c == '"' || c == '\\' || c.is_whitespace() || c.is_control())
+                {
+                    return Err(ConfigError::InvalidValue {
+                        field: "cluster.local_path_dir".into(),
+                        value: format!(
+                            "{d} (must be an absolute path with no quotes, backslashes, or whitespace)"
+                        ),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -1208,6 +1254,8 @@ mod tests {
         assert_eq!(c.service_cidr, "10.43.0.0/16");
         assert_eq!(c.cni_mtu, 1450);
         assert_eq!(c.cni, "kuberouter");
+        assert_eq!(c.storage_provisioner, "local-path");
+        assert_eq!(c.local_path_dir, "/var/lib/local-path-provisioner");
     }
 
     #[test]
@@ -1244,6 +1292,29 @@ cni_mtu = 1400
             "cluster_name=\"t\"\n[cluster]\nenabled=true\ndistro=\"k3s\"\n"
         )
         .is_err());
+        // Unknown storage provisioner is rejected; "none" and "local-path" are accepted.
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\nstorage_provisioner=\"nfs\"\n"
+        )
+        .is_err());
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\nstorage_provisioner=\"none\"\n"
+        )
+        .is_ok());
+        // A local_path_dir that would break the JSON it is interpolated into is rejected.
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\nlocal_path_dir=\"/mnt/a\\\"b\"\n"
+        )
+        .is_err());
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\nlocal_path_dir=\"relative/path\"\n"
+        )
+        .is_err());
+        // A local_path_dir only matters for local-path; junk is ignored when storage is "none".
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\nstorage_provisioner=\"none\"\nlocal_path_dir=\"bad path\"\n"
+        )
+        .is_ok());
         // Disabled cluster: no cluster validation applied even with junk values.
         assert!(SlurmConfig::load_from_str(
             "cluster_name=\"t\"\n[cluster]\nenabled=false\npod_cidr=\"whatever\"\n"
