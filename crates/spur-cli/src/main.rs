@@ -70,7 +70,7 @@ fn main() -> anyhow::Result<()> {
     // otherwise register -V/--version. Only the first argument is checked so
     // that trailing args forwarded to a user program (srun, exec, scontrol
     // update, sacctmgr, ...) can't be mistaken for this flag.
-    if matches!(std::env::args().nth(1).as_deref(), Some("-V" | "--version")) {
+    if matches!(std::env::args_os().nth(1).as_deref(), Some(a) if a == "-V" || a == "--version") {
         println!("{}", spur_core::version::version_string());
         std::process::exit(0);
     }

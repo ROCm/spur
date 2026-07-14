@@ -79,7 +79,10 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    if matches!(std::env::args().nth(1).as_deref(), Some("-V" | "--version")) {
+    if std::env::args_os()
+        .skip(1)
+        .any(|a| a == "-V" || a == "--version")
+    {
         println!("{}", spur_core::version::version_string());
         return Ok(());
     }
