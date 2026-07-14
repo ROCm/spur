@@ -125,9 +125,11 @@ impl ClusterSupervisor {
     }
 
     /// Render the unit file. Mirrors k0s's own installer directives (see module docs for why
-    /// `Type=simple` / `KillMode=process` and not `notify` / `mixed`). `StartLimitIntervalSec=0`
-    /// disables systemd's restart rate-limit because this supervisor is the higher-level recovery
-    /// authority and must never be locked out by a burst limit.
+    /// `Type=simple` / `KillMode=process` and not `notify` / `mixed`). A finite
+    /// `StartLimitIntervalSec`/`StartLimitBurst` bounds a hard crash-loop (a genuinely broken node
+    /// stops hammering every `RestartSec`); the reconcile supervisor is the higher-level recovery
+    /// authority and re-enables the unit on its next tick, so the limit adds backoff without a
+    /// permanent lockout.
     fn render_unit(&self) -> String {
         let mut exec = format!(
             "{} {}",
@@ -156,7 +158,8 @@ impl ClusterSupervisor {
              ExecStart={exec}\n\
              Restart=always\n\
              RestartSec=10\n\
-             StartLimitIntervalSec=0\n\
+             StartLimitIntervalSec=300\n\
+             StartLimitBurst=5\n\
              Delegate=yes\n\
              KillMode=process\n\
              LimitCORE=infinity\n\
@@ -300,7 +303,7 @@ impl ClusterSupervisor {
         }
         self.disable_unit().await;
         if reset {
-            self.k0s_reset().await;
+            self.k0s_reset().await?;
         }
         Ok(())
     }
@@ -312,20 +315,22 @@ impl ClusterSupervisor {
         let _ = self.systemctl(&["disable", "--now", &unit]).await;
     }
 
-    /// `k0s reset` (destructive host-wide cleanup). Best-effort — logs, never fails the caller.
-    async fn k0s_reset(&self) {
-        match Command::new(&self.cfg.k0s_binary)
+    /// `k0s reset` (destructive host-wide cleanup). Returns an error if the reset fails so the
+    /// caller can report a partial teardown instead of a false success.
+    async fn k0s_reset(&self) -> anyhow::Result<()> {
+        let out = Command::new(&self.cfg.k0s_binary)
             .arg("reset")
             .output()
             .await
-        {
-            Ok(out) if !out.status.success() => warn!(
-                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-                "k0s reset reported an error"
-            ),
-            Err(e) => warn!(error = %e, "failed to run `k0s reset`"),
-            _ => {}
+            .context("failed to run `k0s reset`")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "`k0s reset` failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
+        Ok(())
     }
 }
 
@@ -562,7 +567,7 @@ impl K0sAgent {
         let taken = self.active.lock().await.take();
         match taken {
             Some(sup) => sup.stop(reset).await?,
-            None => self.stop_untracked(reset).await,
+            None => self.stop_untracked(reset).await?,
         }
         remove_cdi_spec().await;
         info!(reset, "k0s component stopped");
@@ -571,16 +576,18 @@ impl K0sAgent {
 
     /// Stop/disable any spurd-owned k0s unit present on the host (a node runs at most one, but both
     /// names are disabled idempotently), then `k0s reset` once if requested. Used when `active` is
-    /// empty so a lost in-memory state can't leave a running k0s unit behind.
-    async fn stop_untracked(&self, reset: bool) {
+    /// empty so a lost in-memory state can't leave a running k0s unit behind. A failed reset is
+    /// surfaced so `down --reset` reports the partial teardown rather than a false success.
+    async fn stop_untracked(&self, reset: bool) -> anyhow::Result<()> {
         for role in [ClusterRole::Controller, ClusterRole::Worker] {
             self.probe_supervisor(role).disable_unit().await;
         }
         if reset {
             self.probe_supervisor(ClusterRole::Controller)
                 .k0s_reset()
-                .await;
+                .await?;
         }
+        Ok(())
     }
 
     /// Mint a k0s join token on this (control-plane) node via `k0s token create`. Returns the

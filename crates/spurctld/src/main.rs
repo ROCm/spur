@@ -242,6 +242,7 @@ async fn main() -> anyhow::Result<()> {
             mesh_cidr: config.network.wg_cidr.clone(),
             pod_cidr: config.cluster.pod_cidr.clone(),
             service_cidr: config.cluster.service_cidr.clone(),
+            cni_mtu: config.cluster.cni_mtu,
             cni: config.cluster.cni.clone(),
             control_plane_node: config.cluster.control_plane_node.clone(),
         };

@@ -21,9 +21,10 @@ pub struct NodeReporter {
     pub free_memory_mb: AtomicU64,
     pub cpu_load: AtomicU64,
     pub join_token: String,
-    /// This node's WireGuard public key (empty if not on a mesh). The controller uses it to
-    /// reconcile mesh peers.
-    pub wg_pubkey: String,
+    /// The WireGuard interface this node's mesh key is read from (e.g. "spur0"). The public key is
+    /// re-read on every register/heartbeat via [`wg_pubkey`](Self::wg_pubkey) so a key that appears
+    /// or changes after startup (late mesh join, `spur0` recreated) reaches the controller.
+    pub wg_iface: String,
     node_token: RwLock<String>,
 }
 
@@ -35,7 +36,7 @@ impl NodeReporter {
         node_address: spur_net::NodeAddress,
         labels: HashMap<String, String>,
         join_token: String,
-        wg_pubkey: String,
+        wg_iface: String,
     ) -> Self {
         Self {
             hostname,
@@ -46,9 +47,15 @@ impl NodeReporter {
             free_memory_mb: AtomicU64::new(0),
             cpu_load: AtomicU64::new(0),
             join_token,
-            wg_pubkey,
+            wg_iface,
             node_token: RwLock::new(String::new()),
         }
+    }
+
+    /// This node's current WireGuard mesh public key (empty if the interface has no key / no mesh).
+    /// Read live from the interface so a key that appears or changes after startup is picked up.
+    fn wg_pubkey(&self) -> String {
+        spur_net::wireguard::interface_public_key(&self.wg_iface).unwrap_or_default()
     }
 
     /// Register with the controller.
@@ -65,7 +72,7 @@ impl NodeReporter {
                 version: env!("CARGO_PKG_VERSION").into(),
                 address: self.node_address.ip.clone(),
                 port: self.node_address.port as u32,
-                wg_pubkey: self.wg_pubkey.clone(),
+                wg_pubkey: self.wg_pubkey(),
                 labels: self.labels.clone(),
                 join_token: self.join_token.clone(),
             })
@@ -128,6 +135,7 @@ impl NodeReporter {
                             free_memory_mb: free_mem,
                             running_jobs: vec![],
                             node_token: current_token,
+                            wg_pubkey: self.wg_pubkey(),
                         })
                         .await
                     {

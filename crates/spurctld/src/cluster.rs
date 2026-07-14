@@ -1169,6 +1169,24 @@ impl ClusterManager {
         }
     }
 
+    /// Update a node's WireGuard mesh public key from a heartbeat when it appears or changes (mesh
+    /// came up after registration, or `spur0` was recreated). In-memory like `update_heartbeat` —
+    /// the mesh reconcile loop reads live inventory, so this is enough to include the node in
+    /// ApplyMesh without a spurd restart. Returns true if the stored key changed.
+    pub fn update_node_wg_pubkey(&self, name: &str, pubkey: &str) -> bool {
+        if pubkey.is_empty() {
+            return false;
+        }
+        let mut nodes = self.nodes.write();
+        if let Some(node) = nodes.get_mut(name) {
+            if node.wg_pubkey.as_deref() != Some(pubkey) {
+                node.wg_pubkey = Some(pubkey.to_string());
+                return true;
+            }
+        }
+        false
+    }
+
     /// Create an admission token and persist via Raft.
     pub fn create_token(
         &self,
@@ -1519,26 +1537,6 @@ impl ClusterManager {
             reset_requested,
         })?;
         info!(?phase, "k0s cluster phase set");
-        Ok(())
-    }
-
-    /// record minted join-token METADATA (never the plaintext secret) via Raft.
-    /// Consumer is the deferred worker join-token mint on the control-plane agent.
-    #[allow(dead_code)]
-    pub fn create_k0s_join_token(
-        &self,
-        token: spur_core::k0s::K0sJoinTokenRecord,
-    ) -> anyhow::Result<()> {
-        self.propose(WalOperation::K0sJoinTokenCreate { token })?;
-        Ok(())
-    }
-
-    /// mark a k0s join token revoked.
-    #[allow(dead_code)]
-    pub fn revoke_k0s_join_token(&self, token_id: &str) -> anyhow::Result<()> {
-        self.propose(WalOperation::K0sJoinTokenRevoke {
-            token_id: token_id.to_string(),
-        })?;
         Ok(())
     }
 
@@ -3713,17 +3711,6 @@ impl ClusterManager {
                     k0s.control_plane_node = control_plane_node.clone();
                 }
                 k0s.reset_requested = *reset_requested;
-            }
-            WalOperation::K0sJoinTokenCreate { token } => {
-                self.k0s
-                    .write()
-                    .join_tokens
-                    .insert(token.id.clone(), token.clone());
-            }
-            WalOperation::K0sJoinTokenRevoke { token_id } => {
-                if let Some(t) = self.k0s.write().join_tokens.get_mut(token_id) {
-                    t.revoked = true;
-                }
             }
         }
         self.next_job_id.store(next_id, Ordering::Relaxed);
@@ -8933,7 +8920,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn k0s_state_survives_snapshot() {
-        use spur_core::k0s::{K0sJoinTokenRecord, K0sPhase, K0sRole};
+        use spur_core::k0s::{K0sPhase, K0sRole};
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
@@ -8942,14 +8929,6 @@ mod tests {
             .unwrap();
         cm.set_k0s_phase(K0sPhase::Ready, Some("head-node".into()), false)
             .unwrap();
-        cm.create_k0s_join_token(K0sJoinTokenRecord {
-            id: "tok-1".into(),
-            role: K0sRole::Worker,
-            created_at: chrono::Utc::now(),
-            expires_at: None,
-            revoked: false,
-        })
-        .unwrap();
         wait_for("k0s state applied", || {
             cm.k0s_state().phase == K0sPhase::Ready
                 && cm.get_node("n1").and_then(|n| n.k0s_role).is_some()
@@ -8965,7 +8944,6 @@ mod tests {
         let st = cm2.k0s_state();
         assert_eq!(st.phase, K0sPhase::Ready);
         assert_eq!(st.control_plane_node.as_deref(), Some("head-node"));
-        assert!(st.join_tokens.contains_key("tok-1"));
         // Per-node k0s fields ride snap.nodes.
         let n1 = cm2.get_node("n1").unwrap();
         assert_eq!(n1.k0s_role, Some(K0sRole::Worker));
@@ -8987,6 +8965,7 @@ mod tests {
             mesh_cidr: "10.44.0.0/16".into(),
             pod_cidr: "10.42.0.0/16".into(),
             service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
             cni: "kuberouter".into(),
             control_plane_node: None,
         };

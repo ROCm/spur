@@ -640,26 +640,13 @@ pub struct ClusterConfig {
     /// Service network CIDR.
     #[serde(default = "default_service_cidr")]
     pub service_cidr: String,
-    /// CNI MTU. Defaults to 1450 to leave headroom for WireGuard's ~50-byte overhead over the mesh;
-    /// set explicitly if your underlay differs.
+    /// CNI MTU (Calico only). Defaults to 1450 to leave headroom for WireGuard's ~50-byte overhead
+    /// over the mesh; set explicitly if your underlay differs. Emitted into the generated k0s config.
     #[serde(default = "default_cni_mtu")]
     pub cni_mtu: u16,
-    /// Interface k0s/Calico use for node-IP autodetection (the SPUR mesh interface).
-    #[serde(default = "default_flannel_iface")]
-    pub flannel_iface: String,
     /// Hostname of the node that runs the k0s control plane. Empty = pick from inventory.
     #[serde(default)]
     pub control_plane_node: Option<String>,
-    /// Node label selector that marks GPU workers.
-    #[serde(default = "default_gpu_worker_selector")]
-    pub gpu_worker_selector: String,
-    /// GPU device plugin advertising `amd.com/gpu` ("rocm" = ROCm/k8s-device-plugin;
-    /// "spur" = native spur-device-plugin, a later milestone).
-    #[serde(default = "default_device_plugin")]
-    pub device_plugin: String,
-    /// ARC (actions-runner-controller) settings for CI runner scale sets.
-    #[serde(default)]
-    pub arc: ClusterArcConfig,
     /// k0s release to install/run (e.g. "v1.36.2+k0s.0", or "latest"). Pinned to a known-good
     /// version by default; bumped per spur release. spurd installs this if the binary is missing.
     #[serde(default = "default_k0s_version")]
@@ -696,15 +683,6 @@ fn default_service_cidr() -> String {
 fn default_cni_mtu() -> u16 {
     1450
 }
-fn default_flannel_iface() -> String {
-    "spur0".into()
-}
-fn default_gpu_worker_selector() -> String {
-    "spur.amd.com/compute=true".into()
-}
-fn default_device_plugin() -> String {
-    "rocm".into()
-}
 
 impl Default for ClusterConfig {
     fn default() -> Self {
@@ -714,53 +692,10 @@ impl Default for ClusterConfig {
             pod_cidr: default_pod_cidr(),
             service_cidr: default_service_cidr(),
             cni_mtu: default_cni_mtu(),
-            flannel_iface: default_flannel_iface(),
             control_plane_node: None,
-            gpu_worker_selector: default_gpu_worker_selector(),
-            device_plugin: default_device_plugin(),
-            arc: ClusterArcConfig::default(),
             k0s_version: default_k0s_version(),
             k0s_binary: default_k0s_binary(),
             cni: default_cni(),
-        }
-    }
-}
-
-/// ARC (actions-runner-controller) settings for CI runner scale sets on the SPUR-managed cluster.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClusterArcConfig {
-    /// Install ARC as part of `spur k8s up`.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Helm release / runner scale-set name.
-    #[serde(default = "default_arc_installation_name")]
-    pub installation_name: String,
-    /// GitHub org/repo URL the runners register to (required when arc.enabled).
-    #[serde(default)]
-    pub github_config_url: String,
-    /// ARC container mode ("dind", "kubernetes", or empty for a hand-authored pod spec).
-    #[serde(default)]
-    pub container_mode: String,
-    /// Runner image.
-    #[serde(default = "default_arc_runner_image")]
-    pub runner_image: String,
-}
-
-fn default_arc_installation_name() -> String {
-    "spur-gpu-runners".into()
-}
-fn default_arc_runner_image() -> String {
-    "ghcr.io/actions/actions-runner:latest".into()
-}
-
-impl Default for ClusterArcConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            installation_name: default_arc_installation_name(),
-            github_config_url: String::new(),
-            container_mode: String::new(),
-            runner_image: default_arc_runner_image(),
         }
     }
 }
@@ -1098,11 +1033,6 @@ impl SlurmConfig {
                     ),
                 });
             }
-            if self.cluster.arc.enabled && self.cluster.arc.github_config_url.is_empty() {
-                return Err(ConfigError::MissingField(
-                    "cluster.arc.github_config_url".into(),
-                ));
-            }
         }
         Ok(())
     }
@@ -1277,8 +1207,7 @@ mod tests {
         assert_eq!(c.pod_cidr, "10.42.0.0/16");
         assert_eq!(c.service_cidr, "10.43.0.0/16");
         assert_eq!(c.cni_mtu, 1450);
-        assert_eq!(c.flannel_iface, "spur0");
-        assert!(!c.arc.enabled);
+        assert_eq!(c.cni, "kuberouter");
     }
 
     #[test]
@@ -1290,10 +1219,8 @@ cluster_name = "test"
 enabled = true
 pod_cidr = "10.60.0.0/16"
 control_plane_node = "head-node"
-
-[cluster.arc]
-enabled = true
-github_config_url = "https://github.com/org/repo"
+cni = "calico"
+cni_mtu = 1400
 "#;
         let cfg = SlurmConfig::load_from_str(toml).expect("valid cluster config");
         assert!(cfg.cluster.enabled);
@@ -1301,7 +1228,8 @@ github_config_url = "https://github.com/org/repo"
         assert_eq!(cfg.cluster.pod_cidr, "10.60.0.0/16");
         assert_eq!(cfg.cluster.control_plane_node.as_deref(), Some("head-node"));
         assert_eq!(cfg.cluster.service_cidr, "10.43.0.0/16"); // default
-        assert!(cfg.cluster.arc.enabled);
+        assert_eq!(cfg.cluster.cni, "calico");
+        assert_eq!(cfg.cluster.cni_mtu, 1400);
     }
 
     #[test]
@@ -1314,11 +1242,6 @@ github_config_url = "https://github.com/org/repo"
         // Unsupported distro is rejected.
         assert!(SlurmConfig::load_from_str(
             "cluster_name=\"t\"\n[cluster]\nenabled=true\ndistro=\"k3s\"\n"
-        )
-        .is_err());
-        // ARC enabled without a github_config_url is rejected.
-        assert!(SlurmConfig::load_from_str(
-            "cluster_name=\"t\"\n[cluster]\nenabled=true\n[cluster.arc]\nenabled=true\n"
         )
         .is_err());
         // Disabled cluster: no cluster validation applied even with junk values.

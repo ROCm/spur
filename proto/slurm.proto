@@ -611,6 +611,10 @@ message HeartbeatRequest {
   uint64 free_memory_mb = 3;
   repeated RunningJobStatus running_jobs = 4;
   string node_token = 5;
+  // This node's current WireGuard mesh public key. Re-sent every heartbeat so the controller
+  // learns a key that appears/changes after registration (late mesh, spur0 recreated) and can
+  // include the node in ApplyMesh without a spurd restart. Empty when the node has no mesh key.
+  string wg_pubkey = 6;
 }
 
 message RunningJobStatus {
@@ -693,8 +697,7 @@ message RunStepResponse {
 message ClusterUpRequest {
   // Override the control-plane node; empty = pick from [cluster] config / inventory.
   optional string control_plane_node = 1;
-  // Also install the ARC CI runner scale sets.
-  bool install_arc = 2;
+  reserved 2; // was install_arc — ARC is not installed by spur/k0s
 }
 message ClusterUpResponse {
   bool accepted = 1;
