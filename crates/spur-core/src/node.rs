@@ -268,10 +268,13 @@ pub struct Node {
 }
 
 fn default_weight() -> u32 {
-    1
+    Node::DEFAULT_WEIGHT
 }
 
 impl Node {
+    /// Default scheduling weight for a node with no matching `NodeConfig`.
+    pub const DEFAULT_WEIGHT: u32 = 1;
+
     pub fn new(name: String, resources: ResourceSet) -> Self {
         Self {
             name,
@@ -296,9 +299,17 @@ impl Node {
             port: 6818,
             wg_pubkey: None,
             version: None,
-            weight: 1,
+            weight: Self::DEFAULT_WEIGHT,
             switch_name: None,
         }
+    }
+
+    /// Reset config-derived scheduling policy (features, weight) to defaults.
+    /// Used when a node no longer matches any `NodeConfig` so stale policy does
+    /// not persist. Keeps the "no match" state identical to a freshly created node.
+    pub fn reset_config_policy(&mut self) {
+        self.features.clear();
+        self.weight = Self::DEFAULT_WEIGHT;
     }
 
     /// Whether available inventory can satisfy a count-based request.

@@ -3434,14 +3434,7 @@ impl ClusterManager {
                 }
                 drop(partitions);
 
-                // Apply features/weight from matching NodeConfig (by hostname OR selector)
-                for nc in &self.config.nodes {
-                    if node_config_matches(nc, name, labels) {
-                        node.features = nc.features.clone();
-                        node.weight = nc.weight;
-                        break;
-                    }
-                }
+                self.apply_node_config_policy(&mut node);
 
                 let mut nodes = self.nodes.write();
                 nodes.insert(name.clone(), node);
@@ -3510,14 +3503,7 @@ impl ClusterManager {
                     }
                     node.partitions = matched;
 
-                    // Re-apply NodeConfig features/weight
-                    for nc in &self.config.nodes {
-                        if node_config_matches(nc, &node.name, &node.labels) {
-                            node.features = nc.features.clone();
-                            node.weight = nc.weight;
-                            break;
-                        }
-                    }
+                    self.apply_node_config_policy(node);
                 }
             }
             WalOperation::NodeRemove { name, reason } => {
@@ -3627,6 +3613,20 @@ struct ClusterSnapshot {
 }
 
 impl ClusterManager {
+    /// Apply features/weight from the first matching NodeConfig, reverting to
+    /// node defaults when none matches so stale policy from a previously matching
+    /// entry does not persist.
+    fn apply_node_config_policy(&self, node: &mut Node) {
+        for nc in &self.config.nodes {
+            if node_config_matches(nc, &node.name, &node.labels) {
+                node.features = nc.features.clone();
+                node.weight = nc.weight;
+                return;
+            }
+        }
+        node.reset_config_policy();
+    }
+
     /// Re-evaluate partition membership and NodeConfig policy (features, weight)
     /// for all nodes against the current config. Called after snapshot restore to
     /// handle config changes that occurred between snapshot creation and restart.
@@ -3648,13 +3648,7 @@ impl ClusterManager {
             }
             node.partitions = matched;
 
-            for nc in &self.config.nodes {
-                if node_config_matches(nc, &node.name, &node.labels) {
-                    node.features = nc.features.clone();
-                    node.weight = nc.weight;
-                    break;
-                }
-            }
+            self.apply_node_config_policy(node);
         }
     }
 }
@@ -9920,6 +9914,132 @@ mod tests {
         let node = cm.get_node("gpu-node").unwrap();
         assert_eq!(node.features, vec!["mi300x", "rocm6"]);
         assert_eq!(node.weight, 10);
+    }
+
+    #[test]
+    fn label_update_resets_features_when_no_match() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.nodes = vec![spur_core::config::NodeConfig {
+            names: String::new(),
+            selector: HashMap::from([("gpu".into(), "mi300x".into())]),
+            cpus: 0,
+            memory_mb: 0,
+            gres: Vec::new(),
+            features: vec!["mi300x".into(), "rocm6".into()],
+            address: None,
+            weight: 10,
+        }];
+        let cm = ClusterManager::new(cfg, dir.path()).unwrap();
+
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "gpu-node".into(),
+            resources: ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::from([("gpu".into(), "mi300x".into())]),
+        });
+
+        let node = cm.get_node("gpu-node").unwrap();
+        assert_eq!(node.features, vec!["mi300x", "rocm6"]);
+        assert_eq!(node.weight, 10);
+
+        cm.apply_operation(&WalOperation::NodeLabelsUpdate {
+            name: "gpu-node".into(),
+            set: HashMap::new(),
+            remove: vec!["gpu".into()],
+        });
+
+        let node = cm.get_node("gpu-node").unwrap();
+        assert!(node.features.is_empty());
+        assert_eq!(node.weight, 1);
+    }
+
+    #[test]
+    fn node_register_no_match_uses_defaults() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.nodes = vec![spur_core::config::NodeConfig {
+            names: String::new(),
+            selector: HashMap::from([("gpu".into(), "mi300x".into())]),
+            cpus: 0,
+            memory_mb: 0,
+            gres: Vec::new(),
+            features: vec!["mi300x".into(), "rocm6".into()],
+            address: None,
+            weight: 10,
+        }];
+        let cm = ClusterManager::new(cfg, dir.path()).unwrap();
+
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "cpu-node".into(),
+            resources: ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::from([("gpu".into(), "mi250".into())]),
+        });
+
+        let node = cm.get_node("cpu-node").unwrap();
+        assert!(node.features.is_empty());
+        assert_eq!(node.weight, 1);
+    }
+
+    #[test]
+    fn reconcile_resets_stale_features_on_restore() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.nodes = vec![spur_core::config::NodeConfig {
+            names: String::new(),
+            selector: HashMap::from([("gpu".into(), "mi300x".into())]),
+            cpus: 0,
+            memory_mb: 0,
+            gres: Vec::new(),
+            features: vec!["mi300x".into(), "rocm6".into()],
+            address: None,
+            weight: 10,
+        }];
+        let cm = ClusterManager::new(cfg, dir.path()).unwrap();
+
+        // Snapshot node has stale policy but labels that no longer match the config.
+        let mut stale = Node::new(
+            "gpu-node".into(),
+            ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+        );
+        stale.features = vec!["mi300x".into(), "rocm6".into()];
+        stale.weight = 10;
+        stale.labels = HashMap::new();
+
+        let snap = ClusterSnapshot {
+            jobs: Vec::new(),
+            nodes: vec![stale],
+            reservations: Vec::new(),
+            steps: Vec::new(),
+            license_pool: HashMap::new(),
+            tokens: Vec::new(),
+            burst_buffer_total_gb: 0,
+        };
+        let bytes = serde_json::to_vec(&snap).unwrap();
+        cm.restore_from_snapshot(&bytes).unwrap();
+
+        let node = cm.get_node("gpu-node").unwrap();
+        assert!(node.features.is_empty());
+        assert_eq!(node.weight, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
