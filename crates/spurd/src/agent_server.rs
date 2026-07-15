@@ -251,6 +251,8 @@ impl AgentService {
                     for c in &completed {
                         let context = SpankContext {
                             job_id: c.job_id,
+                            uid: c.uid,
+                            gid: c.gid,
                             ..Default::default()
                         };
                         let mut handle = SpankHandle::new(context, HashMap::new());

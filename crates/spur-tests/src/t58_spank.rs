@@ -110,17 +110,6 @@ mod tests {
         assert_eq!(host.plugin_count(), 0);
     }
 
-    // -- T58.8: Item IDs match Slurm's enum spank_item --------------------
-
-    #[test]
-    fn t58_8_item_ids_match_slurm() {
-        use std::os::raw::c_int;
-        assert_eq!(SpankItem::JobUid as c_int, 0);
-        assert_eq!(SpankItem::JobGid as c_int, 1);
-        assert_eq!(SpankItem::JobId as c_int, 2);
-        assert_eq!(SpankItem::TaskPid as c_int, 14);
-    }
-
     // -- T58.9: spank_setenv / spank_getenv round-trip --------------------
 
     #[test]

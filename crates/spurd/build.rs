@@ -29,10 +29,25 @@ fn main() {
     }
 
     // --undefined forces the linker to pull each symbol from the spur-spank rlib
-    // despite having no caller; --export-dynamic then places them in the dynamic
-    // symbol table so plugin dlsym resolves them.
+    // despite having no caller.
     for sym in SPANK_SYMBOLS {
         println!("cargo::rustc-link-arg-bins=-Wl,--undefined={sym}");
     }
-    println!("cargo::rustc-link-arg-bins=-Wl,--export-dynamic");
+
+    // Export ONLY these symbols into the dynamic symbol table so plugin dlsym
+    // resolves them. A scoped --dynamic-list avoids --export-dynamic exposing
+    // every global in the binary.
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
+    let list_path = std::path::Path::new(&out_dir).join("spank_dynamic_list.ld");
+    let mut list = String::from("{\n");
+    for sym in SPANK_SYMBOLS {
+        list.push_str(&format!("    {sym};\n"));
+    }
+    list.push_str("};\n");
+    std::fs::write(&list_path, list).expect("write dynamic list");
+    println!("cargo::rerun-if-changed=build.rs");
+    println!(
+        "cargo::rustc-link-arg-bins=-Wl,--dynamic-list={}",
+        list_path.display()
+    );
 }
