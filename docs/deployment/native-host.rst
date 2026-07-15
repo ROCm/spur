@@ -148,6 +148,29 @@ Verify:
    spur net status    # WireGuard peers and handshake times
    spur nodes         # All registered nodes
 
+Resource Limits (rlimits)
+-------------------------
+
+By default, ``spurd`` raises ``RLIMIT_MEMLOCK`` to unlimited for every job step
+before dropping to the submitting user. This is required for InfiniBand/RDMA
+verbs (``ibv_reg_mr``, ``ibv_create_cq``) and NCCL collective communication.
+Without it, jobs fail with ``Cannot allocate memory`` from libibverbs.
+
+The default can be changed in ``spur.conf``:
+
+.. code-block:: toml
+
+   [rlimits]
+   memlock = "unlimited"   # default: RDMA/NCCL just works
+   # memlock = "inherit"   # keep whatever spurd inherited
+   # memlock = "1073741824" # fixed cap in bytes
+
+.. note::
+
+   With the default ``"unlimited"`` setting, a ``LimitMEMLOCK=infinity`` line on
+   the ``spurd`` systemd unit is no longer required. The agent raises the limit
+   itself while still privileged.
+
 Submitting Jobs
 ---------------
 

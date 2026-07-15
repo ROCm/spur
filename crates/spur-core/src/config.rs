@@ -103,6 +103,10 @@ pub struct SlurmConfig {
     /// Node admission control.
     #[serde(default)]
     pub admission: AdmissionConfig,
+
+    /// POSIX per-process resource limits applied to job steps at launch.
+    #[serde(default)]
+    pub rlimits: RlimitsConfig,
 }
 
 /// Configuration for auto-update checking and self-update.
@@ -790,6 +794,62 @@ pub enum AdmissionMode {
     Token,
 }
 
+/// POSIX per-process resource limits (`RLIMIT_*`) applied to job steps at launch.
+///
+/// Distinct from QoS/association caps (scheduling policy) and cgroup limits
+/// (derived per-job from the allocation). This is where Tier 2 propagation
+/// controls (`propagate`, `propagate_except`) will live.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RlimitsConfig {
+    /// RLIMIT_MEMLOCK applied to job processes.
+    /// "unlimited" (default) | "inherit" | byte count as string.
+    #[serde(default = "default_memlock")]
+    pub memlock: String,
+}
+
+fn default_memlock() -> String {
+    "unlimited".into()
+}
+
+impl Default for RlimitsConfig {
+    fn default() -> Self {
+        Self {
+            memlock: default_memlock(),
+        }
+    }
+}
+
+/// Parsed value for RLIMIT_MEMLOCK configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemlockLimit {
+    /// Set both soft and hard to RLIM_INFINITY.
+    Unlimited,
+    /// Do not call setrlimit; inherit from spurd's process.
+    Inherit,
+    /// Set both soft and hard to a fixed byte count.
+    Bytes(u64),
+}
+
+impl RlimitsConfig {
+    pub fn memlock_limit(&self) -> Result<MemlockLimit, ConfigError> {
+        match self.memlock.trim().to_lowercase().as_str() {
+            "unlimited" | "" => Ok(MemlockLimit::Unlimited),
+            "inherit" => Ok(MemlockLimit::Inherit),
+            other => match other.parse::<u64>() {
+                Ok(0) => Ok(MemlockLimit::Unlimited),
+                Ok(n) => Ok(MemlockLimit::Bytes(n)),
+                Err(_) => Err(ConfigError::InvalidValue {
+                    field: "rlimits.memlock".into(),
+                    value: format!(
+                        "{:?} (expected \"unlimited\", \"inherit\", or byte count)",
+                        other
+                    ),
+                }),
+            },
+        }
+    }
+}
+
 impl SlurmConfig {
     /// Load from a TOML file.
     pub fn load_from_file(path: &Path) -> Result<Self, ConfigError> {
@@ -1325,5 +1385,78 @@ listen_addr = "[::]:6817"
 "#;
         let config = SlurmConfig::load_from_str(toml).unwrap();
         assert_eq!(config.controller.heartbeat_timeout_secs, None);
+    }
+
+    #[test]
+    fn rlimits_default_is_unlimited() {
+        let cfg = RlimitsConfig::default();
+        assert_eq!(cfg.memlock_limit().unwrap(), MemlockLimit::Unlimited);
+    }
+
+    #[test]
+    fn rlimits_parses_unlimited() {
+        let cfg = RlimitsConfig {
+            memlock: "unlimited".into(),
+        };
+        assert_eq!(cfg.memlock_limit().unwrap(), MemlockLimit::Unlimited);
+    }
+
+    #[test]
+    fn rlimits_parses_inherit() {
+        let cfg = RlimitsConfig {
+            memlock: "inherit".into(),
+        };
+        assert_eq!(cfg.memlock_limit().unwrap(), MemlockLimit::Inherit);
+    }
+
+    #[test]
+    fn rlimits_parses_bytes() {
+        let cfg = RlimitsConfig {
+            memlock: "1048576".into(),
+        };
+        assert_eq!(cfg.memlock_limit().unwrap(), MemlockLimit::Bytes(1048576));
+    }
+
+    #[test]
+    fn rlimits_invalid_errors() {
+        let cfg = RlimitsConfig {
+            memlock: "bogus".into(),
+        };
+        assert!(cfg.memlock_limit().is_err());
+    }
+
+    #[test]
+    fn rlimits_zero_treated_as_unlimited() {
+        let cfg = RlimitsConfig {
+            memlock: "0".into(),
+        };
+        assert_eq!(cfg.memlock_limit().unwrap(), MemlockLimit::Unlimited);
+    }
+
+    #[test]
+    fn rlimits_from_toml_default() {
+        let toml = r#"
+cluster_name = "test"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(
+            config.rlimits.memlock_limit().unwrap(),
+            MemlockLimit::Unlimited
+        );
+    }
+
+    #[test]
+    fn rlimits_from_toml_explicit() {
+        let toml = r#"
+cluster_name = "test"
+
+[rlimits]
+memlock = "inherit"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(
+            config.rlimits.memlock_limit().unwrap(),
+            MemlockLimit::Inherit
+        );
     }
 }

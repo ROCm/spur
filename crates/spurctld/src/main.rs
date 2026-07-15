@@ -344,5 +344,6 @@ fn default_config() -> spur_core::config::SlurmConfig {
         hooks: Default::default(),
         devices: Default::default(),
         admission: Default::default(),
+        rlimits: Default::default(),
     }
 }

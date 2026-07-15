@@ -1836,6 +1836,7 @@ mod tests {
                 hooks: Default::default(),
                 devices: Default::default(),
                 admission: Default::default(),
+                rlimits: Default::default(),
             }
         }
 

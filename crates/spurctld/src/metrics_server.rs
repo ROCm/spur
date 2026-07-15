@@ -181,6 +181,7 @@ mod tests {
             devices: Default::default(),
             admission: Default::default(),
             burst_buffer: Default::default(),
+            rlimits: Default::default(),
         }
     }
 

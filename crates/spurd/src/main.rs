@@ -22,6 +22,34 @@ use spur_devices::DeviceRegistry;
 
 use reporter::NodeReporter;
 
+fn log_memlock_status(memlock: spur_core::config::MemlockLimit) {
+    use spur_core::config::MemlockLimit;
+    let configured_desc = match memlock {
+        MemlockLimit::Unlimited => "unlimited",
+        MemlockLimit::Inherit => "inherit",
+        MemlockLimit::Bytes(_) => "bytes",
+    };
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut current) };
+    let effective = if current.rlim_max == libc::RLIM_INFINITY {
+        "unlimited".to_string()
+    } else {
+        format!("{} bytes", current.rlim_max)
+    };
+    info!(configured = configured_desc, effective_hard = %effective, "memlock rlimit");
+    let is_root = unsafe { libc::geteuid() } == 0;
+    if memlock == MemlockLimit::Unlimited && current.rlim_max != libc::RLIM_INFINITY && !is_root {
+        warn!(
+            effective_hard = %effective,
+            "configured memlock=unlimited but process hard limit is finite; \
+             jobs will get at most the hard limit unless spurd runs as root"
+        );
+    }
+}
+
 /// Parse a "key=value" string into a validated label.
 fn parse_label(s: &str) -> Result<String, String> {
     if s.contains('=') && s.split('=').next().is_some_and(|k| !k.is_empty()) {
@@ -212,8 +240,15 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Start agent gRPC server (receives job launches from spurctld)
+    let memlock = match config.as_ref() {
+        Some(c) => c.rlimits.memlock_limit()?,
+        None => spur_core::config::MemlockLimit::Unlimited,
+    };
+
+    log_memlock_status(memlock);
+
     let agent_service =
-        agent_server::AgentService::new(reporter.clone(), hooks_config, registry.clone());
+        agent_server::AgentService::new(reporter.clone(), hooks_config, registry.clone(), memlock);
     agent_service.start_monitor(args.controller.clone());
 
     let addr = args.listen.parse()?;

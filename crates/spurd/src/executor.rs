@@ -14,6 +14,7 @@ use nix::unistd::Pid;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
+use spur_core::config::MemlockLimit;
 use spur_core::job::JobId;
 use spur_spank::SpankHost;
 
@@ -78,6 +79,8 @@ pub struct JobLaunchConfig {
     pub nodelist: String,
     /// Registry-based device injection plan for host (non-container) jobs.
     pub host_device_plan: Option<spur_devices::inject::HostInjectionPlan>,
+    /// RLIMIT_MEMLOCK to apply before exec (while still privileged).
+    pub memlock: MemlockLimit,
 }
 
 pub struct LaunchResult {
@@ -110,6 +113,35 @@ pub fn decode_wait_status(status: nix::sys::wait::WaitStatus) -> (i32, i32) {
         nix::sys::wait::WaitStatus::Exited(_, code) => (code, 0),
         nix::sys::wait::WaitStatus::Signaled(_, sig, _) => (0, sig as i32),
         _ => (-1, 0), // unreachable from try_wait (only Exited/Signaled reach here); -1 = shouldn't-happen sentinel
+    }
+}
+
+/// Set RLIMIT_MEMLOCK in the current process. Best-effort: a non-root spurd
+/// cannot raise the hard limit beyond what it inherited.
+pub(crate) fn apply_memlock(limit: MemlockLimit) {
+    let v = match limit {
+        MemlockLimit::Inherit => return,
+        MemlockLimit::Unlimited => libc::RLIM_INFINITY,
+        MemlockLimit::Bytes(n) => n as libc::rlim_t,
+    };
+    let rl = libc::rlimit {
+        rlim_cur: v,
+        rlim_max: v,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rl) } == 0 {
+        return;
+    }
+    // Non-root cannot raise hard limit. Fall back: raise soft to current hard.
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut current) } == 0 {
+        let fallback = libc::rlimit {
+            rlim_cur: current.rlim_max,
+            rlim_max: current.rlim_max,
+        };
+        unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &fallback) };
     }
 }
 
@@ -444,6 +476,15 @@ async fn spawn_job_process(
             ] {
                 let _ = signal::sigaction(sig, &dfl);
             }
+            Ok(())
+        });
+    }
+
+    // RLIMIT_MEMLOCK: raise before privilege drop so RDMA/NCCL ibv_reg_mr works.
+    let memlock = cfg.memlock;
+    unsafe {
+        cmd.pre_exec(move || {
+            apply_memlock(memlock);
             Ok(())
         });
     }
@@ -1042,6 +1083,9 @@ async fn launch_container_job(
 
             // Close inherited fds (gRPC sockets, other jobs' files)
             crate::container::close_inherited_fds(ready_w);
+
+            // RLIMIT_MEMLOCK: raise while still root, before container_init drops privileges.
+            apply_memlock(cfg.memlock);
 
             // Run container init: namespaces, mounts, pivot_root, priv drop
             let hook_env = match crate::container::container_init(config, &rootfs) {
