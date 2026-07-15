@@ -31,7 +31,6 @@ use crate::reporter::NodeReporter;
 struct TrackedJob {
     job: executor::RunningJob,
     rootfs_mode: crate::container::RootfsMode,
-    allocation: Option<AllocationResult>,
     stdout_path: String,
     stderr_path: String,
     has_pid_namespace: bool,
@@ -50,7 +49,6 @@ struct CompletedJob {
     exit_code: i32,
     signal: i32,
     rootfs_mode: crate::container::RootfsMode,
-    allocation: Option<AllocationResult>,
     cgroup: Option<std::path::PathBuf>,
     work_dir: String,
     uid: u32,
@@ -177,7 +175,6 @@ impl AgentService {
                                 exit_code,
                                 signal,
                                 rootfs_mode: tracked.rootfs_mode.clone(),
-                                allocation: tracked.allocation.take(),
                                 cgroup,
                                 work_dir: tracked.work_dir.clone(),
                                 uid: tracked.uid,
@@ -203,11 +200,27 @@ impl AgentService {
                     if let Some(ref cgroup) = c.cgroup {
                         crate::executor::cleanup_cgroup(cgroup);
                     }
-                    if let Some(ref alloc) = c.allocation {
-                        allocation.lock().await.release(alloc);
-                    }
+                    allocation.lock().await.release_job(c.job_id);
                     if let Some(pmi) = pmi_servers.lock().await.remove(&c.job_id) {
                         pmi.cleanup();
+                    }
+                }
+
+                // Self-heal: reclaim any allocation that no longer maps to a
+                // tracked job and is not mid-launch. This is the backstop for
+                // SPUR-65 — if any teardown path ever fails to release, the
+                // node recovers on the next tick instead of silently rejecting
+                // dispatches until spurd restart. `jobs` is still held, so the
+                // live set is a consistent snapshot and cannot race a launch
+                // that is committing (commit_job takes the running lock first).
+                {
+                    let live: std::collections::HashSet<u32> = jobs.keys().copied().collect();
+                    let reclaimed = allocation.lock().await.reconcile(&live);
+                    if !reclaimed.is_empty() {
+                        warn!(
+                            ?reclaimed,
+                            "reconciled orphaned resource allocations with no tracked job"
+                        );
                     }
                 }
 
@@ -768,11 +781,13 @@ impl SlurmAgent for AgentService {
             .allocate_local_resources(job_id, &spec, req.allocated.as_ref())
             .await?;
 
-        // Any failure between here and inserting the job into `running` must
-        // release the allocation just recorded by allocate_local_resources —
+        // Any failure between here and committing the job into `running` must
+        // release the allocation just reserved by allocate_local_resources —
         // otherwise the GPUs stay marked in-use with no tracked job to ever
         // free them, and the node silently rejects every future dispatch while
-        // the controller still believes it is IDLE (SPUR-65 stranding).
+        // the controller still believes it is IDLE (SPUR-65 stranding). The
+        // allocation is `launching` until commit_job, so reconcile is also a
+        // backstop, but releasing eagerly here reclaims immediately.
         let injection = {
             let reg = self.device_registry.lock().await;
             reg.build_job_injection_plans("gpu", &allocated_device_ids, spec.uid, spec.gid)
@@ -781,9 +796,7 @@ impl SlurmAgent for AgentService {
             Ok(plans) => plans,
             Err(e) => {
                 error!(job_id, error = %e, "device registry resolution failed");
-                if let Some(ref alloc) = alloc_result {
-                    self.allocation.lock().await.release(alloc);
-                }
+                self.allocation.lock().await.release_job(job_id);
                 return Err(Status::failed_precondition(format!(
                     "device resolution failed: {}",
                     e
@@ -842,13 +855,17 @@ impl SlurmAgent for AgentService {
         match executor::launch_job(&launch_cfg, (*self.spank).as_ref()).await {
             Ok(result) => {
                 let mut jobs = self.running.lock().await;
+                // Commit the reservation: the job now has a tracked process, so
+                // it is no longer exempt from reconcile. Take the running lock
+                // first so a job is never briefly absent from BOTH `running` and
+                // `launching` (which would let reconcile reclaim it).
+                self.allocation.lock().await.commit_job(job_id);
                 info!(job_id, gpus = ?launch_cfg.gpu_devices, "job launched successfully");
                 jobs.insert(
                     job_id,
                     TrackedJob {
                         job: result.job,
                         rootfs_mode: rootfs_mode.clone(),
-                        allocation: alloc_result,
                         stdout_path: result.stdout_path,
                         stderr_path: result.stderr_path,
                         has_pid_namespace: nix::unistd::geteuid().is_root(),
@@ -868,10 +885,7 @@ impl SlurmAgent for AgentService {
                 }))
             }
             Err(e) => {
-                // Release allocation on launch failure
-                if let Some(ref alloc) = alloc_result {
-                    self.allocation.lock().await.release(alloc);
-                }
+                self.allocation.lock().await.release_job(job_id);
 
                 let is_prolog_failure = matches!(e, executor::LaunchError::PrologFailed(_));
                 let err_msg = e.to_string();
@@ -1448,7 +1462,14 @@ impl AgentService {
 
         let mut alloc = self.allocation.lock().await;
 
-        if !controller_gpu_ids.is_empty() && !alloc.record_gpus(&controller_gpu_ids) {
+        let cpus = if spec.cpus_per_task > 0 {
+            spec.cpus_per_task
+        } else {
+            0
+        };
+        let Some(result) =
+            alloc.allocate_for_job(job_id, cpus, spec.memory_per_node_mb, &controller_gpu_ids)
+        else {
             warn!(
                 job_id,
                 requested = ?controller_gpu_ids,
@@ -1459,21 +1480,9 @@ impl AgentService {
             return Err(Status::resource_exhausted(
                 "controller-allocated GPUs unavailable on this node",
             ));
-        }
-
-        let cpu_alloc = if spec.cpus_per_task > 0 {
-            alloc.try_allocate(spec.cpus_per_task.max(1), spec.memory_per_node_mb, 0, None)
-        } else {
-            None
         };
 
-        let gpu_ids = controller_gpu_ids.clone();
-        let result = AllocationResult {
-            cpu_ids: cpu_alloc.map(|a| a.cpu_ids).unwrap_or_default(),
-            gpu_ids: controller_gpu_ids,
-            memory_mb: spec.memory_per_node_mb,
-        };
-
+        let gpu_ids = controller_gpu_ids;
         Ok((Some(result), gpu_ids))
     }
 
@@ -1576,7 +1585,6 @@ impl TrackedJob {
                 cgroup_path: None,
             },
             rootfs_mode: crate::container::RootfsMode::Extracted,
-            allocation: None,
             stdout_path: "/dev/null".into(),
             stderr_path: "/dev/null".into(),
             has_pid_namespace: false,
@@ -2107,7 +2115,6 @@ mod tests {
                 cgroup_path: None,
             },
             rootfs_mode: crate::container::RootfsMode::Extracted,
-            allocation: None,
             stdout_path: "/dev/null".into(),
             stderr_path: "/dev/null".into(),
             has_pid_namespace: false,

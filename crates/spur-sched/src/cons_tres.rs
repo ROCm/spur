@@ -6,6 +6,8 @@
 //! Tracks resources at core/socket/GPU granularity within a node.
 //! This is the equivalent of Slurm's select/cons_tres plugin.
 
+use std::collections::{HashMap, HashSet};
+
 use spur_core::resource::{GpuResource, ResourceSet};
 
 /// Per-node resource allocation state.
@@ -25,6 +27,16 @@ pub struct NodeAllocation {
     pub gpu_allocated: Vec<bool>,
     /// GPU info for type matching.
     pub gpus: Vec<GpuResource>,
+    /// Per-job ownership of what each job holds, so an allocation can be
+    /// released by job id and orphaned allocations can be reconciled away.
+    /// This is the single source of truth for what is allocated — the bitmaps
+    /// above are a derived index for fast free-count queries.
+    owners: HashMap<u32, AllocationResult>,
+    /// Jobs whose resources are reserved but that have not yet been committed
+    /// to the agent's running set (still mid-launch: image pull, fork, etc.).
+    /// Reconcile must never reclaim these — they have no tracked process yet
+    /// but are not orphaned.
+    launching: HashSet<u32>,
 }
 
 impl NodeAllocation {
@@ -38,6 +50,8 @@ impl NodeAllocation {
             allocated_memory_mb: 0,
             gpu_allocated: vec![false; num_gpus],
             gpus: resources.gpus.clone(),
+            owners: HashMap::new(),
+            launching: HashSet::new(),
         }
     }
 
@@ -83,81 +97,11 @@ impl NodeAllocation {
             .count() as u32
     }
 
-    /// Try to allocate resources. Returns allocated core IDs and GPU IDs, or None if insufficient.
-    pub fn try_allocate(
-        &mut self,
-        cpus: u32,
-        memory_mb: u64,
-        gpus: u32,
-        gpu_type: Option<&str>,
-    ) -> Option<AllocationResult> {
-        // Check availability
-        if self.free_cpus() < cpus
-            || self.free_memory_mb() < memory_mb
-            || self.free_gpus(gpu_type) < gpus
-        {
-            return None;
-        }
-
-        // Allocate CPUs (first-fit)
-        let mut cpu_ids = Vec::new();
-        for (i, allocated) in self.allocated_cpus.iter_mut().enumerate() {
-            if !*allocated && cpu_ids.len() < cpus as usize {
-                *allocated = true;
-                cpu_ids.push(i as u32);
-            }
-        }
-
-        // Allocate memory
-        self.allocated_memory_mb += memory_mb;
-
-        // Allocate GPUs (first-fit with type matching). gpu_ids holds device
-        // ids (stable hardware identifiers), not vec positions, so release and
-        // record_gpus can agree on a single meaning.
-        let mut gpu_ids = Vec::new();
-        for i in 0..self.gpu_allocated.len() {
-            if self.gpu_allocated[i] || gpu_ids.len() >= gpus as usize {
-                continue;
-            }
-            if let Some(gtype) = gpu_type {
-                if gtype != "any" && self.gpus.get(i).map(|g| g.gpu_type.as_str()) != Some(gtype) {
-                    continue;
-                }
-            }
-            self.gpu_allocated[i] = true;
-            gpu_ids.push(self.gpus[i].device_id);
-        }
-
-        Some(AllocationResult {
-            cpu_ids,
-            gpu_ids,
-            memory_mb,
-        })
-    }
-
-    /// Record controller-assigned device IDs as in-use. All-or-nothing: if any
-    /// id is unknown or already allocated, no state is changed and false is
-    /// returned (a partial record would leak the earlier ids).
-    pub fn record_gpus(&mut self, device_ids: &[u32]) -> bool {
-        let mut indices = Vec::with_capacity(device_ids.len());
-        for &id in device_ids {
-            let Some(idx) = self.gpus.iter().position(|g| g.device_id == id) else {
-                return false;
-            };
-            if self.gpu_allocated[idx] || indices.contains(&idx) {
-                return false;
-            }
-            indices.push(idx);
-        }
-        for idx in indices {
-            self.gpu_allocated[idx] = true;
-        }
-        true
-    }
-
-    /// Release previously allocated resources. GPU ids are device ids, matched
-    /// against the node's GPU table the same way record_gpus records them.
-    pub fn release(&mut self, alloc: &AllocationResult) {
+    /// Free the bitmaps/counters an allocation held. Internal helper: callers
+    /// go through `release_job` so per-job ownership stays consistent. GPU ids
+    /// are device ids, matched against the node's GPU table the same way
+    /// `allocate_for_job` records them.
+    fn release(&mut self, alloc: &AllocationResult) {
         for &cpu in &alloc.cpu_ids {
             if let Some(a) = self.allocated_cpus.get_mut(cpu as usize) {
                 *a = false;
@@ -169,6 +113,90 @@ impl NodeAllocation {
                 self.gpu_allocated[idx] = false;
             }
         }
+    }
+
+    /// Reserve resources for a job, tracked by job id. GPU device ids are the
+    /// hard gate: if any is unknown or already in use, nothing is reserved and
+    /// None is returned (the caller must reject the dispatch). CPU/memory are
+    /// recorded as usage bookkeeping — the controller is authoritative for
+    /// placement, so an oversubscribed CPU count records what is available
+    /// rather than failing. Memory is always accounted, independent of CPU
+    /// count, so release stays symmetric.
+    ///
+    /// The job is marked `launching` until `commit_job` or `release_job` is
+    /// called, so reconcile never reclaims an in-flight launch.
+    pub fn allocate_for_job(
+        &mut self,
+        job_id: u32,
+        cpus: u32,
+        memory_mb: u64,
+        gpu_device_ids: &[u32],
+    ) -> Option<AllocationResult> {
+        let mut gpu_indices = Vec::with_capacity(gpu_device_ids.len());
+        for &id in gpu_device_ids {
+            let idx = self.gpus.iter().position(|g| g.device_id == id)?;
+            if self.gpu_allocated[idx] || gpu_indices.contains(&idx) {
+                return None;
+            }
+            gpu_indices.push(idx);
+        }
+
+        let mut cpu_ids = Vec::new();
+        for (i, allocated) in self.allocated_cpus.iter_mut().enumerate() {
+            if !*allocated && cpu_ids.len() < cpus as usize {
+                *allocated = true;
+                cpu_ids.push(i as u32);
+            }
+        }
+
+        self.allocated_memory_mb += memory_mb;
+        for &idx in &gpu_indices {
+            self.gpu_allocated[idx] = true;
+        }
+
+        let result = AllocationResult {
+            cpu_ids,
+            gpu_ids: gpu_device_ids.to_vec(),
+            memory_mb,
+        };
+        self.owners.insert(job_id, result.clone());
+        self.launching.insert(job_id);
+        Some(result)
+    }
+
+    /// Mark a job's allocation as committed (its process is now tracked), so it
+    /// is no longer exempt from reconcile.
+    pub fn commit_job(&mut self, job_id: u32) {
+        self.launching.remove(&job_id);
+    }
+
+    /// Release a job's allocation by id. Idempotent: releasing an unknown or
+    /// already-released job is a no-op returning false.
+    pub fn release_job(&mut self, job_id: u32) -> bool {
+        self.launching.remove(&job_id);
+        let Some(alloc) = self.owners.remove(&job_id) else {
+            return false;
+        };
+        self.release(&alloc);
+        true
+    }
+
+    /// Release every owned allocation whose job is neither in `live` nor still
+    /// launching. Returns the reclaimed job ids. This is the self-healing path:
+    /// if a job's teardown ever fails to release (a completion path that dropped
+    /// the job without releasing), its resources are recovered here instead of
+    /// stranding the node until spurd restart (SPUR-65).
+    pub fn reconcile(&mut self, live: &HashSet<u32>) -> Vec<u32> {
+        let orphaned: Vec<u32> = self
+            .owners
+            .keys()
+            .copied()
+            .filter(|id| !live.contains(id) && !self.launching.contains(id))
+            .collect();
+        for &id in &orphaned {
+            self.release_job(id);
+        }
+        orphaned
     }
 }
 
@@ -250,73 +278,33 @@ mod tests {
     #[test]
     fn test_allocate_cpus() {
         let mut node = make_node(64, 256_000, 0, "");
-        let alloc = node.try_allocate(16, 0, 0, None).unwrap();
+        let alloc = node.allocate_for_job(1, 16, 0, &[]).unwrap();
         assert_eq!(alloc.cpu_ids.len(), 16);
         assert_eq!(node.free_cpus(), 48);
     }
 
     #[test]
-    fn test_allocate_gpus() {
+    fn test_allocate_gpus_by_device_id() {
         let mut node = make_node(64, 256_000, 8, "mi300x");
-        let alloc = node.try_allocate(0, 0, 4, Some("mi300x")).unwrap();
-        assert_eq!(alloc.gpu_ids.len(), 4);
-        assert_eq!(node.free_gpus(Some("mi300x")), 4);
-    }
-
-    #[test]
-    fn test_allocate_wrong_gpu_type() {
-        let mut node = make_node(64, 256_000, 8, "mi300x");
-        let result = node.try_allocate(0, 0, 4, Some("h100"));
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_allocate_any_gpu() {
-        let mut node = make_node(64, 256_000, 8, "mi300x");
-        let alloc = node.try_allocate(0, 0, 4, Some("any")).unwrap();
-        assert_eq!(alloc.gpu_ids.len(), 4);
-    }
-
-    #[test]
-    fn test_insufficient_resources() {
-        let mut node = make_node(32, 128_000, 4, "mi300x");
-        assert!(node.try_allocate(64, 0, 0, None).is_none()); // Too many CPUs
-        assert!(node.try_allocate(0, 256_000, 0, None).is_none()); // Too much memory
-        assert!(node.try_allocate(0, 0, 8, None).is_none()); // Too many GPUs
-    }
-
-    #[test]
-    fn test_release() {
-        let mut node = make_node(64, 256_000, 8, "mi300x");
-        let alloc = node.try_allocate(32, 128_000, 4, None).unwrap();
-        assert_eq!(node.free_cpus(), 32);
+        let alloc = node.allocate_for_job(1, 0, 0, &[0, 1, 2, 3]).unwrap();
+        assert_eq!(alloc.gpu_ids, vec![0, 1, 2, 3]);
         assert_eq!(node.free_gpus(None), 4);
-
-        node.release(&alloc);
-        assert_eq!(node.free_cpus(), 64);
-        assert_eq!(node.free_memory_mb(), 256_000);
-        assert_eq!(node.free_gpus(None), 8);
     }
 
     #[test]
     fn test_record_then_release_noncontiguous_device_ids() {
         // Real nodes expose GPUs whose device_id is not its position in the
-        // vec (e.g. DRM render ids 128..135). record_gpus keys by device_id,
-        // so release must too — otherwise the slot is never cleared and the
-        // controller's next legitimate allocation of that device is rejected
-        // forever (SPUR-65: node becomes a black hole -> JobHoldMaxRequeue).
+        // vec (e.g. DRM render ids 128..135). allocate_for_job/release_job key
+        // by device_id, so a released device must return to the free pool —
+        // otherwise the slot is never cleared and the controller's next
+        // legitimate allocation of that device is rejected forever (SPUR-65:
+        // node becomes a black hole -> JobHoldMaxRequeue).
         let mut node = make_node_with_ids(64, 256_000, vec![128, 129, 130, 131], "mi350x");
 
-        // Controller assigns device_ids (not indices), mirroring the agent path.
-        assert!(node.record_gpus(&[129, 131]));
+        assert!(node.allocate_for_job(1, 0, 0, &[129, 131]).is_some());
         assert_eq!(node.free_gpus(None), 2);
 
-        let alloc = AllocationResult {
-            cpu_ids: vec![],
-            gpu_ids: vec![129, 131],
-            memory_mb: 0,
-        };
-        node.release(&alloc);
+        assert!(node.release_job(1));
         assert_eq!(
             node.free_gpus(None),
             4,
@@ -325,39 +313,107 @@ mod tests {
 
         // The whole point: the device is re-allocatable after release.
         assert!(
-            node.record_gpus(&[129, 131]),
-            "device_ids must be re-recordable after release"
+            node.allocate_for_job(2, 0, 0, &[129, 131]).is_some(),
+            "device_ids must be re-allocatable after release"
         );
     }
 
     #[test]
-    fn test_record_gpus_rejects_unknown_device_id() {
+    fn test_allocate_rejects_unknown_device_id() {
         let mut node = make_node_with_ids(64, 256_000, vec![128, 129], "mi350x");
-        assert!(!node.record_gpus(&[200]));
-        // A rejected record must not leave partial state behind.
+        assert!(node.allocate_for_job(1, 0, 0, &[200]).is_none());
+        // A rejected allocation must not leave partial state behind.
         assert_eq!(node.free_gpus(None), 2);
+        assert!(!node.release_job(1));
     }
 
     #[test]
-    fn test_record_gpus_rolls_back_on_partial_conflict() {
-        // If a multi-GPU record hits a conflict partway, it must not leave the
-        // earlier device_ids marked allocated — that is itself a leak.
+    fn test_allocate_rolls_back_on_partial_gpu_conflict() {
+        // If a multi-GPU allocation hits a conflict partway, it must not leave
+        // the earlier device_ids marked allocated — that is itself a leak.
         let mut node = make_node_with_ids(64, 256_000, vec![128, 129, 130], "mi350x");
-        assert!(node.record_gpus(&[129]));
+        assert!(node.allocate_for_job(1, 0, 0, &[129]).is_some());
         // [128, 129] — 129 already taken, so the whole call must fail and 128
         // must remain free.
-        assert!(!node.record_gpus(&[128, 129]));
+        assert!(node.allocate_for_job(2, 0, 0, &[128, 129]).is_none());
         assert!(
-            node.record_gpus(&[128]),
-            "128 must remain free after the failed partial record"
+            node.allocate_for_job(3, 0, 0, &[128]).is_some(),
+            "128 must remain free after the failed partial allocation"
         );
+    }
+
+    #[test]
+    fn test_allocate_for_job_release_by_id() {
+        let mut node = make_node_with_ids(64, 256_000, vec![128, 129, 130, 131], "mi350x");
+        let alloc = node
+            .allocate_for_job(1, 8, 32_000, &[129, 131])
+            .expect("allocation should succeed");
+        assert_eq!(alloc.gpu_ids, vec![129, 131]);
+        assert_eq!(node.free_cpus(), 56);
+        assert_eq!(node.free_gpus(None), 2);
+        assert_eq!(node.free_memory_mb(), 224_000);
+
+        assert!(node.release_job(1));
+        assert_eq!(node.free_cpus(), 64);
+        assert_eq!(node.free_gpus(None), 4);
+        assert_eq!(node.free_memory_mb(), 256_000);
+        // Idempotent: releasing again is a no-op.
+        assert!(!node.release_job(1));
+    }
+
+    #[test]
+    fn test_allocate_for_job_rejects_conflicting_gpu() {
+        let mut node = make_node_with_ids(64, 256_000, vec![0, 1], "mi300x");
+        assert!(node.allocate_for_job(1, 4, 0, &[0]).is_some());
+        // Second job wanting the same device id must fail with no state change.
+        assert!(node.allocate_for_job(2, 4, 0, &[0]).is_none());
+        assert_eq!(node.free_gpus(None), 1);
+        // The failed job left no owner entry.
+        assert!(!node.release_job(2));
+    }
+
+    #[test]
+    fn test_reconcile_reclaims_orphans_but_spares_live_and_launching() {
+        let mut node = make_node_with_ids(64, 256_000, vec![0, 1, 2, 3], "mi300x");
+        // job 1: committed and live.
+        node.allocate_for_job(1, 4, 8_000, &[0]);
+        node.commit_job(1);
+        // job 2: committed but NOT live (its teardown failed to release — the
+        // exact SPUR-65 orphan condition).
+        node.allocate_for_job(2, 4, 8_000, &[1]);
+        node.commit_job(2);
+        // job 3: still launching (reserved, not yet committed) — must be spared.
+        node.allocate_for_job(3, 4, 8_000, &[2]);
+
+        let live: HashSet<u32> = [1].into_iter().collect();
+        let mut reclaimed = node.reconcile(&live);
+        reclaimed.sort();
+        assert_eq!(reclaimed, vec![2], "only the orphan (job 2) is reclaimed");
+
+        // job 1 (live) and job 3 (launching) still hold their resources.
+        assert!(!node.release_job(2), "job 2 already reconciled");
+        assert!(node.release_job(1));
+        assert!(node.release_job(3));
+        assert_eq!(node.free_gpus(None), 4);
+    }
+
+    #[test]
+    fn test_memory_released_symmetrically_with_zero_cpus() {
+        // A job with 0 cpus must still have its memory reserved and released
+        // symmetrically — otherwise release drives allocated_memory_mb below
+        // what was added (the pre-fix drift).
+        let mut node = make_node(64, 256_000, 0, "");
+        node.allocate_for_job(1, 0, 16_000, &[]);
+        assert_eq!(node.free_memory_mb(), 240_000);
+        node.release_job(1);
+        assert_eq!(node.free_memory_mb(), 256_000);
     }
 
     #[test]
     fn test_multiple_allocations() {
         let mut node = make_node(64, 256_000, 8, "mi300x");
-        let a1 = node.try_allocate(16, 64_000, 2, None).unwrap();
-        let a2 = node.try_allocate(16, 64_000, 2, None).unwrap();
+        let a1 = node.allocate_for_job(1, 16, 64_000, &[0, 1]).unwrap();
+        let a2 = node.allocate_for_job(2, 16, 64_000, &[2, 3]).unwrap();
         assert_eq!(node.free_cpus(), 32);
         assert_eq!(node.free_gpus(None), 4);
 
