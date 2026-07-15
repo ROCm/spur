@@ -52,6 +52,16 @@ impl NodeAllocation {
             .saturating_sub(self.allocated_memory_mb)
     }
 
+    /// Device ids of all currently-allocated GPUs (for diagnostics).
+    pub fn allocated_gpu_ids(&self) -> Vec<u32> {
+        self.gpu_allocated
+            .iter()
+            .enumerate()
+            .filter(|(_, &a)| a)
+            .filter_map(|(i, _)| self.gpus.get(i).map(|g| g.device_id))
+            .collect()
+    }
+
     /// Available GPU count (optionally filtered by type).
     pub fn free_gpus(&self, gpu_type: Option<&str>) -> u32 {
         self.gpu_allocated
@@ -101,10 +111,12 @@ impl NodeAllocation {
         // Allocate memory
         self.allocated_memory_mb += memory_mb;
 
-        // Allocate GPUs (first-fit with type matching)
+        // Allocate GPUs (first-fit with type matching). gpu_ids holds device
+        // ids (stable hardware identifiers), not vec positions, so release and
+        // record_gpus can agree on a single meaning.
         let mut gpu_ids = Vec::new();
-        for (i, allocated) in self.gpu_allocated.iter_mut().enumerate() {
-            if *allocated || gpu_ids.len() >= gpus as usize {
+        for i in 0..self.gpu_allocated.len() {
+            if self.gpu_allocated[i] || gpu_ids.len() >= gpus as usize {
                 continue;
             }
             if let Some(gtype) = gpu_type {
@@ -112,8 +124,8 @@ impl NodeAllocation {
                     continue;
                 }
             }
-            *allocated = true;
-            gpu_ids.push(i as u32);
+            self.gpu_allocated[i] = true;
+            gpu_ids.push(self.gpus[i].device_id);
         }
 
         Some(AllocationResult {
@@ -123,21 +135,28 @@ impl NodeAllocation {
         })
     }
 
-    /// Record controller-assigned device IDs as in-use.
+    /// Record controller-assigned device IDs as in-use. All-or-nothing: if any
+    /// id is unknown or already allocated, no state is changed and false is
+    /// returned (a partial record would leak the earlier ids).
     pub fn record_gpus(&mut self, device_ids: &[u32]) -> bool {
+        let mut indices = Vec::with_capacity(device_ids.len());
         for &id in device_ids {
             let Some(idx) = self.gpus.iter().position(|g| g.device_id == id) else {
                 return false;
             };
-            if self.gpu_allocated[idx] {
+            if self.gpu_allocated[idx] || indices.contains(&idx) {
                 return false;
             }
+            indices.push(idx);
+        }
+        for idx in indices {
             self.gpu_allocated[idx] = true;
         }
         true
     }
 
-    /// Release previously allocated resources.
+    /// Release previously allocated resources. GPU ids are device ids, matched
+    /// against the node's GPU table the same way record_gpus records them.
     pub fn release(&mut self, alloc: &AllocationResult) {
         for &cpu in &alloc.cpu_ids {
             if let Some(a) = self.allocated_cpus.get_mut(cpu as usize) {
@@ -145,9 +164,9 @@ impl NodeAllocation {
             }
         }
         self.allocated_memory_mb = self.allocated_memory_mb.saturating_sub(alloc.memory_mb);
-        for &gpu in &alloc.gpu_ids {
-            if let Some(a) = self.gpu_allocated.get_mut(gpu as usize) {
-                *a = false;
+        for &device_id in &alloc.gpu_ids {
+            if let Some(idx) = self.gpus.iter().position(|g| g.device_id == device_id) {
+                self.gpu_allocated[idx] = false;
             }
         }
     }
@@ -190,9 +209,19 @@ mod tests {
     use spur_core::resource::GpuLinkType;
 
     fn make_node(cpus: u32, mem: u64, num_gpus: usize, gpu_type: &str) -> NodeAllocation {
-        let gpus: Vec<GpuResource> = (0..num_gpus)
-            .map(|i| GpuResource {
-                device_id: i as u32,
+        make_node_with_ids(cpus, mem, (0..num_gpus as u32).collect(), gpu_type)
+    }
+
+    fn make_node_with_ids(
+        cpus: u32,
+        mem: u64,
+        device_ids: Vec<u32>,
+        gpu_type: &str,
+    ) -> NodeAllocation {
+        let gpus: Vec<GpuResource> = device_ids
+            .into_iter()
+            .map(|device_id| GpuResource {
+                device_id,
                 gpu_type: gpu_type.into(),
                 memory_mb: 192_000,
                 peer_gpus: vec![],
@@ -267,6 +296,61 @@ mod tests {
         assert_eq!(node.free_cpus(), 64);
         assert_eq!(node.free_memory_mb(), 256_000);
         assert_eq!(node.free_gpus(None), 8);
+    }
+
+    #[test]
+    fn test_record_then_release_noncontiguous_device_ids() {
+        // Real nodes expose GPUs whose device_id is not its position in the
+        // vec (e.g. DRM render ids 128..135). record_gpus keys by device_id,
+        // so release must too — otherwise the slot is never cleared and the
+        // controller's next legitimate allocation of that device is rejected
+        // forever (SPUR-65: node becomes a black hole -> JobHoldMaxRequeue).
+        let mut node = make_node_with_ids(64, 256_000, vec![128, 129, 130, 131], "mi350x");
+
+        // Controller assigns device_ids (not indices), mirroring the agent path.
+        assert!(node.record_gpus(&[129, 131]));
+        assert_eq!(node.free_gpus(None), 2);
+
+        let alloc = AllocationResult {
+            cpu_ids: vec![],
+            gpu_ids: vec![129, 131],
+            memory_mb: 0,
+        };
+        node.release(&alloc);
+        assert_eq!(
+            node.free_gpus(None),
+            4,
+            "released GPUs must return to the free pool"
+        );
+
+        // The whole point: the device is re-allocatable after release.
+        assert!(
+            node.record_gpus(&[129, 131]),
+            "device_ids must be re-recordable after release"
+        );
+    }
+
+    #[test]
+    fn test_record_gpus_rejects_unknown_device_id() {
+        let mut node = make_node_with_ids(64, 256_000, vec![128, 129], "mi350x");
+        assert!(!node.record_gpus(&[200]));
+        // A rejected record must not leave partial state behind.
+        assert_eq!(node.free_gpus(None), 2);
+    }
+
+    #[test]
+    fn test_record_gpus_rolls_back_on_partial_conflict() {
+        // If a multi-GPU record hits a conflict partway, it must not leave the
+        // earlier device_ids marked allocated — that is itself a leak.
+        let mut node = make_node_with_ids(64, 256_000, vec![128, 129, 130], "mi350x");
+        assert!(node.record_gpus(&[129]));
+        // [128, 129] — 129 already taken, so the whole call must fail and 128
+        // must remain free.
+        assert!(!node.record_gpus(&[128, 129]));
+        assert!(
+            node.record_gpus(&[128]),
+            "128 must remain free after the failed partial record"
+        );
     }
 
     #[test]

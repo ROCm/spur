@@ -765,7 +765,7 @@ impl SlurmAgent for AgentService {
         };
 
         let (alloc_result, allocated_device_ids) = self
-            .allocate_local_resources(&spec, req.allocated.as_ref())
+            .allocate_local_resources(job_id, &spec, req.allocated.as_ref())
             .await?;
 
         let (host_device_plan, container_device_plan) = {
@@ -1413,6 +1413,7 @@ impl AgentService {
     /// Record controller-allocated GPUs and allocate local CPU/memory resources.
     async fn allocate_local_resources(
         &self,
+        job_id: u32,
         spec: &JobSpec,
         allocated: Option<&ResourceAllocations>,
     ) -> Result<(Option<AllocationResult>, Vec<u32>), Status> {
@@ -1434,6 +1435,13 @@ impl AgentService {
         let mut alloc = self.allocation.lock().await;
 
         if !controller_gpu_ids.is_empty() && !alloc.record_gpus(&controller_gpu_ids) {
+            warn!(
+                job_id,
+                requested = ?controller_gpu_ids,
+                already_allocated = ?alloc.allocated_gpu_ids(),
+                "rejecting dispatch: controller-allocated GPUs already in use in the local \
+                 allocation table (stale allocation from a prior job would strand this node)"
+            );
             return Err(Status::resource_exhausted(
                 "controller-allocated GPUs unavailable on this node",
             ));
