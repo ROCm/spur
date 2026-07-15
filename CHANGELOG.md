@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.5.0](https://github.com/ROCm/spur/compare/v0.4.1...v0.5.0) (2026-07-15)
+
+
+### Features
+
+* **spur-cli:** add -V/--version support across all binaries and CLI entry points ([#437](https://github.com/ROCm/spur/issues/437)) ([fa358b8](https://github.com/ROCm/spur/commit/fa358b800b0105a6aec233865ac9dffc58cc0fea))
+* **spur-cli:** honor SRUN_/SALLOC_/SLURM_ env-var defaults for srun … ([#421](https://github.com/ROCm/spur/issues/421)) ([ac53a26](https://github.com/ROCm/spur/commit/ac53a26eb6f30a949f9ebef5b011a2b9236e6f55))
+* **spur-cli:** support slurm-buildkite bridge (comment readback, parsable, script args, format literals, squeue --name) ([#443](https://github.com/ROCm/spur/issues/443)) ([bd4abbc](https://github.com/ROCm/spur/commit/bd4abbce80286ec67b4d0cad72644ba3dc0d017a))
+
+
+### Bug Fixes
+
+* **spur-spank:** rename SPANK exports to Slurm-compatible symbols ([#429](https://github.com/ROCm/spur/issues/429)) ([3620047](https://github.com/ROCm/spur/commit/3620047f98595ecb7c9423713089ea3ec56ebeca))
+* **spurctld:** evict job to nodefail on partial multi-node dispatch failure ([#426](https://github.com/ROCm/spur/issues/426)) ([0a08108](https://github.com/ROCm/spur/commit/0a08108998b7d8408322a728f6416ef017fab0d2))
+* **spurctld:** raise grpc message-size limits and cap job submission size ([#442](https://github.com/ROCm/spur/issues/442)) ([91ab393](https://github.com/ROCm/spur/commit/91ab39334ded92081b2f0a06abb200e89ff9a10a))
+* **spurctld:** stop counting preemption requeues against the failure-requeue hold limit ([#431](https://github.com/ROCm/spur/issues/431)) ([35485a2](https://github.com/ROCm/spur/commit/35485a277ad95c5c0a58ab3993248d9403c6e53c))
+* **spurctld:** wire QOS priority into scheduling and preemption ([#430](https://github.com/ROCm/spur/issues/430)) ([8923528](https://github.com/ROCm/spur/commit/892352891052b5c787c7eabb58f94a698e3cc677))
+* **spurd:** raise RLIMIT_MEMLOCK for job steps (default unlimited) ([#449](https://github.com/ROCm/spur/issues/449)) ([d49634d](https://github.com/ROCm/spur/commit/d49634d2ddf94fc74c4273e0e3379be142febe56))
+
 ## [0.4.1](https://github.com/ROCm/spur/compare/v0.4.0...v0.4.1) (2026-07-10)
 
 
