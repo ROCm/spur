@@ -243,7 +243,12 @@ impl ClusterManager {
         apply_default_account(&mut spec, &self.association_cache);
         validate_user_account(&spec, &self.association_cache)?;
         self.validate_partition(&spec)?;
-        apply_default_qos(&mut spec, &self.association_cache, &self.qos_cache)?;
+        apply_default_qos(
+            &mut spec,
+            &self.association_cache,
+            &self.qos_cache,
+            &self.config.accounting,
+        )?;
 
         // Checked after defaults are applied so we measure the final spec.
         // Array expansion only adds bounded integer metadata per task, so a
@@ -4189,10 +4194,16 @@ fn validate_user_account(
 /// Resolve a job's effective QOS at submission time (mirrors
 /// `apply_default_partition`). An explicit `--qos` naming an unknown QOS is
 /// rejected; a stale association default degrades silently instead.
+/// Resolve a job's QOS at submit, in Slurm's order: explicit `--qos`
+/// (must exist) → association default QOS → cluster-wide fallback
+/// (`accounting.default_qos`). If none resolves and `accounting.require_qos`
+/// is set, the job is rejected (mirrors `AccountingStorageEnforce=qos`);
+/// otherwise it is accepted with no QOS (existing behavior).
 fn apply_default_qos(
     spec: &mut JobSpec,
     assoc_cache: &AssociationCache,
     qos_cache: &QosCache,
+    accounting: &spur_core::config::AccountingConfig,
 ) -> Result<(), SubmitError> {
     if let Some(name) = spec.qos.as_deref().filter(|n| !n.is_empty()) {
         if qos_cache.get(name).is_none() {
@@ -4203,13 +4214,11 @@ fn apply_default_qos(
 
     let given_account = spec.account.as_deref().filter(|a| !a.is_empty());
     let (account, default_qos) = assoc_cache.resolve(&spec.user, given_account);
-    let Some(default_qos) = default_qos else {
-        return Ok(());
-    };
-
-    if qos_cache.get(&default_qos).is_some() {
-        spec.qos = Some(default_qos);
-    } else {
+    if let Some(default_qos) = default_qos {
+        if qos_cache.get(&default_qos).is_some() {
+            spec.qos = Some(default_qos);
+            return Ok(());
+        }
         warn!(
             user = %spec.user,
             account = account.as_deref().unwrap_or_default(),
@@ -4217,6 +4226,28 @@ fn apply_default_qos(
             "association default QOS no longer exists, ignoring"
         );
     }
+
+    // Cluster-wide fallback: the last link so a QOS (and its limits) applies
+    // even when no association default is set. A misconfigured fallback (names
+    // a QOS that doesn't exist) is a hard error — silently ignoring it would
+    // reintroduce the very enforcement gap this closes.
+    let fallback = accounting.default_qos.trim();
+    if !fallback.is_empty() {
+        if qos_cache.get(fallback).is_none() {
+            return Err(SubmitError::invalid(format!(
+                "configured default QOS '{fallback}' does not exist"
+            )));
+        }
+        spec.qos = Some(fallback.to_string());
+        return Ok(());
+    }
+
+    if accounting.require_qos {
+        return Err(SubmitError::invalid(
+            "no QOS specified and no default QOS is configured for this user/account",
+        ));
+    }
+
     Ok(())
 }
 
@@ -9184,6 +9215,20 @@ mod tests {
         cache
     }
 
+    // Inert accounting config: no cluster fallback, require_qos off — the
+    // pre-SPUR-64 behavior, so existing tests keep asserting the base chain.
+    fn acct_cfg() -> spur_core::config::AccountingConfig {
+        spur_core::config::AccountingConfig::default()
+    }
+
+    fn acct_cfg_with(default_qos: &str, require_qos: bool) -> spur_core::config::AccountingConfig {
+        spur_core::config::AccountingConfig {
+            default_qos: default_qos.into(),
+            require_qos,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn apply_default_qos_explicit_valid_passes_through() {
         let assoc = AssociationCache::new();
@@ -9191,7 +9236,7 @@ mod tests {
         let mut spec = basic_spec("j");
         spec.qos = Some("highprio".into());
 
-        super::apply_default_qos(&mut spec, &assoc, &qos).unwrap();
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
         assert_eq!(spec.qos.as_deref(), Some("highprio"));
     }
 
@@ -9202,7 +9247,7 @@ mod tests {
         let mut spec = basic_spec("j");
         spec.qos = Some("doesnotexist".into());
 
-        let err = super::apply_default_qos(&mut spec, &assoc, &qos).unwrap_err();
+        let err = super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap_err();
         assert_eq!(
             err,
             SubmitError::invalid("QOS 'doesnotexist' does not exist")
@@ -9217,7 +9262,7 @@ mod tests {
         let mut spec = basic_spec("j");
         spec.account = Some("research".into());
 
-        super::apply_default_qos(&mut spec, &assoc, &qos).unwrap();
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
         assert_eq!(spec.qos.as_deref(), Some("highprio"));
     }
 
@@ -9261,7 +9306,7 @@ mod tests {
         // No --account given at all.
         assert!(spec.account.is_none());
 
-        super::apply_default_qos(&mut spec, &assoc, &qos).unwrap();
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
         assert_eq!(spec.qos.as_deref(), Some("highprio"));
     }
 
@@ -9272,7 +9317,7 @@ mod tests {
         let mut spec = basic_spec("j");
         spec.account = Some("research".into());
 
-        super::apply_default_qos(&mut spec, &assoc, &qos).unwrap();
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
         assert_eq!(spec.qos, None);
     }
 
@@ -9285,8 +9330,94 @@ mod tests {
         let mut spec = basic_spec("j");
         spec.account = Some("research".into());
 
-        super::apply_default_qos(&mut spec, &assoc, &qos).unwrap();
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
         assert_eq!(spec.qos, None, "must not fail submission on stale data");
+    }
+
+    #[test]
+    fn apply_default_qos_falls_back_to_cluster_default() {
+        // SPUR-64: no --qos, no association default → cluster fallback applies
+        // so a QOS (and its limits) is enforced instead of running limitless.
+        let assoc = AssociationCache::new();
+        let qos = qos_cache_with(&["normal"]);
+        let mut spec = basic_spec("j");
+
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg_with("normal", false)).unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("normal"));
+    }
+
+    #[test]
+    fn apply_default_qos_association_default_beats_cluster_default() {
+        let assoc = AssociationCache::new();
+        assoc.insert_default_qos("testuser", "research", "highprio");
+        let qos = qos_cache_with(&["highprio", "normal"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg_with("normal", false)).unwrap();
+        assert_eq!(
+            spec.qos.as_deref(),
+            Some("highprio"),
+            "association default takes precedence over the cluster fallback"
+        );
+    }
+
+    #[test]
+    fn apply_default_qos_nonexistent_cluster_default_is_rejected() {
+        // A misconfigured fallback must hard-error, not silently leave the job
+        // unenforced (that would reintroduce the SPUR-64 gap).
+        let assoc = AssociationCache::new();
+        let qos = qos_cache_with(&["normal"]);
+        let mut spec = basic_spec("j");
+
+        let err = super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg_with("ghost", false))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid("configured default QOS 'ghost' does not exist")
+        );
+    }
+
+    #[test]
+    fn apply_default_qos_require_qos_rejects_when_none_resolves() {
+        // SPUR-64: with require_qos and no fallback, a job that resolves to no
+        // QOS is rejected at submit (mirrors AccountingStorageEnforce=qos).
+        let assoc = AssociationCache::new();
+        let qos = QosCache::new();
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        let err = super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg_with("", true))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid(
+                "no QOS specified and no default QOS is configured for this user/account"
+            )
+        );
+    }
+
+    #[test]
+    fn apply_default_qos_require_qos_satisfied_by_cluster_default() {
+        // With both set, the fallback satisfies require_qos — no rejection.
+        let assoc = AssociationCache::new();
+        let qos = qos_cache_with(&["normal"]);
+        let mut spec = basic_spec("j");
+
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg_with("normal", true)).unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("normal"));
+    }
+
+    #[test]
+    fn apply_default_qos_require_qos_satisfied_by_explicit() {
+        // An explicit valid QOS satisfies require_qos regardless of fallback.
+        let assoc = AssociationCache::new();
+        let qos = qos_cache_with(&["highprio"]);
+        let mut spec = basic_spec("j");
+        spec.qos = Some("highprio".into());
+
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg_with("", true)).unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("highprio"));
     }
 
     // ── array-parent dependency: cancel + display synthesis ──────
