@@ -209,4 +209,41 @@ mod tests {
 
         assert_eq!(err.code(), tonic::Code::OutOfRange);
     }
+
+    /// The Raft-internal service accepts messages up to `RAFT_MAX_MESSAGE_SIZE`
+    /// (32 MiB) while the client-facing surface caps inbound requests at
+    /// `MAX_GRPC_REQUEST_SIZE` (8 MiB). This test verifies that the raft-internal
+    /// server still accepts a message above the client-facing cap but below the
+    /// raft cap, guarding against accidental re-tightening.
+    #[tokio::test]
+    async fn raft_server_accepts_above_client_cap() {
+        let addr = spawn(raft_server(EchoRaft)).await;
+        let mut client = crate::raft::raft_client(connect(addr).await);
+
+        let payload = vec![0u8; 12 * 1024 * 1024];
+        let resp = client
+            .append_entries(RaftRequest {
+                payload: payload.clone(),
+            })
+            .await
+            .expect("12 MiB should be accepted by raft-internal (32 MiB cap)");
+
+        let echoed = u64::from_le_bytes(resp.into_inner().payload.try_into().unwrap());
+        assert_eq!(echoed as usize, payload.len());
+    }
+
+    /// Verify the constant relationship: client-facing request cap is
+    /// significantly tighter than the raft-internal cap.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn request_size_tighter_than_raft_size() {
+        assert!(
+            spur_proto::MAX_GRPC_REQUEST_SIZE < RAFT_MAX_MESSAGE_SIZE,
+            "client-facing request cap must be below raft-internal cap"
+        );
+        assert!(
+            spur_proto::MAX_GRPC_REQUEST_SIZE <= spur_proto::MAX_GRPC_MESSAGE_SIZE / 4,
+            "request cap should be at most 1/4 of the response cap"
+        );
+    }
 }

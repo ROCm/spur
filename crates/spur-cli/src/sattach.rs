@@ -79,7 +79,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .await
         .context(format!("failed to connect to agent at {}", agent_addr))?
         .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-        .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE);
+        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
 
     if args.output_only {
         // Output-only mode: stream stdout/stderr without stdin

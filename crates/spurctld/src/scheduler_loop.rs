@@ -532,7 +532,7 @@ async fn forward_to_federation(cluster: &ClusterManager, jobs: &[spur_core::job:
                 .await
                 .map(|c| {
                     c.max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-                        .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+                        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE)
                 }) {
                 Ok(mut client) => {
                     let req = SubmitJobRequest {
@@ -682,7 +682,7 @@ async fn dispatch_to_agent(
     let mut client = SlurmAgentClient::connect(agent_addr.to_string())
         .await?
         .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-        .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE);
+        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
 
     let spec = params.spec;
     let proto_spec = ProtoJobSpec {
@@ -1256,7 +1256,7 @@ async fn cancel_one_agent(agent_addr: String, job_id: spur_core::job::JobId, sig
             .await
             .map(|c| {
                 c.max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-                    .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+                    .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE)
             }) {
             Ok(mut client) => {
                 if let Err(e) = client
@@ -1319,7 +1319,7 @@ pub async fn send_suspend_to_agents(
                 .await
                 .map(|c| {
                     c.max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-                        .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+                        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE)
                 }) {
                 Ok(mut client) => {
                     if let Err(e) = client

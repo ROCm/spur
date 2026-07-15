@@ -239,12 +239,16 @@ impl ClusterManager {
 
     /// Submit a new job. If it has an array spec, expand into individual tasks.
     pub fn submit_job(&self, mut spec: JobSpec) -> Result<JobId, SubmitError> {
-        check_submission_size(&spec)?;
         apply_default_partition(&mut spec, &self.partitions.read());
         apply_default_account(&mut spec, &self.association_cache);
         validate_user_account(&spec, &self.association_cache)?;
         self.validate_partition(&spec)?;
         apply_default_qos(&mut spec, &self.association_cache, &self.qos_cache)?;
+
+        // Checked after defaults are applied so we measure the final spec.
+        // Array expansion only adds bounded integer metadata per task, so a
+        // single pre-expansion check still bounds each Raft log entry.
+        check_submission_size(&spec)?;
 
         // Reject unknown/malformed dependency types up front so users get a
         // clear error instead of a silently-deadlocked job (e.g. `expand:N`).

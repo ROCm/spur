@@ -641,6 +641,13 @@ impl openraft::RaftNetwork<SpurTypeConfig> for SpurNetworkConnection {
             ))
         })?;
 
+        if payload.len() > RAFT_MAX_MESSAGE_SIZE {
+            let hint = (rpc.entries.len() as u64 / 2).max(1);
+            return Err(openraft::error::RPCError::PayloadTooLarge(
+                openraft::error::PayloadTooLarge::new_entries_hint(hint),
+            ));
+        }
+
         let client = self.get_client().await?;
         let resp = client
             .append_entries(spur_proto::raft_proto::RaftRequest { payload })
@@ -1274,5 +1281,95 @@ mod tests {
         // A rejected snapshot must never reach disk: persisting it first would
         // make the next (strict-by-default) startup hard-fail on it forever.
         assert!(!dir.path().join("raft").join("snapshot.json").exists());
+    }
+
+    #[tokio::test]
+    async fn append_entries_rejects_oversized_batch_with_payload_too_large() {
+        use openraft::network::RPCOption;
+        use openraft::RaftNetwork;
+        use spur_core::job::JobSpec;
+
+        let mut conn = SpurNetworkConnection {
+            target: 99,
+            addr: "http://127.0.0.1:1".into(),
+            client: None,
+        };
+
+        let big_spec = JobSpec {
+            script: Some("x".repeat(2 * 1024 * 1024)),
+            ..Default::default()
+        };
+        let entry = Entry::<SpurTypeConfig> {
+            log_id: LogId {
+                leader_id: openraft::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index: 1,
+            },
+            payload: EntryPayload::Normal(WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(big_spec),
+            }),
+        };
+
+        let rpc = openraft::raft::AppendEntriesRequest::<SpurTypeConfig> {
+            vote: Vote::new(1, 1),
+            prev_log_id: None,
+            entries: vec![entry; 20],
+            leader_commit: None,
+        };
+
+        let option = RPCOption::new(std::time::Duration::from_secs(5));
+        let result = conn.append_entries(rpc, option).await;
+
+        let err = result.expect_err("oversized batch should be rejected");
+        match err {
+            openraft::error::RPCError::PayloadTooLarge(too_large) => {
+                assert_eq!(too_large.entries_hint(), 10);
+            }
+            other => panic!("expected PayloadTooLarge, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn append_entries_accepts_small_batch() {
+        use openraft::network::RPCOption;
+        use openraft::RaftNetwork;
+
+        let mut conn = SpurNetworkConnection {
+            target: 99,
+            addr: "http://127.0.0.1:1".into(),
+            client: None,
+        };
+
+        let entry = Entry::<SpurTypeConfig> {
+            log_id: LogId {
+                leader_id: openraft::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index: 1,
+            },
+            payload: EntryPayload::Blank,
+        };
+
+        let rpc = openraft::raft::AppendEntriesRequest::<SpurTypeConfig> {
+            vote: Vote::new(1, 1),
+            prev_log_id: None,
+            entries: vec![entry],
+            leader_commit: None,
+        };
+
+        let option = RPCOption::new(std::time::Duration::from_secs(5));
+        let result = conn.append_entries(rpc, option).await;
+
+        // Small batch passes the size guard but fails to connect (bogus address).
+        // The error should be Unreachable (connection failure), NOT PayloadTooLarge.
+        let err = result.expect_err("should fail to connect to bogus address");
+        assert!(
+            matches!(err, openraft::error::RPCError::Unreachable(_)),
+            "expected Unreachable, got: {err:?}"
+        );
     }
 }

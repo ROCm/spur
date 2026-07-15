@@ -82,7 +82,7 @@ impl LeaderProxy {
             .await
             .map_err(|e| Status::unavailable(format!("cannot reach leader: {e}")))?
             .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-            .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE);
+            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
 
         *cached = Some((leader_id, client.clone()));
         Ok(client)
@@ -1372,7 +1372,7 @@ impl SlurmController for ControllerService {
                 Status::unavailable(format!("cannot reach agent at {}: {}", agent_addr, e))
             })?
             .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-            .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE);
+            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
 
         let resp = agent
             .exec_in_job(ExecInJobRequest {
@@ -1434,7 +1434,7 @@ impl SlurmController for ControllerService {
                 Status::unavailable(format!("cannot reach agent at {}: {}", agent_addr, e))
             })?
             .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-            .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE);
+            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
 
         let agent_resp = agent
             .run_command(RunCommandRequest {

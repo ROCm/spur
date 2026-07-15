@@ -415,7 +415,7 @@ async fn try_stream_output(
     let mut agent = match SlurmAgentClient::connect(agent_addr).await {
         Ok(c) => c
             .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-            .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE),
+            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE),
         Err(_) => return false,
     };
 
