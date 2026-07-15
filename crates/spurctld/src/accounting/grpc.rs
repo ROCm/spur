@@ -22,7 +22,7 @@ impl AccountingService {
 
 /// Build a ready-to-register tonic service for embedding in another server.
 pub fn accounting_server(pool: PgPool) -> SlurmAccountingServer<AccountingService> {
-    SlurmAccountingServer::new(AccountingService::new(pool))
+    spur_proto::accounting_server(AccountingService::new(pool))
 }
 
 #[tonic::async_trait]

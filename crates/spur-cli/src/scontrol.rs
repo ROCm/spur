@@ -3,11 +3,9 @@
 
 use std::collections::HashMap;
 
+use crate::exit_fmt::{format_exit, render_reason};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
-
-use crate::exit_fmt::{format_exit, render_reason};
 
 /// Administrative control commands.
 #[derive(Parser, Debug)]
@@ -174,7 +172,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             let channel = spur_client::connect_channel(&args.controller)
                 .await
                 .context("failed to connect to spurctld")?;
-            let mut client = SlurmControllerClient::new(channel);
+            let mut client = spur_proto::controller_client(channel);
             client
                 .cancel_job(spur_proto::proto::CancelJobRequest {
                     job_id,
@@ -190,7 +188,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             let channel = spur_client::connect_channel(&args.controller)
                 .await
                 .context("failed to connect to spurctld")?;
-            let mut client = SlurmControllerClient::new(channel);
+            let mut client = spur_proto::controller_client(channel);
             client
                 .suspend_job(spur_proto::proto::SuspendJobRequest {
                     job_id,
@@ -205,7 +203,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             let channel = spur_client::connect_channel(&args.controller)
                 .await
                 .context("failed to connect to spurctld")?;
-            let mut client = SlurmControllerClient::new(channel);
+            let mut client = spur_proto::controller_client(channel);
             client
                 .resume_job(spur_proto::proto::ResumeJobRequest {
                     job_id,
@@ -257,7 +255,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             let channel = spur_client::connect_channel(&args.controller)
                 .await
                 .context("failed to connect to spurctld")?;
-            let mut client = SlurmControllerClient::new(channel);
+            let mut client = spur_proto::controller_client(channel);
             client
                 .update_reservation(spur_proto::proto::UpdateReservationRequest {
                     name: name.clone(),
@@ -284,7 +282,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
     let channel = spur_client::connect_channel(controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
+    let mut client = spur_proto::controller_client(channel);
 
     match entity.to_lowercase().as_str() {
         "job" | "jobs" => {
@@ -531,7 +529,7 @@ async fn ping(controller: &str) -> Result<()> {
     let channel = spur_client::connect_channel(controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
+    let mut client = spur_proto::controller_client(channel);
 
     let resp = client.ping(()).await.context("ping failed")?;
 
@@ -573,7 +571,7 @@ async fn send_job_update(controller: &str, req: spur_proto::proto::UpdateJobRequ
     let channel = spur_client::connect_channel(controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
+    let mut client = spur_proto::controller_client(channel);
 
     client.update_job(req).await.context("update failed")?;
 
@@ -661,7 +659,7 @@ async fn update_node(
     let channel = spur_client::connect_channel(controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
+    let mut client = spur_proto::controller_client(channel);
 
     let proto_state = state.map(|s| match s.to_lowercase().as_str() {
         "idle" | "resume" => spur_proto::proto::NodeState::NodeIdle as i32,
@@ -706,7 +704,7 @@ async fn create_reservation(
     let channel = spur_client::connect_channel(controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
+    let mut client = spur_proto::controller_client(channel);
 
     let node_list: Vec<String> = nodes
         .split(',')
@@ -751,7 +749,7 @@ async fn delete_reservation(controller: &str, name: &str) -> Result<()> {
     let channel = spur_client::connect_channel(controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
+    let mut client = spur_proto::controller_client(channel);
 
     client
         .delete_reservation(spur_proto::proto::DeleteReservationRequest {

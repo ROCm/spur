@@ -4,7 +4,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
-use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{AttachJobInput, GetJobRequest, JobState, StreamJobOutputRequest};
 use std::io::Write;
 
@@ -50,7 +49,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
+    let mut client = spur_proto::controller_client(channel);
 
     // Look up the job to find which node it is running on
     let job = client
@@ -78,7 +77,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let agent_addr = format!("http://{}:6818", first_node);
     let mut agent = SlurmAgentClient::connect(agent_addr.clone())
         .await
-        .context(format!("failed to connect to agent at {}", agent_addr))?;
+        .context(format!("failed to connect to agent at {}", agent_addr))?
+        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
 
     if args.output_only {
         // Output-only mode: stream stdout/stderr without stdin

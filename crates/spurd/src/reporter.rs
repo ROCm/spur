@@ -8,7 +8,6 @@ use std::sync::RwLock;
 use anyhow::Context;
 use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
 use spur_devices::{resolve_link_type, DeviceRegistry, LinkType};
-use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{RegisterAgentRequest, ResourceSet as ProtoResourceSet};
 use tracing::{debug, info, warn};
 
@@ -52,7 +51,7 @@ impl NodeReporter {
         let channel = spur_client::connect_channel(&self.controller_addr)
             .await
             .context("failed to connect to spurctld for registration")?;
-        let mut client = SlurmControllerClient::new(channel);
+        let mut client = spur_proto::controller_client(channel);
 
         let resp = client
             .register_agent(RegisterAgentRequest {
@@ -87,7 +86,7 @@ impl NodeReporter {
         let channel = spur_client::connect_channel(&self.controller_addr)
             .await
             .context("failed to connect to spurctld for deregistration")?;
-        let mut client = SlurmControllerClient::new(channel);
+        let mut client = spur_proto::controller_client(channel);
 
         client
             .deregister_agent(spur_proto::proto::DeregisterAgentRequest {
@@ -116,7 +115,7 @@ impl NodeReporter {
 
             match spur_client::connect_channel(&self.controller_addr).await {
                 Ok(channel) => {
-                    let mut client = SlurmControllerClient::new(channel);
+                    let mut client = spur_proto::controller_client(channel);
                     match client
                         .heartbeat(spur_proto::proto::HeartbeatRequest {
                             hostname: self.hostname.clone(),

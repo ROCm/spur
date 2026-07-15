@@ -3,7 +3,6 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use spur_proto::proto::slurm_accounting_client::SlurmAccountingClient;
 use spur_proto::proto::{GetUsageRequest, ListAccountsRequest, ListUsersRequest};
 
 /// Display fair-share information by account and user.
@@ -45,7 +44,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to controller")?;
-    let mut client = SlurmAccountingClient::new(channel);
+    let mut client = spur_proto::accounting_client(channel);
 
     // Get accounts
     let accounts_resp = client

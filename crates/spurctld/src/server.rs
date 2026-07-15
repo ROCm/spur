@@ -14,7 +14,7 @@ use tracing::warn;
 use spur_core::job::NodeCompleteError;
 use spur_core::reservation::Reservation;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
-use spur_proto::proto::slurm_controller_server::{SlurmController, SlurmControllerServer};
+use spur_proto::proto::slurm_controller_server::SlurmController;
 use spur_proto::proto::*;
 
 use crate::cluster::{ClusterManager, ReservationError};
@@ -80,7 +80,9 @@ impl LeaderProxy {
 
         let client = SlurmControllerClient::connect(url)
             .await
-            .map_err(|e| Status::unavailable(format!("cannot reach leader: {e}")))?;
+            .map_err(|e| Status::unavailable(format!("cannot reach leader: {e}")))?
+            .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
 
         *cached = Some((leader_id, client.clone()));
         Ok(client)
@@ -1368,7 +1370,9 @@ impl SlurmController for ControllerService {
             .await
             .map_err(|e| {
                 Status::unavailable(format!("cannot reach agent at {}: {}", agent_addr, e))
-            })?;
+            })?
+            .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
 
         let resp = agent
             .exec_in_job(ExecInJobRequest {
@@ -1428,7 +1432,9 @@ impl SlurmController for ControllerService {
             .await
             .map_err(|e| {
                 Status::unavailable(format!("cannot reach agent at {}: {}", agent_addr, e))
-            })?;
+            })?
+            .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
 
         let agent_resp = agent
             .run_command(RunCommandRequest {
@@ -1503,7 +1509,7 @@ pub async fn serve(
 
     let mut builder = tonic::transport::Server::builder().layer(stats_layer);
 
-    let mut router = builder.add_service(SlurmControllerServer::new(service));
+    let mut router = builder.add_service(spur_proto::controller_server(service));
     if let Some(pool) = accounting_pool {
         router = router.add_service(crate::accounting::accounting_server(pool));
     }

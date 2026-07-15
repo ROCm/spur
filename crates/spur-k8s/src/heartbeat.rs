@@ -81,7 +81,10 @@ async fn connect(addr: &str) -> anyhow::Result<SlurmControllerClient<tonic::tran
     } else {
         format!("http://{}", addr)
     };
-    Ok(SlurmControllerClient::connect(url).await?)
+    Ok(SlurmControllerClient::connect(url)
+        .await?
+        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+        .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE))
 }
 
 #[cfg(test)]

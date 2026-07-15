@@ -369,8 +369,6 @@ async fn report_completion(
     reporting_node: &str,
     drain: Option<&DrainRequest>,
 ) {
-    use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
-
     // Wire `state` is derived from `exit_code` alone (advisory): a signaled job
     // reports Completed/0 because the controller's validator requires
     // state<->exit_code agreement. The controller rederives the true Failed /
@@ -382,7 +380,7 @@ async fn report_completion(
     for attempt in 1..=3 {
         match spur_client::connect_channel(controller_addr).await {
             Ok(channel) => {
-                let mut client = SlurmControllerClient::new(channel);
+                let mut client = spur_proto::controller_client(channel);
                 let req = ReportJobStatusRequest {
                     job_id,
                     state,

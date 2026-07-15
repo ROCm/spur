@@ -6,7 +6,8 @@
 //! Establishes a [`tonic::transport::Channel`] from a comma-separated list of
 //! endpoints, rotating to the next endpoint when one is unreachable. The helper
 //! is service-agnostic: callers wrap the returned channel in whatever generated
-//! client they need (e.g. `SlurmControllerClient::new(channel)`).
+//! client they need (e.g. `spur_proto::controller_client(channel)`, which
+//! applies the shared `MAX_GRPC_MESSAGE_SIZE` limit).
 
 use std::time::Duration;
 

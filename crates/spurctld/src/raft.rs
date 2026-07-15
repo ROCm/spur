@@ -35,6 +35,32 @@ openraft::declare_raft_types!(
 
 pub type SpurRaft = Raft<SpurTypeConfig>;
 
+/// Maximum size of a single Raft gRPC message (request or response), in bytes.
+///
+/// tonic defaults both encode and decode limits to 4 MiB. Snapshots ship in
+/// chunks of `RAFT_SNAPSHOT_MAX_CHUNK_SIZE` raw bytes, and `serde_json` inflates
+/// the chunk's `Vec<u8>` payload roughly 3.4x (each byte becomes a decimal
+/// integer plus a comma), so the largest message we ever put on the wire is
+/// about `3.4 * RAFT_SNAPSHOT_MAX_CHUNK_SIZE`. This limit keeps large headroom
+/// over that bound. Invariant: `4 * RAFT_SNAPSHOT_MAX_CHUNK_SIZE < RAFT_MAX_MESSAGE_SIZE`.
+pub const RAFT_MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
+
+/// Raw bytes per `install_snapshot` chunk. Bounded so the JSON-encoded message
+/// stays well under `RAFT_MAX_MESSAGE_SIZE` (see the invariant above). A larger
+/// snapshot simply ships in more chunks.
+pub const RAFT_SNAPSHOT_MAX_CHUNK_SIZE: u64 = 1024 * 1024;
+
+/// Build a Raft gRPC client with message-size limits raised to
+/// `RAFT_MAX_MESSAGE_SIZE`. Used by both the live network path and tests so the
+/// exact transport configuration is covered.
+pub(crate) fn raft_client(
+    channel: tonic::transport::Channel,
+) -> spur_proto::raft_proto::raft_internal_client::RaftInternalClient<tonic::transport::Channel> {
+    spur_proto::raft_proto::raft_internal_client::RaftInternalClient::new(channel)
+        .max_decoding_message_size(RAFT_MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(RAFT_MAX_MESSAGE_SIZE)
+}
+
 /// Set when a committed WAL entry transitions a job to a terminal state.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct JobFinalized {
@@ -594,9 +620,7 @@ impl SpurNetworkConnection {
                         &std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e.to_string()),
                     ))
                 })?;
-            self.client = Some(
-                spur_proto::raft_proto::raft_internal_client::RaftInternalClient::new(channel),
-            );
+            self.client = Some(raft_client(channel));
         }
         Ok(self.client.as_mut().unwrap())
     }
@@ -616,6 +640,13 @@ impl openraft::RaftNetwork<SpurTypeConfig> for SpurNetworkConnection {
                 &std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
             ))
         })?;
+
+        if payload.len() > RAFT_MAX_MESSAGE_SIZE {
+            let hint = (rpc.entries.len() as u64 / 2).max(1);
+            return Err(openraft::error::RPCError::PayloadTooLarge(
+                openraft::error::PayloadTooLarge::new_entries_hint(hint),
+            ));
+        }
 
         let client = self.get_client().await?;
         let resp = client
@@ -775,6 +806,7 @@ pub async fn start_raft_with_recovery_mode(
         heartbeat_interval: 500,
         election_timeout_min: 1500,
         election_timeout_max: 3000,
+        snapshot_max_chunk_size: RAFT_SNAPSHOT_MAX_CHUNK_SIZE,
         ..Default::default()
     };
     let config = Arc::new(config.validate().map_err(|e| anyhow::anyhow!("{e}"))?);
@@ -1249,5 +1281,95 @@ mod tests {
         // A rejected snapshot must never reach disk: persisting it first would
         // make the next (strict-by-default) startup hard-fail on it forever.
         assert!(!dir.path().join("raft").join("snapshot.json").exists());
+    }
+
+    #[tokio::test]
+    async fn append_entries_rejects_oversized_batch_with_payload_too_large() {
+        use openraft::network::RPCOption;
+        use openraft::RaftNetwork;
+        use spur_core::job::JobSpec;
+
+        let mut conn = SpurNetworkConnection {
+            target: 99,
+            addr: "http://127.0.0.1:1".into(),
+            client: None,
+        };
+
+        let big_spec = JobSpec {
+            script: Some("x".repeat(2 * 1024 * 1024)),
+            ..Default::default()
+        };
+        let entry = Entry::<SpurTypeConfig> {
+            log_id: LogId {
+                leader_id: openraft::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index: 1,
+            },
+            payload: EntryPayload::Normal(WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(big_spec),
+            }),
+        };
+
+        let rpc = openraft::raft::AppendEntriesRequest::<SpurTypeConfig> {
+            vote: Vote::new(1, 1),
+            prev_log_id: None,
+            entries: vec![entry; 20],
+            leader_commit: None,
+        };
+
+        let option = RPCOption::new(std::time::Duration::from_secs(5));
+        let result = conn.append_entries(rpc, option).await;
+
+        let err = result.expect_err("oversized batch should be rejected");
+        match err {
+            openraft::error::RPCError::PayloadTooLarge(too_large) => {
+                assert_eq!(too_large.entries_hint(), 10);
+            }
+            other => panic!("expected PayloadTooLarge, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn append_entries_accepts_small_batch() {
+        use openraft::network::RPCOption;
+        use openraft::RaftNetwork;
+
+        let mut conn = SpurNetworkConnection {
+            target: 99,
+            addr: "http://127.0.0.1:1".into(),
+            client: None,
+        };
+
+        let entry = Entry::<SpurTypeConfig> {
+            log_id: LogId {
+                leader_id: openraft::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index: 1,
+            },
+            payload: EntryPayload::Blank,
+        };
+
+        let rpc = openraft::raft::AppendEntriesRequest::<SpurTypeConfig> {
+            vote: Vote::new(1, 1),
+            prev_log_id: None,
+            entries: vec![entry],
+            leader_commit: None,
+        };
+
+        let option = RPCOption::new(std::time::Duration::from_secs(5));
+        let result = conn.append_entries(rpc, option).await;
+
+        // Small batch passes the size guard but fails to connect (bogus address).
+        // The error should be Unreachable (connection failure), NOT PayloadTooLarge.
+        let err = result.expect_err("should fail to connect to bogus address");
+        assert!(
+            matches!(err, openraft::error::RPCError::Unreachable(_)),
+            "expected Unreachable, got: {err:?}"
+        );
     }
 }

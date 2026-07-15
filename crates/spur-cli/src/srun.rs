@@ -241,7 +241,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
+    let mut client = spur_proto::controller_client(channel);
 
     let job_spec = JobSpec {
         name,
@@ -413,7 +413,9 @@ async fn try_stream_output(
     let agent_addr = format!("http://{}:6818", first_node);
 
     let mut agent = match SlurmAgentClient::connect(agent_addr).await {
-        Ok(c) => c,
+        Ok(c) => c
+            .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE),
         Err(_) => return false,
     };
 
@@ -667,7 +669,7 @@ async fn run_as_step(
     let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
+    let mut client = spur_proto::controller_client(channel);
 
     // Create a step on the controller for tracking; capture the assigned
     // step_id so the completion (and thus DerivedExitCode) records against it.

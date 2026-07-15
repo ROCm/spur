@@ -528,7 +528,12 @@ async fn forward_to_federation(cluster: &ClusterManager, jobs: &[spur_core::job:
     let peers = &cluster.config.federation.clusters;
     for job in jobs {
         for peer in peers {
-            match SlurmControllerClient::connect(peer.address.clone()).await {
+            match SlurmControllerClient::connect(peer.address.clone())
+                .await
+                .map(|c| {
+                    c.max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+                        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE)
+                }) {
                 Ok(mut client) => {
                     let req = SubmitJobRequest {
                         spec: Some(core_spec_to_proto(&job.spec)),
@@ -674,7 +679,10 @@ async fn dispatch_to_agent(
     agent_addr: &str,
     params: &AgentDispatchParams<'_>,
 ) -> anyhow::Result<()> {
-    let mut client = SlurmAgentClient::connect(agent_addr.to_string()).await?;
+    let mut client = SlurmAgentClient::connect(agent_addr.to_string())
+        .await?
+        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
 
     let spec = params.spec;
     let proto_spec = ProtoJobSpec {
@@ -1244,7 +1252,12 @@ fn cancel_agent_addrs(
 /// must not block the caller past the timeout.
 async fn cancel_one_agent(agent_addr: String, job_id: spur_core::job::JobId, signal: i32) {
     let attempt = async {
-        match SlurmAgentClient::connect(agent_addr.clone()).await {
+        match SlurmAgentClient::connect(agent_addr.clone())
+            .await
+            .map(|c| {
+                c.max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+                    .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE)
+            }) {
             Ok(mut client) => {
                 if let Err(e) = client
                     .cancel_job(AgentCancelJobRequest { job_id, signal })
@@ -1302,7 +1315,12 @@ pub async fn send_suspend_to_agents(
         let agent_addr = format!("http://{}:{}", addr, port);
         let job_id = job.job_id;
         tokio::spawn(async move {
-            match SlurmAgentClient::connect(agent_addr.clone()).await {
+            match SlurmAgentClient::connect(agent_addr.clone())
+                .await
+                .map(|c| {
+                    c.max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+                        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE)
+                }) {
                 Ok(mut client) => {
                     if let Err(e) = client
                         .suspend_job(AgentSuspendJobRequest { job_id, resume })

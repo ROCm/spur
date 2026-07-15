@@ -220,7 +220,7 @@ async fn main() -> anyhow::Result<()> {
     info!(%addr, "agent gRPC server listening");
 
     let server_future = tonic::transport::Server::builder()
-        .add_service(spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent_service))
+        .add_service(spur_proto::agent_server(agent_service))
         .serve(addr);
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;

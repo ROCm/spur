@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 
-use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::UpdateNodeRequest;
 
 /// Node management commands.
@@ -104,7 +103,7 @@ fn parse_label_args(label_args: &[String]) -> Result<(HashMap<String, String>, V
 }
 
 async fn cmd_label(controller: &str, node: String, label_args: Vec<String>) -> Result<()> {
-    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
+    let mut client = spur_proto::controller_client(spur_client::connect_channel(controller).await?);
     let (set_labels, remove_labels) = parse_label_args(&label_args)?;
 
     client
@@ -128,7 +127,7 @@ async fn cmd_label(controller: &str, node: String, label_args: Vec<String>) -> R
 }
 
 async fn cmd_drain(controller: &str, node: String, reason: Option<String>) -> Result<()> {
-    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
+    let mut client = spur_proto::controller_client(spur_client::connect_channel(controller).await?);
     let resp = client
         .drain_node(spur_proto::proto::DrainNodeRequest {
             name: node.clone(),
@@ -158,7 +157,7 @@ async fn cmd_remove(
     force: bool,
     reason: Option<String>,
 ) -> Result<()> {
-    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
+    let mut client = spur_proto::controller_client(spur_client::connect_channel(controller).await?);
     let resp = client
         .deregister_node(spur_proto::proto::DeregisterNodeRequest {
             name: node.clone(),

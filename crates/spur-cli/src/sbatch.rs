@@ -4,7 +4,6 @@
 use anyhow::{bail, Context, Result};
 use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches, Parser};
-use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{JobSpec, SubmitJobRequest};
 use std::collections::HashMap;
 
@@ -842,7 +841,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
     let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
+    let mut client = spur_proto::controller_client(channel);
 
     let response = client
         .submit_job(SubmitJobRequest {

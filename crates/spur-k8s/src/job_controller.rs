@@ -297,7 +297,10 @@ pub async fn run(
     } else {
         format!("http://{}", controller_addr)
     };
-    let ctrl_client = SlurmControllerClient::connect(url).await?;
+    let ctrl_client = SlurmControllerClient::connect(url)
+        .await?
+        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+        .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE);
 
     let ctx = Arc::new(JobControllerCtx {
         client: client.clone(),

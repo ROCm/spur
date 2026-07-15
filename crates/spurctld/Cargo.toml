@@ -40,6 +40,7 @@ tower-http = { workspace = true }
 tempfile = "3"
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [lints]
 workspace = true

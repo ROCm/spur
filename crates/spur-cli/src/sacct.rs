@@ -3,7 +3,6 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use spur_proto::proto::slurm_accounting_client::SlurmAccountingClient;
 use spur_proto::proto::GetJobHistoryRequest;
 
 use crate::exit_fmt::format_exit;
@@ -156,7 +155,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to controller")?;
-    let mut client = SlurmAccountingClient::new(channel);
+    let mut client = spur_proto::accounting_client(channel);
 
     let start_after = args
         .starttime

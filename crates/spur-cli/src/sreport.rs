@@ -69,7 +69,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to controller")?;
-    let mut client = SlurmAccountingClient::new(channel);
+    let mut client = spur_proto::accounting_client(channel);
 
     match &args.command {
         SreportCommand::Cluster { report_type } => match report_type.to_lowercase().as_str() {

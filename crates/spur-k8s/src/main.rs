@@ -16,8 +16,6 @@ use clap::{Parser, Subcommand};
 use kube::Client;
 use tracing::info;
 
-use spur_proto::proto::slurm_agent_server::SlurmAgentServer;
-
 #[derive(Parser)]
 #[command(
     name = "spur-k8s-operator",
@@ -176,7 +174,7 @@ async fn main() -> anyhow::Result<()> {
     info!(%listen_addr, "virtual agent gRPC server listening");
 
     tonic::transport::Server::builder()
-        .add_service(SlurmAgentServer::new(virtual_agent))
+        .add_service(spur_proto::agent_server(virtual_agent))
         .serve(listen_addr)
         .await?;
 

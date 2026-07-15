@@ -3,7 +3,6 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::GetJobRequest;
 
 /// Display status information for running jobs.
@@ -56,7 +55,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
+    let mut client = spur_proto::controller_client(channel);
 
     // Determine which fields to show
     let fields = if let Some(ref fmt) = args.format {

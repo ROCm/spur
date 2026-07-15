@@ -97,6 +97,52 @@ impl SubmitError {
     }
 }
 
+/// Maximum serialized size of a single job submission, in bytes.
+///
+/// A submission becomes one Raft log entry (`WalOperation::JobSubmit`) that is
+/// also retained in every snapshot, so bounding the whole serialized spec keeps
+/// that entry well under `crate::raft::RAFT_MAX_MESSAGE_SIZE`. Measuring the
+/// serialized form rather than individual fields counts every payload the spec
+/// carries (script, environment, argv, container env/mounts, ...), so it cannot
+/// be bypassed by a field the check forgot to sum. Mirrors Slurm, which rejects
+/// oversized batch scripts.
+const MAX_JOB_SPEC_SIZE: usize = 4 * 1024 * 1024;
+
+/// A `std::io::Write` that only tallies byte counts and discards the data. Used
+/// to measure a value's serialized size without allocating the serialized bytes.
+#[derive(Default)]
+struct ByteCounter {
+    len: usize,
+}
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.len += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn check_submission_size(spec: &JobSpec) -> Result<(), SubmitError> {
+    // Count serialized bytes without allocating the output; the entry is
+    // re-serialized by openraft on propose.
+    let mut counter = ByteCounter::default();
+    serde_json::to_writer(&mut counter, spec)
+        .map_err(|e| SubmitError::internal(format!("failed to encode job spec: {e}")))?;
+    let size = counter.len;
+    if size > MAX_JOB_SPEC_SIZE {
+        return Err(SubmitError::invalid(format!(
+            "job submission too large: {:.1} MiB serialized, limit is {} MiB (reduce script, environment, or argv size)",
+            size as f64 / (1024.0 * 1024.0),
+            MAX_JOB_SPEC_SIZE / (1024 * 1024),
+        )));
+    }
+    Ok(())
+}
+
 impl ReservationError {
     pub fn invalid(msg: impl Into<String>) -> Self {
         Self::InvalidArgument(msg.into())
@@ -198,6 +244,11 @@ impl ClusterManager {
         validate_user_account(&spec, &self.association_cache)?;
         self.validate_partition(&spec)?;
         apply_default_qos(&mut spec, &self.association_cache, &self.qos_cache)?;
+
+        // Checked after defaults are applied so we measure the final spec.
+        // Array expansion only adds bounded integer metadata per task, so a
+        // single pre-expansion check still bounds each Raft log entry.
+        check_submission_size(&spec)?;
 
         // Reject unknown/malformed dependency types up front so users get a
         // clear error instead of a silently-deadlocked job (e.g. `expand:N`).
@@ -4209,6 +4260,41 @@ mod tests {
     use spur_core::resource::{ResourceAllocations, ResourceSet};
     use spur_metrics::job::JobMetricsSnapshot;
     use tempfile::TempDir;
+
+    #[test]
+    fn submission_size_accepts_normal_script() {
+        let spec = JobSpec {
+            script: Some("#!/bin/bash\necho hello\n".into()),
+            ..Default::default()
+        };
+        assert!(check_submission_size(&spec).is_ok());
+    }
+
+    #[test]
+    fn submission_size_rejects_oversized_script() {
+        let spec = JobSpec {
+            script: Some("x".repeat(MAX_JOB_SPEC_SIZE + 1)),
+            ..Default::default()
+        };
+        let err = check_submission_size(&spec).expect_err("oversized script must be rejected");
+        assert!(matches!(err, SubmitError::InvalidArgument(_)));
+        assert!(err.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn submission_size_counts_all_fields() {
+        // Split the payload across environment and argv (not script) to prove the
+        // check bounds the whole serialized spec, not just the script field.
+        let big = "y".repeat(MAX_JOB_SPEC_SIZE / 2 + 1024);
+        let spec = JobSpec {
+            environment: std::iter::once(("BIG".to_string(), big.clone())).collect(),
+            argv: vec![big],
+            ..Default::default()
+        };
+        let err =
+            check_submission_size(&spec).expect_err("env + argv over the cap must be rejected");
+        assert!(matches!(err, SubmitError::InvalidArgument(_)));
+    }
 
     fn test_config() -> SlurmConfig {
         SlurmConfig {
