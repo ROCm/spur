@@ -1,0 +1,85 @@
+name: Helm Chart
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/helm/**'
+      - '.github/workflows/helm.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'deploy/helm/**'
+      - '.github/workflows/helm.yml'
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: helm lint + template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: helm lint
+        run: helm lint deploy/helm/spur
+
+      # Render every scenario the chart claims to support so a broken template
+      # fails the build instead of failing in a customer cluster.
+      - name: helm template (defaults — 3-replica Raft HA)
+        run: helm template ci deploy/helm/spur > /tmp/render-default.yaml
+
+      - name: helm template (single-node dev)
+        run: |
+          helm template ci deploy/helm/spur \
+            --set controller.replicaCount=1 \
+            --set controller.persistence.enabled=false \
+            --set controller.pdb.enabled=false \
+            --set agent.gpu.rocm=false \
+            --set agent.nodeSelector=null \
+            --set operator.enabled=false \
+            --set crds.install=false \
+            > /tmp/render-single.yaml
+
+      - name: helm template (external Postgres)
+        run: |
+          helm template ci deploy/helm/spur \
+            --set accounting.externalDatabase.existingSecret=spur-db-creds \
+            --set accounting.embeddedPostgres.enabled=false \
+            > /tmp/render-extdb.yaml
+
+      - name: helm template (REST API ingress)
+        run: |
+          helm template ci deploy/helm/spur \
+            --set restd.ingress.enabled=true \
+            --set restd.ingress.className=nginx \
+            --set 'restd.ingress.hosts[0].host=spur.example.com' \
+            --set 'restd.ingress.hosts[0].paths[0].path=/' \
+            --set 'restd.ingress.hosts[0].paths[0].pathType=Prefix' \
+            > /tmp/render-ingress.yaml
+
+      - name: Install kubeconform
+        run: |
+          curl -sSL -o /tmp/kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar -xzf /tmp/kubeconform.tar.gz -C /usr/local/bin kubeconform
+
+      # Validate every rendered scenario against real Kubernetes API schemas.
+      # --strict catches unknown fields; --ignore-missing-schemas lets the
+      # SpurJob CRD instances through without us hosting a custom schema.
+      - name: kubeconform validate (all scenarios)
+        run: |
+          set -e
+          for f in /tmp/render-*.yaml; do
+            echo "==> $f"
+            kubeconform \
+              -strict \
+              -ignore-missing-schemas \
+              -kubernetes-version 1.29.0 \
+              -summary \
+              "$f"
+          done
