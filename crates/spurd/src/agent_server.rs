@@ -213,16 +213,7 @@ impl AgentService {
                 // dispatches until spurd restart. `jobs` is still held, so the
                 // live set is a consistent snapshot and cannot race a launch
                 // that is committing (commit_job takes the running lock first).
-                {
-                    let live: std::collections::HashSet<u32> = jobs.keys().copied().collect();
-                    let reclaimed = allocation.lock().await.reconcile(&live);
-                    if !reclaimed.is_empty() {
-                        warn!(
-                            ?reclaimed,
-                            "reconciled orphaned resource allocations with no tracked job"
-                        );
-                    }
-                }
+                reconcile_orphaned_allocations(&jobs, &mut *allocation.lock().await);
 
                 // Release lock BEFORE network I/O — holding the lock during
                 // report_completion blocks new job launches and can lose
@@ -306,6 +297,24 @@ impl AgentService {
 
 struct DrainRequest {
     reason: String,
+}
+
+/// Reclaim allocations whose job is no longer tracked and is not mid-launch,
+/// using the running set as ground truth. Callers hold the `running` lock
+/// across building `running` and this call so the live set is a consistent
+/// snapshot (see the monitor loop). Returns nothing; logs what it reclaimed.
+fn reconcile_orphaned_allocations(
+    running: &HashMap<u32, TrackedJob>,
+    allocation: &mut NodeAllocation,
+) {
+    let live: std::collections::HashSet<u32> = running.keys().copied().collect();
+    let reclaimed = allocation.reconcile(&live);
+    if !reclaimed.is_empty() {
+        warn!(
+            ?reclaimed,
+            "reconciled orphaned resource allocations with no tracked job"
+        );
+    }
 }
 
 fn completion_report_retryable(status: &tonic::Status) -> bool {
@@ -815,12 +824,23 @@ impl SlurmAgent for AgentService {
             .map(|a| a.cpu_ids.clone())
             .unwrap_or_default();
 
-        // Build container launch config if this is a containerized job
+        // Build container launch config if this is a containerized job.
+        // container_config/rootfs_path are always Some here when the image is
+        // set (populated together above), but guard rather than unwrap so a
+        // future refactor can't leak the reservation: any exit before commit
+        // must release, since the job is still `launching` (SPUR-65).
         let container_launch = if !spec.container_image.is_empty() {
-            Some(executor::ContainerLaunchConfig {
-                config: container_config.take().unwrap(),
-                rootfs: rootfs_path.take().unwrap(),
-            })
+            match (container_config.take(), rootfs_path.take()) {
+                (Some(config), Some(rootfs)) => {
+                    Some(executor::ContainerLaunchConfig { config, rootfs })
+                }
+                _ => {
+                    self.allocation.lock().await.release_job(job_id);
+                    return Err(Status::internal(
+                        "internal error: container config missing after setup",
+                    ));
+                }
+            }
         } else {
             None
         };
@@ -1961,7 +1981,7 @@ mod tests {
     // stranding the node until spurd restart -> JobHoldMaxRequeue.
     #[tokio::test]
     async fn launch_failure_after_gpu_record_releases_allocation() {
-        // Reporter advertises GPU device_id 0 so record_gpus succeeds, but the
+        // Reporter advertises GPU device_id 0 so allocate_for_job succeeds, but the
         // device registry is empty so build_job_injection_plans fails.
         let svc = AgentService::new(
             test_reporter_with_gpus(&[0]),
@@ -2009,6 +2029,45 @@ mod tests {
             svc.free_gpu_count().await,
             1,
             "GPU allocation must be released after a post-record launch failure"
+        );
+    }
+
+    // SPUR-65 self-heal: the monitor loop's reconcile step must reclaim an
+    // allocation whose job is no longer tracked, while sparing a job that is
+    // still in `running`. Exercises the real reconcile_orphaned_allocations
+    // wiring the monitor loop calls, without driving the timed loop.
+    #[tokio::test]
+    async fn reconcile_reclaims_orphan_but_spares_tracked_job() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0, 1]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        // job 1: tracked (live) and committed.
+        svc.insert_test_job(1, TrackedJob::dummy(0)).await;
+        // job 2: orphan — committed allocation but never entered `running`
+        // (simulating a teardown path that dropped the job without releasing).
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(1, 2, 0, &[0]);
+            alloc.commit_job(1);
+            alloc.allocate_for_job(2, 2, 0, &[1]);
+            alloc.commit_job(2);
+        }
+        assert_eq!(svc.free_gpu_count().await, 0);
+
+        {
+            let jobs = svc.running.lock().await;
+            reconcile_orphaned_allocations(&jobs, &mut *svc.allocation.lock().await);
+        }
+
+        // Orphan (job 2) reclaimed; live job 1 still holds its GPU.
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "exactly the orphan's GPU must be reclaimed; the tracked job's is spared"
         );
     }
 
