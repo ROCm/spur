@@ -768,13 +768,27 @@ impl SlurmAgent for AgentService {
             .allocate_local_resources(job_id, &spec, req.allocated.as_ref())
             .await?;
 
-        let (host_device_plan, container_device_plan) = {
+        // Any failure between here and inserting the job into `running` must
+        // release the allocation just recorded by allocate_local_resources —
+        // otherwise the GPUs stay marked in-use with no tracked job to ever
+        // free them, and the node silently rejects every future dispatch while
+        // the controller still believes it is IDLE (SPUR-65 stranding).
+        let injection = {
             let reg = self.device_registry.lock().await;
             reg.build_job_injection_plans("gpu", &allocated_device_ids, spec.uid, spec.gid)
-                .map_err(|e| {
-                    error!(job_id, error = %e, "device registry resolution failed");
-                    Status::failed_precondition(format!("device resolution failed: {}", e))
-                })?
+        };
+        let (host_device_plan, container_device_plan) = match injection {
+            Ok(plans) => plans,
+            Err(e) => {
+                error!(job_id, error = %e, "device registry resolution failed");
+                if let Some(ref alloc) = alloc_result {
+                    self.allocation.lock().await.release(alloc);
+                }
+                return Err(Status::failed_precondition(format!(
+                    "device resolution failed: {}",
+                    e
+                )));
+            }
         };
 
         // Wire allocated device IDs and injection plan into container config.
@@ -1583,6 +1597,10 @@ impl AgentService {
     async fn insert_test_job(&self, job_id: u32, job: TrackedJob) {
         self.running.lock().await.insert(job_id, job);
     }
+
+    async fn free_gpu_count(&self) -> u32 {
+        self.allocation.lock().await.free_gpus(None)
+    }
 }
 
 #[cfg(test)]
@@ -1894,6 +1912,96 @@ mod tests {
         assert_eq!(resp.exit_code, 0);
         let observed_canonical = std::fs::canonicalize(resp.stdout.trim()).unwrap();
         assert_eq!(observed_canonical, tmp_canonical);
+    }
+
+    fn test_reporter_with_gpus(device_ids: &[u32]) -> Arc<NodeReporter> {
+        use spur_core::resource::{GpuLinkType, GpuResource};
+        let gpus = device_ids
+            .iter()
+            .map(|&device_id| GpuResource {
+                device_id,
+                gpu_type: "mi300x".into(),
+                memory_mb: 192_000,
+                peer_gpus: vec![],
+                link_type: GpuLinkType::XGMI,
+            })
+            .collect();
+        Arc::new(NodeReporter::new(
+            "test-node".into(),
+            "http://localhost:6817".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8192,
+                gpus,
+                ..Default::default()
+            },
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "test-node".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            std::collections::HashMap::new(),
+            String::new(),
+        ))
+    }
+
+    // SPUR-65: a dispatch that records GPUs but then fails before the job is
+    // tracked (here: device-registry resolution fails) must release those GPUs.
+    // Otherwise the node keeps rejecting every future dispatch ("controller-
+    // allocated GPUs unavailable") while the controller still sees it IDLE,
+    // stranding the node until spurd restart -> JobHoldMaxRequeue.
+    #[tokio::test]
+    async fn launch_failure_after_gpu_record_releases_allocation() {
+        // Reporter advertises GPU device_id 0 so record_gpus succeeds, but the
+        // device registry is empty so build_job_injection_plans fails.
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        assert_eq!(svc.free_gpu_count().await, 1);
+
+        let mut devices = std::collections::HashMap::new();
+        devices.insert(
+            "gpu".to_string(),
+            DeviceAllocations {
+                devices: vec![AllocatedDevice {
+                    device_id: 0,
+                    count: 1,
+                }],
+            },
+        );
+
+        let req = Request::new(LaunchJobRequest {
+            job_id: 65,
+            spec: Some(JobSpec {
+                script: "#!/bin/sh\ntrue\n".into(),
+                cpus_per_task: 1,
+                gres: vec!["gpu:1".into()],
+                ..Default::default()
+            }),
+            allocated: Some(ResourceAllocations {
+                cpus: 1,
+                memory_mb: 0,
+                devices,
+            }),
+            ..Default::default()
+        });
+
+        let result = svc.launch_job(req).await;
+        assert!(
+            result.is_err(),
+            "expected launch to fail on registry resolution"
+        );
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "GPU allocation must be released after a post-record launch failure"
+        );
     }
 
     #[tokio::test]
