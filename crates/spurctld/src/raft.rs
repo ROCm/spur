@@ -906,6 +906,49 @@ fn first_label(host: &str) -> &str {
     host.split('.').next().unwrap_or(host)
 }
 
+/// Guard against a shifted node identity across restarts.
+///
+/// The resolved id is derived from the live hostname and `peers` on every boot,
+/// but the persisted Raft state (vote/log) belongs to the id this node last ran
+/// under. If a peer is inserted or removed before this host in the list, or the
+/// host is renamed, the derived id would silently diverge from the on-disk state
+/// and openraft would orphan committed entries. Persist the id on first boot and
+/// fail fast if a later boot derives a different one.
+fn persist_or_verify_node_id(state_dir: &Path, node_id: NodeId) -> anyhow::Result<()> {
+    let raft_dir = state_dir.join("raft");
+    std::fs::create_dir_all(&raft_dir)?;
+    let path = raft_dir.join("node_id");
+
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => {
+            let prev: NodeId = contents.trim().parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "failed to parse persisted node_id {:?} at {}",
+                    contents.trim(),
+                    path.display()
+                )
+            })?;
+            if prev != node_id {
+                anyhow::bail!(
+                    "resolved Raft node_id {node_id} differs from persisted id {prev} at {}; \
+                     the controller.peers ordering or this host's name likely changed. \
+                     Running under a new id would orphan committed Raft state. Restore the \
+                     previous identity, or wipe the raft state dir to rejoin as a fresh member.",
+                    path.display()
+                );
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let tmp = raft_dir.join("node_id.tmp");
+            std::fs::write(&tmp, node_id.to_string())?;
+            std::fs::rename(&tmp, &path)?;
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!("failed to read {}: {e}", path.display())),
+    }
+}
+
 /// Build a 1-indexed peer map from the config peers list.
 pub fn build_peer_map(peers: &[String]) -> BTreeMap<NodeId, String> {
     peers
@@ -944,6 +987,8 @@ pub async fn start_raft_with_recovery_mode(
         ..Default::default()
     };
     let config = Arc::new(config.validate().map_err(|e| anyhow::anyhow!("{e}"))?);
+
+    persist_or_verify_node_id(state_dir, node_id)?;
 
     let store = Arc::new(SpurStore::new_with_recovery_mode(
         state_dir,
@@ -1185,6 +1230,33 @@ mod tests {
     fn resolve_ip_only_peers_without_ordinal_errors() {
         let peers = vec!["10.0.0.1:6821".to_string(), "10.0.0.2:6821".to_string()];
         assert!(resolve_node_id(None, "plainhost", &peers).is_err());
+    }
+
+    #[test]
+    fn node_id_persists_on_first_boot() {
+        let dir = TempDir::new().unwrap();
+        persist_or_verify_node_id(dir.path(), 2).unwrap();
+        let persisted = std::fs::read_to_string(dir.path().join("raft").join("node_id")).unwrap();
+        assert_eq!(persisted.trim(), "2");
+    }
+
+    #[test]
+    fn node_id_same_across_restart_is_ok() {
+        let dir = TempDir::new().unwrap();
+        persist_or_verify_node_id(dir.path(), 3).unwrap();
+        // A second boot with the same derived id must succeed.
+        persist_or_verify_node_id(dir.path(), 3).unwrap();
+    }
+
+    #[test]
+    fn node_id_shift_across_restart_fails_fast() {
+        let dir = TempDir::new().unwrap();
+        persist_or_verify_node_id(dir.path(), 1).unwrap();
+        let err = persist_or_verify_node_id(dir.path(), 2).unwrap_err();
+        assert!(
+            err.to_string().contains("differs from persisted id"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

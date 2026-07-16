@@ -272,6 +272,12 @@ pub struct ControllerConfig {
     /// Raft peers for HA consensus. Each entry is "host:port" (Raft gRPC address).
     /// If empty, single-node mode (no Raft, no replication).
     /// Example: ["node1:6821", "node2:6821", "node3:6821"]
+    ///
+    /// INVARIANT: every controller must be given a byte-identical,
+    /// identically-ordered `peers` list. Node ids derive from list position, so
+    /// a reordered list makes a host derive a different id for itself than its
+    /// peers map to it — at initial bootstrap this can form an inconsistent
+    /// voter set.
     #[serde(default)]
     pub peers: Vec<String>,
 
@@ -286,7 +292,10 @@ pub struct ControllerConfig {
     ///    peer lists where hostname matching cannot work.
     ///
     /// The resolved id must fall within `1..=peers.len()`, else startup fails.
-    /// Only needed when peers are IP-only and cannot match a hostname.
+    /// Only needed when peers are IP-only and cannot match a hostname. An
+    /// explicit id that is in range but disagrees with this host's positional
+    /// index in `peers` is accepted silently, so when set it must match that
+    /// position (id == index + 1) or peers will map the host to a different id.
     pub node_id: Option<u64>,
 
     /// Listen address for Raft internal gRPC traffic (separate from client API).
