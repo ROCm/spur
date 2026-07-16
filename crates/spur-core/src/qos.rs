@@ -42,6 +42,9 @@ pub enum QosCheckResult {
 ///
 /// `user_running_*` aggregate the requesting user's load; `qos_running_tres`
 /// aggregates all running jobs in the QOS (for the `Grp*` group limits).
+///
+/// `grp_wall_minutes` is not enforced: it needs a persisted, period-resetting
+/// consumed-wall accumulator that does not exist yet (stored/shown only).
 pub fn check_qos_limits(
     job: &Job,
     qos: &Qos,

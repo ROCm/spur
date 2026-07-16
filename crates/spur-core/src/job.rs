@@ -544,7 +544,7 @@ pub fn effective_memory_mb(spec: &JobSpec, num_nodes: u32) -> u64 {
         .map(|mem| mem * num_nodes as u64)
         .or_else(|| {
             spec.memory_per_cpu_mb
-                .map(|mem| mem * (spec.num_tasks * spec.cpus_per_task) as u64)
+                .map(|mem| mem * spec.num_tasks as u64 * spec.cpus_per_task as u64)
         })
         .unwrap_or(0)
 }
