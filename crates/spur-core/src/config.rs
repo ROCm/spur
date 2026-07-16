@@ -715,6 +715,14 @@ fn is_valid_cidr(s: &str) -> bool {
     }
 }
 
+/// Prefix length of a CIDR string. Returns 255 (an impossible prefix, so any `<=` bound rejects it)
+/// when unparseable — callers gate with `is_valid_cidr` first, so this only extracts the number.
+fn cidr_prefix(s: &str) -> u8 {
+    s.split_once('/')
+        .and_then(|(_, p)| p.parse().ok())
+        .unwrap_or(255)
+}
+
 /// True if two IPv4 CIDRs overlap (share any address). Non-IPv4 / malformed inputs return false
 /// (they are rejected separately by `is_valid_cidr`).
 fn cidrs_overlap(a: &str, b: &str) -> bool {
@@ -959,7 +967,11 @@ impl SlurmConfig {
                     value: format!("{} (only \"k0s\" is supported)", self.cluster.distro),
                 });
             }
+            // The mesh CIDR feeds the k0s IPAM (AddressPool) exactly like pod/service, so assert it is
+            // a valid IPv4 CIDR in the same pass — otherwise a malformed wg_cidr bypasses validate()
+            // and fails every reconcile tick in AddressPool::new, leaving the cluster silently stuck.
             for (field, cidr) in [
+                ("network.wg_cidr", &self.network.wg_cidr),
                 ("cluster.pod_cidr", &self.cluster.pod_cidr),
                 ("cluster.service_cidr", &self.cluster.service_cidr),
             ] {
@@ -970,14 +982,45 @@ impl SlurmConfig {
                     });
                 }
             }
-            if cidrs_overlap(&self.cluster.pod_cidr, &self.cluster.service_cidr) {
+            // Pods are carved into per-node /24s (`carve_pod_cidr`), so the pod CIDR must be <= /24.
+            // is_valid_cidr only bounds the prefix at /32, so this would otherwise pass here and then
+            // fail every reconcile tick with only a warn! — the same silent-stuck state.
+            if cidr_prefix(&self.cluster.pod_cidr) > 24 {
                 return Err(ConfigError::InvalidValue {
-                    field: "cluster.pod_cidr/service_cidr".into(),
+                    field: "cluster.pod_cidr".into(),
                     value: format!(
-                        "{} overlaps {}",
-                        self.cluster.pod_cidr, self.cluster.service_cidr
+                        "{} (prefix must be <= /24 to carve per-node /24s)",
+                        self.cluster.pod_cidr
                     ),
                 });
+            }
+            // Mesh, pod, and service ranges must be mutually non-overlapping.
+            for (fa, a, fb, b) in [
+                (
+                    "cluster.pod_cidr",
+                    &self.cluster.pod_cidr,
+                    "cluster.service_cidr",
+                    &self.cluster.service_cidr,
+                ),
+                (
+                    "network.wg_cidr",
+                    &self.network.wg_cidr,
+                    "cluster.pod_cidr",
+                    &self.cluster.pod_cidr,
+                ),
+                (
+                    "network.wg_cidr",
+                    &self.network.wg_cidr,
+                    "cluster.service_cidr",
+                    &self.cluster.service_cidr,
+                ),
+            ] {
+                if cidrs_overlap(a, b) {
+                    return Err(ConfigError::InvalidValue {
+                        field: format!("{fa}/{fb}"),
+                        value: format!("{a} overlaps {b}"),
+                    });
+                }
             }
             if !matches!(
                 self.cluster.storage_provisioner.as_str(),

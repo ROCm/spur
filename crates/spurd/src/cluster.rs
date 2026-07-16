@@ -437,6 +437,9 @@ pub struct K0sAgent {
     storage_provisioner: String,
     /// On-node PV directory for local-path; [`ClusterConfig::local_path_dir`].
     local_path_dir: String,
+    /// `[cluster].enabled` from this node's config. When false, `start()` refuses to touch
+    /// systemd/k0s — the documented contract for the flag ([`ClusterConfig::enabled`]).
+    enabled: bool,
     active: Mutex<Option<ClusterSupervisor>>,
 }
 
@@ -450,6 +453,7 @@ impl K0sAgent {
             config_dir: PathBuf::from("/etc/k0s"),
             storage_provisioner: cfg.storage_provisioner.clone(),
             local_path_dir: cfg.local_path_dir.clone(),
+            enabled: cfg.enabled,
             active: Mutex::new(None),
         }
     }
@@ -507,6 +511,15 @@ impl K0sAgent {
         k0s_config: Option<String>,
         node_ip: Option<String>,
     ) -> anyhow::Result<String> {
+        // Honor the documented `[cluster].enabled` contract ("spurd never touches systemd/k0s" when
+        // false): refuse to install/write/enable/start k0s on a node whose operator disabled it, even
+        // if the controller sends a StartClusterComponent RPC. (The handler surfaces this as
+        // started=false with this message.)
+        if !self.enabled {
+            anyhow::bail!(
+                "[cluster].enabled is false on this node; refusing to install or start k0s"
+            );
+        }
         // Make a fresh bare-metal node self-contained: install the pinned/configured k0s if the
         // binary is missing. No-op (no network) when it is already present. A failure here is fatal
         // to start — the systemd unit's ConditionFileIsExecutable would otherwise silently skip.
