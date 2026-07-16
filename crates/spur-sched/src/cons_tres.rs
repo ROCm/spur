@@ -124,6 +124,12 @@ impl NodeAllocation {
         memory_mb: u64,
         gpu_device_ids: &[u32],
     ) -> Option<AllocationResult> {
+        // A duplicate reservation for the same job (a retried LaunchJob RPC)
+        // would double-count CPU/memory and orphan the prior owner entry.
+        if self.owners.contains_key(&job_id) {
+            return None;
+        }
+
         let mut gpu_indices = Vec::with_capacity(gpu_device_ids.len());
         for &id in gpu_device_ids {
             let idx = self.gpus.iter().position(|g| g.device_id == id)?;
@@ -347,6 +353,20 @@ mod tests {
         assert_eq!(node.free_memory_mb(), 256_000);
         // Idempotent: releasing again is a no-op.
         assert!(!node.release_job(1));
+    }
+
+    #[test]
+    fn test_allocate_for_job_rejects_duplicate_job_id() {
+        // A retried reservation for the same job must not double-count CPU/mem
+        // or orphan the prior owner entry.
+        let mut node = make_node(64, 256_000, 0, "");
+        assert!(node.allocate_for_job(1, 8, 16_000, &[]).is_some());
+        assert!(node.allocate_for_job(1, 8, 16_000, &[]).is_none());
+        assert_eq!(node.free_cpus(), 56);
+        assert_eq!(node.free_memory_mb(), 240_000);
+        // After release the id is free to reserve again.
+        assert!(node.release_job(1));
+        assert!(node.allocate_for_job(1, 8, 16_000, &[]).is_some());
     }
 
     #[test]
