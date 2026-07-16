@@ -85,17 +85,29 @@ features and weight; see :doc:`native-host`), keyed by ``names`` (hostlist) or
 Applying Config Changes
 -----------------------
 
-After editing ``[[partitions]]`` in ``spur.conf``, apply the changes to a
-running controller without a restart:
+After editing ``spur.conf``, apply the changes to a running controller without
+a restart:
 
 .. code-block:: bash
 
    scontrol reconfigure
 
-This reloads ``[[partitions]]`` **only** — partitions are created, updated, or
-deleted to match the file. All other config sections (``[scheduler]``,
-``[accounting]``, ``[controller]``, and so on) are ignored by ``reconfigure``
-and require a controller restart to take effect.
+``reconfigure`` re-reads ``spur.conf`` and makes the file authoritative:
+runtime-only changes not reflected in the file are overwritten.
+
+**Applied live** (no restart): ``[[partitions]]`` (created, updated, or deleted
+to match the file), ``[[nodes]]`` features and weight, ``licenses``,
+``burst_buffer``, ``[hooks]``, ``[notifications]``, ``[federation]``,
+``[power]`` suspend/resume commands, ``[admission]`` mode, and the
+``[scheduler]`` tunables ``complete_wait`` and ``resv_overrun``.
+
+**Restart-only**: settings baked in when the daemon starts — listen addresses
+and ports (``[controller]``, ``[metrics]``, ``[rest_api]``), the accounting
+database (``[accounting]``), Raft identity and peers, ``first_job_id``, and the
+scheduler loop cadence (``interval_secs``, ``max_jobs_per_cycle``, topology).
+``reconfigure`` reads these but does not apply them; a full controller restart
+is required. This mirrors Slurm, where a documented subset of parameters
+(ports, ``StateSaveLocation``, plugin set) also require a daemon restart.
 
 Verifying Membership
 --------------------

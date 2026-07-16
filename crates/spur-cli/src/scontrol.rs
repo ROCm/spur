@@ -221,8 +221,8 @@ pub enum ScontrolCommand {
         #[arg(long)]
         name: String,
     },
-    /// Re-read spur.conf and reconcile the live partition table to match it
-    /// (partitions only; other config sections require a controller restart)
+    /// Re-read spur.conf and apply it live (partitions, nodes, licenses,
+    /// hooks, scheduler tunables, etc.; ports/DB/raft need a restart)
     Reconfigure,
     /// Create a reservation
     #[command(name = "create-reservation")]
@@ -1484,7 +1484,7 @@ async fn reconfigure(controller: &str) -> Result<()> {
     client.reconfigure(()).await.context("reconfigure failed")?;
 
     println!(
-        "Reconfiguration complete (partitions only; other config sections require a controller restart)"
+        "Reconfiguration complete (listen ports, accounting DB, and raft peers still require a controller restart)"
     );
     Ok(())
 }

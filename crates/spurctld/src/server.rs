@@ -141,7 +141,8 @@ impl ControllerService {
     fn validate_admission(&self, join_token: &str, hostname: &str) -> Result<String, Status> {
         use spur_core::config::AdmissionMode;
 
-        if !matches!(self.cluster.config.admission.mode, AdmissionMode::Token) {
+        let config = self.cluster.config();
+        if !matches!(config.admission.mode, AdmissionMode::Token) {
             return Ok(String::new());
         }
 
@@ -156,13 +157,7 @@ impl ControllerService {
         spur_core::admission::validate_token(token_id, secret, &token_store)
             .map_err(|e| Status::permission_denied(e.to_string()))?;
 
-        let jwt_key = self
-            .cluster
-            .config
-            .auth
-            .jwt_key
-            .as_deref()
-            .unwrap_or("spur-default-key");
+        let jwt_key = config.auth.jwt_key.as_deref().unwrap_or("spur-default-key");
 
         spur_core::admission::generate_node_token(hostname, jwt_key.as_bytes())
             .map_err(|e| Status::internal(e.to_string()))
@@ -685,20 +680,15 @@ impl SlurmController for ControllerService {
         }
         let req = request.into_inner();
 
+        let config = self.cluster.config();
         if matches!(
-            self.cluster.config.admission.mode,
+            config.admission.mode,
             spur_core::config::AdmissionMode::Token
         ) {
             if req.node_token.is_empty() {
                 return Err(Status::unauthenticated("node token required"));
             }
-            let jwt_key = self
-                .cluster
-                .config
-                .auth
-                .jwt_key
-                .as_deref()
-                .unwrap_or("spur-default-key");
+            let jwt_key = config.auth.jwt_key.as_deref().unwrap_or("spur-default-key");
             let identity =
                 spur_core::admission::verify_node_token(&req.node_token, jwt_key.as_bytes())
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
@@ -749,7 +739,7 @@ impl SlurmController for ControllerService {
 
         let federation_peers: Vec<String> = self
             .cluster
-            .config
+            .config()
             .federation
             .clusters
             .iter()
@@ -1040,20 +1030,15 @@ impl SlurmController for ControllerService {
 
         let req = request.into_inner();
 
+        let config = self.cluster.config();
         if matches!(
-            self.cluster.config.admission.mode,
+            config.admission.mode,
             spur_core::config::AdmissionMode::Token
         ) {
             if req.node_token.is_empty() {
                 return Err(Status::unauthenticated("node token required"));
             }
-            let jwt_key = self
-                .cluster
-                .config
-                .auth
-                .jwt_key
-                .as_deref()
-                .unwrap_or("spur-default-key");
+            let jwt_key = config.auth.jwt_key.as_deref().unwrap_or("spur-default-key");
             let identity =
                 spur_core::admission::verify_node_token(&req.node_token, jwt_key.as_bytes())
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;

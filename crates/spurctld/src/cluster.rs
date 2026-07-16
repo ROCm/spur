@@ -263,7 +263,14 @@ pub enum PreemptOutcome {
 /// Thread-safe via RwLock. The scheduler and gRPC server both access this.
 /// State recovery happens through Raft log replay (via `StateMachineApply`).
 pub struct ClusterManager {
-    pub config: SlurmConfig,
+    /// Live cluster configuration, swapped wholesale by `reconfigure()`.
+    ///
+    /// Held behind `RwLock<Arc<_>>` so `reconfigure` can atomically replace it
+    /// while readers take a cheap snapshot via `config()`. Sections consumed
+    /// per-request or per-scheduler-cycle through that snapshot pick up new
+    /// values live; sections captured once at startup (bound sockets, DB pool,
+    /// scheduler loop interval) remain restart-only — see `reconfigure`.
+    config: RwLock<Arc<SlurmConfig>>,
     /// Path to the spur.conf file, re-read by `reconfigure()`. spur.conf is
     /// never written back — the Raft WAL is the sole source of runtime truth.
     /// None when running without a config file (e.g. in tests).
@@ -319,7 +326,7 @@ impl ClusterManager {
         let association_cache = Arc::new(AssociationCache::new());
 
         let cm = Self {
-            config,
+            config: RwLock::new(Arc::new(config)),
             config_path,
             jobs: RwLock::new(HashMap::new()),
             nodes: RwLock::new(HashMap::new()),
@@ -346,6 +353,13 @@ impl ClusterManager {
         Ok(cm)
     }
 
+    /// Snapshot the live configuration. Cheap `Arc` clone; callers read fields
+    /// off the returned snapshot so a concurrent `reconfigure` swap is atomic
+    /// from their point of view.
+    pub fn config(&self) -> Arc<SlurmConfig> {
+        self.config.read().clone()
+    }
+
     /// Submit a new job. If it has an array spec, expand into individual tasks.
     pub fn submit_job(&self, mut spec: JobSpec) -> Result<JobId, SubmitError> {
         apply_default_partition(&mut spec, &self.partitions.read());
@@ -353,11 +367,12 @@ impl ClusterManager {
         apply_default_account(&mut spec, &self.association_cache);
         validate_user_account(&spec, &self.association_cache)?;
         self.validate_partition(&spec)?;
+        let config = self.config();
         apply_default_qos(
             &mut spec,
             &self.association_cache,
             &self.qos_cache,
-            &self.config.accounting,
+            &config.accounting,
         )?;
 
         // Checked after defaults are applied so we measure the final spec.
@@ -1072,7 +1087,7 @@ impl ClusterManager {
                 // the maybe_requeue MAX_REQUEUE cap: Slurm always requeues a
                 // preempted job regardless of its --requeue flag. This is a
                 // deliberate divergence from the ordinary requeue path.
-                let hold_secs = (self.config.scheduler.interval_secs as i64 * 2 + 3).max(5);
+                let hold_secs = (self.config().scheduler.interval_secs as i64 * 2 + 3).max(5);
                 let hold = Utc::now() + chrono::Duration::seconds(hold_secs);
                 // Honor a later user --begin: compute the max on the leader so
                 // followers apply one verbatim instant (no per-replica clock).
@@ -1105,7 +1120,7 @@ impl ClusterManager {
     }
 
     fn run_epilog_slurmctld(&self, job_id: JobId) {
-        let Some(epilog_ctld) = self.config.hooks.epilog_slurmctld.clone() else {
+        let Some(epilog_ctld) = self.config().hooks.epilog_slurmctld.clone() else {
             return;
         };
         let job = self.get_job(job_id);
@@ -1184,7 +1199,7 @@ impl ClusterManager {
 
     /// Requeue a job if spec.requeue is set and attempt limit not exceeded.
     fn maybe_requeue(&self, job_id: JobId) -> anyhow::Result<()> {
-        let max = self.config.controller.max_batch_requeue;
+        let max = self.config().controller.max_batch_requeue;
         let (should_requeue, old_state) = {
             let jobs = self.jobs.read();
             let Some(job) = jobs.get(&job_id) else {
@@ -1233,7 +1248,7 @@ impl ClusterManager {
             if job.state.is_terminal() {
                 return Ok(());
             }
-            if job.requeue_count >= self.config.controller.max_batch_requeue {
+            if job.requeue_count >= self.config().controller.max_batch_requeue {
                 drop(jobs);
                 return self.hold_job_at_max_requeue(job_id);
             }
@@ -2640,15 +2655,25 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Re-read spur.conf and reconcile the live partition table to match it.
+    /// Re-read spur.conf and apply it to the running controller.
     ///
     /// Makes the config file authoritative, matching `scontrol reconfigure`
     /// semantics in Slurm: runtime-only changes not reflected in the conf are
     /// overwritten by the incoming conf values.
     ///
-    /// Reloads `[[partitions]]` only. All other sections (`[scheduler]`,
-    /// `[accounting]`, `[controller]`, etc.) are parsed but discarded; changing
-    /// them requires a controller restart.
+    /// Reloaded live (readers take a fresh snapshot via `config()`):
+    /// `[[partitions]]`, `[[nodes]]` features/weight, `licenses`,
+    /// `burst_buffer`, `scheduler` tunables (`complete_wait`, `resv_overrun`),
+    /// `controller.max_batch_requeue`, `hooks`, `notifications`, `federation`,
+    /// `power` suspend/resume commands, `admission.mode`, `auth.jwt_key`, and
+    /// `metrics.high_cardinality`.
+    ///
+    /// Restart-only (baked in at startup — mirrors Slurm's restart-required set
+    /// of ports/plugins/StateSaveLocation): bind addresses and ports
+    /// (`controller.listen_addr`, `metrics`/`rest_api` listeners), the
+    /// accounting database pool (`accounting.database_url`), Raft identity/peers,
+    /// `controller.first_job_id`, and the scheduler loop cadence
+    /// (`scheduler.interval_secs`, `max_jobs_per_cycle`, `topology`).
     pub fn reconfigure(&self) -> Result<(), anyhow::Error> {
         let Some(ref path) = self.config_path else {
             anyhow::bail!("reconfigure requires a config file path, but none is configured");
@@ -2731,9 +2756,29 @@ impl ClusterManager {
             .map_err(|e| anyhow::anyhow!("reconfigure: update {}: {e}", part.name))?;
         }
 
-        info!(
-            "reconfigure: reloaded partitions from spur.conf; other config sections require a controller restart"
-        );
+        // Re-derive the config-total pools. Availability is computed as total
+        // minus in-use elsewhere, so swapping the totals cannot strand
+        // capacity already held by running jobs.
+        *self.license_pool.write() = new_config.licenses.clone();
+        *self.burst_buffer_total_gb.write() = new_config.burst_buffer.total_gb;
+
+        // Swap the live config last, after partition WAL ops have been accepted,
+        // so a mid-reconfigure failure leaves the previous config in place.
+        // Readers pick up the new sections on their next `config()` snapshot.
+        *self.config.write() = Arc::new(new_config);
+
+        // Re-derive per-node `[[nodes]]` policy (features/weight) and partition
+        // membership against the freshly-swapped config. This is a local derived
+        // projection (recomputed identically on snapshot restore and inside the
+        // partition WAL apply handlers), so recomputing it here is consistent.
+        // Partition ops above already trigger the same recompute on every peer
+        // via the WAL; this covers a nodes-only edit that proposes no op.
+        {
+            let mut nodes = self.nodes.write();
+            self.reconcile_partitions(&mut nodes);
+        }
+
+        info!("reconfigure: applied spur.conf; restart-only sections (listen ports, accounting DB, raft peers, scheduler cadence) unchanged until controller restart");
         Ok(())
     }
 
@@ -2919,7 +2964,7 @@ impl ClusterManager {
     /// Cancel running jobs whose reservation window has ended (after optional grace).
     pub fn enforce_reservation_end_times(&self) {
         let now = Utc::now();
-        let grace = chrono::Duration::minutes(self.config.scheduler.resv_overrun_minutes as i64);
+        let grace = chrono::Duration::minutes(self.config().scheduler.resv_overrun_minutes as i64);
         let reservations: std::collections::HashMap<String, Reservation> = self
             .get_reservations()
             .into_iter()
@@ -3207,7 +3252,8 @@ impl ClusterManager {
     ///
     /// Uses `curl` as a subprocess to avoid pulling in an HTTP client dependency.
     fn send_notification(&self, job_id: JobId, event: &str, spec: &JobSpec) {
-        let webhook_url = self.config.notifications.webhook_url.clone();
+        let config = self.config();
+        let webhook_url = config.notifications.webhook_url.clone();
         if let Some(url) = webhook_url {
             let event = event.to_string();
             let user = spec.user.clone();
@@ -3258,9 +3304,8 @@ impl ClusterManager {
         }
 
         // SMTP email notification via sendmail-compatible command
-        if let Some(ref smtp_cmd) = self.config.notifications.smtp_command {
-            let from = self
-                .config
+        if let Some(ref smtp_cmd) = config.notifications.smtp_command {
+            let from = config
                 .notifications
                 .from_address
                 .as_deref()
@@ -3569,7 +3614,7 @@ impl ClusterManager {
                     // Gated on a real transition so a replay doesn't re-wipe
                     // fields or double-count requeue_count.
                     if outcome == TransitionOutcome::Applied && *new_state == JobState::Pending {
-                        let max = self.config.controller.max_batch_requeue;
+                        let max = self.config().controller.max_batch_requeue;
                         if job.requeue_count < max {
                             Self::reset_job_for_requeue(job);
                         } else {
@@ -4473,7 +4518,7 @@ impl StateMachineApply for ClusterManager {
     fn restore_from_snapshot(&self, data: &[u8]) -> Result<(), anyhow::Error> {
         let snap = serde_json::from_slice::<ClusterSnapshot>(data)?;
 
-        let mut next_id = self.config.controller.first_job_id;
+        let mut next_id = self.config().controller.first_job_id;
         let mut jobs = self.jobs.write();
         jobs.clear();
         for job in snap.jobs {
@@ -4503,7 +4548,7 @@ impl StateMachineApply for ClusterManager {
         {
             let mut partitions = self.partitions.write();
             *partitions = if snap.partitions.is_empty() {
-                let mut base = self.config.build_partitions();
+                let mut base = self.config().build_partitions();
                 base.retain(|p| !snap.deleted_partition_names.contains(&p.name));
                 base
             } else {
@@ -5278,6 +5323,126 @@ mod tests {
         let mut spec = basic_spec(name);
         spec.srun_job = true;
         spec
+    }
+
+    /// Build a cluster backed by a real spur.conf on disk so `reconfigure()`
+    /// has a path to re-read. Returns the cluster and the conf path so tests
+    /// can rewrite the file and reconcile.
+    async fn test_cluster_with_conf_file(
+        dir: &TempDir,
+        toml: &str,
+    ) -> (Arc<ClusterManager>, PathBuf) {
+        let conf_path = dir.path().join("spur.conf");
+        std::fs::write(&conf_path, toml).unwrap();
+        let config = SlurmConfig::load_from_file(&conf_path).unwrap();
+        let cm = Arc::new(
+            ClusterManager::new_with_config_path(config, dir.path(), Some(conf_path.clone()))
+                .unwrap(),
+        );
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .expect("single-node raft did not self-elect within 5s");
+        cm.set_raft(handle.raft);
+        (cm, conf_path)
+    }
+
+    #[tokio::test]
+    async fn reconfigure_reloads_max_batch_requeue_live() {
+        let dir = TempDir::new().unwrap();
+        let (cm, conf_path) = test_cluster_with_conf_file(
+            &dir,
+            "cluster_name = \"test\"\n[controller]\nmax_batch_requeue = 3\n",
+        )
+        .await;
+        assert_eq!(cm.config().controller.max_batch_requeue, 3);
+
+        std::fs::write(
+            &conf_path,
+            "cluster_name = \"test\"\n[controller]\nmax_batch_requeue = 9\n",
+        )
+        .unwrap();
+        cm.reconfigure().unwrap();
+
+        assert_eq!(
+            cm.config().controller.max_batch_requeue,
+            9,
+            "reconfigure must apply the new max_batch_requeue to the live config"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconfigure_reloads_scheduler_tunables_live() {
+        let dir = TempDir::new().unwrap();
+        let (cm, conf_path) = test_cluster_with_conf_file(
+            &dir,
+            "cluster_name = \"test\"\n[scheduler]\nresv_overrun_minutes = 5\ncomplete_wait_secs = 30\n",
+        )
+        .await;
+        assert_eq!(cm.config().scheduler.resv_overrun_minutes, 5);
+
+        std::fs::write(
+            &conf_path,
+            "cluster_name = \"test\"\n[scheduler]\nresv_overrun_minutes = 45\ncomplete_wait_secs = 90\n",
+        )
+        .unwrap();
+        cm.reconfigure().unwrap();
+
+        let cfg = cm.config();
+        assert_eq!(cfg.scheduler.resv_overrun_minutes, 45);
+        assert_eq!(cfg.scheduler.complete_wait_secs, 90);
+    }
+
+    #[tokio::test]
+    async fn reconfigure_reloads_hooks_and_notifications_live() {
+        let dir = TempDir::new().unwrap();
+        let (cm, conf_path) = test_cluster_with_conf_file(&dir, "cluster_name = \"test\"\n").await;
+        assert!(cm.config().hooks.epilog_slurmctld.is_none());
+        assert!(cm.config().notifications.webhook_url.is_none());
+
+        std::fs::write(
+            &conf_path,
+            "cluster_name = \"test\"\n[hooks]\nepilog_slurmctld = \"/usr/bin/epi\"\n[notifications]\nwebhook_url = \"http://hook/\"\n",
+        )
+        .unwrap();
+        cm.reconfigure().unwrap();
+
+        let cfg = cm.config();
+        assert_eq!(cfg.hooks.epilog_slurmctld.as_deref(), Some("/usr/bin/epi"));
+        assert_eq!(
+            cfg.notifications.webhook_url.as_deref(),
+            Some("http://hook/")
+        );
+    }
+
+    #[tokio::test]
+    async fn reconfigure_reloads_license_pool_live() {
+        let dir = TempDir::new().unwrap();
+        let (cm, conf_path) =
+            test_cluster_with_conf_file(&dir, "cluster_name = \"test\"\n[licenses]\nfluent = 5\n")
+                .await;
+        // Availability is derived from the pool total; no jobs hold licenses.
+        assert_eq!(cm.available_licenses().get("fluent").copied(), Some(5));
+
+        std::fs::write(
+            &conf_path,
+            "cluster_name = \"test\"\n[licenses]\nfluent = 20\ncomsol = 2\n",
+        )
+        .unwrap();
+        cm.reconfigure().unwrap();
+
+        let avail = cm.available_licenses();
+        assert_eq!(
+            avail.get("fluent").copied(),
+            Some(20),
+            "reconfigure must apply the new license total"
+        );
+        assert_eq!(avail.get("comsol").copied(), Some(2));
     }
 
     fn scalar_alloc(cpus: u32, memory_mb: u64) -> ResourceAllocations {
@@ -8950,7 +9115,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "worker1", 8, 16000);
-        let max = cm.config.controller.max_batch_requeue;
+        let max = cm.config().controller.max_batch_requeue;
 
         let job_id = run_job_on(&cm, "chronic-preempt", "worker1");
         for _ in 0..(max + 3) {
@@ -8997,7 +9162,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "worker1", 8, 16000);
-        let max = cm.config.controller.max_batch_requeue;
+        let max = cm.config().controller.max_batch_requeue;
 
         let mut spec = basic_spec("chronic-then-timeout");
         spec.requeue = true;

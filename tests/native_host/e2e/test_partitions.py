@@ -1055,3 +1055,41 @@ class TestReconfigure:
             f"spur.conf was modified by reconfigure: "
             f"mtime {mtime_before} → {mtime_after}"
         )
+
+    def test_reconfigure_reloads_non_partition_section_live(self, cluster):
+        """A non-partition section ([federation]) added to spur.conf must take
+        effect on `scontrol reconfigure` WITHOUT a controller restart.
+
+        Proves reconfigure is not partition-only: the controller re-reads the
+        file and swaps its live config, and a consumer (the ping path behind
+        `scontrol show federation`) picks up the new value immediately.
+        """
+        node = cluster.nodes[0]
+        conf_path = f"{cluster.etc_dir}/spur.conf"
+
+        before = cluster.scontrol("show", "federation")
+        assert "reconf-peer" not in before, (
+            "peer must not exist before the conf edit"
+        )
+
+        original = node.read_file(conf_path)
+        assert "[[federation.clusters]]" not in original
+        node.write_file(
+            conf_path,
+            original
+            + '\n[[federation.clusters]]\n'
+            + 'name = "reconf-peer"\n'
+            + 'address = "http://reconf-peer:6817"\n',
+        )
+        try:
+            cluster.scontrol("reconfigure")
+
+            after = cluster.scontrol("show", "federation")
+            assert "reconf-peer" in after, (
+                "federation peer added to spur.conf must be live after "
+                f"reconfigure without a restart; got:\n{after}"
+            )
+        finally:
+            # Restore conf so later tests see the original config on disk.
+            node.write_file(conf_path, original)
+            cluster.scontrol("reconfigure")
