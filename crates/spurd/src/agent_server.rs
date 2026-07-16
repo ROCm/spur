@@ -16,7 +16,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use spur_proto::proto::slurm_agent_server::SlurmAgent;
 use spur_proto::proto::*;
 
-use spur_sched::cons_tres::{AllocationResult, NodeAllocation};
+use spur_sched::cons_tres::{AllocError, AllocationResult, NodeAllocation};
 
 use spur_spank::{SpankContext, SpankHandle, SpankHook, SpankHost};
 
@@ -812,10 +812,7 @@ impl SlurmAgent for AgentService {
             cfg.device_plan = Some(container_device_plan);
         }
 
-        let cpu_ids: Vec<u32> = alloc_result
-            .as_ref()
-            .map(|a| a.cpu_ids.clone())
-            .unwrap_or_default();
+        let cpu_ids: Vec<u32> = alloc_result.cpu_ids.clone();
 
         // Guard rather than unwrap: these are always Some when the image is
         // set, but an early exit before commit must release the reservation.
@@ -1454,7 +1451,7 @@ impl AgentService {
         job_id: u32,
         spec: &JobSpec,
         allocated: Option<&ResourceAllocations>,
-    ) -> Result<(Option<AllocationResult>, Vec<u32>), Status> {
+    ) -> Result<(AllocationResult, Vec<u32>), Status> {
         let controller_gpu_ids: Vec<u32> = allocated
             .and_then(|a| a.devices.get("gpu"))
             .map(|d| d.devices.iter().map(|dev| dev.device_id).collect())
@@ -1477,23 +1474,41 @@ impl AgentService {
         } else {
             0
         };
-        let Some(result) =
-            alloc.allocate_for_job(job_id, cpus, spec.memory_per_node_mb, &controller_gpu_ids)
-        else {
-            warn!(
-                job_id,
-                requested = ?controller_gpu_ids,
-                already_allocated = ?alloc.allocated_gpu_ids(),
-                "rejecting dispatch: controller-allocated GPUs already in use in the local \
-                 allocation table (stale allocation from a prior job would strand this node)"
-            );
-            return Err(Status::resource_exhausted(
-                "controller-allocated GPUs unavailable on this node",
-            ));
+        let result = match alloc.allocate_for_job(
+            job_id,
+            cpus,
+            spec.memory_per_node_mb,
+            &controller_gpu_ids,
+        ) {
+            Ok(result) => result,
+            Err(AllocError::GpusUnavailable) => {
+                warn!(
+                    job_id,
+                    requested = ?controller_gpu_ids,
+                    already_allocated = ?alloc.allocated_gpu_ids(),
+                    "rejecting dispatch: controller-allocated GPUs already in use in the local \
+                     allocation table (stale allocation from a prior job would strand this node)"
+                );
+                return Err(Status::resource_exhausted(
+                    "controller-allocated GPUs unavailable on this node",
+                ));
+            }
+            Err(AllocError::DuplicateJob) => {
+                // A retried LaunchJob for a job that already holds a
+                // reservation: the RPC was already accepted, so this is a
+                // protocol-level duplicate, not resource exhaustion.
+                warn!(
+                    job_id,
+                    "rejecting duplicate launch: job already has a reservation"
+                );
+                return Err(Status::already_exists(format!(
+                    "job {job_id} already has a reservation on this node"
+                )));
+            }
         };
 
         let gpu_ids = controller_gpu_ids;
-        Ok((Some(result), gpu_ids))
+        Ok((result, gpu_ids))
     }
 
     fn parse_gpu_gres(gres: &[String]) -> (u32, Option<String>) {
@@ -2022,7 +2037,7 @@ mod tests {
         );
     }
 
-    // The monitor loop.s reconcile step must reclaim an
+    // The monitor loop's reconcile step must reclaim an
     // allocation whose job is no longer tracked, while sparing a job that is
     // still in `running`. Exercises the real reconcile_orphaned_allocations
     // wiring the monitor loop calls, without driving the timed loop.
@@ -2041,9 +2056,9 @@ mod tests {
         // (simulating a teardown path that dropped the job without releasing).
         {
             let mut alloc = svc.allocation.lock().await;
-            alloc.allocate_for_job(1, 2, 0, &[0]);
+            alloc.allocate_for_job(1, 2, 0, &[0]).unwrap();
             alloc.commit_job(1);
-            alloc.allocate_for_job(2, 2, 0, &[1]);
+            alloc.allocate_for_job(2, 2, 0, &[1]).unwrap();
             alloc.commit_job(2);
         }
         assert_eq!(svc.free_gpu_count().await, 0);

@@ -10,6 +10,17 @@ use std::collections::{HashMap, HashSet};
 
 use spur_core::resource::{GpuResource, ResourceSet};
 
+/// Why a reservation could not be made. Distinguished so the caller can map
+/// each to the right gRPC status instead of reporting every failure as GPU
+/// exhaustion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AllocError {
+    /// A controller-allocated GPU is unknown to this node or already in use.
+    GpusUnavailable,
+    /// This job id already holds a reservation (a retried LaunchJob RPC).
+    DuplicateJob,
+}
+
 /// Per-node resource allocation state.
 /// Tracks which specific cores and GPUs are allocated.
 #[derive(Debug, Clone)]
@@ -113,28 +124,33 @@ impl NodeAllocation {
     }
 
     /// Reserve resources for a job, keyed by job id. GPU device ids are the
-    /// hard gate (unknown or in-use → None, caller rejects the dispatch); CPU
-    /// is best-effort since the controller owns placement. Memory is always
-    /// accounted so release stays symmetric. Marked `launching` until
-    /// `commit_job`/`release_job` so reconcile spares an in-flight launch.
+    /// hard gate (unknown or in-use → `GpusUnavailable`); a job id that already
+    /// holds a reservation → `DuplicateJob`. CPU is best-effort since the
+    /// controller owns placement. Memory is always accounted so release stays
+    /// symmetric. Marked `launching` until `commit_job`/`release_job` so
+    /// reconcile spares an in-flight launch.
     pub fn allocate_for_job(
         &mut self,
         job_id: u32,
         cpus: u32,
         memory_mb: u64,
         gpu_device_ids: &[u32],
-    ) -> Option<AllocationResult> {
+    ) -> Result<AllocationResult, AllocError> {
         // A duplicate reservation for the same job (a retried LaunchJob RPC)
         // would double-count CPU/memory and orphan the prior owner entry.
         if self.owners.contains_key(&job_id) {
-            return None;
+            return Err(AllocError::DuplicateJob);
         }
 
         let mut gpu_indices = Vec::with_capacity(gpu_device_ids.len());
         for &id in gpu_device_ids {
-            let idx = self.gpus.iter().position(|g| g.device_id == id)?;
+            let idx = self
+                .gpus
+                .iter()
+                .position(|g| g.device_id == id)
+                .ok_or(AllocError::GpusUnavailable)?;
             if self.gpu_allocated[idx] || gpu_indices.contains(&idx) {
-                return None;
+                return Err(AllocError::GpusUnavailable);
             }
             gpu_indices.push(idx);
         }
@@ -159,7 +175,7 @@ impl NodeAllocation {
         };
         self.owners.insert(job_id, result.clone());
         self.launching.insert(job_id);
-        Some(result)
+        Ok(result)
     }
 
     /// Mark a job's allocation as committed (its process is now tracked), so it
@@ -198,7 +214,7 @@ impl NodeAllocation {
 }
 
 /// Result of a successful allocation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllocationResult {
     /// Allocated core IDs.
     pub cpu_ids: Vec<u32>,
@@ -295,7 +311,7 @@ mod tests {
         // return to the free pool or it is rejected forever.
         let mut node = make_node_with_ids(64, 256_000, vec![128, 129, 130, 131], "mi350x");
 
-        assert!(node.allocate_for_job(1, 0, 0, &[129, 131]).is_some());
+        assert!(node.allocate_for_job(1, 0, 0, &[129, 131]).is_ok());
         assert_eq!(node.free_gpus(None), 2);
 
         assert!(node.release_job(1));
@@ -307,7 +323,7 @@ mod tests {
 
         // The whole point: the device is re-allocatable after release.
         assert!(
-            node.allocate_for_job(2, 0, 0, &[129, 131]).is_some(),
+            node.allocate_for_job(2, 0, 0, &[129, 131]).is_ok(),
             "device_ids must be re-allocatable after release"
         );
     }
@@ -315,7 +331,7 @@ mod tests {
     #[test]
     fn test_allocate_rejects_unknown_device_id() {
         let mut node = make_node_with_ids(64, 256_000, vec![128, 129], "mi350x");
-        assert!(node.allocate_for_job(1, 0, 0, &[200]).is_none());
+        assert!(node.allocate_for_job(1, 0, 0, &[200]).is_err());
         // A rejected allocation must not leave partial state behind.
         assert_eq!(node.free_gpus(None), 2);
         assert!(!node.release_job(1));
@@ -326,12 +342,12 @@ mod tests {
         // If a multi-GPU allocation hits a conflict partway, it must not leave
         // the earlier device_ids marked allocated — that is itself a leak.
         let mut node = make_node_with_ids(64, 256_000, vec![128, 129, 130], "mi350x");
-        assert!(node.allocate_for_job(1, 0, 0, &[129]).is_some());
+        assert!(node.allocate_for_job(1, 0, 0, &[129]).is_ok());
         // [128, 129] — 129 already taken, so the whole call must fail and 128
         // must remain free.
-        assert!(node.allocate_for_job(2, 0, 0, &[128, 129]).is_none());
+        assert!(node.allocate_for_job(2, 0, 0, &[128, 129]).is_err());
         assert!(
-            node.allocate_for_job(3, 0, 0, &[128]).is_some(),
+            node.allocate_for_job(3, 0, 0, &[128]).is_ok(),
             "128 must remain free after the failed partial allocation"
         );
     }
@@ -360,21 +376,27 @@ mod tests {
         // A retried reservation for the same job must not double-count CPU/mem
         // or orphan the prior owner entry.
         let mut node = make_node(64, 256_000, 0, "");
-        assert!(node.allocate_for_job(1, 8, 16_000, &[]).is_some());
-        assert!(node.allocate_for_job(1, 8, 16_000, &[]).is_none());
+        assert!(node.allocate_for_job(1, 8, 16_000, &[]).is_ok());
+        assert_eq!(
+            node.allocate_for_job(1, 8, 16_000, &[]),
+            Err(AllocError::DuplicateJob)
+        );
         assert_eq!(node.free_cpus(), 56);
         assert_eq!(node.free_memory_mb(), 240_000);
         // After release the id is free to reserve again.
         assert!(node.release_job(1));
-        assert!(node.allocate_for_job(1, 8, 16_000, &[]).is_some());
+        assert!(node.allocate_for_job(1, 8, 16_000, &[]).is_ok());
     }
 
     #[test]
     fn test_allocate_for_job_rejects_conflicting_gpu() {
         let mut node = make_node_with_ids(64, 256_000, vec![0, 1], "mi300x");
-        assert!(node.allocate_for_job(1, 4, 0, &[0]).is_some());
+        assert!(node.allocate_for_job(1, 4, 0, &[0]).is_ok());
         // Second job wanting the same device id must fail with no state change.
-        assert!(node.allocate_for_job(2, 4, 0, &[0]).is_none());
+        assert_eq!(
+            node.allocate_for_job(2, 4, 0, &[0]),
+            Err(AllocError::GpusUnavailable)
+        );
         assert_eq!(node.free_gpus(None), 1);
         // The failed job left no owner entry.
         assert!(!node.release_job(2));
@@ -384,13 +406,13 @@ mod tests {
     fn test_reconcile_reclaims_orphans_but_spares_live_and_launching() {
         let mut node = make_node_with_ids(64, 256_000, vec![0, 1, 2, 3], "mi300x");
         // job 1: committed and live.
-        node.allocate_for_job(1, 4, 8_000, &[0]);
+        node.allocate_for_job(1, 4, 8_000, &[0]).unwrap();
         node.commit_job(1);
         // job 2: committed but NOT live (teardown failed to release — orphan).
-        node.allocate_for_job(2, 4, 8_000, &[1]);
+        node.allocate_for_job(2, 4, 8_000, &[1]).unwrap();
         node.commit_job(2);
         // job 3: still launching (reserved, not yet committed) — must be spared.
-        node.allocate_for_job(3, 4, 8_000, &[2]);
+        node.allocate_for_job(3, 4, 8_000, &[2]).unwrap();
 
         let live: HashSet<u32> = [1].into_iter().collect();
         let mut reclaimed = node.reconcile(&live);
@@ -407,10 +429,10 @@ mod tests {
     #[test]
     fn test_memory_released_symmetrically_with_zero_cpus() {
         // A job with 0 cpus must still have its memory reserved and released
-        // symmetrically — otherwise release drives allocated_memory_mb below
-        // what was added (the pre-fix drift).
+        // symmetrically, or release drives allocated_memory_mb below what was
+        // added.
         let mut node = make_node(64, 256_000, 0, "");
-        node.allocate_for_job(1, 0, 16_000, &[]);
+        node.allocate_for_job(1, 0, 16_000, &[]).unwrap();
         assert_eq!(node.free_memory_mb(), 240_000);
         node.release_job(1);
         assert_eq!(node.free_memory_mb(), 256_000);
