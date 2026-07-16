@@ -271,6 +271,12 @@ pub struct ClusterManager {
     /// values live; sections captured once at startup (bound sockets, DB pool,
     /// scheduler loop interval) remain restart-only — see `reconfigure`.
     config: RwLock<Arc<SlurmConfig>>,
+    /// Scheduler tick interval captured at startup. The scheduler loop's cadence
+    /// is fixed once at boot (restart-only), so the preemption requeue hold —
+    /// which is sized to that cadence — must read this pinned value, not the
+    /// live `config()`, or the hold window would drift after `reconfigure`
+    /// while the loop keeps ticking at the old rate.
+    scheduler_interval_secs: u32,
     /// Path to the spur.conf file, re-read by `reconfigure()`. spur.conf is
     /// never written back — the Raft WAL is the sole source of runtime truth.
     /// None when running without a config file (e.g. in tests).
@@ -322,11 +328,13 @@ impl ClusterManager {
         let burst_buffer_total_gb = config.burst_buffer.total_gb;
         let fairshare_cache = Arc::new(FairshareCache::new());
         let first_job_id = config.controller.first_job_id;
+        let scheduler_interval_secs = config.scheduler.interval_secs;
         let qos_cache = Arc::new(QosCache::new());
         let association_cache = Arc::new(AssociationCache::new());
 
         let cm = Self {
             config: RwLock::new(Arc::new(config)),
+            scheduler_interval_secs,
             config_path,
             jobs: RwLock::new(HashMap::new()),
             nodes: RwLock::new(HashMap::new()),
@@ -1087,7 +1095,7 @@ impl ClusterManager {
                 // the maybe_requeue MAX_REQUEUE cap: Slurm always requeues a
                 // preempted job regardless of its --requeue flag. This is a
                 // deliberate divergence from the ordinary requeue path.
-                let hold_secs = (self.config().scheduler.interval_secs as i64 * 2 + 3).max(5);
+                let hold_secs = (self.scheduler_interval_secs as i64 * 2 + 3).max(5);
                 let hold = Utc::now() + chrono::Duration::seconds(hold_secs);
                 // Honor a later user --begin: compute the max on the leader so
                 // followers apply one verbatim instant (no per-replica clock).
@@ -2661,19 +2669,32 @@ impl ClusterManager {
     /// semantics in Slurm: runtime-only changes not reflected in the conf are
     /// overwritten by the incoming conf values.
     ///
-    /// Reloaded live (readers take a fresh snapshot via `config()`):
-    /// `[[partitions]]`, `[[nodes]]` features/weight, `licenses`,
+    /// **Leader-only.** The command is forwarded to the Raft leader, and this
+    /// swaps only the leader's in-memory config — no WAL entry carries the new
+    /// config. Followers keep the config they read at startup until they
+    /// restart (in Kubernetes they re-read the same ConfigMap). Do not rely on
+    /// reconfigured non-partition state surviving an immediate failover.
+    /// Partition edits DO propagate (via partition WAL ops), but a follower
+    /// re-runs `reconcile_partitions` against its own stale `config().nodes`,
+    /// so after a partition edit followers pick up new partition membership but
+    /// keep old node features until restart. WAL-propagating config is a
+    /// planned follow-up.
+    ///
+    /// Reloaded live on the leader (readers take a fresh snapshot via
+    /// `config()`): `[[partitions]]`, `[[nodes]]` features/weight, `licenses`,
     /// `burst_buffer`, `scheduler` tunables (`complete_wait`, `resv_overrun`),
     /// `controller.max_batch_requeue`, `hooks`, `notifications`, `federation`,
-    /// `power` suspend/resume commands, `admission.mode`, `auth.jwt_key`, and
+    /// `power` suspend/resume commands, `admission.mode`, and
     /// `metrics.high_cardinality`.
     ///
     /// Restart-only (baked in at startup — mirrors Slurm's restart-required set
-    /// of ports/plugins/StateSaveLocation): bind addresses and ports
+    /// of ports/plugins/StateSaveLocation/AuthType): bind addresses and ports
     /// (`controller.listen_addr`, `metrics`/`rest_api` listeners), the
     /// accounting database pool (`accounting.database_url`), Raft identity/peers,
-    /// `controller.first_job_id`, and the scheduler loop cadence
-    /// (`scheduler.interval_secs`, `max_jobs_per_cycle`, `topology`).
+    /// `controller.first_job_id`, `auth.jwt_key` (swapping it live would
+    /// instantly invalidate every outstanding node token), and the scheduler
+    /// loop cadence (`scheduler.interval_secs`, `max_jobs_per_cycle`,
+    /// `topology`).
     pub fn reconfigure(&self) -> Result<(), anyhow::Error> {
         let Some(ref path) = self.config_path else {
             anyhow::bail!("reconfigure requires a config file path, but none is configured");
@@ -2778,7 +2799,7 @@ impl ClusterManager {
             self.reconcile_partitions(&mut nodes);
         }
 
-        info!("reconfigure: applied spur.conf; restart-only sections (listen ports, accounting DB, raft peers, scheduler cadence) unchanged until controller restart");
+        info!("reconfigure: applied spur.conf on this leader (followers converge on restart); restart-only sections (listen ports, accounting DB, raft peers, jwt_key, scheduler cadence) unchanged until controller restart");
         Ok(())
     }
 
@@ -5352,27 +5373,54 @@ mod tests {
         (cm, conf_path)
     }
 
-    #[tokio::test]
-    async fn reconfigure_reloads_max_batch_requeue_live() {
+    /// Consumer-driven: `maybe_requeue` must honor the new `max_batch_requeue`
+    /// after reconfigure, not just the swapped config value. A job whose
+    /// `requeue_count` sits between the old and new caps is a no-op under the
+    /// old cap but requeues to Pending under the new one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_max_batch_requeue_changes_consumer_behavior() {
+        let conf = |cap: u32| {
+            format!(
+                "cluster_name = \"test\"\n\
+                 [controller]\nmax_batch_requeue = {cap}\n\
+                 [[partitions]]\nname = \"default\"\ndefault = true\nstate = \"UP\"\nnodes = \"ALL\"\n"
+            )
+        };
         let dir = TempDir::new().unwrap();
-        let (cm, conf_path) = test_cluster_with_conf_file(
-            &dir,
-            "cluster_name = \"test\"\n[controller]\nmax_batch_requeue = 3\n",
-        )
-        .await;
-        assert_eq!(cm.config().controller.max_batch_requeue, 3);
+        let (cm, conf_path) = test_cluster_with_conf_file(&dir, &conf(3)).await;
+        register_node(&cm, "worker1", 8, 16000);
 
-        std::fs::write(
-            &conf_path,
-            "cluster_name = \"test\"\n[controller]\nmax_batch_requeue = 9\n",
-        )
-        .unwrap();
+        let job_id = run_job_on(&cm, "requeue-cap", "worker1");
+        // Put the job in a terminal, requeue-eligible state (Failed → Pending is
+        // a valid requeue transition and is NOT in the max-requeue hold set, so
+        // over-cap is a clean no-op) with 5 attempts already recorded.
+        {
+            let mut jobs = cm.jobs.write();
+            let job = jobs.get_mut(&job_id).unwrap();
+            job.state = JobState::Failed;
+            job.spec.requeue = true;
+            job.requeue_count = 5;
+        }
+
+        // Cap = 3, count = 5 → over cap → maybe_requeue is a no-op (stays Failed).
+        cm.maybe_requeue(job_id).unwrap();
+        assert_eq!(
+            cm.get_job(job_id).unwrap().state,
+            JobState::Failed,
+            "over-cap job must not requeue before reconfigure"
+        );
+
+        // Raise the cap past the attempt count and reconfigure.
+        std::fs::write(&conf_path, conf(9)).unwrap();
         cm.reconfigure().unwrap();
 
+        // Cap = 9, count = 5 → under cap → maybe_requeue returns it to Pending.
+        cm.maybe_requeue(job_id).unwrap();
+        settle(&cm, job_id, JobState::Pending);
         assert_eq!(
-            cm.config().controller.max_batch_requeue,
-            9,
-            "reconfigure must apply the new max_batch_requeue to the live config"
+            cm.get_job(job_id).unwrap().state,
+            JobState::Pending,
+            "after reconfigure raised the cap, the consumer must requeue the job"
         );
     }
 

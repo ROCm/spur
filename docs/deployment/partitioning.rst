@@ -103,11 +103,22 @@ to match the file), ``[[nodes]]`` features and weight, ``licenses``,
 
 **Restart-only**: settings baked in when the daemon starts — listen addresses
 and ports (``[controller]``, ``[metrics]``, ``[rest_api]``), the accounting
-database (``[accounting]``), Raft identity and peers, ``first_job_id``, and the
-scheduler loop cadence (``interval_secs``, ``max_jobs_per_cycle``, topology).
-``reconfigure`` reads these but does not apply them; a full controller restart
-is required. This mirrors Slurm, where a documented subset of parameters
-(ports, ``StateSaveLocation``, plugin set) also require a daemon restart.
+database (``[accounting]``), Raft identity and peers, ``first_job_id``,
+``auth.jwt_key`` (swapping the node-token signing key live would immediately
+invalidate every outstanding node token), and the scheduler loop cadence
+(``interval_secs``, ``max_jobs_per_cycle``, topology). ``reconfigure`` reads
+these but does not apply them; a full controller restart is required. This
+mirrors Slurm, where a documented subset of parameters (ports,
+``StateSaveLocation``, ``AuthType``, plugin set) also require a daemon restart.
+
+**Leader-only, in an HA cluster.** ``reconfigure`` is handled by the Raft
+leader and swaps only the leader's in-memory config; no Raft log entry carries
+the new config, so follower controllers keep the config they loaded at startup
+until they restart (in Kubernetes they re-read the same ConfigMap on restart).
+Partition changes still replicate through the partition write-ahead log, but
+followers recompute node membership from their own (pre-reconfigure) node
+config. Do not rely on reconfigured non-partition state surviving an immediate
+failover; roll the controllers to converge them.
 
 Verifying Membership
 --------------------

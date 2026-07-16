@@ -35,6 +35,11 @@ pub struct ControllerService {
     client_addrs: BTreeMap<u64, String>,
     rpc_stats: Arc<RpcStatsCollector>,
     sched_stats: Arc<SchedStatsCollector>,
+    /// JWT signing key for node tokens, captured at startup. Deliberately NOT
+    /// re-read on `scontrol reconfigure`: swapping it live would instantly fail
+    /// verification of every outstanding node token (7-day TTL), silently
+    /// partitioning healthy nodes. Like Slurm's AuthType, it is restart-only.
+    jwt_key: String,
 }
 
 struct LeaderProxy {
@@ -90,6 +95,18 @@ impl LeaderProxy {
     }
 }
 
+/// Resolve the node-token signing key from config at startup. Captured once by
+/// `serve` into `ControllerService::jwt_key`; deliberately not re-read on
+/// `reconfigure` (see the field doc). Falls back to a shared default so
+/// key-less dev clusters interoperate.
+fn resolve_startup_jwt_key(config: &spur_core::config::SlurmConfig) -> String {
+    config
+        .auth
+        .jwt_key
+        .clone()
+        .unwrap_or_else(|| "spur-default-key".to_string())
+}
+
 impl ControllerService {
     // tonic::Status is 176 bytes (over clippy's 128-byte threshold); fixed upstream in tonic 0.13+
     #[allow(clippy::result_large_err)]
@@ -141,8 +158,7 @@ impl ControllerService {
     fn validate_admission(&self, join_token: &str, hostname: &str) -> Result<String, Status> {
         use spur_core::config::AdmissionMode;
 
-        let config = self.cluster.config();
-        if !matches!(config.admission.mode, AdmissionMode::Token) {
+        if !matches!(self.cluster.config().admission.mode, AdmissionMode::Token) {
             return Ok(String::new());
         }
 
@@ -157,9 +173,7 @@ impl ControllerService {
         spur_core::admission::validate_token(token_id, secret, &token_store)
             .map_err(|e| Status::permission_denied(e.to_string()))?;
 
-        let jwt_key = config.auth.jwt_key.as_deref().unwrap_or("spur-default-key");
-
-        spur_core::admission::generate_node_token(hostname, jwt_key.as_bytes())
+        spur_core::admission::generate_node_token(hostname, self.jwt_key.as_bytes())
             .map_err(|e| Status::internal(e.to_string()))
     }
 }
@@ -680,17 +694,15 @@ impl SlurmController for ControllerService {
         }
         let req = request.into_inner();
 
-        let config = self.cluster.config();
         if matches!(
-            config.admission.mode,
+            self.cluster.config().admission.mode,
             spur_core::config::AdmissionMode::Token
         ) {
             if req.node_token.is_empty() {
                 return Err(Status::unauthenticated("node token required"));
             }
-            let jwt_key = config.auth.jwt_key.as_deref().unwrap_or("spur-default-key");
             let identity =
-                spur_core::admission::verify_node_token(&req.node_token, jwt_key.as_bytes())
+                spur_core::admission::verify_node_token(&req.node_token, self.jwt_key.as_bytes())
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
             if identity.hostname != req.hostname {
                 return Err(Status::permission_denied("node token hostname mismatch"));
@@ -1030,17 +1042,15 @@ impl SlurmController for ControllerService {
 
         let req = request.into_inner();
 
-        let config = self.cluster.config();
         if matches!(
-            config.admission.mode,
+            self.cluster.config().admission.mode,
             spur_core::config::AdmissionMode::Token
         ) {
             if req.node_token.is_empty() {
                 return Err(Status::unauthenticated("node token required"));
             }
-            let jwt_key = config.auth.jwt_key.as_deref().unwrap_or("spur-default-key");
             let identity =
-                spur_core::admission::verify_node_token(&req.node_token, jwt_key.as_bytes())
+                spur_core::admission::verify_node_token(&req.node_token, self.jwt_key.as_bytes())
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
             if identity.hostname != req.hostname {
                 return Err(Status::permission_denied("node token hostname mismatch"));
@@ -2044,6 +2054,8 @@ pub async fn serve(
 
     let leader_proxy = LeaderProxy::new(raft_handle.clone(), client_addrs.clone());
 
+    let jwt_key = resolve_startup_jwt_key(&cluster.config());
+
     let service = ControllerService {
         cluster,
         client_addrs,
@@ -2051,6 +2063,7 @@ pub async fn serve(
         leader_proxy,
         rpc_stats: rpc_stats.clone(),
         sched_stats: sched_stats.clone(),
+        jwt_key,
     };
 
     let stats_layer = RpcStatsLayer::new(rpc_stats, raft_handle);
@@ -2627,6 +2640,73 @@ mod tests {
         let status = submit_rpc_status(SubmitError::invalid("partition 'gpu' not found"));
         assert_eq!(status.code(), Code::InvalidArgument);
         assert_eq!(status.message(), "partition 'gpu' not found");
+    }
+
+    /// GATE: `auth.jwt_key` is captured at startup and must NOT change on
+    /// `reconfigure`. Swapping it live would instantly invalidate every
+    /// outstanding node token. This drives the real capture path
+    /// (`resolve_startup_jwt_key`) and the real `reconfigure`, then proves the
+    /// running controller still verifies a token minted with the startup key.
+    #[tokio::test]
+    async fn reconfigure_does_not_adopt_new_jwt_key() {
+        use spur_core::admission::{generate_node_token, verify_node_token};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let conf_path = dir.path().join("spur.conf");
+        std::fs::write(
+            &conf_path,
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\njwt_key = \"old-secret\"\n",
+        )
+        .unwrap();
+
+        let config = spur_core::config::SlurmConfig::load_from_file(&conf_path).unwrap();
+        let cluster = Arc::new(
+            ClusterManager::new_with_config_path(config, dir.path(), Some(conf_path.clone()))
+                .unwrap(),
+        );
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cluster.clone())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .unwrap();
+        cluster.set_raft(handle.raft);
+
+        // The controller captures the signing key exactly here, at startup.
+        let startup_key = resolve_startup_jwt_key(&cluster.config());
+        assert_eq!(startup_key, "old-secret");
+        let token = generate_node_token("node-1", startup_key.as_bytes()).unwrap();
+
+        // Operator edits jwt_key and reconfigures.
+        std::fs::write(
+            &conf_path,
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\njwt_key = \"new-secret\"\n",
+        )
+        .unwrap();
+        cluster.reconfigure().unwrap();
+
+        // The live config reflects the new key (proving reconfigure did swap
+        // config)...
+        assert_eq!(
+            cluster.config().auth.jwt_key.as_deref(),
+            Some("new-secret"),
+            "reconfigure must swap the live config"
+        );
+        // ...but the controller's captured key is unchanged, so tokens minted
+        // with the startup key still verify. A live-reloaded key would reject
+        // this token.
+        assert_eq!(startup_key, "old-secret", "captured key must not change");
+        assert!(
+            verify_node_token(&token, startup_key.as_bytes()).is_ok(),
+            "outstanding node token must still verify against the startup key"
+        );
+        assert!(
+            verify_node_token(&token, b"new-secret").is_err(),
+            "sanity: the token would fail under the new key (proving the key matters)"
+        );
     }
 
     #[test]
