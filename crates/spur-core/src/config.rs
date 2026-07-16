@@ -275,11 +275,15 @@ pub struct ControllerConfig {
     #[serde(default)]
     pub peers: Vec<String>,
 
-    /// This node's Raft ID. Normally left unset. Resolution precedence is:
+    /// This node's Raft ID. Normally left unset. Only consulted in multi-node
+    /// mode (`peers` non-empty); single-node mode always uses id 1.
+    ///
+    /// In multi-node mode the id is resolved by precedence:
     /// 1. this explicit value, if set;
     /// 2. this host's position in `peers` (its hostname matched against each
     ///    entry's host part, on the full name or first DNS label);
-    /// 3. the hostname ordinal (e.g. spurctld-2 → node_id 3).
+    /// 3. the hostname ordinal (e.g. spurctld-2 → node_id 3), only for IP-only
+    ///    peer lists where hostname matching cannot work.
     ///
     /// The resolved id must fall within `1..=peers.len()`, else startup fails.
     /// Only needed when peers are IP-only and cannot match a hostname.

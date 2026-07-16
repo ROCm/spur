@@ -811,9 +811,19 @@ pub fn resolve_node_id(
         return Ok((id, NodeIdSource::PeersPosition));
     }
 
-    // Hostname-ordinal is a legacy fallback, reached only when the host matched
-    // no peer entry (e.g. IP-only peers). Accept it only if it lands in range;
-    // an out-of-range ordinal is a misconfiguration, not a valid member.
+    // Hostname-ordinal is a legacy fallback for IP-only peer lists, where
+    // hostname matching is impossible. When peers carry hostnames, a no-match
+    // means the host is misconfigured, so fail fast rather than risk assigning
+    // an in-range but wrong id (silent split-brain).
+    if !all_peers_ip_only(peers) {
+        anyhow::bail!(
+            "this host ({hostname:?}) matched no entry in controller.peers; fix the \
+             hostname to match its peers entry or set controller.node_id in spur.conf"
+        );
+    }
+
+    // IP-only peers: accept the ordinal only if it lands in range; an
+    // out-of-range ordinal is a misconfiguration, not a valid member.
     if let Some(id) = node_id_from_hostname(hostname) {
         if (1..=n).contains(&id) {
             return Ok((id, NodeIdSource::HostnameOrdinal));
@@ -826,9 +836,17 @@ pub fn resolve_node_id(
     }
 
     anyhow::bail!(
-        "this host ({hostname:?}) matched no entry in controller.peers; fix the \
-         hostname to match its peers entry or set controller.node_id in spur.conf"
+        "controller.peers are IP-only and hostname {hostname:?} has no ordinal to \
+         derive a node_id from; set controller.node_id in spur.conf"
     )
+}
+
+/// True when every peer entry's host part is an IP literal (no hostname to
+/// match against), meaning position matching cannot work.
+fn all_peers_ip_only(peers: &[String]) -> bool {
+    peers
+        .iter()
+        .all(|entry| peer_host(entry).parse::<std::net::IpAddr>().is_ok())
 }
 
 /// Parse a node_id from a hostname string. The ordinal after the last '-'
@@ -1149,6 +1167,24 @@ mod tests {
     #[test]
     fn resolve_no_match_errors() {
         assert!(resolve_node_id(None, "unknownhost", &three_peers()).is_err());
+    }
+
+    #[test]
+    fn resolve_hostname_peers_no_match_does_not_fall_back_to_ordinal() {
+        // Peers carry hostnames and none match, but the host has a valid
+        // in-range ordinal (spurctld-1 -> 2). It must still fail fast rather
+        // than silently joining with the ordinal-derived id.
+        let err = resolve_node_id(None, "spurctld-1", &three_peers()).unwrap_err();
+        assert!(
+            err.to_string().contains("matched no entry"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_ip_only_peers_without_ordinal_errors() {
+        let peers = vec!["10.0.0.1:6821".to_string(), "10.0.0.2:6821".to_string()];
+        assert!(resolve_node_id(None, "plainhost", &peers).is_err());
     }
 
     #[test]
