@@ -1219,4 +1219,14 @@ mod tests {
         assert_eq!(account, "testacct");
         assert_eq!(user, "testuser");
     }
+
+    #[test]
+    fn list_user_filters_include_user_alias() {
+        let p = parse_params(&["user=testuser".into()]);
+
+        let (account, user) = list_user_filters(&p);
+
+        assert!(account.is_empty());
+        assert_eq!(user, "testuser");
+    }
 }
