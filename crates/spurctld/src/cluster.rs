@@ -1354,14 +1354,19 @@ impl ClusterManager {
 
         // Reject before mutating: an unknown QOS resolves to the limitless
         // default and an empty QOS clears enforcement — both reopen the bypass.
-        if let Some(ref q) = qos {
-            if q.trim().is_empty() {
-                anyhow::bail!("cannot clear a job's QOS");
+        let qos = match qos {
+            Some(q) => {
+                let q = q.trim().to_string();
+                if q.is_empty() {
+                    anyhow::bail!("cannot clear a job's QOS");
+                }
+                if self.qos_cache.get(&q).is_none() {
+                    anyhow::bail!("QOS '{q}' does not exist");
+                }
+                Some(q)
             }
-            if self.qos_cache.get(q).is_none() {
-                anyhow::bail!("QOS '{q}' does not exist");
-            }
-        }
+            None => None,
+        };
 
         if let Some(p) = priority {
             let old = self
