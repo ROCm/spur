@@ -10,7 +10,7 @@ when Docker is unavailable).
 import re
 import time
 
-from cluster import parse_job_id, wait_job, wait_sacct_row
+from cluster import deep_merge, parse_job_id, wait_job, wait_sacct_row
 
 
 class TestSacctExitReporting:
@@ -85,7 +85,10 @@ class TestQosLimitReasons:
         # run unenforced" bypass.
         c = accounting_cluster
         c.sacctmgr(["add", "qos", "name=capped", "maxwall=1"])
-        c.config_overrides = {"accounting": {"default_qos": "capped"}}
+        # Merge the fallback into the on-disk config, then restart so spurctld
+        # re-reads it (restart_controller alone does not re-render the config).
+        deep_merge(c.config_overrides, {"accounting": {"default_qos": "capped"}})
+        c._write_config()
         c.restart_controller()
         time.sleep(15)
 
