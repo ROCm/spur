@@ -4485,23 +4485,23 @@ impl StateMachineApply for ClusterManager {
         // Restore tombstone set first — used below to filter the config baseline.
         *self.deleted_partition_names.write() = snap.deleted_partition_names.clone();
 
-        // Rebuild partition table:
-        //   1. Start from the config-file baseline, skipping any name the
-        //      operator deleted at runtime (tombstone set).
-        //   2. Overlay snapshot entries: if a snapshot entry matches a config
-        //      partition by name, snapshot wins (runtime edits survive restart).
-        //      If no config entry exists for a snapshot entry, it is appended
-        //      (runtime-created partitions survive restart).
+        // Restore the partition table wholesale from the snapshot, like every
+        // other collection here. snap.partitions is the leader's complete
+        // authoritative set (snapshot_state clones the full live vec), so a
+        // stale in-memory partition can't survive install and local config
+        // can't reintroduce one the leader doesn't have. Only fall back to the
+        // config baseline for a pre-partition-snapshot snapshot, where the
+        // serde-default leaves snap.partitions empty and there is nothing
+        // authoritative to restore.
         {
             let mut partitions = self.partitions.write();
-            partitions.retain(|p| !snap.deleted_partition_names.contains(&p.name));
-            for snap_part in snap.partitions {
-                if let Some(existing) = partitions.iter_mut().find(|p| p.name == snap_part.name) {
-                    *existing = snap_part;
-                } else {
-                    partitions.push(snap_part);
-                }
-            }
+            *partitions = if snap.partitions.is_empty() {
+                let mut base = self.config.build_partitions();
+                base.retain(|p| !snap.deleted_partition_names.contains(&p.name));
+                base
+            } else {
+                snap.partitions
+            };
         }
 
         let mut steps = self.steps.write();
@@ -10222,6 +10222,52 @@ mod tests {
         assert_ne!(a.k0s_mesh_ip, b.k0s_mesh_ip);
         assert_ne!(a.k0s_pod_cidr, b.k0s_pod_cidr);
         assert_eq!(cm.k0s_state().control_plane_node.as_deref(), Some("node-a"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_from_snapshot_drops_stale_live_partition() {
+        // A partition present in the target's live memory but absent from the
+        // snapshot (and not tombstoned) must not survive a snapshot install —
+        // otherwise a follower diverges from the leader's partition table.
+        let src = TempDir::new().unwrap();
+        let cm = test_cluster(&src).await;
+        let data = cm.snapshot_state().unwrap();
+
+        let dst = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dst).await;
+        cm2.apply_operation(&WalOperation::PartitionCreate {
+            partition: gpu_partition(),
+        });
+        assert!(cm2.get_partitions().iter().any(|p| p.name == "gpu"));
+
+        cm2.restore_from_snapshot(&data).unwrap();
+        assert!(
+            !cm2.get_partitions().iter().any(|p| p.name == "gpu"),
+            "stale live partition must be gone after restore"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_from_pre_partition_snapshot_keeps_config_baseline() {
+        // An old snapshot predating partition support has no `partitions` field
+        // (serde-default → empty). Restore must fall back to the config
+        // baseline, not wipe all partitions.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let baseline: Vec<String> = cm.get_partitions().iter().map(|p| p.name.clone()).collect();
+        assert!(!baseline.is_empty(), "test config must define a partition");
+
+        let mut snap: serde_json::Value =
+            serde_json::from_slice(&cm.snapshot_state().unwrap()).unwrap();
+        snap.as_object_mut().unwrap().remove("partitions");
+        let data = serde_json::to_vec(&snap).unwrap();
+
+        cm.restore_from_snapshot(&data).unwrap();
+        let after: Vec<String> = cm.get_partitions().iter().map(|p| p.name.clone()).collect();
+        assert_eq!(
+            after, baseline,
+            "config baseline must survive an old snapshot"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
