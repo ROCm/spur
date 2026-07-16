@@ -687,20 +687,15 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 .into_inner()
                 .qos_list;
 
+            let has_name_filter = p.contains_key("name");
             if let Some(name_filter) = p.get("name") {
-                let names: Vec<&str> = name_filter.split(',').collect();
+                let names: Vec<&str> = name_filter.split(',').map(str::trim).collect();
                 qos_list.retain(|q| names.iter().any(|n| n.eq_ignore_ascii_case(&q.name)));
             }
 
             format_engine::print_header(&fields);
 
-            let rows: Vec<&QosInfo> = if qos_list.is_empty() {
-                vec![]
-            } else {
-                qos_list.iter().collect()
-            };
-
-            if rows.is_empty() {
+            if qos_list.is_empty() && !has_name_filter {
                 let default_qos = QosInfo {
                     name: "normal".into(),
                     preempt_mode: "off".into(),
@@ -715,7 +710,7 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     ))
                 );
             } else {
-                for q in rows {
+                for q in &qos_list {
                     println!(
                         "{}",
                         format_engine::format_row(&fields, &|spec| resolve_qos_field(q, spec))
@@ -750,8 +745,7 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
     }
 }
 
-const QOS_DEFAULT_FORMAT: &str =
-    "%-15N %-8p %-10P %-12U %-10J %-10S %-10W %-10w %-20T %-20V %-20G";
+const QOS_DEFAULT_FORMAT: &str = "%-15N %-8p %-10P %-12U %-10J %-10S %-10W %-10w %-20T %-20V %-20G";
 
 const QOS_ALL_FORMAT: &str =
     "%-15N %-30D %-8p %-10P %-12U %-10J %-10S %-10W %-10w %-20T %-20V %-20G";
@@ -1163,11 +1157,12 @@ mod tests {
         assert_eq!(resolve_qos_field(&q, 'J'), "");
         assert_eq!(resolve_qos_field(&q, 'S'), "");
         assert_eq!(resolve_qos_field(&q, 'W'), "");
+        assert_eq!(resolve_qos_field(&q, 'w'), "");
     }
 
     #[test]
-    fn qos_name_filter_retains_matching() {
-        let list = vec![
+    fn qos_name_filter_retains_matching_and_trims_whitespace() {
+        let mut list = vec![
             QosInfo {
                 name: "alpha".into(),
                 ..Default::default()
@@ -1181,14 +1176,12 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let names = ["alpha", "gamma"];
-        let filtered: Vec<_> = list
-            .into_iter()
-            .filter(|q| names.iter().any(|n| n.eq_ignore_ascii_case(&q.name)))
-            .collect();
-        assert_eq!(filtered.len(), 2);
-        assert_eq!(filtered[0].name, "alpha");
-        assert_eq!(filtered[1].name, "gamma");
+        let filter = "alpha, gamma";
+        let names: Vec<&str> = filter.split(',').map(str::trim).collect();
+        list.retain(|q| names.iter().any(|n| n.eq_ignore_ascii_case(&q.name)));
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].name, "alpha");
+        assert_eq!(list[1].name, "gamma");
     }
 
     #[test]

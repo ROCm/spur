@@ -254,7 +254,8 @@ pub fn resolve_format(
         Some(fmt) if fmt.eq_ignore_ascii_case("all") => Ok(parse_format(all_format, header_map)),
         Some(fmt) => {
             let f = parse_named_format(fmt, name_to_spec, header_map);
-            if f.is_empty() {
+            let has_fields = f.iter().any(|t| matches!(t, FormatToken::Field(_)));
+            if !has_fields {
                 anyhow::bail!("no recognized fields in format='{fmt}'. Valid fields: {valid_hint}");
             }
             Ok(f)
