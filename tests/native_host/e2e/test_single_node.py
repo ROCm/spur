@@ -124,6 +124,31 @@ class TestJobLifecycle:
             time.sleep(2)
         assert False, "node should return to idle after cancel"
 
+    def test_failed_launch_releases_reservation(self, cluster):
+        # A launch that fails after the agent reserves resources (here: a
+        # nonexistent container image) must release them, or the node becomes a
+        # black hole that rejects every future dispatch while looking idle.
+        script = cluster.write_file("badimg.sh", "#!/bin/bash\nhostname\n")
+        bad = cluster.sbatch(
+            ["-J", "badimg", "-N", "1",
+             "--container-image=/tmp/does-not-exist-9999.sqsh", script]
+        )
+        bad_id = parse_job_id(bad)
+        assert bad_id is not None
+        time.sleep(6)
+
+        # The node must still accept and complete a normal job afterwards.
+        out_path = f"{cluster.remote_dir}/after-bad.out"
+        ok = cluster.sbatch(
+            ["-J", "after-bad", "-N", "1", "-o", out_path,
+             cluster.write_file("after.sh", "#!/bin/bash\necho AFTER_OK\n")]
+        )
+        ok_id = parse_job_id(ok)
+        assert ok_id is not None
+        wait_job(cluster, ok_id, timeout=60)
+        assert "AFTER_OK" in cluster.read_output_on_any_node(out_path)
+        cluster.scancel(str(bad_id))
+
     def test_job_hold_and_release(self, cluster):
         out_path = f"{cluster.remote_dir}/hold.out"
         script = cluster.write_file("test-hold.sh", "#!/bin/bash\necho HOLD_OK\n")

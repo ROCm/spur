@@ -27,15 +27,12 @@ pub struct NodeAllocation {
     pub gpu_allocated: Vec<bool>,
     /// GPU info for type matching.
     pub gpus: Vec<GpuResource>,
-    /// Per-job ownership of what each job holds, so an allocation can be
-    /// released by job id and orphaned allocations can be reconciled away.
-    /// This is the single source of truth for what is allocated — the bitmaps
-    /// above are a derived index for fast free-count queries.
+    /// Per-job ownership, so an allocation can be released by job id and
+    /// orphans reconciled. Source of truth; the bitmaps above are a derived
+    /// index for fast free-count queries.
     owners: HashMap<u32, AllocationResult>,
-    /// Jobs whose resources are reserved but that have not yet been committed
-    /// to the agent's running set (still mid-launch: image pull, fork, etc.).
-    /// Reconcile must never reclaim these — they have no tracked process yet
-    /// but are not orphaned.
+    /// Reserved but not yet committed to the running set (mid-launch: image
+    /// pull, fork). Reconcile spares these — not yet tracked, but not orphaned.
     launching: HashSet<u32>,
 }
 
@@ -115,16 +112,11 @@ impl NodeAllocation {
         }
     }
 
-    /// Reserve resources for a job, tracked by job id. GPU device ids are the
-    /// hard gate: if any is unknown or already in use, nothing is reserved and
-    /// None is returned (the caller must reject the dispatch). CPU/memory are
-    /// recorded as usage bookkeeping — the controller is authoritative for
-    /// placement, so an oversubscribed CPU count records what is available
-    /// rather than failing. Memory is always accounted, independent of CPU
-    /// count, so release stays symmetric.
-    ///
-    /// The job is marked `launching` until `commit_job` or `release_job` is
-    /// called, so reconcile never reclaims an in-flight launch.
+    /// Reserve resources for a job, keyed by job id. GPU device ids are the
+    /// hard gate (unknown or in-use → None, caller rejects the dispatch); CPU
+    /// is best-effort since the controller owns placement. Memory is always
+    /// accounted so release stays symmetric. Marked `launching` until
+    /// `commit_job`/`release_job` so reconcile spares an in-flight launch.
     pub fn allocate_for_job(
         &mut self,
         job_id: u32,
@@ -182,10 +174,9 @@ impl NodeAllocation {
     }
 
     /// Release every owned allocation whose job is neither in `live` nor still
-    /// launching. Returns the reclaimed job ids. This is the self-healing path:
-    /// if a job's teardown ever fails to release (a completion path that dropped
-    /// the job without releasing), its resources are recovered here instead of
-    /// stranding the node until spurd restart (SPUR-65).
+    /// launching, returning the reclaimed ids. Self-healing backstop: if a
+    /// teardown ever fails to release, resources are recovered here instead of
+    /// stranding the node until spurd restart.
     pub fn reconcile(&mut self, live: &HashSet<u32>) -> Vec<u32> {
         let orphaned: Vec<u32> = self
             .owners
@@ -293,12 +284,9 @@ mod tests {
 
     #[test]
     fn test_record_then_release_noncontiguous_device_ids() {
-        // Real nodes expose GPUs whose device_id is not its position in the
-        // vec (e.g. DRM render ids 128..135). allocate_for_job/release_job key
-        // by device_id, so a released device must return to the free pool —
-        // otherwise the slot is never cleared and the controller's next
-        // legitimate allocation of that device is rejected forever (SPUR-65:
-        // node becomes a black hole -> JobHoldMaxRequeue).
+        // Real nodes expose GPUs whose device_id != vec position (DRM render
+        // ids 128..135). Release keys by device_id, so a released device must
+        // return to the free pool or it is rejected forever.
         let mut node = make_node_with_ids(64, 256_000, vec![128, 129, 130, 131], "mi350x");
 
         assert!(node.allocate_for_job(1, 0, 0, &[129, 131]).is_some());
@@ -378,8 +366,7 @@ mod tests {
         // job 1: committed and live.
         node.allocate_for_job(1, 4, 8_000, &[0]);
         node.commit_job(1);
-        // job 2: committed but NOT live (its teardown failed to release — the
-        // exact SPUR-65 orphan condition).
+        // job 2: committed but NOT live (teardown failed to release — orphan).
         node.allocate_for_job(2, 4, 8_000, &[1]);
         node.commit_job(2);
         // job 3: still launching (reserved, not yet committed) — must be spared.

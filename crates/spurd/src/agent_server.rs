@@ -206,13 +206,10 @@ impl AgentService {
                     }
                 }
 
-                // Self-heal: reclaim any allocation that no longer maps to a
-                // tracked job and is not mid-launch. This is the backstop for
-                // SPUR-65 — if any teardown path ever fails to release, the
-                // node recovers on the next tick instead of silently rejecting
-                // dispatches until spurd restart. `jobs` is still held, so the
-                // live set is a consistent snapshot and cannot race a launch
-                // that is committing (commit_job takes the running lock first).
+                // Self-heal backstop: reclaim allocations with no tracked,
+                // non-launching job. `jobs` is held so the live set is a
+                // consistent snapshot that can't race a committing launch
+                // (commit_job takes the running lock first).
                 reconcile_orphaned_allocations(&jobs, &mut *allocation.lock().await);
 
                 // Release lock BEFORE network I/O — holding the lock during
@@ -790,13 +787,9 @@ impl SlurmAgent for AgentService {
             .allocate_local_resources(job_id, &spec, req.allocated.as_ref())
             .await?;
 
-        // Any failure between here and committing the job into `running` must
-        // release the allocation just reserved by allocate_local_resources —
-        // otherwise the GPUs stay marked in-use with no tracked job to ever
-        // free them, and the node silently rejects every future dispatch while
-        // the controller still believes it is IDLE (SPUR-65 stranding). The
-        // allocation is `launching` until commit_job, so reconcile is also a
-        // backstop, but releasing eagerly here reclaims immediately.
+        // Any failure before commit must release the reservation, or the GPUs
+        // stay in-use with no tracked job while the controller sees the node
+        // IDLE. Reconcile is a backstop; releasing eagerly reclaims at once.
         let injection = {
             let reg = self.device_registry.lock().await;
             reg.build_job_injection_plans("gpu", &allocated_device_ids, spec.uid, spec.gid)
@@ -824,11 +817,8 @@ impl SlurmAgent for AgentService {
             .map(|a| a.cpu_ids.clone())
             .unwrap_or_default();
 
-        // Build container launch config if this is a containerized job.
-        // container_config/rootfs_path are always Some here when the image is
-        // set (populated together above), but guard rather than unwrap so a
-        // future refactor can't leak the reservation: any exit before commit
-        // must release, since the job is still `launching` (SPUR-65).
+        // Guard rather than unwrap: these are always Some when the image is
+        // set, but an early exit before commit must release the reservation.
         let container_launch = if !spec.container_image.is_empty() {
             match (container_config.take(), rootfs_path.take()) {
                 (Some(config), Some(rootfs)) => {
@@ -1974,7 +1964,7 @@ mod tests {
         ))
     }
 
-    // SPUR-65: a dispatch that records GPUs but then fails before the job is
+    // A dispatch that records GPUs but fails before the job is
     // tracked (here: device-registry resolution fails) must release those GPUs.
     // Otherwise the node keeps rejecting every future dispatch ("controller-
     // allocated GPUs unavailable") while the controller still sees it IDLE,
@@ -2032,7 +2022,7 @@ mod tests {
         );
     }
 
-    // SPUR-65 self-heal: the monitor loop's reconcile step must reclaim an
+    // The monitor loop.s reconcile step must reclaim an
     // allocation whose job is no longer tracked, while sparing a job that is
     // still in `running`. Exercises the real reconcile_orphaned_allocations
     // wiring the monitor loop calls, without driving the timed loop.
