@@ -4031,7 +4031,7 @@ fn validate_user_account(
             )))
         }
         AccountMembership::NotMember(valid_accounts) => Err(SubmitError::invalid(format!(
-            "user '{}' is not associated with account '{account}'. Valid accounts for this user: [{}]. Use --account=<account> to specify.",
+            "user '{}' is not associated with account '{account}'. Accounts associated with this user: [{}].",
             spec.user,
             valid_accounts.join(", ")
         ))),
@@ -6421,7 +6421,7 @@ mod tests {
         assert_eq!(
             err,
             SubmitError::invalid(
-                "user 'testuser' is not associated with account 'research'. Valid accounts for this user: [student-a, student-z]. Use --account=<account> to specify."
+                "user 'testuser' is not associated with account 'research'. Accounts associated with this user: [student-a, student-z]."
             )
         );
     }
