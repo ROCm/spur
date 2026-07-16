@@ -190,30 +190,36 @@ impl Scheduler for BackfillScheduler {
                 )
             });
 
+            let allocated_cpus_at_start: HashMap<usize, u32> = node_starts
+                .iter()
+                .map(|(ni, start)| (*ni, self.timelines[*ni].accumulated_at(*start).cpus))
+                .collect();
+
             // For --spread-job, sort by least-loaded (ascending alloc) so we
             // prefer nodes with the most available resources. For normal jobs,
-            // sort by earliest start time. For weighted nodes, prefer higher
-            // weight (descending).
+            // sort by earliest start time, then higher weight, then least load.
             if job.spec.spread_job {
                 node_starts.sort_by(|(a_ni, a_t), (b_ni, b_t)| {
                     // Primary: earliest start time
                     a_t.cmp(b_t)
                         // Secondary: least allocated CPUs (ascending = most free)
                         .then_with(|| {
-                            cluster.nodes[*a_ni]
-                                .alloc_resources
-                                .cpus
-                                .cmp(&cluster.nodes[*b_ni].alloc_resources.cpus)
+                            allocated_cpus_at_start[a_ni].cmp(&allocated_cpus_at_start[b_ni])
                         })
                 });
             } else {
-                // Default: sort by time, then prefer higher-weight nodes
+                // Default: sort by time, then prefer higher-weight nodes. Equal
+                // weights favor the least-loaded node.
                 node_starts.sort_by(|(a_ni, a_t), (b_ni, b_t)| {
-                    a_t.cmp(b_t).then_with(|| {
-                        cluster.nodes[*b_ni]
-                            .weight
-                            .cmp(&cluster.nodes[*a_ni].weight)
-                    })
+                    a_t.cmp(b_t)
+                        .then_with(|| {
+                            cluster.nodes[*b_ni]
+                                .weight
+                                .cmp(&cluster.nodes[*a_ni].weight)
+                        })
+                        .then_with(|| {
+                            allocated_cpus_at_start[a_ni].cmp(&allocated_cpus_at_start[b_ni])
+                        })
                 });
             }
 
@@ -1018,6 +1024,39 @@ mod tests {
         assert_eq!(assignments.len(), 1);
         // Should prefer least-loaded node (node003)
         assert_eq!(assignments[0].nodes[0], "node003");
+    }
+
+    #[test]
+    fn test_equal_weight_jobs_spread_across_least_loaded_nodes() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2);
+        nodes[0].total_resources.cpus = 24;
+        nodes[1].total_resources.cpus = 10;
+
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let pending: Vec<Job> = (1..=8).map(|id| make_job(id, 1, 1)).collect();
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        let node001_jobs = assignments
+            .iter()
+            .filter(|assignment| assignment.nodes == ["node001"])
+            .count();
+        let node002_jobs = assignments
+            .iter()
+            .filter(|assignment| assignment.nodes == ["node002"])
+            .count();
+
+        assert_eq!(node001_jobs, 4);
+        assert_eq!(node002_jobs, 4);
     }
 
     #[test]
