@@ -74,7 +74,15 @@ The ConfigMap (``examples/k8s/configmap.yaml``) embeds ``spur.conf``:
    state = "UP"
    default = true
 
-Raft peers use StatefulSet DNS names. The node ID is auto-detected from the pod hostname ordinal.
+Raft peers use StatefulSet DNS names. The node ID is auto-derived from each pod's
+position in ``peers`` by matching the pod hostname (e.g. ``spurctld-0``) against
+each entry's host part, so ``controller.node_id`` never needs to be set. Each
+pod's hostname must correspond to its own ``peers`` entry.
+
+Resolution precedence is: explicit ``controller.node_id`` -> position in
+``peers`` -> hostname ordinal. The resolved id must fall within
+``1..=len(peers)``; if a pod's hostname matches no entry (or matches more than
+one), the controller fails fast at startup rather than joining with a wrong ID.
 
 Adjust partition definitions and node resources to match your cluster hardware.
 

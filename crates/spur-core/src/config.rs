@@ -275,8 +275,14 @@ pub struct ControllerConfig {
     #[serde(default)]
     pub peers: Vec<String>,
 
-    /// This node's Raft ID. If not set, auto-derived from hostname ordinal
-    /// (e.g. spurctld-2 → node_id 3) or defaults to 1.
+    /// This node's Raft ID. Normally left unset. Resolution precedence is:
+    /// 1. this explicit value, if set;
+    /// 2. this host's position in `peers` (its hostname matched against each
+    ///    entry's host part, on the full name or first DNS label);
+    /// 3. the hostname ordinal (e.g. spurctld-2 → node_id 3).
+    ///
+    /// The resolved id must fall within `1..=peers.len()`, else startup fails.
+    /// Only needed when peers are IP-only and cannot match a hostname.
     pub node_id: Option<u64>,
 
     /// Listen address for Raft internal gRPC traffic (separate from client API).
