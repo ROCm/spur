@@ -17,7 +17,9 @@ use spur_core::resource::{GpuResource, ResourceSet};
 pub enum AllocError {
     /// A controller-allocated GPU is unknown to this node or already in use.
     GpusUnavailable,
-    /// This job id already holds a reservation (a retried LaunchJob RPC).
+    /// A LaunchJob is already in flight for this job id (its reservation is
+    /// still mid-launch, not yet committed or released). A second concurrent
+    /// launch would double-count resources, so it is rejected.
     DuplicateJob,
 }
 
@@ -124,8 +126,8 @@ impl NodeAllocation {
     }
 
     /// Reserve resources for a job, keyed by job id. GPU device ids are the
-    /// hard gate (unknown or in-use → `GpusUnavailable`); a job id that already
-    /// holds a reservation → `DuplicateJob`. CPU is best-effort since the
+    /// hard gate (unknown or in-use → `GpusUnavailable`); a launch already in
+    /// flight for the same job id → `DuplicateJob`. CPU is best-effort since the
     /// controller owns placement. Memory is always accounted so release stays
     /// symmetric. Marked `launching` until `commit_job`/`release_job` so
     /// reconcile spares an in-flight launch.
@@ -136,11 +138,18 @@ impl NodeAllocation {
         memory_mb: u64,
         gpu_device_ids: &[u32],
     ) -> Result<AllocationResult, AllocError> {
-        // A duplicate reservation for the same job (a retried LaunchJob RPC)
-        // would double-count CPU/memory and orphan the prior owner entry.
-        if self.owners.contains_key(&job_id) {
+        // A launch still in flight (reserved, not yet committed or released) is
+        // a genuine concurrent duplicate: a second launch would double-count.
+        if self.launching.contains(&job_id) {
             return Err(AllocError::DuplicateJob);
         }
+        // A committed reservation still owned here means a prior run's teardown
+        // has not released yet (e.g. a preempted-then-requeued job re-dispatched
+        // under the same id before the agent reaped the killed process). The
+        // controller only re-issues LaunchJob after freeing the job, so this
+        // reservation is stale — supersede it rather than reject, releasing it
+        // first so CPU/memory stay symmetric and the owner entry is not orphaned.
+        self.release_job(job_id);
 
         let mut gpu_indices = Vec::with_capacity(gpu_device_ids.len());
         for &id in gpu_device_ids {
@@ -372,9 +381,10 @@ mod tests {
     }
 
     #[test]
-    fn test_allocate_for_job_rejects_duplicate_job_id() {
-        // A retried reservation for the same job must not double-count CPU/mem
-        // or orphan the prior owner entry.
+    fn test_allocate_for_job_rejects_in_flight_duplicate() {
+        // A second launch while the first is still in flight (reserved, not yet
+        // committed or released) is a genuine concurrent duplicate: rejecting it
+        // avoids double-counting CPU/mem and orphaning the prior owner entry.
         let mut node = make_node(64, 256_000, 0, "");
         assert!(node.allocate_for_job(1, 8, 16_000, &[]).is_ok());
         assert_eq!(
@@ -386,6 +396,33 @@ mod tests {
         // After release the id is free to reserve again.
         assert!(node.release_job(1));
         assert!(node.allocate_for_job(1, 8, 16_000, &[]).is_ok());
+    }
+
+    #[test]
+    fn test_allocate_for_job_supersedes_stale_committed_reservation() {
+        // A committed reservation whose teardown has not released yet (e.g. a
+        // preempted-then-requeued job re-dispatched under the same id before the
+        // agent reaped the killed process) must be superseded, not rejected —
+        // otherwise the legitimate re-launch fails and the job never runs. The
+        // stale reservation is released first, so resources are not double-counted.
+        let mut node = make_node(64, 256_000, 0, "");
+        node.allocate_for_job(7, 8, 16_000, &[]).unwrap();
+        node.commit_job(7); // prior run committed, then preempted (not released).
+        assert_eq!(node.free_cpus(), 56);
+
+        // Re-dispatch under the same id succeeds and does not double-count.
+        let alloc = node
+            .allocate_for_job(7, 8, 16_000, &[])
+            .expect("re-dispatch of a stale committed job id must succeed");
+        assert_eq!(alloc.cpu_ids.len(), 8);
+        assert_eq!(node.free_cpus(), 56);
+        assert_eq!(node.free_memory_mb(), 240_000);
+        // Exactly one owner entry remains, and the fresh reservation is again
+        // treated as in-flight until it commits or releases.
+        assert_eq!(
+            node.allocate_for_job(7, 8, 16_000, &[]),
+            Err(AllocError::DuplicateJob)
+        );
     }
 
     #[test]

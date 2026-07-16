@@ -1494,15 +1494,17 @@ impl AgentService {
                 ));
             }
             Err(AllocError::DuplicateJob) => {
-                // A retried LaunchJob for a job that already holds a
-                // reservation: the RPC was already accepted, so this is a
-                // protocol-level duplicate, not resource exhaustion.
+                // A launch is already in flight for this job id (reserved, not
+                // yet committed or released). This is a concurrent duplicate,
+                // not resource exhaustion. A stale reservation from a prior,
+                // already-torn-down run is superseded inside allocate_for_job
+                // and does not reach here.
                 warn!(
                     job_id,
-                    "rejecting duplicate launch: job already has a reservation"
+                    "rejecting duplicate launch: a launch is already in flight for this job"
                 );
                 return Err(Status::already_exists(format!(
-                    "job {job_id} already has a reservation on this node"
+                    "job {job_id} already has a launch in flight on this node"
                 )));
             }
         };
