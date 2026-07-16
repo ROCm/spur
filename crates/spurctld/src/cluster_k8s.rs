@@ -135,10 +135,18 @@ pub(crate) fn provision_assignments(
     }
     nodes.sort_by(|a, b| a.name.cmp(&b.name)); // deterministic
 
-    // Control-plane node: existing choice -> config override -> lexically-first node.
-    let cp_node = state
-        .control_plane_node
-        .clone()
+    // Control-plane node. Derive from an ALREADY-ASSIGNED Controller/Single node FIRST: the persisted
+    // role assignment is the durable source of truth. The CP-choice persist below is a separate raft
+    // write that lands *after* the assignment loop, so a crash between the first `assign(CP, .1)` and
+    // that persist would otherwise let a restart (with `state.control_plane_node` still None) pick a
+    // different, lexically-earlier node as CP and hand it the same `.1`/Controller — two controllers
+    // silently sharing the mesh IP across the failover. Fall back to the recorded choice -> config
+    // override -> lexically-first only when nothing is assigned yet.
+    let cp_node = nodes
+        .iter()
+        .find(|n| matches!(n.k0s_role, Some(K0sRole::Controller) | Some(K0sRole::Single)))
+        .map(|n| n.name.clone())
+        .or_else(|| state.control_plane_node.clone())
         .or_else(|| net.control_plane_node.clone())
         .unwrap_or_else(|| nodes[0].name.clone());
 
