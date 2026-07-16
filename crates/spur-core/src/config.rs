@@ -365,15 +365,12 @@ pub struct AccountingConfig {
     #[serde(default = "default_fairshare_refresh_secs")]
     pub fairshare_refresh_secs: u32,
     /// Cluster-wide fallback QOS, applied at submit when a job resolves to no
-    /// QOS (no `--qos` and no association default). Analogous to Slurm's stock
-    /// `normal` QOS: it is the last link in the resolution chain so a QOS —
-    /// and its limits — always applies. Empty (default) = no fallback.
+    /// QOS. The last link in the resolution chain (Slurm's stock `normal`
+    /// analogue). Empty (default) = no fallback.
     #[serde(default)]
     pub default_qos: String,
-    /// When true, reject at submit any job that still has no QOS after the full
-    /// resolution chain (explicit → association default → cluster default_qos).
-    /// Mirrors Slurm's `AccountingStorageEnforce=qos`. Default false = jobs
-    /// without a QOS are accepted (existing behavior).
+    /// Reject at submit any job that still has no QOS after the resolution
+    /// chain. Mirrors Slurm's `AccountingStorageEnforce=qos`. Default false.
     #[serde(default)]
     pub require_qos: bool,
 }

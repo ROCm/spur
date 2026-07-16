@@ -1352,11 +1352,8 @@ impl ClusterManager {
             }
         }
 
-        // Validate a QOS change before any mutation, so an invalid update is
-        // rejected atomically. An unknown QOS would resolve to the limitless
-        // default, and an empty QOS would clear enforcement entirely — both
-        // reopen the SPUR-64 bypass one command after submit, so reject them
-        // rather than silently accepting.
+        // Reject before mutating: an unknown QOS resolves to the limitless
+        // default and an empty QOS clears enforcement — both reopen the bypass.
         if let Some(ref q) = qos {
             if q.trim().is_empty() {
                 anyhow::bail!("cannot clear a job's QOS");
@@ -4205,12 +4202,9 @@ fn validate_user_account(
     Ok(())
 }
 
-/// Resolve a job's QOS at submit, in Slurm's order: explicit `--qos`
-/// (must exist) → association default QOS → cluster-wide fallback
-/// (`accounting.default_qos`). If none resolves and `accounting.require_qos`
-/// is set, the job is rejected (mirrors `AccountingStorageEnforce=qos`);
-/// otherwise it is accepted with no QOS (existing behavior). A stale
-/// association default (points at a deleted QOS) degrades to the fallback.
+/// Resolve a job's QOS at submit, in Slurm's order: explicit `--qos` (must
+/// exist) → association default → cluster fallback (`accounting.default_qos`)
+/// → reject if `accounting.require_qos`, else accept with no QOS.
 fn apply_default_qos(
     spec: &mut JobSpec,
     assoc_cache: &AssociationCache,
@@ -4239,10 +4233,8 @@ fn apply_default_qos(
         );
     }
 
-    // Cluster-wide fallback: the last link so a QOS (and its limits) applies
-    // even when no association default is set. A misconfigured fallback (names
-    // a QOS that doesn't exist) is a hard error — silently ignoring it would
-    // reintroduce the very enforcement gap this closes.
+    // A configured fallback naming a nonexistent QOS is a hard error — silently
+    // ignoring it would leave the job unenforced, the gap this closes.
     let fallback = accounting.default_qos.trim();
     if !fallback.is_empty() {
         if qos_cache.get(fallback).is_none() {
@@ -7998,10 +7990,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_default_qos_reaches_real_enforcement() {
-        // SPUR-64 end to end: with a cluster fallback QOS configured and no
-        // --qos / no association default, a submitted job is bound to the
-        // fallback and its limits actually block a second job — closing the
-        // "omit --qos to run unenforced" bypass.
+        // A cluster fallback QOS must bind a no-qos job and its limits must
+        // actually block a second job — end to end.
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.accounting.default_qos = "normal".into();
@@ -8630,9 +8620,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn update_job_qos_validates_against_cache() {
-        // SPUR-64: `scontrol update job qos=` must not be a second door to the
-        // limitless-default bypass — unknown and empty QOS are rejected, and
-        // the job's QOS is left unchanged.
+        // `scontrol update job qos=` must not be a second door to the bypass:
+        // unknown and empty QOS are rejected, leaving the job's QOS unchanged.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         cm.qos_cache().insert(Qos {
@@ -9309,8 +9298,7 @@ mod tests {
         cache
     }
 
-    // Inert accounting config: no cluster fallback, require_qos off — the
-    // pre-SPUR-64 behavior, so existing tests keep asserting the base chain.
+    // Inert config: no fallback, require_qos off (base resolution chain).
     fn acct_cfg() -> spur_core::config::AccountingConfig {
         spur_core::config::AccountingConfig::default()
     }
@@ -9430,8 +9418,7 @@ mod tests {
 
     #[test]
     fn apply_default_qos_falls_back_to_cluster_default() {
-        // SPUR-64: no --qos, no association default → cluster fallback applies
-        // so a QOS (and its limits) is enforced instead of running limitless.
+        // No --qos and no association default → cluster fallback applies.
         let assoc = AssociationCache::new();
         let qos = qos_cache_with(&["normal"]);
         let mut spec = basic_spec("j");
@@ -9458,8 +9445,7 @@ mod tests {
 
     #[test]
     fn apply_default_qos_nonexistent_cluster_default_is_rejected() {
-        // A misconfigured fallback must hard-error, not silently leave the job
-        // unenforced (that would reintroduce the SPUR-64 gap).
+        // A misconfigured fallback must hard-error, not silently leave it unenforced.
         let assoc = AssociationCache::new();
         let qos = qos_cache_with(&["normal"]);
         let mut spec = basic_spec("j");
@@ -9474,8 +9460,7 @@ mod tests {
 
     #[test]
     fn apply_default_qos_require_qos_rejects_when_none_resolves() {
-        // SPUR-64: with require_qos and no fallback, a job that resolves to no
-        // QOS is rejected at submit (mirrors AccountingStorageEnforce=qos).
+        // require_qos with no fallback rejects a job that resolves to no QOS.
         let assoc = AssociationCache::new();
         let qos = QosCache::new();
         let mut spec = basic_spec("j");

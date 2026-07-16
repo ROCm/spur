@@ -109,6 +109,38 @@ fn parse_params(params: &[String]) -> std::collections::HashMap<String, String> 
     map
 }
 
+const QOS_KEYS: &[&str] = &[
+    "name",
+    "qos",
+    "description",
+    "priority",
+    "preemptmode",
+    "usagefactor",
+    "maxjobsperuser",
+    "maxjobspu",
+    "maxwall",
+    "maxtresperjob",
+    "maxsubmitjobsperuser",
+    "maxtresperuser",
+    "grptres",
+];
+
+/// Reject keys the command does not understand, so a mistyped or unsupported
+/// field errors loudly instead of being silently dropped (a dropped limit
+/// reads as "set" but never enforces).
+fn reject_unknown_keys(
+    p: &std::collections::HashMap<String, String>,
+    allowed: &[&str],
+) -> Result<()> {
+    if let Some(key) = p.keys().find(|k| !allowed.contains(&k.as_str())) {
+        bail!(
+            "sacctmgr: unknown field '{key}'. Supported: {}",
+            allowed.join(", ")
+        );
+    }
+    Ok(())
+}
+
 async fn connect(addr: &str) -> Result<SlurmAccountingClient<tonic::transport::Channel>> {
     let channel = spur_client::connect_channel(addr)
         .await
@@ -215,6 +247,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
             Ok(())
         }
         "qos" => {
+            reject_unknown_keys(&p, QOS_KEYS)?;
             let name = p
                 .get("name")
                 .or_else(|| p.get("qos"))
@@ -231,6 +264,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 .unwrap_or(1.0);
             let max_jobs: u32 = p
                 .get("maxjobsperuser")
+                .or_else(|| p.get("maxjobspu"))
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
             let max_wall: u32 = p
@@ -376,6 +410,7 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
             Ok(())
         }
         "qos" => {
+            reject_unknown_keys(&p, QOS_KEYS)?;
             let name = p
                 .get("name")
                 .or_else(|| p.get("qos"))
@@ -397,6 +432,7 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
                         .unwrap_or(1.0),
                     max_jobs_per_user: p
                         .get("maxjobsperuser")
+                        .or_else(|| p.get("maxjobspu"))
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0),
                     max_wall_minutes: p
@@ -636,6 +672,27 @@ mod tests {
         assert_eq!(account, "testacct");
         assert_eq!(admin, "none");
         assert_eq!(default_qos, "highprio");
+    }
+
+    #[test]
+    fn reject_unknown_keys_flags_dropped_field() {
+        // A field the command doesn't read must error, not be silently dropped
+        // (a dropped limit reads as "set" but never enforces).
+        let p = parse_params(&["name=normal".into(), "bogusfield=1".into()]);
+        let err = reject_unknown_keys(&p, QOS_KEYS).unwrap_err();
+        assert!(err.to_string().contains("unknown field 'bogusfield'"));
+    }
+
+    #[test]
+    fn reject_unknown_keys_accepts_known_and_alias() {
+        // maxjobspu is the label `sacctmgr show qos` prints, so it must be a
+        // valid input alias for maxjobsperuser.
+        let p = parse_params(&["name=normal".into(), "maxjobspu=5".into()]);
+        assert!(reject_unknown_keys(&p, QOS_KEYS).is_ok());
+        assert_eq!(
+            p.get("maxjobsperuser").or_else(|| p.get("maxjobspu")),
+            Some(&"5".to_string())
+        );
     }
 
     #[test]
