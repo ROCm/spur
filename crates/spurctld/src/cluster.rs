@@ -1352,6 +1352,20 @@ impl ClusterManager {
             }
         }
 
+        // Validate a QOS change before any mutation, so an invalid update is
+        // rejected atomically. An unknown QOS would resolve to the limitless
+        // default, and an empty QOS would clear enforcement entirely — both
+        // reopen the SPUR-64 bypass one command after submit, so reject them
+        // rather than silently accepting.
+        if let Some(ref q) = qos {
+            if q.trim().is_empty() {
+                anyhow::bail!("cannot clear a job's QOS");
+            }
+            if self.qos_cache.get(q).is_none() {
+                anyhow::bail!("QOS '{q}' does not exist");
+            }
+        }
+
         if let Some(p) = priority {
             let old = self
                 .jobs
@@ -4191,14 +4205,12 @@ fn validate_user_account(
     Ok(())
 }
 
-/// Resolve a job's effective QOS at submission time (mirrors
-/// `apply_default_partition`). An explicit `--qos` naming an unknown QOS is
-/// rejected; a stale association default degrades silently instead.
 /// Resolve a job's QOS at submit, in Slurm's order: explicit `--qos`
 /// (must exist) → association default QOS → cluster-wide fallback
 /// (`accounting.default_qos`). If none resolves and `accounting.require_qos`
 /// is set, the job is rejected (mirrors `AccountingStorageEnforce=qos`);
-/// otherwise it is accepted with no QOS (existing behavior).
+/// otherwise it is accepted with no QOS (existing behavior). A stale
+/// association default (points at a deleted QOS) degrades to the fallback.
 fn apply_default_qos(
     spec: &mut JobSpec,
     assoc_cache: &AssociationCache,
@@ -7985,6 +7997,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_default_qos_reaches_real_enforcement() {
+        // SPUR-64 end to end: with a cluster fallback QOS configured and no
+        // --qos / no association default, a submitted job is bound to the
+        // fallback and its limits actually block a second job — closing the
+        // "omit --qos to run unenforced" bypass.
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.accounting.default_qos = "normal".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.qos_cache().insert(Qos {
+            name: "normal".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_jobs_per_user: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let j1 = submit_and_wait(&cm, basic_spec("d1"));
+        assert_eq!(
+            cm.get_job(j1).unwrap().spec.qos.as_deref(),
+            Some("normal"),
+            "no-qos job must be bound to the cluster fallback at submit"
+        );
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            j1,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, j1, JobState::Running);
+
+        let j2 = submit_and_wait(&cm, basic_spec("d2"));
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::QoSMaxJobsPerUser,
+            "the fallback QOS's limits must actually enforce"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn running_job_license_consumption_blocks_next_job() {
         // Concurrent license accounting: a running job holding all of a license
         // must make a second job requesting that license ineligible, even though
@@ -8569,6 +8626,43 @@ mod tests {
             cm.get_job(id).is_some_and(|j| j.priority == 5000)
         });
         assert_eq!(cm.get_job(id).unwrap().priority, 5000);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_qos_validates_against_cache() {
+        // SPUR-64: `scontrol update job qos=` must not be a second door to the
+        // limitless-default bypass — unknown and empty QOS are rejected, and
+        // the job's QOS is left unchanged.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache().insert(Qos {
+            name: "highprio".into(),
+            ..Default::default()
+        });
+        let id = submit_and_wait(&cm, basic_spec("q"));
+        assert_eq!(cm.get_job(id).unwrap().spec.qos, None);
+
+        // Unknown QOS rejected.
+        let err = cm
+            .update_job(id, None, None, None, None, None, Some("ghost".into()))
+            .unwrap_err();
+        assert!(err.to_string().contains("QOS 'ghost' does not exist"));
+        assert_eq!(cm.get_job(id).unwrap().spec.qos, None);
+
+        // Empty QOS (clear-to-limitless) rejected.
+        let err = cm
+            .update_job(id, None, None, None, None, None, Some(String::new()))
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot clear a job's QOS"));
+        assert_eq!(cm.get_job(id).unwrap().spec.qos, None);
+
+        // A valid QOS is applied.
+        cm.update_job(id, None, None, None, None, None, Some("highprio".into()))
+            .unwrap();
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.qos.as_deref(),
+            Some("highprio")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
