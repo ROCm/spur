@@ -1341,7 +1341,7 @@ async fn create_partition(
     let channel = spur_client::connect_channel(controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
+    let mut client = spur_proto::controller_client(channel);
 
     let split_csv = |s: &str| -> Vec<String> {
         s.split(',')
@@ -1407,7 +1407,7 @@ async fn update_partition(
     let channel = spur_client::connect_channel(controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
+    let mut client = spur_proto::controller_client(channel);
 
     let split_csv = |s: &str| -> Vec<String> {
         s.split(',')
@@ -1460,7 +1460,7 @@ async fn delete_partition(controller: &str, name: &str) -> Result<()> {
     let channel = spur_client::connect_channel(controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
+    let mut client = spur_proto::controller_client(channel);
 
     client
         .delete_partition(spur_proto::proto::DeletePartitionRequest {
@@ -1478,7 +1478,7 @@ async fn reconfigure(controller: &str) -> Result<()> {
     let channel = spur_client::connect_channel(controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
+    let mut client = spur_proto::controller_client(channel);
 
     client.reconfigure(()).await.context("reconfigure failed")?;
 

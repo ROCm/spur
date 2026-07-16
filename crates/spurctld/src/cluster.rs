@@ -4406,7 +4406,7 @@ impl ClusterManager {
     /// node defaults when none matches so stale policy from a previously matching
     /// entry does not persist.
     fn apply_node_config_policy(&self, node: &mut Node) {
-        for nc in &self.config.nodes {
+        for nc in self.config().nodes.iter() {
             if node_config_matches(nc, &node.name, &node.labels) {
                 node.features = nc.features.clone();
                 node.weight = nc.weight;
@@ -11989,6 +11989,8 @@ mod tests {
             jobs: Vec::new(),
             nodes: vec![stale],
             reservations: Vec::new(),
+            partitions: Vec::new(),
+            deleted_partition_names: HashSet::new(),
             steps: Vec::new(),
             license_pool: HashMap::new(),
             tokens: Vec::new(),
