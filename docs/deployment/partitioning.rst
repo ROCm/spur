@@ -82,6 +82,21 @@ The same dual-path matching applies to ``[[nodes]]`` config blocks (which set
 features and weight; see :doc:`native-host`), keyed by ``names`` (hostlist) or
 ``selector`` (labels).
 
+Applying Config Changes
+-----------------------
+
+After editing ``[[partitions]]`` in ``spur.conf``, apply the changes to a
+running controller without a restart:
+
+.. code-block:: bash
+
+   scontrol reconfigure
+
+This reloads ``[[partitions]]`` **only** — partitions are created, updated, or
+deleted to match the file. All other config sections (``[scheduler]``,
+``[accounting]``, ``[controller]``, and so on) are ignored by ``reconfigure``
+and require a controller restart to take effect.
+
 Verifying Membership
 --------------------
 

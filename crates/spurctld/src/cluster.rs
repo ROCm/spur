@@ -2645,6 +2645,10 @@ impl ClusterManager {
     /// Makes the config file authoritative, matching `scontrol reconfigure`
     /// semantics in Slurm: runtime-only changes not reflected in the conf are
     /// overwritten by the incoming conf values.
+    ///
+    /// Reloads `[[partitions]]` only. All other sections (`[scheduler]`,
+    /// `[accounting]`, `[controller]`, etc.) are parsed but discarded; changing
+    /// them requires a controller restart.
     pub fn reconfigure(&self) -> Result<(), anyhow::Error> {
         let Some(ref path) = self.config_path else {
             anyhow::bail!("reconfigure requires a config file path, but none is configured");
@@ -2727,6 +2731,9 @@ impl ClusterManager {
             .map_err(|e| anyhow::anyhow!("reconfigure: update {}: {e}", part.name))?;
         }
 
+        info!(
+            "reconfigure: reloaded partitions from spur.conf; other config sections require a controller restart"
+        );
         Ok(())
     }
 

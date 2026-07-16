@@ -85,6 +85,8 @@ Resolution precedence is: explicit ``controller.node_id`` -> position in
 one), the controller fails fast at startup rather than joining with a wrong ID.
 
 Adjust partition definitions and node resources to match your cluster hardware.
+Once the controller is running, ``scontrol reconfigure`` applies ``[[partitions]]``
+changes without a restart; other config sections require restarting the controller.
 
 Submitting Jobs
 ---------------
