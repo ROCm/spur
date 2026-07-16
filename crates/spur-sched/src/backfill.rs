@@ -1060,6 +1060,45 @@ mod tests {
     }
 
     #[test]
+    fn test_equal_weight_jobs_spread_across_scheduler_cycles() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2);
+        nodes[0].total_resources.cpus = 24;
+        nodes[1].total_resources.cpus = 10;
+
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        for id in 1..=8 {
+            let pending = vec![make_job(id, 1, 1)];
+            let cluster = ClusterState {
+                nodes: &nodes,
+                partitions: &partitions,
+                reservations: &[],
+                topology: None,
+            };
+
+            let assignments = sched.schedule(&pending, &cluster);
+            assert_eq!(assignments.len(), 1);
+
+            let assignment = &assignments[0];
+            let node_name = &assignment.nodes[0];
+            let allocation = &assignment.per_node_alloc[node_name];
+            let node = nodes
+                .iter_mut()
+                .find(|node| node.name == *node_name)
+                .unwrap();
+            node.alloc_resources.add(allocation);
+            node.state = NodeState::Mixed;
+        }
+
+        assert_eq!(nodes[0].alloc_resources.cpus, 4);
+        assert_eq!(nodes[1].alloc_resources.cpus, 4);
+    }
+
+    #[test]
     fn test_node_weight_prefers_higher() {
         let mut sched = BackfillScheduler::new(100);
         let mut nodes = make_nodes(3);
