@@ -8,3 +8,4 @@ Everything you need to build, test, and contribute to Spur.
 
    building
    contributing
+   k8s-quota-enforcement
