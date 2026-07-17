@@ -291,7 +291,7 @@ impl ClusterManager {
         Ok(job_id)
     }
 
-    /// Validate partition constraints: access control and node limits.
+    /// Validate requested partition names and partition account access control.
     fn validate_partition(&self, spec: &JobSpec) -> Result<(), SubmitError> {
         let partition_spec = match spec.partition.as_deref() {
             Some(p) if !p.is_empty() => p,
