@@ -10753,6 +10753,7 @@ mod tests {
             license_pool: HashMap::new(),
             tokens: Vec::new(),
             burst_buffer_total_gb: 0,
+            k0s: spur_core::k0s::K0sClusterState::default(),
         };
         let bytes = serde_json::to_vec(&snap).unwrap();
         cm.restore_from_snapshot(&bytes).unwrap();

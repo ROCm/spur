@@ -144,7 +144,12 @@ pub(crate) fn provision_assignments(
     // override -> lexically-first only when nothing is assigned yet.
     let cp_node = nodes
         .iter()
-        .find(|n| matches!(n.k0s_role, Some(K0sRole::Controller) | Some(K0sRole::Single)))
+        .find(|n| {
+            matches!(
+                n.k0s_role,
+                Some(K0sRole::Controller) | Some(K0sRole::Single)
+            )
+        })
         .map(|n| n.name.clone())
         .or_else(|| state.control_plane_node.clone())
         .or_else(|| net.control_plane_node.clone())

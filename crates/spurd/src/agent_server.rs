@@ -2169,6 +2169,7 @@ mod tests {
             },
             std::collections::HashMap::new(),
             String::new(),
+            "spur0".into(),
         ))
     }
 

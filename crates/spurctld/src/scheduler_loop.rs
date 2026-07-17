@@ -1761,6 +1761,61 @@ mod tests {
             ) -> Result<tonic::Response<Self::AttachJobStream>, tonic::Status> {
                 Err(tonic::Status::unimplemented("not used in tests"))
             }
+
+            // k0s cluster-component + mesh RPCs: not exercised by these scheduler tests.
+            async fn start_cluster_component(
+                &self,
+                _request: tonic::Request<spur_proto::proto::StartClusterComponentRequest>,
+            ) -> Result<
+                tonic::Response<spur_proto::proto::StartClusterComponentResponse>,
+                tonic::Status,
+            > {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+
+            async fn stop_cluster_component(
+                &self,
+                _request: tonic::Request<spur_proto::proto::StopClusterComponentRequest>,
+            ) -> Result<
+                tonic::Response<spur_proto::proto::StopClusterComponentResponse>,
+                tonic::Status,
+            > {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+
+            async fn get_cluster_component_status(
+                &self,
+                _request: tonic::Request<spur_proto::proto::GetClusterComponentStatusRequest>,
+            ) -> Result<
+                tonic::Response<spur_proto::proto::GetClusterComponentStatusResponse>,
+                tonic::Status,
+            > {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+
+            async fn create_k0s_join_token(
+                &self,
+                _request: tonic::Request<spur_proto::proto::CreateK0sJoinTokenRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::CreateK0sJoinTokenResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+
+            async fn get_admin_kubeconfig(
+                &self,
+                _request: tonic::Request<spur_proto::proto::GetAdminKubeconfigRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::GetAdminKubeconfigResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+
+            async fn apply_mesh(
+                &self,
+                _request: tonic::Request<spur_proto::proto::MeshMembership>,
+            ) -> Result<tonic::Response<spur_proto::proto::ApplyMeshResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
         }
 
         /// Spawn a real MockAgent gRPC server on an OS-assigned localhost
@@ -1823,6 +1878,7 @@ mod tests {
                 network: Default::default(),
                 logging: Default::default(),
                 kubernetes: Default::default(),
+                cluster: Default::default(),
                 notifications: Default::default(),
                 power: Default::default(),
                 federation: Default::default(),
