@@ -19,7 +19,7 @@ use spur_core::job::{
     Job, JobId, JobSpec, JobState, NodeCompleteError, PendingReason, TransitionOutcome,
 };
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
-use spur_core::partition::{Partition, PreemptMode};
+use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
 use spur_core::qos::{check_qos_limits, qos_adjusted_priority, QosCheckResult};
 use spur_core::reservation::{self, normalize_node_list, running_jobs_overlap_start, Reservation};
 use spur_core::resource::{ResourceAllocations, ResourceSet};
@@ -293,30 +293,38 @@ impl ClusterManager {
 
     /// Validate partition constraints: access control and node limits.
     fn validate_partition(&self, spec: &JobSpec) -> Result<(), SubmitError> {
-        let partition_name = match spec.partition.as_ref() {
+        let partition_spec = match spec.partition.as_deref() {
             Some(p) if !p.is_empty() => p,
             _ => return Ok(()), // Unset or empty partition name — nothing to validate
         };
 
         let partitions = self.partitions.read();
-        let part = match partitions.iter().find(|p| p.name == *partition_name) {
-            Some(p) => p,
-            None => {
-                return Err(SubmitError::invalid(format!(
-                    "partition '{partition_name}' not found"
-                )));
-            }
-        };
-
-        let needs_acl = !part.allow_accounts.is_empty() || !part.deny_accounts.is_empty();
-        if !needs_acl {
-            return Ok(());
+        let requested = requested_partition_names(Some(partition_spec))
+            .map(|name| {
+                partitions
+                    .iter()
+                    .find(|part| part.name == name)
+                    .ok_or_else(|| SubmitError::invalid(format!("partition '{name}' not found")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if requested.is_empty() {
+            return Err(SubmitError::invalid(format!(
+                "partition '{partition_spec}' not found"
+            )));
         }
+
+        let Some(first_acl_partition) = requested
+            .iter()
+            .copied()
+            .find(|part| !part.allow_accounts.is_empty() || !part.deny_accounts.is_empty())
+        else {
+            return Ok(());
+        };
 
         if !self.association_cache.is_loaded() {
             warn!(
                 user = %spec.user,
-                partition = %partition_name,
+                partition = %partition_spec,
                 "association cache unavailable; skipping partition account access checks"
             );
             return Ok(());
@@ -326,22 +334,28 @@ impl ClusterManager {
             Some(a) => a,
             None => {
                 return Err(SubmitError::invalid(format!(
-                    "no account for user '{}' on partition '{partition_name}'",
-                    spec.user
+                    "no account for user '{}' on partition '{}'",
+                    spec.user, first_acl_partition.name
                 )));
             }
         };
 
-        if !part.allow_accounts.is_empty() {
-            if !part.allow_accounts.iter().any(|a| a == account) {
+        for part in requested {
+            if !part.allow_accounts.is_empty() {
+                if part.allow_accounts.iter().any(|a| a == account) {
+                    continue;
+                }
                 return Err(SubmitError::invalid(format!(
-                    "account '{account}' not allowed on partition '{partition_name}'"
+                    "account '{account}' not allowed on partition '{}'",
+                    part.name
                 )));
             }
-        } else if part.deny_accounts.iter().any(|a| a == account) {
-            return Err(SubmitError::invalid(format!(
-                "account '{account}' denied on partition '{partition_name}'"
-            )));
+            if part.deny_accounts.iter().any(|a| a == account) {
+                return Err(SubmitError::invalid(format!(
+                    "account '{account}' denied on partition '{}'",
+                    part.name
+                )));
+            }
         }
 
         Ok(())
@@ -3954,28 +3968,49 @@ fn partition_block(job: &Job, partitions: &[Partition]) -> Option<spur_core::job
     use spur_core::job::PendingReason;
     use spur_core::partition::PartitionState;
 
-    let name = job.spec.partition.as_deref().filter(|p| !p.is_empty())?;
-    let Some(part) = partitions.iter().find(|p| p.name == name) else {
+    let partition_spec = job
+        .spec
+        .partition
+        .as_deref()
+        .filter(|spec| !spec.is_empty())?;
+    let requested = spur_core::partition::matched_partitions(Some(partition_spec), partitions);
+    if requested.is_empty() {
         return Some(PendingReason::PartitionConfig);
-    };
-
-    if part.state != PartitionState::Up {
-        return Some(PendingReason::PartitionInactive);
     }
+
+    let mut has_up_partition = false;
+    for part in requested {
+        if part.state != PartitionState::Up {
+            continue;
+        }
+        has_up_partition = true;
+        if partition_limits_allow(job, part) {
+            return None;
+        }
+    }
+
+    Some(if has_up_partition {
+        PendingReason::PartitionConfig
+    } else {
+        PendingReason::PartitionInactive
+    })
+}
+
+fn partition_limits_allow(job: &Job, part: &Partition) -> bool {
     if let Some(max) = part.max_nodes {
         if job.spec.num_nodes > max {
-            return Some(PendingReason::PartitionConfig);
+            return false;
         }
     }
     if part.min_nodes > 0 && job.spec.num_nodes < part.min_nodes {
-        return Some(PendingReason::PartitionConfig);
+        return false;
     }
     if let (Some(max_mins), Some(tl)) = (part.max_time_minutes, &job.spec.time_limit) {
         if tl.num_minutes() > i64::from(max_mins) {
-            return Some(PendingReason::PartitionConfig);
+            return false;
         }
     }
-    None
+    true
 }
 
 fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> TresRecord {
@@ -6515,6 +6550,33 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multi_partition_job_reaches_scheduling_when_one_partition_is_eligible() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].state = "DOWN".into();
+        config.partitions[0].max_nodes = Some(1);
+        let mut batch = config.partitions[0].clone();
+        batch.name = "batch".into();
+        batch.default = false;
+        batch.state = "UP".into();
+        batch.max_nodes = Some(2);
+        config.partitions.push(batch);
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("multi-partition");
+        spec.partition = Some("default, batch".into());
+        spec.num_nodes = 2;
+        spec.num_tasks = 2;
+        let job_id = submit_and_wait(&cm, spec);
+
+        assert!(cm.pending_jobs().iter().any(|job| job.job_id == job_id));
+        assert_eq!(
+            cm.get_job(job_id).unwrap().spec.partition.as_deref(),
+            Some("default, batch")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_rejects_account_not_in_allow_accounts() {
         let dir = TempDir::new().unwrap();
         let mut cfg = test_config();
@@ -6684,6 +6746,43 @@ mod tests {
         assert!(
             cm.submit_job(spec).is_err(),
             "submitting to an unknown partition must error"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_rejects_nonexistent_partition_in_or_list() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let mut spec = basic_spec("badpart");
+        spec.partition = Some("default, does-not-exist".into());
+        let err = cm.submit_job(spec).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid("partition 'does-not-exist' not found")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_enforces_account_access_on_every_requested_partition() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].allow_accounts = vec!["research".into()];
+        let mut restricted = config.partitions[0].clone();
+        restricted.name = "restricted".into();
+        restricted.default = false;
+        restricted.allow_accounts = vec!["faculty".into()];
+        config.partitions.push(restricted);
+        let cm = test_cluster_with_config(&dir, config).await;
+        cm.association_cache()
+            .insert_association("testuser", "research");
+
+        let mut spec = basic_spec("mixed-access");
+        spec.partition = Some("default,restricted".into());
+        spec.account = Some("research".into());
+        let err = cm.submit_job(spec).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid("account 'research' not allowed on partition 'restricted'")
         );
     }
 
