@@ -50,7 +50,7 @@ pub fn spawn_loop(
 /// not candidates.
 async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
     let candidates: Vec<Job> = cluster
-        .get_jobs(&[], None, None, None, &[])
+        .get_jobs(&[], None, None, None, None, &[])
         .into_iter()
         .filter(|j| j.start_time.is_some())
         .collect();
