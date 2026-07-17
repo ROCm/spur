@@ -241,44 +241,19 @@ fn resolve_partition_field(
                 "infinite".into()
             }
         }
-        'D' => {
-            // part.total_nodes may be 0 (not populated by server),
-            // so fall back to the actual node count from the query.
-            // If node filtering returned 0 matches (e.g. nodes lack partition
-            // metadata), fall back to counting entries in the partition's
-            // nodelist string, then to part.total_nodes.
-            if !nodes.is_empty() {
-                nodes.len().to_string()
-            } else if !part.nodes.is_empty() {
-                part.nodes
-                    .split(',')
-                    .filter(|s| !s.trim().is_empty())
-                    .count()
-                    .to_string()
-            } else if part.total_nodes > 0 {
-                part.total_nodes.to_string()
-            } else {
-                "0".into()
-            }
-        }
+        'D' => nodes.len().to_string(),
         't' | 'T' => {
             if nodes.is_empty() {
-                "idle".into()
+                "n/a".into()
             } else {
                 effective_state_str(nodes[0])
             }
         }
-        'N' => {
-            if !nodes.is_empty() {
-                nodes
-                    .iter()
-                    .map(|n| n.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            } else {
-                part.nodes.clone()
-            }
-        }
+        'N' => nodes
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
         'c' => part.total_cpus.to_string(),
         _ => "?".into(),
     }
@@ -441,13 +416,26 @@ mod tests {
 
     #[test]
     fn test_render_empty_partition() {
-        let fields = default_fields();
+        let fields = format_engine::parse_format("%P|%D|%t|%N", &format_engine::sinfo_header);
         let partitions = vec![make_partition("empty", false)];
         let nodes: Vec<NodeInfo> = vec![];
 
         let lines = render_sinfo_output(&fields, &partitions, &nodes, false);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("idle"));
+        assert_eq!(lines, ["empty|0|n/a|"]);
+    }
+
+    #[test]
+    fn test_unregistered_configured_nodes_are_not_reported() {
+        let fields = format_engine::parse_format("%P|%D|%t|%N", &format_engine::sinfo_header);
+        let mut partition = make_partition("gpu", false);
+        partition.nodes = "gpu-node1,gpu-node2".into();
+
+        let lines = render_sinfo_output(&fields, std::slice::from_ref(&partition), &[], false);
+        assert_eq!(lines, ["gpu|0|n/a|"]);
+
+        let nodes = [make_node("gpu-node1", NodeState::NodeIdle, "gpu")];
+        let lines = render_sinfo_output(&fields, &[partition], &nodes, false);
+        assert_eq!(lines, ["gpu|1|idle|gpu-node1"]);
     }
 
     #[test]
