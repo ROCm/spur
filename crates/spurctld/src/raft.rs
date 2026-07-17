@@ -784,12 +784,9 @@ impl std::fmt::Display for NodeIdSource {
     }
 }
 
-/// Resolve this node's Raft id for a multi-node cluster (`peers` non-empty).
-///
-/// Precedence: explicit `controller.node_id` -> position in `peers` -> hostname
-/// ordinal. Every path is validated to fall in `1..=peers.len()` so a
-/// mismatched id fails fast at startup instead of silently splitting the
-/// cluster (an id outside that range exists in no peer's `build_peer_map`).
+/// Resolve this node's Raft id (multi-node; `peers` non-empty). Precedence:
+/// explicit -> position in `peers` -> hostname ordinal. Validated to be in
+/// `1..=peers.len()`, else fails fast (an out-of-range id splits brain).
 pub fn resolve_node_id(
     explicit: Option<u64>,
     hostname: &str,
@@ -811,10 +808,8 @@ pub fn resolve_node_id(
         return Ok((id, NodeIdSource::PeersPosition));
     }
 
-    // Hostname-ordinal is a legacy fallback for IP-only peer lists, where
-    // hostname matching is impossible. When peers carry hostnames, a no-match
-    // means the host is misconfigured, so fail fast rather than risk assigning
-    // an in-range but wrong id (silent split-brain).
+    // Ordinal fallback only fits IP-only peers (no hostname to match). With
+    // hostname peers a no-match is a misconfig: fail fast, don't guess an id.
     if !all_peers_ip_only(peers) {
         anyhow::bail!(
             "this host ({hostname:?}) matched no entry in controller.peers; fix the \
@@ -822,8 +817,7 @@ pub fn resolve_node_id(
         );
     }
 
-    // IP-only peers: accept the ordinal only if it lands in range; an
-    // out-of-range ordinal is a misconfiguration, not a valid member.
+    // Accept the ordinal only if in range; out-of-range is a misconfig.
     if let Some(id) = node_id_from_hostname(hostname) {
         if (1..=n).contains(&id) {
             return Ok((id, NodeIdSource::HostnameOrdinal));
@@ -841,8 +835,7 @@ pub fn resolve_node_id(
     )
 }
 
-/// True when every peer entry's host part is an IP literal (no hostname to
-/// match against), meaning position matching cannot work.
+/// True when every peer host is an IP literal (no hostname to match against).
 fn all_peers_ip_only(peers: &[String]) -> bool {
     peers
         .iter()
@@ -856,11 +849,9 @@ pub fn node_id_from_hostname(hostname: &str) -> Option<u64> {
     Some(ordinal + 1)
 }
 
-/// Derive a node_id from `hostname`'s position in `peers` (index + 1, matching
-/// `build_peer_map`). Matching is on the full name or the first DNS label, so a
-/// short hostname like `spurctld-0` matches `spurctld-0.ns.svc.cluster.local`.
-/// Returns `Ok(None)` when no entry matches, and errors when more than one does
-/// (ambiguous: silently picking one risks a split-brain).
+/// Node id (index + 1) of the `peers` entry matching `hostname`, on the full
+/// name or first DNS label (so `spurctld-0` matches `spurctld-0.ns.svc...`).
+/// `Ok(None)` if none match; errors if several do (guessing risks split-brain).
 pub fn node_id_from_peers(hostname: &str, peers: &[String]) -> anyhow::Result<Option<u64>> {
     let matches: Vec<u64> = peers
         .iter()
@@ -885,8 +876,7 @@ fn peer_host(entry: &str) -> &str {
     if let Some(rest) = entry.strip_prefix('[') {
         return rest.split(']').next().unwrap_or(rest);
     }
-    // A single ':' delimits "host:port"; more colons mean an unbracketed IPv6
-    // literal, which has no port to strip and is returned unchanged.
+    // One ':' is "host:port"; more colons are an unbracketed IPv6 literal (no port).
     match entry.rsplit_once(':') {
         Some((host, _)) if !host.contains(':') => host,
         _ => entry,
@@ -906,14 +896,9 @@ fn first_label(host: &str) -> &str {
     host.split('.').next().unwrap_or(host)
 }
 
-/// Guard against a shifted node identity across restarts.
-///
-/// The resolved id is derived from the live hostname and `peers` on every boot,
-/// but the persisted Raft state (vote/log) belongs to the id this node last ran
-/// under. If a peer is inserted or removed before this host in the list, or the
-/// host is renamed, the derived id would silently diverge from the on-disk state
-/// and openraft would orphan committed entries. Persist the id on first boot and
-/// fail fast if a later boot derives a different one.
+/// Guard against a shifted node identity across restarts: the id is re-derived
+/// each boot but persisted Raft state belongs to the old id, so a reordered or
+/// renamed peer would orphan committed entries. Persist first, then verify.
 fn persist_or_verify_node_id(state_dir: &Path, node_id: NodeId) -> anyhow::Result<()> {
     let raft_dir = state_dir.join("raft");
     std::fs::create_dir_all(&raft_dir)?;
@@ -1216,9 +1201,8 @@ mod tests {
 
     #[test]
     fn resolve_hostname_peers_no_match_does_not_fall_back_to_ordinal() {
-        // Peers carry hostnames and none match, but the host has a valid
-        // in-range ordinal (spurctld-1 -> 2). It must still fail fast rather
-        // than silently joining with the ordinal-derived id.
+        // spurctld-1 has a valid in-range ordinal (2), but hostname peers with
+        // no match must fail fast, not fall back to it.
         let err = resolve_node_id(None, "spurctld-1", &three_peers()).unwrap_err();
         assert!(
             err.to_string().contains("matched no entry"),
@@ -1244,7 +1228,6 @@ mod tests {
     fn node_id_same_across_restart_is_ok() {
         let dir = TempDir::new().unwrap();
         persist_or_verify_node_id(dir.path(), 3).unwrap();
-        // A second boot with the same derived id must succeed.
         persist_or_verify_node_id(dir.path(), 3).unwrap();
     }
 

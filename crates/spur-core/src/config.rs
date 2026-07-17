@@ -269,33 +269,17 @@ pub struct ControllerConfig {
     #[serde(default = "default_one")]
     pub first_job_id: u32,
 
-    /// Raft peers for HA consensus. Each entry is "host:port" (Raft gRPC address).
-    /// If empty, single-node mode (no Raft, no replication).
+    /// Raft peers for HA consensus, "host:port" each. Empty = single-node mode.
+    /// Must be identically ordered on every controller: node ids derive from
+    /// list position, so a reordered list can form an inconsistent voter set.
     /// Example: ["node1:6821", "node2:6821", "node3:6821"]
-    ///
-    /// INVARIANT: every controller must be given a byte-identical,
-    /// identically-ordered `peers` list. Node ids derive from list position, so
-    /// a reordered list makes a host derive a different id for itself than its
-    /// peers map to it — at initial bootstrap this can form an inconsistent
-    /// voter set.
     #[serde(default)]
     pub peers: Vec<String>,
 
-    /// This node's Raft ID. Normally left unset. Only consulted in multi-node
-    /// mode (`peers` non-empty); single-node mode always uses id 1.
-    ///
-    /// In multi-node mode the id is resolved by precedence:
-    /// 1. this explicit value, if set;
-    /// 2. this host's position in `peers` (its hostname matched against each
-    ///    entry's host part, on the full name or first DNS label);
-    /// 3. the hostname ordinal (e.g. spurctld-2 → node_id 3), only for IP-only
-    ///    peer lists where hostname matching cannot work.
-    ///
-    /// The resolved id must fall within `1..=peers.len()`, else startup fails.
-    /// Only needed when peers are IP-only and cannot match a hostname. An
-    /// explicit id that is in range but disagrees with this host's positional
-    /// index in `peers` is accepted silently, so when set it must match that
-    /// position (id == index + 1) or peers will map the host to a different id.
+    /// This node's Raft ID. Normally unset; single-node mode always uses 1.
+    /// Otherwise resolved as: explicit value, else position in `peers` (by
+    /// hostname), else hostname ordinal (IP-only peers). Must be in
+    /// `1..=peers.len()` and, if set, equal its position (index + 1).
     pub node_id: Option<u64>,
 
     /// Listen address for Raft internal gRPC traffic (separate from client API).
