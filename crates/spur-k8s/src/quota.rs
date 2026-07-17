@@ -3,8 +3,8 @@
 
 //! Projects a SPUR account's allocation into the native Kubernetes objects that ENFORCE it:
 //! a Namespace (tenancy), a ResourceQuota (hard caps from the account's `grp_tres` allocation),
-//! a LimitRange (default requests so unset-request pods can't dodge the quota), and RBAC (a Role
-//! + a RoleBinding to the account's members). Pure — no I/O — so the whole mapping is unit-tested
+//! a LimitRange (default requests so unset-request pods can't dodge the quota), and RBAC (a Role and
+//! a RoleBinding to the account's members). Pure — no I/O — so the whole mapping is unit-tested
 //! here; the quota controller applies what these return and drift-corrects.
 
 use std::collections::BTreeMap;
@@ -153,7 +153,9 @@ pub fn role(account: &str) -> Role {
         verbs: verbs.iter().map(|s| s.to_string()).collect(),
         ..Default::default()
     };
-    let rw = &["get", "list", "watch", "create", "update", "patch", "delete"];
+    let rw = &[
+        "get", "list", "watch", "create", "update", "patch", "delete",
+    ];
     Role {
         metadata: meta(ROLE_NAME, Some(&ns), account),
         rules: Some(vec![
@@ -309,8 +311,10 @@ mod tests {
         let rb = role_binding(&aq);
         let subs = rb.subjects.unwrap();
         assert_eq!(subs.len(), 2);
-        assert!(subs.iter().all(|s| s.kind == "ServiceAccount"
-            && s.namespace.as_deref() == Some("spur-acct-physics")));
+        assert!(subs
+            .iter()
+            .all(|s| s.kind == "ServiceAccount"
+                && s.namespace.as_deref() == Some("spur-acct-physics")));
         assert_eq!(subs[0].name, "spur-user-alice");
         assert_eq!(rb.role_ref.name, ROLE_NAME);
         assert_eq!(rb.role_ref.kind, "Role");

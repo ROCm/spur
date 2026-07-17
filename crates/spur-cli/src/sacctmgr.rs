@@ -256,6 +256,9 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 .map(|v| parse_limit("maxjobs", v))
                 .transpose()?
                 .unwrap_or(0);
+            // Account resource allocation, e.g. grptres=cpu=16,mem=32768,gres/gpu=8. Projected to a
+            // per-account k8s ResourceQuota by the quota reconciler.
+            let grp_tres = p.get("grptres").cloned().unwrap_or_default();
 
             let mut client = connect(addr).await?;
             client
@@ -266,6 +269,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     parent_account: parent.clone(),
                     fairshare_weight: fairshare,
                     max_running_jobs: max_jobs,
+                    grp_tres: grp_tres.clone(),
                 })
                 .await
                 .context("CreateAccount RPC failed")?;
@@ -495,6 +499,7 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
                         .map(|v| parse_limit("maxjobs", v))
                         .transpose()?
                         .unwrap_or(0),
+                    grp_tres: p.get("grptres").cloned().unwrap_or_default(),
                 })
                 .await
                 .context("CreateAccount (modify) RPC failed")?;

@@ -300,6 +300,11 @@ impl SlurmAccounting for AccountingService {
         } else {
             Some(req.max_running_jobs as i32)
         };
+        let grp_tres = if req.grp_tres.is_empty() {
+            None
+        } else {
+            Some(req.grp_tres.as_str())
+        };
         db::upsert_account(
             &self.pool,
             &req.name,
@@ -308,6 +313,7 @@ impl SlurmAccounting for AccountingService {
             parent,
             req.fairshare_weight as i32,
             max_running,
+            grp_tres,
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -342,6 +348,7 @@ impl SlurmAccounting for AccountingService {
                 parent_account: r.parent.unwrap_or_default(),
                 fairshare_weight: r.fairshare_weight as f64,
                 max_running_jobs: r.max_running_jobs.unwrap_or(0) as u32,
+                grp_tres: r.grp_tres.unwrap_or_default(),
             })
             .collect();
 
