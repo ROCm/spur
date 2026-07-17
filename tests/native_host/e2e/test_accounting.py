@@ -51,6 +51,87 @@ def _reason(cluster, job_id: int) -> str:
     return m.group(1) if m else ""
 
 
+class TestSacctmgrShowQos:
+    """Verify sacctmgr show qos displays TRES/node-allocation fields, honors
+    format= selection, and filters by where name=."""
+
+    def test_default_output_shows_tres_columns(self, accounting_cluster):
+        c = accounting_cluster
+        c.sacctmgr(["add", "qos", "name=nodeqos", "priority=50",
+                     "grptres=node=4,cpu=16", "maxtresperjob=node=2"])
+        time.sleep(15)
+        out = c.sacctmgr(["show", "qos"])
+        assert "nodeqos" in out
+        assert "node=4" in out, f"GrpTRES node limit missing: {out!r}"
+        assert "node=2" in out, f"MaxTRES node limit missing: {out!r}"
+
+    def test_format_selects_specific_fields(self, accounting_cluster):
+        c = accounting_cluster
+        c.sacctmgr(["add", "qos", "name=fmtqos", "priority=10",
+                     "grptres=cpu=32", "maxtresperjob=cpu=8"])
+        time.sleep(15)
+        out = c.sacctmgr(["show", "qos", "format=Name,GrpTRES,MaxTRES"])
+        assert "fmtqos" in out
+        assert "cpu=32" in out, f"GrpTRES missing: {out!r}"
+        assert "cpu=8" in out, f"MaxTRES missing: {out!r}"
+        # Priority should NOT appear since it was not in the format list.
+        lines = [l for l in out.splitlines() if "fmtqos" in l]
+        assert lines, f"no fmtqos row in output: {out!r}"
+        assert "Priority" not in out.splitlines()[0], (
+            f"Priority column should not appear: {out!r}")
+
+    def test_where_name_filters_to_one_qos(self, accounting_cluster):
+        c = accounting_cluster
+        c.sacctmgr(["add", "qos", "name=alpha", "priority=1"])
+        c.sacctmgr(["add", "qos", "name=beta", "priority=2"])
+        time.sleep(15)
+        out = c.sacctmgr(["show", "qos", "where", "name=alpha"])
+        assert "alpha" in out
+        assert "beta" not in out, f"name filter did not exclude beta: {out!r}"
+
+    def test_show_qos_renders_all_limit_columns(self, accounting_cluster):
+        c = accounting_cluster
+
+        c.sacctmgr(
+            [
+                "add",
+                "qos",
+                "name=fullcap",
+                "maxjobsperuser=2",
+                "maxsubmitjobsperuser=4",
+                "maxwall=30",
+                "grpwall=60",
+                "maxtresperjob=cpu=8",
+                "maxtresperuser=cpu=16",
+                "grptres=cpu=32",
+            ]
+        )
+        time.sleep(15)
+
+        out = c.sacctmgr(["show", "qos"])
+        header, *rows = [line for line in out.splitlines() if line.strip()]
+        for column in (
+            "MaxJobsPU",
+            "MaxSubmitPU",
+            "MaxWall",
+            "GrpWall",
+            "MaxTRES",
+            "MaxTRESPU",
+            "GrpTRES",
+        ):
+            assert column in header, f"missing column {column!r} in header: {header!r}"
+
+        row = next((r for r in rows if r.startswith("fullcap")), None)
+        assert row is not None, f"fullcap row not found in: {rows!r}"
+        assert "2" in row.split()
+        assert "4" in row.split()
+        assert "30" in row.split()
+        assert "60" in row.split()
+        assert "cpu=8" in row
+        assert "cpu=16" in row
+        assert "cpu=32" in row
+
+
 class TestQosLimitReasons:
     def test_wall_cap_sets_qos_pending_reason(self, accounting_cluster):
         c = accounting_cluster
@@ -232,50 +313,6 @@ class TestQosLimitReasons:
         assert reason == "QOSMaxGRESPerUser", (
             f"expected QOSMaxGRESPerUser, got {reason!r}"
         )
-
-
-class TestSacctmgrShowQos:
-    def test_show_qos_renders_all_limit_columns(self, accounting_cluster):
-        c = accounting_cluster
-
-        c.sacctmgr(
-            [
-                "add",
-                "qos",
-                "name=fullcap",
-                "maxjobsperuser=2",
-                "maxsubmitjobsperuser=4",
-                "maxwall=30",
-                "grpwall=60",
-                "maxtresperjob=cpu=8",
-                "maxtresperuser=cpu=16",
-                "grptres=cpu=32",
-            ]
-        )
-        time.sleep(15)
-
-        out = c.sacctmgr(["show", "qos"])
-        header, *rows = [line for line in out.splitlines() if line.strip()]
-        for column in (
-            "MaxJobsPU",
-            "MaxSubmitPU",
-            "MaxWall",
-            "GrpWall",
-            "MaxTRES",
-            "MaxTRESPU",
-            "GrpTRES",
-        ):
-            assert column in header, f"missing column {column!r} in header: {header!r}"
-
-        row = next((r for r in rows if r.startswith("fullcap")), None)
-        assert row is not None, f"fullcap row not found in: {rows!r}"
-        assert "2" in row.split()
-        assert "4" in row.split()
-        assert "30" in row.split()
-        assert "60" in row.split()
-        assert "cpu=8" in row
-        assert "cpu=16" in row
-        assert "cpu=32" in row
 
 
 class TestSacctmgrUserAssociationLimits:

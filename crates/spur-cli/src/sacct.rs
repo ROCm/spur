@@ -183,13 +183,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let jobs = response.into_inner().jobs;
 
     if !args.noheader {
-        println!("{}", format_engine::format_header(&fields));
-        // Print separator line
-        let sep = format_engine::format_header(&fields)
-            .chars()
-            .map(|c| if c == ' ' { ' ' } else { '-' })
-            .collect::<String>();
-        println!("{}", sep);
+        format_engine::print_header(&fields);
     }
 
     for job in &jobs {

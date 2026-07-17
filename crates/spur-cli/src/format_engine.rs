@@ -225,6 +225,45 @@ fn format_field(value: &str, field: &FormatField) -> String {
     }
 }
 
+/// Print a header row followed by a separator line (dashes under text, spaces under spaces).
+pub fn print_header(tokens: &[FormatToken]) {
+    let header = format_header(tokens);
+    let sep: String = header
+        .chars()
+        .map(|c| if c == ' ' { ' ' } else { '-' })
+        .collect();
+    println!("{header}");
+    println!("{sep}");
+}
+
+/// Resolve a `format=` parameter into tokens.
+///
+/// - `"all"` (case-insensitive) expands `all_format` via `parse_format`.
+/// - Any other value is parsed as comma-separated field names via `parse_named_format`.
+/// - Returns an error if the value contains no recognized field names (with `valid_hint`).
+/// - `None` falls back to `default_format` via `parse_format`.
+pub fn resolve_format(
+    format_param: Option<&str>,
+    default_format: &str,
+    all_format: &str,
+    name_to_spec: &dyn Fn(&str) -> Option<char>,
+    header_map: &dyn Fn(char) -> &'static str,
+    valid_hint: &str,
+) -> anyhow::Result<Vec<FormatToken>> {
+    match format_param {
+        Some(fmt) if fmt.eq_ignore_ascii_case("all") => Ok(parse_format(all_format, header_map)),
+        Some(fmt) => {
+            let f = parse_named_format(fmt, name_to_spec, header_map);
+            let has_fields = f.iter().any(|t| matches!(t, FormatToken::Field(_)));
+            if !has_fields {
+                anyhow::bail!("no recognized fields in format='{fmt}'. Valid fields: {valid_hint}");
+            }
+            Ok(f)
+        }
+        None => Ok(parse_format(default_format, header_map)),
+    }
+}
+
 /// Default squeue format string (matches Slurm default).
 pub const SQUEUE_DEFAULT_FORMAT: &str = "%.18i %.9P %.8j %.8u %.2t %10M %6D %R";
 

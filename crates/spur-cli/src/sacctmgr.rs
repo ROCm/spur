@@ -4,6 +4,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
+use crate::format_engine;
 use spur_proto::proto::slurm_accounting_client::SlurmAccountingClient;
 use spur_proto::proto::*;
 
@@ -668,51 +669,51 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
             Ok(())
         }
         "qos" => {
+            let fields = format_engine::resolve_format(
+                p.get("format").map(String::as_str),
+                QOS_DEFAULT_FORMAT,
+                QOS_ALL_FORMAT,
+                &qos_field_spec,
+                &qos_header,
+                "Name, Description, Priority, Preempt, UsageFactor, \
+                 GrpTRES, MaxTRES, MaxTRESPU, MaxJobsPU, MaxSubmitPU, MaxWall, GrpWall",
+            )?;
+
             let mut client = connect(addr).await?;
-            let resp = client
+            let mut qos_list = client
                 .list_qos(ListQosRequest {})
                 .await
-                .context("ListQos RPC failed")?;
+                .context("ListQos RPC failed")?
+                .into_inner()
+                .qos_list;
 
-            let qos_list = resp.into_inner().qos_list;
+            let has_name_filter = p.contains_key("name");
+            if let Some(name_filter) = p.get("name") {
+                let names: Vec<&str> = name_filter.split(',').map(str::trim).collect();
+                qos_list.retain(|q| names.iter().any(|n| n.eq_ignore_ascii_case(&q.name)));
+            }
 
-            println!(
-                "{:<15} {:<8} {:<10} {:<12} {:<10} {:<12} {:<8} {:<8} {:<20} {:<20} {:<20}",
-                "Name",
-                "Priority",
-                "Preempt",
-                "UsageFactor",
-                "MaxJobsPU",
-                "MaxSubmitPU",
-                "MaxWall",
-                "GrpWall",
-                "MaxTRES",
-                "MaxTRESPU",
-                "GrpTRES",
-            );
-            println!("{}", "-".repeat(140));
+            format_engine::print_header(&fields);
 
-            if qos_list.is_empty() {
-                // Show default
+            if qos_list.is_empty() && !has_name_filter {
+                let default_qos = QosInfo {
+                    name: "normal".into(),
+                    preempt_mode: "off".into(),
+                    usage_factor: 1.0,
+                    ..Default::default()
+                };
                 println!(
-                    "{:<15} {:<8} {:<10} {:<12} {:<10} {:<12} {:<8} {:<8} {:<20} {:<20} {:<20}",
-                    "normal", "0", "off", "1.0", "", "", "", "", "", "", "",
+                    "{}",
+                    format_engine::format_row(&fields, &|spec| resolve_qos_field(
+                        &default_qos,
+                        spec
+                    ))
                 );
             } else {
                 for q in &qos_list {
                     println!(
-                        "{:<15} {:<8} {:<10} {:<12} {:<10} {:<12} {:<8} {:<8} {:<20} {:<20} {:<20}",
-                        q.name,
-                        q.priority,
-                        q.preempt_mode,
-                        q.usage_factor,
-                        opt_u32_str(q.max_jobs_per_user),
-                        opt_u32_str(q.max_submit_jobs_per_user),
-                        opt_u32_str(q.max_wall_minutes),
-                        opt_u32_str(q.grp_wall_minutes),
-                        format_tres(&q.max_tres_per_job),
-                        format_tres(&q.max_tres_per_user),
-                        format_tres(&q.grp_tres),
+                        "{}",
+                        format_engine::format_row(&fields, &|spec| resolve_qos_field(q, spec))
                     );
                 }
             }
@@ -741,6 +742,89 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
             "sacctmgr: unknown entity '{}'. Use: account, user, qos, association, tres",
             other
         ),
+    }
+}
+
+const QOS_DEFAULT_FORMAT: &str = "%-15N %-8p %-10P %-12U %-10J %-10S %-10W %-10w %-20T %-20V %-20G";
+
+const QOS_ALL_FORMAT: &str =
+    "%-15N %-30D %-8p %-10P %-12U %-10J %-10S %-10W %-10w %-20T %-20V %-20G";
+
+fn qos_header(spec: char) -> &'static str {
+    match spec {
+        'N' => "Name",
+        'D' => "Descr",
+        'p' => "Priority",
+        'P' => "Preempt",
+        'U' => "UsageFactor",
+        'G' => "GrpTRES",
+        'T' => "MaxTRES",
+        'V' => "MaxTRESPU",
+        'J' => "MaxJobsPU",
+        'S' => "MaxSubmitPU",
+        'W' => "MaxWall",
+        'w' => "GrpWall",
+        _ => "?",
+    }
+}
+
+fn qos_field_spec(name: &str) -> Option<char> {
+    match name.to_lowercase().as_str() {
+        "name" => Some('N'),
+        "description" | "descr" => Some('D'),
+        "priority" | "prio" => Some('p'),
+        "preempt" | "preemptmode" => Some('P'),
+        "usagefactor" => Some('U'),
+        "grptres" => Some('G'),
+        "maxtres" | "maxtrespj" | "maxtresperjob" => Some('T'),
+        "maxtrespu" | "maxtresperuser" => Some('V'),
+        "maxjobspu" | "maxjobsperuser" => Some('J'),
+        "maxsubmitpu" | "maxsubmitjobspu" | "maxsubmitjobsperuser" => Some('S'),
+        "maxwall" | "maxwalldurationperjob" => Some('W'),
+        "grpwall" => Some('w'),
+        _ => None,
+    }
+}
+
+fn resolve_qos_field(q: &QosInfo, spec: char) -> String {
+    match spec {
+        'N' => q.name.clone(),
+        'D' => q.description.clone(),
+        'p' => q.priority.to_string(),
+        'P' => q.preempt_mode.clone(),
+        'U' => format!("{}", q.usage_factor),
+        'G' => q.grp_tres.clone(),
+        'T' => q.max_tres_per_job.clone(),
+        'V' => q.max_tres_per_user.clone(),
+        'J' => {
+            if q.max_jobs_per_user == 0 {
+                String::new()
+            } else {
+                q.max_jobs_per_user.to_string()
+            }
+        }
+        'S' => {
+            if q.max_submit_jobs_per_user == 0 {
+                String::new()
+            } else {
+                q.max_submit_jobs_per_user.to_string()
+            }
+        }
+        'W' => {
+            if q.max_wall_minutes == 0 {
+                String::new()
+            } else {
+                q.max_wall_minutes.to_string()
+            }
+        }
+        'w' => {
+            if q.grp_wall_minutes == 0 {
+                String::new()
+            } else {
+                q.grp_wall_minutes.to_string()
+            }
+        }
+        _ => "?".into(),
     }
 }
 
@@ -778,31 +862,6 @@ fn parse_wall_time(s: &str) -> Option<u32> {
             Some(h * 60 + m)
         }
         _ => None,
-    }
-}
-
-/// Render an unset (0) proto limit as an empty column, matching Slurm's
-/// `sacctmgr show` style for absent limits.
-fn opt_u32_str(v: u32) -> String {
-    if v == 0 {
-        String::new()
-    } else {
-        v.to_string()
-    }
-}
-
-/// Canonicalize a raw TRES string (e.g. user-supplied `mem=10,cpu=5`) into
-/// Slurm's sorted, comma-joined display form via `TresRecord`; empty if unset.
-fn format_tres(raw: &str) -> String {
-    if raw.is_empty() {
-        return String::new();
-    }
-    // Display-only: values are validated at write time (add user/create qos),
-    // so a parse failure here means pre-existing/out-of-band data. Show the
-    // raw string rather than silently dropping tokens.
-    match spur_core::accounting::TresRecord::parse(raw) {
-        Ok(rec) => rec.format(),
-        Err(_) => raw.to_string(),
     }
 }
 
@@ -1029,30 +1088,112 @@ mod tests {
         );
     }
 
-    #[test]
-    fn opt_u32_str_renders_zero_as_empty() {
-        assert_eq!(opt_u32_str(0), "");
-        assert_eq!(opt_u32_str(42), "42");
+    fn stub_qos() -> QosInfo {
+        QosInfo {
+            name: "gpuqos".into(),
+            description: "GPU workers".into(),
+            priority: 100,
+            preempt_mode: "cancel".into(),
+            usage_factor: 1.5,
+            max_jobs_per_user: 8,
+            max_submit_jobs_per_user: 20,
+            max_wall_minutes: 120,
+            max_tres_per_job: "node=2,cpu=64".into(),
+            max_tres_per_user: "cpu=128".into(),
+            grp_tres: "node=4,cpu=256".into(),
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn format_tres_renders_empty_input_as_empty() {
-        assert_eq!(format_tres(""), "");
+    fn qos_named_format_renders_tres_fields() {
+        let fields = format_engine::parse_named_format(
+            "Name,GrpTRES,MaxTRES,MaxTRESPU",
+            &qos_field_spec,
+            &qos_header,
+        );
+        let q = stub_qos();
+        let row = format_engine::format_row(&fields, &|spec| resolve_qos_field(&q, spec));
+        assert!(row.contains("node=4,cpu=256"), "GrpTRES missing: {row}");
+        assert!(row.contains("node=2,cpu=64"), "MaxTRES missing: {row}");
+        assert!(row.contains("cpu=128"), "MaxTRESPU missing: {row}");
     }
 
     #[test]
-    fn format_tres_canonicalizes_and_sorts() {
-        // Unsorted input, alias ("memory") normalized to Slurm's "mem" name.
-        assert_eq!(format_tres("memory=10,cpu=5"), "cpu=5,mem=10");
+    fn qos_field_spec_aliases_are_case_insensitive() {
+        assert_eq!(qos_field_spec("grptres"), qos_field_spec("GrpTRES"));
+        assert_eq!(qos_field_spec("maxtres"), qos_field_spec("MaxTRESPJ"));
+        assert_eq!(qos_field_spec("maxtresperjob"), qos_field_spec("MaxTRES"));
+        assert_eq!(
+            qos_field_spec("maxwall"),
+            qos_field_spec("MaxWallDurationPerJob")
+        );
     }
 
     #[test]
-    fn format_tres_drops_zero_values() {
-        assert_eq!(format_tres("cpu=0,node=2"), "node=2");
+    fn qos_default_format_includes_tres_columns() {
+        let fields = format_engine::parse_format(QOS_DEFAULT_FORMAT, &qos_header);
+        let header = format_engine::format_header(&fields);
+        assert!(header.contains("GrpTRES"), "default header: {header}");
+        assert!(header.contains("MaxTRES"), "default header: {header}");
     }
 
     #[test]
-    fn format_tres_shows_raw_string_when_unparseable() {
-        assert_eq!(format_tres("cpu=4,bogus=nope"), "cpu=4,bogus=nope");
+    fn qos_all_format_includes_description_and_submit() {
+        let fields = format_engine::parse_format(QOS_ALL_FORMAT, &qos_header);
+        let header = format_engine::format_header(&fields);
+        assert!(header.contains("Descr"), "all header: {header}");
+        assert!(header.contains("MaxSubmitPU"), "all header: {header}");
+    }
+
+    #[test]
+    fn qos_resolve_zero_fields_are_blank() {
+        let q = QosInfo {
+            name: "normal".into(),
+            preempt_mode: "off".into(),
+            usage_factor: 1.0,
+            ..Default::default()
+        };
+        assert_eq!(resolve_qos_field(&q, 'J'), "");
+        assert_eq!(resolve_qos_field(&q, 'S'), "");
+        assert_eq!(resolve_qos_field(&q, 'W'), "");
+        assert_eq!(resolve_qos_field(&q, 'w'), "");
+    }
+
+    #[test]
+    fn qos_name_filter_retains_matching_and_trims_whitespace() {
+        let mut list = vec![
+            QosInfo {
+                name: "alpha".into(),
+                ..Default::default()
+            },
+            QosInfo {
+                name: "beta".into(),
+                ..Default::default()
+            },
+            QosInfo {
+                name: "gamma".into(),
+                ..Default::default()
+            },
+        ];
+        let filter = "alpha, gamma";
+        let names: Vec<&str> = filter.split(',').map(str::trim).collect();
+        list.retain(|q| names.iter().any(|n| n.eq_ignore_ascii_case(&q.name)));
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].name, "alpha");
+        assert_eq!(list[1].name, "gamma");
+    }
+
+    #[test]
+    fn qos_field_spec_rejects_unknown_names() {
+        assert_eq!(qos_field_spec("bogus"), None);
+        assert_eq!(qos_field_spec("nodelist"), None);
+        assert_eq!(qos_field_spec(""), None);
+    }
+
+    #[test]
+    fn qos_empty_format_string_produces_no_fields() {
+        let fields = format_engine::parse_named_format("", &qos_field_spec, &qos_header);
+        assert!(fields.is_empty());
     }
 }
