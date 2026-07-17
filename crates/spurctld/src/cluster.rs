@@ -2362,9 +2362,9 @@ impl ClusterManager {
             }
         }
         preview.nodes.retain(|n| !remove_nodes.contains(n));
-        for user in add_users {
-            if !preview.users.contains(user) {
-                preview.users.push(user.clone());
+        for add_user in add_users {
+            if !preview.users.contains(add_user) {
+                preview.users.push(add_user.clone());
             }
         }
         preview.users.retain(|u| !remove_users.contains(u));
