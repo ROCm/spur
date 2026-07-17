@@ -287,6 +287,7 @@ mod reservation_wal_tests {
                     maint: true,
                     ..Default::default()
                 },
+                owner: String::new(),
             },
         };
         let json = serde_json::to_string(&op).unwrap();

@@ -56,6 +56,7 @@ pub enum ReservationError {
     InvalidArgument(String),
     NotFound(String),
     AlreadyExists(String),
+    PermissionDenied(String),
     Raft(String),
 }
 
@@ -65,6 +66,7 @@ impl std::fmt::Display for ReservationError {
             Self::InvalidArgument(m)
             | Self::NotFound(m)
             | Self::AlreadyExists(m)
+            | Self::PermissionDenied(m)
             | Self::Raft(m) => f.write_str(m),
         }
     }
@@ -156,6 +158,10 @@ impl ReservationError {
 
     pub fn already_exists(msg: impl Into<String>) -> Self {
         Self::AlreadyExists(msg.into())
+    }
+
+    pub fn permission_denied(msg: impl Into<String>) -> Self {
+        Self::PermissionDenied(msg.into())
     }
 
     pub fn raft(msg: impl Into<String>) -> Self {
@@ -2319,6 +2325,7 @@ impl ClusterManager {
         remove_users: &[String],
         add_accounts: &[String],
         remove_accounts: &[String],
+        user: &str,
     ) -> Result<(), ReservationError> {
         let mut preview = self
             .reservations
@@ -2329,6 +2336,13 @@ impl ClusterManager {
             .ok_or_else(|| {
                 ReservationError::not_found(format!("reservation '{}' not found", name))
             })?;
+
+        if !preview.can_be_managed_by(user) {
+            return Err(ReservationError::permission_denied(format!(
+                "user '{}' cannot modify reservation '{}' owned by '{}'",
+                user, name, preview.owner
+            )));
+        }
 
         if duration_minutes > 0 {
             preview.end_time =
@@ -2380,13 +2394,23 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Delete a reservation by name (persisted via Raft).
-    pub fn delete_reservation(&self, name: &str) -> Result<(), ReservationError> {
-        if !self.reservations.read().iter().any(|r| r.name == name) {
-            return Err(ReservationError::not_found(format!(
-                "reservation '{}' not found",
-                name
-            )));
+    /// Delete a reservation by name (persisted via Raft). The requesting `user`
+    /// must be the reservation owner, root, or empty (trusted internal calls).
+    pub fn delete_reservation(&self, name: &str, user: &str) -> Result<(), ReservationError> {
+        {
+            let reservations = self.reservations.read();
+            let res = reservations
+                .iter()
+                .find(|r| r.name == name)
+                .ok_or_else(|| {
+                    ReservationError::not_found(format!("reservation '{}' not found", name))
+                })?;
+            if !res.can_be_managed_by(user) {
+                return Err(ReservationError::permission_denied(format!(
+                    "user '{}' cannot delete reservation '{}' owned by '{}'",
+                    user, name, res.owner
+                )));
+            }
         }
 
         for job in self.jobs.read().values() {
@@ -6887,6 +6911,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         let mut r1 = base.clone();
         r1.name = "r1".into();
@@ -6911,6 +6936,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         let mut r1 = base.clone();
         r1.name = "r1".into();
@@ -6936,6 +6962,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["testuser".into()],
             flags: Default::default(),
+            owner: String::new(),
         })
         .unwrap();
 
@@ -7102,6 +7129,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["testuser".into()],
             flags: Default::default(),
+            owner: String::new(),
         })
         .unwrap();
 
@@ -7138,6 +7166,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["testuser".into()],
             flags: Default::default(),
+            owner: String::new(),
         })
         .unwrap();
 
@@ -7298,6 +7327,7 @@ mod tests {
                 accounts: Vec::new(),
                 users: vec!["testuser".into()],
                 flags: Default::default(),
+                owner: String::new(),
             },
         });
 
@@ -7327,6 +7357,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         cm.apply_operation(&WalOperation::ReservationCreate {
             reservation: res.clone(),
@@ -7373,6 +7404,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         cm.apply_operation(&WalOperation::ReservationCreate {
             reservation: res.clone(),
@@ -7396,6 +7428,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         let cm1 = cm.clone();
         let cm2 = cm.clone();
@@ -7430,6 +7463,7 @@ mod tests {
                 accounts: Vec::new(),
                 users: vec!["alice".into()],
                 flags: Default::default(),
+                owner: String::new(),
             })
             .unwrap();
             assert_eq!(cm.get_reservations().len(), 1);
@@ -7459,6 +7493,7 @@ mod tests {
                 no_hold_jobs: true,
                 ..Default::default()
             },
+            owner: String::new(),
         })
         .unwrap();
 
@@ -7466,7 +7501,7 @@ mod tests {
         spec.reservation = Some("r1".into());
         let job_id = submit_and_wait(&cm, spec);
 
-        cm.delete_reservation("r1").unwrap();
+        cm.delete_reservation("r1", "root").unwrap();
         wait_for("reservation deleted", || cm.get_reservations().is_empty());
 
         let job = cm.get_job(job_id).unwrap();
@@ -7478,6 +7513,106 @@ mod tests {
             cm.pending_jobs().iter().any(|j| j.job_id == job_id),
             "job must remain schedulable after no_hold_jobs delete"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_reservation_rejects_non_owner() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "r1".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: Default::default(),
+            owner: "alice".into(),
+        })
+        .unwrap();
+
+        let err = cm.delete_reservation("r1", "bob").unwrap_err();
+        assert!(
+            matches!(err, ReservationError::PermissionDenied(_)),
+            "non-owner delete must be denied, got {err:?}"
+        );
+        assert_eq!(cm.get_reservations().len(), 1, "reservation must survive");
+
+        cm.delete_reservation("r1", "alice").unwrap();
+        assert!(
+            cm.get_reservations().is_empty(),
+            "owner delete must succeed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_reservation_rejects_non_owner() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "r1".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: Default::default(),
+            owner: "alice".into(),
+        })
+        .unwrap();
+
+        let err = cm
+            .update_reservation("r1", 30, &[], &[], &[], &[], &[], &[], "bob")
+            .unwrap_err();
+        assert!(
+            matches!(err, ReservationError::PermissionDenied(_)),
+            "non-owner update must be denied, got {err:?}"
+        );
+
+        cm.update_reservation("r1", 30, &[], &[], &[], &[], &[], &[], "alice")
+            .expect("owner update must succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_reservation_allows_root_and_unowned() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "owned".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: Default::default(),
+            owner: "alice".into(),
+        })
+        .unwrap();
+        cm.create_reservation(Reservation {
+            name: "legacy".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: spur_core::reservation::ReservationFlags {
+                overlap: true,
+                ..Default::default()
+            },
+            owner: String::new(),
+        })
+        .unwrap();
+
+        cm.delete_reservation("owned", "root")
+            .expect("root may delete any reservation");
+        cm.delete_reservation("legacy", "bob")
+            .expect("unowned reservation stays manageable by anyone");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7498,6 +7633,7 @@ mod tests {
                     no_hold_jobs: true,
                     ..Default::default()
                 },
+                owner: String::new(),
             },
         });
 
@@ -7531,6 +7667,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         })
         .unwrap();
 
@@ -7664,13 +7801,14 @@ mod tests {
                 accounts: Vec::new(),
                 users: vec!["testuser".into()],
                 flags: Default::default(),
+                owner: String::new(),
             })
             .unwrap();
 
             let mut spec = basic_spec("resv-hold");
             spec.reservation = Some("r1".into());
             let job_id = submit_and_wait(&cm, spec);
-            cm.delete_reservation("r1").unwrap();
+            cm.delete_reservation("r1", "root").unwrap();
             wait_for("job held after delete", || {
                 cm.get_job(job_id).is_some_and(|j| {
                     j.pending_reason == PendingReason::ReservationDeleted && j.priority == 0
@@ -7706,13 +7844,14 @@ mod tests {
                     no_hold_jobs: true,
                     ..Default::default()
                 },
+                owner: String::new(),
             })
             .unwrap();
 
             let mut spec = basic_spec("resv-no-hold");
             spec.reservation = Some("r1".into());
             job_id = submit_and_wait(&cm, spec);
-            cm.delete_reservation("r1").unwrap();
+            cm.delete_reservation("r1", "root").unwrap();
             wait_for("reservation detached from job", || {
                 cm.get_job(job_id)
                     .is_some_and(|j| j.spec.reservation.is_none() && j.priority > 0)
@@ -7740,13 +7879,14 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["testuser".into()],
             flags: Default::default(),
+            owner: String::new(),
         })
         .unwrap();
 
         let mut spec = basic_spec("release-me");
         spec.reservation = Some("r1".into());
         let job_id = submit_and_wait(&cm, spec);
-        cm.delete_reservation("r1").unwrap();
+        cm.delete_reservation("r1", "root").unwrap();
         wait_for("job held after delete", || {
             cm.get_job(job_id).is_some_and(|j| {
                 j.pending_reason == PendingReason::ReservationDeleted && j.priority == 0

@@ -1224,6 +1224,7 @@ impl SlurmController for ControllerService {
             accounts: req.accounts,
             users: req.users,
             flags,
+            owner: req.user,
         };
 
         self.cluster
@@ -1263,6 +1264,7 @@ impl SlurmController for ControllerService {
                 &req.remove_users,
                 &req.add_accounts,
                 &req.remove_accounts,
+                &req.user,
             )
             .map_err(reservation_rpc_status)?;
         Ok(Response::new(()))
@@ -1287,9 +1289,9 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let name = request.into_inner().name;
+        let req = request.into_inner();
         self.cluster
-            .delete_reservation(&name)
+            .delete_reservation(&req.name, &req.user)
             .map_err(reservation_rpc_status)?;
         Ok(Response::new(()))
     }
@@ -1320,6 +1322,7 @@ impl SlurmController for ControllerService {
                 users: r.users.join(","),
                 flags: r.flags.display_csv(),
                 state: r.state_label(now).into(),
+                owner: r.owner.clone(),
             })
             .collect();
         Ok(Response::new(ListReservationsResponse {
@@ -2131,6 +2134,7 @@ fn reservation_rpc_status(err: ReservationError) -> Status {
         ReservationError::InvalidArgument(m) => Status::invalid_argument(m),
         ReservationError::NotFound(m) => Status::not_found(m),
         ReservationError::AlreadyExists(m) => Status::already_exists(m),
+        ReservationError::PermissionDenied(m) => Status::permission_denied(m),
         ReservationError::Raft(m) => Status::internal(m),
     }
 }
@@ -2222,6 +2226,7 @@ mod tests {
             accounts: Vec::new(),
             users: Vec::new(),
             flags: Default::default(),
+            owner: String::new(),
         }
     }
 
@@ -2357,6 +2362,7 @@ mod tests {
                 overlap: true,
                 ..Default::default()
             },
+            owner: String::new(),
         };
         let maint = Reservation {
             name: "maint".into(),
@@ -2370,6 +2376,7 @@ mod tests {
                 overlap: true,
                 ..Default::default()
             },
+            owner: String::new(),
         };
         let reservations = vec![plain, maint];
         annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now());

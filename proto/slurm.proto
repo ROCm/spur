@@ -1083,6 +1083,7 @@ message CreateReservationRequest {
   repeated string accounts = 5;
   repeated string users = 6;
   repeated string flags = 7;
+  string user = 8;            // requesting user; recorded as reservation owner
 }
 
 message UpdateReservationRequest {
@@ -1094,10 +1095,12 @@ message UpdateReservationRequest {
   repeated string remove_users = 6;
   repeated string add_accounts = 7;
   repeated string remove_accounts = 8;
+  string user = 9;              // requesting user; must be owner or root
 }
 
 message DeleteReservationRequest {
   string name = 1;
+  string user = 2;             // requesting user; must be owner or root
 }
 
 message ListReservationsRequest { }
@@ -1115,6 +1118,7 @@ message ReservationInfo {
   string users = 6;
   string flags = 7;
   string state = 8;
+  string owner = 9;
 }
 
 // ============================================================

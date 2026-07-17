@@ -1059,6 +1059,7 @@ mod tests {
             accounts: Vec::new(),
             users,
             flags: Default::default(),
+            owner: String::new(),
         }
     }
 
@@ -1179,6 +1180,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
 
         // Non-reservation job should be able to use node001 since reservation is inactive
@@ -1215,6 +1217,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
 
         let mut job = make_job(1, 1, 1);

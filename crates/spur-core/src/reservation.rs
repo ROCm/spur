@@ -80,6 +80,11 @@ pub struct Reservation {
     pub users: Vec<String>,
     #[serde(default)]
     pub flags: ReservationFlags,
+    /// User who created the reservation. Empty for reservations created before
+    /// ownership tracking existed (and for trusted internal callers), which are
+    /// treated as unowned and mutable by any authenticated user.
+    #[serde(default)]
+    pub owner: String,
 }
 
 impl Reservation {
@@ -107,6 +112,14 @@ impl Reservation {
 
     pub fn covers_node(&self, node: &str) -> bool {
         self.nodes.iter().any(|n| n == node)
+    }
+
+    /// Whether `user` may modify or delete this reservation. Root and trusted
+    /// internal callers (empty user) are always allowed, as is the recorded
+    /// owner. Reservations with no recorded owner (created before ownership
+    /// tracking) stay mutable by any authenticated user.
+    pub fn can_be_managed_by(&self, user: &str) -> bool {
+        user.is_empty() || user == "root" || self.owner.is_empty() || self.owner == user
     }
 
     pub fn allows_user(&self, user: &str, account: Option<&str>) -> bool {
@@ -304,6 +317,7 @@ mod tests {
             accounts: vec!["research".into()],
             users: vec!["alice".into()],
             flags: ReservationFlags::default(),
+            owner: String::new(),
         }
     }
 
@@ -333,6 +347,26 @@ mod tests {
     }
 
     #[test]
+    fn owner_can_manage_and_others_cannot() {
+        let mut res = make_reservation();
+        res.owner = "alice".into();
+        assert!(res.can_be_managed_by("alice"), "owner may manage");
+        assert!(res.can_be_managed_by("root"), "root may manage");
+        assert!(res.can_be_managed_by(""), "internal calls may manage");
+        assert!(!res.can_be_managed_by("bob"), "non-owner may not manage");
+    }
+
+    #[test]
+    fn unowned_reservation_is_manageable_by_anyone() {
+        let res = make_reservation();
+        assert_eq!(res.owner, "");
+        assert!(
+            res.can_be_managed_by("bob"),
+            "reservations without a recorded owner stay mutable"
+        );
+    }
+
+    #[test]
     fn test_unrestricted_reservation() {
         let now = Utc::now();
         let res = Reservation {
@@ -343,6 +377,7 @@ mod tests {
             accounts: Vec::new(),
             users: Vec::new(),
             flags: ReservationFlags::default(),
+            owner: String::new(),
         };
         assert!(res.allows_user("anyone", None));
     }
@@ -372,6 +407,7 @@ mod tests {
             accounts: Vec::new(),
             users: Vec::new(),
             flags: ReservationFlags::default(),
+            owner: String::new(),
         };
         let b = Reservation {
             name: "b".into(),
@@ -381,6 +417,7 @@ mod tests {
             accounts: Vec::new(),
             users: Vec::new(),
             flags: ReservationFlags::default(),
+            owner: String::new(),
         };
         assert!(reservations_overlap(&a, &b));
     }
@@ -399,6 +436,7 @@ mod tests {
                 overlap: true,
                 ..Default::default()
             },
+            owner: String::new(),
         };
         let b = Reservation {
             name: "b".into(),
@@ -408,6 +446,7 @@ mod tests {
             accounts: Vec::new(),
             users: Vec::new(),
             flags: ReservationFlags::default(),
+            owner: String::new(),
         };
         assert!(overlap_allowed(&a, &b));
         a.flags.overlap = false;
@@ -425,6 +464,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: ReservationFlags::default(),
+            owner: String::new(),
         };
         let job = Job::new(1, JobSpec::default());
         assert!(prospective_overlap(
@@ -459,6 +499,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: ReservationFlags::default(),
+            owner: String::new(),
         };
         let job = Job::new(1, JobSpec::default());
         assert!(prospective_overlap(

@@ -785,6 +785,7 @@ mod tests {
             users: vec!["alice".into()],
             accounts: Vec::new(),
             flags: Default::default(),
+            owner: String::new(),
         };
         // All fields must be mutable for an update to work.
         res.end_time = now + chrono::Duration::hours(8);

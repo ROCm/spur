@@ -294,6 +294,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         assert!(!p.matches(&node("node001"), std::slice::from_ref(&res), now));
         assert!(p.matches(&node("node002"), &[res], now));
