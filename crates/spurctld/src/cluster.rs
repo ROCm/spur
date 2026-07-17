@@ -2313,7 +2313,10 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Update an existing reservation (validated, persisted via Raft).
+    /// Update an existing reservation (validated, persisted via Raft). The
+    /// requesting `user` must be the reservation owner, root, or empty (trusted
+    /// internal calls); legacy reservations with no recorded owner are
+    /// modifiable by anyone.
     #[allow(clippy::too_many_arguments)]
     pub fn update_reservation(
         &self,
@@ -2395,7 +2398,8 @@ impl ClusterManager {
     }
 
     /// Delete a reservation by name (persisted via Raft). The requesting `user`
-    /// must be the reservation owner, root, or empty (trusted internal calls).
+    /// must be the reservation owner, root, or empty (trusted internal calls);
+    /// legacy reservations with no recorded owner are deletable by anyone.
     pub fn delete_reservation(&self, name: &str, user: &str) -> Result<(), ReservationError> {
         {
             let reservations = self.reservations.read();

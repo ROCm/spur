@@ -1095,12 +1095,12 @@ message UpdateReservationRequest {
   repeated string remove_users = 6;
   repeated string add_accounts = 7;
   repeated string remove_accounts = 8;
-  string user = 9;              // requesting user; must be owner or root
+  string user = 9;              // requesting user; must be the owner (root and trusted internal callers always allowed; legacy reservations with no recorded owner are mutable by anyone)
 }
 
 message DeleteReservationRequest {
   string name = 1;
-  string user = 2;             // requesting user; must be owner or root
+  string user = 2;             // requesting user; must be the owner (root and trusted internal callers always allowed; legacy reservations with no recorded owner are mutable by anyone)
 }
 
 message ListReservationsRequest { }
