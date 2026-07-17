@@ -123,6 +123,7 @@ const QOS_KEYS: &[&str] = &[
     "maxsubmitjobsperuser",
     "maxtresperuser",
     "grptres",
+    "grpwall",
 ];
 
 /// Reject keys the command does not understand, so a mistyped or unsupported
@@ -830,6 +831,34 @@ mod tests {
         let p = parse_params(&["name=normal".into(), "bogusfield=1".into()]);
         let err = reject_unknown_keys(&p, QOS_KEYS).unwrap_err();
         assert!(err.to_string().contains("unknown field 'bogusfield'"));
+    }
+
+    #[test]
+    fn reject_unknown_keys_accepts_every_parsed_qos_field() {
+        // Every input key the add/modify qos handlers read must be in the
+        // allowlist, otherwise reject_unknown_keys bounces it before parsing
+        // (grpwall regressed this way: parsed and shown, but not allowlisted).
+        let parsed_fields = [
+            "name",
+            "description",
+            "priority",
+            "preemptmode",
+            "usagefactor",
+            "maxjobsperuser",
+            "maxwall",
+            "maxtresperjob",
+            "maxsubmitjobsperuser",
+            "maxtresperuser",
+            "grptres",
+            "grpwall",
+        ];
+        for field in parsed_fields {
+            let p = parse_params(&["name=normal".into(), format!("{field}=1")]);
+            assert!(
+                reject_unknown_keys(&p, QOS_KEYS).is_ok(),
+                "QOS field '{field}' is read by the handler but missing from QOS_KEYS"
+            );
+        }
     }
 
     #[test]
