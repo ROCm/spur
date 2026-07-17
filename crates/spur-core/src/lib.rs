@@ -16,6 +16,7 @@ pub mod k0s;
 pub mod node;
 pub mod partition;
 pub mod qos;
+pub mod quota_names;
 pub mod reservation;
 pub mod resource;
 pub mod spur_env;

@@ -729,9 +729,14 @@ message ClusterNodeStatus {
   bool enabled = 4;
 }
 
-message ClusterKubeconfigRequest {}
+message ClusterKubeconfigRequest {
+  // Empty -> the cluster-admin kubeconfig. Set -> a namespace-scoped kubeconfig for this SPUR user
+  // (a ServiceAccount + bound token in the user's account namespace).
+  string user = 1;
+}
 message ClusterKubeconfigResponse {
-  // Admin kubeconfig YAML (server rewritten to the control-plane's mesh IP).
+  // Admin kubeconfig YAML (server rewritten to the control-plane's mesh IP), or the scoped kubeconfig
+  // when `user` was set.
   string kubeconfig = 1;
 }
 
@@ -778,9 +783,16 @@ message CreateK0sJoinTokenResponse {
   string join_token = 1;
 }
 
-message GetAdminKubeconfigRequest {}
+message GetAdminKubeconfigRequest {
+  // All empty -> the cluster-admin kubeconfig. When `user` is set, the control-plane node mints a
+  // scoped kubeconfig: a bound token for `service_account` in `namespace` (created if absent), with
+  // the admin cluster CA + server. spurctld resolves the SPUR user -> account namespace + SA name.
+  string user = 1;
+  string namespace = 2;
+  string service_account = 3;
+}
 message GetAdminKubeconfigResponse {
-  // Admin kubeconfig YAML read from the control-plane node.
+  // Admin (or scoped) kubeconfig YAML read/minted on the control-plane node.
   string kubeconfig = 1;
 }
 
