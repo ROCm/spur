@@ -16,6 +16,10 @@ use k8s_openapi::api::rbac::v1::{PolicyRule, Role, RoleBinding, RoleRef, Subject
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use spur_core::accounting::{TresRecord, TresType};
+// Namespace + ServiceAccount naming lives in spur-core so spurctld's `kubeconfig --user` path agrees
+// with what this reconciler creates.
+use spur_core::quota_names::sanitize_dns_label;
+pub use spur_core::quota_names::{account_namespace, user_service_account};
 
 /// Value of the `app.kubernetes.io/managed-by` label stamped on every object this reconciler owns.
 /// The controller finds + drift-corrects its objects by this label and it encodes the
@@ -40,17 +44,6 @@ pub struct AccountQuota {
     /// Users associated with the account. Each becomes a RoleBinding subject via their per-namespace
     /// ServiceAccount (minted by `spur k8s kubeconfig --user`).
     pub members: Vec<String>,
-}
-
-/// Kubernetes namespace for a SPUR account (DNS-1123 label safe).
-pub fn account_namespace(account: &str) -> String {
-    format!("spur-acct-{}", sanitize_dns_label(account))
-}
-
-/// Per-user ServiceAccount name within the account namespace — what `kubeconfig --user` mints and
-/// what the RoleBinding grants.
-pub fn user_service_account(user: &str) -> String {
-    format!("spur-user-{}", sanitize_dns_label(user))
 }
 
 fn managed_labels(account: &str) -> BTreeMap<String, String> {
@@ -207,28 +200,6 @@ pub fn role_binding(aq: &AccountQuota) -> RoleBinding {
     }
 }
 
-/// Lower-case, replace any char that isn't `[a-z0-9-]` with `-`, collapse/trim leading-trailing `-`,
-/// and cap at 63 chars — a DNS-1123 label. Empty input yields "x" so a name is always valid.
-fn sanitize_dns_label(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        let c = c.to_ascii_lowercase();
-        if c.is_ascii_alphanumeric() {
-            out.push(c);
-        } else if !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    let trimmed = out.trim_matches('-');
-    let capped: String = trimmed.chars().take(63).collect();
-    let capped = capped.trim_matches('-').to_string();
-    if capped.is_empty() {
-        "x".to_string()
-    } else {
-        capped
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,16 +240,6 @@ mod tests {
         t.set(TresType::Node, 3);
         t.set(TresType::Billing, 100);
         assert!(quota_hard(&t).is_empty());
-    }
-
-    #[test]
-    fn namespace_and_sa_names_are_dns_safe() {
-        assert_eq!(account_namespace("Physics_Lab"), "spur-acct-physics-lab");
-        assert_eq!(user_service_account("Alice.Smith"), "spur-user-alice-smith");
-        // leading/trailing junk trimmed; empty -> valid.
-        assert_eq!(account_namespace("__weird__"), "spur-acct-weird");
-        assert_eq!(sanitize_dns_label(""), "x");
-        assert!(sanitize_dns_label("a".repeat(200).as_str()).len() <= 63);
     }
 
     #[test]

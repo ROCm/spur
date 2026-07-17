@@ -1682,13 +1682,21 @@ impl SlurmAgent for AgentService {
 
     async fn get_admin_kubeconfig(
         &self,
-        _request: Request<GetAdminKubeconfigRequest>,
+        request: Request<GetAdminKubeconfigRequest>,
     ) -> Result<Response<GetAdminKubeconfigResponse>, Status> {
-        match self.k0s.admin_kubeconfig().await {
+        let req = request.into_inner();
+        // Empty user -> cluster-admin kubeconfig; set -> a scoped kubeconfig (SA + bound token in the
+        // user's account namespace).
+        let result = if req.user.is_empty() {
+            self.k0s.admin_kubeconfig().await
+        } else {
+            self.k0s
+                .user_kubeconfig(&req.user, &req.namespace, &req.service_account)
+                .await
+        };
+        match result {
             Ok(kubeconfig) => Ok(Response::new(GetAdminKubeconfigResponse { kubeconfig })),
-            Err(e) => Err(Status::internal(format!(
-                "k0s kubeconfig admin failed: {e}"
-            ))),
+            Err(e) => Err(Status::internal(format!("get kubeconfig failed: {e}"))),
         }
     }
 
