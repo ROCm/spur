@@ -127,7 +127,14 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
         let jobs = response.into_inner().jobs;
 
+        // Filter-based selection targets only cancellable jobs. Terminal jobs
+        // matched by the filter (e.g. a user's already-finished jobs under
+        // `scancel -u`) are skipped rather than sent to cancel_job, which would
+        // reject each one and emit a spurious per-job error. Matches Slurm.
         for job in &jobs {
+            if !is_cancellable(job.state) {
+                continue;
+            }
             match client
                 .cancel_job(CancelJobRequest {
                     job_id: job.job_id,
@@ -149,6 +156,16 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Whether a job in the given proto state can still be cancelled. Unknown
+/// state values are treated as cancellable so the server remains the
+/// authority on rejection rather than the client silently dropping them.
+fn is_cancellable(proto_state: i32) -> bool {
+    match spur_core::job::JobState::from_proto_i32(proto_state) {
+        Some(state) => !state.is_terminal(),
+        None => true,
+    }
 }
 
 fn parse_signal(s: Option<&str>) -> Result<i32> {
@@ -174,5 +191,51 @@ fn parse_state(s: &str) -> Option<spur_proto::proto::JobState> {
         "PD" | "PENDING" => Some(spur_proto::proto::JobState::JobPending),
         "R" | "RUNNING" => Some(spur_proto::proto::JobState::JobRunning),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spur_proto::proto::JobState;
+
+    #[test]
+    fn active_states_are_cancellable() {
+        for state in [
+            JobState::JobPending,
+            JobState::JobRunning,
+            JobState::JobCompleting,
+            JobState::JobSuspended,
+        ] {
+            assert!(
+                is_cancellable(state as i32),
+                "{state:?} should be cancellable"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_states_are_not_cancellable() {
+        for state in [
+            JobState::JobCompleted,
+            JobState::JobFailed,
+            JobState::JobCancelled,
+            JobState::JobTimeout,
+            JobState::JobNodeFail,
+            JobState::JobDeadline,
+            JobState::JobOutOfMemory,
+        ] {
+            assert!(
+                !is_cancellable(state as i32),
+                "{state:?} should not be cancellable"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_state_is_cancellable() {
+        // Server stays the authority on rejection for values the client
+        // does not recognize.
+        assert!(is_cancellable(9999));
     }
 }
