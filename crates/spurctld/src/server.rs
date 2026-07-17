@@ -1588,11 +1588,34 @@ impl SlurmController for ControllerService {
             *fwd.metadata_mut() = Self::forwarded_metadata();
             return client.cluster_kubeconfig(fwd).await;
         }
-        // Ask the control-plane node's agent to run `k0s kubeconfig admin`.
-        match crate::cluster_k8s::fetch_admin_kubeconfig(&self.cluster).await {
+        let req = request.into_inner();
+        if req.user.is_empty() {
+            // Cluster-admin kubeconfig (`k0s kubeconfig admin` on the control-plane agent).
+            return match crate::cluster_k8s::fetch_admin_kubeconfig(&self.cluster).await {
+                Ok(kubeconfig) => Ok(Response::new(ClusterKubeconfigResponse { kubeconfig })),
+                Err(e) => Err(Status::unavailable(format!(
+                    "could not fetch admin kubeconfig from the control-plane agent: {e}"
+                ))),
+            };
+        }
+        // Scoped kubeconfig: resolve the user's account -> its namespace + per-user ServiceAccount,
+        // then have the control-plane agent mint a bound token there.
+        let (account, _qos) = self.cluster.association_cache().resolve(&req.user, None);
+        let account = account.ok_or_else(|| {
+            Status::not_found(format!(
+                "user '{}' is not associated with any account",
+                req.user
+            ))
+        })?;
+        let namespace = spur_core::quota_names::account_namespace(&account);
+        let sa = spur_core::quota_names::user_service_account(&req.user);
+        match crate::cluster_k8s::fetch_user_kubeconfig(&self.cluster, &req.user, &namespace, &sa)
+            .await
+        {
             Ok(kubeconfig) => Ok(Response::new(ClusterKubeconfigResponse { kubeconfig })),
             Err(e) => Err(Status::unavailable(format!(
-                "could not fetch admin kubeconfig from the control-plane agent: {e}"
+                "could not mint a scoped kubeconfig for user '{}': {e}",
+                req.user
             ))),
         }
     }

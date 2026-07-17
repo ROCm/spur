@@ -365,6 +365,87 @@ fn parse_execstart(exec: &str) -> anyhow::Result<ClusterConfig> {
     })
 }
 
+/// Extract the cluster CA (base64) + server URL from an admin kubeconfig YAML. k0s's admin
+/// kubeconfig has exactly one cluster, so a dependency-free line scan is sufficient.
+fn parse_cluster_ca_server(admin: &str) -> anyhow::Result<(String, String)> {
+    let mut ca = None;
+    let mut server = None;
+    for line in admin.lines() {
+        let t = line.trim();
+        if let Some(v) = t.strip_prefix("certificate-authority-data:") {
+            ca = Some(v.trim().to_string());
+        } else if let Some(v) = t.strip_prefix("server:") {
+            server = Some(v.trim().to_string());
+        }
+    }
+    match (ca, server) {
+        (Some(ca), Some(server)) => Ok((ca, server)),
+        _ => anyhow::bail!("admin kubeconfig missing certificate-authority-data or server"),
+    }
+}
+
+/// Template a namespace-scoped kubeconfig. `name` (the ServiceAccount name) is DNS-safe and the
+/// ca/server/token carry no YAML-breaking characters, so plain interpolation is safe.
+fn build_scoped_kubeconfig(
+    ca: &str,
+    server: &str,
+    token: &str,
+    name: &str,
+    namespace: &str,
+) -> String {
+    format!(
+        r#"apiVersion: v1
+kind: Config
+clusters:
+- name: spur
+  cluster:
+    certificate-authority-data: {ca}
+    server: {server}
+contexts:
+- name: {name}
+  context:
+    cluster: spur
+    namespace: {namespace}
+    user: {name}
+current-context: {name}
+users:
+- name: {name}
+  user:
+    token: {token}
+"#
+    )
+}
+
+#[cfg(test)]
+mod scoped_kubeconfig_tests {
+    use super::{build_scoped_kubeconfig, parse_cluster_ca_server};
+
+    #[test]
+    fn parses_ca_and_server() {
+        let admin = "clusters:\n- cluster:\n    certificate-authority-data: QUJD\n    server: https://10.0.0.1:6443\n  name: k0s\n";
+        let (ca, server) = parse_cluster_ca_server(admin).unwrap();
+        assert_eq!(ca, "QUJD");
+        assert_eq!(server, "https://10.0.0.1:6443");
+        assert!(parse_cluster_ca_server("apiVersion: v1\n").is_err());
+    }
+
+    #[test]
+    fn builds_scoped_kubeconfig_yaml() {
+        let kc = build_scoped_kubeconfig(
+            "QUJD",
+            "https://x:6443",
+            "tok123",
+            "spur-user-alice",
+            "spur-acct-physics",
+        );
+        assert!(kc.starts_with("apiVersion: v1\nkind: Config\n"));
+        assert!(kc.contains("namespace: spur-acct-physics"));
+        assert!(kc.contains("token: tok123"));
+        assert!(kc.contains("certificate-authority-data: QUJD"));
+        assert!(kc.contains("current-context: spur-user-alice"));
+    }
+}
+
 /// Write a bearer-secret file (0600). Content is never logged.
 async fn write_secret_file(path: &Path, content: &[u8]) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
@@ -686,6 +767,72 @@ impl K0sAgent {
             anyhow::bail!("k0s kubeconfig admin returned empty output");
         }
         Ok(kubeconfig)
+    }
+
+    /// Mint a namespace-scoped kubeconfig on this (control-plane) node: ensure `service_account`
+    /// exists in `namespace`, mint a bound token for it (`k0s kubectl create token`), and template a
+    /// kubeconfig with the admin cluster CA + server scoped to that namespace. The namespace + its
+    /// RBAC are expected to exist (created by the operator's quota reconciler). Token never logged.
+    pub async fn user_kubeconfig(
+        &self,
+        user: &str,
+        namespace: &str,
+        service_account: &str,
+    ) -> anyhow::Result<String> {
+        // Ensure the ServiceAccount exists — idempotent (an already-existing SA is fine).
+        let create = Command::new(&self.k0s_binary)
+            .args([
+                "kubectl",
+                "create",
+                "serviceaccount",
+                service_account,
+                "-n",
+                namespace,
+            ])
+            .output()
+            .await?;
+        if !create.status.success() {
+            let err = String::from_utf8_lossy(&create.stderr);
+            if !err.contains("AlreadyExists") && !err.contains("already exists") {
+                anyhow::bail!(
+                    "create serviceaccount {service_account} in {namespace} failed: {}",
+                    err.trim()
+                );
+            }
+        }
+        // Mint a bound (rotatable) token for the ServiceAccount.
+        let tok = Command::new(&self.k0s_binary)
+            .args([
+                "kubectl",
+                "create",
+                "token",
+                service_account,
+                "-n",
+                namespace,
+                "--duration=8760h",
+            ])
+            .output()
+            .await?;
+        if !tok.status.success() {
+            anyhow::bail!(
+                "create token for {service_account} in {namespace} failed: {}",
+                String::from_utf8_lossy(&tok.stderr).trim()
+            );
+        }
+        let token = String::from_utf8_lossy(&tok.stdout).trim().to_string();
+        if token.is_empty() {
+            anyhow::bail!("k0s kubectl create token returned empty output");
+        }
+        // Reuse the admin kubeconfig for the cluster CA + server URL.
+        let (ca, server) = parse_cluster_ca_server(&self.admin_kubeconfig().await?)?;
+        info!(user, namespace, service_account, "minted scoped kubeconfig");
+        Ok(build_scoped_kubeconfig(
+            &ca,
+            &server,
+            &token,
+            service_account,
+            namespace,
+        ))
     }
 
     /// (role, active_state, enabled) for the node's component. When there is no tracked component,
