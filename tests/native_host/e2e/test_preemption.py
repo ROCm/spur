@@ -16,6 +16,12 @@ import pytest
 
 from cluster import parse_job_id, wait_job, wait_job_state
 
+# Time allowed for a requeued low-priority job to get back to RUNNING after a
+# preemption cycle. Generous because it spans the eligibility hold plus node
+# release, scheduler pickup, and spurd relaunch, which is sensitive to CI host
+# load — not a latency assertion.
+RESCHEDULE_TIMEOUT = 60
+
 
 class TestChronicPreemption:
     """A job preempted more times than max_batch_requeue must stay
@@ -53,14 +59,14 @@ class TestChronicPreemption:
             )
             low_id = parse_job_id(sb)
             assert low_id is not None, f"submit failed:\n{sb}"
-            wait_job_state(cluster, low_id, "R", timeout=30)
+            wait_job_state(cluster, low_id, "R", timeout=RESCHEDULE_TIMEOUT)
 
             # One more preemption cycle than max_batch_requeue: if preemption
             # requeues wrongly counted against the failure-requeue budget, the
             # job would be held with JobHoldMaxRequeue by the last cycle.
             cycles = self.MAX_BATCH_REQUEUE + 3
             for i in range(cycles):
-                wait_job_state(cluster, low_id, "R", timeout=30)
+                wait_job_state(cluster, low_id, "R", timeout=RESCHEDULE_TIMEOUT)
 
                 hi_script = cluster.write_file(
                     f"chronic-high-{i}.sh", "#!/bin/bash\nsleep 2\n"
@@ -84,7 +90,7 @@ class TestChronicPreemption:
                 state = wait_job(cluster, hi_id, timeout=30)
                 assert state == "CD", f"high job {hi_id} did not complete: {state}"
 
-            wait_job_state(cluster, low_id, "R", timeout=30)
+            wait_job_state(cluster, low_id, "R", timeout=RESCHEDULE_TIMEOUT)
             show = cluster.scontrol("show", "job", str(low_id))
             assert "Reason=JobHoldMaxRequeue" not in show, (
                 f"low-priority job held after {cycles} preemption cycles "
