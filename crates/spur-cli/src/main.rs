@@ -8,6 +8,7 @@ mod format_engine;
 mod image;
 mod net;
 mod node;
+mod nodelist;
 mod sacct;
 mod sacctmgr;
 mod salloc;
