@@ -11,7 +11,7 @@
 //! across all its users.
 
 use crate::accounting::{AccountLimits, TresRecord, TresType};
-use crate::job::{effective_memory_mb, Job, PendingReason};
+use crate::job::{effective_gpus, effective_memory_mb, Job, PendingReason};
 
 /// Result of an account/association limit check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +69,11 @@ pub fn check_account_limits(
         if max_tres.get(TresType::Memory) > 0 && total_mem > max_tres.get(TresType::Memory) {
             return AccountCheckResult::Blocked(PendingReason::AssocMaxMemPerJob);
         }
+
+        let job_gpus = effective_gpus(&job.spec, job.spec.num_nodes);
+        if max_tres.get(TresType::Gpu) > 0 && job_gpus > max_tres.get(TresType::Gpu) {
+            return AccountCheckResult::Blocked(PendingReason::AssocMaxGpuPerJobLimit);
+        }
     }
 
     if let Some(ref grp) = limits.grp_tres {
@@ -91,6 +96,13 @@ pub fn check_account_limits(
             && account_running_tres.get(TresType::Memory) + job_mem > grp.get(TresType::Memory)
         {
             return AccountCheckResult::Blocked(PendingReason::AssocGrpMemLimit);
+        }
+
+        let job_gpus = effective_gpus(&job.spec, job.spec.num_nodes);
+        if grp.get(TresType::Gpu) > 0
+            && account_running_tres.get(TresType::Gpu) + job_gpus > grp.get(TresType::Gpu)
+        {
+            return AccountCheckResult::Blocked(PendingReason::AssocGrpGpuLimit);
         }
     }
 
@@ -246,6 +258,44 @@ mod tests {
         assert_eq!(
             result,
             AccountCheckResult::Blocked(PendingReason::AssocMaxMemPerJob)
+        );
+    }
+
+    #[test]
+    fn test_blocked_by_max_gpu_per_job() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Gpu, 2); // max 2 GPUs per job
+        let limits = AccountLimits {
+            max_tres_per_job: Some(tres),
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.gres = vec!["gpu:4".into()]; // needs 4 GPUs
+        let result = check_account_limits(&job, &limits, 0, 0, &TresRecord::new());
+        assert_eq!(
+            result,
+            AccountCheckResult::Blocked(PendingReason::AssocMaxGpuPerJobLimit)
+        );
+    }
+
+    #[test]
+    fn test_blocked_by_grp_gpu() {
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Gpu, 8); // account-wide cap 8 GPUs
+        let limits = AccountLimits {
+            grp_tres: Some(grp),
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.gres = vec!["gpu:4".into()];
+        let mut running = TresRecord::new();
+        running.set(TresType::Gpu, 6); // 6 already running in the account; 6 + 4 > 8
+        let result = check_account_limits(&job, &limits, 0, 0, &running);
+        assert_eq!(
+            result,
+            AccountCheckResult::Blocked(PendingReason::AssocGrpGpuLimit)
         );
     }
 

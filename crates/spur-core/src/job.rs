@@ -254,9 +254,12 @@ pub enum PendingReason {
     QosMaxMemoryPerUser,
     QosMaxSubmitJobPerUserLimit,
     QosMaxNodePerJobLimit,
+    QosMaxGpuPerJobLimit,
+    QosMaxGpuPerUserLimit,
     QosGrpCpuLimit,
     QosGrpMemLimit,
     QosGrpNodeLimit,
+    QosGrpGpuLimit,
     BurstBufferResources,
     BurstBufferStageIn,
     ReservedMaintenance,
@@ -270,9 +273,11 @@ pub enum PendingReason {
     AssocMaxCpuPerJobLimit,
     AssocMaxNodePerJobLimit,
     AssocMaxMemPerJob,
+    AssocMaxGpuPerJobLimit,
     AssocGrpCpuLimit,
     AssocGrpNodeLimit,
     AssocGrpMemLimit,
+    AssocGrpGpuLimit,
     AssocMaxWallDurationPerJobLimit,
 }
 
@@ -322,9 +327,12 @@ impl PendingReason {
             Self::QosMaxMemoryPerUser => "QOSMaxMemoryPerUser",
             Self::QosMaxSubmitJobPerUserLimit => "QOSMaxSubmitJobPerUserLimit",
             Self::QosMaxNodePerJobLimit => "QOSMaxNodePerJobLimit",
+            Self::QosMaxGpuPerJobLimit => "QOSMaxGRESPerJob",
+            Self::QosMaxGpuPerUserLimit => "QOSMaxGRESPerUser",
             Self::QosGrpCpuLimit => "QOSGrpCpuLimit",
             Self::QosGrpMemLimit => "QOSGrpMemLimit",
             Self::QosGrpNodeLimit => "QOSGrpNodeLimit",
+            Self::QosGrpGpuLimit => "QOSGrpGRES",
             Self::BurstBufferResources => "BurstBufferResources",
             Self::BurstBufferStageIn => "BurstBufferStageIn",
             Self::ReservedMaintenance => "ReqNodeNotAvail, Reserved for maintenance",
@@ -335,9 +343,11 @@ impl PendingReason {
             Self::AssocMaxCpuPerJobLimit => "AssocMaxCpuPerJobLimit",
             Self::AssocMaxNodePerJobLimit => "AssocMaxNodePerJobLimit",
             Self::AssocMaxMemPerJob => "AssocMaxMemPerJob",
+            Self::AssocMaxGpuPerJobLimit => "AssocMaxGRESPerJob",
             Self::AssocGrpCpuLimit => "AssocGrpCpuLimit",
             Self::AssocGrpNodeLimit => "AssocGrpNodeLimit",
             Self::AssocGrpMemLimit => "AssocGrpMemLimit",
+            Self::AssocGrpGpuLimit => "AssocGrpGRES",
             Self::AssocMaxWallDurationPerJobLimit => "AssocMaxWallDurationPerJobLimit",
         }
     }
@@ -547,6 +557,21 @@ pub fn effective_memory_mb(spec: &JobSpec, num_nodes: u32) -> u64 {
                 .map(|mem| mem * spec.num_tasks as u64 * spec.cpus_per_task as u64)
         })
         .unwrap_or(0)
+}
+
+/// Total GPUs a job requests across all its nodes. GRES `gpu` counts are
+/// per-node (like `memory_per_node_mb`), so the total is the per-node sum
+/// times `num_nodes`, matching how the scheduler allocates one node's GRES
+/// set to each of the job's nodes.
+pub fn effective_gpus(spec: &JobSpec, num_nodes: u32) -> u64 {
+    let per_node: u64 = spec
+        .gres
+        .iter()
+        .filter_map(|g| crate::resource::parse_gres(g))
+        .filter(|(name, _, _)| name == "gpu")
+        .map(|(_, _, count)| count as u64)
+        .sum();
+    per_node * num_nodes as u64
 }
 
 /// One node's completion outcome for a job: the raw process wait status,
@@ -958,6 +983,40 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(effective_memory_mb(&spec, 1), 2048);
+    }
+
+    #[test]
+    fn effective_gpus_zero_when_no_gres() {
+        let spec = JobSpec::default();
+        assert_eq!(effective_gpus(&spec, 1), 0);
+    }
+
+    #[test]
+    fn effective_gpus_counts_per_node_times_nodes() {
+        let spec = JobSpec {
+            gres: vec!["gpu:3".into()],
+            ..Default::default()
+        };
+        assert_eq!(effective_gpus(&spec, 1), 3);
+        assert_eq!(effective_gpus(&spec, 2), 6);
+    }
+
+    #[test]
+    fn effective_gpus_handles_typed_and_ignores_non_gpu() {
+        let spec = JobSpec {
+            gres: vec!["gpu:mi300x:4".into(), "bandwidth:lustre:100".into()],
+            ..Default::default()
+        };
+        assert_eq!(effective_gpus(&spec, 1), 4);
+    }
+
+    #[test]
+    fn effective_gpus_sums_multiple_gpu_entries() {
+        let spec = JobSpec {
+            gres: vec!["gpu:2".into(), "gpu:mi300x:1".into()],
+            ..Default::default()
+        };
+        assert_eq!(effective_gpus(&spec, 1), 3);
     }
 
     #[test]
@@ -1387,9 +1446,12 @@ mod tests {
             PendingReason::QosMaxNodePerJobLimit,
             "QOSMaxNodePerJobLimit",
         ),
+        (PendingReason::QosMaxGpuPerJobLimit, "QOSMaxGRESPerJob"),
+        (PendingReason::QosMaxGpuPerUserLimit, "QOSMaxGRESPerUser"),
         (PendingReason::QosGrpCpuLimit, "QOSGrpCpuLimit"),
         (PendingReason::QosGrpMemLimit, "QOSGrpMemLimit"),
         (PendingReason::QosGrpNodeLimit, "QOSGrpNodeLimit"),
+        (PendingReason::QosGrpGpuLimit, "QOSGrpGRES"),
         (PendingReason::BurstBufferResources, "BurstBufferResources"),
         (PendingReason::BurstBufferStageIn, "BurstBufferStageIn"),
         (PendingReason::JobHoldMaxRequeue, "JobHoldMaxRequeue"),
@@ -1407,9 +1469,11 @@ mod tests {
             "AssocMaxNodePerJobLimit",
         ),
         (PendingReason::AssocMaxMemPerJob, "AssocMaxMemPerJob"),
+        (PendingReason::AssocMaxGpuPerJobLimit, "AssocMaxGRESPerJob"),
         (PendingReason::AssocGrpCpuLimit, "AssocGrpCpuLimit"),
         (PendingReason::AssocGrpNodeLimit, "AssocGrpNodeLimit"),
         (PendingReason::AssocGrpMemLimit, "AssocGrpMemLimit"),
+        (PendingReason::AssocGrpGpuLimit, "AssocGrpGRES"),
         (
             PendingReason::AssocMaxWallDurationPerJobLimit,
             "AssocMaxWallDurationPerJobLimit",

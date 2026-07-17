@@ -204,6 +204,35 @@ class TestQosLimitReasons:
             f"expected QOSMaxMemoryPerUser, got {reason!r}"
         )
 
+    def test_gpu_cap_sets_qos_pending_reason(self, accounting_cluster):
+        c = accounting_cluster
+
+        # Define a QoS that caps a user to 2 GPUs.
+        c.sacctmgr(["add", "qos", "name=gpucap", "maxtresperuser=gres/gpu=2"])
+        time.sleep(15)
+
+        # A job in that QoS asking for 4 GPUs exceeds the per-user cap. The QOS
+        # limit check is independent of physical GPU availability, so this tags
+        # the pending reason regardless of the node's actual GPU count.
+        script = c.write_file("qos-gpu-job.sh", "#!/bin/bash\nsleep 30\n")
+        job_id = parse_job_id(
+            c.sbatch(
+                ["-J", "qos-gpu", "-N", "1", "--gres=gpu:4", "-q", "gpucap", script]
+            )
+        )
+        assert job_id is not None
+
+        deadline = time.time() + 30
+        reason = ""
+        while time.time() < deadline:
+            reason = _reason(c, job_id)
+            if reason == "QOSMaxGRESPerUser":
+                break
+            time.sleep(2)
+        assert reason == "QOSMaxGRESPerUser", (
+            f"expected QOSMaxGRESPerUser, got {reason!r}"
+        )
+
 
 class TestSacctmgrShowQos:
     def test_show_qos_renders_all_limit_columns(self, accounting_cluster):

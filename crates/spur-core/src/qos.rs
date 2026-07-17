@@ -6,7 +6,7 @@
 //! Checks per-QOS limits before allowing a job to be scheduled.
 
 use crate::accounting::{Qos, QosPreemptMode, TresRecord, TresType};
-use crate::job::{effective_memory_mb, Job, PendingReason};
+use crate::job::{effective_gpus, effective_memory_mb, Job, PendingReason};
 use crate::partition::PreemptMode;
 
 impl From<QosPreemptMode> for PreemptMode {
@@ -98,6 +98,11 @@ pub fn check_qos_limits(
         if max_tres.get(TresType::Memory) > 0 && total_mem > max_tres.get(TresType::Memory) {
             return QosCheckResult::Blocked(PendingReason::QosMaxMemoryPerJob);
         }
+
+        let job_gpus = effective_gpus(&job.spec, job.spec.num_nodes);
+        if max_tres.get(TresType::Gpu) > 0 && job_gpus > max_tres.get(TresType::Gpu) {
+            return QosCheckResult::Blocked(PendingReason::QosMaxGpuPerJobLimit);
+        }
     }
 
     // Max TRES per user (group limit)
@@ -118,6 +123,12 @@ pub fn check_qos_limits(
         let new_total_mem = user_running_tres.get(TresType::Memory) + job_mem;
         if max_tres.get(TresType::Memory) > 0 && new_total_mem > max_tres.get(TresType::Memory) {
             return QosCheckResult::Blocked(PendingReason::QosMaxMemoryPerUser);
+        }
+
+        let job_gpus = effective_gpus(&job.spec, job.spec.num_nodes);
+        let new_total_gpus = user_running_tres.get(TresType::Gpu) + job_gpus;
+        if max_tres.get(TresType::Gpu) > 0 && new_total_gpus > max_tres.get(TresType::Gpu) {
+            return QosCheckResult::Blocked(PendingReason::QosMaxGpuPerUserLimit);
         }
     }
 
@@ -141,6 +152,13 @@ pub fn check_qos_limits(
             && qos_running_tres.get(TresType::Memory) + job_mem > grp.get(TresType::Memory)
         {
             return QosCheckResult::Blocked(PendingReason::QosGrpMemLimit);
+        }
+
+        let job_gpus = effective_gpus(&job.spec, job.spec.num_nodes);
+        if grp.get(TresType::Gpu) > 0
+            && qos_running_tres.get(TresType::Gpu) + job_gpus > grp.get(TresType::Gpu)
+        {
+            return QosCheckResult::Blocked(PendingReason::QosGrpGpuLimit);
         }
     }
 
@@ -421,6 +439,168 @@ mod tests {
         assert_eq!(
             result,
             QosCheckResult::Blocked(PendingReason::QosMaxNodePerJobLimit)
+        );
+    }
+
+    #[test]
+    fn test_blocked_by_max_gpu_per_job() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Gpu, 2); // max 2 GPUs per job
+        let qos = Qos {
+            name: "restricted".into(),
+            limits: QosLimits {
+                max_tres_per_job: Some(tres),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.gres = vec!["gpu:4".into()]; // needs 4 GPUs
+        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &TresRecord::new());
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosMaxGpuPerJobLimit)
+        );
+    }
+
+    #[test]
+    fn test_max_gpu_per_job_counts_all_nodes() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Gpu, 4); // max 4 GPUs per job
+        let qos = Qos {
+            name: "restricted".into(),
+            limits: QosLimits {
+                max_tres_per_job: Some(tres),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // gres is per-node, so 2 nodes * gpu:3 = 6 GPUs total > 4.
+        let mut job = make_test_job();
+        job.spec.num_nodes = 2;
+        job.spec.gres = vec!["gpu:3".into()];
+        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &TresRecord::new());
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosMaxGpuPerJobLimit)
+        );
+    }
+
+    #[test]
+    fn test_blocked_by_max_gpu_per_user() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Gpu, 8); // max 8 GPUs across the user's running jobs
+        let qos = Qos {
+            name: "restricted".into(),
+            limits: QosLimits {
+                max_tres_per_user: Some(tres),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.gres = vec!["gpu:4".into()]; // job needs 4
+        let mut running = TresRecord::new();
+        running.set(TresType::Gpu, 6); // already using 6; 6 + 4 > 8
+        let result = check_qos_limits(&job, &qos, 0, 0, &running, &TresRecord::new());
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosMaxGpuPerUserLimit)
+        );
+    }
+
+    #[test]
+    fn test_gpu_typed_gres_counts_toward_limit() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Gpu, 2);
+        let qos = Qos {
+            name: "restricted".into(),
+            limits: QosLimits {
+                max_tres_per_job: Some(tres),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // Typed request "gpu:mi300x:4" must still be counted as 4 GPUs.
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.gres = vec!["gpu:mi300x:4".into()];
+        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &TresRecord::new());
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosMaxGpuPerJobLimit)
+        );
+    }
+
+    #[test]
+    fn test_gpu_limit_ignores_non_gpu_gres() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Gpu, 1); // 1 GPU cap
+        let qos = Qos {
+            name: "restricted".into(),
+            limits: QosLimits {
+                max_tres_per_job: Some(tres),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // A non-gpu gres request must not be counted against the GPU cap.
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.gres = vec!["bandwidth:lustre:100".into()];
+        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &TresRecord::new());
+        assert_eq!(result, QosCheckResult::Allowed);
+    }
+
+    #[test]
+    fn test_gpu_exactly_at_cap_is_allowed() {
+        // The cap uses strict `>`, so a job requesting exactly the limit
+        // (per-job) with the user already at the boundary (per-user) passes.
+        let mut per_job = TresRecord::new();
+        per_job.set(TresType::Gpu, 4);
+        let mut per_user = TresRecord::new();
+        per_user.set(TresType::Gpu, 8);
+        let qos = Qos {
+            name: "boundary".into(),
+            limits: QosLimits {
+                max_tres_per_job: Some(per_job),
+                max_tres_per_user: Some(per_user),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.gres = vec!["gpu:4".into()]; // exactly the per-job cap
+        let mut running = TresRecord::new();
+        running.set(TresType::Gpu, 4); // 4 running + 4 new == 8, the per-user cap
+        let result = check_qos_limits(&job, &qos, 0, 0, &running, &TresRecord::new());
+        assert_eq!(result, QosCheckResult::Allowed);
+    }
+
+    #[test]
+    fn test_blocked_by_grp_gpu() {
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Gpu, 8); // QOS-wide cap 8 GPUs
+        let qos = Qos {
+            name: "grp".into(),
+            limits: QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.gres = vec!["gpu:4".into()];
+        let mut qos_running = TresRecord::new();
+        qos_running.set(TresType::Gpu, 6); // 6 already in the QOS; 6 + 4 > 8
+        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &qos_running);
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosGrpGpuLimit)
         );
     }
 
