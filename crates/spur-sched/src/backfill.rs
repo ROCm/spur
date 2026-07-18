@@ -71,23 +71,33 @@ impl BackfillScheduler {
         let placement = NodePlacement::new(job);
         let now = Utc::now();
 
+        let suitable = |node: &Node| {
+            if !placement.matches(node, reservations, now) {
+                return false;
+            }
+            if node.alloc_resources.cpus >= node.total_resources.cpus
+                && node.total_resources.cpus > 0
+            {
+                return false;
+            }
+            node.total_resources.can_satisfy(&required)
+        };
+
+        if placement.nodelist_is_additive()
+            && nodes.iter().any(|node| {
+                placement.is_listed(&node.name)
+                    && placement.eligible(node, reservations, now)
+                    && node.total_resources.can_satisfy(&required)
+                    && !suitable(node)
+            })
+        {
+            return Vec::new();
+        }
+
         nodes
             .iter()
             .enumerate()
-            .filter(|(_, node)| {
-                if !placement.matches(node, reservations, now) {
-                    return false;
-                }
-                // Skip nodes fully consumed by an exclusive job.
-                if node.alloc_resources.cpus >= node.total_resources.cpus
-                    && node.total_resources.cpus > 0
-                {
-                    return false;
-                }
-                // Capacity against total resources: the backfill timeline below
-                // decides *when* the node is free, not whether it ever fits.
-                node.total_resources.can_satisfy(&required)
-            })
+            .filter(|(_, node)| suitable(node))
             .map(|(i, _)| i)
             .collect()
     }
@@ -160,6 +170,11 @@ impl Scheduler for BackfillScheduler {
                 continue;
             }
 
+            let placement = NodePlacement::new(job);
+            let listed_suitable = suitable
+                .iter()
+                .filter(|ni| placement.is_listed(&cluster.nodes[**ni].name))
+                .count();
             let required = job_resource_request(job);
             let duration = job.spec.time_limit.unwrap_or(Duration::hours(1));
             let needed_nodes = (job.spec.num_nodes as usize).max(1);
@@ -189,6 +204,16 @@ impl Scheduler for BackfillScheduler {
                     duration,
                 )
             });
+
+            if placement.nodelist_is_additive()
+                && node_starts
+                    .iter()
+                    .filter(|(ni, _)| placement.is_listed(&cluster.nodes[*ni].name))
+                    .count()
+                    < listed_suitable
+            {
+                continue;
+            }
 
             // For --spread-job, sort by least-loaded (ascending alloc) so we
             // prefer nodes with the most available resources. For normal jobs,
@@ -247,6 +272,10 @@ impl Scheduler for BackfillScheduler {
                         node_starts = reordered;
                     }
                 }
+            }
+
+            if placement.nodelist_is_additive() {
+                node_starts.sort_by_key(|(ni, _)| !placement.is_listed(&cluster.nodes[*ni].name));
             }
 
             let assigned_nodes: Vec<(usize, chrono::DateTime<Utc>)> =
@@ -379,6 +408,7 @@ mod tests {
     use spur_core::node::NodeState;
     use spur_core::partition::Partition;
     use spur_core::resource::{GpuLinkType, GpuResource, ResourceAllocations};
+    use spur_core::topology::{SwitchConfig, TopologyTree};
     use std::collections::HashSet;
 
     fn make_nodes(count: usize) -> Vec<Node> {
@@ -629,6 +659,293 @@ mod tests {
         assert_eq!(assignments[0].nodes.len(), 2);
         assert!(assignments[0].nodes.contains(&"node001".to_string()));
         assert!(assignments[0].nodes.contains(&"node002".to_string()));
+    }
+
+    #[test]
+    fn test_nodelist_fills_additional_nodes() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(4);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let pending = vec![make_job_with_nodelist(1, 3, Some("node001"), None)];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes.len(), 3);
+        assert!(assignments[0].nodes.contains(&"node001".to_string()));
+    }
+
+    #[test]
+    fn test_nodelist_larger_than_request_remains_candidate_pool() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(4);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let pending = vec![make_job_with_nodelist(
+            1,
+            1,
+            Some("node001,node002,node003"),
+            None,
+        )];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes.len(), 1);
+        assert_ne!(assignments[0].nodes[0], "node004");
+    }
+
+    #[test]
+    fn test_additive_nodelist_survives_weight_ordering() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(4);
+        nodes[0].weight = 1;
+        nodes[1].weight = 40;
+        nodes[2].weight = 30;
+        nodes[3].weight = 20;
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let pending = vec![make_job_with_nodelist(1, 3, Some("node001"), None)];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert!(assignments[0].nodes.contains(&"node001".to_string()));
+    }
+
+    #[test]
+    fn test_additive_nodelist_survives_topology_ordering() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(4);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let topology = TopologyTree::from_switches(&[
+            SwitchConfig {
+                name: "rack01".into(),
+                nodes: Some("node001".into()),
+                switches: None,
+            },
+            SwitchConfig {
+                name: "rack02".into(),
+                nodes: Some("node[002-004]".into()),
+                switches: None,
+            },
+            SwitchConfig {
+                name: "fabric".into(),
+                nodes: None,
+                switches: Some("rack01,rack02".into()),
+            },
+        ]);
+
+        let mut job = make_job_with_nodelist(1, 3, Some("node001"), None);
+        job.spec.topology = Some("tree".into());
+        let pending = vec![job];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: Some(&topology),
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert!(assignments[0].nodes.contains(&"node001".to_string()));
+    }
+
+    #[test]
+    fn test_additive_nodelist_waits_for_listed_node_availability() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(4);
+        nodes[0].alloc_resources = ResourceAllocations::with_scalar(63, 0);
+        nodes[0].state = NodeState::Mixed;
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let mut job = make_job_with_nodelist(1, 3, Some("node001"), None);
+        job.spec.num_tasks = 6;
+        let pending = vec![job];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert!(assignments.is_empty());
+    }
+
+    #[test]
+    fn test_additive_nodelist_waits_for_unavailable_listed_node() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(4);
+        nodes[0].state = NodeState::Drain;
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let pending = vec![make_job_with_nodelist(1, 3, Some("node001"), None)];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert!(assignments.is_empty());
+    }
+
+    #[test]
+    fn test_additive_nodelist_fill_honors_exclude_and_constraint() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(5);
+        for node in &mut nodes[..4] {
+            node.features = vec!["mi300x".into()];
+        }
+        nodes[4].features = vec!["h100".into()];
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let mut job = make_job_with_nodelist(1, 3, Some("node001"), Some("node004"));
+        job.spec.constraint = Some("mi300x".into());
+        let pending = vec![job];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes.len(), 3);
+        assert!(assignments[0].nodes.contains(&"node001".to_string()));
+        assert!(!assignments[0].nodes.contains(&"node004".to_string()));
+        assert!(!assignments[0].nodes.contains(&"node005".to_string()));
+    }
+
+    #[test]
+    fn test_additive_nodelist_expands_and_deduplicates_hostlist() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(4);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        let pending = vec![make_job_with_nodelist(
+            1,
+            3,
+            Some("node[001-002],node001"),
+            None,
+        )];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes.len(), 3);
+        assert!(assignments[0].nodes.contains(&"node001".to_string()));
+        assert!(assignments[0].nodes.contains(&"node002".to_string()));
+    }
+
+    #[test]
+    fn test_additive_nodelist_fill_honors_partition_and_reservation() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(5);
+        nodes[4].partitions = vec!["other".into()];
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let reservations = vec![make_active_reservation(
+            "reserved",
+            vec!["node004".into()],
+            vec!["alice".into()],
+        )];
+
+        let pending = vec![make_job_with_nodelist(1, 3, Some("node001"), None)];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &reservations,
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes.len(), 3);
+        assert!(assignments[0].nodes.contains(&"node001".to_string()));
+        assert!(!assignments[0].nodes.contains(&"node004".to_string()));
+        assert!(!assignments[0].nodes.contains(&"node005".to_string()));
+    }
+
+    #[test]
+    fn test_additive_nodelist_waits_for_listed_node_future_reservation() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(4);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let now = Utc::now();
+        let reservations = vec![Reservation {
+            name: "upcoming".into(),
+            start_time: now + Duration::minutes(30),
+            end_time: now + Duration::hours(2),
+            nodes: vec!["node001".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: Default::default(),
+        }];
+
+        let pending = vec![make_job_with_nodelist(1, 3, Some("node001"), None)];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &reservations,
+            topology: None,
+        };
+
+        let assignments = sched.schedule(&pending, &cluster);
+        assert!(assignments.is_empty());
     }
 
     #[test]

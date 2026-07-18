@@ -2653,6 +2653,19 @@ impl ClusterManager {
                 .filter(|n| placement.eligible(n, cluster_state.reservations, now))
                 .collect();
 
+            let required = spur_sched::backfill::job_resource_request(job);
+            if placement.nodelist_is_additive()
+                && eligible.iter().any(|node| {
+                    placement.is_listed(&node.name)
+                        && node.total_resources.can_satisfy(&required)
+                        && (!placement.matches(node, cluster_state.reservations, now)
+                            || !node.can_satisfy_request(&required))
+                })
+            {
+                job_entry.pending_reason = PendingReason::ReqNodeNotAvail;
+                continue;
+            }
+
             // Fewer eligible nodes than requested: unschedulable as written.
             if eligible.len() < needed {
                 let partition_size = cluster_state
@@ -2665,7 +2678,9 @@ impl ClusterManager {
                     PendingReason::PartitionNodeLimit
                 } else if job.spec.constraint.is_some() && eligible.is_empty() {
                     PendingReason::BadConstraints
-                } else if job.spec.nodelist.as_deref().is_some_and(|s| !s.is_empty()) {
+                } else if job.spec.nodelist.as_deref().is_some_and(|s| !s.is_empty())
+                    && !placement.nodelist_is_additive()
+                {
                     PendingReason::ReqNodeNotAvail
                 } else {
                     PendingReason::Resources
@@ -2688,7 +2703,6 @@ impl ClusterManager {
 
             // Fewer nodes free (schedulable, available resources) than needed →
             // Resources; otherwise queued behind higher priority.
-            let required = spur_sched::backfill::job_resource_request(job);
             let free_now = eligible
                 .iter()
                 .filter(|n| placement.matches(n, cluster_state.reservations, now))
@@ -3858,67 +3872,26 @@ impl StateMachineApply for ClusterManager {
 }
 
 fn job_candidate_node_names(job: &Job, nodes: &[spur_core::node::Node]) -> Vec<String> {
-    let partitions = self_partitions_for_job(job);
-    let nodelist: Option<Vec<&str>> = job.spec.nodelist.as_deref().map(|s| {
-        s.split(',')
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .collect()
-    });
-    let exclude: std::collections::HashSet<&str> = job
-        .spec
-        .exclude
-        .as_deref()
-        .map(|s| {
-            s.split(',')
-                .map(str::trim)
-                .filter(|p| !p.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+    let placement = spur_sched::node_match::NodePlacement::new(job);
+    let required = spur_sched::backfill::job_resource_request(job);
 
     nodes
         .iter()
         .filter(|node| {
-            if exclude.contains(node.name.as_str()) {
-                return false;
-            }
-            if let Some(ref nl) = nodelist {
-                if !nl.iter().any(|n| *n == node.name) {
-                    return false;
-                }
-            }
-            if !partitions.is_empty()
-                && !partitions
-                    .iter()
-                    .any(|p| node.partitions.iter().any(|np| np == p))
-            {
-                return false;
-            }
-            true
+            placement.allows_name(&node.name)
+                && placement.in_partition(node)
+                && placement.has_features(node)
+                && node.total_resources.can_satisfy(&required)
         })
         .map(|n| n.name.clone())
         .collect()
-}
-
-fn self_partitions_for_job(job: &Job) -> Vec<String> {
-    job.spec
-        .partition
-        .as_deref()
-        .map(|p| {
-            p.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn reservation_fence_reason(
     job: &Job,
     cluster_state: &spur_sched::traits::ClusterState,
 ) -> Option<PendingReason> {
+    let placement = spur_sched::node_match::NodePlacement::new(job);
     let candidates = job_candidate_node_names(job, cluster_state.nodes);
     if candidates.is_empty() {
         return None;
@@ -3927,7 +3900,9 @@ fn reservation_fence_reason(
     let now = Utc::now();
     let duration = job.spec.time_limit.unwrap_or(chrono::Duration::hours(1));
     let mut maint_block = false;
-    let mut all_blocked = true;
+    let mut blocked = 0;
+    let mut listed_blocked = false;
+    let mut unblocked = 0;
 
     for node_name in &candidates {
         let mut node_blocked = false;
@@ -3939,13 +3914,16 @@ fn reservation_fence_reason(
                 }
             }
         }
-        if !node_blocked {
-            all_blocked = false;
-            break;
+        if node_blocked {
+            blocked += 1;
+            listed_blocked |= placement.nodelist_is_additive() && placement.is_listed(node_name);
+        } else {
+            unblocked += 1;
         }
     }
 
-    if !all_blocked {
+    let needed = (job.spec.num_nodes as usize).max(1);
+    if blocked == 0 || (!listed_blocked && unblocked >= needed) {
         return None;
     }
     if maint_block {
@@ -6524,6 +6502,174 @@ mod tests {
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::ReqNodeNotAvail
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn additive_nodelist_fill_shortage_reports_resources() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        register_node(&cm, "n3", 4, 8000);
+
+        let mut spec = basic_spec("fill-shortage");
+        spec.num_nodes = 3;
+        spec.num_tasks = 3;
+        spec.nodelist = Some("n1".into());
+        spec.exclude = Some("n3".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let snapshot = cm.get_job(job_id).unwrap();
+
+        let nodes = vec![
+            cm.get_node("n1").unwrap(),
+            cm.get_node("n2").unwrap(),
+            cm.get_node("n3").unwrap(),
+        ];
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::Resources
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn additive_nodelist_unavailable_listed_node_reports_req_node_not_avail() {
+        use spur_core::node::NodeState;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        register_node(&cm, "n3", 4, 8000);
+        register_node(&cm, "n4", 4, 8000);
+
+        let mut spec = basic_spec("listed-down");
+        spec.num_nodes = 3;
+        spec.num_tasks = 3;
+        spec.nodelist = Some("n1".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let snapshot = cm.get_job(job_id).unwrap();
+
+        let mut n1 = cm.get_node("n1").unwrap();
+        n1.state = NodeState::Drain;
+        let nodes = vec![
+            n1,
+            cm.get_node("n2").unwrap(),
+            cm.get_node("n3").unwrap(),
+            cm.get_node("n4").unwrap(),
+        ];
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::ReqNodeNotAvail
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn additive_nodelist_fill_blocked_by_maintenance_reports_reserved_maintenance() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        register_node(&cm, "n3", 4, 8000);
+        register_node(&cm, "n4", 4, 8000);
+
+        let mut spec = basic_spec("fill-maintenance");
+        spec.num_nodes = 3;
+        spec.num_tasks = 3;
+        spec.nodelist = Some("n1".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let snapshot = cm.get_job(job_id).unwrap();
+
+        let nodes = vec![
+            cm.get_node("n1").unwrap(),
+            cm.get_node("n2").unwrap(),
+            cm.get_node("n3").unwrap(),
+            cm.get_node("n4").unwrap(),
+        ];
+        let now = Utc::now();
+        let reservations = vec![Reservation {
+            name: "maintenance".into(),
+            start_time: now + chrono::Duration::minutes(30),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n2".into(), "n3".into(), "n4".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: spur_core::reservation::ReservationFlags {
+                maint: true,
+                ..Default::default()
+            },
+        }];
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &reservations,
+            topology: None,
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::ReservedMaintenance
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn additive_nodelist_listed_node_blocked_by_maintenance_reports_reserved_maintenance() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        register_node(&cm, "n3", 4, 8000);
+        register_node(&cm, "n4", 4, 8000);
+
+        let mut spec = basic_spec("listed-maintenance");
+        spec.num_nodes = 3;
+        spec.num_tasks = 3;
+        spec.nodelist = Some("n1".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let snapshot = cm.get_job(job_id).unwrap();
+
+        let nodes = vec![
+            cm.get_node("n1").unwrap(),
+            cm.get_node("n2").unwrap(),
+            cm.get_node("n3").unwrap(),
+            cm.get_node("n4").unwrap(),
+        ];
+        let now = Utc::now();
+        let reservations = vec![Reservation {
+            name: "maintenance".into(),
+            start_time: now + chrono::Duration::minutes(30),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: spur_core::reservation::ReservationFlags {
+                maint: true,
+                ..Default::default()
+            },
+        }];
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &reservations,
+            topology: None,
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::ReservedMaintenance
         );
     }
 
