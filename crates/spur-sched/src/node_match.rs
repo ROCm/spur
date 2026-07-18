@@ -85,12 +85,13 @@ impl<'a> NodePlacement<'a> {
         !self.exclude.contains(name)
     }
 
-    pub fn nodelist_is_additive(&self) -> bool {
-        let Some(ref nodelist) = self.nodelist else {
-            return false;
-        };
-        (self.job.spec.num_nodes as usize).max(1) > nodelist.len()
-    }
+pub fn nodelist_is_additive(&self) -> bool {
+    let Some(ref nodelist) = self.nodelist else {
+        return false;
+    };
+    let listed = nodelist.iter().filter(|s| !s.is_empty()).count();
+    (self.job.spec.num_nodes as usize).max(1) > listed
+}
 
     pub fn is_listed(&self, name: &str) -> bool {
         self.nodelist
