@@ -33,40 +33,13 @@ fn read(path: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use super::*;
 
-    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
-
-    struct NodeFileFixture {
-        directory: PathBuf,
-        path: PathBuf,
-    }
-
-    impl NodeFileFixture {
-        fn new(contents: &str) -> Self {
-            let directory = std::env::temp_dir().join(format!(
-                "spur-nodefile-test-{}-{}",
-                std::process::id(),
-                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir(&directory).expect("create fixture directory");
-            let path = directory.join("nodes.txt");
-            std::fs::write(&path, contents).expect("write node file fixture");
-            Self { directory, path }
-        }
-
-        fn path(&self) -> String {
-            self.path.to_string_lossy().into_owned()
-        }
-    }
-
-    impl Drop for NodeFileFixture {
-        fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.directory).expect("remove fixture directory");
-        }
+    fn node_file(contents: &str) -> (tempfile::TempDir, String) {
+        let directory = tempfile::tempdir().expect("create fixture directory");
+        let path = directory.path().join("nodes.txt");
+        std::fs::write(&path, contents).expect("write node file fixture");
+        (directory, path.to_string_lossy().into_owned())
     }
 
     #[test]
@@ -77,15 +50,15 @@ mod tests {
 
     #[test]
     fn reads_nodelist_value_containing_slash() {
-        let fixture = NodeFileFixture::new("node001\nnode002,node003\n");
-        let resolved = resolve(Some(fixture.path()), None).expect("resolve nodelist file");
+        let (_directory, path) = node_file("node001\nnode002,node003\n");
+        let resolved = resolve(Some(path), None).expect("resolve nodelist file");
         assert_eq!(resolved.as_deref(), Some("node001,node002,node003"));
     }
 
     #[test]
     fn explicit_nodefile_always_reads_file() {
-        let fixture = NodeFileFixture::new("node[001-003,007] node008\n");
-        let resolved = resolve(None, Some(fixture.path()));
+        let (_directory, path) = node_file("node[001-003,007] node008\n");
+        let resolved = resolve(None, Some(path));
         assert_eq!(
             resolved.expect("resolve nodefile").as_deref(),
             Some("node[001-003,007],node008")
