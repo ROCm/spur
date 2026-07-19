@@ -4,6 +4,7 @@
 """E2E tests for standalone and step-mode srun task fan-out."""
 
 import re
+import shlex
 import time
 
 from cluster import job_state, parse_job_id, wait_job, wait_job_state
@@ -37,23 +38,50 @@ class TestStandaloneSrun:
     def test_srun_holds_allocation_until_step_finishes(self, multi_node_cluster):
         cluster = multi_node_cluster
         log = f"{cluster.remote_dir}/srun-hold.log"
-        cmd = (
-            f"SPUR_CONTROLLER_ADDR='{cluster.controller_addr}' "
-            f"PATH='{cluster.bin_dir}':$PATH "
-            f"nohup '{cluster.bin_dir}/srun' -N 2 sleep 8 > '{log}' 2>&1 & echo $!"
+        srun_cmd = " ".join(
+            [
+                f"SPUR_CONTROLLER_ADDR={shlex.quote(cluster.controller_addr)}",
+                f"PATH={shlex.quote(cluster.bin_dir)}:$PATH",
+                "nohup",
+                shlex.quote(f"{cluster.bin_dir}/srun"),
+                "-J",
+                "srun-hold",
+                "-N",
+                "2",
+                "-n",
+                "2",
+                "sleep",
+                "8",
+                ">",
+                shlex.quote(log),
+                "2>&1",
+                "&",
+                "echo",
+                "$!",
+            ]
         )
-        cluster.nodes[0].exec(cmd)
+        pid_out = cluster.nodes[0].exec(srun_cmd).strip()
+        assert pid_out.isdigit(), f"expected background srun pid, got: {pid_out!r}"
         time.sleep(2)
 
-        sq = cluster.squeue_all()
-        running = [
-            int(m.group(1))
-            for m in re.finditer(r"(\d+)\s+\S+\s+\S+\s+\S+\s+R\b", sq)
-        ]
-        assert running, f"expected a running srun allocation in squeue:\n{sq}"
-        job_id = running[0]
+        job_ids = cluster.running_job_ids_by_name("srun-hold")
+        assert job_ids, (
+            "expected running srun-hold job in squeue:\n"
+            f"{cluster.squeue(['-n', 'srun-hold', '-t', 'all'])}"
+        )
+        job_id = job_ids[0]
 
         wait_job_state(cluster, job_id, "R", timeout=30)
+        show = cluster.scontrol("show", "job", str(job_id))
+        assert "JobState=RUNNING" in show, f"expected RUNNING job:\n{show}"
+        num_nodes_match = re.search(r"NumNodes=(\d+)", show)
+        assert num_nodes_match, f"missing NumNodes in scontrol output:\n{show}"
+        assert int(num_nodes_match.group(1)) == 2, (
+            f"expected 2-node allocation while srun sleep runs:\n{show}"
+        )
+        assert re.search(r"NodeList=\S+", show), (
+            f"missing NodeList in scontrol output:\n{show}"
+        )
         sinfo = cluster.sinfo()
         assert not cluster._cluster_is_ready(sinfo), (
             f"expected allocated nodes while srun sleep runs, sinfo:\n{sinfo}"
@@ -82,6 +110,6 @@ class TestSrunInBatch:
         assert job_id is not None
 
         wait_job(cluster, job_id, timeout=90)
-        content = cluster.read_output_all_nodes(out_path)
-        lines = [ln for ln in content.splitlines() if ln.startswith("host=")]
+        content = cluster.read_output_on_any_node(out_path)
+        lines = sorted({ln for ln in content.splitlines() if ln.startswith("host=")})
         assert len(lines) == 2, f"expected 2 step task lines in batch output:\n{content}"

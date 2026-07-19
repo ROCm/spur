@@ -372,13 +372,10 @@ mod completion_report_tests {
 }
 
 /// Build a bash script that execs a command vector without shell interpretation.
-fn build_one_shot_command_script(command: &[String]) -> String {
-    let quoted: Vec<String> = command
-        .iter()
-        .map(|arg| shlex::try_quote(arg).unwrap_or_else(|_| std::borrow::Cow::Borrowed(arg)))
-        .map(|c| c.into_owned())
-        .collect();
-    format!("#!/bin/bash\nexec {}\n", quoted.join(" "))
+fn build_one_shot_command_script(command: &[String]) -> Result<String, Status> {
+    let joined = shlex::try_join(command.iter().map(String::as_str))
+        .map_err(|e| Status::invalid_argument(format!("command is not shell-safe: {e}")))?;
+    Ok(format!("#!/bin/bash\nexec {joined}\n"))
 }
 
 /// Build the bash job script for a launch request.
@@ -1162,12 +1159,13 @@ impl SlurmAgent for AgentService {
             )
         };
 
-        let hostname = hostname::get()
-            .map(|h| h.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "localhost".into());
+        let agent_hostname = self.reporter.hostname.clone();
         let node_names: Vec<&str> = nodelist.split(',').filter(|s| !s.is_empty()).collect();
         let num_nodes = node_names.len().max(1) as u32;
-        let node_id = node_names.iter().position(|n| *n == hostname).unwrap_or(0) as u32;
+        let node_id = node_names
+            .iter()
+            .position(|n| *n == agent_hostname)
+            .unwrap_or(0) as u32;
 
         let gpu_env = if gpu_devices.is_empty() {
             HashMap::new()
@@ -1231,9 +1229,9 @@ impl SlurmAgent for AgentService {
             senv.set("OMPI_COMM_WORLD_LOCAL_SIZE", tasks_per_node);
         }
 
-        let (program, program_args) = if num_tasks > 1 {
+        let (program, program_args) = if num_tasks > 1 || req.label {
             let user_script_path = format!("{work_dir}/.spur_step_{job_id}_{step_id}_{node_id}.sh");
-            let user_script = build_one_shot_command_script(&req.command);
+            let user_script = build_one_shot_command_script(&req.command)?;
             std::fs::write(&user_script_path, &user_script)
                 .map_err(|e| Status::internal(format!("failed to write step script: {}", e)))?;
             #[cfg(unix)]
@@ -1247,8 +1245,15 @@ impl SlurmAgent for AgentService {
 
             let wrapper_path =
                 format!("{work_dir}/.spur_step_wrapper_{job_id}_{step_id}_{node_id}.sh");
-            let wrapper =
-                build_multi_task_wrapper(&user_script_path, num_tasks, Some(&req.environment));
+            let wrapper = if num_tasks > 1 {
+                build_multi_task_wrapper(&user_script_path, num_tasks, Some(&req.environment))
+            } else {
+                spur_core::task_launch::build_labeled_single_task_wrapper(
+                    &user_script_path,
+                    req.task_offset,
+                    Some(&req.environment),
+                )
+            };
             std::fs::write(&wrapper_path, &wrapper)
                 .map_err(|e| Status::internal(format!("failed to write step wrapper: {}", e)))?;
             #[cfg(unix)]
@@ -1258,7 +1263,11 @@ impl SlurmAgent for AgentService {
                     std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755));
             }
 
-            senv.set("SPUR_TASK_OFFSET", req.task_offset);
+            if num_tasks > 1 {
+                senv.set("SPUR_TASK_OFFSET", req.task_offset);
+            } else {
+                SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0, 1);
+            }
             ("bash".to_string(), vec![wrapper_path])
         } else {
             SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0, 1);

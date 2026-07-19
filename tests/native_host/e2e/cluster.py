@@ -10,6 +10,7 @@ and CLI wrappers for interacting with the running cluster.
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -352,11 +353,11 @@ class SpurCluster:
     def srun_with_exit(self, args: list[str]) -> tuple[int, str]:
         """Run srun and return (exit_code, combined stdout+stderr)."""
         cmd_parts = [
-            f"SPUR_CONTROLLER_ADDR='{self.controller_addr}'",
-            f"PATH='{self.bin_dir}':$PATH",
-            f"'{self.bin_dir}/srun'",
+            f"SPUR_CONTROLLER_ADDR={shlex.quote(self.controller_addr)}",
+            f"PATH={shlex.quote(self.bin_dir)}:$PATH",
+            shlex.quote(f"{self.bin_dir}/srun"),
         ]
-        cmd_parts.extend(f"'{a}'" for a in args)
+        cmd_parts.extend(shlex.quote(a) for a in args)
         _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
         code = stdout.channel.recv_exit_status()
         return code, stdout.read().decode() + stderr.read().decode()
@@ -366,6 +367,20 @@ class SpurCluster:
 
     def squeue_all(self) -> str:
         return self.cli(["squeue", "-t", "all"])
+
+    def running_job_ids_by_name(self, name: str) -> list[int]:
+        """Return running job IDs matching *name* (uses server-side name filter)."""
+        out = self.squeue(["-n", name, "-t", "R", "-h", "-o", "%i"])
+        ids: list[int] = []
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ids.append(int(line.split()[0]))
+            except ValueError:
+                continue
+        return ids
 
     def sinfo(self) -> str:
         return self.cli(["sinfo"])

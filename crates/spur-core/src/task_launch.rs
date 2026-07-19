@@ -159,7 +159,7 @@ fn cpu_bind_bash_prefix(bind: &CpuBind, map_cpus: &[&str]) -> String {
             )
         }
         CpuBind::Map(_) => String::new(),
-        CpuBind::Mask(mask) => format!("taskset -m {mask} "),
+        CpuBind::Mask(mask) => format!("taskset {mask} "),
         CpuBind::None | CpuBind::Cores | CpuBind::Threads | CpuBind::Sockets | CpuBind::Ldoms => {
             String::new()
         }
@@ -199,8 +199,7 @@ pub fn wrap_command_with_cpu_bind(
         }
         CpuBind::Mask(mask) => (
             "taskset".into(),
-            std::iter::once("-m".to_string())
-                .chain(std::iter::once(mask))
+            std::iter::once(mask)
                 .chain(std::iter::once(program.to_string()))
                 .chain(args.iter().cloned())
                 .collect(),
@@ -267,6 +266,26 @@ pub fn build_multi_task_wrapper(
     wrapper.push_str("  fi\n");
     wrapper.push_str("done\nwait\n");
     wrapper
+}
+
+/// Bash wrapper for a single labeled task (one task per node in fan-out steps).
+pub fn build_labeled_single_task_wrapper(
+    user_script_path: &str,
+    procid: u32,
+    environment: Option<&HashMap<String, String>>,
+) -> String {
+    let escaped = user_script_path.replace('"', "\\\"");
+    let bind = environment.map(parse_cpu_bind).unwrap_or(CpuBind::None);
+    let map_cpus: Vec<&str> = match &bind {
+        CpuBind::Map(list) => list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    };
+    let taskset_prefix = cpu_bind_bash_prefix(&bind, &map_cpus);
+    format!("#!/bin/bash\n{taskset_prefix}bash \"{escaped}\" 2>&1 | sed \"s/^/[{procid}] /\"\n")
 }
 
 #[cfg(test)]
@@ -398,6 +417,21 @@ mod tests {
         let (program, args) = wrap_command_with_cpu_bind("hostname", &[], &env, 1);
         assert_eq!(program, "taskset");
         assert_eq!(args, vec!["-c", "4", "hostname"]);
+    }
+
+    #[test]
+    fn wrap_command_with_cpu_bind_mask_uses_hex_mask() {
+        let mut env = HashMap::new();
+        env.insert("SPUR_CPU_BIND".into(), "mask_cpu:0x3".into());
+        let (program, args) = wrap_command_with_cpu_bind("hostname", &[], &env, 0);
+        assert_eq!(program, "taskset");
+        assert_eq!(args, vec!["0x3", "hostname"]);
+    }
+
+    #[test]
+    fn labeled_single_task_wrapper_applies_sed_prefix() {
+        let script = build_labeled_single_task_wrapper("/tmp/step.sh", 4, None);
+        assert!(script.contains("sed \"s/^/[4] /\""));
     }
 
     #[test]
