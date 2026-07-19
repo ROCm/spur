@@ -104,6 +104,8 @@ pub enum RunningJob {
         cgroup_path: Option<PathBuf>,
         reaped: bool,
     },
+    /// Allocation registered without a batch process (standalone srun).
+    AllocationOnly,
 }
 
 /// Split a finished process's wait status into (exit_code, signal).
@@ -158,7 +160,12 @@ impl RunningJob {
         match self {
             RunningJob::Managed { child, .. } => child.id(),
             RunningJob::Forked { pid, .. } => Some(*pid as u32),
+            RunningJob::AllocationOnly => None,
         }
+    }
+
+    pub fn is_allocation_only(&self) -> bool {
+        matches!(self, RunningJob::AllocationOnly)
     }
 
     /// Non-blocking check for process exit. Returns (exit_code, signal) if done.
@@ -193,6 +200,7 @@ impl RunningJob {
                     Err(e) => Err(e.into()),
                 }
             }
+            RunningJob::AllocationOnly => Ok(None),
         }
     }
 
@@ -220,6 +228,7 @@ impl RunningJob {
                 kill_process_tree(*pid, sig);
                 Ok(())
             }
+            RunningJob::AllocationOnly => Ok(()),
         }
     }
 
@@ -227,6 +236,7 @@ impl RunningJob {
         match self {
             RunningJob::Managed { cgroup_path, .. } => cgroup_path.take(),
             RunningJob::Forked { cgroup_path, .. } => cgroup_path.take(),
+            RunningJob::AllocationOnly => None,
         }
     }
 }

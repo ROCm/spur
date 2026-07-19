@@ -79,6 +79,43 @@ pub enum SubmitError {
     Internal(String),
 }
 
+/// Errors from completing a standalone srun allocation.
+#[derive(Debug)]
+pub enum SrunCompleteError {
+    NotFound(JobId),
+    NotSrunJob(JobId),
+    NotStepDispatch(JobId),
+    AlreadyTerminal { job_id: JobId, state: JobState },
+    NotOwner { job_id: JobId, user: String },
+    Internal { job_id: JobId, message: String },
+}
+
+impl std::fmt::Display for SrunCompleteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(id) => write!(f, "job {id} not found"),
+            Self::NotSrunJob(id) => write!(f, "job {id} is not an srun allocation"),
+            Self::NotStepDispatch(id) => {
+                write!(
+                    f,
+                    "job {id} does not use native step dispatch (CompleteJob is not valid)"
+                )
+            }
+            Self::AlreadyTerminal { job_id, state } => {
+                write!(f, "job {job_id} is already {state:?}")
+            }
+            Self::NotOwner { job_id, user } => {
+                write!(f, "user {user} is not permitted to complete job {job_id}")
+            }
+            Self::Internal { job_id, message } => {
+                write!(f, "job {job_id}: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SrunCompleteError {}
+
 impl std::fmt::Display for SubmitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -594,6 +631,54 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Complete a standalone srun allocation after its step finishes.
+    pub fn finish_srun_job(
+        &self,
+        job_id: JobId,
+        exit_code: i32,
+        user: &str,
+    ) -> Result<Job, SrunCompleteError> {
+        let job = {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or(SrunCompleteError::NotFound(job_id))?;
+            if !job.spec.srun_job {
+                return Err(SrunCompleteError::NotSrunJob(job_id));
+            }
+            if !job.srun_step_dispatch {
+                return Err(SrunCompleteError::NotStepDispatch(job_id));
+            }
+            if job.state.is_terminal() {
+                return Err(SrunCompleteError::AlreadyTerminal {
+                    job_id,
+                    state: job.state,
+                });
+            }
+            Self::check_job_owner(user, &job.spec.user, "complete").map_err(|_| {
+                SrunCompleteError::NotOwner {
+                    job_id,
+                    user: user.to_string(),
+                }
+            })?;
+            job.clone()
+        };
+
+        let state = if exit_code == 0 {
+            JobState::Completed
+        } else {
+            JobState::Failed
+        };
+        self.complete_job(job_id, exit_code, state).map_err(|e| {
+            warn!(job_id, error = %e, "finish_srun_job: complete_job failed");
+            SrunCompleteError::Internal {
+                job_id,
+                message: e.to_string(),
+            }
+        })?;
+        Ok(job)
+    }
+
     /// Suspend a running job: validate state, record through Raft. Allocation is retained.
     /// The requesting `user` must be the job owner, root, or empty (trusted internal calls).
     pub fn suspend_job(&self, job_id: JobId, user: &str) -> anyhow::Result<()> {
@@ -644,6 +729,17 @@ impl ClusterManager {
         resources: ResourceAllocations,
         per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
     ) -> anyhow::Result<()> {
+        self.start_job_impl(job_id, node_names, resources, per_node_alloc, false)
+    }
+
+    pub(crate) fn start_job_impl(
+        &self,
+        job_id: JobId,
+        node_names: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
+        srun_step_dispatch: bool,
+    ) -> anyhow::Result<()> {
         for name in &node_names {
             if !per_node_alloc.contains_key(name) {
                 anyhow::bail!(
@@ -682,6 +778,7 @@ impl ClusterManager {
             nodes: node_names.clone(),
             resources: resources.clone(),
             per_node_alloc: per_node_alloc.clone(),
+            srun_step_dispatch,
         })?;
 
         let node_count = node_names.len().max(1) as u32;
@@ -694,21 +791,25 @@ impl ClusterManager {
                     resources.memory_mb / node_count as u64,
                 )
             });
-        let batch_step = JobStep {
-            job_id,
-            step_id: STEP_BATCH,
-            name: "batch".into(),
-            state: StepState::Running,
-            num_tasks: 1,
-            cpus_per_task: per_node.cpus,
-            resources: per_node,
-            nodes: node_names,
-            distribution: spur_core::step::TaskDistribution::Block,
-            start_time: Some(Utc::now()),
-            end_time: None,
-            exit_code: None,
-        };
-        self.create_step(job_id, STEP_BATCH, batch_step);
+        if !srun_step_dispatch {
+            let batch_step = JobStep {
+                job_id,
+                step_id: STEP_BATCH,
+                name: "batch".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: per_node.cpus,
+                resources: per_node,
+                nodes: node_names,
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: Some(Utc::now()),
+                end_time: None,
+                exit_code: None,
+            };
+            if let Err(e) = self.create_step(batch_step) {
+                warn!(job_id, error = %e, "failed to record batch step");
+            }
+        }
 
         if spec_for_notify
             .mail_type
@@ -1679,10 +1780,15 @@ impl ClusterManager {
         Ok(resp.jobs_finalized)
     }
 
-    /// Create a job step.
-    pub fn create_step(&self, job_id: JobId, step_id: u32, step: JobStep) {
-        self.steps.write().insert((job_id, step_id), step);
+    /// Create a job step durably via Raft.
+    pub fn create_step(&self, step: JobStep) -> anyhow::Result<()> {
+        let job_id = step.job_id;
+        let step_id = step.step_id;
+        self.propose(WalOperation::JobStepCreate {
+            step: Box::new(step),
+        })?;
         debug!(job_id, step_id, "step created");
+        Ok(())
     }
 
     /// Record an srun step's completion via Raft so the step exit code and the
@@ -3206,6 +3312,7 @@ impl ClusterManager {
                 nodes: node_names,
                 resources,
                 per_node_alloc,
+                srun_step_dispatch,
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.start_time = Some(timestamp);
@@ -3213,6 +3320,7 @@ impl ClusterManager {
                     job.allocated_resources = Some(resources.clone());
                     job.per_node_alloc = per_node_alloc.clone();
                     job.pending_reason = PendingReason::None;
+                    job.srun_step_dispatch = *srun_step_dispatch;
                 }
                 let node_count = node_names.len().max(1) as u32;
                 for name in node_names {
@@ -3467,6 +3575,29 @@ impl ClusterManager {
                     }
                 }
             }
+            WalOperation::JobStepCreate { step } => match jobs.get(&step.job_id) {
+                None => {
+                    warn!(
+                        job_id = step.job_id,
+                        step_id = step.step_id,
+                        "JobStepCreate: skipping step for unknown job"
+                    );
+                }
+                Some(job) if job.state.is_terminal() => {
+                    warn!(
+                        job_id = step.job_id,
+                        step_id = step.step_id,
+                        state = ?job.state,
+                        "JobStepCreate: skipping step for terminal job"
+                    );
+                }
+                Some(_) => {
+                    let mut steps = self.steps.write();
+                    steps
+                        .entry((step.job_id, step.step_id))
+                        .or_insert_with(|| (**step).clone());
+                }
+            },
             WalOperation::JobPriorityChange {
                 job_id,
                 new_priority,
@@ -4575,6 +4706,12 @@ mod tests {
         }
     }
 
+    fn srun_spec(name: &str) -> JobSpec {
+        let mut spec = basic_spec(name);
+        spec.srun_job = true;
+        spec
+    }
+
     fn scalar_alloc(cpus: u32, memory_mb: u64) -> ResourceAllocations {
         ResourceAllocations::with_scalar(cpus, memory_mb)
     }
@@ -4710,6 +4847,7 @@ mod tests {
             nodes: vec!["node1".into()],
             resources: resources.clone(),
             per_node_alloc: per_node_for(&["node1"], resources),
+            srun_step_dispatch: false,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -4744,6 +4882,7 @@ mod tests {
             nodes: vec!["node1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["node1"], alloc),
+            srun_step_dispatch: false,
         });
 
         cm.apply_operation(&WalOperation::JobComplete {
@@ -5231,6 +5370,7 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -5272,6 +5412,7 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -5314,6 +5455,7 @@ mod tests {
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
+            srun_step_dispatch: false,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -5379,6 +5521,7 @@ mod tests {
             nodes: vec!["n1".into()],
             resources: scalar_alloc(4, 8000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
+            srun_step_dispatch: false,
         });
 
         // Three srun steps exit 7, 3, 2 (in that order). DerivedExitCode tracks
@@ -5471,6 +5614,7 @@ mod tests {
             nodes: vec!["n1".into(), "n2".into()],
             resources: scalar_alloc(4, 8000),
             per_node_alloc: per_node_for(&["n1", "n2"], alloc),
+            srun_step_dispatch: false,
         });
 
         let r1 = cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -5521,6 +5665,7 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
         });
 
         let resp = cm.apply_operation(&WalOperation::JobComplete {
@@ -5560,6 +5705,7 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
         });
 
         let first = cm.apply_operation(&WalOperation::JobComplete {
@@ -5617,6 +5763,7 @@ mod tests {
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
+            srun_step_dispatch: false,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
@@ -5653,6 +5800,7 @@ mod tests {
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+            srun_step_dispatch: false,
         });
 
         cm.node_complete(1, "n1", 0, 9).unwrap();
@@ -5695,6 +5843,7 @@ mod tests {
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+            srun_step_dispatch: false,
         });
 
         // Step 2: the call the RPC makes after validation (wire state dropped).
@@ -5730,6 +5879,7 @@ mod tests {
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+            srun_step_dispatch: false,
         });
 
         cm.node_complete(1, "n1", 42, 0).unwrap();
@@ -5769,6 +5919,7 @@ mod tests {
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
+            srun_step_dispatch: false,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -5836,6 +5987,7 @@ mod tests {
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
+            srun_step_dispatch: false,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
@@ -6186,6 +6338,7 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
         });
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
@@ -6279,6 +6432,7 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
 
@@ -10836,6 +10990,24 @@ mod tests {
             nodes: vec![node.into()],
             resources: scalar_alloc(1, 1000),
             per_node_alloc: per_node_for(&[node], scalar_alloc(1, 1000)),
+            srun_step_dispatch: false,
+        });
+    }
+
+    fn start_srun_job_on(cm: &ClusterManager, id: JobId, node: &str) {
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: id,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: id,
+            nodes: vec![node.into()],
+            resources: scalar_alloc(1, 1000),
+            per_node_alloc: per_node_for(&[node], scalar_alloc(1, 1000)),
+            srun_step_dispatch: true,
         });
     }
 
@@ -11231,5 +11403,91 @@ mod tests {
         );
 
         assert_eq!(nodes["n1"].state, NodeState::Drain);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_completes_running_allocation() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-alloc"));
+        start_srun_job_on(&cm, id, "n1");
+
+        let returned = cm.finish_srun_job(id, 0, "testuser").unwrap();
+        assert_eq!(returned.job_id, id);
+        settle(&cm, id, JobState::Completed);
+        assert_eq!(cm.get_job(id).unwrap().exit_code, Some(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_rejects_non_srun_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("batch"));
+        start_job_on(&cm, id, "n1");
+
+        assert!(matches!(
+            cm.finish_srun_job(id, 0, "testuser"),
+            Err(SrunCompleteError::NotSrunJob(j)) if j == id
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_rejects_terminal_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-done"));
+        start_srun_job_on(&cm, id, "n1");
+        cm.finish_srun_job(id, 0, "testuser").unwrap();
+        settle(&cm, id, JobState::Completed);
+
+        assert!(matches!(
+            cm.finish_srun_job(id, 0, "testuser"),
+            Err(SrunCompleteError::AlreadyTerminal {
+                job_id,
+                state: JobState::Completed,
+            }) if job_id == id
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_rejects_wrong_user() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-owner"));
+        start_srun_job_on(&cm, id, "n1");
+
+        assert!(matches!(
+            cm.finish_srun_job(id, 0, "otheruser"),
+            Err(SrunCompleteError::NotOwner { job_id, user }) if job_id == id && user == "otheruser"
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_rejects_batch_fallback_srun() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-batch-fallback"));
+        start_job_on(&cm, id, "n1");
+
+        assert!(matches!(
+            cm.finish_srun_job(id, 0, "testuser"),
+            Err(SrunCompleteError::NotStepDispatch(j)) if j == id
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_not_found() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        assert!(matches!(
+            cm.finish_srun_job(999, 0, "testuser"),
+            Err(SrunCompleteError::NotFound(999))
+        ));
     }
 }

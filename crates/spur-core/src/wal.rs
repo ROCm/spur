@@ -42,6 +42,9 @@ pub enum WalOperation {
         /// Per-node allocation slices (device IDs are node-local).
         #[serde(default)]
         per_node_alloc: HashMap<String, ResourceAllocations>,
+        /// Standalone srun: native step dispatch (false = K8s batch fallback).
+        #[serde(default)]
+        srun_step_dispatch: bool,
     },
     JobComplete {
         job_id: JobId,
@@ -60,6 +63,10 @@ pub enum WalOperation {
         job_id: JobId,
         step_id: u32,
         exit_code: i32,
+    },
+    /// Record a job step at creation so `run_step` survives controller restart.
+    JobStepCreate {
+        step: Box<crate::step::JobStep>,
     },
     JobPriorityChange {
         job_id: JobId,
@@ -212,6 +219,22 @@ impl WalOperation {
             new_state: JobState::Pending,
             pending_reason: Some(reason),
             pending_priority: Some(0),
+        }
+    }
+
+    /// Record node allocation at job start (batch/sbatch and K8s srun fallback).
+    pub fn job_start(
+        job_id: JobId,
+        nodes: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: HashMap<String, ResourceAllocations>,
+    ) -> Self {
+        Self::JobStart {
+            job_id,
+            nodes,
+            resources,
+            per_node_alloc,
+            srun_step_dispatch: false,
         }
     }
 }
@@ -499,6 +522,7 @@ mod suspend_wal_tests {
 #[cfg(test)]
 mod evict_wal_tests {
     use super::*;
+    use crate::step::{JobStep, StepState, TaskDistribution};
 
     #[test]
     fn job_evict_op_round_trips() {
@@ -507,6 +531,37 @@ mod evict_wal_tests {
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
             WalOperation::JobEvict { job_id } => assert_eq!(job_id, 9),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn job_step_create_op_round_trips() {
+        let step = JobStep {
+            job_id: 7,
+            step_id: 1,
+            name: "hostname".into(),
+            state: StepState::Running,
+            num_tasks: 2,
+            cpus_per_task: 1,
+            resources: Default::default(),
+            nodes: vec!["n1".into(), "n2".into()],
+            distribution: TaskDistribution::Block,
+            start_time: None,
+            end_time: None,
+            exit_code: None,
+        };
+        let op = WalOperation::JobStepCreate {
+            step: Box::new(step.clone()),
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobStepCreate { step: restored } => {
+                assert_eq!(restored.job_id, 7);
+                assert_eq!(restored.step_id, 1);
+                assert_eq!(restored.name, "hostname");
+            }
             _ => panic!("wrong variant"),
         }
     }

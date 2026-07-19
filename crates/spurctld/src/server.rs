@@ -13,6 +13,7 @@ use tracing::{info, warn};
 
 use spur_core::job::NodeCompleteError;
 use spur_core::reservation::Reservation;
+use spur_core::task_launch::build_step_task_plan;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::slurm_controller_server::SlurmController;
 use spur_proto::proto::*;
@@ -308,6 +309,62 @@ impl SlurmController for ControllerService {
                 crate::scheduler_loop::send_cancel_to_agents(&cluster, &job, 0).await;
             });
         }
+
+        Ok(Response::new(()))
+    }
+
+    async fn complete_job(
+        &self,
+        request: Request<CompleteJobRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.complete_job(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward complete_job to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+
+        let req = request.into_inner();
+        let job = self
+            .cluster
+            .finish_srun_job(req.job_id, req.exit_code, &req.user)
+            .map_err(|e| match e {
+                crate::cluster::SrunCompleteError::NotFound(id) => {
+                    Status::not_found(format!("job {id} not found"))
+                }
+                crate::cluster::SrunCompleteError::NotSrunJob(id) => {
+                    Status::failed_precondition(format!("job {id} is not an srun allocation"))
+                }
+                crate::cluster::SrunCompleteError::NotStepDispatch(id) => {
+                    Status::failed_precondition(format!(
+                        "job {id} does not use native step dispatch"
+                    ))
+                }
+                crate::cluster::SrunCompleteError::AlreadyTerminal { job_id, state } => {
+                    Status::failed_precondition(format!("job {job_id} is already {state:?}"))
+                }
+                crate::cluster::SrunCompleteError::NotOwner { job_id, user } => {
+                    Status::permission_denied(format!(
+                        "user {user} is not permitted to complete job {job_id}"
+                    ))
+                }
+                crate::cluster::SrunCompleteError::Internal { job_id, message } => {
+                    Status::internal(format!("job {job_id}: {message}"))
+                }
+            })?;
+
+        let cluster = self.cluster.clone();
+        tokio::spawn(async move {
+            crate::scheduler_loop::release_srun_allocation_on_agents(&cluster, &job).await;
+        });
 
         Ok(Response::new(()))
     }
@@ -1176,7 +1233,9 @@ impl SlurmController for ControllerService {
             exit_code: None,
         };
 
-        self.cluster.create_step(job_id, step_id, step);
+        self.cluster
+            .create_step(step)
+            .map_err(|e| Status::internal(format!("failed to create job step: {e}")))?;
 
         Ok(Response::new(CreateJobStepResponse { step_id }))
     }
@@ -1393,9 +1452,9 @@ impl SlurmController for ControllerService {
         Ok(resp)
     }
 
-    /// #146: route a step from `srun-in-salloc` to one of the job's
-    /// allocated nodes. Unlike ExecInJob, the job may not have a tracked
-    /// process — salloc allocations only exist as scheduler bookkeeping.
+    /// Route a step from srun to the job's allocated nodes. Unlike ExecInJob,
+    /// the job may not have a tracked process — salloc allocations only exist
+    /// as scheduler bookkeeping.
     async fn run_step(
         &self,
         request: Request<RunStepRequest>,
@@ -1425,58 +1484,140 @@ impl SlurmController for ControllerService {
             )));
         }
 
-        let node_name = job.allocated_nodes[0].clone();
-        let node = self
+        let step = self
             .cluster
-            .get_node(&node_name)
-            .ok_or_else(|| Status::not_found(format!("node {} not found", node_name)))?;
-        let addr = node
-            .address
-            .as_ref()
-            .ok_or_else(|| Status::internal(format!("node {} has no agent address", node_name)))?;
-        let agent_addr = format!("http://{}:{}", addr, node.port);
+            .get_steps(job_id)
+            .into_iter()
+            .find(|s| s.step_id == req.step_id)
+            .ok_or_else(|| {
+                Status::not_found(format!("step {} not found for job {}", req.step_id, job_id))
+            })?;
 
-        let mut agent = SlurmAgentClient::connect(agent_addr.clone())
-            .await
-            .map_err(|e| {
-                Status::unavailable(format!("cannot reach agent at {}: {}", agent_addr, e))
-            })?
-            .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
+        let num_nodes = job.allocated_nodes.len() as u32;
+        let plan = build_step_task_plan(step.num_tasks, num_nodes, step.distribution);
+        if plan.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "step {} for job {} has no tasks to run",
+                req.step_id, job_id
+            )));
+        }
 
-        let agent_resp = agent
-            .run_command(RunCommandRequest {
-                command: req.command,
-                uid: req.uid,
-                gid: req.gid,
-                work_dir: req.work_dir,
-                environment: req.environment,
-                job_id: req.job_id,
-            })
-            .await
-            .map_err(|e| Status::internal(format!("run_command failed: {}", e)))?
-            .into_inner();
+        let step_num_tasks = step.num_tasks;
+        let command = req.command.clone();
+        let work_dir = req.work_dir.clone();
+        let environment = req.environment.clone();
+        let uid = req.uid;
+        let gid = req.gid;
+        let step_id = req.step_id;
+        let label = req.label;
 
-        // Record the step's exit code durably (Raft) so the job's live
-        // DerivedExitCode (running max over steps) is consistent and survives
-        // restart. Best-effort: a failure here doesn't fail the step itself.
-        if let Err(e) =
-            self.cluster
-                .record_step_complete(req.job_id, req.step_id, agent_resp.exit_code)
-        {
+        let mut set = tokio::task::JoinSet::new();
+        for node_tasks in plan {
+            let node_name = job
+                .allocated_nodes
+                .get(node_tasks.node_index as usize)
+                .ok_or_else(|| {
+                    Status::internal(format!(
+                        "step plan references node index {} but job {} has {} nodes",
+                        node_tasks.node_index,
+                        job_id,
+                        job.allocated_nodes.len()
+                    ))
+                })?
+                .clone();
+            let node = self
+                .cluster
+                .get_node(&node_name)
+                .ok_or_else(|| Status::not_found(format!("node {} not found", node_name)))?;
+            let addr = node.address.as_ref().ok_or_else(|| {
+                Status::internal(format!("node {} has no agent address", node_name))
+            })?;
+            let agent_addr = format!("http://{}:{}", addr, node.port);
+
+            let command = command.clone();
+            let work_dir = work_dir.clone();
+            let environment = environment.clone();
+            set.spawn(async move {
+                let mut agent = SlurmAgentClient::connect(agent_addr.clone())
+                    .await
+                    .map_err(|e| {
+                        Status::unavailable(format!("cannot reach agent at {}: {}", agent_addr, e))
+                    })?
+                    .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+                    .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
+
+                let agent_resp = agent
+                    .run_command(RunCommandRequest {
+                        command: command.clone(),
+                        uid,
+                        gid,
+                        work_dir: work_dir.clone(),
+                        environment: environment.clone(),
+                        job_id,
+                        num_tasks: node_tasks.tasks_on_node,
+                        task_offset: node_tasks.task_offset,
+                        step_id,
+                        step_num_tasks,
+                        label,
+                    })
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!("run_command on {} failed: {}", node_name, e))
+                    })?
+                    .into_inner();
+
+                Ok::<_, Status>((node_name, agent_resp))
+            });
+        }
+
+        let mut max_exit = 0i32;
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut ran_nodes = Vec::new();
+        let mut dispatch_errors = Vec::new();
+
+        while let Some(result) = set.join_next().await {
+            match result {
+                Ok(Ok((node_name, agent_resp))) => {
+                    max_exit = max_exit.max(agent_resp.exit_code);
+                    stdout.push_str(&agent_resp.stdout);
+                    stderr.push_str(&agent_resp.stderr);
+                    ran_nodes.push(node_name);
+                }
+                Ok(Err(e)) => {
+                    warn!(job_id, step_id, error = %e, "step dispatch failed on one node");
+                    dispatch_errors.push(e.to_string());
+                    max_exit = max_exit.max(1);
+                }
+                Err(e) => {
+                    warn!(job_id, step_id, error = %e, "step dispatch task panicked");
+                    dispatch_errors.push(format!("step dispatch task panicked: {e}"));
+                    max_exit = max_exit.max(1);
+                }
+            }
+        }
+
+        if !dispatch_errors.is_empty() {
+            stderr.push_str(&format!(
+                "srun step dispatch errors:\n{}\n",
+                dispatch_errors.join("\n")
+            ));
+        }
+
+        if let Err(e) = self.cluster.record_step_complete(job_id, step_id, max_exit) {
             warn!(
-                job_id = req.job_id,
-                step_id = req.step_id,
+                job_id,
+                step_id,
                 error = %e,
                 "failed to record step completion"
             );
         }
 
         Ok(Response::new(RunStepResponse {
-            exit_code: agent_resp.exit_code,
-            stdout: agent_resp.stdout,
-            stderr: agent_resp.stderr,
-            node: node_name,
+            exit_code: max_exit,
+            stdout,
+            stderr,
+            node: ran_nodes.join(","),
         }))
     }
 
@@ -1778,6 +1919,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         exclusive: spec.exclusive,
         hold: spec.hold,
         interactive: spec.interactive,
+        srun_job: spec.srun_job,
         mail_type: spec.mail_type,
         mail_user: if spec.mail_user.is_empty() {
             None
@@ -1934,6 +2076,7 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         array_task_id: job.spec.array_task_id.unwrap_or(0),
         reservation: job.spec.reservation.clone().unwrap_or_default(),
         comment: job.spec.comment.clone().unwrap_or_default(),
+        srun_step_dispatch: job.srun_step_dispatch,
     }
 }
 

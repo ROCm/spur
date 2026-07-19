@@ -424,6 +424,10 @@ pub struct JobSpec {
     pub exclusive: bool,
     pub hold: bool,
     pub interactive: bool,
+    /// Standalone srun: reserve nodes without a batch script; user command
+    /// runs as a job step after allocation.
+    #[serde(default)]
+    pub srun_job: bool,
     pub mail_type: Vec<String>,
     pub mail_user: Option<String>,
     pub comment: Option<String>,
@@ -517,6 +521,7 @@ impl Default for JobSpec {
             exclusive: false,
             hold: false,
             interactive: false,
+            srun_job: false,
             mail_type: Vec::new(),
             mail_user: None,
             comment: None,
@@ -632,6 +637,10 @@ pub struct Job {
     #[serde(default)]
     pub node_completions: HashMap<String, NodeCompletion>,
 
+    /// Standalone srun: native step dispatch after allocation registration.
+    #[serde(default)]
+    pub srun_step_dispatch: bool,
+
     /// Wall-clock instant the job entered Suspended (None unless currently suspended).
     #[serde(default)]
     pub suspended_at: Option<DateTime<Utc>>,
@@ -686,6 +695,7 @@ impl Job {
             suspended_at: None,
             suspended_secs: 0,
             bb_stage_state: BbStageState::None,
+            srun_step_dispatch: false,
         }
     }
 
