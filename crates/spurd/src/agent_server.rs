@@ -930,6 +930,10 @@ impl SlurmAgent for AgentService {
                 info!(job_id, gpus = ?launch_cfg.gpu_devices, "job launched successfully");
                 let is_root = nix::unistd::geteuid().is_root();
                 let is_container = launch_cfg.container.is_some();
+                // Report the real resolved paths back so the controller can
+                // surface where output actually landed (e.g. the /tmp fallback).
+                let stdout_path = result.stdout_path.clone();
+                let stderr_path = result.stderr_path.clone();
                 let displaced = jobs.insert(
                     job_id,
                     TrackedJob {
@@ -967,6 +971,8 @@ impl SlurmAgent for AgentService {
                 Ok(Response::new(LaunchJobResponse {
                     success: true,
                     error: String::new(),
+                    stdout_path,
+                    stderr_path,
                 }))
             }
             Err(e) => {
@@ -1000,6 +1006,8 @@ impl SlurmAgent for AgentService {
                 Ok(Response::new(LaunchJobResponse {
                     success: false,
                     error: err_msg,
+                    stdout_path: String::new(),
+                    stderr_path: String::new(),
                 }))
             }
         }
@@ -2711,6 +2719,45 @@ mod tests {
             1,
             "GPU allocation must be released after a post-record launch failure"
         );
+    }
+
+    // A successful launch must report the real resolved output path back so the
+    // controller can surface where output landed. With an empty stdout_path the
+    // agent defaults to spur-<id>.out anchored to the job's work_dir.
+    #[tokio::test]
+    async fn launch_reports_resolved_output_paths() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let work_dir = tempfile::tempdir().unwrap();
+        let work_dir_str = work_dir.path().to_string_lossy().to_string();
+
+        let req = Request::new(LaunchJobRequest {
+            job_id: 77,
+            spec: Some(JobSpec {
+                script: "#!/bin/sh\ntrue\n".into(),
+                cpus_per_task: 1,
+                work_dir: work_dir_str.clone(),
+                ..Default::default()
+            }),
+            allocated: Some(ResourceAllocations {
+                cpus: 1,
+                memory_mb: 0,
+                devices: std::collections::HashMap::new(),
+            }),
+            ..Default::default()
+        });
+
+        let resp = svc.launch_job(req).await.expect("launch should succeed");
+        let inner = resp.into_inner();
+        assert!(inner.success, "launch failed: {}", inner.error);
+        let expected = format!("{}/spur-77.out", work_dir_str);
+        assert_eq!(inner.stdout_path, expected);
+        assert_eq!(inner.stderr_path, expected);
     }
 
     // The monitor loop's reconcile step must reclaim an

@@ -2109,8 +2109,14 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         exit_code: job.exit_code.unwrap_or(0),
         exit_signal: job.exit_signal,
         derived_exit_code: job.derived_exit_code,
-        stdout_path: job.resolved_stdout(),
-        stderr_path: job.resolved_stderr(),
+        stdout_path: job
+            .actual_stdout_path
+            .clone()
+            .unwrap_or_else(|| job.resolved_stdout()),
+        stderr_path: job
+            .actual_stderr_path
+            .clone()
+            .unwrap_or_else(|| job.resolved_stderr()),
         stdin_path: job.resolved_stdin().unwrap_or_default(),
         resources: job.allocated_resources.as_ref().map(allocations_to_proto),
         priority: job.priority,

@@ -662,6 +662,14 @@ pub struct Job {
     /// once it completes. A BB job is held off dispatch until `Ready`.
     #[serde(default)]
     pub bb_stage_state: BbStageState,
+
+    /// Absolute output path the primary node's agent actually resolved at launch
+    /// (including the `/tmp` fallback). `None` until launch; queries fall back to
+    /// the computed `resolved_stdout`/`resolved_stderr` while unset.
+    #[serde(default)]
+    pub actual_stdout_path: Option<String>,
+    #[serde(default)]
+    pub actual_stderr_path: Option<String>,
 }
 
 impl Job {
@@ -706,6 +714,8 @@ impl Job {
             suspended_secs: 0,
             bb_stage_state: BbStageState::None,
             srun_step_dispatch: false,
+            actual_stdout_path: None,
+            actual_stderr_path: None,
         }
     }
 
@@ -813,6 +823,14 @@ impl Job {
             result = result.replace("%N", node);
         }
         result = result.replace("%u", &self.spec.user);
+        // Anchor relative patterns to the job's work_dir so the reported path is
+        // absolute (matching Slurm), mirroring how the agent joins its work_dir.
+        if std::path::Path::new(&result).is_relative() && !self.spec.work_dir.is_empty() {
+            result = std::path::Path::new(&self.spec.work_dir)
+                .join(&result)
+                .to_string_lossy()
+                .into_owned();
+        }
         result
     }
 }
@@ -969,6 +987,45 @@ mod tests {
     fn effective_memory_mb_defaults_to_zero_when_unset() {
         let spec = JobSpec::default();
         assert_eq!(effective_memory_mb(&spec, 1), 0);
+    }
+
+    #[test]
+    fn resolved_stdout_default_is_absolute_under_work_dir() {
+        let job = Job::new(
+            7,
+            JobSpec {
+                work_dir: "/home/alice".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.resolved_stdout(), "/home/alice/spur-7.out");
+        assert_eq!(job.resolved_stderr(), "/home/alice/spur-7.out");
+    }
+
+    #[test]
+    fn resolved_stdout_relative_pattern_joined_and_substituted() {
+        let job = Job::new(
+            42,
+            JobSpec {
+                work_dir: "/work".into(),
+                stdout_path: Some("out-%j.log".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.resolved_stdout(), "/work/out-42.log");
+    }
+
+    #[test]
+    fn resolved_stdout_absolute_pattern_passes_through() {
+        let job = Job::new(
+            9,
+            JobSpec {
+                work_dir: "/work".into(),
+                stdout_path: Some("/shared/job-%j.out".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.resolved_stdout(), "/shared/job-9.out");
     }
 
     #[test]
@@ -1535,9 +1592,16 @@ mod tests {
         job.job_id = 42;
         job.spec.name = "train".into();
         job.spec.user = "bob".into();
+        job.spec.work_dir = "/work".into();
 
-        assert_eq!(job.resolve_path("spur-%j.out"), "spur-42.out");
-        assert_eq!(job.resolve_path("output-%x-%u.log"), "output-train-bob.log");
+        // Relative patterns are anchored to work_dir (absolute), matching Slurm.
+        assert_eq!(job.resolve_path("spur-%j.out"), "/work/spur-42.out");
+        assert_eq!(
+            job.resolve_path("output-%x-%u.log"),
+            "/work/output-train-bob.log"
+        );
+        // Absolute patterns pass through unchanged.
+        assert_eq!(job.resolve_path("/abs/out-%j.log"), "/abs/out-42.log");
     }
 
     #[test]
@@ -1612,10 +1676,12 @@ mod tests {
     fn resolved_stdin_expands_pattern() {
         let spec = JobSpec {
             stdin_path: Some("input-%j.txt".into()),
+            work_dir: "/work".into(),
             ..Default::default()
         };
         let job = Job::new(42, spec);
-        assert_eq!(job.resolved_stdin(), Some("input-42.txt".into()));
+        // Relative stdin is anchored to work_dir, mirroring stdout/stderr.
+        assert_eq!(job.resolved_stdin(), Some("/work/input-42.txt".into()));
     }
 
     #[test]

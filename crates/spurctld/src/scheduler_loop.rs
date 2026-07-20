@@ -762,11 +762,17 @@ struct AgentDispatchParams<'a> {
     run_attempt: u32,
 }
 
+/// Resolved output paths reported by an agent after a successful launch.
+struct LaunchOutcome {
+    stdout_path: String,
+    stderr_path: String,
+}
+
 /// Send a LaunchJob RPC to a node agent.
 async fn dispatch_to_agent(
     agent_addr: &str,
     params: &AgentDispatchParams<'_>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<LaunchOutcome> {
     let mut client = SlurmAgentClient::connect(agent_addr.to_string())
         .await?
         .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
@@ -876,7 +882,10 @@ async fn dispatch_to_agent(
         anyhow::bail!("agent rejected job: {}", inner.error);
     }
 
-    Ok(())
+    Ok(LaunchOutcome {
+        stdout_path: inner.stdout_path,
+        stderr_path: inner.stderr_path,
+    })
 }
 
 /// Outcome of parallel RegisterJobAllocation RPCs for a standalone srun job.
@@ -1052,6 +1061,11 @@ async fn dispatch_job_to_nodes(
     let mut succeeded_nodes: Vec<String> = Vec::new();
     let total = dispatch_nodes.len() as u32;
 
+    // Batch stdout/stderr live on the primary node (task_offset == 0). Capture
+    // only its resolved paths; the JoinSet completes out of order, so select by
+    // this flag rather than arrival order.
+    let mut primary_outcome: Option<LaunchOutcome> = None;
+
     let mut set = tokio::task::JoinSet::new();
     for (node_idx, node_name) in dispatch_nodes.iter().enumerate() {
         let node_info = cluster.get_node(node_name);
@@ -1072,6 +1086,7 @@ async fn dispatch_job_to_nodes(
         let spec = spec.clone();
         let peer_addrs = peer_addrs.clone();
         let task_offset = node_idx as u32 * tasks_per_node;
+        let is_primary = task_offset == 0;
         let target_node = node_name.clone();
         let result_node = node_name.clone();
         let allocated = per_node_allocs.get(node_name).cloned().unwrap_or_default();
@@ -1091,17 +1106,20 @@ async fn dispatch_job_to_nodes(
                 },
             )
             .await;
-            (result_node, result)
+            (result_node, is_primary, result)
         });
     }
 
     while let Some(result) = set.join_next().await {
         match result {
-            Ok((node_name, Ok(()))) => {
+            Ok((node_name, is_primary, Ok(outcome))) => {
                 successes += 1;
                 succeeded_nodes.push(node_name);
+                if is_primary {
+                    primary_outcome = Some(outcome);
+                }
             }
-            Ok((node_name, Err(e))) => {
+            Ok((node_name, _, Err(e))) => {
                 error!(job_id, node = %node_name, error = %e, "dispatch to agent failed");
                 failures += 1;
             }
@@ -1109,6 +1127,15 @@ async fn dispatch_job_to_nodes(
                 error!(job_id, error = %e, "dispatch task panicked");
                 failures += 1;
             }
+        }
+    }
+
+    // Only surface the primary's paths on a clean launch; a partial/total
+    // failure requeues or evicts the job, leaving it to fall back to the
+    // computed path on the next attempt.
+    if failures == 0 {
+        if let Some(outcome) = primary_outcome {
+            cluster.set_job_output_paths(job_id, outcome.stdout_path, outcome.stderr_path);
         }
     }
 
@@ -1947,12 +1974,18 @@ mod tests {
 
             async fn launch_job(
                 &self,
-                _request: tonic::Request<spur_proto::proto::LaunchJobRequest>,
+                request: tonic::Request<spur_proto::proto::LaunchJobRequest>,
             ) -> Result<tonic::Response<spur_proto::proto::LaunchJobResponse>, tonic::Status>
             {
+                // Echo a path keyed by task_offset so tests can assert the
+                // controller keeps the primary node's (task_offset == 0) path.
+                let req = request.into_inner();
+                let path = format!("/spool/off{}/spur.out", req.task_offset);
                 Ok(tonic::Response::new(spur_proto::proto::LaunchJobResponse {
                     success: true,
                     error: String::new(),
+                    stdout_path: path.clone(),
+                    stderr_path: path,
                 }))
             }
 
@@ -2364,6 +2397,132 @@ mod tests {
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(job.state, JobState::Pending);
             assert!(job.allocated_nodes.is_empty());
+        }
+
+        // Mock agents echo an offset-keyed path; the stored path must be the
+        // primary's (task_offset == 0) regardless of which response arrives first.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn clean_dispatch_stores_primary_node_output_path() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (addr1, _) = spawn_mock_agent().await;
+            let (addr2, _) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr1);
+            register_node_at(&cm, "n2", addr2);
+
+            let spec = JobSpec {
+                name: "multi-out".into(),
+                user: "testuser".into(),
+                num_nodes: 2,
+                num_tasks: 2,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            };
+            let job_id = submit_and_wait(&cm, spec.clone());
+            let spec = cm.get_job(job_id).unwrap().spec;
+
+            let nodes = vec!["n1".to_string(), "n2".to_string()];
+            let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
+                .iter()
+                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+            cm.start_job(
+                job_id,
+                nodes.clone(),
+                ResourceAllocations::with_scalar(2, 0),
+                per_node_allocs.clone(),
+            )
+            .unwrap();
+            settle(&cm, job_id, JobState::Running);
+
+            dispatch_job_to_nodes(
+                cm.clone(),
+                job_id,
+                nodes,
+                spec,
+                Vec::new(),
+                per_node_allocs,
+                "n1,n2".into(),
+                1,
+            )
+            .await;
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(
+                job.actual_stdout_path.as_deref(),
+                Some("/spool/off0/spur.out"),
+                "must store the primary (task_offset==0) node's path"
+            );
+            assert_eq!(
+                job.actual_stderr_path.as_deref(),
+                Some("/spool/off0/spur.out")
+            );
+        }
+
+        // If the primary node fails to launch, the dispatch requeues/evicts the
+        // job and no output path is recorded, so queries fall back to the
+        // computed path.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn failed_primary_leaves_output_path_unset() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            // Primary (n1) is unreachable; secondary (n2) accepts.
+            let bad_addr = unreachable_addr().await;
+            let (good_addr, _) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", bad_addr);
+            register_node_at(&cm, "n2", good_addr);
+
+            let spec = JobSpec {
+                name: "primary-fail".into(),
+                user: "testuser".into(),
+                num_nodes: 2,
+                num_tasks: 2,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            };
+            let job_id = submit_and_wait(&cm, spec.clone());
+            let spec = cm.get_job(job_id).unwrap().spec;
+
+            let nodes = vec!["n1".to_string(), "n2".to_string()];
+            let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
+                .iter()
+                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+            cm.start_job(
+                job_id,
+                nodes.clone(),
+                ResourceAllocations::with_scalar(2, 0),
+                per_node_allocs.clone(),
+            )
+            .unwrap();
+            settle(&cm, job_id, JobState::Running);
+
+            dispatch_job_to_nodes(
+                cm.clone(),
+                job_id,
+                nodes,
+                spec,
+                Vec::new(),
+                per_node_allocs,
+                "n1,n2".into(),
+                1,
+            )
+            .await;
+
+            let job = cm.get_job(job_id).unwrap();
+            assert!(
+                job.actual_stdout_path.is_none(),
+                "a failed dispatch must not record an output path"
+            );
+            assert!(job.actual_stderr_path.is_none());
         }
     }
 

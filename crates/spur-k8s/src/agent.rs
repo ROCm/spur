@@ -441,6 +441,7 @@ impl SlurmAgent for VirtualAgent {
                 Ok(Response::new(LaunchJobResponse {
                     success: true,
                     error: String::new(),
+                    ..Default::default()
                 }))
             }
             Err(kube::Error::Api(e)) if e.code == 409 => {
@@ -448,6 +449,7 @@ impl SlurmAgent for VirtualAgent {
                 Ok(Response::new(LaunchJobResponse {
                     success: true,
                     error: String::new(),
+                    ..Default::default()
                 }))
             }
             Err(e) => {
@@ -455,6 +457,7 @@ impl SlurmAgent for VirtualAgent {
                 Ok(Response::new(LaunchJobResponse {
                     success: false,
                     error: e.to_string(),
+                    ..Default::default()
                 }))
             }
         }

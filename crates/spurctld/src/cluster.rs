@@ -1569,6 +1569,18 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Record the absolute output paths resolved by the primary node's agent at
+    /// launch, so queries can report where output actually landed (including the
+    /// `/tmp` fallback). Advisory metadata: updated directly rather than through
+    /// the WAL, mirroring the non-WAL-tracked fields in `update_job`.
+    pub fn set_job_output_paths(&self, job_id: JobId, stdout_path: String, stderr_path: String) {
+        let mut jobs = self.jobs.write();
+        if let Some(job) = jobs.get_mut(&job_id) {
+            job.actual_stdout_path = Some(stdout_path);
+            job.actual_stderr_path = Some(stderr_path);
+        }
+    }
+
     /// Update node state (admin: drain, resume, etc.)
     ///
     /// When draining a node that still has running jobs, the state is set to

@@ -88,6 +88,26 @@ class TestJobBasics:
         content = cluster.read_output_on_any_node(path)
         assert "J_OK" in content
 
+    def test_scontrol_reports_absolute_output_path(self, cluster):
+        # A relative -o pattern is resolved to an absolute path on the compute
+        # node and reported back, so `scontrol show job` tells the user exactly
+        # where output landed (anchored to the job's work_dir).
+        script = cluster.write_file("test-abspath.sh", "#!/bin/bash\necho ABSPATH_OK\n")
+        sb = cluster.sbatch(
+            ["-J", "test-abspath", "-N", "1", "-D", cluster.remote_dir,
+             "-o", "rel-%j.out", script]
+        )
+        job_id = parse_job_id(sb)
+        assert job_id is not None
+        wait_job(cluster, job_id, timeout=60)
+
+        show = cluster.scontrol("show", "job", str(job_id))
+        expected = f"StdOut={cluster.remote_dir}/rel-{job_id}.out"
+        assert expected in show, f"expected '{expected}' in:\n{show}"
+
+        content = cluster.read_output_on_any_node(f"{cluster.remote_dir}/rel-{job_id}.out")
+        assert "ABSPATH_OK" in content, f"output:\n{content}"
+
 
 class TestJobLifecycle:
     def test_job_cancel(self, cluster):
