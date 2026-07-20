@@ -814,9 +814,10 @@ message CreateK0sJoinTokenResponse {
 }
 
 message GetAdminKubeconfigRequest {
-  // All empty -> the cluster-admin kubeconfig. When `user` is set, the control-plane node mints a
-  // scoped kubeconfig: a bound token for `service_account` in `namespace` (created if absent), with
-  // the admin cluster CA + server. spurctld resolves the SPUR user -> account namespace + SA name.
+  // Empty `user` -> the cluster-admin kubeconfig (namespace/service_account ignored). When `user` is
+  // set, the control-plane node mints a scoped kubeconfig: a bound token for `service_account` in
+  // `namespace` (created if absent), with the admin cluster CA + server. spurctld resolves the SPUR
+  // user -> account namespace + SA name.
   string user = 1;
   string namespace = 2;
   string service_account = 3;

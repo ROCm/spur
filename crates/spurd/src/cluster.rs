@@ -779,6 +779,13 @@ impl K0sAgent {
         namespace: &str,
         service_account: &str,
     ) -> anyhow::Result<String> {
+        // Fail closed: this is the token-minting boundary. Empty inputs must never reach kubectl,
+        // where they could scope a token to an unintended namespace/SA.
+        if user.is_empty() || namespace.is_empty() || service_account.is_empty() {
+            anyhow::bail!(
+                "user_kubeconfig requires non-empty user, namespace, and service_account"
+            );
+        }
         // Ensure the ServiceAccount exists — idempotent (an already-existing SA is fine).
         let create = Command::new(&self.k0s_binary)
             .args([
@@ -1044,5 +1051,24 @@ mod tests {
             sup.unit_status_is(&["is-active"], "active").await,
             "active again after re-write"
         );
+    }
+
+    #[tokio::test]
+    async fn user_kubeconfig_fails_closed_on_empty_inputs() {
+        let agent = K0sAgent::from_config(&spur_core::config::ClusterConfig::default());
+        for (user, ns, sa) in [
+            ("", "spur-acct-x", "spur-user-y"),
+            ("u", "", "spur-user-y"),
+            ("u", "spur-acct-x", ""),
+        ] {
+            let err = agent
+                .user_kubeconfig(user, ns, sa)
+                .await
+                .expect_err("empty input must fail closed before minting a token");
+            assert!(
+                err.to_string().contains("non-empty"),
+                "unexpected error: {err}"
+            );
+        }
     }
 }
