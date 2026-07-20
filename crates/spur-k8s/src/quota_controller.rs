@@ -74,7 +74,14 @@ async fn reconcile_once(
             .context("ListUsers RPC")?
             .into_inner()
             .users;
-        let aq = build_account_quota(&a, &users);
+        // A malformed allocation must not silently uncap the namespace; skip the account instead.
+        let aq = match build_account_quota(&a, &users) {
+            Ok(aq) => aq,
+            Err(e) => {
+                warn!(account = %a.name, error = %e, "skipping account with invalid grp_tres");
+                continue;
+            }
+        };
         // Isolate per-account failures so one bad account can't stall the rest of the reconcile.
         if let Err(e) = apply_account(client, &aq).await {
             warn!(account = %a.name, error = %e, "failed to reconcile account quota");
@@ -84,14 +91,23 @@ async fn reconcile_once(
 }
 
 /// Build the account's projected quota from its `AccountInfo` (the `grp_tres` allocation) and its
-/// member users. Pure — unit-tested.
-pub fn build_account_quota(account: &AccountInfo, users: &[UserInfo]) -> AccountQuota {
-    AccountQuota {
+/// member users. Pure — unit-tested. An empty allocation is uncapped; a non-empty but unparseable
+/// one is an error (fail closed — never silently uncap a namespace).
+pub fn build_account_quota(
+    account: &AccountInfo,
+    users: &[UserInfo],
+) -> anyhow::Result<AccountQuota> {
+    let grp_tres = if account.grp_tres.is_empty() {
+        TresRecord::default()
+    } else {
+        TresRecord::parse(&account.grp_tres)
+            .map_err(|e| anyhow::anyhow!("invalid grp_tres {:?}: {e}", account.grp_tres))?
+    };
+    Ok(AccountQuota {
         account: account.name.clone(),
-        // A malformed allocation string leaves the account uncapped rather than stalling the loop.
-        grp_tres: TresRecord::parse(&account.grp_tres).unwrap_or_default(),
+        grp_tres,
         members: users.iter().map(|u| u.name.clone()).collect(),
-    }
+    })
 }
 
 /// Apply the Namespace + ResourceQuota + LimitRange + Role + RoleBinding for one account. The
@@ -176,7 +192,8 @@ mod tests {
         let aq = build_account_quota(
             &account("physics", "cpu=16,mem=32768,gres/gpu=8"),
             &[user("alice", "physics"), user("bob", "physics")],
-        );
+        )
+        .unwrap();
         assert_eq!(aq.account, "physics");
         assert_eq!(aq.grp_tres.get(TresType::Cpu), 16);
         assert_eq!(aq.grp_tres.get(TresType::Memory), 32768);
@@ -187,9 +204,16 @@ mod tests {
     #[test]
     fn empty_grp_tres_yields_uncapped_allocation() {
         // An account with no allocation string -> empty TresRecord -> ResourceQuota with no caps.
-        let aq = build_account_quota(&account("open", ""), &[]);
+        let aq = build_account_quota(&account("open", ""), &[]).unwrap();
         assert_eq!(aq.grp_tres.get(TresType::Cpu), 0);
         assert!(quota::quota_hard(&aq.grp_tres).is_empty());
         assert!(aq.members.is_empty());
+    }
+
+    #[test]
+    fn malformed_grp_tres_is_an_error_not_uncapped() {
+        // A non-empty but unparseable allocation must fail closed, never silently uncap.
+        let err = build_account_quota(&account("bad", "cpu=notanumber"), &[]);
+        assert!(err.is_err());
     }
 }

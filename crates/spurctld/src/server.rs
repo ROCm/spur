@@ -1782,8 +1782,15 @@ impl SlurmController for ControllerService {
             };
         }
         // Scoped kubeconfig: resolve the user's account -> its namespace + per-user ServiceAccount,
-        // then have the control-plane agent mint a bound token there.
-        let (account, _qos) = self.cluster.association_cache().resolve(&req.user, None);
+        // then have the control-plane agent mint a bound token there. Fail closed if associations
+        // aren't loaded yet — the cache resolves fail-open, which would mint an unscoped token.
+        let cache = self.cluster.association_cache();
+        if !cache.is_loaded() {
+            return Err(Status::unavailable(
+                "associations not loaded yet; retry shortly",
+            ));
+        }
+        let (account, _qos) = cache.resolve(&req.user, None);
         let account = account.ok_or_else(|| {
             Status::not_found(format!(
                 "user '{}' is not associated with any account",

@@ -68,7 +68,7 @@ fn meta(name: &str, namespace: Option<&str>, account: &str) -> ObjectMeta {
     }
 }
 
-/// Map the account allocation to ResourceQuota `hard` entries. CPU (cores) and memory (MB→Mi) are
+/// Map the account allocation to ResourceQuota `hard` entries. CPU (cores) and memory (MB) are
 /// capped on both requests and limits; GPUs go on `requests.amd.com/gpu` (an extended resource). A
 /// dimension left at 0 is omitted (uncapped). Node/Energy/Billing have no pod-level quota analog.
 pub fn quota_hard(grp_tres: &TresRecord) -> BTreeMap<String, Quantity> {
@@ -80,8 +80,9 @@ pub fn quota_hard(grp_tres: &TresRecord) -> BTreeMap<String, Quantity> {
     }
     let mem_mb = grp_tres.get(TresType::Memory);
     if mem_mb > 0 {
-        hard.insert("requests.memory".into(), Quantity(format!("{mem_mb}Mi")));
-        hard.insert("limits.memory".into(), Quantity(format!("{mem_mb}Mi")));
+        // TRES mem is base-10 MB; `M` (not `Mi`) keeps the quota equal to the allocation.
+        hard.insert("requests.memory".into(), Quantity(format!("{mem_mb}M")));
+        hard.insert("limits.memory".into(), Quantity(format!("{mem_mb}M")));
     }
     let gpu = grp_tres.get(TresType::Gpu);
     if gpu > 0 {
@@ -111,17 +112,15 @@ pub fn resource_quota(aq: &AccountQuota) -> ResourceQuota {
     }
 }
 
-/// A LimitRange giving every container a default request, so a pod that omits requests still counts
-/// against the ResourceQuota (otherwise unset-request pods dodge the cap).
+/// A LimitRange giving every container a default *request*, so a pod that omits requests still
+/// counts against the ResourceQuota (otherwise unset-request pods dodge the cap). Deliberately no
+/// default *limit*: forcing an arbitrary small limit would reject ordinary larger pods that omit
+/// limits — the account's ResourceQuota is what actually bounds usage.
 pub fn limit_range(account: &str) -> LimitRange {
     let ns = account_namespace(account);
     let default_request = BTreeMap::from([
         ("cpu".to_string(), Quantity("100m".into())),
         ("memory".to_string(), Quantity("128Mi".into())),
-    ]);
-    let default_limit = BTreeMap::from([
-        ("cpu".to_string(), Quantity("1".into())),
-        ("memory".to_string(), Quantity("1Gi".into())),
     ]);
     LimitRange {
         metadata: meta(LIMITS_NAME, Some(&ns), account),
@@ -129,7 +128,6 @@ pub fn limit_range(account: &str) -> LimitRange {
             limits: vec![LimitRangeItem {
                 type_: "Container".to_string(),
                 default_request: Some(default_request),
-                default: Some(default_limit),
                 ..Default::default()
             }],
         }),
@@ -223,8 +221,8 @@ mod tests {
         let h = quota_hard(&tres(16, 32768, 8));
         assert_eq!(h["requests.cpu"].0, "16");
         assert_eq!(h["limits.cpu"].0, "16");
-        assert_eq!(h["requests.memory"].0, "32768Mi");
-        assert_eq!(h["limits.memory"].0, "32768Mi");
+        assert_eq!(h["requests.memory"].0, "32768M");
+        assert_eq!(h["limits.memory"].0, "32768M");
         assert_eq!(h["requests.amd.com/gpu"].0, "8");
     }
 
@@ -283,6 +281,8 @@ mod tests {
         let item = &lr.spec.unwrap().limits[0];
         assert_eq!(item.type_, "Container");
         assert_eq!(item.default_request.as_ref().unwrap()["cpu"].0, "100m");
-        assert_eq!(item.default.as_ref().unwrap()["memory"].0, "1Gi");
+        assert_eq!(item.default_request.as_ref().unwrap()["memory"].0, "128Mi");
+        // No default limit: it would reject ordinary pods that omit limits.
+        assert!(item.default.is_none());
     }
 }
