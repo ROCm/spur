@@ -980,6 +980,7 @@ message CreateAccountRequest {
   string parent_account = 4;
   double fairshare_weight = 5;
   uint32 max_running_jobs = 6;
+  string grp_tres = 7;
 }
 
 message DeleteAccountRequest {
@@ -999,6 +1000,7 @@ message AccountInfo {
   string parent_account = 4;
   double fairshare_weight = 5;
   uint32 max_running_jobs = 6;
+  string grp_tres = 7;
 }
 
 message AddUserRequest {

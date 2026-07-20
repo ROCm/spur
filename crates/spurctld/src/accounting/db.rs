@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     parent_account  TEXT,
     fairshare_weight INTEGER NOT NULL DEFAULT 1,
     max_running_jobs INTEGER,
+    grp_tres        TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -125,6 +126,7 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reservation TEXT NOT NULL DEFAULT '';
 -- default) must degrade gracefully at read time, not be blocked here.
 ALTER TABLE associations ADD COLUMN IF NOT EXISTS default_qos TEXT;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS grp_wall_min INTEGER;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS grp_tres TEXT;
 "#;
 
 /// Record a job start in the database.
@@ -482,7 +484,9 @@ use chrono::Timelike;
 // Account / User / QOS management (sacctmgr operations)
 // ============================================================
 
-/// Create or update an account.
+/// Create or update an account. Like `upsert_qos`/`add_user`, this is a full
+/// resend on modify, not a partial patch: a `None` `grp_tres` clears it.
+#[allow(clippy::too_many_arguments)]
 pub async fn upsert_account(
     pool: &PgPool,
     name: &str,
@@ -491,18 +495,19 @@ pub async fn upsert_account(
     parent: Option<&str>,
     fairshare: i32,
     max_running_jobs: Option<i32>,
+    grp_tres: Option<&str>,
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"
-        INSERT INTO accounts (name, description, organization, parent_account, fairshare_weight, max_running_jobs)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO accounts (name, description, organization, parent_account, fairshare_weight, max_running_jobs, grp_tres)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (name) DO UPDATE SET
             description = $2, organization = $3, parent_account = $4,
-            fairshare_weight = $5, max_running_jobs = $6
+            fairshare_weight = $5, max_running_jobs = $6, grp_tres = $7
         "#,
     )
     .bind(name).bind(description).bind(organization)
-    .bind(parent).bind(fairshare).bind(max_running_jobs)
+    .bind(parent).bind(fairshare).bind(max_running_jobs).bind(grp_tres)
     .execute(pool).await?;
     Ok(())
 }
@@ -519,7 +524,7 @@ pub async fn delete_account(pool: &PgPool, name: &str) -> anyhow::Result<()> {
 /// List all accounts.
 pub async fn list_accounts(pool: &PgPool) -> anyhow::Result<Vec<AccountRecord>> {
     let rows = sqlx::query(
-        "SELECT name, description, organization, parent_account, fairshare_weight, max_running_jobs FROM accounts ORDER BY name"
+        "SELECT name, description, organization, parent_account, fairshare_weight, max_running_jobs, grp_tres FROM accounts ORDER BY name"
     ).fetch_all(pool).await?;
 
     Ok(rows
@@ -531,6 +536,7 @@ pub async fn list_accounts(pool: &PgPool) -> anyhow::Result<Vec<AccountRecord>> 
             parent: r.get("parent_account"),
             fairshare_weight: r.get("fairshare_weight"),
             max_running_jobs: r.get("max_running_jobs"),
+            grp_tres: r.get("grp_tres"),
         })
         .collect())
 }
@@ -543,6 +549,8 @@ pub struct AccountRecord {
     pub parent: Option<String>,
     pub fairshare_weight: i32,
     pub max_running_jobs: Option<i32>,
+    /// Account resource allocation as a TRES string; None = unlimited.
+    pub grp_tres: Option<String>,
 }
 
 /// Add a user-account association. Like `upsert_account`/`upsert_qos`, this
@@ -1208,7 +1216,7 @@ mod job_history_tests {
             .execute(&pool)
             .await?;
 
-        upsert_account(&pool, &account, "d", "o", None, 1, None).await?;
+        upsert_account(&pool, &account, "d", "o", None, 1, None, None).await?;
         upsert_qos(
             &pool, &qos_name, "d", 0, "off", 1.0, None, None, None, None, None, None, None,
         )
@@ -1278,7 +1286,7 @@ mod job_history_tests {
             .execute(&pool)
             .await?;
 
-        upsert_account(&pool, &account, "d", "o", None, 1, None).await?;
+        upsert_account(&pool, &account, "d", "o", None, 1, None, None).await?;
 
         add_user(
             &pool,
@@ -1388,7 +1396,7 @@ mod job_history_tests {
             .execute(&pool)
             .await?;
 
-        upsert_account(&pool, &account, "d", "o", None, 1, None).await?;
+        upsert_account(&pool, &account, "d", "o", None, 1, None, None).await?;
 
         add_user(
             &pool, &user, &account, "none", true, "", None, None, None, None, None,
@@ -1464,7 +1472,7 @@ mod job_history_tests {
             .execute(&pool)
             .await?;
 
-        upsert_account(&pool, &account, "d", "o", None, 1, None).await?;
+        upsert_account(&pool, &account, "d", "o", None, 1, None, None).await?;
         sqlx::query("INSERT INTO users (name, account, admin_level) VALUES ($1, $2, 'none')")
             .bind(&user)
             .bind(&account)
@@ -1518,7 +1526,7 @@ mod job_history_tests {
             .execute(&pool)
             .await?;
 
-        upsert_account(&pool, &account, "d", "o", None, 1, None).await?;
+        upsert_account(&pool, &account, "d", "o", None, 1, None, None).await?;
         sqlx::query(
             "INSERT INTO associations \
              (user_name, account, max_running_jobs, max_submit_jobs, max_tres_per_job, grp_tres, max_wall_min) \
@@ -1544,6 +1552,50 @@ mod job_history_tests {
             .bind(&user)
             .execute(&pool)
             .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn account_grp_tres_round_trips_and_clears() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let account = format!("spur_acct_grptres_{}", std::process::id());
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+
+        upsert_account(
+            &pool,
+            &account,
+            "d",
+            "o",
+            None,
+            1,
+            None,
+            Some("cpu=16,mem=32768,gres/gpu=8"),
+        )
+        .await?;
+        let got = list_accounts(&pool)
+            .await?
+            .into_iter()
+            .find(|a| a.name == account)
+            .expect("account present");
+        assert_eq!(got.grp_tres.as_deref(), Some("cpu=16,mem=32768,gres/gpu=8"));
+
+        // Full-resend upsert with no allocation clears it (same contract as qos/user).
+        upsert_account(&pool, &account, "d", "o", None, 1, None, None).await?;
+        let got = list_accounts(&pool)
+            .await?
+            .into_iter()
+            .find(|a| a.name == account)
+            .expect("account present");
+        assert_eq!(got.grp_tres, None);
+
         sqlx::query("DELETE FROM accounts WHERE name = $1")
             .bind(&account)
             .execute(&pool)
