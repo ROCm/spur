@@ -990,11 +990,38 @@ fn create_job_spool_dir(job_id: JobId, uid: u32, gid: u32) -> anyhow::Result<Pat
     bail!("failed to create job spool dir: {last_err:?}")
 }
 
+/// Private per-job directory for srun step scripts under the step work dir.
+pub(crate) fn prepare_step_script_dir(
+    work_dir: &str,
+    job_id: JobId,
+    uid: u32,
+    gid: u32,
+) -> anyhow::Result<PathBuf> {
+    let dir = PathBuf::from(work_dir).join(format!(".spur_step_{job_id}"));
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        if should_run_as_user(uid) {
+            use nix::unistd::{Gid, Uid};
+            nix::unistd::chown(&dir, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+                .with_context(|| format!("chown {}", dir.display()))?;
+        }
+    }
+    Ok(dir)
+}
+
 /// Write a scratch file (job script, namespace wrapper) executable. When spurd
 /// is root and the job targets a user, hand ownership to that user and keep the
 /// file private (0700), so only the job and root can read it — matching Slurm's
 /// batch script handling.
-fn write_job_scratch(path: &Path, content: &str, uid: u32, gid: u32) -> anyhow::Result<()> {
+pub(crate) fn write_job_scratch(
+    path: &Path,
+    content: &str,
+    uid: u32,
+    gid: u32,
+) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::write(path, content).with_context(|| format!("write {}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;

@@ -282,6 +282,7 @@ impl ClusterManager {
     /// Submit a new job. If it has an array spec, expand into individual tasks.
     pub fn submit_job(&self, mut spec: JobSpec) -> Result<JobId, SubmitError> {
         apply_default_partition(&mut spec, &self.partitions.read());
+        apply_default_time_limit(&mut spec, &self.partitions.read());
         apply_default_account(&mut spec, &self.association_cache);
         validate_user_account(&spec, &self.association_cache)?;
         self.validate_partition(&spec)?;
@@ -4457,6 +4458,21 @@ fn apply_default_partition(spec: &mut JobSpec, partitions: &[Partition]) {
         } else if let Some(first) = partitions.first() {
             spec.partition = Some(first.name.clone());
         }
+    }
+}
+
+fn apply_default_time_limit(spec: &mut JobSpec, partitions: &[Partition]) {
+    if spec.time_limit.is_some() {
+        return;
+    }
+    let partition = spec
+        .partition
+        .as_deref()
+        .and_then(|name| partitions.iter().find(|p| p.name == name))
+        .or_else(|| partitions.iter().find(|p| p.is_default))
+        .or_else(|| partitions.first());
+    if let Some(minutes) = partition.and_then(|p| p.default_time_minutes) {
+        spec.time_limit = Some(chrono::Duration::minutes(minutes as i64));
     }
 }
 
@@ -9902,6 +9918,47 @@ mod tests {
         ];
         super::apply_default_partition(&mut spec, &partitions);
         assert_eq!(spec.partition.as_deref(), Some("gpu"));
+    }
+
+    #[test]
+    fn apply_default_time_limit_uses_partition_default() {
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: Some(30),
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(30)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_noop_when_set() {
+        let mut spec = basic_spec("j");
+        spec.time_limit = Some(chrono::Duration::minutes(5));
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: Some(30),
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(5)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_skips_when_partition_has_no_default() {
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: None,
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions);
+        assert!(spec.time_limit.is_none());
     }
 
     #[test]

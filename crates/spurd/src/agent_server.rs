@@ -378,6 +378,26 @@ fn build_one_shot_command_script(command: &[String]) -> Result<String, Status> {
     Ok(format!("#!/bin/bash\nexec {joined}\n"))
 }
 
+fn cleanup_step_scripts(dir: &std::path::Path, paths: &[&std::path::Path]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
+struct StepScriptCleanup {
+    dir: std::path::PathBuf,
+    paths: Vec<std::path::PathBuf>,
+}
+
+impl Drop for StepScriptCleanup {
+    fn drop(&mut self) {
+        let path_refs: Vec<&std::path::Path> =
+            self.paths.iter().map(std::path::PathBuf::as_path).collect();
+        cleanup_step_scripts(&self.dir, &path_refs);
+    }
+}
+
 /// Build the bash job script for a launch request.
 ///
 /// A non-empty `script` is used verbatim. Otherwise `argv` is a literal
@@ -1201,7 +1221,9 @@ impl SlurmAgent for AgentService {
             );
         }
         if let Some(err) =
-            spur_core::task_launch::map_cpu_bind_error(&req.environment, step_num_tasks)
+            spur_core::task_launch::map_cpu_bind_error(&req.environment, step_num_tasks).or_else(
+                || spur_core::task_launch::mask_cpu_bind_error(&req.environment, step_num_tasks),
+            )
         {
             return Err(Status::invalid_argument(err));
         }
@@ -1229,55 +1251,59 @@ impl SlurmAgent for AgentService {
             senv.set("OMPI_COMM_WORLD_LOCAL_SIZE", tasks_per_node);
         }
 
-        let (program, program_args) = if num_tasks > 1 || req.label {
-            let user_script_path = format!("{work_dir}/.spur_step_{job_id}_{step_id}_{node_id}.sh");
-            let user_script = build_one_shot_command_script(&req.command)?;
-            std::fs::write(&user_script_path, &user_script)
-                .map_err(|e| Status::internal(format!("failed to write step script: {}", e)))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &user_script_path,
-                    std::fs::Permissions::from_mode(0o755),
-                );
-            }
+        let (program, program_args, step_script_cleanup) = if num_tasks > 1 || req.label {
+            let step_dir =
+                crate::executor::prepare_step_script_dir(&work_dir, job_id, req.uid, req.gid)
+                    .map_err(|e| {
+                        Status::internal(format!("failed to create step script dir: {e}"))
+                    })?;
+            let mut guard = StepScriptCleanup {
+                dir: step_dir.clone(),
+                paths: Vec::new(),
+            };
 
-            let wrapper_path =
-                format!("{work_dir}/.spur_step_wrapper_{job_id}_{step_id}_{node_id}.sh");
+            let user_script_path = step_dir.join(format!("cmd_{node_id}.sh"));
+            let user_script = build_one_shot_command_script(&req.command)?;
+            crate::executor::write_job_scratch(&user_script_path, &user_script, req.uid, req.gid)
+                .map_err(|e| Status::internal(format!("failed to write step script: {e}")))?;
+            guard.paths.push(user_script_path.clone());
+
+            let wrapper_path = step_dir.join(format!("wrapper_{node_id}.sh"));
             let wrapper = if num_tasks > 1 {
-                build_multi_task_wrapper(&user_script_path, num_tasks, Some(&req.environment))
+                build_multi_task_wrapper(
+                    user_script_path.to_string_lossy().as_ref(),
+                    num_tasks,
+                    Some(&req.environment),
+                )
             } else {
                 spur_core::task_launch::build_labeled_single_task_wrapper(
-                    &user_script_path,
+                    user_script_path.to_string_lossy().as_ref(),
                     req.task_offset,
                     Some(&req.environment),
                 )
             };
-            std::fs::write(&wrapper_path, &wrapper)
-                .map_err(|e| Status::internal(format!("failed to write step wrapper: {}", e)))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755));
-            }
+            crate::executor::write_job_scratch(&wrapper_path, &wrapper, req.uid, req.gid)
+                .map_err(|e| Status::internal(format!("failed to write step wrapper: {e}")))?;
+            guard.paths.push(wrapper_path.clone());
 
             if num_tasks > 1 {
                 senv.set("SPUR_TASK_OFFSET", req.task_offset);
             } else {
                 SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0, 1);
             }
-            ("bash".to_string(), vec![wrapper_path])
+            let wrapper_path_string = wrapper_path.to_string_lossy().into_owned();
+            ("bash".to_string(), vec![wrapper_path_string], Some(guard))
         } else {
             SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0, 1);
-            spur_core::task_launch::wrap_command_with_cpu_bind(
+            let (program, args) = spur_core::task_launch::wrap_command_with_cpu_bind(
                 &req.command[0],
                 &req.command[1..],
                 &req.environment,
                 req.task_offset,
-            )
+            );
+            (program, args, None)
         };
+        let _step_script_guard = step_script_cleanup;
 
         let mut cmd = tokio::process::Command::new(&program);
         cmd.args(&program_args).current_dir(&work_dir);
@@ -1353,7 +1379,7 @@ impl SlurmAgent for AgentService {
         }
 
         Ok(Response::new(RunCommandResponse {
-            exit_code: output.status.code().unwrap_or(-1),
+            exit_code: spur_core::process::shell_exit_code(&output.status),
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         }))

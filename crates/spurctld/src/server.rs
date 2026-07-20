@@ -1511,29 +1511,48 @@ impl SlurmController for ControllerService {
         let step_id = req.step_id;
         let label = req.label;
 
-        let mut set = tokio::task::JoinSet::new();
+        struct NodeDispatch {
+            node_name: String,
+            agent_addr: String,
+            node_tasks: spur_core::task_launch::NodeStepTasks,
+        }
+
+        let mut dispatches = Vec::new();
+        let mut dispatch_errors = Vec::new();
+
         for node_tasks in plan {
-            let node_name = job
-                .allocated_nodes
-                .get(node_tasks.node_index as usize)
-                .ok_or_else(|| {
-                    Status::internal(format!(
+            let node_name = match job.allocated_nodes.get(node_tasks.node_index as usize) {
+                Some(name) => name.clone(),
+                None => {
+                    dispatch_errors.push(format!(
                         "step plan references node index {} but job {} has {} nodes",
                         node_tasks.node_index,
                         job_id,
                         job.allocated_nodes.len()
-                    ))
-                })?
-                .clone();
-            let node = self
-                .cluster
-                .get_node(&node_name)
-                .ok_or_else(|| Status::not_found(format!("node {} not found", node_name)))?;
-            let addr = node.address.as_ref().ok_or_else(|| {
-                Status::internal(format!("node {} has no agent address", node_name))
-            })?;
-            let agent_addr = format!("http://{}:{}", addr, node.port);
+                    ));
+                    continue;
+                }
+            };
+            let Some(node) = self.cluster.get_node(&node_name) else {
+                dispatch_errors.push(format!("node {node_name} not found"));
+                continue;
+            };
+            let Some(addr) = node.address.as_ref() else {
+                dispatch_errors.push(format!("node {node_name} has no agent address"));
+                continue;
+            };
+            dispatches.push(NodeDispatch {
+                node_name,
+                agent_addr: format!("http://{}:{}", addr, node.port),
+                node_tasks,
+            });
+        }
 
+        let mut set = tokio::task::JoinSet::new();
+        for dispatch in dispatches {
+            let node_name = dispatch.node_name;
+            let agent_addr = dispatch.agent_addr;
+            let node_tasks = dispatch.node_tasks;
             let command = command.clone();
             let work_dir = work_dir.clone();
             let environment = environment.clone();
@@ -1574,7 +1593,6 @@ impl SlurmController for ControllerService {
         let mut stdout = String::new();
         let mut stderr = String::new();
         let mut ran_nodes = Vec::new();
-        let mut dispatch_errors = Vec::new();
 
         while let Some(result) = set.join_next().await {
             match result {
@@ -1598,6 +1616,7 @@ impl SlurmController for ControllerService {
         }
 
         if !dispatch_errors.is_empty() {
+            max_exit = max_exit.max(1);
             stderr.push_str(&format!(
                 "srun step dispatch errors:\n{}\n",
                 dispatch_errors.join("\n")

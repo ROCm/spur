@@ -120,6 +120,29 @@ fn parse_map_cpu_list(list: &str) -> Vec<String> {
         .collect()
 }
 
+fn parse_mask_cpu_list(mask: &str) -> Vec<String> {
+    parse_map_cpu_list(mask)
+}
+
+fn mask_cpu_bind_bash_prefix(masks: &[&str]) -> String {
+    if masks.len() > 1 {
+        let entries = masks.join(" ");
+        format!(
+            "_CPU_MASK=({entries})\n  \
+             _CPU_IDX=$((SPUR_TASK_OFFSET + LOCAL_RANK))\n  \
+             if [ \"$_CPU_IDX\" -ge ${{#_CPU_MASK[@]}} ]; then\n    \
+               echo \"mask_cpu: rank $_CPU_IDX exceeds CPU mask list (len ${{#_CPU_MASK[@]}})\" >&2\n    \
+               exit 1\n  \
+             fi\n  \
+             taskset ${{_CPU_MASK[$_CPU_IDX]}} "
+        )
+    } else if let Some(mask) = masks.first() {
+        format!("taskset {mask} ")
+    } else {
+        String::new()
+    }
+}
+
 /// Returns an error message when `map_cpu` lists fewer CPUs than `num_tasks`.
 pub fn map_cpu_bind_error(source: &HashMap<String, String>, num_tasks: u32) -> Option<String> {
     if num_tasks == 0 {
@@ -135,6 +158,31 @@ pub fn map_cpu_bind_error(source: &HashMap<String, String>, num_tasks: u32) -> O
         Some(format!(
             "map_cpu lists {} CPU(s) but the step requires {} task(s)",
             cpus.len(),
+            need
+        ))
+    } else {
+        None
+    }
+}
+
+/// Returns an error message when comma-separated `mask_cpu` lists fewer masks than `num_tasks`.
+pub fn mask_cpu_bind_error(source: &HashMap<String, String>, num_tasks: u32) -> Option<String> {
+    if num_tasks == 0 {
+        return None;
+    }
+    let bind = parse_cpu_bind(source);
+    let CpuBind::Mask(mask) = bind else {
+        return None;
+    };
+    let masks = parse_mask_cpu_list(&mask);
+    if masks.len() <= 1 {
+        return None;
+    }
+    let need = num_tasks as usize;
+    if masks.len() < need {
+        Some(format!(
+            "mask_cpu lists {} CPU mask(s) but the step requires {} task(s)",
+            masks.len(),
             need
         ))
     } else {
@@ -159,7 +207,14 @@ fn cpu_bind_bash_prefix(bind: &CpuBind, map_cpus: &[&str]) -> String {
             )
         }
         CpuBind::Map(_) => String::new(),
-        CpuBind::Mask(mask) => format!("taskset {mask} "),
+        CpuBind::Mask(mask) => {
+            let masks: Vec<&str> = mask
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            mask_cpu_bind_bash_prefix(&masks)
+        }
         CpuBind::None | CpuBind::Cores | CpuBind::Threads | CpuBind::Sockets | CpuBind::Ldoms => {
             String::new()
         }
@@ -197,13 +252,24 @@ pub fn wrap_command_with_cpu_bind(
                     .collect(),
             )
         }
-        CpuBind::Mask(mask) => (
-            "taskset".into(),
-            std::iter::once(mask)
-                .chain(std::iter::once(program.to_string()))
-                .chain(args.iter().cloned())
-                .collect(),
-        ),
+        CpuBind::Mask(mask) => {
+            let masks = parse_mask_cpu_list(&mask);
+            let mask_arg = if masks.len() > 1 {
+                let Some(m) = masks.get(global_rank as usize) else {
+                    return (program.to_string(), args.to_vec());
+                };
+                m.clone()
+            } else {
+                masks.first().cloned().unwrap_or_else(|| mask.clone())
+            };
+            (
+                "taskset".into(),
+                std::iter::once(mask_arg)
+                    .chain(std::iter::once(program.to_string()))
+                    .chain(args.iter().cloned())
+                    .collect(),
+            )
+        }
         CpuBind::None | CpuBind::Cores | CpuBind::Threads | CpuBind::Sockets | CpuBind::Ldoms => {
             (program.to_string(), args.to_vec())
         }
@@ -224,6 +290,11 @@ pub fn build_multi_task_wrapper(
     let bind = environment.map(parse_cpu_bind).unwrap_or(CpuBind::None);
     let map_cpus: Vec<&str> = match &bind {
         CpuBind::Map(list) => list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect(),
+        CpuBind::Mask(mask) => mask
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -278,6 +349,11 @@ pub fn build_labeled_single_task_wrapper(
     let bind = environment.map(parse_cpu_bind).unwrap_or(CpuBind::None);
     let map_cpus: Vec<&str> = match &bind {
         CpuBind::Map(list) => list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect(),
+        CpuBind::Mask(mask) => mask
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -411,6 +487,24 @@ mod tests {
     }
 
     #[test]
+    fn mask_cpu_bind_error_when_mask_list_shorter_than_tasks() {
+        let mut env = HashMap::new();
+        env.insert("SPUR_CPU_BIND".into(), "mask_cpu:0x3,0xc".into());
+        assert_eq!(
+            mask_cpu_bind_error(&env, 3).as_deref(),
+            Some("mask_cpu lists 2 CPU mask(s) but the step requires 3 task(s)")
+        );
+        assert_eq!(mask_cpu_bind_error(&env, 2), None);
+    }
+
+    #[test]
+    fn mask_cpu_bind_error_allows_single_mask_for_all_tasks() {
+        let mut env = HashMap::new();
+        env.insert("SPUR_CPU_BIND".into(), "mask_cpu:0x3".into());
+        assert_eq!(mask_cpu_bind_error(&env, 4), None);
+    }
+
+    #[test]
     fn wrap_command_with_cpu_bind_map_uses_list_entry() {
         let mut env = HashMap::new();
         env.insert("SPUR_CPU_BIND".into(), "map_cpu:2,4".into());
@@ -426,6 +520,14 @@ mod tests {
         let (program, args) = wrap_command_with_cpu_bind("hostname", &[], &env, 0);
         assert_eq!(program, "taskset");
         assert_eq!(args, vec!["0x3", "hostname"]);
+    }
+
+    #[test]
+    fn wrap_command_with_cpu_bind_mask_uses_per_rank_entry() {
+        let mut env = HashMap::new();
+        env.insert("SPUR_CPU_BIND".into(), "mask_cpu:0x3,0xc".into());
+        let (_, args) = wrap_command_with_cpu_bind("hostname", &[], &env, 1);
+        assert_eq!(args, vec!["0xc", "hostname"]);
     }
 
     #[test]

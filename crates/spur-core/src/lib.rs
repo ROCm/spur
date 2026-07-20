@@ -15,6 +15,7 @@ pub mod job;
 pub mod k0s;
 pub mod node;
 pub mod partition;
+pub mod process;
 pub mod qos;
 pub mod reservation;
 pub mod resource;

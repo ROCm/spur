@@ -599,7 +599,9 @@ async fn dispatch_step(
 
     let environment = srun_dispatch_environment(args);
     warn_unsupported_cpu_bind(&environment);
-    if let Some(err) = spur_core::task_launch::map_cpu_bind_error(&environment, args.ntasks) {
+    if let Some(err) = spur_core::task_launch::map_cpu_bind_error(&environment, args.ntasks)
+        .or_else(|| spur_core::task_launch::mask_cpu_bind_error(&environment, args.ntasks))
+    {
         anyhow::bail!("{err}");
     }
     let resp = client
@@ -666,26 +668,18 @@ async fn dispatch_step_cancellable(
     client: &mut SlurmControllerClient<tonic::transport::Channel>,
     args: &SrunArgs,
     job_id: u32,
-    user: &str,
+    _user: &str,
     work_dir: &str,
     io: &ResolvedIoPaths,
     cancel_job_on_interrupt: bool,
 ) -> Result<StepDispatchResult> {
+    if cancel_job_on_interrupt {
+        return dispatch_step(client, args, job_id, work_dir, io).await;
+    }
     tokio::select! {
         result = dispatch_step(client, args, job_id, work_dir, io) => result,
         _ = tokio::signal::ctrl_c() => {
-            if cancel_job_on_interrupt {
-                eprintln!("\nsrun: cancelling job {}...", job_id);
-                let _ = client
-                    .cancel_job(CancelJobRequest {
-                        job_id,
-                        signal: 2,
-                        user: user.to_string(),
-                    })
-                    .await;
-            } else {
-                eprintln!("\nsrun: step interrupted");
-            }
+            eprintln!("\nsrun: step interrupted");
             std::process::exit(130);
         }
     }
@@ -710,6 +704,8 @@ async fn run_standalone_srun(args: &SrunArgs, hooks: &HooksConfig, work_dir: &st
         .job_id;
 
     eprintln!("srun: Pending job allocation {}...", job_id);
+
+    install_ctrl_c_cancel(client.clone(), job_id, user.clone());
 
     let nodelist = wait_for_job_running(&mut client, job_id).await?;
     if !nodelist.is_empty() {
@@ -747,8 +743,6 @@ async fn run_standalone_srun(args: &SrunArgs, hooks: &HooksConfig, work_dir: &st
         )
         .await;
     }
-
-    install_ctrl_c_cancel(client.clone(), job_id, user.clone());
 
     let output_streamed = if io.stdout.is_empty() {
         try_stream_output(&mut client, &nodelist, job_id).await
