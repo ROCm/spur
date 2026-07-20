@@ -906,16 +906,7 @@ impl SlurmAgent for AgentService {
                 // `launching` (which would let reconcile reclaim it).
                 self.allocation.lock().await.commit_job(job_id);
                 info!(job_id, gpus = ?launch_cfg.gpu_devices, "job launched successfully");
-                // Re-dispatch onto the same node reuses job_id. If an older run
-                // is still tracked (its process ignored SIGTERM and outlived the
-                // requeue), the insert would drop its Child without killing it —
-                // an orphaned runaway. SIGKILL it before overwriting.
-                if let Some(old) = jobs.get(&job_id) {
-                    if old.run_attempt < run_attempt {
-                        let _ = old.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
-                    }
-                }
-                jobs.insert(
+                let displaced = jobs.insert(
                     job_id,
                     TrackedJob {
                         job: result.job,
@@ -935,6 +926,21 @@ impl SlurmAgent for AgentService {
                         run_attempt,
                     },
                 );
+                drop(jobs);
+                // Re-dispatch onto the same node reuses job_id and displaces an
+                // older run. If its process ignored SIGTERM and outlived the
+                // requeue, kill and reap it here — the monitor loop no longer
+                // tracks it, so without this it would leak as an orphan/zombie.
+                if let Some(mut old) = displaced {
+                    if old.run_attempt < run_attempt {
+                        let _ = old.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
+                        tokio::spawn(async move {
+                            if let executor::RunningJob::Managed { child, .. } = &mut old.job {
+                                let _ = child.wait().await;
+                            }
+                        });
+                    }
+                }
                 Ok(Response::new(LaunchJobResponse {
                     success: true,
                     error: String::new(),
