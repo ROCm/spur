@@ -625,6 +625,11 @@ pub struct Job {
     #[serde(default)]
     pub preempt_requeue_count: u32,
 
+    /// Monotonic run epoch, bumped on each dispatch (first dispatch = 1). Lets
+    /// the controller drop a completion report from a superseded run.
+    #[serde(default)]
+    pub run_attempt: u32,
+
     // Heterogeneous job support
     /// Links het job components to the first component's job ID.
     #[serde(default)]
@@ -689,6 +694,7 @@ impl Job {
             derived_exit_code: 0,
             requeue_count: 0,
             preempt_requeue_count: 0,
+            run_attempt: 0,
             het_job_id: None,
             het_group: None,
             node_completions: HashMap::new(),

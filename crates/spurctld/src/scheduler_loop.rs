@@ -279,17 +279,20 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                     assignment.per_node_alloc.clone(),
                 )
             };
-            if let Err(e) = start_result {
-                if spec.srun_job && srun_step_dispatch {
-                    cancel_job_on_nodes(&cluster, job_id, &dispatch_nodes, 0).await;
+            let run_attempt = match start_result {
+                Ok(attempt) => attempt,
+                Err(e) => {
+                    if spec.srun_job && srun_step_dispatch {
+                        cancel_job_on_nodes(&cluster, job_id, &dispatch_nodes, 0).await;
+                    }
+                    debug!(
+                        job_id = assignment.job_id,
+                        error = %e,
+                        "failed to start job"
+                    );
+                    continue;
                 }
-                debug!(
-                    job_id = assignment.job_id,
-                    error = %e,
-                    "failed to start job"
-                );
-                continue;
-            }
+            };
 
             // Run PrologSlurmctld if configured
             if let Some(ref prolog_ctld) = cluster.config.hooks.prolog_slurmctld {
@@ -359,6 +362,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                         per_node_allocs,
                         allocated_nodelist,
                         tasks_per_node,
+                        run_attempt,
                     ));
                 }
             } else {
@@ -371,6 +375,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                     per_node_allocs,
                     allocated_nodelist,
                     tasks_per_node,
+                    run_attempt,
                 ));
             }
         }
@@ -755,6 +760,7 @@ struct AgentDispatchParams<'a> {
     target_node: &'a str,
     allocated: &'a spur_core::resource::ResourceAllocations,
     allocated_nodelist: &'a str,
+    run_attempt: u32,
 }
 
 /// Send a LaunchJob RPC to a node agent.
@@ -855,6 +861,7 @@ async fn dispatch_to_agent(
             // Controller-assigned at array expansion; consumed agent-side.
             array_job_id: spec.array_job_id.unwrap_or(0),
             array_task_id: spec.array_task_id.unwrap_or(0),
+            run_attempt: params.run_attempt,
         })
         .await?;
 
@@ -1034,6 +1041,7 @@ async fn dispatch_job_to_nodes(
     per_node_allocs: std::collections::HashMap<String, spur_core::resource::ResourceAllocations>,
     allocated_nodelist: String,
     tasks_per_node: u32,
+    run_attempt: u32,
 ) {
     let mut successes = 0u32;
     let mut failures = 0u32;
@@ -1075,6 +1083,7 @@ async fn dispatch_job_to_nodes(
                     target_node: &target_node,
                     allocated: &allocated,
                     allocated_nodelist: &allocated_nodelist,
+                    run_attempt,
                 },
             )
             .await;
@@ -2234,13 +2243,14 @@ mod tests {
                 .iter()
                 .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
                 .collect();
-            cm.start_job(
-                job_id,
-                nodes.clone(),
-                ResourceAllocations::with_scalar(2, 0),
-                per_node_allocs.clone(),
-            )
-            .unwrap();
+            let run_attempt = cm
+                .start_job(
+                    job_id,
+                    nodes.clone(),
+                    ResourceAllocations::with_scalar(2, 0),
+                    per_node_allocs.clone(),
+                )
+                .unwrap();
             settle(&cm, job_id, JobState::Running);
 
             // This calls the exact same function `run()` spawns per assignment:
@@ -2256,6 +2266,7 @@ mod tests {
                 per_node_allocs,
                 "n1,n2".into(),
                 1,
+                run_attempt,
             )
             .await;
 
@@ -2330,6 +2341,7 @@ mod tests {
                 Vec::new(),
                 per_node_allocs,
                 "n1,n2".into(),
+                1,
                 1,
             )
             .await;

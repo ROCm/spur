@@ -958,6 +958,7 @@ impl SlurmController for ControllerService {
                 &req.reporting_node,
                 req.exit_code,
                 req.signal,
+                req.run_attempt,
             ))
         } else {
             None
@@ -993,6 +994,15 @@ impl SlurmController for ControllerService {
                     job_id = req.job_id,
                     node = %req.reporting_node,
                     "duplicate completion report for terminal job"
+                );
+                Ok(Response::new(()))
+            }
+            Some(Ok(NodeCompleteResult::StaleReport)) => {
+                warn!(
+                    job_id = req.job_id,
+                    node = %req.reporting_node,
+                    run_attempt = req.run_attempt,
+                    "ignoring completion report from superseded run"
                 );
                 Ok(Response::new(()))
             }

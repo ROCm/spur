@@ -45,6 +45,9 @@ pub enum WalOperation {
         /// Standalone srun: native step dispatch (false = K8s batch fallback).
         #[serde(default)]
         srun_step_dispatch: bool,
+        /// Run epoch for this dispatch (0 for pre-upgrade entries).
+        #[serde(default)]
+        run_attempt: u32,
     },
     JobComplete {
         job_id: JobId,
@@ -235,6 +238,7 @@ impl WalOperation {
             resources,
             per_node_alloc,
             srun_step_dispatch: false,
+            run_attempt: 0,
         }
     }
 }

@@ -524,6 +524,9 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                     drain_node: false,
                     drain_reason: String::new(),
                     reporting_node,
+                    // K8s operator doesn't track run epochs; 0 disables the
+                    // controller-side staleness check for this report.
+                    run_attempt: 0,
                 };
                 if let Err(e) = ctrl.report_job_status(req).await {
                     error!(job_id, error = %e, "failed to report job status");

@@ -657,6 +657,9 @@ message LaunchJobRequest {
   // array_job_id is the parent id (0 = not an array task); exported as SLURM_ARRAY_*.
   uint32 array_job_id = 7;
   uint32 array_task_id = 8;
+  // Run epoch for this dispatch; agent echoes it in ReportJobStatusRequest so
+  // the controller can drop stale-run reports. 0 = unset (legacy), check off.
+  uint32 run_attempt = 9;
 }
 
 message LaunchJobResponse {
@@ -967,6 +970,9 @@ message ReportJobStatusRequest {
   string drain_reason = 6; // Reason for drain request
   string reporting_node = 7; // Hostname of the reporting agent (for drain targeting)
   int32 signal = 8;  // Terminating signal of the reporting node's process (0 = none)
+  // Echoed from LaunchJobRequest.run_attempt; controller drops this report if
+  // older than the job's current epoch. 0 = unset (legacy), check off.
+  uint32 run_attempt = 9;
 }
 
 // ============================================================
