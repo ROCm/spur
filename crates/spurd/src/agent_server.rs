@@ -2714,8 +2714,6 @@ mod tests {
             };
             (t, pid)
         }
-        let alive = |pid: i32| std::path::Path::new(&format!("/proc/{pid}")).exists();
-
         let job_id = 902;
         let (run1, pid1) = spawn_trap(1);
         svc.insert_test_job(job_id, run1).await;
@@ -2728,17 +2726,21 @@ mod tests {
         svc.insert_test_job(job_id, run2).await;
 
         // Wait past the 5s grace period; the guard must skip the SIGKILL, so the
-        // epoch-2 process stays alive.
+        // epoch-2 process stays alive. Assert a live state ('S'/'R'), not mere
+        // /proc existence — a wrongly-killed unreaped child would be a zombie
+        // ('Z'), which still has /proc and would false-pass an existence check.
         tokio::time::sleep(tokio::time::Duration::from_secs(6)).await;
+        let state = proc_state(pid2);
         assert!(
-            alive(pid2),
-            "grace-period SIGKILL wrongly killed the re-dispatched run"
+            matches!(state, 'S' | 'R' | 'D'),
+            "grace-period SIGKILL wrongly killed the re-dispatched run (state {state})"
         );
 
-        // Cleanup: both trap processes ignore SIGTERM, so SIGKILL by pid.
+        // Cleanup: trap processes ignore SIGTERM; SIGKILL each process group
+        // (negative pid) so the inner sleep child is reaped too.
         for pid in [pid1, pid2] {
             let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid),
+                nix::unistd::Pid::from_raw(-pid),
                 nix::sys::signal::Signal::SIGKILL,
             );
         }
