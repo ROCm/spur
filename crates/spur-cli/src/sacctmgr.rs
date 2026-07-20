@@ -128,8 +128,8 @@ const QOS_KEYS: &[&str] = &[
 ];
 
 /// Input keys the `add`/`modify account` handlers read (names + aliases). Gates
-/// mistyped fields the same way `QOS_KEYS` does, so a dropped limit can't read
-/// as "set" but never enforce.
+/// mistyped fields the same way `QOS_KEYS` does, so an unsupported field errors
+/// loudly instead of being silently dropped.
 const ACCOUNT_KEYS: &[&str] = &[
     "name",
     "account",
