@@ -102,16 +102,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         }
     } else {
         // Filter-based cancellation: get matching jobs, then cancel each
-        let states = args
-            .state
-            .as_ref()
-            .map(|s| {
-                s.split(',')
-                    .filter_map(|st| parse_state(st.trim()))
-                    .map(|s| s as i32)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(cancellable_states);
+        let states = filter_states(args.state.as_deref());
 
         let response = client
             .get_jobs(spur_proto::proto::GetJobsRequest {
@@ -166,6 +157,18 @@ fn is_cancellable(proto_state: i32) -> bool {
         Some(state) => !state.is_terminal(),
         None => true,
     }
+}
+
+fn filter_states(state: Option<&str>) -> Vec<i32> {
+    state
+        .map(|states| {
+            states
+                .split(',')
+                .filter_map(|state| parse_state(state.trim()))
+                .map(|state| state as i32)
+                .collect()
+        })
+        .unwrap_or_else(cancellable_states)
 }
 
 fn cancellable_states() -> Vec<i32> {
@@ -232,7 +235,7 @@ mod tests {
 
     #[test]
     fn default_filter_requests_only_cancellable_states() {
-        let states = cancellable_states();
+        let states = filter_states(None);
 
         assert!(states.contains(&(JobState::JobPending as i32)));
         assert!(states.contains(&(JobState::JobRunning as i32)));
@@ -246,6 +249,14 @@ mod tests {
         assert!(!states.contains(&(JobState::JobNodeFail as i32)));
         assert!(!states.contains(&(JobState::JobDeadline as i32)));
         assert!(!states.contains(&(JobState::JobOutOfMemory as i32)));
+    }
+
+    #[test]
+    fn explicit_filter_uses_requested_states() {
+        assert_eq!(
+            filter_states(Some("PD,R")),
+            vec![JobState::JobPending as i32, JobState::JobRunning as i32,]
+        );
     }
 
     #[test]
