@@ -99,7 +99,7 @@ runtime-only changes not reflected in the file are overwritten.
 to match the file), ``[[nodes]]`` features and weight, ``licenses``,
 ``burst_buffer``, ``[hooks]``, ``[notifications]``, ``[federation]``,
 ``[power]`` suspend/resume commands, ``[admission]`` mode, and the
-``[scheduler]`` tunables ``complete_wait`` and ``resv_overrun``.
+``[scheduler]`` tunables ``complete_wait_secs`` and ``resv_overrun_minutes``.
 
 **Restart-only**: settings baked in when the daemon starts — listen addresses
 and ports (``[controller]``, ``[metrics]``, ``[rest_api]``), the accounting

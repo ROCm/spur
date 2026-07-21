@@ -895,22 +895,42 @@ async fn send_job_update(controller: &str, req: spur_proto::proto::UpdateJobRequ
     Ok(())
 }
 
+/// The entity a Slurm-style `scontrol` key=value command targets.
+#[derive(Debug, PartialEq, Eq)]
+enum ScontrolEntity {
+    Partition,
+    Reservation,
+}
+
+/// Detect the target entity by scanning all params for `PartitionName=` /
+/// `ReservationName=`. Slurm key=value syntax is order-independent, so the
+/// marker may appear anywhere. Errors if both markers are present; returns
+/// `None` when neither is (the caller picks the default, e.g. job/node update).
+fn detect_entity(params: &[String]) -> Result<Option<ScontrolEntity>> {
+    let present = |marker: &str| {
+        params.iter().any(|p| {
+            p.split_once('=')
+                .is_some_and(|(k, _)| k.eq_ignore_ascii_case(marker))
+        })
+    };
+    match (present("PartitionName"), present("ReservationName")) {
+        (true, true) => {
+            anyhow::bail!("scontrol: specify only one of PartitionName= or ReservationName=")
+        }
+        (true, false) => Ok(Some(ScontrolEntity::Partition)),
+        (false, true) => Ok(Some(ScontrolEntity::Reservation)),
+        (false, false) => Ok(None),
+    }
+}
+
 /// Parse key=value pairs from a Slurm-style `scontrol create` command and
 /// dispatch to the appropriate create handler (partition or reservation).
 async fn parse_and_create(controller: &str, params: &[String]) -> Result<()> {
-    // Find the entity type from the first key.
-    let entity = params.iter().find_map(|p| {
-        let (k, _) = p.split_once('=')?;
-        Some(k.to_lowercase())
-    });
-
-    match entity.as_deref() {
-        Some("partitionname") => parse_and_create_partition(controller, params).await,
-        Some("reservationname") => parse_and_create_reservation(controller, params).await,
-        other => anyhow::bail!(
-            "scontrol create: unknown entity '{}';\n\
-             expected PartitionName=<name> or ReservationName=<name>",
-            other.unwrap_or("<none>")
+    match detect_entity(params)? {
+        Some(ScontrolEntity::Partition) => parse_and_create_partition(controller, params).await,
+        Some(ScontrolEntity::Reservation) => parse_and_create_reservation(controller, params).await,
+        None => anyhow::bail!(
+            "scontrol create: expected PartitionName=<name> or ReservationName=<name>"
         ),
     }
 }
@@ -1038,51 +1058,34 @@ async fn parse_and_create_reservation(controller: &str, params: &[String]) -> Re
 /// Parse key=value pairs from a Slurm-style `scontrol delete` command and
 /// dispatch to the appropriate delete handler.
 async fn parse_and_delete(controller: &str, params: &[String]) -> Result<()> {
-    let entity = params.iter().find_map(|p| {
-        let (k, _) = p.split_once('=')?;
-        Some(k.to_lowercase())
-    });
+    let value_for = |marker: &str| {
+        params.iter().find_map(|p| {
+            let (k, v) = p.split_once('=')?;
+            k.eq_ignore_ascii_case(marker).then(|| v.to_string())
+        })
+    };
 
-    match entity.as_deref() {
-        Some("partitionname") => {
-            let name = params
-                .iter()
-                .find_map(|p| {
-                    let (k, v) = p.split_once('=')?;
-                    (k.to_lowercase() == "partitionname").then(|| v.to_string())
-                })
+    match detect_entity(params)? {
+        Some(ScontrolEntity::Partition) => {
+            let name = value_for("PartitionName")
                 .ok_or_else(|| anyhow::anyhow!("scontrol delete: PartitionName= value missing"))?;
             delete_partition(controller, &name).await
         }
-        Some("reservationname") => {
-            let name = params
-                .iter()
-                .find_map(|p| {
-                    let (k, v) = p.split_once('=')?;
-                    (k.to_lowercase() == "reservationname").then(|| v.to_string())
-                })
-                .ok_or_else(|| {
-                    anyhow::anyhow!("scontrol delete: ReservationName= value missing")
-                })?;
+        Some(ScontrolEntity::Reservation) => {
+            let name = value_for("ReservationName").ok_or_else(|| {
+                anyhow::anyhow!("scontrol delete: ReservationName= value missing")
+            })?;
             delete_reservation(controller, &name).await
         }
-        other => anyhow::bail!(
-            "scontrol delete: unknown entity '{}';\n\
-             expected PartitionName=<name> or ReservationName=<name>",
-            other.unwrap_or("<none>")
+        None => anyhow::bail!(
+            "scontrol delete: expected PartitionName=<name> or ReservationName=<name>"
         ),
     }
 }
 
 /// Parse "key=value" params from `scontrol update` command.
 async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
-    // Check entity type first.
-    let entity = params.iter().find_map(|p| {
-        let (k, _) = p.split_once('=')?;
-        Some(k.to_lowercase())
-    });
-
-    if let Some("partitionname") = entity.as_deref() {
+    if let Some(ScontrolEntity::Partition) = detect_entity(params)? {
         return parse_and_update_partition(controller, params).await;
     }
 
@@ -1183,10 +1186,13 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
                 "maxtime" => max_time = Some(value.into()),
                 "defaulttime" => default_time = Some(value.into()),
                 "maxnodes" => {
+                    // Last key wins: a later numeric value must undo an earlier clear.
                     if value.eq_ignore_ascii_case("UNLIMITED") || value == "0" {
                         clear_max_nodes = true;
+                        max_nodes = None;
                     } else {
                         max_nodes = value.parse().ok();
+                        clear_max_nodes = false;
                     }
                 }
                 "minnodes" => min_nodes = value.parse().ok(),
@@ -1563,4 +1569,44 @@ async fn delete_reservation(controller: &str, name: &str) -> Result<()> {
 
     println!("Reservation {} deleted", name);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn detect_entity_is_order_independent() {
+        // The entity marker may appear after other keys — Slurm syntax is
+        // order-independent, so detection must scan all params, not just the first.
+        assert_eq!(
+            detect_entity(&p(&["Nodes=n1", "PartitionName=gpu"])).unwrap(),
+            Some(ScontrolEntity::Partition)
+        );
+        assert_eq!(
+            detect_entity(&p(&["Flags=MAINT", "ReservationName=maint"])).unwrap(),
+            Some(ScontrolEntity::Reservation)
+        );
+        assert_eq!(
+            detect_entity(&p(&["State=DOWN", "PartitionName=gpu"])).unwrap(),
+            Some(ScontrolEntity::Partition)
+        );
+    }
+
+    #[test]
+    fn detect_entity_none_when_no_marker() {
+        assert_eq!(
+            detect_entity(&p(&["JobId=5", "Priority=10"])).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn detect_entity_rejects_both_markers() {
+        assert!(detect_entity(&p(&["PartitionName=gpu", "ReservationName=maint"])).is_err());
+    }
 }

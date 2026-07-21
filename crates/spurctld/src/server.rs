@@ -100,11 +100,21 @@ impl LeaderProxy {
 /// `reconfigure` (see the field doc). Falls back to a shared default so
 /// key-less dev clusters interoperate.
 fn resolve_startup_jwt_key(config: &spur_core::config::SlurmConfig) -> String {
-    config
-        .auth
-        .jwt_key
-        .clone()
-        .unwrap_or_else(|| "spur-default-key".to_string())
+    if let Some(key) = &config.auth.jwt_key {
+        return key.clone();
+    }
+    // Token admission signs/verifies node tokens with this key. A well-known
+    // default is trivially forgeable by anyone who can reach the controller.
+    if matches!(
+        config.admission.mode,
+        spur_core::config::AdmissionMode::Token
+    ) {
+        warn!(
+            "admission.mode=Token but auth.jwt_key is unset: node tokens are signed with a \
+             well-known default key and are forgeable. Set auth.jwt_key to a secret value."
+        );
+    }
+    "spur-default-key".to_string()
 }
 
 impl ControllerService {
