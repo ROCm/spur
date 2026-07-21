@@ -30,6 +30,10 @@ pub struct SrunArgs {
     #[arg(short = 'A', long)]
     pub account: Option<String>,
 
+    /// QoS
+    #[arg(short = 'q', long)]
+    pub qos: Option<String>,
+
     /// Number of nodes
     #[arg(short = 'N', long, default_value = "1")]
     pub nodes: u32,
@@ -250,6 +254,12 @@ fn resolve_srun_env(matches: &ArgMatches, args: &mut SrunArgs) -> Result<()> {
         ],
         &mut args.account,
     );
+    apply_str(
+        matches,
+        "qos",
+        &["SPUR_QOS", "SPUR_JOB_QOS", "SLURM_QOS", "SLURM_JOB_QOS"],
+        &mut args.qos,
+    );
     apply_num(
         matches,
         "nodes",
@@ -458,6 +468,7 @@ fn build_srun_job_spec(args: &SrunArgs, work_dir: &str, io: &ResolvedIoPaths) ->
             .unwrap_or_else(|| args.command[0].clone()),
         partition: args.partition.clone().unwrap_or_default(),
         account: args.account.clone().unwrap_or_default(),
+        qos: args.qos.clone().unwrap_or_default(),
         user: whoami::username().unwrap_or_else(|_| "unknown".into()),
         uid: nix::unistd::getuid().as_raw(),
         gid: nix::unistd::getgid().as_raw(),
@@ -1274,6 +1285,41 @@ mod tests {
     }
 
     #[test]
+    fn parses_qos_short_and_long() {
+        let short =
+            SrunArgs::try_parse_from(["srun", "-q", "high", "hostname"]).expect("parse short qos");
+        assert_eq!(short.qos.as_deref(), Some("high"));
+
+        let long =
+            SrunArgs::try_parse_from(["srun", "--qos=normal", "hostname"]).expect("parse long qos");
+        assert_eq!(long.qos.as_deref(), Some("normal"));
+    }
+
+    #[test]
+    fn build_srun_job_spec_sets_qos() {
+        let args = SrunArgs::try_parse_from(["srun", "--qos", "high", "hostname"]).expect("parse");
+        let io = ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        };
+        let spec = build_srun_job_spec(&args, "/tmp/work", &io).expect("spec");
+        assert_eq!(spec.qos, "high");
+    }
+
+    #[test]
+    fn build_srun_job_spec_qos_defaults_empty() {
+        let args = SrunArgs::try_parse_from(["srun", "hostname"]).expect("parse");
+        let io = ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        };
+        let spec = build_srun_job_spec(&args, "/tmp/work", &io).expect("spec");
+        assert!(spec.qos.is_empty());
+    }
+
+    #[test]
     fn build_command_script_simple_argv() {
         assert_eq!(
             build_command_script(&["hostname".to_string()]).unwrap(),
@@ -1358,6 +1404,59 @@ mod tests {
         env.set("SLURM_PARTITION", "from-slurm");
         let args = resolve_from(&["srun", "hostname"]);
         assert_eq!(args.partition.as_deref(), Some("from-spur"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn qos_env_default_and_cli_override() {
+        let env = EnvGuard::new();
+        env.set("SLURM_QOS", "high");
+        assert_eq!(
+            resolve_from(&["srun", "hostname"]).qos.as_deref(),
+            Some("high")
+        );
+
+        // CLI wins over env.
+        assert_eq!(
+            resolve_from(&["srun", "--qos=low", "hostname"])
+                .qos
+                .as_deref(),
+            Some("low")
+        );
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn qos_spur_alias_precedes_slurm_twin() {
+        let env = EnvGuard::new();
+        env.set("SPUR_QOS", "from-spur");
+        env.set("SLURM_QOS", "from-slurm");
+        assert_eq!(
+            resolve_from(&["srun", "hostname"]).qos.as_deref(),
+            Some("from-spur")
+        );
+    }
+
+    /// An allocation exports QoS under the `*_JOB_QOS` twin, so srun inside a
+    /// Spur allocation inherits it; the direct input var still takes precedence.
+    #[test]
+    #[serial(env_injection)]
+    fn qos_inherits_allocation_twin() {
+        let env = EnvGuard::new();
+        env.set("SLURM_JOB_QOS", "alloc-qos");
+        assert_eq!(
+            resolve_from(&["srun", "hostname"]).qos.as_deref(),
+            Some("alloc-qos")
+        );
+
+        env.set("SLURM_QOS", "input-qos");
+        assert_eq!(
+            resolve_from(&["srun", "hostname"]).qos.as_deref(),
+            Some("input-qos")
+        );
+
+        let overridden = resolve_from(&["srun", "-q", "cli-qos", "hostname"]);
+        assert_eq!(overridden.qos.as_deref(), Some("cli-qos"));
     }
 
     #[test]
