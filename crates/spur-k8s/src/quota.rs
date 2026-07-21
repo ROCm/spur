@@ -122,7 +122,7 @@ pub fn limit_range(account: &str) -> LimitRange {
     let ns = account_namespace(account);
     let default_request = BTreeMap::from([
         ("cpu".to_string(), Quantity("100m".into())),
-        ("memory".to_string(), Quantity("128Mi".into())),
+        ("memory".to_string(), Quantity("128M".into())),
     ]);
     LimitRange {
         metadata: meta(LIMITS_NAME, Some(&ns), account),
@@ -284,7 +284,7 @@ mod tests {
         let item = &lr.spec.unwrap().limits[0];
         assert_eq!(item.type_, "Container");
         assert_eq!(item.default_request.as_ref().unwrap()["cpu"].0, "100m");
-        assert_eq!(item.default_request.as_ref().unwrap()["memory"].0, "128Mi");
+        assert_eq!(item.default_request.as_ref().unwrap()["memory"].0, "128M");
         // No default limit: it would reject ordinary pods that omit limits.
         assert!(item.default.is_none());
     }

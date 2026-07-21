@@ -169,6 +169,28 @@ impl ControllerService {
     }
 }
 
+/// Resolve a user to the (namespace, ServiceAccount) its scoped kubeconfig must be bound to.
+/// Fails closed if associations aren't loaded yet — the cache resolves fail-open, which would
+/// otherwise mint an unscoped token — and rejects a user with no account.
+fn resolve_user_namespace_sa(
+    cache: &crate::association_cache::AssociationCache,
+    user: &str,
+) -> Result<(String, String), Status> {
+    if !cache.is_loaded() {
+        return Err(Status::unavailable(
+            "associations not loaded yet; retry shortly",
+        ));
+    }
+    let (account, _qos, _allowed_qos) = cache.resolve(user, None);
+    let account = account.ok_or_else(|| {
+        Status::not_found(format!("user '{user}' is not associated with any account"))
+    })?;
+    Ok((
+        spur_core::quota_names::account_namespace(&account),
+        spur_core::quota_names::user_service_account(user),
+    ))
+}
+
 #[tonic::async_trait]
 impl SlurmController for ControllerService {
     async fn submit_job(
@@ -1782,23 +1804,9 @@ impl SlurmController for ControllerService {
             };
         }
         // Scoped kubeconfig: resolve the user's account -> its namespace + per-user ServiceAccount,
-        // then have the control-plane agent mint a bound token there. Fail closed if associations
-        // aren't loaded yet — the cache resolves fail-open, which would mint an unscoped token.
-        let cache = self.cluster.association_cache();
-        if !cache.is_loaded() {
-            return Err(Status::unavailable(
-                "associations not loaded yet; retry shortly",
-            ));
-        }
-        let (account, _qos) = cache.resolve(&req.user, None);
-        let account = account.ok_or_else(|| {
-            Status::not_found(format!(
-                "user '{}' is not associated with any account",
-                req.user
-            ))
-        })?;
-        let namespace = spur_core::quota_names::account_namespace(&account);
-        let sa = spur_core::quota_names::user_service_account(&req.user);
+        // then have the control-plane agent mint a bound token there.
+        let (namespace, sa) =
+            resolve_user_namespace_sa(self.cluster.association_cache(), &req.user)?;
         match crate::cluster_k8s::fetch_user_kubeconfig(&self.cluster, &req.user, &namespace, &sa)
             .await
         {
@@ -2406,6 +2414,32 @@ mod tests {
     use spur_core::job::{JobState, NodeCompleteError};
     use spur_core::reservation::ReservationFlags;
     use tonic::Code;
+
+    #[test]
+    fn resolve_user_namespace_sa_fails_closed_on_cold_cache() {
+        // A not-yet-loaded cache resolves fail-open, so the scoped-kubeconfig path
+        // must reject rather than mint an unscoped (cluster-wide) token.
+        let cache = crate::association_cache::AssociationCache::new();
+        let err = resolve_user_namespace_sa(&cache, "alice").unwrap_err();
+        assert_eq!(err.code(), Code::Unavailable);
+    }
+
+    #[test]
+    fn resolve_user_namespace_sa_rejects_unassociated_user() {
+        let cache = crate::association_cache::AssociationCache::new();
+        cache.set_loaded_without_associations();
+        let err = resolve_user_namespace_sa(&cache, "alice").unwrap_err();
+        assert_eq!(err.code(), Code::NotFound);
+    }
+
+    #[test]
+    fn resolve_user_namespace_sa_derives_namespace_and_sa() {
+        let cache = crate::association_cache::AssociationCache::new();
+        cache.insert_default_account("alice", "physics");
+        let (namespace, sa) = resolve_user_namespace_sa(&cache, "alice").unwrap();
+        assert_eq!(namespace, "spur-acct-physics");
+        assert_eq!(sa, "spur-user-alice");
+    }
 
     #[test]
     fn submit_rpc_status_maps_invalid_argument() {
