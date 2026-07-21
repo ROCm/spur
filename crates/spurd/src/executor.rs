@@ -1303,25 +1303,30 @@ async fn launch_container_job(
                 .collect();
             let c_env_refs: Vec<&std::ffi::CStr> = c_env.iter().map(|s| s.as_c_str()).collect();
 
-            // Build exec args: with or without entrypoint
-            let c_bash = CString::new("/bin/bash").unwrap();
+            // Pick a shell that exists in the container
+            let shell = if Path::new("/bin/bash").exists() {
+                "/bin/bash"
+            } else {
+                "/bin/sh"
+            };
+            let c_shell = CString::new(shell).unwrap();
             let exec_args: Vec<CString> = if let Some(ref ep) = entrypoint {
-                let cmd = format!("{} && /bin/bash /tmp/spur_job_{}.sh", ep, job_id);
+                let cmd = format!("{} && {} /tmp/spur_job_{}.sh", ep, shell, job_id);
                 vec![
-                    c_bash.clone(),
+                    c_shell.clone(),
                     CString::new("-c").unwrap(),
                     CString::new(cmd).unwrap(),
                 ]
             } else {
                 vec![
-                    c_bash.clone(),
+                    c_shell.clone(),
                     CString::new(format!("/tmp/spur_job_{}.sh", job_id)).unwrap(),
                 ]
             };
             let exec_arg_refs: Vec<&std::ffi::CStr> =
                 exec_args.iter().map(|s| s.as_c_str()).collect();
 
-            let _ = nix::unistd::execve(&c_bash, &exec_arg_refs, &c_env_refs);
+            let _ = nix::unistd::execve(&c_shell, &exec_arg_refs, &c_env_refs);
             eprintln!("spur: execve failed: {}", std::io::Error::last_os_error());
             std::process::exit(1);
         }
