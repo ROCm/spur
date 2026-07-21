@@ -8,12 +8,13 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use tracing::{debug, error, info, warn};
 
+use spur_core::node::NodeSource;
 use spur_core::partition::requested_partition_names;
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
     AgentCancelJobRequest, AgentSuspendJobRequest, JobSpec as ProtoJobSpec, LaunchJobRequest,
-    SubmitJobRequest,
+    RegisterJobAllocationRequest, SubmitJobRequest,
 };
 use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::traits::{ClusterState, Scheduler};
@@ -206,13 +207,83 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             let resources =
                 compute_job_allocation(&job, &assignment.nodes, &assignment.per_node_alloc);
 
+            let job_id = assignment.job_id;
+            let spec = job.spec.clone();
+            let all_nodes = assignment.nodes.clone();
+            let per_node_allocs = assignment.per_node_alloc.clone();
+            let dispatch_nodes = all_nodes.clone();
+            let allocated_nodelist = all_nodes.join(",");
+
+            let srun_step_dispatch = spec.srun_job
+                && dispatch_nodes.iter().all(|name| {
+                    cluster
+                        .get_node(name)
+                        .is_some_and(|n| n.source == NodeSource::NativeHost)
+                });
+
+            if spec.srun_job
+                && !srun_step_dispatch
+                && spec.script.as_deref().unwrap_or("").is_empty()
+            {
+                warn!(
+                    job_id,
+                    "srun batch fallback requires a script in the job spec"
+                );
+                if let Err(e) = cluster.requeue_job(job_id) {
+                    error!(job_id, error = %e, "failed to requeue srun job without script");
+                }
+                continue;
+            }
+
+            if spec.srun_job && srun_step_dispatch {
+                match register_allocation_on_nodes(
+                    cluster.clone(),
+                    job_id,
+                    dispatch_nodes.clone(),
+                    &spec,
+                    per_node_allocs.clone(),
+                    allocated_nodelist.clone(),
+                )
+                .await
+                {
+                    AllocationRegisterOutcome::AllFailed => {
+                        if let Err(e) = cluster.requeue_job(job_id) {
+                            error!(job_id, error = %e, "failed to requeue after registration failure");
+                        }
+                        continue;
+                    }
+                    AllocationRegisterOutcome::PartialFailed { succeeded_nodes } => {
+                        cancel_job_on_nodes(&cluster, job_id, &succeeded_nodes, 9).await;
+                        if let Err(e) = cluster.requeue_job(job_id) {
+                            error!(job_id, error = %e, "failed to requeue after partial registration");
+                        }
+                        continue;
+                    }
+                    AllocationRegisterOutcome::AllSucceeded => {}
+                }
+            }
+
             // Transition job to Running
-            if let Err(e) = cluster.start_job(
-                assignment.job_id,
-                assignment.nodes.clone(),
-                resources,
-                assignment.per_node_alloc.clone(),
-            ) {
+            let start_result = if srun_step_dispatch {
+                cluster.start_job_impl(
+                    job_id,
+                    assignment.nodes.clone(),
+                    resources,
+                    assignment.per_node_alloc.clone(),
+                    true,
+                )
+            } else {
+                cluster.start_job(
+                    job_id,
+                    assignment.nodes.clone(),
+                    resources,
+                    assignment.per_node_alloc.clone(),
+                )
+            };
+            if let Err(e) = start_result {
+                if spec.srun_job && srun_step_dispatch {
+                    cancel_job_on_nodes(&cluster, job_id, &dispatch_nodes, 0).await;
+                }
                 debug!(
                     job_id = assignment.job_id,
                     error = %e,
@@ -241,6 +312,9 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                         error = %e,
                         "PrologSlurmctld failed"
                     );
+                    if spec.srun_job && srun_step_dispatch && !job.spec.interactive {
+                        cancel_job_on_nodes(&cluster, job_id, &dispatch_nodes, 0).await;
+                    }
                     if job.spec.interactive {
                         if let Err(ce) = cluster.cancel_job(assignment.job_id, &job.spec.user) {
                             error!(job_id = assignment.job_id, error = %ce, "failed to cancel job after PrologSlurmctld failure");
@@ -255,12 +329,6 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             }
 
             jobs_started_cycle += 1;
-
-            // Dispatch job to ALL assigned nodes
-            let job_id = assignment.job_id;
-            let spec = job.spec.clone();
-            let all_nodes = assignment.nodes.clone();
-            let per_node_allocs = assignment.per_node_alloc.clone();
 
             // Build peer_nodes list with addresses for cross-node communication
             let peer_addrs: Vec<String> = all_nodes
@@ -278,20 +346,34 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 (spec.num_tasks / spec.num_nodes.max(1)).max(1)
             };
 
-            // Collect dispatch tasks to track success/failure
             let cluster_ref = cluster.clone();
-            let dispatch_nodes = all_nodes.clone();
-            let allocated_nodelist = all_nodes.join(",");
-            tokio::spawn(dispatch_job_to_nodes(
-                cluster_ref,
-                job_id,
-                dispatch_nodes,
-                spec,
-                peer_addrs,
-                per_node_allocs,
-                allocated_nodelist,
-                tasks_per_node,
-            ));
+            if spec.srun_job {
+                if !srun_step_dispatch {
+                    let mut batch_spec = spec;
+                    batch_spec.srun_job = false;
+                    tokio::spawn(dispatch_job_to_nodes(
+                        cluster_ref,
+                        job_id,
+                        dispatch_nodes,
+                        batch_spec,
+                        peer_addrs,
+                        per_node_allocs,
+                        allocated_nodelist,
+                        tasks_per_node,
+                    ));
+                }
+            } else {
+                tokio::spawn(dispatch_job_to_nodes(
+                    cluster_ref,
+                    job_id,
+                    dispatch_nodes,
+                    spec,
+                    peer_addrs,
+                    per_node_allocs,
+                    allocated_nodelist,
+                    tasks_per_node,
+                ));
+            }
         }
 
         let cycle_time_us = cycle_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
@@ -627,6 +709,7 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
         exclusive: s.exclusive,
         hold: s.hold,
         interactive: s.interactive,
+        srun_job: s.srun_job,
         mail_type: s.mail_type.clone(),
         mail_user: s.mail_user.clone().unwrap_or_default(),
         comment: s.comment.clone().unwrap_or_default(),
@@ -724,6 +807,7 @@ async fn dispatch_to_agent(
         exclusive: spec.exclusive,
         hold: spec.hold,
         interactive: spec.interactive,
+        srun_job: spec.srun_job,
         comment: spec.comment.clone().unwrap_or_default(),
         wckey: spec.wckey.clone().unwrap_or_default(),
         container_image: spec.container_image.clone().unwrap_or_default(),
@@ -782,6 +866,155 @@ async fn dispatch_to_agent(
     }
 
     Ok(())
+}
+
+/// Outcome of parallel RegisterJobAllocation RPCs for a standalone srun job.
+pub(crate) enum AllocationRegisterOutcome {
+    AllSucceeded,
+    AllFailed,
+    PartialFailed { succeeded_nodes: Vec<String> },
+}
+
+/// Parameters for registering a srun-only allocation on a single node agent.
+struct AllocationRegisterParams {
+    job_id: u32,
+    partition: String,
+    uid: u32,
+    gid: u32,
+    mpi: String,
+    allocated_nodelist: String,
+    allocated: spur_core::resource::ResourceAllocations,
+}
+
+/// Register a srun-only allocation on a node agent without launching a batch process.
+async fn register_allocation_to_agent(
+    agent_addr: &str,
+    params: &AllocationRegisterParams,
+) -> anyhow::Result<()> {
+    let mut client = SlurmAgentClient::connect(agent_addr.to_string())
+        .await?
+        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
+
+    client
+        .register_job_allocation(RegisterJobAllocationRequest {
+            job_id: params.job_id,
+            partition: params.partition.clone(),
+            nodelist: params.allocated_nodelist.clone(),
+            uid: params.uid,
+            gid: params.gid,
+            cpus: params.allocated.cpus,
+            memory_mb: params.allocated.memory_mb,
+            gpu_devices: params
+                .allocated
+                .device_ids("gpu")
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect(),
+            allocated: Some(crate::server::allocations_to_proto(&params.allocated)),
+            mpi: params.mpi.clone(),
+        })
+        .await?;
+
+    info!(
+        job_id = params.job_id,
+        "srun allocation registered on agent successfully"
+    );
+
+    Ok(())
+}
+
+/// Register a srun-only allocation on every assigned node.
+#[allow(clippy::too_many_arguments)]
+async fn register_allocation_on_nodes(
+    cluster: Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    dispatch_nodes: Vec<String>,
+    spec: &spur_core::job::JobSpec,
+    per_node_allocs: std::collections::HashMap<String, spur_core::resource::ResourceAllocations>,
+    allocated_nodelist: String,
+) -> AllocationRegisterOutcome {
+    let mut successes = 0u32;
+    let mut failures = 0u32;
+    let mut succeeded_nodes: Vec<String> = Vec::new();
+    let total = dispatch_nodes.len() as u32;
+
+    let mut set = tokio::task::JoinSet::new();
+    for node_name in &dispatch_nodes {
+        let node_info = cluster.get_node(node_name);
+        let (addr, port) = match node_info {
+            Some(ref n) if n.address.is_some() => (n.address.clone().unwrap(), n.port),
+            _ => {
+                warn!(
+                    job_id,
+                    node = %node_name,
+                    "no agent address for node, skipping allocation registration"
+                );
+                failures += 1;
+                continue;
+            }
+        };
+
+        let agent_addr = format!("http://{}:{}", addr, port);
+        let result_node = node_name.clone();
+        let allocated = per_node_allocs.get(node_name).cloned().unwrap_or_default();
+        let params = AllocationRegisterParams {
+            job_id,
+            partition: spec.partition.clone().unwrap_or_default(),
+            uid: spec.uid,
+            gid: spec.gid,
+            mpi: spec.mpi.clone().unwrap_or_default(),
+            allocated_nodelist: allocated_nodelist.clone(),
+            allocated,
+        };
+        set.spawn(async move {
+            let result = register_allocation_to_agent(&agent_addr, &params).await;
+            (result_node, result)
+        });
+    }
+
+    while let Some(result) = set.join_next().await {
+        match result {
+            Ok((node_name, Ok(()))) => {
+                successes += 1;
+                succeeded_nodes.push(node_name);
+            }
+            Ok((node_name, Err(e))) => {
+                error!(
+                    job_id,
+                    node = %node_name,
+                    error = %e,
+                    "allocation registration on agent failed"
+                );
+                failures += 1;
+            }
+            Err(e) => {
+                error!(job_id, error = %e, "allocation registration task panicked");
+                failures += 1;
+            }
+        }
+    }
+
+    if successes == 0 && total > 0 {
+        error!(job_id, failures, "all allocation registrations failed");
+        AllocationRegisterOutcome::AllFailed
+    } else if failures > 0 {
+        warn!(
+            job_id,
+            successes, failures, "partial allocation registration failure"
+        );
+        AllocationRegisterOutcome::PartialFailed { succeeded_nodes }
+    } else {
+        AllocationRegisterOutcome::AllSucceeded
+    }
+}
+
+/// Release standalone srun allocations on agents after CompleteJob.
+pub async fn release_srun_allocation_on_agents(
+    cluster: &Arc<ClusterManager>,
+    job: &spur_core::job::Job,
+) {
+    send_cancel_to_agents(cluster, job, 0).await;
 }
 
 /// Dispatch a job to every assigned node and act on the aggregate result:
@@ -1745,6 +1978,16 @@ mod tests {
                 Ok(tonic::Response::new(Default::default()))
             }
 
+            async fn register_job_allocation(
+                &self,
+                _request: tonic::Request<spur_proto::proto::RegisterJobAllocationRequest>,
+            ) -> Result<
+                tonic::Response<spur_proto::proto::RegisterJobAllocationResponse>,
+                tonic::Status,
+            > {
+                Ok(tonic::Response::new(Default::default()))
+            }
+
             async fn stream_job_output(
                 &self,
                 _request: tonic::Request<spur_proto::proto::StreamJobOutputRequest>,
@@ -1756,6 +1999,61 @@ mod tests {
                 &self,
                 _request: tonic::Request<tonic::Streaming<spur_proto::proto::AttachJobInput>>,
             ) -> Result<tonic::Response<Self::AttachJobStream>, tonic::Status> {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+
+            // k0s cluster-component + mesh RPCs: not exercised by these scheduler tests.
+            async fn start_cluster_component(
+                &self,
+                _request: tonic::Request<spur_proto::proto::StartClusterComponentRequest>,
+            ) -> Result<
+                tonic::Response<spur_proto::proto::StartClusterComponentResponse>,
+                tonic::Status,
+            > {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+
+            async fn stop_cluster_component(
+                &self,
+                _request: tonic::Request<spur_proto::proto::StopClusterComponentRequest>,
+            ) -> Result<
+                tonic::Response<spur_proto::proto::StopClusterComponentResponse>,
+                tonic::Status,
+            > {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+
+            async fn get_cluster_component_status(
+                &self,
+                _request: tonic::Request<spur_proto::proto::GetClusterComponentStatusRequest>,
+            ) -> Result<
+                tonic::Response<spur_proto::proto::GetClusterComponentStatusResponse>,
+                tonic::Status,
+            > {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+
+            async fn create_k0s_join_token(
+                &self,
+                _request: tonic::Request<spur_proto::proto::CreateK0sJoinTokenRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::CreateK0sJoinTokenResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+
+            async fn get_admin_kubeconfig(
+                &self,
+                _request: tonic::Request<spur_proto::proto::GetAdminKubeconfigRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::GetAdminKubeconfigResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+
+            async fn apply_mesh(
+                &self,
+                _request: tonic::Request<spur_proto::proto::MeshMembership>,
+            ) -> Result<tonic::Response<spur_proto::proto::ApplyMeshResponse>, tonic::Status>
+            {
                 Err(tonic::Status::unimplemented("not used in tests"))
             }
         }
@@ -1820,6 +2118,7 @@ mod tests {
                 network: Default::default(),
                 logging: Default::default(),
                 kubernetes: Default::default(),
+                cluster: Default::default(),
                 notifications: Default::default(),
                 power: Default::default(),
                 federation: Default::default(),

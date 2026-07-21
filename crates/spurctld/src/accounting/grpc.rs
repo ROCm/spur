@@ -5,10 +5,22 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tonic::{Request, Response, Status};
 
+use spur_core::accounting::TresRecord;
 use spur_proto::proto::slurm_accounting_server::{SlurmAccounting, SlurmAccountingServer};
 use spur_proto::proto::*;
 
 use super::{db, fairshare};
+
+/// Reject a TRES string (e.g. `grptres=`/`maxtresperjob=`/`maxtresperuser=`)
+/// that doesn't parse, instead of letting it silently become a no-op limit.
+fn validate_tres(field: &str, raw: &str) -> Result<(), Status> {
+    if raw.is_empty() {
+        return Ok(());
+    }
+    TresRecord::parse(raw)
+        .map(|_| ())
+        .map_err(|e| Status::invalid_argument(format!("invalid {field}: {e}")))
+}
 
 pub(crate) struct AccountingService {
     pool: PgPool,
@@ -212,6 +224,7 @@ impl SlurmAccounting for AccountingService {
                 array_task_id: 0,
                 reservation: r.reservation.clone(),
                 comment: String::new(),
+                srun_step_dispatch: false,
             })
             .collect();
 
@@ -352,6 +365,42 @@ impl SlurmAccounting for AccountingService {
                 )));
             }
         }
+        let max_running_jobs = if req.max_running_jobs == 0 {
+            None
+        } else {
+            Some(
+                i32::try_from(req.max_running_jobs)
+                    .map_err(|_| Status::invalid_argument("max_running_jobs exceeds i32::MAX"))?,
+            )
+        };
+        let max_submit_jobs = if req.max_submit_jobs == 0 {
+            None
+        } else {
+            Some(
+                i32::try_from(req.max_submit_jobs)
+                    .map_err(|_| Status::invalid_argument("max_submit_jobs exceeds i32::MAX"))?,
+            )
+        };
+        validate_tres("maxtresperjob", &req.max_tres_per_job)?;
+        validate_tres("grptres", &req.grp_tres)?;
+        let max_tres_per_job = if req.max_tres_per_job.is_empty() {
+            None
+        } else {
+            Some(req.max_tres_per_job.as_str())
+        };
+        let grp_tres = if req.grp_tres.is_empty() {
+            None
+        } else {
+            Some(req.grp_tres.as_str())
+        };
+        let max_wall_minutes = if req.max_wall_minutes == 0 {
+            None
+        } else {
+            Some(
+                i32::try_from(req.max_wall_minutes)
+                    .map_err(|_| Status::invalid_argument("max_wall_minutes exceeds i32::MAX"))?,
+            )
+        };
         db::add_user(
             &self.pool,
             &req.user,
@@ -359,6 +408,11 @@ impl SlurmAccounting for AccountingService {
             &req.admin_level,
             req.is_default,
             &req.default_qos,
+            max_running_jobs,
+            max_submit_jobs,
+            max_tres_per_job,
+            grp_tres,
+            max_wall_minutes,
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -406,6 +460,9 @@ impl SlurmAccounting for AccountingService {
 
     async fn create_qos(&self, request: Request<CreateQosRequest>) -> Result<Response<()>, Status> {
         let req = request.into_inner();
+        validate_tres("maxtresperjob", &req.max_tres_per_job)?;
+        validate_tres("maxtresperuser", &req.max_tres_per_user)?;
+        validate_tres("grptres", &req.grp_tres)?;
         let max_jobs = if req.max_jobs_per_user == 0 {
             None
         } else {
@@ -444,6 +501,14 @@ impl SlurmAccounting for AccountingService {
         } else {
             Some(req.grp_tres.as_str())
         };
+        let grp_wall = if req.grp_wall_minutes == 0 {
+            None
+        } else {
+            Some(
+                i32::try_from(req.grp_wall_minutes)
+                    .map_err(|_| Status::invalid_argument("grp_wall_minutes exceeds i32::MAX"))?,
+            )
+        };
         db::upsert_qos(
             &self.pool,
             &req.name,
@@ -457,6 +522,7 @@ impl SlurmAccounting for AccountingService {
             max_submit,
             max_tres_user,
             grp_tres,
+            grp_wall,
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -493,6 +559,7 @@ impl SlurmAccounting for AccountingService {
                 max_submit_jobs_per_user: r.max_submit_per_user.unwrap_or(0) as u32,
                 max_tres_per_user: r.max_tres_per_user.unwrap_or_default(),
                 grp_tres: r.grp_tres.unwrap_or_default(),
+                grp_wall_minutes: r.grp_wall_min.unwrap_or(0) as u32,
             })
             .collect();
 
@@ -546,5 +613,33 @@ fn datetime_to_proto(dt: DateTime<Utc>) -> prost_types::Timestamp {
     prost_types::Timestamp {
         seconds: dt.timestamp(),
         nanos: dt.timestamp_subsec_nanos() as i32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_tres_accepts_empty() {
+        assert!(validate_tres("grptres", "").is_ok());
+    }
+
+    #[test]
+    fn validate_tres_accepts_well_formed() {
+        assert!(validate_tres("maxtresperjob", "cpu=8,mem=1024").is_ok());
+    }
+
+    #[test]
+    fn validate_tres_rejects_unit_suffixed_value() {
+        let err = validate_tres("grptres", "mem=1G").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("grptres"));
+    }
+
+    #[test]
+    fn validate_tres_rejects_unknown_type() {
+        let err = validate_tres("maxtresperuser", "bogus=5").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }

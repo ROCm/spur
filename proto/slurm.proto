@@ -160,6 +160,10 @@ message JobSpec {
   map<string, string> container_env = 76; // Extra env vars for container
   string container_entrypoint = 77; // Override entrypoint
   bool container_remap_root = 78;  // Remap user to root inside container
+
+  // Standalone srun: reserve an allocation without launching a batch script;
+  // the user command runs as a job step after nodes are registered.
+  bool srun_job = 82;
 }
 
 message JobInfo {
@@ -204,6 +208,12 @@ message JobInfo {
   string reservation = 52;
 
   string comment = 53;
+
+  // True when standalone srun uses native step dispatch (not K8s batch fallback).
+  // Requires a matching spur CLI: clients that ignore this field against a
+  // step-dispatch controller will poll for batch completion while agents hold
+  // allocation-only state.
+  bool srun_step_dispatch = 54;
 }
 
 message NodeInfo {
@@ -268,6 +278,8 @@ service SlurmController {
   rpc GetJobs(GetJobsRequest) returns (GetJobsResponse);
   rpc GetJob(GetJobRequest) returns (JobInfo);
   rpc CancelJob(CancelJobRequest) returns (google.protobuf.Empty);
+  // Finish a standalone srun allocation after its step completes.
+  rpc CompleteJob(CompleteJobRequest) returns (google.protobuf.Empty);
   rpc SuspendJob(SuspendJobRequest) returns (google.protobuf.Empty);
   rpc ResumeJob(ResumeJobRequest) returns (google.protobuf.Empty);
   rpc UpdateJob(UpdateJobRequest) returns (google.protobuf.Empty);
@@ -324,10 +336,15 @@ service SlurmController {
   // Exec a command inside a running job's container (proxies to correct agent)
   rpc ExecInJob(ExecInJobRequest) returns (ExecInJobResponse);
 
-  // Run a step on one of an allocation's nodes — used by `srun` inside an
-  // `salloc` interactive shell. The controller picks an allocated node and
-  // proxies to its agent's RunCommand RPC (#146).
+  // Run a step across an allocation's nodes — used by srun inside sbatch/salloc
+  // and standalone srun. Fans out tasks via agent RunCommand RPCs.
   rpc RunStep(RunStepRequest) returns (RunStepResponse);
+
+  // -- Native cluster (k0s) lifecycle: SPUR owns the k0s cluster --
+  rpc ClusterUp(ClusterUpRequest) returns (ClusterUpResponse);
+  rpc ClusterDown(ClusterDownRequest) returns (ClusterDownResponse);
+  rpc ClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+  rpc ClusterKubeconfig(ClusterKubeconfigRequest) returns (ClusterKubeconfigResponse);
 }
 
 // -- Agent service (slurmd) --
@@ -338,11 +355,31 @@ service SlurmAgent {
   rpc SuspendJob(AgentSuspendJobRequest) returns (google.protobuf.Empty);
   rpc GetNodeResources(google.protobuf.Empty) returns (NodeResourcesResponse);
   rpc ExecInJob(ExecInJobRequest) returns (ExecInJobResponse);
-  // Run a one-shot command on this node (for srun-in-salloc step dispatch, #146)
+  // Run a one-shot command on this node (for srun step dispatch).
   rpc RunCommand(RunCommandRequest) returns (RunCommandResponse);
+  // Record an allocation on this node without launching a batch process.
+  rpc RegisterJobAllocation(RegisterJobAllocationRequest) returns (RegisterJobAllocationResponse);
   rpc StreamJobOutput(StreamJobOutputRequest) returns (stream StreamJobOutputChunk);
   // Interactive attach: bidirectional streaming for stdin/stdout forwarding
   rpc AttachJob(stream AttachJobInput) returns (stream AttachJobOutput);
+
+  // -- Native cluster component control: the controller drives each node's
+  //    spurd-owned k0s systemd unit through these. --
+  rpc StartClusterComponent(StartClusterComponentRequest) returns (StartClusterComponentResponse);
+  rpc StopClusterComponent(StopClusterComponentRequest) returns (StopClusterComponentResponse);
+  rpc GetClusterComponentStatus(GetClusterComponentStatusRequest) returns (GetClusterComponentStatusResponse);
+
+  // -- Control-plane-only cluster admin: the controller calls these on
+  //    the control-plane node's agent, which shells `k0s` against the running
+  //    controller. Worker joins need a fresh token; ClusterKubeconfig needs the
+  //    admin kubeconfig. Erroring on a non-control-plane node is expected. --
+  rpc CreateK0sJoinToken(CreateK0sJoinTokenRequest) returns (CreateK0sJoinTokenResponse);
+  rpc GetAdminKubeconfig(GetAdminKubeconfigRequest) returns (GetAdminKubeconfigResponse);
+
+  // Apply the full-mesh WireGuard membership on this node: the controller pushes the
+  // authoritative peer set so a native-routing CNI (Calico bird) can ride the mesh. Additive +
+  // idempotent — safe to re-push.
+  rpc ApplyMesh(MeshMembership) returns (ApplyMeshResponse);
 }
 
 // -- Accounting service --
@@ -406,6 +443,12 @@ message GetJobRequest {
 message CancelJobRequest {
   uint32 job_id = 1;
   int32 signal = 2;  // 0 = cancel, else signal number
+  string user = 3;   // For authorization
+}
+
+message CompleteJobRequest {
+  uint32 job_id = 1;
+  int32 exit_code = 2;
   string user = 3;   // For authorization
 }
 
@@ -587,6 +630,10 @@ message HeartbeatRequest {
   uint64 free_memory_mb = 3;
   repeated RunningJobStatus running_jobs = 4;
   string node_token = 5;
+  // This node's current WireGuard mesh public key. Re-sent every heartbeat so the controller
+  // learns a key that appears/changes after registration (late mesh, spur0 recreated) and can
+  // include the node in ApplyMesh without a spurd restart. Empty when the node has no mesh key.
+  string wg_pubkey = 6;
 }
 
 message RunningJobStatus {
@@ -645,8 +692,8 @@ message ExecInJobResponse {
 }
 
 // Controller-side request: run a step inside an allocation. The controller
-// selects a node from the allocation's allocated_nodes and forwards to that
-// agent's RunCommand RPC. Used for srun-in-salloc (#146).
+// fans out tasks across the allocation's nodes via each agent's RunCommand
+// RPC. Used by srun inside sbatch/salloc and standalone srun.
 message RunStepRequest {
   uint32 job_id = 1;
   repeated string command = 2;
@@ -655,13 +702,124 @@ message RunStepRequest {
   string work_dir = 5;
   map<string, string> environment = 6;
   uint32 step_id = 7;  // Step id from CreateJobStep, for recording completion
+  bool label = 8;      // Prefix output lines with [rank] (srun -l)
 }
 
 message RunStepResponse {
-  int32 exit_code = 1;
-  string stdout = 2;
-  string stderr = 3;
-  string node = 4;  // Hostname of the allocated node the command ran on
+  int32 exit_code = 1;   // Max exit code across all tasks in the step
+  string stdout = 2;     // Aggregated stdout from all tasks/nodes
+  string stderr = 3;     // Aggregated stderr from all tasks/nodes
+  string node = 4;       // Comma-separated hostnames that ran tasks
+}
+
+// -- Native cluster (k0s) lifecycle messages --
+
+message ClusterUpRequest {
+  // Override the control-plane node; empty = pick from [cluster] config / inventory.
+  optional string control_plane_node = 1;
+  reserved 2; // was install_arc — ARC is not installed by spur/k0s
+}
+message ClusterUpResponse {
+  bool accepted = 1;
+  string message = 2;
+  repeated ClusterNodeStatus nodes = 3;
+}
+
+message ClusterDownRequest {
+  // Also `k0s reset` each node (destructive: wipes cluster state).
+  bool reset = 1;
+}
+message ClusterDownResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message ClusterStatusRequest {}
+message ClusterStatusResponse {
+  // "down" | "provisioning" | "ready" | "degraded"
+  string phase = 1;
+  string control_plane_node = 2;
+  repeated ClusterNodeStatus nodes = 3;
+}
+
+message ClusterNodeStatus {
+  string node = 1;
+  string role = 2;             // "controller" | "worker" | "single"
+  string component_state = 3;  // systemd active-state: "active" | "inactive" | "failed" | "unknown"
+  bool enabled = 4;
+}
+
+message ClusterKubeconfigRequest {}
+message ClusterKubeconfigResponse {
+  // Admin kubeconfig YAML (server rewritten to the control-plane's mesh IP).
+  string kubeconfig = 1;
+}
+
+// -- Agent-side cluster component control messages --
+
+message StartClusterComponentRequest {
+  string role = 1;             // "controller" | "worker" | "single"
+  // k0s join token (bearer secret — never log). Empty for single / first controller.
+  optional string join_token = 2;
+  // Rendered k0s config YAML. Empty = agent uses role defaults.
+  optional string k0s_config = 3;
+  // Worker kubelet --node-ip (its mesh IP) for native-routing CNIs. Empty = k0s picks the default.
+  optional string node_ip = 4;
+}
+message StartClusterComponentResponse {
+  bool started = 1;
+  string component_state = 2;  // systemd active-state after the action
+  string message = 3;
+}
+
+message StopClusterComponentRequest {
+  bool reset = 1;              // also `k0s reset` (destructive)
+}
+message StopClusterComponentResponse {
+  bool stopped = 1;
+  string message = 2;
+}
+
+message GetClusterComponentStatusRequest {}
+message GetClusterComponentStatusResponse {
+  string role = 1;
+  string component_state = 2;  // "active" | "inactive" | "failed" | "unknown"
+  bool enabled = 3;
+}
+
+// -- Control-plane-only cluster admin messages --
+
+message CreateK0sJoinTokenRequest {
+  string role = 1;             // "worker" | "controller"
+  uint64 expiry_seconds = 2;   // token lifetime; 0 = k0s default
+}
+message CreateK0sJoinTokenResponse {
+  // k0s join token (bearer secret — never log).
+  string join_token = 1;
+}
+
+message GetAdminKubeconfigRequest {}
+message GetAdminKubeconfigResponse {
+  // Admin kubeconfig YAML read from the control-plane node.
+  string kubeconfig = 1;
+}
+
+// -- Full-mesh membership: proto mirror of spur_net::mesh::MeshNode/MeshMembership --
+
+message MeshNode {
+  string hostname = 1;     // node name (used to resolve self + the agent endpoint)
+  string public_key = 2;   // WireGuard public key
+  string mesh_ip = 3;      // mesh address on spur0 (no prefix), e.g. 10.44.0.2
+  string endpoint = 4;     // underlay endpoint, e.g. 198.51.100.2:51820
+  optional string pod_cidr = 5; // node's pod /24 for native-routing CNIs
+}
+message MeshMembership {
+  repeated MeshNode nodes = 1;
+}
+message ApplyMeshResponse {
+  bool applied = 1;
+  uint32 peers = 2;        // number of peers applied (self excluded)
+  string message = 3;
 }
 
 // Agent-side request: run a command directly on this node (no namespace
@@ -674,7 +832,28 @@ message RunCommandRequest {
   string work_dir = 4;
   map<string, string> environment = 5;
   uint32 job_id = 6;
+  uint32 num_tasks = 7;        // Tasks to launch on this node (default 1)
+  uint32 task_offset = 8;      // Global rank of the first local task
+  uint32 step_id = 9;
+  uint32 step_num_tasks = 10;  // Total tasks in the step (SLURM_NTASKS)
+  bool label = 11;             // Prefix output with [rank] inside wrapper
 }
+
+// Register a srun-only allocation on an agent without starting a batch process.
+message RegisterJobAllocationRequest {
+  uint32 job_id = 1;
+  string partition = 2;
+  string nodelist = 3;
+  uint32 uid = 4;
+  uint32 gid = 5;
+  uint32 cpus = 6;
+  uint64 memory_mb = 7;
+  repeated string gpu_devices = 8;
+  ResourceAllocations allocated = 9;
+  string mpi = 10;
+}
+
+message RegisterJobAllocationResponse {}
 
 message RunCommandResponse {
   int32 exit_code = 1;
@@ -831,6 +1010,14 @@ message AddUserRequest {
   // other field here, this is a full resend on upsert, not a partial
   // patch: empty clears an existing default (matches modify account/qos).
   string default_qos = 5;
+  // Association-level resource limits for `user` within `account`. Same
+  // full-resend semantics as default_qos: 0/empty clears an existing
+  // limit rather than leaving it unchanged.
+  uint32 max_running_jobs = 6;
+  uint32 max_submit_jobs = 7;
+  string max_tres_per_job = 8;
+  string grp_tres = 9;
+  uint32 max_wall_minutes = 10;
 }
 
 message RemoveUserRequest {
@@ -866,6 +1053,7 @@ message CreateQosRequest {
   uint32 max_submit_jobs_per_user = 9;
   string max_tres_per_user = 10;
   string grp_tres = 11;
+  uint32 grp_wall_minutes = 12;
 }
 
 message DeleteQosRequest {
@@ -890,6 +1078,7 @@ message QosInfo {
   uint32 max_submit_jobs_per_user = 9;
   string max_tres_per_user = 10;
   string grp_tres = 11;
+  uint32 grp_wall_minutes = 12;
 }
 
 // ============================================================
@@ -935,6 +1124,7 @@ message CreateReservationRequest {
   repeated string accounts = 5;
   repeated string users = 6;
   repeated string flags = 7;
+  string user = 8;            // requesting user; recorded as reservation owner
 }
 
 message UpdateReservationRequest {
@@ -946,10 +1136,12 @@ message UpdateReservationRequest {
   repeated string remove_users = 6;
   repeated string add_accounts = 7;
   repeated string remove_accounts = 8;
+  string user = 9;              // requesting user; must be the owner (root and trusted internal callers always allowed; legacy reservations with no recorded owner are mutable by anyone)
 }
 
 message DeleteReservationRequest {
   string name = 1;
+  string user = 2;             // requesting user; must be the owner (root and trusted internal callers always allowed; legacy reservations with no recorded owner are mutable by anyone)
 }
 
 message ListReservationsRequest { }
@@ -967,6 +1159,7 @@ message ReservationInfo {
   string users = 6;
   string flags = 7;
   string state = 8;
+  string owner = 9;
 }
 
 // ============================================================

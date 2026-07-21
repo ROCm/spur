@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.1](https://github.com/ROCm/spur/compare/v0.5.0...v0.5.1) (2026-07-17)
+
+
+### Bug Fixes
+
+* **spur-cli:** hide unregistered nodes from sinfo ([#465](https://github.com/ROCm/spur/issues/465)) ([3052801](https://github.com/ROCm/spur/commit/30528013a78c70c017d61f0fd4ec49b22bbfec59))
+* **spur-cli:** wire format engine into sacctmgr show qos ([#457](https://github.com/ROCm/spur/issues/457)) ([a422f51](https://github.com/ROCm/spur/commit/a422f516d286ab665e949d45104deff698aa32d5))
+* **spur-core:** derive version from cargo version plus git sha ([#458](https://github.com/ROCm/spur/issues/458)) ([055336f](https://github.com/ROCm/spur/commit/055336fd3160f6bc526b858c7c2f29ab6cde8220))
+* **spur-core:** enforce node and memory limits in QOS per-user checks ([#427](https://github.com/ROCm/spur/issues/427)) ([7595e9e](https://github.com/ROCm/spur/commit/7595e9e27c0e7a90e0eddda34f6a22cadf3a19fd))
+* **spurctld:** close QOS enforcement bypass for jobs submitted without a QOS ([#452](https://github.com/ROCm/spur/issues/452)) ([deafb10](https://github.com/ROCm/spur/commit/deafb1048a92c13d66102a125101718da955df12))
+* **spurctld:** pass name filter to get_jobs in accounting reconcile ([#464](https://github.com/ROCm/spur/issues/464)) ([e970764](https://github.com/ROCm/spur/commit/e9707641f893facfe706ef0e6648d792f0655cd9))
+* **spurctld:** reset stale node features/weight when NodeConfig stops matching ([#455](https://github.com/ROCm/spur/issues/455)) ([ab88dc4](https://github.com/ROCm/spur/commit/ab88dc4b4902b7c4cc14e228d519eaf27e27b50e))
+* **spurctld:** retry accounting writes and reconcile drift from job store ([#428](https://github.com/ROCm/spur/issues/428)) ([c7dad32](https://github.com/ROCm/spur/commit/c7dad3249f19e538cccafc525e701bd62eea47a5))
+* **spurd:** release GPU allocation on completion and post-record launch failure ([#450](https://github.com/ROCm/spur/issues/450)) ([86cd880](https://github.com/ROCm/spur/commit/86cd880067aa32c1fe3266f61de2e34747a3be9c))
+
 ## [0.5.0](https://github.com/ROCm/spur/compare/v0.4.1...v0.5.0) (2026-07-15)
 
 

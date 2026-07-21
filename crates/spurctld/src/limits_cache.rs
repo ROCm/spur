@@ -90,7 +90,16 @@ impl Default for QosCache {
 
 fn qos_from_record(r: crate::accounting::db::QosRecord) -> Qos {
     let opt_u32 = |v: Option<i32>| v.filter(|&x| x > 0).map(|x| x as u32);
-    let opt_tres = |s: Option<String>| s.filter(|s| !s.is_empty()).map(|s| TresRecord::parse(&s));
+    // Values are validated by `create_qos` before being stored, so a parse
+    // failure here means the DB row predates that check or was edited
+    // out-of-band; treat it as unset rather than poisoning the whole refresh.
+    let opt_tres = |s: Option<String>| {
+        s.filter(|s| !s.is_empty()).and_then(|s| {
+            TresRecord::parse(&s)
+                .inspect_err(|e| warn!(tres = %s, error = %e, "dropping unparseable stored TRES"))
+                .ok()
+        })
+    };
 
     Qos {
         name: r.name,
@@ -104,7 +113,7 @@ fn qos_from_record(r: crate::accounting::db::QosRecord) -> Qos {
             max_tres_per_user: opt_tres(r.max_tres_per_user),
             grp_tres: opt_tres(r.grp_tres),
             max_wall_minutes: opt_u32(r.max_wall_min),
-            grp_wall_minutes: None,
+            grp_wall_minutes: opt_u32(r.grp_wall_min),
         },
         usage_factor: r.usage_factor,
     }
@@ -170,7 +179,7 @@ mod tests {
     fn test_cached_qos_fires_cpu_per_user_reason() {
         let cache = QosCache::new();
         let mut qos = make_qos("cpucap");
-        qos.limits.max_tres_per_user = Some(TresRecord::parse("cpu=8"));
+        qos.limits.max_tres_per_user = Some(TresRecord::parse("cpu=8").unwrap());
         cache.replace(HashMap::from([("cpucap".to_string(), qos)]));
 
         let qos = cache.get("cpucap").expect("present");
@@ -204,10 +213,11 @@ mod tests {
             usage_factor: 2.0,
             max_jobs_per_user: Some(10),
             max_wall_min: Some(60),
-            max_tres_per_job: Some("cpu=32,mem=128G".into()),
+            max_tres_per_job: Some("cpu=32,mem=131072".into()),
             max_submit_per_user: Some(50),
             max_tres_per_user: Some("cpu=64".into()),
             grp_tres: Some("gpu=8".into()),
+            grp_wall_min: Some(120),
         };
 
         let qos = qos_from_record(record);
@@ -218,6 +228,7 @@ mod tests {
         assert_eq!(qos.usage_factor, 2.0);
         assert_eq!(qos.limits.max_jobs_per_user, Some(10));
         assert_eq!(qos.limits.max_wall_minutes, Some(60));
+        assert_eq!(qos.limits.grp_wall_minutes, Some(120));
         assert_eq!(qos.limits.max_submit_jobs_per_user, Some(50));
         assert!(qos.limits.max_tres_per_job.is_some());
         assert_eq!(
@@ -254,6 +265,7 @@ mod tests {
             max_submit_per_user: Some(-1),
             max_tres_per_user: None,
             grp_tres: None,
+            grp_wall_min: Some(0),
         };
 
         let qos = qos_from_record(record);
@@ -264,5 +276,6 @@ mod tests {
         assert_eq!(qos.limits.max_submit_jobs_per_user, None);
         assert!(qos.limits.max_tres_per_user.is_none());
         assert!(qos.limits.grp_tres.is_none());
+        assert_eq!(qos.limits.grp_wall_minutes, None);
     }
 }

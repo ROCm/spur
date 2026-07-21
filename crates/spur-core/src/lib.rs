@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod account_limits;
 pub mod accounting;
 pub mod admission;
 pub mod array;
@@ -11,13 +12,16 @@ pub mod dependency;
 pub mod hooks;
 pub mod hostlist;
 pub mod job;
+pub mod k0s;
 pub mod node;
 pub mod partition;
+pub mod process;
 pub mod qos;
 pub mod reservation;
 pub mod resource;
 pub mod spur_env;
 pub mod step;
+pub mod task_launch;
 pub mod topology;
 pub mod version;
 pub mod wal;

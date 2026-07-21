@@ -11,12 +11,14 @@ use parking_lot::RwLock;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
+use spur_core::account_limits::{check_account_limits, AccountCheckResult};
 use spur_core::accounting::{Qos, TresRecord, TresType};
 use spur_core::auth::AuthError;
 use spur_core::burst_buffer::BbStageState;
 use spur_core::config::SlurmConfig;
 use spur_core::job::{
-    Job, JobId, JobSpec, JobState, NodeCompleteError, PendingReason, TransitionOutcome,
+    effective_gpus, effective_memory_mb, Job, JobId, JobSpec, JobState, NodeCompleteError,
+    PendingReason, TransitionOutcome,
 };
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
@@ -54,6 +56,7 @@ pub enum ReservationError {
     InvalidArgument(String),
     NotFound(String),
     AlreadyExists(String),
+    PermissionDenied(String),
     Raft(String),
 }
 
@@ -63,6 +66,7 @@ impl std::fmt::Display for ReservationError {
             Self::InvalidArgument(m)
             | Self::NotFound(m)
             | Self::AlreadyExists(m)
+            | Self::PermissionDenied(m)
             | Self::Raft(m) => f.write_str(m),
         }
     }
@@ -76,6 +80,43 @@ pub enum SubmitError {
     InvalidArgument(String),
     Internal(String),
 }
+
+/// Errors from completing a standalone srun allocation.
+#[derive(Debug)]
+pub enum SrunCompleteError {
+    NotFound(JobId),
+    NotSrunJob(JobId),
+    NotStepDispatch(JobId),
+    AlreadyTerminal { job_id: JobId, state: JobState },
+    NotOwner { job_id: JobId, user: String },
+    Internal { job_id: JobId, message: String },
+}
+
+impl std::fmt::Display for SrunCompleteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(id) => write!(f, "job {id} not found"),
+            Self::NotSrunJob(id) => write!(f, "job {id} is not an srun allocation"),
+            Self::NotStepDispatch(id) => {
+                write!(
+                    f,
+                    "job {id} does not use native step dispatch (CompleteJob is not valid)"
+                )
+            }
+            Self::AlreadyTerminal { job_id, state } => {
+                write!(f, "job {job_id} is already {state:?}")
+            }
+            Self::NotOwner { job_id, user } => {
+                write!(f, "user {user} is not permitted to complete job {job_id}")
+            }
+            Self::Internal { job_id, message } => {
+                write!(f, "job {job_id}: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SrunCompleteError {}
 
 impl std::fmt::Display for SubmitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -156,6 +197,10 @@ impl ReservationError {
         Self::AlreadyExists(msg.into())
     }
 
+    pub fn permission_denied(msg: impl Into<String>) -> Self {
+        Self::PermissionDenied(msg.into())
+    }
+
     pub fn raft(msg: impl Into<String>) -> Self {
         Self::Raft(msg.into())
     }
@@ -192,6 +237,8 @@ pub struct ClusterManager {
     /// `available_bb_with`), so it cannot drift from config.
     burst_buffer_total_gb: RwLock<u64>,
     tokens: RwLock<HashMap<String, spur_core::admission::AdmissionToken>>,
+    /// Native k0s cluster state (phase, control-plane node, join-token metadata).
+    k0s: RwLock<spur_core::k0s::K0sClusterState>,
     raft: RwLock<Option<SpurRaft>>,
     accounting: RwLock<Option<AccountingNotifier>>,
     fairshare_cache: Arc<FairshareCache>,
@@ -223,6 +270,7 @@ impl ClusterManager {
             license_pool: RwLock::new(license_pool),
             burst_buffer_total_gb: RwLock::new(burst_buffer_total_gb),
             tokens: RwLock::new(HashMap::new()),
+            k0s: RwLock::new(spur_core::k0s::K0sClusterState::default()),
             raft: RwLock::new(None),
             accounting: RwLock::new(None),
             fairshare_cache,
@@ -240,6 +288,7 @@ impl ClusterManager {
     /// Submit a new job. If it has an array spec, expand into individual tasks.
     pub fn submit_job(&self, mut spec: JobSpec) -> Result<JobId, SubmitError> {
         apply_default_partition(&mut spec, &self.partitions.read());
+        apply_default_time_limit(&mut spec, &self.partitions.read());
         apply_default_account(&mut spec, &self.association_cache);
         validate_user_account(&spec, &self.association_cache)?;
         self.validate_partition(&spec)?;
@@ -603,6 +652,54 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Complete a standalone srun allocation after its step finishes.
+    pub fn finish_srun_job(
+        &self,
+        job_id: JobId,
+        exit_code: i32,
+        user: &str,
+    ) -> Result<Job, SrunCompleteError> {
+        let job = {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or(SrunCompleteError::NotFound(job_id))?;
+            if !job.spec.srun_job {
+                return Err(SrunCompleteError::NotSrunJob(job_id));
+            }
+            if !job.srun_step_dispatch {
+                return Err(SrunCompleteError::NotStepDispatch(job_id));
+            }
+            if job.state.is_terminal() {
+                return Err(SrunCompleteError::AlreadyTerminal {
+                    job_id,
+                    state: job.state,
+                });
+            }
+            Self::check_job_owner(user, &job.spec.user, "complete").map_err(|_| {
+                SrunCompleteError::NotOwner {
+                    job_id,
+                    user: user.to_string(),
+                }
+            })?;
+            job.clone()
+        };
+
+        let state = if exit_code == 0 {
+            JobState::Completed
+        } else {
+            JobState::Failed
+        };
+        self.complete_job(job_id, exit_code, state).map_err(|e| {
+            warn!(job_id, error = %e, "finish_srun_job: complete_job failed");
+            SrunCompleteError::Internal {
+                job_id,
+                message: e.to_string(),
+            }
+        })?;
+        Ok(job)
+    }
+
     /// Suspend a running job: validate state, record through Raft. Allocation is retained.
     /// The requesting `user` must be the job owner, root, or empty (trusted internal calls).
     pub fn suspend_job(&self, job_id: JobId, user: &str) -> anyhow::Result<()> {
@@ -653,6 +750,17 @@ impl ClusterManager {
         resources: ResourceAllocations,
         per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
     ) -> anyhow::Result<()> {
+        self.start_job_impl(job_id, node_names, resources, per_node_alloc, false)
+    }
+
+    pub(crate) fn start_job_impl(
+        &self,
+        job_id: JobId,
+        node_names: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
+        srun_step_dispatch: bool,
+    ) -> anyhow::Result<()> {
         for name in &node_names {
             if !per_node_alloc.contains_key(name) {
                 anyhow::bail!(
@@ -691,6 +799,7 @@ impl ClusterManager {
             nodes: node_names.clone(),
             resources: resources.clone(),
             per_node_alloc: per_node_alloc.clone(),
+            srun_step_dispatch,
         })?;
 
         let node_count = node_names.len().max(1) as u32;
@@ -703,21 +812,25 @@ impl ClusterManager {
                     resources.memory_mb / node_count as u64,
                 )
             });
-        let batch_step = JobStep {
-            job_id,
-            step_id: STEP_BATCH,
-            name: "batch".into(),
-            state: StepState::Running,
-            num_tasks: 1,
-            cpus_per_task: per_node.cpus,
-            resources: per_node,
-            nodes: node_names,
-            distribution: spur_core::step::TaskDistribution::Block,
-            start_time: Some(Utc::now()),
-            end_time: None,
-            exit_code: None,
-        };
-        self.create_step(job_id, STEP_BATCH, batch_step);
+        if !srun_step_dispatch {
+            let batch_step = JobStep {
+                job_id,
+                step_id: STEP_BATCH,
+                name: "batch".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: per_node.cpus,
+                resources: per_node,
+                nodes: node_names,
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: Some(Utc::now()),
+                end_time: None,
+                exit_code: None,
+            };
+            if let Err(e) = self.create_step(batch_step) {
+                warn!(job_id, error = %e, "failed to record batch step");
+            }
+        }
 
         if spec_for_notify
             .mail_type
@@ -1178,6 +1291,24 @@ impl ClusterManager {
         }
     }
 
+    /// Update a node's WireGuard mesh public key from a heartbeat when it appears or changes (mesh
+    /// came up after registration, or `spur0` was recreated). In-memory like `update_heartbeat` —
+    /// the mesh reconcile loop reads live inventory, so this is enough to include the node in
+    /// ApplyMesh without a spurd restart. Returns true if the stored key changed.
+    pub fn update_node_wg_pubkey(&self, name: &str, pubkey: &str) -> bool {
+        if pubkey.is_empty() {
+            return false;
+        }
+        let mut nodes = self.nodes.write();
+        if let Some(node) = nodes.get_mut(name) {
+            if node.wg_pubkey.as_deref() != Some(pubkey) {
+                node.wg_pubkey = Some(pubkey.to_string());
+                return true;
+            }
+        }
+        false
+    }
+
     /// Create an admission token and persist via Raft.
     pub fn create_token(
         &self,
@@ -1490,6 +1621,52 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// assign a k0s role + allocated mesh IP + pod /24 to a node (replicated via Raft).
+    /// Callers never touch `self.nodes`/`self.k0s` directly — that would bypass Raft.
+    pub fn assign_node_k0s(
+        &self,
+        name: &str,
+        role: spur_core::k0s::K0sRole,
+        mesh_ip: &str,
+        pod_cidr: &str,
+    ) -> anyhow::Result<()> {
+        {
+            let nodes = self.nodes.read();
+            if !nodes.contains_key(name) {
+                anyhow::bail!("node {} not found", name);
+            }
+        }
+        self.propose(WalOperation::NodeK0sAssign {
+            name: name.to_string(),
+            role,
+            mesh_ip: mesh_ip.to_string(),
+            pod_cidr: pod_cidr.to_string(),
+        })?;
+        info!(node = %name, ?role, "node k0s role assigned");
+        Ok(())
+    }
+
+    /// set the cluster-wide k0s phase (+ optional control-plane node / reset flag).
+    pub fn set_k0s_phase(
+        &self,
+        phase: spur_core::k0s::K0sPhase,
+        control_plane_node: Option<String>,
+        reset_requested: bool,
+    ) -> anyhow::Result<()> {
+        self.propose(WalOperation::K0sSetPhase {
+            phase,
+            control_plane_node,
+            reset_requested,
+        })?;
+        info!(?phase, "k0s cluster phase set");
+        Ok(())
+    }
+
+    /// snapshot of the current cluster-wide k0s state.
+    pub fn k0s_state(&self) -> spur_core::k0s::K0sClusterState {
+        self.k0s.read().clone()
+    }
+
     /// Reconcile node liveness state with heartbeat data.
     /// Marks stale nodes Down and recovers nodes whose heartbeat has resumed.
     /// Returns finalized jobs from eviction so callers can send cancel RPCs.
@@ -1624,10 +1801,15 @@ impl ClusterManager {
         Ok(resp.jobs_finalized)
     }
 
-    /// Create a job step.
-    pub fn create_step(&self, job_id: JobId, step_id: u32, step: JobStep) {
-        self.steps.write().insert((job_id, step_id), step);
+    /// Create a job step durably via Raft.
+    pub fn create_step(&self, step: JobStep) -> anyhow::Result<()> {
+        let job_id = step.job_id;
+        let step_id = step.step_id;
+        self.propose(WalOperation::JobStepCreate {
+            step: Box::new(step),
+        })?;
         debug!(job_id, step_id, "step created");
+        Ok(())
     }
 
     /// Record an srun step's completion via Raft so the step exit code and the
@@ -1738,6 +1920,11 @@ impl ClusterManager {
             }
             true
         });
+
+        // Account/association enforcement: check per-user-per-account limits.
+        // Shares the eligibility logic with tag_blocked_pending_reasons() via
+        // account_block_for() so the drop decision and the displayed reason agree.
+        pending.retain(|job| account_block_for(job, &self.association_cache, &jobs).is_none());
 
         // Resolve once, reuse for both the QoS-limit check and the priority
         // adjustment below, instead of looking it up twice per job.
@@ -2182,11 +2369,12 @@ impl ClusterManager {
                         && !begin_held
                 })
                 .filter_map(|job| {
-                    // Same drop order as pending_jobs(): Part -> Dep -> QoS ->
-                    // Resv -> Lic -> BB (partition block is permanent, so first;
-                    // BB is last because staging runs just before dispatch).
+                    // Same drop order as pending_jobs(): Part -> Dep -> Assoc ->
+                    // QoS -> Resv -> Lic -> BB (partition block is permanent, so
+                    // first; BB is last because staging runs just before dispatch).
                     partition_block(job, &partitions)
                         .or_else(|| dependency_block(job))
+                        .or_else(|| account_block_for(job, &self.association_cache, &jobs))
                         .or_else(|| qos_block_for(job, &self.resolve_qos(job), &jobs))
                         .or_else(|| reservation_block(job, &reservations, now))
                         .or_else(|| license_block(job, &available))
@@ -2246,7 +2434,10 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Update an existing reservation (validated, persisted via Raft).
+    /// Update an existing reservation (validated, persisted via Raft). The
+    /// requesting `user` must be the reservation owner, root, or empty (trusted
+    /// internal calls); legacy reservations with no recorded owner are
+    /// modifiable by anyone.
     #[allow(clippy::too_many_arguments)]
     pub fn update_reservation(
         &self,
@@ -2258,6 +2449,7 @@ impl ClusterManager {
         remove_users: &[String],
         add_accounts: &[String],
         remove_accounts: &[String],
+        user: &str,
     ) -> Result<(), ReservationError> {
         let mut preview = self
             .reservations
@@ -2268,6 +2460,13 @@ impl ClusterManager {
             .ok_or_else(|| {
                 ReservationError::not_found(format!("reservation '{}' not found", name))
             })?;
+
+        if !preview.can_be_managed_by(user) {
+            return Err(ReservationError::permission_denied(format!(
+                "user '{}' cannot modify reservation '{}' owned by '{}'",
+                user, name, preview.owner
+            )));
+        }
 
         if duration_minutes > 0 {
             preview.end_time =
@@ -2287,9 +2486,9 @@ impl ClusterManager {
             }
         }
         preview.nodes.retain(|n| !remove_nodes.contains(n));
-        for user in add_users {
-            if !preview.users.contains(user) {
-                preview.users.push(user.clone());
+        for add_user in add_users {
+            if !preview.users.contains(add_user) {
+                preview.users.push(add_user.clone());
             }
         }
         preview.users.retain(|u| !remove_users.contains(u));
@@ -2319,13 +2518,24 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Delete a reservation by name (persisted via Raft).
-    pub fn delete_reservation(&self, name: &str) -> Result<(), ReservationError> {
-        if !self.reservations.read().iter().any(|r| r.name == name) {
-            return Err(ReservationError::not_found(format!(
-                "reservation '{}' not found",
-                name
-            )));
+    /// Delete a reservation by name (persisted via Raft). The requesting `user`
+    /// must be the reservation owner, root, or empty (trusted internal calls);
+    /// legacy reservations with no recorded owner are deletable by anyone.
+    pub fn delete_reservation(&self, name: &str, user: &str) -> Result<(), ReservationError> {
+        {
+            let reservations = self.reservations.read();
+            let res = reservations
+                .iter()
+                .find(|r| r.name == name)
+                .ok_or_else(|| {
+                    ReservationError::not_found(format!("reservation '{}' not found", name))
+                })?;
+            if !res.can_be_managed_by(user) {
+                return Err(ReservationError::permission_denied(format!(
+                    "user '{}' cannot delete reservation '{}' owned by '{}'",
+                    user, name, res.owner
+                )));
+            }
         }
 
         for job in self.jobs.read().values() {
@@ -3145,6 +3355,7 @@ impl ClusterManager {
                 nodes: node_names,
                 resources,
                 per_node_alloc,
+                srun_step_dispatch,
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.start_time = Some(timestamp);
@@ -3152,6 +3363,7 @@ impl ClusterManager {
                     job.allocated_resources = Some(resources.clone());
                     job.per_node_alloc = per_node_alloc.clone();
                     job.pending_reason = PendingReason::None;
+                    job.srun_step_dispatch = *srun_step_dispatch;
                 }
                 let node_count = node_names.len().max(1) as u32;
                 for name in node_names {
@@ -3406,6 +3618,29 @@ impl ClusterManager {
                     }
                 }
             }
+            WalOperation::JobStepCreate { step } => match jobs.get(&step.job_id) {
+                None => {
+                    warn!(
+                        job_id = step.job_id,
+                        step_id = step.step_id,
+                        "JobStepCreate: skipping step for unknown job"
+                    );
+                }
+                Some(job) if job.state.is_terminal() => {
+                    warn!(
+                        job_id = step.job_id,
+                        step_id = step.step_id,
+                        state = ?job.state,
+                        "JobStepCreate: skipping step for terminal job"
+                    );
+                }
+                Some(_) => {
+                    let mut steps = self.steps.write();
+                    steps
+                        .entry((step.job_id, step.step_id))
+                        .or_insert_with(|| (**step).clone());
+                }
+            },
             WalOperation::JobPriorityChange {
                 job_id,
                 new_priority,
@@ -3469,14 +3704,7 @@ impl ClusterManager {
                 }
                 drop(partitions);
 
-                // Apply features/weight from matching NodeConfig (by hostname OR selector)
-                for nc in &self.config.nodes {
-                    if node_config_matches(nc, name, labels) {
-                        node.features = nc.features.clone();
-                        node.weight = nc.weight;
-                        break;
-                    }
-                }
+                self.apply_node_config_policy(&mut node);
 
                 let mut nodes = self.nodes.write();
                 nodes.insert(name.clone(), node);
@@ -3545,14 +3773,7 @@ impl ClusterManager {
                     }
                     node.partitions = matched;
 
-                    // Re-apply NodeConfig features/weight
-                    for nc in &self.config.nodes {
-                        if node_config_matches(nc, &node.name, &node.labels) {
-                            node.features = nc.features.clone();
-                            node.weight = nc.weight;
-                            break;
-                        }
-                    }
+                    self.apply_node_config_policy(node);
                 }
             }
             WalOperation::NodeRemove { name, reason } => {
@@ -3637,6 +3858,34 @@ impl ClusterManager {
                     }
                 }
             }
+
+            // Native k0s cluster operations. All idempotent/replay-safe: NodeK0sAssign is
+            // keyed by node name, token insert/revoke are keyed by id, phase is a last-write set.
+            WalOperation::NodeK0sAssign {
+                name,
+                role,
+                mesh_ip,
+                pod_cidr,
+            } => {
+                // Reuses the `nodes` write guard from the top of this fn.
+                if let Some(node) = nodes.get_mut(name) {
+                    node.k0s_role = Some(*role);
+                    node.k0s_mesh_ip = Some(mesh_ip.clone());
+                    node.k0s_pod_cidr = Some(pod_cidr.clone());
+                }
+            }
+            WalOperation::K0sSetPhase {
+                phase,
+                control_plane_node,
+                reset_requested,
+            } => {
+                let mut k0s = self.k0s.write();
+                k0s.phase = *phase;
+                if control_plane_node.is_some() {
+                    k0s.control_plane_node = control_plane_node.clone();
+                }
+                k0s.reset_requested = *reset_requested;
+            }
         }
         self.next_job_id.store(next_id, Ordering::Relaxed);
         response
@@ -3659,9 +3908,28 @@ struct ClusterSnapshot {
     /// staging phase rides along on each `Job`.
     #[serde(default)]
     burst_buffer_total_gb: u64,
+    /// cluster-wide k0s state (phase, control-plane node, join-token metadata). Unlike
+    /// license_pool/burst_buffer this is runtime-authoritative allocated state and MUST be
+    /// restored (see restore_from_snapshot).
+    #[serde(default)]
+    k0s: spur_core::k0s::K0sClusterState,
 }
 
 impl ClusterManager {
+    /// Apply features/weight from the first matching NodeConfig, reverting to
+    /// node defaults when none matches so stale policy from a previously matching
+    /// entry does not persist.
+    fn apply_node_config_policy(&self, node: &mut Node) {
+        for nc in &self.config.nodes {
+            if node_config_matches(nc, &node.name, &node.labels) {
+                node.features = nc.features.clone();
+                node.weight = nc.weight;
+                return;
+            }
+        }
+        node.reset_config_policy();
+    }
+
     /// Re-evaluate partition membership and NodeConfig policy (features, weight)
     /// for all nodes against the current config. Called after snapshot restore to
     /// handle config changes that occurred between snapshot creation and restart.
@@ -3683,13 +3951,7 @@ impl ClusterManager {
             }
             node.partitions = matched;
 
-            for nc in &self.config.nodes {
-                if node_config_matches(nc, &node.name, &node.labels) {
-                    node.features = nc.features.clone();
-                    node.weight = nc.weight;
-                    break;
-                }
-            }
+            self.apply_node_config_policy(node);
         }
     }
 }
@@ -3708,6 +3970,7 @@ impl StateMachineApply for ClusterManager {
             license_pool: self.license_pool.read().clone(),
             tokens: self.tokens.read().values().cloned().collect(),
             burst_buffer_total_gb: *self.burst_buffer_total_gb.read(),
+            k0s: self.k0s.read().clone(),
         };
         serde_json::to_vec(&snap).map_err(Into::into)
     }
@@ -3748,6 +4011,10 @@ impl StateMachineApply for ClusterManager {
         for token in snap.tokens {
             tokens.insert(token.id.clone(), token);
         }
+
+        // k0s phase + join-token metadata are runtime-authoritative allocated state
+        // (NOT config-derived like license_pool/burst_buffer) — restore them.
+        *self.k0s.write() = snap.k0s;
 
         self.next_job_id.store(next_id, Ordering::Relaxed);
 
@@ -3926,10 +4193,13 @@ fn qos_block_for(
                 && j.spec.qos.as_deref() == Some(qos_name.as_str())
         })
         .count() as u32;
+    // Count only earlier-submitted jobs (lower job_id) so a later job never
+    // makes an earlier, within-limit job retroactively blocked.
     let submitted_count = jobs
         .values()
         .filter(|j| {
-            (j.state == JobState::Pending || j.state == JobState::Running)
+            j.job_id < job.job_id
+                && (j.state == JobState::Pending || j.state == JobState::Running)
                 && j.spec.user == *user
                 && j.spec.qos.as_deref() == Some(qos_name.as_str())
         })
@@ -3950,6 +4220,53 @@ fn qos_block_for(
     ) {
         QosCheckResult::Allowed => None,
         QosCheckResult::Blocked(reason) => Some(reason),
+    }
+}
+
+/// Shared by `pending_jobs()` and `tag_blocked_pending_reasons()` so the drop
+/// decision and displayed reason always agree. Looks up the job's (user,
+/// account) association limits from `AssociationCache`; a job with no account
+/// (or an association the cache has no limits for) is unconstrained.
+fn account_block_for(
+    job: &Job,
+    assoc_cache: &AssociationCache,
+    jobs: &HashMap<JobId, Job>,
+) -> Option<spur_core::job::PendingReason> {
+    let account = job.spec.account.as_deref().filter(|a| !a.is_empty())?;
+    let user = &job.spec.user;
+    let limits = assoc_cache.limits(user, account);
+
+    let running_count = jobs
+        .values()
+        .filter(|j| {
+            j.state == JobState::Running
+                && j.spec.user == *user
+                && j.spec.account.as_deref() == Some(account)
+        })
+        .count() as u32;
+    // Count only earlier-submitted jobs (lower job_id) so a later job never
+    // makes an earlier, within-limit job retroactively blocked.
+    let submitted_count = jobs
+        .values()
+        .filter(|j| {
+            j.job_id < job.job_id
+                && (j.state == JobState::Pending || j.state == JobState::Running)
+                && j.spec.user == *user
+                && j.spec.account.as_deref() == Some(account)
+        })
+        .count() as u32;
+    let account_running_tres =
+        sum_running_tres(jobs, |j| j.spec.account.as_deref() == Some(account));
+
+    match check_account_limits(
+        job,
+        &limits,
+        running_count,
+        submitted_count,
+        &account_running_tres,
+    ) {
+        AccountCheckResult::Allowed => None,
+        AccountCheckResult::Blocked(reason) => Some(reason),
     }
 }
 
@@ -4013,20 +4330,20 @@ fn partition_limits_allow(job: &Job, part: &Partition) -> bool {
 
 fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> TresRecord {
     let mut tres = TresRecord::new();
-    let (mut cpu, mut node, mut mem) = (0u64, 0u64, 0u64);
+    let (mut cpu, mut node, mut mem, mut gpu) = (0u64, 0u64, 0u64, 0u64);
     for j in jobs.values() {
         if j.state != JobState::Running || !pred(j) {
             continue;
         }
         cpu += (j.spec.num_tasks * j.spec.cpus_per_task) as u64;
         node += j.spec.num_nodes as u64;
-        if let Some(m) = j.spec.memory_per_node_mb {
-            mem += m * j.spec.num_nodes as u64;
-        }
+        mem += effective_memory_mb(&j.spec, j.spec.num_nodes);
+        gpu += effective_gpus(&j.spec, j.spec.num_nodes);
     }
     tres.set(TresType::Cpu, cpu);
     tres.set(TresType::Node, node);
     tres.set(TresType::Memory, mem);
+    tres.set(TresType::Gpu, gpu);
     tres
 }
 
@@ -4202,6 +4519,21 @@ fn apply_default_partition(spec: &mut JobSpec, partitions: &[Partition]) {
         } else if let Some(first) = partitions.first() {
             spec.partition = Some(first.name.clone());
         }
+    }
+}
+
+fn apply_default_time_limit(spec: &mut JobSpec, partitions: &[Partition]) {
+    if spec.time_limit.is_some() {
+        return;
+    }
+    let partition = spec
+        .partition
+        .as_deref()
+        .and_then(|name| partitions.iter().find(|p| p.name == name))
+        .or_else(|| partitions.iter().find(|p| p.is_default))
+        .or_else(|| partitions.first());
+    if let Some(minutes) = partition.and_then(|p| p.default_time_minutes) {
+        spec.time_limit = Some(chrono::Duration::minutes(minutes as i64));
     }
 }
 
@@ -4399,6 +4731,7 @@ mod tests {
             network: Default::default(),
             logging: Default::default(),
             kubernetes: Default::default(),
+            cluster: Default::default(),
             notifications: Default::default(),
             power: Default::default(),
             federation: Default::default(),
@@ -4448,6 +4781,12 @@ mod tests {
             work_dir: "/tmp".into(),
             ..Default::default()
         }
+    }
+
+    fn srun_spec(name: &str) -> JobSpec {
+        let mut spec = basic_spec(name);
+        spec.srun_job = true;
+        spec
     }
 
     fn scalar_alloc(cpus: u32, memory_mb: u64) -> ResourceAllocations {
@@ -4585,6 +4924,7 @@ mod tests {
             nodes: vec!["node1".into()],
             resources: resources.clone(),
             per_node_alloc: per_node_for(&["node1"], resources),
+            srun_step_dispatch: false,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -4619,6 +4959,7 @@ mod tests {
             nodes: vec!["node1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["node1"], alloc),
+            srun_step_dispatch: false,
         });
 
         cm.apply_operation(&WalOperation::JobComplete {
@@ -5106,6 +5447,7 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -5147,6 +5489,7 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -5189,6 +5532,7 @@ mod tests {
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
+            srun_step_dispatch: false,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -5254,6 +5598,7 @@ mod tests {
             nodes: vec!["n1".into()],
             resources: scalar_alloc(4, 8000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
+            srun_step_dispatch: false,
         });
 
         // Three srun steps exit 7, 3, 2 (in that order). DerivedExitCode tracks
@@ -5346,6 +5691,7 @@ mod tests {
             nodes: vec!["n1".into(), "n2".into()],
             resources: scalar_alloc(4, 8000),
             per_node_alloc: per_node_for(&["n1", "n2"], alloc),
+            srun_step_dispatch: false,
         });
 
         let r1 = cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -5396,6 +5742,7 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
         });
 
         let resp = cm.apply_operation(&WalOperation::JobComplete {
@@ -5435,6 +5782,7 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
         });
 
         let first = cm.apply_operation(&WalOperation::JobComplete {
@@ -5492,6 +5840,7 @@ mod tests {
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
+            srun_step_dispatch: false,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
@@ -5528,6 +5877,7 @@ mod tests {
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+            srun_step_dispatch: false,
         });
 
         cm.node_complete(1, "n1", 0, 9).unwrap();
@@ -5570,6 +5920,7 @@ mod tests {
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+            srun_step_dispatch: false,
         });
 
         // Step 2: the call the RPC makes after validation (wire state dropped).
@@ -5605,6 +5956,7 @@ mod tests {
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+            srun_step_dispatch: false,
         });
 
         cm.node_complete(1, "n1", 42, 0).unwrap();
@@ -5644,6 +5996,7 @@ mod tests {
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
+            srun_step_dispatch: false,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -5711,6 +6064,7 @@ mod tests {
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
+            srun_step_dispatch: false,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
@@ -6061,6 +6415,7 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
         });
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
@@ -6154,6 +6509,7 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
 
@@ -6846,6 +7202,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         let mut r1 = base.clone();
         r1.name = "r1".into();
@@ -6870,6 +7227,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         let mut r1 = base.clone();
         r1.name = "r1".into();
@@ -6895,6 +7253,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["testuser".into()],
             flags: Default::default(),
+            owner: String::new(),
         })
         .unwrap();
 
@@ -7061,6 +7420,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["testuser".into()],
             flags: Default::default(),
+            owner: String::new(),
         })
         .unwrap();
 
@@ -7097,6 +7457,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["testuser".into()],
             flags: Default::default(),
+            owner: String::new(),
         })
         .unwrap();
 
@@ -7257,6 +7618,7 @@ mod tests {
                 accounts: Vec::new(),
                 users: vec!["testuser".into()],
                 flags: Default::default(),
+                owner: String::new(),
             },
         });
 
@@ -7286,6 +7648,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         cm.apply_operation(&WalOperation::ReservationCreate {
             reservation: res.clone(),
@@ -7332,6 +7695,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         cm.apply_operation(&WalOperation::ReservationCreate {
             reservation: res.clone(),
@@ -7355,6 +7719,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         let cm1 = cm.clone();
         let cm2 = cm.clone();
@@ -7389,6 +7754,7 @@ mod tests {
                 accounts: Vec::new(),
                 users: vec!["alice".into()],
                 flags: Default::default(),
+                owner: String::new(),
             })
             .unwrap();
             assert_eq!(cm.get_reservations().len(), 1);
@@ -7418,6 +7784,7 @@ mod tests {
                 no_hold_jobs: true,
                 ..Default::default()
             },
+            owner: String::new(),
         })
         .unwrap();
 
@@ -7425,7 +7792,7 @@ mod tests {
         spec.reservation = Some("r1".into());
         let job_id = submit_and_wait(&cm, spec);
 
-        cm.delete_reservation("r1").unwrap();
+        cm.delete_reservation("r1", "root").unwrap();
         wait_for("reservation deleted", || cm.get_reservations().is_empty());
 
         let job = cm.get_job(job_id).unwrap();
@@ -7437,6 +7804,106 @@ mod tests {
             cm.pending_jobs().iter().any(|j| j.job_id == job_id),
             "job must remain schedulable after no_hold_jobs delete"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_reservation_rejects_non_owner() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "r1".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: Default::default(),
+            owner: "alice".into(),
+        })
+        .unwrap();
+
+        let err = cm.delete_reservation("r1", "bob").unwrap_err();
+        assert!(
+            matches!(err, ReservationError::PermissionDenied(_)),
+            "non-owner delete must be denied, got {err:?}"
+        );
+        assert_eq!(cm.get_reservations().len(), 1, "reservation must survive");
+
+        cm.delete_reservation("r1", "alice").unwrap();
+        assert!(
+            cm.get_reservations().is_empty(),
+            "owner delete must succeed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_reservation_rejects_non_owner() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "r1".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: Default::default(),
+            owner: "alice".into(),
+        })
+        .unwrap();
+
+        let err = cm
+            .update_reservation("r1", 30, &[], &[], &[], &[], &[], &[], "bob")
+            .unwrap_err();
+        assert!(
+            matches!(err, ReservationError::PermissionDenied(_)),
+            "non-owner update must be denied, got {err:?}"
+        );
+
+        cm.update_reservation("r1", 30, &[], &[], &[], &[], &[], &[], "alice")
+            .expect("owner update must succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_reservation_allows_root_and_unowned() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "owned".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: Default::default(),
+            owner: "alice".into(),
+        })
+        .unwrap();
+        cm.create_reservation(Reservation {
+            name: "legacy".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: spur_core::reservation::ReservationFlags {
+                overlap: true,
+                ..Default::default()
+            },
+            owner: String::new(),
+        })
+        .unwrap();
+
+        cm.delete_reservation("owned", "root")
+            .expect("root may delete any reservation");
+        cm.delete_reservation("legacy", "bob")
+            .expect("unowned reservation stays manageable by anyone");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7457,6 +7924,7 @@ mod tests {
                     no_hold_jobs: true,
                     ..Default::default()
                 },
+                owner: String::new(),
             },
         });
 
@@ -7490,6 +7958,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         })
         .unwrap();
 
@@ -7623,13 +8092,14 @@ mod tests {
                 accounts: Vec::new(),
                 users: vec!["testuser".into()],
                 flags: Default::default(),
+                owner: String::new(),
             })
             .unwrap();
 
             let mut spec = basic_spec("resv-hold");
             spec.reservation = Some("r1".into());
             let job_id = submit_and_wait(&cm, spec);
-            cm.delete_reservation("r1").unwrap();
+            cm.delete_reservation("r1", "root").unwrap();
             wait_for("job held after delete", || {
                 cm.get_job(job_id).is_some_and(|j| {
                     j.pending_reason == PendingReason::ReservationDeleted && j.priority == 0
@@ -7665,13 +8135,14 @@ mod tests {
                     no_hold_jobs: true,
                     ..Default::default()
                 },
+                owner: String::new(),
             })
             .unwrap();
 
             let mut spec = basic_spec("resv-no-hold");
             spec.reservation = Some("r1".into());
             job_id = submit_and_wait(&cm, spec);
-            cm.delete_reservation("r1").unwrap();
+            cm.delete_reservation("r1", "root").unwrap();
             wait_for("reservation detached from job", || {
                 cm.get_job(job_id)
                     .is_some_and(|j| j.spec.reservation.is_none() && j.priority > 0)
@@ -7699,13 +8170,14 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["testuser".into()],
             flags: Default::default(),
+            owner: String::new(),
         })
         .unwrap();
 
         let mut spec = basic_spec("release-me");
         spec.reservation = Some("r1".into());
         let job_id = submit_and_wait(&cm, spec);
-        cm.delete_reservation("r1").unwrap();
+        cm.delete_reservation("r1", "root").unwrap();
         wait_for("job held after delete", || {
             cm.get_job(job_id).is_some_and(|j| {
                 j.pending_reason == PendingReason::ReservationDeleted && j.priority == 0
@@ -8150,6 +8622,188 @@ mod tests {
             cm.get_job(j2).unwrap().pending_reason,
             PendingReason::QoSMaxJobsPerUser,
             "the fallback QOS's limits must actually enforce"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_sets_account_max_jobs_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.association_cache().insert_limits(
+            "testuser",
+            "research",
+            spur_core::accounting::AccountLimits {
+                max_running_jobs: Some(1),
+                ..Default::default()
+            },
+        );
+
+        let mut s1 = basic_spec("a1");
+        s1.account = Some("research".into());
+        let j1 = submit_and_wait(&cm, s1);
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            j1,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, j1, JobState::Running);
+
+        let mut s2 = basic_spec("a2");
+        s2.account = Some("research".into());
+        let j2 = submit_and_wait(&cm, s2);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::AssocMaxJobsLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_sets_account_max_submit_jobs_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.association_cache().insert_limits(
+            "testuser",
+            "research",
+            spur_core::accounting::AccountLimits {
+                max_submit_jobs: Some(1),
+                ..Default::default()
+            },
+        );
+
+        let mut s1 = basic_spec("b1");
+        s1.account = Some("research".into());
+        let j1 = submit_and_wait(&cm, s1);
+
+        let mut s2 = basic_spec("b2");
+        s2.account = Some("research".into());
+        let j2 = submit_and_wait(&cm, s2);
+
+        cm.tag_blocked_pending_reasons();
+        // j1 alone is within the limit (max_submit_jobs=1) and must not be
+        // blocked by counting itself; only j2, which pushes the count over
+        // the cap, should be blocked.
+        assert_eq!(cm.get_job(j1).unwrap().pending_reason, PendingReason::None);
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::AssocMaxSubmitJobLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_sets_qos_max_submit_jobs_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache().insert(Qos {
+            name: "capped".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_submit_jobs_per_user: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut s1 = basic_spec("c1");
+        s1.qos = Some("capped".into());
+        let j1 = submit_and_wait(&cm, s1);
+
+        let mut s2 = basic_spec("c2");
+        s2.qos = Some("capped".into());
+        let j2 = submit_and_wait(&cm, s2);
+
+        cm.tag_blocked_pending_reasons();
+        // j1 alone is within the limit (max_submit_jobs_per_user=1) and must
+        // not be blocked by counting itself; only j2, which pushes the count
+        // over the cap, should be blocked.
+        assert_eq!(cm.get_job(j1).unwrap().pending_reason, PendingReason::None);
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::QosMaxSubmitJobPerUserLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_sets_account_grp_cpu_reason_across_users() {
+        // GrpTRES aggregates across every user in the account, not just the
+        // requester: a different user's running job fills the cap so the next
+        // job in the same account blocks with AssocGrpCpuLimit.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Cpu, 4);
+        cm.association_cache().insert_limits(
+            "alice",
+            "research",
+            spur_core::accounting::AccountLimits {
+                grp_tres: Some(grp.clone()),
+                ..Default::default()
+            },
+        );
+        cm.association_cache().insert_limits(
+            "bob",
+            "research",
+            spur_core::accounting::AccountLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+        );
+
+        let mut s1 = basic_spec("c1");
+        s1.user = "alice".into();
+        s1.account = Some("research".into());
+        s1.num_tasks = 4;
+        let j1 = submit_and_wait(&cm, s1);
+        let res = scalar_alloc(4, 1000);
+        cm.start_job(
+            j1,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, j1, JobState::Running);
+
+        let mut s2 = basic_spec("c2");
+        s2.user = "bob".into();
+        s2.account = Some("research".into());
+        s2.num_tasks = 1;
+        let j2 = submit_and_wait(&cm, s2);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::AssocGrpCpuLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn account_limits_do_not_block_jobs_without_an_account() {
+        // A job with no account can't be constrained by an association it
+        // doesn't belong to.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.association_cache().insert_limits(
+            "testuser",
+            "research",
+            spur_core::accounting::AccountLimits {
+                max_running_jobs: Some(0),
+                ..Default::default()
+            },
+        );
+
+        let spec = basic_spec("d1");
+        let job_id = submit_and_wait(&cm, spec);
+
+        cm.tag_blocked_pending_reasons();
+        assert_ne!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::AssocMaxJobsLimit
         );
     }
 
@@ -8693,6 +9347,165 @@ mod tests {
 
         assert!(cm2.get_job(1).is_some());
         assert!(cm2.get_node("n1").is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn k0s_state_survives_snapshot() {
+        use spur_core::k0s::{K0sPhase, K0sRole};
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+        cm.assign_node_k0s("n1", K0sRole::Worker, "10.44.0.2", "10.42.2.0/24")
+            .unwrap();
+        cm.set_k0s_phase(K0sPhase::Ready, Some("head-node".into()), false)
+            .unwrap();
+        wait_for("k0s state applied", || {
+            cm.k0s_state().phase == K0sPhase::Ready
+                && cm.get_node("n1").and_then(|n| n.k0s_role).is_some()
+        });
+
+        // snapshot -> restore into a fresh cluster (log-compaction / HA follower path)
+        let data = cm.snapshot_state().unwrap();
+        let dir2 = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dir2).await;
+        cm2.restore_from_snapshot(&data).unwrap();
+
+        // Cluster-wide k0s state must be restored (it is runtime-authoritative).
+        let st = cm2.k0s_state();
+        assert_eq!(st.phase, K0sPhase::Ready);
+        assert_eq!(st.control_plane_node.as_deref(), Some("head-node"));
+        // Per-node k0s fields ride snap.nodes.
+        let n1 = cm2.get_node("n1").unwrap();
+        assert_eq!(n1.k0s_role, Some(K0sRole::Worker));
+        assert_eq!(n1.k0s_mesh_ip.as_deref(), Some("10.44.0.2"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_reassigns_a_readded_node() {
+        // The Ready-phase self-heal: a spurd restart deregisters on SIGTERM (the node is REMOVED),
+        // then re-registers as a fresh node with no k0s role. Re-running provisioning (which the
+        // reconcile loop now does in Ready, not only Provisioning) must re-assign the un-roled node
+        // its role + mesh IP + pod CIDR so it rejoins the mesh — without disturbing the others.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        register_node(&cm, "node-b", 4, 8000);
+        wait_for("both registered", || {
+            cm.get_node("node-a").is_some() && cm.get_node("node-b").is_some()
+        });
+        let net = crate::cluster_k8s::ClusterNetworking {
+            mesh_cidr: "10.44.0.0/16".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
+            cni: "kuberouter".into(),
+            control_plane_node: None,
+        };
+        crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
+        wait_for("both assigned", || {
+            cm.get_node("node-a").and_then(|n| n.k0s_role).is_some()
+                && cm.get_node("node-b").and_then(|n| n.k0s_role).is_some()
+        });
+        let b_role = cm.get_node("node-b").unwrap().k0s_role;
+        let b_ip = cm.get_node("node-b").unwrap().k0s_mesh_ip.clone();
+        let b_cidr = cm.get_node("node-b").unwrap().k0s_pod_cidr.clone();
+        assert!(b_ip.is_some() && b_cidr.is_some());
+
+        // spurd restart: deregister (remove) then re-register as a fresh, un-roled node.
+        cm.remove_node("node-b", true, Some("test restart".into()))
+            .unwrap();
+        wait_for("node-b removed", || cm.get_node("node-b").is_none());
+        register_node(&cm, "node-b", 4, 8000);
+        wait_for("node-b re-registered without a role", || {
+            cm.get_node("node-b")
+                .map(|n| n.k0s_role.is_none())
+                .unwrap_or(false)
+        });
+
+        // The Ready-phase reconcile re-runs provisioning and heals the un-roled node.
+        crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
+        wait_for("node-b re-assigned", || {
+            cm.get_node("node-b").and_then(|n| n.k0s_role).is_some()
+        });
+        let b = cm.get_node("node-b").unwrap();
+        assert_eq!(b.k0s_role, b_role, "same role after re-add");
+        assert_eq!(b.k0s_mesh_ip, b_ip, "same mesh IP reclaimed after re-add");
+        assert_eq!(b.k0s_pod_cidr, b_cidr, "same pod CIDR after re-add");
+        // The untouched node keeps its assignment (provisioning is idempotent).
+        assert!(cm.get_node("node-a").and_then(|n| n.k0s_role).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_phase_reconcile_assigns_unroled_node() {
+        // The loop wiring: reconcile_phase must run provisioning in the Ready phase, not only
+        // Provisioning. An un-roled node present while Ready (e.g. re-added after a spurd restart)
+        // must be assigned by a Ready-phase reconcile tick. If Ready were a no-op it would stay
+        // un-roled forever (out of the mesh) — the bug this fixes.
+        use spur_core::k0s::K0sPhase;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        wait_for("registered", || cm.get_node("node-a").is_some());
+        // Cluster is Ready with the control plane already recorded, but node-a has no k0s role.
+        cm.set_k0s_phase(K0sPhase::Ready, Some("node-a".into()), false)
+            .unwrap();
+        wait_for("phase ready", || cm.k0s_state().phase == K0sPhase::Ready);
+        assert!(cm.get_node("node-a").and_then(|n| n.k0s_role).is_none());
+
+        let net = crate::cluster_k8s::ClusterNetworking {
+            mesh_cidr: "10.44.0.0/16".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
+            cni: "kuberouter".into(),
+            control_plane_node: Some("node-a".into()),
+        };
+        let mut tokens = std::collections::HashMap::new();
+        crate::cluster_k8s::reconcile_phase(&cm, &net, &cm.k0s_state(), &mut tokens).await;
+
+        wait_for("un-roled node assigned by a Ready-phase tick", || {
+            cm.get_node("node-a").and_then(|n| n.k0s_role).is_some()
+        });
+        assert!(cm.get_node("node-a").and_then(|n| n.k0s_mesh_ip).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_assigns_controller_and_worker_for_two_nodes() {
+        use spur_core::k0s::K0sRole;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        register_node(&cm, "node-b", 4, 8000);
+        wait_for("both nodes registered", || {
+            cm.get_node("node-a").is_some() && cm.get_node("node-b").is_some()
+        });
+
+        let net = crate::cluster_k8s::ClusterNetworking {
+            mesh_cidr: "10.44.0.0/16".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
+            cni: "kuberouter".into(),
+            control_plane_node: None,
+        };
+        crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
+        wait_for("both nodes assigned k0s roles", || {
+            cm.get_node("node-a").and_then(|n| n.k0s_role).is_some()
+                && cm.get_node("node-b").and_then(|n| n.k0s_role).is_some()
+        });
+
+        // Two nodes -> the deterministic control-plane (lexically-first, node-a) is a Controller
+        // (NOT Single, which would never exercise the worker token-mint/join path); node-b is a
+        // Worker. Each gets a distinct mesh IP + pod /24, and the control-plane choice is recorded.
+        let a = cm.get_node("node-a").unwrap();
+        let b = cm.get_node("node-b").unwrap();
+        assert_eq!(a.k0s_role, Some(K0sRole::Controller));
+        assert_eq!(b.k0s_role, Some(K0sRole::Worker));
+        assert!(a.k0s_mesh_ip.is_some() && b.k0s_mesh_ip.is_some());
+        assert_ne!(a.k0s_mesh_ip, b.k0s_mesh_ip);
+        assert_ne!(a.k0s_pod_cidr, b.k0s_pod_cidr);
+        assert_eq!(cm.k0s_state().control_plane_node.as_deref(), Some("node-a"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9366,6 +10179,47 @@ mod tests {
         ];
         super::apply_default_partition(&mut spec, &partitions);
         assert_eq!(spec.partition.as_deref(), Some("gpu"));
+    }
+
+    #[test]
+    fn apply_default_time_limit_uses_partition_default() {
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: Some(30),
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(30)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_noop_when_set() {
+        let mut spec = basic_spec("j");
+        spec.time_limit = Some(chrono::Duration::minutes(5));
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: Some(30),
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(5)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_skips_when_partition_has_no_default() {
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: None,
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions);
+        assert!(spec.time_limit.is_none());
     }
 
     #[test]
@@ -10254,6 +11108,133 @@ mod tests {
         assert_eq!(node.weight, 10);
     }
 
+    #[test]
+    fn label_update_resets_features_when_no_match() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.nodes = vec![spur_core::config::NodeConfig {
+            names: String::new(),
+            selector: HashMap::from([("gpu".into(), "mi300x".into())]),
+            cpus: 0,
+            memory_mb: 0,
+            gres: Vec::new(),
+            features: vec!["mi300x".into(), "rocm6".into()],
+            address: None,
+            weight: 10,
+        }];
+        let cm = ClusterManager::new(cfg, dir.path()).unwrap();
+
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "gpu-node".into(),
+            resources: ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::from([("gpu".into(), "mi300x".into())]),
+        });
+
+        let node = cm.get_node("gpu-node").unwrap();
+        assert_eq!(node.features, vec!["mi300x", "rocm6"]);
+        assert_eq!(node.weight, 10);
+
+        cm.apply_operation(&WalOperation::NodeLabelsUpdate {
+            name: "gpu-node".into(),
+            set: HashMap::new(),
+            remove: vec!["gpu".into()],
+        });
+
+        let node = cm.get_node("gpu-node").unwrap();
+        assert!(node.features.is_empty());
+        assert_eq!(node.weight, 1);
+    }
+
+    #[test]
+    fn node_register_no_match_uses_defaults() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.nodes = vec![spur_core::config::NodeConfig {
+            names: String::new(),
+            selector: HashMap::from([("gpu".into(), "mi300x".into())]),
+            cpus: 0,
+            memory_mb: 0,
+            gres: Vec::new(),
+            features: vec!["mi300x".into(), "rocm6".into()],
+            address: None,
+            weight: 10,
+        }];
+        let cm = ClusterManager::new(cfg, dir.path()).unwrap();
+
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "cpu-node".into(),
+            resources: ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::from([("gpu".into(), "mi250".into())]),
+        });
+
+        let node = cm.get_node("cpu-node").unwrap();
+        assert!(node.features.is_empty());
+        assert_eq!(node.weight, 1);
+    }
+
+    #[test]
+    fn reconcile_resets_stale_features_on_restore() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.nodes = vec![spur_core::config::NodeConfig {
+            names: String::new(),
+            selector: HashMap::from([("gpu".into(), "mi300x".into())]),
+            cpus: 0,
+            memory_mb: 0,
+            gres: Vec::new(),
+            features: vec!["mi300x".into(), "rocm6".into()],
+            address: None,
+            weight: 10,
+        }];
+        let cm = ClusterManager::new(cfg, dir.path()).unwrap();
+
+        // Snapshot node has stale policy but labels that no longer match the config.
+        let mut stale = Node::new(
+            "gpu-node".into(),
+            ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+        );
+        stale.features = vec!["mi300x".into(), "rocm6".into()];
+        stale.weight = 10;
+        stale.labels = HashMap::new();
+
+        let snap = ClusterSnapshot {
+            jobs: Vec::new(),
+            nodes: vec![stale],
+            reservations: Vec::new(),
+            steps: Vec::new(),
+            license_pool: HashMap::new(),
+            tokens: Vec::new(),
+            burst_buffer_total_gb: 0,
+            k0s: spur_core::k0s::K0sClusterState::default(),
+        };
+        let bytes = serde_json::to_vec(&snap).unwrap();
+        cm.restore_from_snapshot(&bytes).unwrap();
+
+        let node = cm.get_node("gpu-node").unwrap();
+        assert!(node.features.is_empty());
+        assert_eq!(node.weight, 1);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_job_triggers_scheduler_notify() {
         // Verify that submit_job() actually calls notify_one() in production code path.
@@ -10327,6 +11308,24 @@ mod tests {
             nodes: vec![node.into()],
             resources: scalar_alloc(1, 1000),
             per_node_alloc: per_node_for(&[node], scalar_alloc(1, 1000)),
+            srun_step_dispatch: false,
+        });
+    }
+
+    fn start_srun_job_on(cm: &ClusterManager, id: JobId, node: &str) {
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: id,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: id,
+            nodes: vec![node.into()],
+            resources: scalar_alloc(1, 1000),
+            per_node_alloc: per_node_for(&[node], scalar_alloc(1, 1000)),
+            srun_step_dispatch: true,
         });
     }
 
@@ -10722,5 +11721,91 @@ mod tests {
         );
 
         assert_eq!(nodes["n1"].state, NodeState::Drain);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_completes_running_allocation() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-alloc"));
+        start_srun_job_on(&cm, id, "n1");
+
+        let returned = cm.finish_srun_job(id, 0, "testuser").unwrap();
+        assert_eq!(returned.job_id, id);
+        settle(&cm, id, JobState::Completed);
+        assert_eq!(cm.get_job(id).unwrap().exit_code, Some(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_rejects_non_srun_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("batch"));
+        start_job_on(&cm, id, "n1");
+
+        assert!(matches!(
+            cm.finish_srun_job(id, 0, "testuser"),
+            Err(SrunCompleteError::NotSrunJob(j)) if j == id
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_rejects_terminal_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-done"));
+        start_srun_job_on(&cm, id, "n1");
+        cm.finish_srun_job(id, 0, "testuser").unwrap();
+        settle(&cm, id, JobState::Completed);
+
+        assert!(matches!(
+            cm.finish_srun_job(id, 0, "testuser"),
+            Err(SrunCompleteError::AlreadyTerminal {
+                job_id,
+                state: JobState::Completed,
+            }) if job_id == id
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_rejects_wrong_user() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-owner"));
+        start_srun_job_on(&cm, id, "n1");
+
+        assert!(matches!(
+            cm.finish_srun_job(id, 0, "otheruser"),
+            Err(SrunCompleteError::NotOwner { job_id, user }) if job_id == id && user == "otheruser"
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_rejects_batch_fallback_srun() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-batch-fallback"));
+        start_job_on(&cm, id, "n1");
+
+        assert!(matches!(
+            cm.finish_srun_job(id, 0, "testuser"),
+            Err(SrunCompleteError::NotStepDispatch(j)) if j == id
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_not_found() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        assert!(matches!(
+            cm.finish_srun_job(999, 0, "testuser"),
+            Err(SrunCompleteError::NotFound(999))
+        ));
     }
 }

@@ -15,6 +15,8 @@ use std::collections::{HashMap, HashSet};
 
 use sqlx::PgPool;
 
+use spur_core::accounting::{AccountLimits, TresRecord};
+
 /// Compute fairshare factors directly from the database.
 ///
 /// Reused by both the gRPC `GetFairshareFactors` RPC and the controller's
@@ -47,14 +49,15 @@ pub async fn fairshare_factors(
     ))
 }
 
-/// Load association defaults and the full user→account membership set backing
-/// the controller's `AssociationCache`.
+/// Load association defaults, the full user→account membership set, and
+/// per-association resource limits backing the controller's `AssociationCache`.
 pub async fn association_maps(
     pool: &PgPool,
 ) -> anyhow::Result<(
     HashMap<(String, String), String>,
     HashMap<String, String>,
     HashSet<(String, String)>,
+    HashMap<(String, String), AccountLimits>,
 )> {
     let users = db::list_users(pool, None).await?;
 
@@ -71,5 +74,38 @@ pub async fn association_maps(
         }
     }
 
-    Ok((default_qos, default_account, memberships))
+    let limits = db::list_associations(pool)
+        .await?
+        .into_iter()
+        .map(|a| {
+            let key = (a.user_name.clone(), a.account.clone());
+            (key, account_limits_from_record(a))
+        })
+        .collect();
+
+    Ok((default_qos, default_account, memberships, limits))
+}
+
+fn account_limits_from_record(r: db::AssociationRecord) -> AccountLimits {
+    let opt_u32 = |v: Option<i32>| v.filter(|&x| x > 0).map(|x| x as u32);
+    // Values are validated by `add_user` before being stored, so a parse
+    // failure here means the DB row predates that check or was edited
+    // out-of-band; treat it as unset rather than poisoning the whole load.
+    let opt_tres = |s: Option<String>| {
+        s.filter(|s| !s.is_empty()).and_then(|s| {
+            TresRecord::parse(&s)
+                .inspect_err(
+                    |e| tracing::warn!(tres = %s, error = %e, "dropping unparseable stored TRES"),
+                )
+                .ok()
+        })
+    };
+
+    AccountLimits {
+        max_running_jobs: opt_u32(r.max_running_jobs),
+        max_submit_jobs: opt_u32(r.max_submit_jobs),
+        max_tres_per_job: opt_tres(r.max_tres_per_job),
+        grp_tres: opt_tres(r.grp_tres),
+        max_wall_minutes: opt_u32(r.max_wall_min),
+    }
 }

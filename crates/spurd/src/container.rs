@@ -1652,7 +1652,7 @@ mod tests {
         assert!(is_loopback_nameserver("::1"));
         assert!(!is_loopback_nameserver("8.8.8.8"));
         assert!(!is_loopback_nameserver("1.1.1.1"));
-        assert!(!is_loopback_nameserver("192.168.1.1"));
+        assert!(!is_loopback_nameserver("203.0.113.1"));
     }
 
     #[test]

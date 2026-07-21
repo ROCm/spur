@@ -23,7 +23,6 @@ jobs:
       date: ${{ steps.meta.outputs.date }}
       short_sha: ${{ steps.meta.outputs.short_sha }}
       full_sha: ${{ steps.meta.outputs.full_sha }}
-      git_describe: ${{ steps.meta.outputs.git_describe }}
     steps:
       - uses: actions/checkout@v7
 
@@ -48,9 +47,8 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         run: |
           echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
-          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_OUTPUT"
           echo "full_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "git_describe=$(git describe --always --dirty)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         if: steps.check.outputs.skip != 'true'
@@ -66,7 +64,8 @@ jobs:
           push: false
           outputs: type=local,dest=./dist
           build-args: |
-            SPUR_GIT_DESCRIBE=${{ steps.meta.outputs.git_describe }}
+            SPUR_GIT_SHA=${{ steps.meta.outputs.short_sha }}
+            SPUR_GIT_DIRTY=false
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -171,7 +170,8 @@ jobs:
             rocm/spur:nightly
             rocm/spur:nightly-${{ needs.build.outputs.date }}
           build-args: |
-            SPUR_GIT_DESCRIBE=${{ needs.build.outputs.git_describe }}
+            SPUR_GIT_SHA=${{ needs.build.outputs.short_sha }}
+            SPUR_GIT_DIRTY=false
           cache-from: type=gha,scope=nightly-docker
           cache-to: type=gha,scope=nightly-docker,mode=max
 

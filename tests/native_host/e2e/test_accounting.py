@@ -10,7 +10,7 @@ when Docker is unavailable).
 import re
 import time
 
-from cluster import deep_merge, parse_job_id, wait_job, wait_sacct_row
+from cluster import deep_merge, parse_job_id, wait_job, wait_job_state, wait_sacct_row
 
 
 class TestSacctExitReporting:
@@ -49,6 +49,87 @@ def _reason(cluster, job_id: int) -> str:
     out = cluster.scontrol("show", "job", str(job_id))
     m = re.search(r"Reason=(\S+)", out)
     return m.group(1) if m else ""
+
+
+class TestSacctmgrShowQos:
+    """Verify sacctmgr show qos displays TRES/node-allocation fields, honors
+    format= selection, and filters by where name=."""
+
+    def test_default_output_shows_tres_columns(self, accounting_cluster):
+        c = accounting_cluster
+        c.sacctmgr(["add", "qos", "name=nodeqos", "priority=50",
+                     "grptres=node=4,cpu=16", "maxtresperjob=node=2"])
+        time.sleep(15)
+        out = c.sacctmgr(["show", "qos"])
+        assert "nodeqos" in out
+        assert "node=4" in out, f"GrpTRES node limit missing: {out!r}"
+        assert "node=2" in out, f"MaxTRES node limit missing: {out!r}"
+
+    def test_format_selects_specific_fields(self, accounting_cluster):
+        c = accounting_cluster
+        c.sacctmgr(["add", "qos", "name=fmtqos", "priority=10",
+                     "grptres=cpu=32", "maxtresperjob=cpu=8"])
+        time.sleep(15)
+        out = c.sacctmgr(["show", "qos", "format=Name,GrpTRES,MaxTRES"])
+        assert "fmtqos" in out
+        assert "cpu=32" in out, f"GrpTRES missing: {out!r}"
+        assert "cpu=8" in out, f"MaxTRES missing: {out!r}"
+        # Priority should NOT appear since it was not in the format list.
+        lines = [l for l in out.splitlines() if "fmtqos" in l]
+        assert lines, f"no fmtqos row in output: {out!r}"
+        assert "Priority" not in out.splitlines()[0], (
+            f"Priority column should not appear: {out!r}")
+
+    def test_where_name_filters_to_one_qos(self, accounting_cluster):
+        c = accounting_cluster
+        c.sacctmgr(["add", "qos", "name=alpha", "priority=1"])
+        c.sacctmgr(["add", "qos", "name=beta", "priority=2"])
+        time.sleep(15)
+        out = c.sacctmgr(["show", "qos", "where", "name=alpha"])
+        assert "alpha" in out
+        assert "beta" not in out, f"name filter did not exclude beta: {out!r}"
+
+    def test_show_qos_renders_all_limit_columns(self, accounting_cluster):
+        c = accounting_cluster
+
+        c.sacctmgr(
+            [
+                "add",
+                "qos",
+                "name=fullcap",
+                "maxjobsperuser=2",
+                "maxsubmitjobsperuser=4",
+                "maxwall=30",
+                "grpwall=60",
+                "maxtresperjob=cpu=8",
+                "maxtresperuser=cpu=16",
+                "grptres=cpu=32",
+            ]
+        )
+        time.sleep(15)
+
+        out = c.sacctmgr(["show", "qos"])
+        header, *rows = [line for line in out.splitlines() if line.strip()]
+        for column in (
+            "MaxJobsPU",
+            "MaxSubmitPU",
+            "MaxWall",
+            "GrpWall",
+            "MaxTRES",
+            "MaxTRESPU",
+            "GrpTRES",
+        ):
+            assert column in header, f"missing column {column!r} in header: {header!r}"
+
+        row = next((r for r in rows if r.startswith("fullcap")), None)
+        assert row is not None, f"fullcap row not found in: {rows!r}"
+        assert "2" in row.split()
+        assert "4" in row.split()
+        assert "30" in row.split()
+        assert "60" in row.split()
+        assert "cpu=8" in row
+        assert "cpu=16" in row
+        assert "cpu=32" in row
 
 
 class TestQosLimitReasons:
@@ -111,3 +192,186 @@ class TestQosLimitReasons:
         assert reason == "QOSMaxWallDurationPerJobLimit", (
             f"fallback QOS limit not enforced, got {reason!r}"
         )
+
+    def test_node_cap_sets_qos_pending_reason(self, accounting_cluster):
+        c = accounting_cluster
+
+        # Define a QoS that caps a user to 1 node.
+        c.sacctmgr(["add", "qos", "name=nodecap", "maxtresperuser=node=1"])
+        time.sleep(15)
+
+        # A job in that QoS asking for 2 nodes exceeds the per-user cap.
+        script = c.write_file("qos-node-job.sh", "#!/bin/bash\nsleep 30\n")
+        job_id = parse_job_id(
+            c.sbatch(["-J", "qos-node", "-N", "2", "-q", "nodecap", script])
+        )
+        assert job_id is not None
+
+        deadline = time.time() + 30
+        reason = ""
+        while time.time() < deadline:
+            reason = _reason(c, job_id)
+            if reason == "QOSMaxNodePerUserLimit":
+                break
+            time.sleep(2)
+        assert reason == "QOSMaxNodePerUserLimit", (
+            f"expected QOSMaxNodePerUserLimit, got {reason!r}"
+        )
+
+    def test_memory_cap_sets_qos_pending_reason(self, accounting_cluster):
+        c = accounting_cluster
+
+        # Define a QoS that caps a user to 1G of memory.
+        c.sacctmgr(["add", "qos", "name=memcap", "maxtresperuser=mem=1024"])
+        time.sleep(15)
+
+        # A job in that QoS asking for 2G exceeds the per-user cap.
+        script = c.write_file("qos-mem-job.sh", "#!/bin/bash\nsleep 30\n")
+        job_id = parse_job_id(
+            c.sbatch(
+                ["-J", "qos-mem", "-N", "1", "--mem=2G", "-q", "memcap", script]
+            )
+        )
+        assert job_id is not None
+
+        deadline = time.time() + 30
+        reason = ""
+        while time.time() < deadline:
+            reason = _reason(c, job_id)
+            if reason == "QOSMaxMemoryPerUser":
+                break
+            time.sleep(2)
+        assert reason == "QOSMaxMemoryPerUser", (
+            f"expected QOSMaxMemoryPerUser, got {reason!r}"
+        )
+
+    def test_memory_per_cpu_cap_sets_qos_pending_reason(self, accounting_cluster):
+        c = accounting_cluster
+
+        # Same cap as test_memory_cap_sets_qos_pending_reason, but the job
+        # requests memory via --mem-per-cpu instead of --mem: the QOS memory
+        # check must derive the same effective total (2 CPUs * 1024 MB = 2G)
+        # rather than treating a --mem-per-cpu job as requesting 0 memory.
+        c.sacctmgr(["add", "qos", "name=memcappercpu", "maxtresperuser=mem=1024"])
+        time.sleep(15)
+
+        script = c.write_file("qos-mem-per-cpu-job.sh", "#!/bin/bash\nsleep 30\n")
+        job_id = parse_job_id(
+            c.sbatch(
+                [
+                    "-J",
+                    "qos-mem-per-cpu",
+                    "-N",
+                    "1",
+                    "-c",
+                    "2",
+                    "--mem-per-cpu=1024",
+                    "-q",
+                    "memcappercpu",
+                    script,
+                ]
+            )
+        )
+        assert job_id is not None
+
+        deadline = time.time() + 30
+        reason = ""
+        while time.time() < deadline:
+            reason = _reason(c, job_id)
+            if reason == "QOSMaxMemoryPerUser":
+                break
+            time.sleep(2)
+        assert reason == "QOSMaxMemoryPerUser", (
+            f"expected QOSMaxMemoryPerUser, got {reason!r}"
+        )
+
+    def test_gpu_cap_sets_qos_pending_reason(self, accounting_cluster):
+        c = accounting_cluster
+
+        # Define a QoS that caps a user to 2 GPUs.
+        c.sacctmgr(["add", "qos", "name=gpucap", "maxtresperuser=gres/gpu=2"])
+        time.sleep(15)
+
+        # A job in that QoS asking for 4 GPUs exceeds the per-user cap. The QOS
+        # limit check is independent of physical GPU availability, so this tags
+        # the pending reason regardless of the node's actual GPU count.
+        script = c.write_file("qos-gpu-job.sh", "#!/bin/bash\nsleep 30\n")
+        job_id = parse_job_id(
+            c.sbatch(
+                ["-J", "qos-gpu", "-N", "1", "--gres=gpu:4", "-q", "gpucap", script]
+            )
+        )
+        assert job_id is not None
+
+        deadline = time.time() + 30
+        reason = ""
+        while time.time() < deadline:
+            reason = _reason(c, job_id)
+            if reason == "QOSMaxGRESPerUser":
+                break
+            time.sleep(2)
+        assert reason == "QOSMaxGRESPerUser", (
+            f"expected QOSMaxGRESPerUser, got {reason!r}"
+        )
+
+
+class TestSacctmgrUserAssociationLimits:
+    def test_maxjobs_set_via_add_user_blocks_a_second_job(self, accounting_cluster):
+        c = accounting_cluster
+        user = c.nodes[0].user
+
+        # `sacctmgr add user ... maxjobs=1` is the real write path this test
+        # closes the gap on: previously the only way to set this limit was
+        # raw SQL against the associations table.
+        c.sacctmgr(["add", "account", "name=assoccap"])
+        c.sacctmgr(["add", "user", f"name={user}", "account=assoccap", "maxjobs=1"])
+        # Wait past the association cache refresh floor (10s) before
+        # submitting, else the job starts before the cap loads.
+        time.sleep(15)
+
+        script = c.write_file("assoc-maxjobs.sh", "#!/bin/bash\nsleep 30\n")
+        first_id = parse_job_id(
+            c.sbatch(["-J", "assoc-first", "-N", "1", "-A", "assoccap", script])
+        )
+        assert first_id is not None
+        wait_job_state(c, first_id, "R", timeout=30)
+
+        second_id = parse_job_id(
+            c.sbatch(["-J", "assoc-second", "-N", "1", "-A", "assoccap", script])
+        )
+        assert second_id is not None
+
+        deadline = time.time() + 30
+        reason = ""
+        while time.time() < deadline:
+            reason = _reason(c, second_id)
+            if reason == "AssocMaxJobsLimit":
+                break
+            time.sleep(2)
+        assert reason == "AssocMaxJobsLimit", f"expected AssocMaxJobsLimit, got {reason!r}"
+
+
+class TestSacctmgrInvalidInput:
+    def test_add_qos_with_non_numeric_limit_fails_cleanly(self, accounting_cluster):
+        c = accounting_cluster
+
+        # A typo'd numeric limit must be rejected outright, not silently
+        # coerced to 0 ("unlimited").
+        out = c.cli_allow_fail(["sacctmgr", "add", "qos", "name=badlimit", "maxjobsperuser=abc"])
+        assert "maxjobsperuser" in out, f"expected error mentioning maxjobsperuser, got {out!r}"
+
+        show_out = c.sacctmgr(["show", "qos"])
+        assert "badlimit" not in show_out, "QOS should not have been created"
+
+    def test_add_qos_with_unit_suffixed_tres_fails_cleanly(self, accounting_cluster):
+        c = accounting_cluster
+
+        # Slurm's K/M/G unit-suffix TRES syntax isn't supported; it must be
+        # rejected rather than silently dropped into a no-op limit.
+        out = c.cli_allow_fail(
+            ["sacctmgr", "add", "qos", "name=badtres", "maxtresperjob=mem=1G"]
+        )
+        assert "mem" in out, f"expected error mentioning the bad TRES token, got {out!r}"
+
+        show_out = c.sacctmgr(["show", "qos"])
+        assert "badtres" not in show_out, "QOS should not have been created"

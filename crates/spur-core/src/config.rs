@@ -55,6 +55,10 @@ pub struct SlurmConfig {
     #[serde(default)]
     pub kubernetes: KubernetesConfig,
 
+    /// Native cluster (k0s) that SPUR provisions and owns. Inverse of `[kubernetes]`.
+    #[serde(default)]
+    pub cluster: ClusterConfig,
+
     #[serde(default)]
     pub notifications: NotificationConfig,
 
@@ -269,14 +273,17 @@ pub struct ControllerConfig {
     #[serde(default = "default_one")]
     pub first_job_id: u32,
 
-    /// Raft peers for HA consensus. Each entry is "host:port" (Raft gRPC address).
-    /// If empty, single-node mode (no Raft, no replication).
+    /// Raft peers for HA consensus, "host:port" each. Empty = single-node mode.
+    /// Must be identically ordered on every controller: node ids derive from
+    /// list position, so a reordered list can form an inconsistent voter set.
     /// Example: ["node1:6821", "node2:6821", "node3:6821"]
     #[serde(default)]
     pub peers: Vec<String>,
 
-    /// This node's Raft ID. If not set, auto-derived from hostname ordinal
-    /// (e.g. spurctld-2 → node_id 3) or defaults to 1.
+    /// This node's Raft ID. Normally unset; single-node mode always uses 1.
+    /// Otherwise resolved as: explicit value, else position in `peers` (by
+    /// hostname), else hostname ordinal (IP-only peers). Must be in
+    /// `1..=peers.len()` and, if set, equal its position (index + 1).
     pub node_id: Option<u64>,
 
     /// Listen address for Raft internal gRPC traffic (separate from client API).
@@ -618,6 +625,146 @@ impl Default for KubernetesConfig {
     }
 }
 
+/// Native cluster (k0s) integration — SPUR OWNS the Kubernetes cluster lifecycle
+/// (`spur k8s up/down`, spurd-owned k0s systemd units, GPU CDI on join). This is the
+/// inverse of `[kubernetes]` above (which lets SPUR run *inside* an existing k8s and accept
+/// SpurJob CRDs); the two are intentionally distinct sections.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterConfig {
+    /// Enable SPUR-managed k0s. When false, spurd never touches systemd/k0s.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Kubernetes distribution SPUR manages. Only "k0s" is supported today.
+    #[serde(default = "default_cluster_distro")]
+    pub distro: String,
+    /// Pod network CIDR. Calico bird native routing over the mesh carves per-node /24s from this.
+    #[serde(default = "default_pod_cidr")]
+    pub pod_cidr: String,
+    /// Service network CIDR.
+    #[serde(default = "default_service_cidr")]
+    pub service_cidr: String,
+    /// CNI MTU (Calico only). Defaults to 1450 to leave headroom for WireGuard's ~50-byte overhead
+    /// over the mesh; set explicitly if your underlay differs. Emitted into the generated k0s config.
+    #[serde(default = "default_cni_mtu")]
+    pub cni_mtu: u16,
+    /// Hostname of the node that runs the k0s control plane. Empty = pick from inventory.
+    #[serde(default)]
+    pub control_plane_node: Option<String>,
+    /// k0s release to install/run (e.g. "v1.36.2+k0s.0", or "latest"). Pinned to a known-good
+    /// version by default; bumped per spur release. spurd installs this if the binary is missing.
+    #[serde(default = "default_k0s_version")]
+    pub k0s_version: String,
+    /// Filesystem path to the k0s binary (install target + what the systemd unit runs).
+    #[serde(default = "default_k0s_binary")]
+    pub k0s_binary: String,
+    /// CNI / network mode. "kuberouter" (k0s default — no custom config) or "calico" (Calico in
+    /// bird native-routing mode with the API advertised on the mesh IP, so pods route over the
+    /// WireGuard mesh). Selecting "calico" makes `spur k8s up` generate the k0s config + set each
+    /// worker's kubelet `--node-ip` to its mesh IP.
+    #[serde(default = "default_cni")]
+    pub cni: String,
+    /// Storage provisioner SPUR ships so PVC workloads work out of the box (k0s bundles none).
+    /// "local-path" (default — RWO node-local, set as the default StorageClass) or "none" (bring your
+    /// own). Applied via k0s's manifest deployer on the control-plane node.
+    #[serde(default = "default_storage_provisioner")]
+    pub storage_provisioner: String,
+    /// On-node directory the local-path provisioner stores PersistentVolumes in. Point this at a
+    /// large scratch disk if PVCs will hold much data — the default lives under `/var/lib` (root fs).
+    #[serde(default = "default_local_path_dir")]
+    pub local_path_dir: String,
+}
+
+fn default_cluster_distro() -> String {
+    "k0s".into()
+}
+fn default_k0s_version() -> String {
+    crate::k0s::K0S_PINNED_VERSION.into()
+}
+fn default_k0s_binary() -> String {
+    crate::k0s::K0S_DEFAULT_BINARY.into()
+}
+fn default_cni() -> String {
+    "kuberouter".into()
+}
+fn default_pod_cidr() -> String {
+    "10.42.0.0/16".into()
+}
+fn default_service_cidr() -> String {
+    "10.43.0.0/16".into()
+}
+fn default_cni_mtu() -> u16 {
+    1450
+}
+fn default_storage_provisioner() -> String {
+    "local-path".into()
+}
+fn default_local_path_dir() -> String {
+    crate::k0s::DEFAULT_LOCAL_PATH_DIR.into()
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            distro: default_cluster_distro(),
+            pod_cidr: default_pod_cidr(),
+            service_cidr: default_service_cidr(),
+            cni_mtu: default_cni_mtu(),
+            control_plane_node: None,
+            k0s_version: default_k0s_version(),
+            k0s_binary: default_k0s_binary(),
+            cni: default_cni(),
+            storage_provisioner: default_storage_provisioner(),
+            local_path_dir: default_local_path_dir(),
+        }
+    }
+}
+
+/// Basic dependency-free CIDR sanity check (`<ip>/<prefix>`), used by config validation.
+fn is_valid_cidr(s: &str) -> bool {
+    // IPv4 only: the native k0s provisioning paths (cluster_k8s IPAM, pod-CIDR carving, AddressPool)
+    // are all `Ipv4Addr`, so an IPv6 CIDR would validate here and then fail later at runtime.
+    match s.split_once('/') {
+        Some((ip, prefix)) => {
+            ip.parse::<std::net::Ipv4Addr>().is_ok()
+                && prefix.parse::<u8>().map(|p| p <= 32).unwrap_or(false)
+        }
+        None => false,
+    }
+}
+
+/// Prefix length of a CIDR string. Returns 255 (an impossible prefix, so any `<=` bound rejects it)
+/// when unparseable — callers gate with `is_valid_cidr` first, so this only extracts the number.
+fn cidr_prefix(s: &str) -> u8 {
+    s.split_once('/')
+        .and_then(|(_, p)| p.parse().ok())
+        .unwrap_or(255)
+}
+
+/// True if two IPv4 CIDRs overlap (share any address). Non-IPv4 / malformed inputs return false
+/// (they are rejected separately by `is_valid_cidr`).
+fn cidrs_overlap(a: &str, b: &str) -> bool {
+    fn parse_v4(s: &str) -> Option<(u32, u8)> {
+        let (ip, prefix) = s.split_once('/')?;
+        let ip: std::net::Ipv4Addr = ip.parse().ok()?;
+        let prefix: u8 = prefix.parse().ok()?;
+        if prefix > 32 {
+            return None;
+        }
+        Some((u32::from(ip), prefix))
+    }
+    let (Some((a_ip, a_pfx)), Some((b_ip, b_pfx))) = (parse_v4(a), parse_v4(b)) else {
+        return false;
+    };
+    let shorter = a_pfx.min(b_pfx);
+    let mask = if shorter == 0 {
+        0
+    } else {
+        u32::MAX << (32 - shorter)
+    };
+    (a_ip & mask) == (b_ip & mask)
+}
+
 /// Power management configuration for suspending/resuming idle nodes.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PowerConfig {
@@ -887,6 +1034,98 @@ impl SlurmConfig {
                 value: "0 (must be at least 1)".into(),
             });
         }
+        if self.cluster.enabled {
+            if self.cluster.distro != "k0s" {
+                return Err(ConfigError::InvalidValue {
+                    field: "cluster.distro".into(),
+                    value: format!("{} (only \"k0s\" is supported)", self.cluster.distro),
+                });
+            }
+            // The mesh CIDR feeds the k0s IPAM (AddressPool) exactly like pod/service, so assert it is
+            // a valid IPv4 CIDR in the same pass — otherwise a malformed wg_cidr bypasses validate()
+            // and fails every reconcile tick in AddressPool::new, leaving the cluster silently stuck.
+            for (field, cidr) in [
+                ("network.wg_cidr", &self.network.wg_cidr),
+                ("cluster.pod_cidr", &self.cluster.pod_cidr),
+                ("cluster.service_cidr", &self.cluster.service_cidr),
+            ] {
+                if !is_valid_cidr(cidr) {
+                    return Err(ConfigError::InvalidValue {
+                        field: field.into(),
+                        value: cidr.clone(),
+                    });
+                }
+            }
+            // Pods are carved into per-node /24s (`carve_pod_cidr`), so the pod CIDR must be <= /24.
+            // is_valid_cidr only bounds the prefix at /32, so this would otherwise pass here and then
+            // fail every reconcile tick with only a warn! — the same silent-stuck state.
+            if cidr_prefix(&self.cluster.pod_cidr) > 24 {
+                return Err(ConfigError::InvalidValue {
+                    field: "cluster.pod_cidr".into(),
+                    value: format!(
+                        "{} (prefix must be <= /24 to carve per-node /24s)",
+                        self.cluster.pod_cidr
+                    ),
+                });
+            }
+            // Mesh, pod, and service ranges must be mutually non-overlapping.
+            for (fa, a, fb, b) in [
+                (
+                    "cluster.pod_cidr",
+                    &self.cluster.pod_cidr,
+                    "cluster.service_cidr",
+                    &self.cluster.service_cidr,
+                ),
+                (
+                    "network.wg_cidr",
+                    &self.network.wg_cidr,
+                    "cluster.pod_cidr",
+                    &self.cluster.pod_cidr,
+                ),
+                (
+                    "network.wg_cidr",
+                    &self.network.wg_cidr,
+                    "cluster.service_cidr",
+                    &self.cluster.service_cidr,
+                ),
+            ] {
+                if cidrs_overlap(a, b) {
+                    return Err(ConfigError::InvalidValue {
+                        field: format!("{fa}/{fb}"),
+                        value: format!("{a} overlaps {b}"),
+                    });
+                }
+            }
+            if !matches!(
+                self.cluster.storage_provisioner.as_str(),
+                "local-path" | "none"
+            ) {
+                return Err(ConfigError::InvalidValue {
+                    field: "cluster.storage_provisioner".into(),
+                    value: format!(
+                        "{} (expected \"local-path\" or \"none\")",
+                        self.cluster.storage_provisioner
+                    ),
+                });
+            }
+            // local_path_dir is interpolated verbatim into a JSON string in the generated manifest,
+            // so an absolute path free of quotes/backslashes/whitespace/control chars keeps the JSON
+            // valid and can't inject. Only meaningful when local-path is the chosen provisioner.
+            if self.cluster.storage_provisioner == "local-path" {
+                let d = &self.cluster.local_path_dir;
+                if !d.starts_with('/')
+                    || d.chars()
+                        .any(|c| c == '"' || c == '\\' || c.is_whitespace() || c.is_control())
+                {
+                    return Err(ConfigError::InvalidValue {
+                        field: "cluster.local_path_dir".into(),
+                        value: format!(
+                            "{d} (must be an absolute path with no quotes, backslashes, or whitespace)"
+                        ),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1050,6 +1289,105 @@ mod tests {
     fn test_controller_endpoints_single_host() {
         let cfg = ControllerConfig::default();
         assert_eq!(cfg.endpoints(), vec!["http://localhost:6817"]);
+    }
+
+    #[test]
+    fn cluster_config_defaults_are_disabled_and_sane() {
+        let c = ClusterConfig::default();
+        assert!(!c.enabled);
+        assert_eq!(c.distro, "k0s");
+        assert_eq!(c.pod_cidr, "10.42.0.0/16");
+        assert_eq!(c.service_cidr, "10.43.0.0/16");
+        assert_eq!(c.cni_mtu, 1450);
+        assert_eq!(c.cni, "kuberouter");
+        assert_eq!(c.storage_provisioner, "local-path");
+        assert_eq!(c.local_path_dir, "/var/lib/local-path-provisioner");
+    }
+
+    #[test]
+    fn cluster_config_round_trips_from_toml() {
+        let toml = r#"
+cluster_name = "test"
+
+[cluster]
+enabled = true
+pod_cidr = "10.60.0.0/16"
+control_plane_node = "head-node"
+cni = "calico"
+cni_mtu = 1400
+"#;
+        let cfg = SlurmConfig::load_from_str(toml).expect("valid cluster config");
+        assert!(cfg.cluster.enabled);
+        assert_eq!(cfg.cluster.distro, "k0s"); // default fills in
+        assert_eq!(cfg.cluster.pod_cidr, "10.60.0.0/16");
+        assert_eq!(cfg.cluster.control_plane_node.as_deref(), Some("head-node"));
+        assert_eq!(cfg.cluster.service_cidr, "10.43.0.0/16"); // default
+        assert_eq!(cfg.cluster.cni, "calico");
+        assert_eq!(cfg.cluster.cni_mtu, 1400);
+    }
+
+    #[test]
+    fn cluster_validation_gates_on_enabled() {
+        // Bad pod_cidr is rejected when enabled.
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\npod_cidr=\"not-a-cidr\"\n"
+        )
+        .is_err());
+        // Unsupported distro is rejected.
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\ndistro=\"k3s\"\n"
+        )
+        .is_err());
+        // Unknown storage provisioner is rejected; "none" and "local-path" are accepted.
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\nstorage_provisioner=\"nfs\"\n"
+        )
+        .is_err());
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\nstorage_provisioner=\"none\"\n"
+        )
+        .is_ok());
+        // A local_path_dir that would break the JSON it is interpolated into is rejected.
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\nlocal_path_dir=\"/mnt/a\\\"b\"\n"
+        )
+        .is_err());
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\nlocal_path_dir=\"relative/path\"\n"
+        )
+        .is_err());
+        // A local_path_dir only matters for local-path; junk is ignored when storage is "none".
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\nstorage_provisioner=\"none\"\nlocal_path_dir=\"bad path\"\n"
+        )
+        .is_ok());
+        // Disabled cluster: no cluster validation applied even with junk values.
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=false\npod_cidr=\"whatever\"\n"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn cidr_overlap_detection() {
+        assert!(cidrs_overlap("10.42.0.0/16", "10.42.5.0/24")); // /24 inside /16
+        assert!(cidrs_overlap("10.42.0.0/16", "10.42.0.0/16")); // identical
+        assert!(!cidrs_overlap("10.42.0.0/16", "10.43.0.0/16")); // adjacent, disjoint
+        assert!(!cidrs_overlap("10.42.0.0/16", "10.96.0.0/12")); // pod vs default service
+        assert!(!cidrs_overlap("bad", "10.42.0.0/16")); // malformed -> false
+    }
+
+    #[test]
+    fn cluster_validation_rejects_overlapping_cidrs() {
+        // pod_cidr overlapping service_cidr is rejected when enabled.
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\npod_cidr=\"10.42.0.0/16\"\nservice_cidr=\"10.42.5.0/24\"\n"
+        )
+        .is_err());
+        // The defaults (10.42/16 pod vs 10.43/16 service) do NOT overlap.
+        assert!(
+            SlurmConfig::load_from_str("cluster_name=\"t\"\n[cluster]\nenabled=true\n").is_ok()
+        );
     }
 
     #[test]

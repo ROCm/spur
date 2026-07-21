@@ -123,9 +123,17 @@ pub struct SbatchArgs {
         short = 'w',
         long,
         env = "SBATCH_NODELIST",
-        overrides_with = "nodelist"
+        overrides_with_all = ["nodelist", "nodefile"]
     )]
     pub nodelist: Option<String>,
+
+    /// Read the node list from a file
+    #[arg(
+        short = 'F',
+        long,
+        overrides_with_all = ["nodelist", "nodefile"]
+    )]
+    pub nodefile: Option<String>,
 
     /// Exclude nodes
     #[arg(short = 'x', long, env = "SBATCH_EXCLUDE", overrides_with = "exclude")]
@@ -401,7 +409,10 @@ fn merge_resolved(cli_matches: &clap::ArgMatches, cli: SbatchArgs, dir: SbatchAr
     fallback!(error, "error");
     fallback!(qos, "qos");
     fallback!(dependency, "dependency");
-    fallback!(nodelist, "nodelist");
+    if is_default(cli_matches, "nodelist") && is_default(cli_matches, "nodefile") {
+        out.nodelist = dir.nodelist;
+        out.nodefile = dir.nodefile;
+    }
     fallback!(exclude, "exclude");
     fallback!(constraint, "constraint");
     fallback!(reservation, "reservation");
@@ -673,6 +684,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         .unwrap_or_default();
 
     let mut args = resolve_sbatch_args(&directive_args, &cli_args)?;
+    let nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
 
     // Build the job spec
     let is_wrap = args.wrap.is_some();
@@ -773,7 +785,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         priority: 0,
         reservation: args.reservation.unwrap_or_default(),
         dependency: dependencies,
-        nodelist: args.nodelist.unwrap_or_default(),
+        nodelist: nodelist.unwrap_or_default(),
         exclude: args.exclude.unwrap_or_default(),
         constraint: args.constraint.unwrap_or_default(),
         mpi: args.mpi,
@@ -835,6 +847,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         shm_size: String::new(),
         extra_resources: std::collections::HashMap::new(),
         open_mode: args.open_mode.unwrap_or_default(),
+        srun_job: false,
     };
 
     // Submit to controller
@@ -1006,6 +1019,27 @@ echo "hello world"
         assert_eq!(args.nodes, 4);
         assert_eq!(args.time.as_deref(), Some("1:00:00"));
         assert_eq!(args.job_name.as_deref(), Some("script-name"));
+    }
+
+    #[test]
+    fn test_nodefile_directive_is_parsed() {
+        let args = parse_merged(&["--nodefile=nodes.txt"], &["sbatch"]);
+        assert_eq!(args.nodefile.as_deref(), Some("nodes.txt"));
+        assert!(args.nodelist.is_none());
+    }
+
+    #[test]
+    fn test_cli_nodelist_overrides_nodefile_directive() {
+        let args = parse_merged(&["--nodefile=nodes.txt"], &["sbatch", "--nodelist=node001"]);
+        assert_eq!(args.nodelist.as_deref(), Some("node001"));
+        assert!(args.nodefile.is_none());
+    }
+
+    #[test]
+    fn test_cli_nodefile_overrides_nodelist_directive() {
+        let args = parse_merged(&["--nodelist=node001"], &["sbatch", "-F", "nodes.txt"]);
+        assert_eq!(args.nodefile.as_deref(), Some("nodes.txt"));
+        assert!(args.nodelist.is_none());
     }
 
     #[test]

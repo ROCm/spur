@@ -46,7 +46,7 @@ impl TresType {
 }
 
 /// TRES usage/allocation record.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TresRecord {
     pub values: HashMap<TresType, u64>,
 }
@@ -84,20 +84,28 @@ impl TresRecord {
         parts.join(",")
     }
 
-    /// Parse from "cpu=N,mem=N" string.
-    pub fn parse(s: &str) -> Self {
+    /// Parse from a "cpu=N,mem=N" string. Errors on any token that isn't a
+    /// known TRES type with a plain integer value (e.g. Slurm's unit-suffixed
+    /// `mem=1G` is rejected, not silently dropped) so bad admin input never
+    /// turns into a silent no-op limit.
+    pub fn parse(s: &str) -> Result<Self, String> {
         let mut rec = Self::new();
         for part in s.split(',') {
             let part = part.trim();
-            if let Some((key, val)) = part.split_once('=') {
-                if let (Some(tres), Ok(v)) =
-                    (TresType::from_name(key.trim()), val.trim().parse::<u64>())
-                {
-                    rec.set(tres, v);
-                }
+            if part.is_empty() {
+                continue;
             }
+            let (key, val) = part
+                .split_once('=')
+                .ok_or_else(|| format!("invalid TRES token '{part}': expected key=value"))?;
+            let tres = TresType::from_name(key.trim())
+                .ok_or_else(|| format!("unknown TRES type '{}'", key.trim()))?;
+            let value = val.trim().parse::<u64>().map_err(|_| {
+                format!("invalid TRES value for '{}': '{}'", key.trim(), val.trim())
+            })?;
+            rec.set(tres, value);
         }
-        rec
+        Ok(rec)
     }
 }
 
@@ -114,15 +122,15 @@ pub struct Account {
 }
 
 /// Per-account resource limits.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AccountLimits {
-    /// Max running jobs across all users in this account.
+    /// Max running jobs for a single user within this account.
     pub max_running_jobs: Option<u32>,
-    /// Max submitted (pending + running) jobs.
+    /// Max submitted (pending + running) jobs for a single user within this account.
     pub max_submit_jobs: Option<u32>,
     /// Max TRES per job.
     pub max_tres_per_job: Option<TresRecord>,
-    /// Max total TRES across all running jobs.
+    /// Max total TRES across all running jobs in this account, summed over every user.
     pub grp_tres: Option<TresRecord>,
     /// Max wall time per job (minutes).
     pub max_wall_minutes: Option<u32>,
@@ -227,9 +235,32 @@ mod tests {
         assert!(formatted.contains("cpu=64"));
         assert!(formatted.contains("gres/gpu=8"));
 
-        let parsed = TresRecord::parse(&formatted);
+        let parsed = TresRecord::parse(&formatted).unwrap();
         assert_eq!(parsed.get(TresType::Cpu), 64);
         assert_eq!(parsed.get(TresType::Gpu), 8);
+    }
+
+    #[test]
+    fn test_tres_parse_rejects_unknown_type() {
+        assert!(TresRecord::parse("bogus=5").is_err());
+    }
+
+    #[test]
+    fn test_tres_parse_rejects_unit_suffixed_value() {
+        // K/M/G unit suffixes (Slurm's `mem=1G`) are out of scope for this
+        // parser; they must fail loudly rather than being silently dropped.
+        assert!(TresRecord::parse("mem=1G").is_err());
+    }
+
+    #[test]
+    fn test_tres_parse_rejects_malformed_token() {
+        assert!(TresRecord::parse("cpu").is_err());
+    }
+
+    #[test]
+    fn test_tres_parse_empty_string_is_empty_record() {
+        let rec = TresRecord::parse("").unwrap();
+        assert_eq!(rec.values.len(), 0);
     }
 
     #[test]

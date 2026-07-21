@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::admission::AdmissionToken;
 use crate::job::{JobId, JobSpec, JobState, PendingReason};
+use crate::k0s::{K0sPhase, K0sRole};
 use crate::node::NodeState;
 use crate::reservation::Reservation;
 use std::collections::HashMap;
@@ -41,6 +42,9 @@ pub enum WalOperation {
         /// Per-node allocation slices (device IDs are node-local).
         #[serde(default)]
         per_node_alloc: HashMap<String, ResourceAllocations>,
+        /// Standalone srun: native step dispatch (false = K8s batch fallback).
+        #[serde(default)]
+        srun_step_dispatch: bool,
     },
     JobComplete {
         job_id: JobId,
@@ -59,6 +63,10 @@ pub enum WalOperation {
         job_id: JobId,
         step_id: u32,
         exit_code: i32,
+    },
+    /// Record a job step at creation so `run_step` survives controller restart.
+    JobStepCreate {
+        step: Box<crate::step::JobStep>,
     },
     JobPriorityChange {
         job_id: JobId,
@@ -170,6 +178,22 @@ pub enum WalOperation {
     ReservationDelete {
         name: String,
     },
+
+    // Native k0s cluster operations. Appended at the end to keep externally-tagged
+    // WAL replay backward-compatible.
+    NodeK0sAssign {
+        name: String,
+        role: K0sRole,
+        mesh_ip: String,
+        pod_cidr: String,
+    },
+    K0sSetPhase {
+        phase: K0sPhase,
+        #[serde(default)]
+        control_plane_node: Option<String>,
+        #[serde(default)]
+        reset_requested: bool,
+    },
 }
 
 impl WalOperation {
@@ -195,6 +219,22 @@ impl WalOperation {
             new_state: JobState::Pending,
             pending_reason: Some(reason),
             pending_priority: Some(0),
+        }
+    }
+
+    /// Record node allocation at job start (batch/sbatch and K8s srun fallback).
+    pub fn job_start(
+        job_id: JobId,
+        nodes: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: HashMap<String, ResourceAllocations>,
+    ) -> Self {
+        Self::JobStart {
+            job_id,
+            nodes,
+            resources,
+            per_node_alloc,
+            srun_step_dispatch: false,
         }
     }
 }
@@ -270,6 +310,7 @@ mod reservation_wal_tests {
                     maint: true,
                     ..Default::default()
                 },
+                owner: String::new(),
             },
         };
         let json = serde_json::to_string(&op).unwrap();
@@ -343,6 +384,52 @@ mod deregistration_wal_tests {
             WalOperation::NodeRemove { name, reason } => {
                 assert_eq!(name, "gpu01");
                 assert_eq!(reason.as_deref(), Some("decommission"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn k0s_wal_variants_round_trip() {
+        let op = WalOperation::NodeK0sAssign {
+            name: "gpu-node-1".into(),
+            role: K0sRole::Worker,
+            mesh_ip: "10.44.0.2".into(),
+            pod_cidr: "10.42.2.0/24".into(),
+        };
+        let back: WalOperation =
+            serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
+        match back {
+            WalOperation::NodeK0sAssign {
+                name,
+                role,
+                mesh_ip,
+                pod_cidr,
+            } => {
+                assert_eq!(name, "gpu-node-1");
+                assert_eq!(role, K0sRole::Worker);
+                assert_eq!(mesh_ip, "10.44.0.2");
+                assert_eq!(pod_cidr, "10.42.2.0/24");
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let op = WalOperation::K0sSetPhase {
+            phase: K0sPhase::Ready,
+            control_plane_node: Some("head-node".into()),
+            reset_requested: false,
+        };
+        let back: WalOperation =
+            serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
+        match back {
+            WalOperation::K0sSetPhase {
+                phase,
+                control_plane_node,
+                reset_requested,
+            } => {
+                assert_eq!(phase, K0sPhase::Ready);
+                assert_eq!(control_plane_node.as_deref(), Some("head-node"));
+                assert!(!reset_requested);
             }
             _ => panic!("wrong variant"),
         }
@@ -436,6 +523,7 @@ mod suspend_wal_tests {
 #[cfg(test)]
 mod evict_wal_tests {
     use super::*;
+    use crate::step::{JobStep, StepState, TaskDistribution};
 
     #[test]
     fn job_evict_op_round_trips() {
@@ -444,6 +532,37 @@ mod evict_wal_tests {
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
             WalOperation::JobEvict { job_id } => assert_eq!(job_id, 9),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn job_step_create_op_round_trips() {
+        let step = JobStep {
+            job_id: 7,
+            step_id: 1,
+            name: "hostname".into(),
+            state: StepState::Running,
+            num_tasks: 2,
+            cpus_per_task: 1,
+            resources: Default::default(),
+            nodes: vec!["n1".into(), "n2".into()],
+            distribution: TaskDistribution::Block,
+            start_time: None,
+            end_time: None,
+            exit_code: None,
+        };
+        let op = WalOperation::JobStepCreate {
+            step: Box::new(step.clone()),
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobStepCreate { step: restored } => {
+                assert_eq!(restored.job_id, 7);
+                assert_eq!(restored.step_id, 1);
+                assert_eq!(restored.name, "hostname");
+            }
             _ => panic!("wrong variant"),
         }
     }

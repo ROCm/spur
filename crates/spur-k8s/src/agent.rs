@@ -598,15 +598,20 @@ impl SlurmAgent for VirtualAgent {
         &self,
         _request: Request<RunCommandRequest>,
     ) -> Result<Response<RunCommandResponse>, Status> {
-        // #146: srun-in-salloc step dispatch. The K8s virtual agent does
-        // not currently support one-shot commands outside the job pod's
-        // lifecycle — salloc + srun-in-allocation is not a common K8s
-        // workflow. Implementations that need it could spawn a transient
-        // pod (e.g. via PodSpec with the same image as the allocation
-        // template), but that's a non-trivial design choice and the
-        // user-facing path uses the native spurd agent.
+        // Srun step dispatch. The K8s virtual agent does not currently support
+        // one-shot commands outside the job pod's lifecycle — salloc plus
+        // srun-in-allocation is not a common K8s workflow.
         Err(Status::unimplemented(
             "RunCommand is not yet supported by the K8s virtual agent",
+        ))
+    }
+
+    async fn register_job_allocation(
+        &self,
+        _request: Request<RegisterJobAllocationRequest>,
+    ) -> Result<Response<RegisterJobAllocationResponse>, Status> {
+        Err(Status::unimplemented(
+            "RegisterJobAllocation is not yet supported by the K8s virtual agent",
         ))
     }
 
@@ -677,6 +682,60 @@ impl SlurmAgent for VirtualAgent {
         Err(Status::unimplemented(
             "interactive attach not supported for K8s agent",
         ))
+    }
+
+    // -- Native cluster component control. The virtual K8s agent does not run k0s
+    //    systemd units, so these are permanently unsupported here. --
+    async fn start_cluster_component(
+        &self,
+        _request: Request<StartClusterComponentRequest>,
+    ) -> Result<Response<StartClusterComponentResponse>, Status> {
+        Err(Status::unimplemented(
+            "cluster components not supported for K8s agent",
+        ))
+    }
+
+    async fn stop_cluster_component(
+        &self,
+        _request: Request<StopClusterComponentRequest>,
+    ) -> Result<Response<StopClusterComponentResponse>, Status> {
+        Err(Status::unimplemented(
+            "cluster components not supported for K8s agent",
+        ))
+    }
+
+    async fn get_cluster_component_status(
+        &self,
+        _request: Request<GetClusterComponentStatusRequest>,
+    ) -> Result<Response<GetClusterComponentStatusResponse>, Status> {
+        Err(Status::unimplemented(
+            "cluster components not supported for K8s agent",
+        ))
+    }
+
+    async fn create_k0s_join_token(
+        &self,
+        _request: Request<CreateK0sJoinTokenRequest>,
+    ) -> Result<Response<CreateK0sJoinTokenResponse>, Status> {
+        Err(Status::unimplemented(
+            "cluster components not supported for K8s agent",
+        ))
+    }
+
+    async fn get_admin_kubeconfig(
+        &self,
+        _request: Request<GetAdminKubeconfigRequest>,
+    ) -> Result<Response<GetAdminKubeconfigResponse>, Status> {
+        Err(Status::unimplemented(
+            "cluster components not supported for K8s agent",
+        ))
+    }
+
+    async fn apply_mesh(
+        &self,
+        _request: Request<MeshMembership>,
+    ) -> Result<Response<ApplyMeshResponse>, Status> {
+        Err(Status::unimplemented("mesh not supported for K8s agent"))
     }
 }
 

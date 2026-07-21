@@ -5,6 +5,8 @@
 
 import time
 
+import pytest
+
 from cluster import parse_job_id, wait_job, wait_job_state
 
 
@@ -196,3 +198,64 @@ class TestReservations:
         )
         msg = out.lower()
         assert "busy" in msg or "until after reservation start" in msg, f"unexpected: {out}"
+
+    def test_non_owner_cannot_delete_or_update_reservation(self, cluster):
+        """A reservation is owned by its creator; a different user must not be
+        able to delete or update it, but the owner still can. Exercises the
+        full CLI -> gRPC -> controller ownership check (SPUR-69)."""
+        submit_user = cluster.nodes[0].user
+        if submit_user == "root":
+            pytest.skip("need a non-root SSH user to test non-owner rejection")
+
+        # Verify passwordless/known-password sudo -u works in this environment;
+        # otherwise we cannot assume a second identity.
+        probe = cluster.cli_as_user("root", ["scontrol", "show", "reservation"])
+        if "sudo" in probe.lower() and (
+            "password" in probe.lower() or "not allowed" in probe.lower()
+        ):
+            pytest.skip(f"sudo -u unavailable in this environment: {probe.strip()}")
+
+        res_name = f"res-owner-{int(time.time())}"
+        node = cluster.node_names[0]
+
+        # Create as root -> owner is root.
+        create_out = cluster.cli_as_user(
+            "root",
+            [
+                "scontrol",
+                "create-reservation",
+                f"--name={res_name}",
+                "--start-time=now",
+                "--duration=60",
+                f"--nodes={node}",
+                "--users=testuser",
+            ],
+        )
+        assert "created" in create_out.lower(), f"create failed: {create_out}"
+
+        show_out = cluster.scontrol("show", "reservation")
+        assert res_name in show_out
+        assert "Owner=root" in show_out
+
+        # Non-owner (the ordinary SSH user) delete must be rejected.
+        del_denied = cluster.cli_as_user(
+            submit_user, ["scontrol", "delete-reservation", res_name]
+        )
+        assert "deleted" not in del_denied.lower(), f"unexpected delete: {del_denied}"
+        assert "cannot delete" in del_denied.lower() or "permission" in del_denied.lower()
+        assert res_name in cluster.scontrol("show", "reservation")
+
+        # Non-owner update must be rejected too.
+        upd_denied = cluster.cli_as_user(
+            submit_user,
+            ["scontrol", "update-reservation", f"--name={res_name}", "--duration=120"],
+        )
+        assert "cannot modify" in upd_denied.lower() or "permission" in upd_denied.lower()
+        assert res_name in cluster.scontrol("show", "reservation")
+
+        # Owner (root) can still delete.
+        del_ok = cluster.cli_as_user(
+            "root", ["scontrol", "delete-reservation", res_name]
+        )
+        assert "deleted" in del_ok.lower(), f"owner delete failed: {del_ok}"
+        assert res_name not in cluster.scontrol("show", "reservation")

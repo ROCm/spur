@@ -4,6 +4,7 @@
 mod accounting;
 mod association_cache;
 mod cluster;
+mod cluster_k8s;
 mod fairshare_cache;
 mod limits_cache;
 mod metrics_proto;
@@ -127,19 +128,16 @@ async fn main() -> anyhow::Result<()> {
         info!("single-node Raft mode (no peers configured)");
         (vec![raft_addr], 1u64)
     } else {
-        let id = config
-            .controller
-            .node_id
-            .or_else(raft::detect_node_id_from_hostname)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Raft peers configured but node_id could not be determined. \
-                 Set controller.node_id in spur.conf or use a hostname ending \
-                 in -N (e.g. spurctld-0)."
-                )
-            })?;
+        let hostname = raft::system_hostname()?;
+        let (id, source) = raft::resolve_node_id(
+            config.controller.node_id,
+            &hostname,
+            &config.controller.peers,
+        )?;
         info!(
             node_id = id,
+            source = %source,
+            hostname,
             peers = ?config.controller.peers,
             "initializing Raft consensus"
         );
@@ -232,6 +230,23 @@ async fn main() -> anyhow::Result<()> {
     let sched_handle = tokio::spawn(async move {
         scheduler_loop::run(sched_cluster, sched_raft).await;
     });
+
+    // Start the k0s cluster reconcile loop (leader-gated; only when [cluster].enabled).
+    if config.cluster.enabled {
+        let k8s_cluster = cluster.clone();
+        let k8s_raft = raft_handle.clone();
+        let k8s_net = cluster_k8s::ClusterNetworking {
+            mesh_cidr: config.network.wg_cidr.clone(),
+            pod_cidr: config.cluster.pod_cidr.clone(),
+            service_cidr: config.cluster.service_cidr.clone(),
+            cni_mtu: config.cluster.cni_mtu,
+            cni: config.cluster.cni.clone(),
+            control_plane_node: config.cluster.control_plane_node.clone(),
+        };
+        tokio::spawn(async move {
+            cluster_k8s::run(k8s_cluster, k8s_raft, k8s_net).await;
+        });
+    }
 
     // Start node health checker (only on leader).
     let hb_timeout = config.controller.heartbeat_timeout_secs.unwrap_or(90);
@@ -338,6 +353,7 @@ fn default_config() -> spur_core::config::SlurmConfig {
         network: Default::default(),
         logging: Default::default(),
         kubernetes: Default::default(),
+        cluster: Default::default(),
         notifications: Default::default(),
         power: Default::default(),
         federation: Default::default(),

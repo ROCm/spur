@@ -4,6 +4,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
+use crate::format_engine;
 use spur_proto::proto::slurm_accounting_client::SlurmAccountingClient;
 use spur_proto::proto::*;
 
@@ -123,6 +124,7 @@ const QOS_KEYS: &[&str] = &[
     "maxsubmitjobsperuser",
     "maxtresperuser",
     "grptres",
+    "grpwall",
 ];
 
 /// Reject keys the command does not understand, so a mistyped or unsupported
@@ -148,12 +150,42 @@ async fn connect(addr: &str) -> Result<SlurmAccountingClient<tonic::transport::C
     Ok(spur_proto::accounting_client(channel))
 }
 
-/// Extract the fields shared by `add user` and `modify user` (both upsert
-/// via the same `AddUserRequest`). Returns (name, account, admin_level,
-/// default_qos).
+/// Parse a numeric limit value where `0` is a keyword meaning "no limit".
+/// Fails loudly instead of silently defaulting to `0` so a typo or
+/// out-of-range value never accidentally lifts a limit.
+fn parse_limit(key: &str, val: &str) -> Result<u32> {
+    val.parse()
+        .map_err(|_| anyhow::anyhow!("invalid value for {key}=: '{val}'"))
+}
+
+/// Same as `parse_limit`, but for wall-time fields that also accept Slurm's
+/// `d-hh:mm:ss`/`hh:mm:ss` duration syntax (see `parse_wall_time`).
+fn parse_wall_limit(key: &str, val: &str) -> Result<u32> {
+    parse_wall_time(val).ok_or_else(|| anyhow::anyhow!("invalid value for {key}=: '{val}'"))
+}
+
+/// Fields shared by `add user` and `modify user` (both upsert via the same
+/// `AddUserRequest`).
+#[derive(Debug, PartialEq)]
+struct UserUpsertFields {
+    name: String,
+    account: String,
+    admin: String,
+    default_qos: String,
+    max_running_jobs: u32,
+    max_submit_jobs: u32,
+    max_tres_per_job: String,
+    grp_tres: String,
+    max_wall_minutes: u32,
+}
+
+/// Parse the key=value params for `add user`/`modify user` into the shared
+/// upsert shape. Numeric/TRES aliases mirror `add account`'s
+/// `maxrunningjobs`/`maxjobs` and `add qos`'s `maxwall` for consistency
+/// across entities.
 fn build_add_user_request(
     p: &std::collections::HashMap<String, String>,
-) -> Result<(String, String, String, String)> {
+) -> Result<UserUpsertFields> {
     let name = p
         .get("name")
         .or_else(|| p.get("user"))
@@ -169,7 +201,37 @@ fn build_add_user_request(
         .cloned()
         .unwrap_or_else(|| "none".into());
     let default_qos = p.get("defaultqos").cloned().unwrap_or_default();
-    Ok((name, account, admin, default_qos))
+    let max_running_jobs: u32 = p
+        .get("maxrunningjobs")
+        .or_else(|| p.get("maxjobs"))
+        .map(|v| parse_limit("maxjobs", v))
+        .transpose()?
+        .unwrap_or(0);
+    let max_submit_jobs: u32 = p
+        .get("maxsubmitjobs")
+        .map(|v| parse_limit("maxsubmitjobs", v))
+        .transpose()?
+        .unwrap_or(0);
+    let max_tres_per_job = p.get("maxtresperjob").cloned().unwrap_or_default();
+    let grp_tres = p.get("grptres").cloned().unwrap_or_default();
+    let max_wall_minutes: u32 = p
+        .get("maxwall")
+        .or_else(|| p.get("maxwallduration"))
+        .map(|v| parse_wall_limit("maxwall", v))
+        .transpose()?
+        .unwrap_or(0);
+
+    Ok(UserUpsertFields {
+        name,
+        account,
+        admin,
+        default_qos,
+        max_running_jobs,
+        max_submit_jobs,
+        max_tres_per_job,
+        grp_tres,
+        max_wall_minutes,
+    })
 }
 
 async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
@@ -191,7 +253,8 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
             let max_jobs: u32 = p
                 .get("maxrunningjobs")
                 .or_else(|| p.get("maxjobs"))
-                .and_then(|v| v.parse().ok())
+                .map(|v| parse_limit("maxjobs", v))
+                .transpose()?
                 .unwrap_or(0);
 
             let mut client = connect(addr).await?;
@@ -219,29 +282,49 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
             Ok(())
         }
         "user" => {
-            let (name, account, admin, default_qos) = build_add_user_request(&p)?;
+            let fields = build_add_user_request(&p)?;
 
             let mut client = connect(addr).await?;
             client
                 .add_user(AddUserRequest {
-                    user: name.clone(),
-                    account: account.clone(),
-                    admin_level: admin.clone(),
+                    user: fields.name.clone(),
+                    account: fields.account.clone(),
+                    admin_level: fields.admin.clone(),
                     is_default: p
                         .get("defaultaccount")
-                        .map(|da| da == &account)
+                        .map(|da| da == &fields.account)
                         .unwrap_or(true),
-                    default_qos: default_qos.clone(),
+                    default_qos: fields.default_qos.clone(),
+                    max_running_jobs: fields.max_running_jobs,
+                    max_submit_jobs: fields.max_submit_jobs,
+                    max_tres_per_job: fields.max_tres_per_job.clone(),
+                    grp_tres: fields.grp_tres.clone(),
+                    max_wall_minutes: fields.max_wall_minutes,
                 })
                 .await
                 .context("AddUser RPC failed")?;
 
             println!(
                 " Adding User(s)\n  Name       = {}\n  Account    = {}\n  Admin      = {}",
-                name, account, admin
+                fields.name, fields.account, fields.admin
             );
-            if !default_qos.is_empty() {
-                println!("  DefQOS     = {}", default_qos);
+            if !fields.default_qos.is_empty() {
+                println!("  DefQOS     = {}", fields.default_qos);
+            }
+            if fields.max_running_jobs > 0 {
+                println!("  MaxJobs    = {}", fields.max_running_jobs);
+            }
+            if fields.max_submit_jobs > 0 {
+                println!("  MaxSubmit  = {}", fields.max_submit_jobs);
+            }
+            if fields.max_wall_minutes > 0 {
+                println!("  MaxWall    = {} min", fields.max_wall_minutes);
+            }
+            if !fields.max_tres_per_job.is_empty() {
+                println!("  MaxTRES    = {}", fields.max_tres_per_job);
+            }
+            if !fields.grp_tres.is_empty() {
+                println!("  GrpTRES    = {}", fields.grp_tres);
             }
             println!(" User added.");
             Ok(())
@@ -265,13 +348,20 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
             let max_jobs: u32 = p
                 .get("maxjobsperuser")
                 .or_else(|| p.get("maxjobspu"))
-                .and_then(|v| v.parse().ok())
+                .map(|v| parse_limit("maxjobsperuser", v))
+                .transpose()?
                 .unwrap_or(0);
             let max_wall: u32 = p
                 .get("maxwall")
-                .and_then(|v| parse_wall_time(v))
+                .map(|v| parse_wall_limit("maxwall", v))
+                .transpose()?
                 .unwrap_or(0);
             let max_tres = p.get("maxtresperjob").cloned().unwrap_or_default();
+            let grp_wall: u32 = p
+                .get("grpwall")
+                .map(|v| parse_wall_limit("grpwall", v))
+                .transpose()?
+                .unwrap_or(0);
 
             let mut client = connect(addr).await?;
             client
@@ -286,10 +376,12 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     max_tres_per_job: max_tres,
                     max_submit_jobs_per_user: p
                         .get("maxsubmitjobsperuser")
-                        .and_then(|v| v.parse().ok())
+                        .map(|v| parse_limit("maxsubmitjobsperuser", v))
+                        .transpose()?
                         .unwrap_or(0),
                     max_tres_per_user: p.get("maxtresperuser").cloned().unwrap_or_default(),
                     grp_tres: p.get("grptres").cloned().unwrap_or_default(),
+                    grp_wall_minutes: grp_wall,
                 })
                 .await
                 .context("CreateQos RPC failed")?;
@@ -400,7 +492,8 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     max_running_jobs: p
                         .get("maxrunningjobs")
                         .or_else(|| p.get("maxjobs"))
-                        .and_then(|v| v.parse().ok())
+                        .map(|v| parse_limit("maxjobs", v))
+                        .transpose()?
                         .unwrap_or(0),
                 })
                 .await
@@ -433,19 +526,27 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     max_jobs_per_user: p
                         .get("maxjobsperuser")
                         .or_else(|| p.get("maxjobspu"))
-                        .and_then(|v| v.parse().ok())
+                        .map(|v| parse_limit("maxjobsperuser", v))
+                        .transpose()?
                         .unwrap_or(0),
                     max_wall_minutes: p
                         .get("maxwall")
-                        .and_then(|v| parse_wall_time(v))
+                        .map(|v| parse_wall_limit("maxwall", v))
+                        .transpose()?
                         .unwrap_or(0),
                     max_tres_per_job: p.get("maxtresperjob").cloned().unwrap_or_default(),
                     max_submit_jobs_per_user: p
                         .get("maxsubmitjobsperuser")
-                        .and_then(|v| v.parse().ok())
+                        .map(|v| parse_limit("maxsubmitjobsperuser", v))
+                        .transpose()?
                         .unwrap_or(0),
                     max_tres_per_user: p.get("maxtresperuser").cloned().unwrap_or_default(),
                     grp_tres: p.get("grptres").cloned().unwrap_or_default(),
+                    grp_wall_minutes: p
+                        .get("grpwall")
+                        .map(|v| parse_wall_limit("grpwall", v))
+                        .transpose()?
+                        .unwrap_or(0),
                 })
                 .await
                 .context("CreateQos (modify) RPC failed")?;
@@ -454,26 +555,46 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
             Ok(())
         }
         "user" => {
-            let (name, account, admin, default_qos) = build_add_user_request(&p)?;
+            let fields = build_add_user_request(&p)?;
 
             let mut client = connect(addr).await?;
             client
                 .add_user(AddUserRequest {
-                    user: name.clone(),
-                    account: account.clone(),
-                    admin_level: admin,
+                    user: fields.name.clone(),
+                    account: fields.account.clone(),
+                    admin_level: fields.admin.clone(),
                     is_default: p
                         .get("defaultaccount")
-                        .map(|da| da == &account)
+                        .map(|da| da == &fields.account)
                         .unwrap_or(true),
-                    default_qos: default_qos.clone(),
+                    default_qos: fields.default_qos.clone(),
+                    max_running_jobs: fields.max_running_jobs,
+                    max_submit_jobs: fields.max_submit_jobs,
+                    max_tres_per_job: fields.max_tres_per_job.clone(),
+                    grp_tres: fields.grp_tres.clone(),
+                    max_wall_minutes: fields.max_wall_minutes,
                 })
                 .await
                 .context("AddUser (modify) RPC failed")?;
 
-            println!(" Modified user '{}'.", name);
-            if !default_qos.is_empty() {
-                println!("  DefQOS     = {}", default_qos);
+            println!(" Modified user '{}'.", fields.name);
+            if !fields.default_qos.is_empty() {
+                println!("  DefQOS     = {}", fields.default_qos);
+            }
+            if fields.max_running_jobs > 0 {
+                println!("  MaxJobs    = {}", fields.max_running_jobs);
+            }
+            if fields.max_submit_jobs > 0 {
+                println!("  MaxSubmit  = {}", fields.max_submit_jobs);
+            }
+            if fields.max_wall_minutes > 0 {
+                println!("  MaxWall    = {} min", fields.max_wall_minutes);
+            }
+            if !fields.max_tres_per_job.is_empty() {
+                println!("  MaxTRES    = {}", fields.max_tres_per_job);
+            }
+            if !fields.grp_tres.is_empty() {
+                println!("  GrpTRES    = {}", fields.grp_tres);
             }
             Ok(())
         }
@@ -548,46 +669,50 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
             Ok(())
         }
         "qos" => {
+            let fields = format_engine::resolve_format(
+                p.get("format").map(String::as_str),
+                QOS_DEFAULT_FORMAT,
+                QOS_ALL_FORMAT,
+                &qos_field_spec,
+                &qos_header,
+                "Name, Description, Priority, Preempt, UsageFactor, \
+                 GrpTRES, MaxTRES, MaxTRESPU, MaxJobsPU, MaxSubmitPU, MaxWall, GrpWall",
+            )?;
+
             let mut client = connect(addr).await?;
-            let resp = client
+            let mut qos_list = client
                 .list_qos(ListQosRequest {})
                 .await
-                .context("ListQos RPC failed")?;
+                .context("ListQos RPC failed")?
+                .into_inner()
+                .qos_list;
 
-            let qos_list = resp.into_inner().qos_list;
+            let has_name_filter = p.contains_key("name");
+            if let Some(name_filter) = p.get("name") {
+                filter_qos_by_name(&mut qos_list, name_filter);
+            }
 
-            println!(
-                "{:<15} {:<8} {:<10} {:<12} {:<10} {:<10}",
-                "Name", "Prio", "Preempt", "UsageFactor", "MaxJobsPU", "MaxWall"
-            );
-            println!("{}", "-".repeat(65));
+            format_engine::print_header(&fields);
 
-            if qos_list.is_empty() {
-                // Show default
+            if qos_list.is_empty() && !has_name_filter {
+                let default_qos = QosInfo {
+                    name: "normal".into(),
+                    preempt_mode: "off".into(),
+                    usage_factor: 1.0,
+                    ..Default::default()
+                };
                 println!(
-                    "{:<15} {:<8} {:<10} {:<12} {:<10} {:<10}",
-                    "normal", "0", "off", "1.0", "", ""
+                    "{}",
+                    format_engine::format_row(&fields, &|spec| resolve_qos_field(
+                        &default_qos,
+                        spec
+                    ))
                 );
             } else {
                 for q in &qos_list {
-                    let max_jobs_str = if q.max_jobs_per_user == 0 {
-                        String::new()
-                    } else {
-                        q.max_jobs_per_user.to_string()
-                    };
-                    let max_wall_str = if q.max_wall_minutes == 0 {
-                        String::new()
-                    } else {
-                        q.max_wall_minutes.to_string()
-                    };
                     println!(
-                        "{:<15} {:<8} {:<10} {:<12} {:<10} {:<10}",
-                        q.name,
-                        q.priority,
-                        q.preempt_mode,
-                        q.usage_factor,
-                        max_jobs_str,
-                        max_wall_str,
+                        "{}",
+                        format_engine::format_row(&fields, &|spec| resolve_qos_field(q, spec))
                     );
                 }
             }
@@ -616,6 +741,94 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
             "sacctmgr: unknown entity '{}'. Use: account, user, qos, association, tres",
             other
         ),
+    }
+}
+
+fn filter_qos_by_name(qos_list: &mut Vec<QosInfo>, filter: &str) {
+    let names: Vec<&str> = filter.split(',').map(str::trim).collect();
+    qos_list.retain(|q| names.iter().any(|n| n.eq_ignore_ascii_case(&q.name)));
+}
+
+const QOS_DEFAULT_FORMAT: &str = "%-15N %-8p %-10P %-12U %-10J %-10S %-10W %-10w %-20T %-20V %-20G";
+
+const QOS_ALL_FORMAT: &str =
+    "%-15N %-30D %-8p %-10P %-12U %-10J %-10S %-10W %-10w %-20T %-20V %-20G";
+
+fn qos_header(spec: char) -> &'static str {
+    match spec {
+        'N' => "Name",
+        'D' => "Descr",
+        'p' => "Priority",
+        'P' => "Preempt",
+        'U' => "UsageFactor",
+        'G' => "GrpTRES",
+        'T' => "MaxTRES",
+        'V' => "MaxTRESPU",
+        'J' => "MaxJobsPU",
+        'S' => "MaxSubmitPU",
+        'W' => "MaxWall",
+        'w' => "GrpWall",
+        _ => "?",
+    }
+}
+
+fn qos_field_spec(name: &str) -> Option<char> {
+    match name.to_lowercase().as_str() {
+        "name" => Some('N'),
+        "description" | "descr" => Some('D'),
+        "priority" | "prio" => Some('p'),
+        "preempt" | "preemptmode" => Some('P'),
+        "usagefactor" => Some('U'),
+        "grptres" => Some('G'),
+        "maxtres" | "maxtrespj" | "maxtresperjob" => Some('T'),
+        "maxtrespu" | "maxtresperuser" => Some('V'),
+        "maxjobspu" | "maxjobsperuser" => Some('J'),
+        "maxsubmitpu" | "maxsubmitjobspu" | "maxsubmitjobsperuser" => Some('S'),
+        "maxwall" | "maxwalldurationperjob" => Some('W'),
+        "grpwall" => Some('w'),
+        _ => None,
+    }
+}
+
+fn resolve_qos_field(q: &QosInfo, spec: char) -> String {
+    match spec {
+        'N' => q.name.clone(),
+        'D' => q.description.clone(),
+        'p' => q.priority.to_string(),
+        'P' => q.preempt_mode.clone(),
+        'U' => format!("{}", q.usage_factor),
+        'G' => q.grp_tres.clone(),
+        'T' => q.max_tres_per_job.clone(),
+        'V' => q.max_tres_per_user.clone(),
+        'J' => {
+            if q.max_jobs_per_user == 0 {
+                String::new()
+            } else {
+                q.max_jobs_per_user.to_string()
+            }
+        }
+        'S' => {
+            if q.max_submit_jobs_per_user == 0 {
+                String::new()
+            } else {
+                q.max_submit_jobs_per_user.to_string()
+            }
+        }
+        'W' => {
+            if q.max_wall_minutes == 0 {
+                String::new()
+            } else {
+                q.max_wall_minutes.to_string()
+            }
+        }
+        'w' => {
+            if q.grp_wall_minutes == 0 {
+                String::new()
+            } else {
+                q.grp_wall_minutes.to_string()
+            }
+        }
+        _ => "?".into(),
     }
 }
 
@@ -667,11 +880,11 @@ mod tests {
             "account=testacct".into(),
             "defaultqos=highprio".into(),
         ]);
-        let (name, account, admin, default_qos) = build_add_user_request(&p).unwrap();
-        assert_eq!(name, "testuser");
-        assert_eq!(account, "testacct");
-        assert_eq!(admin, "none");
-        assert_eq!(default_qos, "highprio");
+        let fields = build_add_user_request(&p).unwrap();
+        assert_eq!(fields.name, "testuser");
+        assert_eq!(fields.account, "testacct");
+        assert_eq!(fields.admin, "none");
+        assert_eq!(fields.default_qos, "highprio");
     }
 
     #[test]
@@ -681,6 +894,34 @@ mod tests {
         let p = parse_params(&["name=normal".into(), "bogusfield=1".into()]);
         let err = reject_unknown_keys(&p, QOS_KEYS).unwrap_err();
         assert!(err.to_string().contains("unknown field 'bogusfield'"));
+    }
+
+    #[test]
+    fn reject_unknown_keys_accepts_every_parsed_qos_field() {
+        // Every input key the add/modify qos handlers read must be in the
+        // allowlist, otherwise reject_unknown_keys bounces it before parsing
+        // (grpwall regressed this way: parsed and shown, but not allowlisted).
+        let parsed_fields = [
+            "name",
+            "description",
+            "priority",
+            "preemptmode",
+            "usagefactor",
+            "maxjobsperuser",
+            "maxwall",
+            "maxtresperjob",
+            "maxsubmitjobsperuser",
+            "maxtresperuser",
+            "grptres",
+            "grpwall",
+        ];
+        for field in parsed_fields {
+            let p = parse_params(&["name=normal".into(), format!("{field}=1")]);
+            assert!(
+                reject_unknown_keys(&p, QOS_KEYS).is_ok(),
+                "QOS field '{field}' is read by the handler but missing from QOS_KEYS"
+            );
+        }
     }
 
     #[test]
@@ -698,8 +939,60 @@ mod tests {
     #[test]
     fn build_add_user_request_defaultqos_absent_is_empty() {
         let p = parse_params(&["name=testuser".into(), "account=testacct".into()]);
-        let (_, _, _, default_qos) = build_add_user_request(&p).unwrap();
-        assert_eq!(default_qos, "");
+        let fields = build_add_user_request(&p).unwrap();
+        assert_eq!(fields.default_qos, "");
+    }
+
+    #[test]
+    fn build_add_user_request_parses_account_limits() {
+        let p = parse_params(&[
+            "name=testuser".into(),
+            "account=testacct".into(),
+            "maxjobs=2".into(),
+            "maxsubmitjobs=4".into(),
+            "maxtresperjob=cpu=8".into(),
+            "grptres=cpu=32".into(),
+            "maxwall=60".into(),
+        ]);
+        let fields = build_add_user_request(&p).unwrap();
+        assert_eq!(fields.max_running_jobs, 2);
+        assert_eq!(fields.max_submit_jobs, 4);
+        assert_eq!(fields.max_tres_per_job, "cpu=8");
+        assert_eq!(fields.grp_tres, "cpu=32");
+        assert_eq!(fields.max_wall_minutes, 60);
+    }
+
+    #[test]
+    fn build_add_user_request_maxrunningjobs_alias() {
+        let p = parse_params(&[
+            "name=testuser".into(),
+            "account=testacct".into(),
+            "maxrunningjobs=3".into(),
+        ]);
+        let fields = build_add_user_request(&p).unwrap();
+        assert_eq!(fields.max_running_jobs, 3);
+    }
+
+    #[test]
+    fn build_add_user_request_maxwallduration_alias() {
+        let p = parse_params(&[
+            "name=testuser".into(),
+            "account=testacct".into(),
+            "maxwallduration=1:30".into(),
+        ]);
+        let fields = build_add_user_request(&p).unwrap();
+        assert_eq!(fields.max_wall_minutes, 90);
+    }
+
+    #[test]
+    fn build_add_user_request_account_limits_absent_are_zero() {
+        let p = parse_params(&["name=testuser".into(), "account=testacct".into()]);
+        let fields = build_add_user_request(&p).unwrap();
+        assert_eq!(fields.max_running_jobs, 0);
+        assert_eq!(fields.max_submit_jobs, 0);
+        assert_eq!(fields.max_tres_per_job, "");
+        assert_eq!(fields.grp_tres, "");
+        assert_eq!(fields.max_wall_minutes, 0);
     }
 
     #[test]
@@ -711,6 +1004,69 @@ mod tests {
     #[test]
     fn build_add_user_request_missing_account_errors() {
         let p = parse_params(&["name=testuser".into()]);
+        assert!(build_add_user_request(&p).is_err());
+    }
+
+    #[test]
+    fn parse_limit_rejects_non_numeric_value() {
+        let err = parse_limit("maxjobs", "abc").unwrap_err();
+        assert!(err.to_string().contains("maxjobs"));
+        assert!(err.to_string().contains("abc"));
+    }
+
+    #[test]
+    fn parse_limit_rejects_negative_value() {
+        assert!(parse_limit("maxjobs", "-5").is_err());
+    }
+
+    #[test]
+    fn parse_limit_rejects_overflowing_value() {
+        assert!(parse_limit("maxjobs", "99999999999999999999").is_err());
+    }
+
+    #[test]
+    fn parse_limit_accepts_valid_value() {
+        assert_eq!(parse_limit("maxjobs", "5").unwrap(), 5);
+    }
+
+    #[test]
+    fn parse_wall_limit_rejects_non_numeric_value() {
+        assert!(parse_wall_limit("maxwall", "abc").is_err());
+    }
+
+    #[test]
+    fn parse_wall_limit_accepts_duration_syntax() {
+        assert_eq!(parse_wall_limit("maxwall", "1:30").unwrap(), 90);
+    }
+
+    #[test]
+    fn build_add_user_request_rejects_invalid_maxjobs() {
+        let p = parse_params(&[
+            "name=testuser".into(),
+            "account=testacct".into(),
+            "maxjobs=abc".into(),
+        ]);
+        let err = build_add_user_request(&p).unwrap_err();
+        assert!(err.to_string().contains("maxjobs"));
+    }
+
+    #[test]
+    fn build_add_user_request_rejects_negative_maxsubmitjobs() {
+        let p = parse_params(&[
+            "name=testuser".into(),
+            "account=testacct".into(),
+            "maxsubmitjobs=-1".into(),
+        ]);
+        assert!(build_add_user_request(&p).is_err());
+    }
+
+    #[test]
+    fn build_add_user_request_rejects_invalid_maxwall() {
+        let p = parse_params(&[
+            "name=testuser".into(),
+            "account=testacct".into(),
+            "maxwall=notatime".into(),
+        ]);
         assert!(build_add_user_request(&p).is_err());
     }
 
@@ -734,5 +1090,112 @@ mod tests {
             build_add_user_request(&add_params).unwrap(),
             build_add_user_request(&modify_params).unwrap()
         );
+    }
+
+    fn stub_qos() -> QosInfo {
+        QosInfo {
+            name: "gpuqos".into(),
+            description: "GPU workers".into(),
+            priority: 100,
+            preempt_mode: "cancel".into(),
+            usage_factor: 1.5,
+            max_jobs_per_user: 8,
+            max_submit_jobs_per_user: 20,
+            max_wall_minutes: 120,
+            max_tres_per_job: "node=2,cpu=64".into(),
+            max_tres_per_user: "cpu=128".into(),
+            grp_tres: "node=4,cpu=256".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn qos_named_format_renders_tres_fields() {
+        let fields = format_engine::parse_named_format(
+            "Name,GrpTRES,MaxTRES,MaxTRESPU",
+            &qos_field_spec,
+            &qos_header,
+        );
+        let q = stub_qos();
+        let row = format_engine::format_row(&fields, &|spec| resolve_qos_field(&q, spec));
+        assert!(row.contains("node=4,cpu=256"), "GrpTRES missing: {row}");
+        assert!(row.contains("node=2,cpu=64"), "MaxTRES missing: {row}");
+        assert!(row.contains("cpu=128"), "MaxTRESPU missing: {row}");
+    }
+
+    #[test]
+    fn qos_field_spec_aliases_are_case_insensitive() {
+        assert_eq!(qos_field_spec("grptres"), qos_field_spec("GrpTRES"));
+        assert_eq!(qos_field_spec("maxtres"), qos_field_spec("MaxTRESPJ"));
+        assert_eq!(qos_field_spec("maxtresperjob"), qos_field_spec("MaxTRES"));
+        assert_eq!(
+            qos_field_spec("maxwall"),
+            qos_field_spec("MaxWallDurationPerJob")
+        );
+    }
+
+    #[test]
+    fn qos_default_format_includes_tres_columns() {
+        let fields = format_engine::parse_format(QOS_DEFAULT_FORMAT, &qos_header);
+        let header = format_engine::format_header(&fields);
+        assert!(header.contains("GrpTRES"), "default header: {header}");
+        assert!(header.contains("MaxTRES"), "default header: {header}");
+    }
+
+    #[test]
+    fn qos_all_format_includes_description_and_submit() {
+        let fields = format_engine::parse_format(QOS_ALL_FORMAT, &qos_header);
+        let header = format_engine::format_header(&fields);
+        assert!(header.contains("Descr"), "all header: {header}");
+        assert!(header.contains("MaxSubmitPU"), "all header: {header}");
+    }
+
+    #[test]
+    fn qos_resolve_zero_fields_are_blank() {
+        let q = QosInfo {
+            name: "normal".into(),
+            preempt_mode: "off".into(),
+            usage_factor: 1.0,
+            ..Default::default()
+        };
+        assert_eq!(resolve_qos_field(&q, 'J'), "");
+        assert_eq!(resolve_qos_field(&q, 'S'), "");
+        assert_eq!(resolve_qos_field(&q, 'W'), "");
+        assert_eq!(resolve_qos_field(&q, 'w'), "");
+    }
+
+    #[test]
+    fn qos_name_filter_retains_matching_and_trims_whitespace() {
+        let mut list = vec![
+            QosInfo {
+                name: "alpha".into(),
+                ..Default::default()
+            },
+            QosInfo {
+                name: "beta".into(),
+                ..Default::default()
+            },
+            QosInfo {
+                name: "gamma".into(),
+                ..Default::default()
+            },
+        ];
+        filter_qos_by_name(&mut list, "alpha, gamma");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].name, "alpha");
+        assert_eq!(list[1].name, "gamma");
+    }
+
+    #[test]
+    fn qos_field_spec_rejects_unknown_names() {
+        assert_eq!(qos_field_spec("bogus"), None);
+        assert_eq!(qos_field_spec("nodelist"), None);
+        assert_eq!(qos_field_spec(""), None);
+    }
+
+    #[test]
+    fn qos_empty_format_string_produces_no_fields() {
+        let fields = format_engine::parse_named_format("", &qos_field_spec, &qos_header);
+        assert!(fields.is_empty());
     }
 }

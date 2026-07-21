@@ -8,4 +8,5 @@ Guides for deploying Spur in production across multiple nodes.
 
    native-host
    kubernetes
+   managed-kubernetes
    partitioning
