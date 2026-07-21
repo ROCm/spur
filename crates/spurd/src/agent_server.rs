@@ -376,6 +376,20 @@ mod completion_report_tests {
     }
 }
 
+/// Reap an already-killed displaced run. Polls `try_wait` so both executor
+/// variants are collected: a `Managed` child via tokio, a `Forked` container's
+/// raw pid via `waitpid`. Once a displaced run leaves the `running` map the
+/// monitor loop no longer polls it, so without this a killed `Forked` run would
+/// linger as a zombie until spurd exits.
+async fn reap_killed_job(mut job: executor::RunningJob) {
+    loop {
+        match job.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+        }
+    }
+}
+
 /// Build a bash script that execs a command vector without shell interpretation.
 fn build_one_shot_command_script(command: &[String]) -> Result<String, Status> {
     let joined = shlex::try_join(command.iter().map(String::as_str))
@@ -931,14 +945,10 @@ impl SlurmAgent for AgentService {
                 // older run. If its process ignored SIGTERM and outlived the
                 // requeue, kill and reap it here — the monitor loop no longer
                 // tracks it, so without this it would leak as an orphan/zombie.
-                if let Some(mut old) = displaced {
+                if let Some(old) = displaced {
                     if old.run_attempt < run_attempt {
                         let _ = old.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
-                        tokio::spawn(async move {
-                            if let executor::RunningJob::Managed { child, .. } = &mut old.job {
-                                let _ = child.wait().await;
-                            }
-                        });
+                        tokio::spawn(reap_killed_job(old.job));
                     }
                 }
                 Ok(Response::new(LaunchJobResponse {
@@ -2775,6 +2785,40 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         proc_state(pid)
+    }
+
+    /// A displaced `Forked` run (root/container path) holds a raw pid that
+    /// spurd must reap itself. `reap_killed_job` must collect it via `waitpid`;
+    /// otherwise it lingers as a zombie once it leaves the monitor loop's map.
+    #[tokio::test]
+    async fn reap_killed_job_reaps_forked_variant() {
+        // Fork a child that exits immediately, leaving it unreaped (a zombie)
+        // until something waits on it — exactly the displaced-run situation.
+        let pid = match unsafe { nix::unistd::fork() }.expect("fork") {
+            nix::unistd::ForkResult::Child => unsafe { libc::_exit(0) },
+            nix::unistd::ForkResult::Parent { child } => child.as_raw(),
+        };
+
+        // Let the child exit so it is a zombie before we reap it.
+        assert_eq!(
+            await_proc_state(pid, &['Z']).await,
+            'Z',
+            "forked child should be an unreaped zombie before reap_killed_job"
+        );
+
+        let job = executor::RunningJob::Forked {
+            pid,
+            _pidfd: None,
+            cgroup_path: None,
+            reaped: false,
+        };
+        reap_killed_job(job).await;
+
+        // After reaping, the pid is gone from the process table entirely.
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "reap_killed_job must reap the Forked child (pid {pid} still present)"
+        );
     }
 
     #[tokio::test]
