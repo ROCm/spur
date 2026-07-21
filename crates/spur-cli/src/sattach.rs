@@ -75,11 +75,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     // Connect to the first node's agent
     let first_node = nodelist.split(',').next().unwrap_or(nodelist).trim();
     let agent_addr = format!("http://{}:6818", first_node);
-    let mut agent = SlurmAgentClient::connect(agent_addr.clone())
-        .await
-        .context(format!("failed to connect to agent at {}", agent_addr))?
-        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
+    let mut agent = crate::interactive::connect_agent(&agent_addr).await?;
 
     if args.output_only {
         stream_output_only(&mut agent, job_id, &args.output).await

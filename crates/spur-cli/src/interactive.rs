@@ -8,6 +8,16 @@ use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal::unix::{signal, SignalKind};
 
+/// Connect to a spurd agent, applying the standard gRPC size limits.
+pub async fn connect_agent(addr: &str) -> Result<SlurmAgentClient<tonic::transport::Channel>> {
+    let channel = spur_client::connect_channel(addr)
+        .await
+        .context("cannot connect to agent")?;
+    Ok(SlurmAgentClient::new(channel)
+        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE))
+}
+
 pub fn get_terminal_size() -> spur_proto::proto::WindowSize {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     spur_proto::proto::WindowSize {
@@ -18,16 +28,23 @@ pub fn get_terminal_size() -> spur_proto::proto::WindowSize {
     }
 }
 
-/// Run a full interactive PTY session over the InteractiveSession RPC.
-/// Returns the remote exit code.
-pub async fn run_interactive_session(
+/// Established interactive session: the input sender and output stream.
+pub struct InteractiveSessionHandle {
+    pub in_tx: tokio::sync::mpsc::Sender<InteractiveInput>,
+    pub out_stream: tonic::Streaming<spur_proto::proto::InteractiveOutput>,
+}
+
+/// Open the InteractiveSession RPC, returning the raw handle.
+///
+/// Returns `Err(tonic::Status)` on RPC failure.
+pub async fn open_interactive_session(
     agent: &mut SlurmAgentClient<tonic::transport::Channel>,
     job_id: u32,
     step_id: u32,
     argv: Vec<String>,
     winsize: spur_proto::proto::WindowSize,
     overlap: bool,
-) -> Result<i32> {
+) -> std::result::Result<InteractiveSessionHandle, tonic::Status> {
     let init = InteractiveInput {
         msg: Some(interactive_input::Msg::Init(InitSession {
             job_id,
@@ -44,20 +61,37 @@ pub async fn run_interactive_session(
     in_tx.send(init).await.ok();
 
     let in_stream = tokio_stream::wrappers::ReceiverStream::new(in_rx);
-    let response = agent
-        .interactive_session(in_stream)
-        .await
-        .context("InteractiveSession RPC failed")?;
+    let response = agent.interactive_session(in_stream).await?;
 
-    let mut out_stream = response.into_inner();
+    Ok(InteractiveSessionHandle {
+        in_tx,
+        out_stream: response.into_inner(),
+    })
+}
 
-    let _raw_guard = RawModeGuard::enter().ok();
+/// Drive the I/O loop for an already-opened interactive session.
+/// Returns the remote exit code.
+pub async fn drive_interactive_session(handle: InteractiveSessionHandle) -> Result<i32> {
+    let InteractiveSessionHandle {
+        in_tx,
+        mut out_stream,
+    } = handle;
+
+    let _raw_guard = match RawModeGuard::enter() {
+        Ok(g) => Some(g),
+        Err(_) => {
+            eprintln!("spur: warning: raw mode unavailable (stdin is not a TTY)");
+            None
+        }
+    };
 
     let mut sigwinch = signal(SignalKind::window_change())?;
 
     let mut stdout = tokio::io::stdout();
     let mut stdin = tokio::io::stdin();
     let mut stdin_buf = vec![0u8; 4096];
+    let mut stdin_open = true;
+    let mut in_tx = Some(in_tx);
 
     let exit_code: i32 = loop {
         tokio::select! {
@@ -83,25 +117,35 @@ pub async fn run_interactive_session(
                 }
             }
 
-            n = stdin.read(&mut stdin_buf) => {
+            n = stdin.read(&mut stdin_buf), if stdin_open => {
                 match n {
-                    Ok(0) => break 0,
-                    Ok(n) => {
-                        let _ = in_tx.send(InteractiveInput {
-                            msg: Some(interactive_input::Msg::Stdin(
-                                stdin_buf[..n].to_vec(),
-                            )),
-                        }).await;
+                    Ok(0) => {
+                        stdin_open = false;
+                        in_tx.take();
                     }
-                    Err(_) => break 1,
+                    Ok(n) => {
+                        if let Some(ref tx) = in_tx {
+                            let _ = tx.send(InteractiveInput {
+                                msg: Some(interactive_input::Msg::Stdin(
+                                    stdin_buf[..n].to_vec(),
+                                )),
+                            }).await;
+                        }
+                    }
+                    Err(_) => {
+                        stdin_open = false;
+                        in_tx.take();
+                    }
                 }
             }
 
-            _ = sigwinch.recv() => {
+            _ = sigwinch.recv(), if stdin_open => {
                 let ws = get_terminal_size();
-                let _ = in_tx.send(InteractiveInput {
-                    msg: Some(interactive_input::Msg::Resize(ws)),
-                }).await;
+                if let Some(ref tx) = in_tx {
+                    let _ = tx.send(InteractiveInput {
+                        msg: Some(interactive_input::Msg::Resize(ws)),
+                    }).await;
+                }
             }
         }
     };
@@ -109,6 +153,22 @@ pub async fn run_interactive_session(
     drop(_raw_guard);
 
     Ok(exit_code)
+}
+
+/// Run a full interactive PTY session over the InteractiveSession RPC.
+/// Returns the remote exit code.
+pub async fn run_interactive_session(
+    agent: &mut SlurmAgentClient<tonic::transport::Channel>,
+    job_id: u32,
+    step_id: u32,
+    argv: Vec<String>,
+    winsize: spur_proto::proto::WindowSize,
+    overlap: bool,
+) -> Result<i32> {
+    let handle = open_interactive_session(agent, job_id, step_id, argv, winsize, overlap)
+        .await
+        .map_err(|status| anyhow::anyhow!("InteractiveSession RPC failed: {}", status.message()))?;
+    drive_interactive_session(handle).await
 }
 
 /// RAII guard that puts the terminal into raw mode and restores it on drop.

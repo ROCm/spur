@@ -1166,7 +1166,6 @@ impl SlurmAgent for AgentService {
                 has_pid_namespace: false,
                 has_user_namespace: false,
                 has_mount_namespace: false,
-                rootfs: None,
                 _pty_master: None,
                 work_dir: String::new(),
                 uid: req.uid,

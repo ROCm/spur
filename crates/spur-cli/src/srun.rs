@@ -5,7 +5,6 @@ use crate::env_defaults::{apply_csv, apply_flag, apply_num, apply_str, apply_str
 use anyhow::{Context, Result};
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use spur_core::config::HooksConfig;
-use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
     CancelJobRequest, CompleteJobRequest, CreateJobStepRequest, GetJobRequest, GetNodeRequest,
@@ -197,7 +196,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         if !args.overlap {
             anyhow::bail!("--jobid requires --overlap");
         }
-        let exit_code = run_interactive_overlap(&args, job_id).await?;
+        let exit_code = run_interactive_pty(&args.controller, job_id, args.command.clone()).await?;
         std::process::exit(exit_code);
     }
 
@@ -487,7 +486,11 @@ fn build_srun_job_spec(args: &SrunArgs, work_dir: &str, io: &ResolvedIoPaths) ->
         cpus_per_task: args.cpus_per_task,
         memory_per_node_mb: memory_mb,
         gres,
-        script: build_command_script(&args.command)?,
+        script: if args.pty {
+            "#!/bin/sh\nsleep infinity\n".to_string()
+        } else {
+            build_command_script(&args.command)?
+        },
         work_dir: work_dir.to_string(),
         stdout_path: io.stdout.clone(),
         stderr_path: io.stderr.clone(),
@@ -514,6 +517,7 @@ fn build_srun_job_spec(args: &SrunArgs, work_dir: &str, io: &ResolvedIoPaths) ->
             .collect(),
         container_remap_root: args.container_remap_root,
         srun_job: true,
+        pty: args.pty,
         ..Default::default()
     })
 }
@@ -749,6 +753,19 @@ async fn run_standalone_srun(args: &SrunArgs, hooks: &HooksConfig, work_dir: &st
         eprintln!("srun: job {} running on {}", job_id, nodelist);
     }
 
+    if args.pty {
+        eprintln!("srun: opening interactive session on {}", nodelist);
+        let result = run_interactive_pty(&args.controller, job_id, args.command.clone()).await;
+        let _ = client
+            .cancel_job(CancelJobRequest {
+                job_id,
+                signal: 0,
+                user: user.clone(),
+            })
+            .await;
+        std::process::exit(result?);
+    }
+
     let job = client
         .get_job(GetJobRequest { job_id })
         .await
@@ -854,10 +871,8 @@ async fn try_stream_output(
 
     let agent_addr = format!("http://{first_node}:6818");
 
-    let mut agent = match SlurmAgentClient::connect(agent_addr).await {
-        Ok(c) => c
-            .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE),
+    let mut agent = match crate::interactive::connect_agent(&agent_addr).await {
+        Ok(c) => c,
         Err(_) => return false,
     };
 
@@ -1039,55 +1054,94 @@ fn warn_unsupported_cpu_bind(environment: &HashMap<String, String>) {
     }
 }
 
-/// Exec into a running job using the InteractiveSession RPC (--jobid --overlap).
-async fn run_interactive_overlap(args: &SrunArgs, job_id: u32) -> Result<i32> {
-    use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
-    use spur_proto::proto::CreateJobStepRequest;
-
-    let channel = spur_client::connect_channel(&args.controller)
+/// Create an interactive PTY step on a running job and attach to it.
+///
+/// Retries transient failures (job not yet visible on agent after controller
+/// reports it as Running) up to a few seconds before giving up.
+async fn run_interactive_pty(controller: &str, job_id: u32, command: Vec<String>) -> Result<i32> {
+    let channel = spur_client::connect_channel(controller)
         .await
         .context("cannot connect to controller")?;
     let mut ctrl = SlurmControllerClient::new(channel);
 
     let winsize = crate::interactive::get_terminal_size();
 
-    let step_resp = ctrl
-        .create_job_step(CreateJobStepRequest {
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..5 {
+        if attempt > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+
+        let step_resp = match ctrl
+            .create_job_step(CreateJobStepRequest {
+                job_id,
+                command: command.clone(),
+                num_tasks: 1,
+                cpus_per_task: 1,
+                overlap: true,
+                pty: true,
+                winsize: Some(winsize),
+            })
+            .await
+        {
+            Ok(resp) => resp.into_inner(),
+            Err(status) if is_retryable_status(&status) && attempt < 4 => {
+                last_err = Some(anyhow::anyhow!("CreateJobStep: {}", status.message()));
+                continue;
+            }
+            Err(status) => {
+                return Err(anyhow::anyhow!(
+                    "CreateJobStep failed: {}",
+                    status.message()
+                ))
+            }
+        };
+
+        let node_addr = if step_resp.node_addr.is_empty() {
+            anyhow::bail!(
+                "controller did not return a node address for job {}",
+                job_id
+            );
+        } else {
+            format!("http://{}", step_resp.node_addr)
+        };
+
+        let mut agent = crate::interactive::connect_agent(&node_addr).await?;
+
+        match crate::interactive::open_interactive_session(
+            &mut agent,
             job_id,
-            command: args.command.clone(),
-            num_tasks: 1,
-            cpus_per_task: 1,
-            overlap: true,
-            pty: true,
-            winsize: Some(winsize),
-        })
+            step_resp.step_id,
+            command.clone(),
+            winsize,
+            true,
+        )
         .await
-        .context("CreateJobStep failed")?
-        .into_inner();
+        {
+            Ok(handle) => {
+                return crate::interactive::drive_interactive_session(handle).await;
+            }
+            Err(status) if is_retryable_status(&status) && attempt < 4 => {
+                last_err = Some(anyhow::anyhow!("InteractiveSession: {}", status.message()));
+                continue;
+            }
+            Err(status) => {
+                return Err(anyhow::anyhow!(
+                    "InteractiveSession RPC failed: {}",
+                    status.message()
+                ));
+            }
+        }
+    }
 
-    let node_addr = if step_resp.node_addr.is_empty() {
-        anyhow::bail!(
-            "controller did not return a node address for job {}",
-            job_id
-        );
-    } else {
-        format!("http://{}", step_resp.node_addr)
-    };
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("interactive session failed after retries")))
+}
 
-    let agent_channel = spur_client::connect_channel(&node_addr)
-        .await
-        .context("cannot connect to agent")?;
-    let mut agent = SlurmAgentClient::new(agent_channel);
-
-    crate::interactive::run_interactive_session(
-        &mut agent,
-        job_id,
-        step_resp.step_id,
-        args.command.clone(),
-        winsize,
-        true,
+fn is_retryable_status(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::NotFound | tonic::Code::FailedPrecondition | tonic::Code::Unavailable
     )
-    .await
 }
 
 async fn run_as_step(
