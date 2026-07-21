@@ -446,7 +446,7 @@ async fn spawn_job_process(
 
     // Build resolved output paths (empty for PTY mode since output goes to the terminal).
     let (stdout_resolved, stderr_resolved) = if cfg.io_mode == LaunchIo::Pty {
-        (String::new(), String::new())
+        ("/dev/null".to_string(), "/dev/null".to_string())
     } else {
         (
             resolve_output_path(stdout_path, job_id, work_dir),
@@ -1259,11 +1259,12 @@ async fn launch_container_job(
                 libc::signal(libc::SIGPIPE, libc::SIG_DFL);
             }
 
-            // wire() must run before close_inherited_fds: it dup2's the
-            // job's fds onto 0/1/2, then close_inherited_fds reaps
-            // everything else > 2 (except ready_w).
             unsafe {
-                let _ = raw_io.wire();
+                if let Err(e) = raw_io.wire() {
+                    let msg = format!("E:stdio wire failed: {:#}", e);
+                    let _ = libc::write(ready_w, msg.as_ptr() as *const _, msg.len());
+                    libc::_exit(1);
+                }
             }
 
             crate::container::close_inherited_fds(ready_w);

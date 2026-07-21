@@ -2122,7 +2122,16 @@ impl AgentService {
             .map_err(|e| Status::internal(format!("openpty: {e}")))?;
 
         let shell = if argv.is_empty() {
-            vec!["/bin/bash".to_string()]
+            let bash_exists = if entry.has_mount_namespace {
+                std::path::Path::new(&format!("/proc/{}/root/bin/bash", entry.pid)).exists()
+            } else {
+                std::path::Path::new("/bin/bash").exists()
+            };
+            if bash_exists {
+                vec!["/bin/bash".to_string()]
+            } else {
+                vec!["/bin/sh".to_string()]
+            }
         } else {
             argv.to_vec()
         };

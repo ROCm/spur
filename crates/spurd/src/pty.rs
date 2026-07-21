@@ -36,8 +36,9 @@ pub fn openpty_with_winsize(ws: Option<&WindowSize>) -> Result<(OwnedFd, OwnedFd
     let pty = openpty(None, None).context("openpty")?;
 
     if let Some(ws) = ws {
-        unsafe {
-            libc::ioctl(pty.slave.as_raw_fd(), libc::TIOCSWINSZ, &ws.to_libc());
+        let ret = unsafe { libc::ioctl(pty.slave.as_raw_fd(), libc::TIOCSWINSZ, &ws.to_libc()) };
+        if ret < 0 {
+            tracing::warn!("TIOCSWINSZ failed: {}", std::io::Error::last_os_error());
         }
     }
 
