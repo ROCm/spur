@@ -3809,17 +3809,9 @@ fn job_candidate_node_names(job: &Job, nodes: &[spur_core::node::Node]) -> Vec<S
 }
 
 fn self_partitions_for_job(job: &Job) -> Vec<String> {
-    job.spec
-        .partition
-        .as_deref()
-        .map(|p| {
-            p.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default()
+    requested_partition_names(job.spec.partition.as_deref())
+        .map(String::from)
+        .collect()
 }
 
 fn reservation_fence_reason(
@@ -3961,9 +3953,10 @@ fn qos_block_for(
     }
 }
 
-/// `PartitionInactive` if the partition is not Up, `PartitionConfig` if the
-/// request exceeds its node/time limits, else `None`. Shared by `pending_jobs()`
-/// and `tag_blocked_pending_reasons()` so drop and displayed reason agree.
+/// For a partition OR-list, returns `None` when any requested partition is Up
+/// and permits the request. Unknown names and limits rejected by every Up
+/// alternative return `PartitionConfig`; all-inactive alternatives return
+/// `PartitionInactive`.
 fn partition_block(job: &Job, partitions: &[Partition]) -> Option<spur_core::job::PendingReason> {
     use spur_core::job::PendingReason;
     use spur_core::partition::PartitionState;
@@ -3973,7 +3966,12 @@ fn partition_block(job: &Job, partitions: &[Partition]) -> Option<spur_core::job
         .partition
         .as_deref()
         .filter(|spec| !spec.is_empty())?;
-    let requested = spur_core::partition::matched_partitions(Some(partition_spec), partitions);
+    let requested = requested_partition_names(Some(partition_spec))
+        .map(|name| partitions.iter().find(|part| part.name == name))
+        .collect::<Option<Vec<_>>>();
+    let Some(requested) = requested else {
+        return Some(PendingReason::PartitionConfig);
+    };
     if requested.is_empty() {
         return Some(PendingReason::PartitionConfig);
     }
@@ -6573,6 +6571,26 @@ mod tests {
         assert_eq!(
             cm.get_job(job_id).unwrap().spec.partition.as_deref(),
             Some("default, batch")
+        );
+    }
+
+    #[test]
+    fn partition_block_rejects_mixed_known_and_unknown_partitions() {
+        let job = Job::new(
+            1,
+            JobSpec {
+                partition: Some("default,missing".into()),
+                ..basic_spec("mixed-partitions")
+            },
+        );
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        assert_eq!(
+            partition_block(&job, &partitions),
+            Some(PendingReason::PartitionConfig)
         );
     }
 

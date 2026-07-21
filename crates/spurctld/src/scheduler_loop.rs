@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use tracing::{debug, error, info, warn};
 
+use spur_core::partition::requested_partition_names;
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
@@ -500,12 +501,8 @@ fn preempt_overlaps_pending_nodes(
             .any(|n| occupied.contains(n));
     }
 
-    let partitions: Vec<&str> = pending
-        .spec
-        .partition
-        .as_deref()
-        .map(|p| p.split(',').map(str::trim).collect())
-        .unwrap_or_default();
+    let partitions: Vec<&str> =
+        requested_partition_names(pending.spec.partition.as_deref()).collect();
 
     nodes.iter().any(|node| {
         if !occupied.contains(node.name.as_str()) {
