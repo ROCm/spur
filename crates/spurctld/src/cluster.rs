@@ -4413,14 +4413,12 @@ impl PassReservations {
             *self.qos_user_count.entry(key).or_insert(0) += 1;
         }
         if let Some(account) = job.spec.account.as_deref().filter(|a| !a.is_empty()) {
+            let account = account.to_string();
             self.account_grp
-                .entry(account.to_string())
+                .entry(account.clone())
                 .or_default()
                 .add(&tres);
-            *self
-                .account_user_count
-                .entry((user, account.to_string()))
-                .or_insert(0) += 1;
+            *self.account_user_count.entry((user, account)).or_insert(0) += 1;
         }
     }
 }
