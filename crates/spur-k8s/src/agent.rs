@@ -726,10 +726,10 @@ impl SlurmAgent for VirtualAgent {
         ))
     }
 
-    async fn get_admin_kubeconfig(
+    async fn get_kubeconfig(
         &self,
-        _request: Request<GetAdminKubeconfigRequest>,
-    ) -> Result<Response<GetAdminKubeconfigResponse>, Status> {
+        _request: Request<GetKubeconfigRequest>,
+    ) -> Result<Response<GetKubeconfigResponse>, Status> {
         Err(Status::unimplemented(
             "cluster components not supported for K8s agent",
         ))

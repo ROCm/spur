@@ -22,8 +22,8 @@ use spur_net::address::AddressPool;
 use spur_net::mesh::{MeshMembership, MeshNode};
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::{
-    ClusterNodeStatus, CreateK0sJoinTokenRequest, GetAdminKubeconfigRequest,
-    GetClusterComponentStatusRequest, StartClusterComponentRequest, StopClusterComponentRequest,
+    ClusterNodeStatus, CreateK0sJoinTokenRequest, GetClusterComponentStatusRequest,
+    GetKubeconfigRequest, StartClusterComponentRequest, StopClusterComponentRequest,
 };
 
 use crate::cluster::ClusterManager;
@@ -383,9 +383,9 @@ async fn mint_worker_token(cluster: &ClusterManager) -> anyhow::Result<String> {
 pub async fn fetch_admin_kubeconfig(cluster: &ClusterManager) -> anyhow::Result<String> {
     let mut client = connect_control_plane(cluster).await?;
     let resp = client
-        .get_admin_kubeconfig(GetAdminKubeconfigRequest::default())
+        .get_kubeconfig(GetKubeconfigRequest::default())
         .await
-        .map_err(|e| anyhow::anyhow!("get_admin_kubeconfig RPC failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("get_kubeconfig RPC failed: {e}"))?;
     Ok(resp.into_inner().kubeconfig)
 }
 
@@ -400,13 +400,13 @@ pub async fn fetch_user_kubeconfig(
 ) -> anyhow::Result<String> {
     let mut client = connect_control_plane(cluster).await?;
     let resp = client
-        .get_admin_kubeconfig(GetAdminKubeconfigRequest {
+        .get_kubeconfig(GetKubeconfigRequest {
             user: user.to_string(),
             namespace: namespace.to_string(),
             service_account: service_account.to_string(),
         })
         .await
-        .map_err(|e| anyhow::anyhow!("get_admin_kubeconfig (scoped) RPC failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("get_kubeconfig (scoped) RPC failed: {e}"))?;
     Ok(resp.into_inner().kubeconfig)
 }
 
