@@ -10,6 +10,7 @@
 //! admin's hand-edit (the "SPUR-managed" contract). Runs on a level-triggered interval loop; a
 //! converged cluster re-applies the same objects (a no-op) and self-heals otherwise.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -65,17 +66,24 @@ async fn reconcile_once(
         .into_inner()
         .accounts;
 
+    // One ListUsers (empty account = all) grouped client-side, instead of one RPC per account.
+    let all_users = acct
+        .list_users(ListUsersRequest {
+            account: String::new(),
+        })
+        .await
+        .context("ListUsers RPC")?
+        .into_inner()
+        .users;
+    let users_by_account = group_users_by_account(all_users);
+
     for a in accounts {
-        let users = acct
-            .list_users(ListUsersRequest {
-                account: a.name.clone(),
-            })
-            .await
-            .context("ListUsers RPC")?
-            .into_inner()
-            .users;
+        let users = users_by_account
+            .get(&a.name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         // A malformed allocation must not silently uncap the namespace; skip the account instead.
-        let aq = match build_account_quota(&a, &users) {
+        let aq = match build_account_quota(&a, users) {
             Ok(aq) => aq,
             Err(e) => {
                 warn!(account = %a.name, error = %e, "skipping account with invalid grp_tres");
@@ -88,6 +96,16 @@ async fn reconcile_once(
         }
     }
     Ok(())
+}
+
+/// Group all users by their account. Pure — lets the reconciler fetch users in one RPC and look
+/// each account's members up locally instead of a ListUsers call per account.
+fn group_users_by_account(users: Vec<UserInfo>) -> HashMap<String, Vec<UserInfo>> {
+    let mut by_account: HashMap<String, Vec<UserInfo>> = HashMap::new();
+    for u in users {
+        by_account.entry(u.account.clone()).or_default().push(u);
+    }
+    by_account
 }
 
 /// Build the account's projected quota from its `AccountInfo` (the `grp_tres` allocation) and its
@@ -215,5 +233,17 @@ mod tests {
         // A non-empty but unparseable allocation must fail closed, never silently uncap.
         let err = build_account_quota(&account("bad", "cpu=notanumber"), &[]);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn group_users_by_account_buckets_members() {
+        let grouped = group_users_by_account(vec![
+            user("alice", "physics"),
+            user("bob", "physics"),
+            user("carol", "chem"),
+        ]);
+        assert_eq!(grouped["physics"].len(), 2);
+        assert_eq!(grouped["chem"].len(), 1);
+        assert!(!grouped.contains_key("bio"));
     }
 }

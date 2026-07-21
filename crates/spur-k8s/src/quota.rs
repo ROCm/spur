@@ -69,20 +69,22 @@ fn meta(name: &str, namespace: Option<&str>, account: &str) -> ObjectMeta {
 }
 
 /// Map the account allocation to ResourceQuota `hard` entries. CPU (cores) and memory (MB) are
-/// capped on both requests and limits; GPUs go on `requests.amd.com/gpu` (an extended resource). A
-/// dimension left at 0 is omitted (uncapped). Node/Energy/Billing have no pod-level quota analog.
+/// capped on `requests.*`; GPUs go on `requests.amd.com/gpu` (an extended resource). A dimension
+/// left at 0 is omitted (uncapped). Node/Energy/Billing have no pod-level quota analog.
+///
+/// Only `requests.*` is capped, never `limits.*`: a `limits.cpu`/`limits.memory` quota key forces
+/// every pod to declare a limit (or inherit a LimitRange default), so unset-limit pods would fail
+/// admission. `limit_range` supplies only a default *request*, matching this requests-only cap.
 pub fn quota_hard(grp_tres: &TresRecord) -> BTreeMap<String, Quantity> {
     let mut hard = BTreeMap::new();
     let cpu = grp_tres.get(TresType::Cpu);
     if cpu > 0 {
         hard.insert("requests.cpu".into(), Quantity(cpu.to_string()));
-        hard.insert("limits.cpu".into(), Quantity(cpu.to_string()));
     }
     let mem_mb = grp_tres.get(TresType::Memory);
     if mem_mb > 0 {
         // TRES mem is base-10 MB; `M` (not `Mi`) keeps the quota equal to the allocation.
         hard.insert("requests.memory".into(), Quantity(format!("{mem_mb}M")));
-        hard.insert("limits.memory".into(), Quantity(format!("{mem_mb}M")));
     }
     let gpu = grp_tres.get(TresType::Gpu);
     if gpu > 0 {
@@ -220,10 +222,11 @@ mod tests {
     fn quota_hard_maps_cpu_mem_gpu() {
         let h = quota_hard(&tres(16, 32768, 8));
         assert_eq!(h["requests.cpu"].0, "16");
-        assert_eq!(h["limits.cpu"].0, "16");
         assert_eq!(h["requests.memory"].0, "32768M");
-        assert_eq!(h["limits.memory"].0, "32768M");
         assert_eq!(h["requests.amd.com/gpu"].0, "8");
+        // Never cap limits.* — that would reject pods that omit limits.
+        assert!(!h.contains_key("limits.cpu"));
+        assert!(!h.contains_key("limits.memory"));
     }
 
     #[test]
