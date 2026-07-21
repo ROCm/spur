@@ -111,7 +111,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                     .map(|s| s as i32)
                     .collect::<Vec<_>>()
             })
-            .unwrap_or_default();
+            .unwrap_or_else(cancellable_states);
 
         let response = client
             .get_jobs(spur_proto::proto::GetJobsRequest {
@@ -168,6 +168,21 @@ fn is_cancellable(proto_state: i32) -> bool {
     }
 }
 
+fn cancellable_states() -> Vec<i32> {
+    use spur_proto::proto::JobState;
+
+    [
+        JobState::JobPending,
+        JobState::JobRunning,
+        JobState::JobCompleting,
+        JobState::JobPreempted,
+        JobState::JobSuspended,
+    ]
+    .into_iter()
+    .map(|state| state as i32)
+    .collect()
+}
+
 fn parse_signal(s: Option<&str>) -> Result<i32> {
     match s {
         None => Ok(0), // 0 = cancel (not a signal)
@@ -205,6 +220,7 @@ mod tests {
             JobState::JobPending,
             JobState::JobRunning,
             JobState::JobCompleting,
+            JobState::JobPreempted,
             JobState::JobSuspended,
         ] {
             assert!(
@@ -212,6 +228,24 @@ mod tests {
                 "{state:?} should be cancellable"
             );
         }
+    }
+
+    #[test]
+    fn default_filter_requests_only_cancellable_states() {
+        let states = cancellable_states();
+
+        assert!(states.contains(&(JobState::JobPending as i32)));
+        assert!(states.contains(&(JobState::JobRunning as i32)));
+        assert!(states.contains(&(JobState::JobCompleting as i32)));
+        assert!(states.contains(&(JobState::JobPreempted as i32)));
+        assert!(states.contains(&(JobState::JobSuspended as i32)));
+        assert!(!states.contains(&(JobState::JobCompleted as i32)));
+        assert!(!states.contains(&(JobState::JobFailed as i32)));
+        assert!(!states.contains(&(JobState::JobCancelled as i32)));
+        assert!(!states.contains(&(JobState::JobTimeout as i32)));
+        assert!(!states.contains(&(JobState::JobNodeFail as i32)));
+        assert!(!states.contains(&(JobState::JobDeadline as i32)));
+        assert!(!states.contains(&(JobState::JobOutOfMemory as i32)));
     }
 
     #[test]
