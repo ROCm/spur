@@ -1387,7 +1387,7 @@ mod job_history_tests {
             .execute(&pool)
             .await?;
 
-        upsert_account(&pool, &account, "d", "o", None, 1, None).await?;
+        upsert_account(&pool, &account, "d", "o", None, 1, None, None).await?;
         add_user(
             &pool,
             &matching_user,
