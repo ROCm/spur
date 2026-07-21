@@ -37,7 +37,6 @@ struct TrackedJob {
     has_pid_namespace: bool,
     has_user_namespace: bool,
     has_mount_namespace: bool,
-    rootfs: Option<std::path::PathBuf>,
     _pty_master: Option<std::os::fd::OwnedFd>,
     work_dir: String,
     uid: u32,
@@ -931,7 +930,6 @@ impl SlurmAgent for AgentService {
                 info!(job_id, gpus = ?launch_cfg.gpu_devices, "job launched successfully");
                 let is_root = nix::unistd::geteuid().is_root();
                 let is_container = launch_cfg.container.is_some();
-                let rootfs = launch_cfg.container.as_ref().map(|c| c.rootfs.clone());
                 let displaced = jobs.insert(
                     job_id,
                     TrackedJob {
@@ -942,7 +940,6 @@ impl SlurmAgent for AgentService {
                         has_pid_namespace: is_root || is_container,
                         has_user_namespace: is_container && !is_root,
                         has_mount_namespace: is_root || is_container,
-                        rootfs,
                         _pty_master: result.pty_master,
                         work_dir: launch_cfg.work_dir,
                         uid: launch_cfg.uid,
@@ -1934,7 +1931,6 @@ impl AgentService {
             has_pid_namespace: tracked.has_pid_namespace,
             has_user_namespace: tracked.has_user_namespace,
             has_mount_namespace: tracked.has_mount_namespace,
-            _rootfs: tracked.rootfs.clone(),
             uid: tracked.uid,
             gid: tracked.gid,
             work_dir: tracked.work_dir.clone(),
@@ -2172,12 +2168,10 @@ impl AgentService {
             cmd.pre_exec(move || raw.wire());
         }
 
-        // For non-nsenter case, drop privs via Command::uid()/gid().
-        // nsenter case already handled above via --setuid/--setgid.
-        if drop_priv && !entry.has_namespaces() {
-            cmd.gid(entry.gid);
-            cmd.uid(entry.uid);
-        }
+        debug_assert!(
+            !drop_priv || entry.has_namespaces(),
+            "root spurd always has namespaces; direct priv drop should be unreachable"
+        );
 
         let child = cmd
             .spawn()
@@ -2201,18 +2195,24 @@ impl AgentService {
 
     /// Read environment variables from a running process via /proc.
     fn read_proc_environ(pid: u32) -> Vec<(String, String)> {
+        const MAX_ENVIRON: usize = 1 << 20; // 1 MiB
         let path = format!("/proc/{}/environ", pid);
-        match std::fs::read(&path) {
-            Ok(data) => data
-                .split(|&b| b == 0)
-                .filter_map(|entry| {
-                    let s = std::str::from_utf8(entry).ok()?;
-                    let (k, v) = s.split_once('=')?;
-                    Some((k.to_string(), v.to_string()))
-                })
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+        let mut buf = vec![0u8; MAX_ENVIRON];
+        let n = match std::fs::File::open(&path).and_then(|mut f| {
+            use std::io::Read;
+            f.read(&mut buf)
+        }) {
+            Ok(n) => n,
+            Err(_) => return Vec::new(),
+        };
+        buf.truncate(n);
+        buf.split(|&b| b == 0)
+            .filter_map(|entry| {
+                let s = std::str::from_utf8(entry).ok()?;
+                let (k, v) = s.split_once('=')?;
+                Some((k.to_string(), v.to_string()))
+            })
+            .collect()
     }
 }
 
@@ -2237,7 +2237,6 @@ impl TrackedJob {
             has_pid_namespace: false,
             has_user_namespace: false,
             has_mount_namespace: false,
-            rootfs: None,
             _pty_master: None,
             work_dir: "/tmp".into(),
             uid: 0,
@@ -2822,7 +2821,6 @@ mod tests {
             has_pid_namespace: false,
             has_user_namespace: false,
             has_mount_namespace: false,
-            rootfs: None,
             _pty_master: None,
             work_dir: "/tmp".into(),
             uid: 0,

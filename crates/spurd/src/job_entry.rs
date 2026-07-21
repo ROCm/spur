@@ -1,8 +1,6 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::path::PathBuf;
-
 /// Namespace and isolation metadata for a tracked job, used to build the
 /// correct `nsenter` arguments for entering the job's execution context.
 #[derive(Debug, Clone)]
@@ -11,7 +9,6 @@ pub struct JobEntry {
     pub has_pid_namespace: bool,
     pub has_user_namespace: bool,
     pub has_mount_namespace: bool,
-    pub _rootfs: Option<PathBuf>,
     pub uid: u32,
     pub gid: u32,
     pub work_dir: String,
@@ -63,7 +60,6 @@ mod tests {
             has_pid_namespace: true,
             has_user_namespace: false,
             has_mount_namespace: true,
-            _rootfs: None,
             uid: 1000,
             gid: 1000,
             work_dir: "/home/user".into(),
@@ -79,7 +75,6 @@ mod tests {
             has_pid_namespace: true,
             has_user_namespace: true,
             has_mount_namespace: true,
-            _rootfs: Some(PathBuf::from("/var/spool/spur/containers/abc")),
             uid: 0,
             gid: 0,
             work_dir: "/".into(),
@@ -95,7 +90,6 @@ mod tests {
             has_pid_namespace: false,
             has_user_namespace: false,
             has_mount_namespace: false,
-            _rootfs: None,
             uid: 1000,
             gid: 1000,
             work_dir: "/tmp".into(),
@@ -112,7 +106,6 @@ mod tests {
             has_pid_namespace: true,
             has_user_namespace: true,
             has_mount_namespace: true,
-            _rootfs: Some(PathBuf::from("/var/spool/spur/containers/xyz")),
             uid: 1000,
             gid: 1000,
             work_dir: "/".into(),
