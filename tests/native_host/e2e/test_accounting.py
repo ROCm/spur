@@ -314,6 +314,48 @@ class TestQosLimitReasons:
             f"expected QOSMaxGRESPerUser, got {reason!r}"
         )
 
+    def test_grp_cpu_cap_not_oversubscribed_by_concurrent_jobs(self, accounting_cluster):
+        # SPUR-84: a QOS group cap must hold across a burst of submissions, not
+        # just one job. Three 1-cpu jobs each fit the grptres=cpu=2 cap on their
+        # own, but a single scheduling pass must never run more than two at once
+        # — the third pends with QOSGrpCpuLimit until one finishes.
+        c = accounting_cluster
+
+        # 1-cpu jobs against a cpu=2 group cap: needs >= 2 schedulable CPUs, which
+        # the provisioned test nodes always have, so physical CPU is never the
+        # binding constraint here — only the QOS group cap is.
+        c.sacctmgr(["add", "qos", "name=grpburst", "grptres=cpu=2"])
+        time.sleep(15)
+
+        script = c.write_file("qos-grpburst.sh", "#!/bin/bash\nsleep 30\n")
+        ids = []
+        for i in range(3):
+            job_id = parse_job_id(
+                c.sbatch(["-J", "grpburst", "-N", "1", "-c", "1", "-q", "grpburst", script])
+            )
+            assert job_id is not None
+            ids.append(job_id)
+
+        # Poll for the steady state and assert the cap is never breached: at most
+        # two of the three run concurrently, and the surplus shows QOSGrpCpuLimit.
+        deadline = time.time() + 40
+        running = []
+        while time.time() < deadline:
+            running = c.running_job_ids_by_name("grpburst")
+            assert len(running) <= 2, (
+                f"grptres=cpu=2 over-subscribed: {len(running)} jobs running {running}"
+            )
+            if len(running) == 2:
+                break
+            time.sleep(2)
+        assert len(running) == 2, f"expected 2 jobs running under the cap, got {running}"
+
+        blocked = [j for j in ids if j not in running]
+        assert len(blocked) == 1, f"expected exactly one blocked job, got {blocked}"
+        assert _reason(c, blocked[0]) == "QOSGrpCpuLimit", (
+            f"blocked job {blocked[0]} reason: {_reason(c, blocked[0])!r}"
+        )
+
 
 class TestSacctmgrUserAssociationLimits:
     def test_maxjobs_set_via_add_user_blocks_a_second_job(self, accounting_cluster):

@@ -1907,11 +1907,6 @@ impl ClusterManager {
             true
         });
 
-        // Account/association enforcement: check per-user-per-account limits.
-        // Shares the eligibility logic with tag_blocked_pending_reasons() via
-        // account_block_for() so the drop decision and the displayed reason agree.
-        pending.retain(|job| account_block_for(job, &self.association_cache, &jobs).is_none());
-
         // Resolve once, reuse for both the QoS-limit check and the priority
         // adjustment below, instead of looking it up twice per job.
         let qos_by_job: HashMap<JobId, Qos> = pending
@@ -1919,14 +1914,10 @@ impl ClusterManager {
             .map(|job| (job.job_id, self.resolve_qos(job)))
             .collect();
 
-        // QoS enforcement: check per-user limits for jobs with a QoS. Shares
-        // the eligibility logic with tag_blocked_pending_reasons() via
-        // qos_block_for() so the drop decision and the displayed reason agree.
-        pending.retain(|job| qos_block_for(job, &qos_by_job[&job.job_id], &jobs).is_none());
-
-        // License enforcement is applied after the priority sort below, so scarce
-        // licenses are reserved highest-priority-first and a single pass cannot
-        // over-subscribe the pool.
+        // Account/association and QoS aggregate enforcement is applied after the
+        // priority sort below, so group (`grp_tres`) and per-user caps are
+        // reserved highest-priority-first and a single pass cannot over-subscribe
+        // them. License enforcement follows for the same reason.
 
         // Reservation validation: reject jobs targeting expired/nonexistent reservations
         {
@@ -1966,6 +1957,31 @@ impl ClusterManager {
                 .then(b.priority.cmp(&a.priority))
                 .then(a.job_id.cmp(&b.job_id))
         });
+
+        // Account/association then QoS aggregate enforcement, in priority order.
+        // Each kept job reserves its footprint against the group (`grp_tres`) and
+        // per-user caps so lower-priority jobs later in the same pass see the
+        // reduced headroom — otherwise several pending jobs could each fit against
+        // the static running total yet collectively exceed the cap. Mirrors the
+        // license/BB reservation passes below. A job whose own request already
+        // exceeds the cap against the running total is reported by
+        // tag_blocked_pending_reasons(); a job deferred only because same-pass
+        // higher-priority siblings consumed the headroom is picked up on the next
+        // cycle once those siblings are Running (same transient the license/BB
+        // reservation passes already have).
+        {
+            let mut reserved = PassReservations::default();
+            pending.retain(|job| {
+                if account_block_with(job, &self.association_cache, &jobs, &reserved).is_some() {
+                    return false;
+                }
+                if qos_block_with(job, &qos_by_job[&job.job_id], &jobs, &reserved).is_some() {
+                    return false;
+                }
+                reserved.reserve(job);
+                true
+            });
+        }
 
         // License reservation, in priority order. `remaining` starts from current
         // availability (config total minus licenses held by running jobs) and each
@@ -4177,9 +4193,21 @@ fn qos_block_for(
     qos: &Qos,
     jobs: &HashMap<JobId, Job>,
 ) -> Option<spur_core::job::PendingReason> {
+    qos_block_with(job, qos, jobs, &PassReservations::default())
+}
+
+/// Like [`qos_block_for`] but folds `reserved` (headroom already claimed by
+/// higher-priority jobs earlier in the same scheduling pass) into the running
+/// aggregates, so a single pass can't over-subscribe a QOS group/per-user cap.
+fn qos_block_with(
+    job: &Job,
+    qos: &Qos,
+    jobs: &HashMap<JobId, Job>,
+    reserved: &PassReservations,
+) -> Option<spur_core::job::PendingReason> {
     let qos_name = job.spec.qos.as_ref()?;
     let user = &job.spec.user;
-    let running_count = jobs
+    let mut running_count = jobs
         .values()
         .filter(|j| {
             j.state == JobState::Running
@@ -4198,11 +4226,20 @@ fn qos_block_for(
                 && j.spec.qos.as_deref() == Some(qos_name.as_str())
         })
         .count() as u32;
-    let user_running_tres = sum_running_tres(jobs, |j| {
+    let mut user_running_tres = sum_running_tres(jobs, |j| {
         j.spec.user == *user && j.spec.qos.as_deref() == Some(qos_name.as_str())
     });
-    let qos_running_tres =
+    let mut qos_running_tres =
         sum_running_tres(jobs, |j| j.spec.qos.as_deref() == Some(qos_name.as_str()));
+
+    let user_key = (user.clone(), qos_name.clone());
+    running_count += reserved.qos_user_count.get(&user_key).copied().unwrap_or(0);
+    if let Some(t) = reserved.qos_user_tres.get(&user_key) {
+        user_running_tres.add(t);
+    }
+    if let Some(t) = reserved.qos_grp.get(qos_name) {
+        qos_running_tres.add(t);
+    }
 
     match check_qos_limits(
         job,
@@ -4226,11 +4263,23 @@ fn account_block_for(
     assoc_cache: &AssociationCache,
     jobs: &HashMap<JobId, Job>,
 ) -> Option<spur_core::job::PendingReason> {
+    account_block_with(job, assoc_cache, jobs, &PassReservations::default())
+}
+
+/// Like [`account_block_for`] but folds `reserved` (headroom already claimed by
+/// higher-priority jobs earlier in the same scheduling pass) into the running
+/// aggregates, so a single pass can't over-subscribe an account group cap.
+fn account_block_with(
+    job: &Job,
+    assoc_cache: &AssociationCache,
+    jobs: &HashMap<JobId, Job>,
+    reserved: &PassReservations,
+) -> Option<spur_core::job::PendingReason> {
     let account = job.spec.account.as_deref().filter(|a| !a.is_empty())?;
     let user = &job.spec.user;
     let limits = assoc_cache.limits(user, account);
 
-    let running_count = jobs
+    let mut running_count = jobs
         .values()
         .filter(|j| {
             j.state == JobState::Running
@@ -4249,8 +4298,17 @@ fn account_block_for(
                 && j.spec.account.as_deref() == Some(account)
         })
         .count() as u32;
-    let account_running_tres =
+    let mut account_running_tres =
         sum_running_tres(jobs, |j| j.spec.account.as_deref() == Some(account));
+
+    running_count += reserved
+        .account_user_count
+        .get(&(user.clone(), account.to_string()))
+        .copied()
+        .unwrap_or(0);
+    if let Some(t) = reserved.account_grp.get(account) {
+        account_running_tres.add(t);
+    }
 
     match check_account_limits(
         job,
@@ -4297,21 +4355,74 @@ fn partition_block(job: &Job, partitions: &[Partition]) -> Option<spur_core::job
 
 fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> TresRecord {
     let mut tres = TresRecord::new();
-    let (mut cpu, mut node, mut mem, mut gpu) = (0u64, 0u64, 0u64, 0u64);
     for j in jobs.values() {
         if j.state != JobState::Running || !pred(j) {
             continue;
         }
-        cpu += (j.spec.num_tasks * j.spec.cpus_per_task) as u64;
-        node += j.spec.num_nodes as u64;
-        mem += effective_memory_mb(&j.spec, j.spec.num_nodes);
-        gpu += effective_gpus(&j.spec, j.spec.num_nodes);
+        tres.add(&job_tres(j));
     }
-    tres.set(TresType::Cpu, cpu);
-    tres.set(TresType::Node, node);
-    tres.set(TresType::Memory, mem);
-    tres.set(TresType::Gpu, gpu);
     tres
+}
+
+/// The TRES a single job occupies (its scheduling footprint). Shared by the
+/// running-usage sum and the same-pass reservation accounting so both count a
+/// job's CPU/node/mem/GPU footprint identically.
+fn job_tres(job: &Job) -> TresRecord {
+    let mut tres = TresRecord::new();
+    tres.set(
+        TresType::Cpu,
+        (job.spec.num_tasks * job.spec.cpus_per_task) as u64,
+    );
+    tres.set(TresType::Node, job.spec.num_nodes as u64);
+    tres.set(
+        TresType::Memory,
+        effective_memory_mb(&job.spec, job.spec.num_nodes),
+    );
+    tres.set(TresType::Gpu, effective_gpus(&job.spec, job.spec.num_nodes));
+    tres
+}
+
+/// Headroom claimed by jobs already kept earlier in a single `pending_jobs()`
+/// pass, folded into the running aggregates so aggregate QOS/account caps
+/// (`grp_tres`, per-user TRES, per-user running-job counts) can't be
+/// over-subscribed within one pass — the same guarantee licenses and
+/// burst-buffer capacity already get via priority-ordered reservation.
+#[derive(Default)]
+struct PassReservations {
+    qos_grp: HashMap<String, TresRecord>,
+    qos_user_tres: HashMap<(String, String), TresRecord>,
+    qos_user_count: HashMap<(String, String), u32>,
+    account_grp: HashMap<String, TresRecord>,
+    account_user_count: HashMap<(String, String), u32>,
+}
+
+impl PassReservations {
+    /// Record that `job` (kept this pass) now occupies its footprint against the
+    /// QOS and account aggregates, so lower-priority jobs later in the pass see
+    /// the reduced headroom.
+    fn reserve(&mut self, job: &Job) {
+        let tres = job_tres(job);
+        let user = job.spec.user.clone();
+        if let Some(qos) = job.spec.qos.as_ref().filter(|q| !q.is_empty()) {
+            self.qos_grp.entry(qos.clone()).or_default().add(&tres);
+            let key = (user.clone(), qos.clone());
+            self.qos_user_tres
+                .entry(key.clone())
+                .or_default()
+                .add(&tres);
+            *self.qos_user_count.entry(key).or_insert(0) += 1;
+        }
+        if let Some(account) = job.spec.account.as_deref().filter(|a| !a.is_empty()) {
+            self.account_grp
+                .entry(account.to_string())
+                .or_default()
+                .add(&tres);
+            *self
+                .account_user_count
+                .entry((user, account.to_string()))
+                .or_insert(0) += 1;
+        }
+    }
 }
 
 /// Burst-buffer capacity (GB) a job's `--bb` string reserves cluster-wide.
@@ -8788,6 +8899,188 @@ mod tests {
         assert_eq!(
             granted, 1,
             "pending_jobs() returned {granted} fluent jobs but the pool holds only 1"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_does_not_oversubscribe_qos_grp_node_within_one_pass() {
+        // Three pending 1-node jobs share a QOS capped at grp_tres node=2. Each
+        // fits against the empty running total, but a single pass must admit at
+        // most 2 or the QOSGrpNodeLimit is over-subscribed (SPUR-84).
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 2);
+        cm.qos_cache().insert(Qos {
+            name: "burst".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let ids: Vec<JobId> = (0..3)
+            .map(|i| {
+                let mut s = basic_spec(&format!("b{i}"));
+                s.qos = Some("burst".into());
+                submit_and_wait(&cm, s)
+            })
+            .collect();
+
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        let granted = ids.iter().filter(|id| pending.contains(id)).count();
+        assert_eq!(
+            granted, 2,
+            "pending_jobs() returned {granted} burst jobs but grp_tres node=2 allows 2"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_qos_grp_reserves_highest_priority_first() {
+        // A high-priority 2-node job and a low-priority 1-node job share a QOS
+        // capped at grp_tres node=2. The pass must keep the high-priority job
+        // (which alone fills the cap) and drop the low-priority one, not admit
+        // the small job first and starve the large one.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 2);
+        cm.qos_cache().insert(Qos {
+            name: "burst".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut big = basic_spec("big");
+        big.qos = Some("burst".into());
+        big.num_nodes = 2;
+        big.priority = Some(1000);
+        let big_id = submit_and_wait(&cm, big);
+
+        let mut small = basic_spec("small");
+        small.qos = Some("burst".into());
+        small.num_nodes = 1;
+        small.priority = Some(1);
+        let small_id = submit_and_wait(&cm, small);
+
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        assert!(
+            pending.contains(&big_id),
+            "the highest-priority job must win the group reservation"
+        );
+        assert!(
+            !pending.contains(&small_id),
+            "the low-priority job must not consume headroom the big job needs"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_does_not_oversubscribe_account_grp_node_within_one_pass() {
+        // Same one-pass over-subscription guard, one layer up: an account
+        // association capped at grp_tres node=2 must not admit 3 pending 1-node
+        // jobs in a single pass.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 2);
+        cm.association_cache().insert_limits(
+            "testuser",
+            "research",
+            spur_core::accounting::AccountLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+        );
+
+        let ids: Vec<JobId> = (0..3)
+            .map(|i| {
+                let mut s = basic_spec(&format!("a{i}"));
+                s.account = Some("research".into());
+                submit_and_wait(&cm, s)
+            })
+            .collect();
+
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        let granted = ids.iter().filter(|id| pending.contains(id)).count();
+        assert_eq!(
+            granted, 2,
+            "pending_jobs() returned {granted} account jobs but grp_tres node=2 allows 2"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_does_not_oversubscribe_qos_max_jobs_per_user_within_one_pass() {
+        // The per-user running-job count cap is a same-pass accumulator too: three
+        // pending jobs from one user under a QOS capped at max_jobs_per_user=2
+        // must not all be admitted in a single pass even though none is running yet.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        cm.qos_cache().insert(Qos {
+            name: "cnt".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_jobs_per_user: Some(2),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let ids: Vec<JobId> = (0..3)
+            .map(|i| {
+                let mut s = basic_spec(&format!("c{i}"));
+                s.qos = Some("cnt".into());
+                submit_and_wait(&cm, s)
+            })
+            .collect();
+
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        let granted = ids.iter().filter(|id| pending.contains(id)).count();
+        assert_eq!(
+            granted, 2,
+            "pending_jobs() returned {granted} jobs but max_jobs_per_user=2 allows 2"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_does_not_oversubscribe_qos_max_tres_per_user_within_one_pass() {
+        // The per-user TRES cap (distinct from the group cap) also accumulates
+        // within a pass: two 3-cpu jobs from one user under maxtresperuser cpu=4
+        // must not both be admitted (3+3 > 4), even with an empty running set.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        let mut per_user = TresRecord::new();
+        per_user.set(TresType::Cpu, 4);
+        cm.qos_cache().insert(Qos {
+            name: "usertres".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_tres_per_user: Some(per_user),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let ids: Vec<JobId> = (0..2)
+            .map(|i| {
+                let mut s = basic_spec(&format!("u{i}"));
+                s.qos = Some("usertres".into());
+                s.num_tasks = 3;
+                submit_and_wait(&cm, s)
+            })
+            .collect();
+
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        let granted = ids.iter().filter(|id| pending.contains(id)).count();
+        assert_eq!(
+            granted, 1,
+            "pending_jobs() returned {granted} jobs but maxtresperuser cpu=4 fits only one 3-cpu job"
         );
     }
 
