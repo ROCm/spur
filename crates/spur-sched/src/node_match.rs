@@ -85,13 +85,12 @@ impl<'a> NodePlacement<'a> {
         !self.exclude.contains(name)
     }
 
-pub fn nodelist_is_additive(&self) -> bool {
-    let Some(ref nodelist) = self.nodelist else {
-        return false;
-    };
-    let listed = nodelist.iter().filter(|s| !s.is_empty()).count();
-    (self.job.spec.num_nodes as usize).max(1) > listed
-}
+    pub fn nodelist_is_additive(&self) -> bool {
+        let Some(ref nodelist) = self.nodelist else {
+            return false;
+        };
+        (self.job.spec.num_nodes as usize).max(1) > nodelist.len()
+    }
 
     pub fn is_listed(&self, name: &str) -> bool {
         self.nodelist
@@ -180,7 +179,7 @@ pub fn nodelist_is_additive(&self) -> bool {
 /// Falls back to a plain comma-split if the pattern is malformed, so existing
 /// behaviour is preserved for simple comma-separated lists.
 pub fn expand_hostlist_or_split(pattern: &str) -> Vec<String> {
-    match spur_core::hostlist::expand(pattern) {
+    let names = match spur_core::hostlist::expand(pattern) {
         Ok(names) => names,
         Err(e) => {
             warn!(
@@ -190,7 +189,8 @@ pub fn expand_hostlist_or_split(pattern: &str) -> Vec<String> {
             );
             pattern.split(',').map(|s| s.trim().to_string()).collect()
         }
-    }
+    };
+    names.into_iter().filter(|name| !name.is_empty()).collect()
 }
 
 #[cfg(test)]
@@ -240,6 +240,21 @@ mod tests {
         );
         // Plain comma list is not a hostlist pattern; fallback splits it.
         assert_eq!(expand_hostlist_or_split("a,b,c"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn empty_hostlist_entries_are_ignored() {
+        assert_eq!(
+            expand_hostlist_or_split("node001,,node002,"),
+            vec!["node001", "node002"]
+        );
+
+        let job = job_with(JobSpec {
+            nodelist: Some("node001,".into()),
+            num_nodes: 2,
+            ..base_spec()
+        });
+        assert!(NodePlacement::new(&job).nodelist_is_additive());
     }
 
     #[test]
