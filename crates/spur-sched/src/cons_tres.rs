@@ -45,10 +45,8 @@ pub struct NodeAllocation {
     /// orphans reconciled. Source of truth; the bitmaps above are a derived
     /// index for fast free-count queries.
     owners: HashMap<u32, AllocationResult>,
-    /// Reserved but not yet committed to the running set (mid-launch: image
-    /// pull, fork), each with the instant it was reserved. Reconcile spares
-    /// these until they exceed a TTL, so a launch whose future is dropped
-    /// before commit/release cannot pin resources forever.
+    /// Reserved but not yet committed, with reserve time. Reconcile spares
+    /// these until they exceed a TTL so a dropped launch can't pin resources.
     launching: HashMap<u32, Instant>,
 }
 
@@ -218,13 +216,9 @@ impl NodeAllocation {
         true
     }
 
-    /// Release every owned allocation whose job is neither in `live` nor still
-    /// launching within `launching_ttl`, returning the reclaimed ids.
-    /// Self-healing backstop: a teardown that fails to release, or a launch
-    /// whose future is dropped before commit/release, is recovered here
-    /// instead of stranding the node until spurd restart. A launch still
-    /// inside its TTL is spared so an in-flight image pull/fork isn't reclaimed
-    /// out from under itself.
+    /// Release owned allocations whose job is neither live nor launching within
+    /// `launching_ttl`, returning the reclaimed ids. Recovers a failed teardown
+    /// or a dropped launch instead of stranding the node until spurd restart.
     pub fn reconcile(
         &mut self,
         live: &HashSet<u32>,
@@ -498,8 +492,7 @@ mod tests {
         // job 2: committed but NOT live (teardown failed to release — orphan).
         node.allocate_for_job(2, 4, 8_000, &[1]).unwrap();
         node.commit_job(2);
-        // job 3: still launching (reserved, not yet committed) — must be spared
-        // while within its TTL.
+        // job 3: launching within TTL — spared.
         node.allocate_for_job(3, 4, 8_000, &[2]).unwrap();
 
         let live: HashSet<u32> = [1].into_iter().collect();
@@ -508,7 +501,6 @@ mod tests {
         reclaimed.sort();
         assert_eq!(reclaimed, vec![2], "only the orphan (job 2) is reclaimed");
 
-        // job 1 (live) and job 3 (launching, within TTL) still hold resources.
         assert!(!node.release_job(2), "job 2 already reconciled");
         assert!(node.release_job(1));
         assert!(node.release_job(3));
@@ -518,19 +510,15 @@ mod tests {
     #[test]
     fn test_reconcile_reclaims_launching_past_ttl() {
         let mut node = make_node_with_ids(64, 256_000, vec![0, 1, 2, 3], "mi300x");
-        // A launch reserved but never committed/released (future dropped between
-        // reserve and commit) must be reclaimed once it exceeds the TTL, or it
-        // strands the node forever.
+        // A launch reserved but never committed must be reclaimed past the TTL.
         node.allocate_for_job(1, 4, 8_000, &[0]).unwrap();
 
         let live: HashSet<u32> = HashSet::new();
         let ttl = Duration::from_secs(120);
 
-        // Within TTL: spared.
         assert!(node.reconcile(&live, Instant::now(), ttl).is_empty());
         assert_eq!(node.free_gpus(None), 3, "still reserved within TTL");
 
-        // Past TTL: reclaimed. Simulate elapsed time by advancing `now`.
         let future = Instant::now() + Duration::from_secs(121);
         assert_eq!(node.reconcile(&live, future, ttl), vec![1]);
         assert_eq!(node.free_gpus(None), 4, "reclaimed after TTL");

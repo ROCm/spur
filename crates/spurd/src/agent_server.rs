@@ -335,9 +335,8 @@ struct DrainRequest {
     reason: String,
 }
 
-/// A launch reservation that never commits within this bound is treated as
-/// abandoned and reclaimed by reconcile. Sized well above a worst-case image
-/// pull + fork so a genuinely in-flight launch is never reclaimed under it.
+/// Reclaim a launch reservation that never commits within this bound. Sized
+/// above a worst-case image pull + fork so an in-flight launch isn't reclaimed.
 const LAUNCHING_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Reclaim allocations whose job is no longer tracked and is not mid-launch,
@@ -358,12 +357,9 @@ fn reconcile_orphaned_allocations(
     }
 }
 
-/// Releases a launch reservation if the `launch_job` handler exits between
-/// `allocate_for_job` and `commit_job` — including when the RPC future is
-/// cancelled/dropped mid-launch, which no explicit error path can catch.
-/// `disarm` is called once the job is committed to the running set. Without
-/// this, a dropped launch strands its GPUs in the `launching` set (reconcile
-/// spares in-flight launches), the failure mode that black-holes a node.
+/// Releases a launch reservation if the handler exits between reserve and
+/// commit, including on future cancellation which no error path can catch.
+/// Disarmed once the job is committed to the running set.
 struct LaunchReservationGuard {
     allocation: Arc<Mutex<NodeAllocation>>,
     job_id: u32,
@@ -390,9 +386,8 @@ impl Drop for LaunchReservationGuard {
             return;
         }
         let job_id = self.job_id;
-        // Drop can't await. The allocation mutex is effectively uncontended on
-        // this path, so try_lock succeeds inline; if it ever doesn't, fall back
-        // to a spawned release so the reservation is never left stranded.
+        // Drop can't await; try_lock succeeds inline on this uncontended path,
+        // else spawn the release so the reservation is never left stranded.
         if let Ok(mut alloc) = self.allocation.try_lock() {
             alloc.release_job(job_id);
         } else {
@@ -893,11 +888,8 @@ impl SlurmAgent for AgentService {
             .allocate_local_resources(job_id, &spec, req.allocated.as_ref())
             .await?;
 
-        // Any exit before commit — an error path OR a cancelled/dropped launch
-        // future — must release the reservation, or the GPUs stay in-use with no
-        // tracked job while the controller sees the node IDLE. The guard covers
-        // every such exit (including future cancellation, which no explicit
-        // branch can); it is disarmed once the job is committed to `running`.
+        // Release the reservation on any exit before commit, including a
+        // cancelled launch future; disarmed once committed to `running`.
         let mut reservation_guard = LaunchReservationGuard::new(self.allocation.clone(), job_id);
 
         let injection = {
@@ -1084,14 +1076,10 @@ impl SlurmAgent for AgentService {
             self.graceful_cancel(job_id).await;
         }
 
-        // The signal paths above only act on a tracked (running) job. If the
-        // controller cancels a job still reserving resources mid-launch (in the
-        // `launching` set, not yet committed to `running`), release it here so a
-        // cancel-during-eviction can't strand the reservation until the TTL.
-        // Hold the running lock across the release so this can't race a launch
-        // committing into `running` in the gap: launch_job takes running before
-        // allocation on commit, so matching that order means we never free a job
-        // that just became running.
+        // The signal paths only act on a running job; release a still-launching
+        // reservation so a cancel-during-eviction doesn't strand it until the
+        // TTL. Hold the running lock across the release (matching launch_job's
+        // commit order) so this can't free a job that just became running.
         let jobs = self.running.lock().await;
         if !jobs.contains_key(&job_id) {
             self.allocation.lock().await.release_job(job_id);
@@ -3140,10 +3128,8 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
     }
 
-    // A CancelJob for a job still reserving resources mid-launch (in the
-    // `launching` set, never committed to `running`) must release the
-    // reservation. Otherwise a cancel-during-eviction leaves the GPUs pinned
-    // and reconcile spares them until the TTL, black-holing the node.
+    // CancelJob must release a still-launching (never-committed) reservation,
+    // else a cancel-during-eviction strands it until the TTL.
     #[tokio::test]
     async fn cancel_releases_launching_reservation() {
         let svc = AgentService::new(
@@ -3178,9 +3164,8 @@ mod tests {
         );
     }
 
-    // The launch reservation guard must release the allocation if the launch
-    // handler's future is dropped after reserving but before committing —
-    // cancellation no explicit error branch can catch.
+    // The guard must release the reservation when dropped before commit
+    // (the future-cancellation path), and leave it intact once disarmed.
     #[tokio::test]
     async fn reservation_guard_releases_on_drop_when_not_committed() {
         let svc = AgentService::new(
