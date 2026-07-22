@@ -1525,11 +1525,9 @@ impl ClusterManager {
                 if self.qos_cache.get(&q).is_none() {
                     anyhow::bail!("QOS '{q}' does not exist");
                 }
-                // Falling back to an unfiltered `account` would let a bogus
-                // or unaffiliated account name (or `account=""`) resolve to
-                // "no association on record", which `check_qos_authorized`
-                // treats as permissive — the exact bypass this check exists
-                // to close.
+                // Treat account="" as unset so we authorize against the
+                // job's existing account, rather than erroring on a blank
+                // value that check_qos_authorized would otherwise reject.
                 let effective_account = account
                     .as_deref()
                     .filter(|a| !a.is_empty())

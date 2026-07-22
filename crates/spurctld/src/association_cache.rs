@@ -77,8 +77,9 @@ impl AssociationCache {
     /// the association must exist, and if it's been pinned to a QOS,
     /// `qos` must match it exactly. Membership and QOS are read under one
     /// lock so a concurrent refresh can't validate one against the other's
-    /// stale snapshot (see `resolve()`). Permissive when the cache hasn't
-    /// loaded (accounting disabled).
+    /// stale snapshot (see `resolve()`). Permissive while the cache hasn't
+    /// loaded — at startup before the first fetch completes, or while the
+    /// accounting DB stays unreachable/erroring.
     pub fn check_qos_authorized(&self, user: &str, account: &str, qos: &str) -> Result<(), String> {
         let snapshot = self.snapshot.read();
         if !snapshot.loaded {
