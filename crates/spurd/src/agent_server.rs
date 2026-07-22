@@ -971,14 +971,44 @@ impl SlurmAgent for AgentService {
         };
 
         match executor::launch_job(&launch_cfg, (*self.spank).as_ref()).await {
-            Ok(result) => {
+            Ok(mut result) => {
                 let mut jobs = self.running.lock().await;
                 // Commit the reservation: the job now has a tracked process, so
                 // it is no longer exempt from reconcile. Take the running lock
                 // first so a job is never briefly absent from BOTH `running` and
                 // `launching` (which would let reconcile reclaim it).
-                self.allocation.lock().await.commit_job(job_id);
+                let committed = self.allocation.lock().await.commit_job(job_id);
                 reservation_guard.disarm();
+
+                // reconcile reclaimed the reservation mid-launch (launch exceeded
+                // the TTL). Don't track a job with no backing allocation — kill,
+                // reap, and clean up its cgroup/rootfs/spool (mirroring the
+                // monitor loop's completion teardown, which never runs since the
+                // job never enters `running`), then fail the launch.
+                if !committed {
+                    drop(jobs);
+                    warn!(
+                        job_id,
+                        "reservation reclaimed during launch; aborting to avoid running unbacked"
+                    );
+                    let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
+                    let cgroup = result.job.take_cgroup();
+                    tokio::spawn(async move {
+                        while let Ok(None) = result.job.try_wait() {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                        crate::container::cleanup_rootfs(job_id, &rootfs_mode);
+                        crate::executor::cleanup_job_spool(job_id);
+                        if let Some(ref cg) = cgroup {
+                            crate::executor::cleanup_cgroup(cg);
+                        }
+                    });
+                    return Ok(Response::new(LaunchJobResponse {
+                        success: false,
+                        error: "reservation reclaimed during launch".into(),
+                    }));
+                }
+
                 info!(job_id, gpus = ?launch_cfg.gpu_devices, "job launched successfully");
                 let is_root = nix::unistd::geteuid().is_root();
                 let is_container = launch_cfg.container.is_some();
@@ -1233,7 +1263,9 @@ impl SlurmAgent for AgentService {
                         req.job_id
                     )),
                 })?;
-            alloc.commit_job(req.job_id);
+            // Reserve and commit under one lock scope, so reconcile can't
+            // interleave and reclaim between them.
+            let _ = alloc.commit_job(req.job_id);
         }
 
         info!(

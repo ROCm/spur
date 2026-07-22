@@ -200,9 +200,12 @@ impl NodeAllocation {
     }
 
     /// Mark a job's allocation as committed (its process is now tracked), so it
-    /// is no longer exempt from reconcile.
-    pub fn commit_job(&mut self, job_id: u32) {
+    /// is no longer exempt from reconcile. Returns false if the reservation no
+    /// longer exists — reconcile reclaimed it after the launch exceeded the TTL,
+    /// so the caller must not treat the job as backed by an allocation.
+    pub fn commit_job(&mut self, job_id: u32) -> bool {
         self.launching.remove(&job_id);
+        self.owners.contains_key(&job_id)
     }
 
     /// Release a job's allocation by id. Idempotent: releasing an unknown or
@@ -524,6 +527,33 @@ mod tests {
         let future = Instant::now() + Duration::from_secs(121);
         assert_eq!(node.reconcile(&live, future, ttl), vec![1]);
         assert_eq!(node.free_gpus(None), 4, "reclaimed after TTL");
+    }
+
+    #[test]
+    fn test_commit_job_reports_reclaimed_reservation() {
+        let mut node = make_node_with_ids(64, 256_000, vec![0, 1], "mi300x");
+        node.allocate_for_job(1, 4, 8_000, &[0]).unwrap();
+        assert!(
+            node.commit_job(1),
+            "commit of a live reservation returns true"
+        );
+
+        // A launch whose reservation reconcile reclaimed before commit: the
+        // owner is gone, so commit must report false and stay a no-op. Keep
+        // job 1 in the live set so only the past-TTL launch (job 2) is reclaimed.
+        node.allocate_for_job(2, 4, 8_000, &[1]).unwrap();
+        let live: HashSet<u32> = [1].into_iter().collect();
+        let past = Instant::now() + Duration::from_secs(121);
+        node.reconcile(&live, past, Duration::from_secs(120));
+        assert!(
+            !node.commit_job(2),
+            "commit of a reclaimed reservation returns false"
+        );
+        assert_eq!(
+            node.free_gpus(None),
+            1,
+            "reclaimed GPU stays free after the no-op commit"
+        );
     }
 
     #[test]
