@@ -1525,13 +1525,19 @@ impl ClusterManager {
                 if self.qos_cache.get(&q).is_none() {
                     anyhow::bail!("QOS '{q}' does not exist");
                 }
-                let effective_account = account.as_deref().or(job_account.as_deref());
+                // Falling back to an unfiltered `account` would let a bogus
+                // or unaffiliated account name (or `account=""`) resolve to
+                // "no association on record", which `check_qos_authorized`
+                // treats as permissive — the exact bypass this check exists
+                // to close.
+                let effective_account = account
+                    .as_deref()
+                    .filter(|a| !a.is_empty())
+                    .or(job_account.as_deref());
                 if let Some(acct) = effective_account {
-                    if !self.association_cache.qos_allowed(&job_user, acct, &q) {
-                        anyhow::bail!(
-                            "QOS '{q}' is not permitted for user '{job_user}' under account '{acct}'"
-                        );
-                    }
+                    self.association_cache
+                        .check_qos_authorized(&job_user, acct, &q)
+                        .map_err(anyhow::Error::msg)?;
                 }
                 Some(q)
             }
@@ -4720,24 +4726,25 @@ fn apply_default_qos(
     accounting: &spur_core::config::AccountingConfig,
 ) -> Result<(), SubmitError> {
     let given_account = spec.account.as_deref().filter(|a| !a.is_empty());
+    // Resolved once and shared by both branches below: `resolve()` reads
+    // account and default QOS under a single lock, so a concurrent cache
+    // refresh can't validate one against the other's stale snapshot.
+    let (account, default_qos) = assoc_cache.resolve(&spec.user, given_account);
 
     if let Some(name) = spec.qos.as_deref().filter(|n| !n.is_empty()) {
         if qos_cache.get(name).is_none() {
             return Err(SubmitError::invalid(format!("QOS '{name}' does not exist")));
         }
-        let (account, _) = assoc_cache.resolve(&spec.user, given_account);
-        if let Some(account) = account.as_deref() {
-            if !assoc_cache.qos_allowed(&spec.user, account, name) {
-                return Err(SubmitError::invalid(format!(
-                    "QOS '{name}' is not permitted for user '{}' under account '{account}'",
-                    spec.user
-                )));
-            }
+        if default_qos.as_deref().is_some_and(|d| d != name) {
+            return Err(SubmitError::invalid(format!(
+                "QOS '{name}' is not permitted for user '{}' under account '{}'",
+                spec.user,
+                account.as_deref().unwrap_or_default()
+            )));
         }
         return Ok(());
     }
 
-    let (account, default_qos) = assoc_cache.resolve(&spec.user, given_account);
     if let Some(default_qos) = default_qos {
         if qos_cache.get(&default_qos).is_some() {
             spec.qos = Some(default_qos);
@@ -10283,6 +10290,65 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_qos_rejects_bypass_via_unaffiliated_account() {
+        // Pairing the QOS change with an account the user has no recorded
+        // association for must not fall back to "nothing to check" — that
+        // was a live bypass of the authorization this PR adds.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache().insert(Qos {
+            name: "highprio".into(),
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "other-teams-qos".into(),
+            ..Default::default()
+        });
+        cm.association_cache()
+            .insert_default_qos("testuser", "research", "highprio");
+        let id = submit_and_wait(&cm, basic_spec("q"));
+
+        let err = cm
+            .update_job(
+                id,
+                None,
+                None,
+                None,
+                None,
+                Some("made-up-account".into()),
+                Some("other-teams-qos".into()),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not associated with account"),
+            "expected an association error, got {err}"
+        );
+        assert_eq!(cm.get_job(id).unwrap().spec.qos, None);
+
+        // An empty account string must fall back to the job's existing
+        // account, not to "no account given" (which would skip
+        // authorization entirely).
+        let mut spec = basic_spec("q2");
+        spec.account = Some("research".into());
+        let id2 = submit_and_wait(&cm, spec);
+        let err = cm
+            .update_job(
+                id2,
+                None,
+                None,
+                None,
+                None,
+                Some(String::new()),
+                Some("other-teams-qos".into()),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("is not permitted"),
+            "expected re-enforcement against the job's own account 'research', got {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn update_node_state() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -11250,6 +11316,28 @@ mod tests {
 
         super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
         assert_eq!(spec.qos.as_deref(), Some("anything"));
+    }
+
+    #[test]
+    fn apply_default_qos_explicit_rejects_other_accounts_qos() {
+        // A user in two accounts, each pinned to its own QOS, must not be
+        // able to borrow one account's QOS while submitting under the
+        // other — the exact cross-account confusion reported in SPUR-101.
+        let assoc = AssociationCache::new();
+        assoc.insert_default_qos("testuser", "hyperloom", "hyperloom-qos");
+        assoc.insert_default_qos("testuser", "primus", "primus-qos");
+        let qos = qos_cache_with(&["hyperloom-qos", "primus-qos"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("hyperloom".into());
+        spec.qos = Some("primus-qos".into());
+
+        let err = super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid(
+                "QOS 'primus-qos' is not permitted for user 'testuser' under account 'hyperloom'"
+            )
+        );
     }
 
     // ── array-parent dependency: cancel + display synthesis ──────

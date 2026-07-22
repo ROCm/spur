@@ -422,6 +422,38 @@ class TestSacctmgrQosAuthorization:
         assert good_id is not None
         wait_job(c, good_id, timeout=30)
 
+    def test_submission_rejects_borrowing_qos_from_a_different_account(self, accounting_cluster):
+        # A user in two accounts, each pinned to its own QOS, must not be
+        # able to submit under one account while borrowing the other's QOS
+        # — the exact cross-account confusion reported in SPUR-101.
+        c = accounting_cluster
+        user = c.nodes[0].user
+
+        c.sacctmgr(["add", "qos", "name=hyperloomqos"])
+        c.sacctmgr(["add", "qos", "name=primusqos"])
+        c.sacctmgr(["add", "account", "name=hyperloom"])
+        c.sacctmgr(["add", "account", "name=primus"])
+        c.sacctmgr(["add", "user", f"name={user}", "account=hyperloom", "defaultqos=hyperloomqos"])
+        c.sacctmgr(["add", "user", f"name={user}", "account=primus", "defaultqos=primusqos"])
+        time.sleep(15)
+
+        script = c.write_file("qos-cross-acct.sh", "#!/bin/bash\ntrue\n")
+
+        out = c.cli_allow_fail(
+            [
+                "sbatch",
+                "-J",
+                "qos-borrow",
+                "-N",
+                "1",
+                "-A",
+                "hyperloom",
+                "--qos=primusqos",
+                script,
+            ]
+        )
+        assert "not permitted" in out, f"expected an authorization rejection, got {out!r}"
+
 
 class TestSacctmgrInvalidInput:
     def test_add_qos_with_non_numeric_limit_fails_cleanly(self, accounting_cluster):
