@@ -335,6 +335,11 @@ struct DrainRequest {
     reason: String,
 }
 
+/// A launch reservation that never commits within this bound is treated as
+/// abandoned and reclaimed by reconcile. Sized well above a worst-case image
+/// pull + fork so a genuinely in-flight launch is never reclaimed under it.
+const LAUNCHING_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Reclaim allocations whose job is no longer tracked and is not mid-launch,
 /// using the running set as ground truth. Callers hold the `running` lock
 /// across building `running` and this call so the live set is a consistent
@@ -344,12 +349,58 @@ fn reconcile_orphaned_allocations(
     allocation: &mut NodeAllocation,
 ) {
     let live: std::collections::HashSet<u32> = running.keys().copied().collect();
-    let reclaimed = allocation.reconcile(&live);
+    let reclaimed = allocation.reconcile(&live, std::time::Instant::now(), LAUNCHING_TTL);
     if !reclaimed.is_empty() {
         warn!(
             ?reclaimed,
             "reconciled orphaned resource allocations with no tracked job"
         );
+    }
+}
+
+/// Releases a launch reservation if the `launch_job` handler exits between
+/// `allocate_for_job` and `commit_job` — including when the RPC future is
+/// cancelled/dropped mid-launch, which no explicit error path can catch.
+/// `disarm` is called once the job is committed to the running set. Without
+/// this, a dropped launch strands its GPUs in the `launching` set (reconcile
+/// spares in-flight launches), the failure mode that black-holes a node.
+struct LaunchReservationGuard {
+    allocation: Arc<Mutex<NodeAllocation>>,
+    job_id: u32,
+    armed: bool,
+}
+
+impl LaunchReservationGuard {
+    fn new(allocation: Arc<Mutex<NodeAllocation>>, job_id: u32) -> Self {
+        Self {
+            allocation,
+            job_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LaunchReservationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let job_id = self.job_id;
+        // Drop can't await. The allocation mutex is effectively uncontended on
+        // this path, so try_lock succeeds inline; if it ever doesn't, fall back
+        // to a spawned release so the reservation is never left stranded.
+        if let Ok(mut alloc) = self.allocation.try_lock() {
+            alloc.release_job(job_id);
+        } else {
+            let allocation = self.allocation.clone();
+            tokio::spawn(async move {
+                allocation.lock().await.release_job(job_id);
+            });
+        }
     }
 }
 
@@ -842,9 +893,13 @@ impl SlurmAgent for AgentService {
             .allocate_local_resources(job_id, &spec, req.allocated.as_ref())
             .await?;
 
-        // Any failure before commit must release the reservation, or the GPUs
-        // stay in-use with no tracked job while the controller sees the node
-        // IDLE. Reconcile is a backstop; releasing eagerly reclaims at once.
+        // Any exit before commit — an error path OR a cancelled/dropped launch
+        // future — must release the reservation, or the GPUs stay in-use with no
+        // tracked job while the controller sees the node IDLE. The guard covers
+        // every such exit (including future cancellation, which no explicit
+        // branch can); it is disarmed once the job is committed to `running`.
+        let mut reservation_guard = LaunchReservationGuard::new(self.allocation.clone(), job_id);
+
         let injection = {
             let reg = self.device_registry.lock().await;
             reg.build_job_injection_plans("gpu", &allocated_device_ids, spec.uid, spec.gid)
@@ -853,7 +908,6 @@ impl SlurmAgent for AgentService {
             Ok(plans) => plans,
             Err(e) => {
                 error!(job_id, error = %e, "device registry resolution failed");
-                self.allocation.lock().await.release_job(job_id);
                 return Err(Status::failed_precondition(format!(
                     "device resolution failed: {}",
                     e
@@ -870,14 +924,13 @@ impl SlurmAgent for AgentService {
         let cpu_ids: Vec<u32> = alloc_result.cpu_ids.clone();
 
         // Guard rather than unwrap: these are always Some when the image is
-        // set, but an early exit before commit must release the reservation.
+        // set. An early return here releases the reservation via the guard.
         let container_launch = if !spec.container_image.is_empty() {
             match (container_config.take(), rootfs_path.take()) {
                 (Some(config), Some(rootfs)) => {
                     Some(executor::ContainerLaunchConfig { config, rootfs })
                 }
                 _ => {
-                    self.allocation.lock().await.release_job(job_id);
                     return Err(Status::internal(
                         "internal error: container config missing after setup",
                     ));
@@ -932,6 +985,7 @@ impl SlurmAgent for AgentService {
                 // first so a job is never briefly absent from BOTH `running` and
                 // `launching` (which would let reconcile reclaim it).
                 self.allocation.lock().await.commit_job(job_id);
+                reservation_guard.disarm();
                 info!(job_id, gpus = ?launch_cfg.gpu_devices, "job launched successfully");
                 let is_root = nix::unistd::geteuid().is_root();
                 let is_container = launch_cfg.container.is_some();
@@ -981,8 +1035,7 @@ impl SlurmAgent for AgentService {
                 }))
             }
             Err(e) => {
-                self.allocation.lock().await.release_job(job_id);
-
+                // reservation_guard releases the allocation on this return.
                 let is_prolog_failure = matches!(e, executor::LaunchError::PrologFailed(_));
                 let err_msg = e.to_string();
                 error!(job_id, error = %err_msg, "failed to launch job");
@@ -1030,6 +1083,20 @@ impl SlurmAgent for AgentService {
         } else {
             self.graceful_cancel(job_id).await;
         }
+
+        // The signal paths above only act on a tracked (running) job. If the
+        // controller cancels a job still reserving resources mid-launch (in the
+        // `launching` set, not yet committed to `running`), release it here so a
+        // cancel-during-eviction can't strand the reservation until the TTL.
+        // Hold the running lock across the release so this can't race a launch
+        // committing into `running` in the gap: launch_job takes running before
+        // allocation on commit, so matching that order means we never free a job
+        // that just became running.
+        let jobs = self.running.lock().await;
+        if !jobs.contains_key(&job_id) {
+            self.allocation.lock().await.release_job(job_id);
+        }
+        drop(jobs);
 
         Ok(Response::new(()))
     }
@@ -3071,6 +3138,91 @@ mod tests {
             .await;
         let err = res.expect_err("must reject: GPU 1's owner is still running");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    }
+
+    // A CancelJob for a job still reserving resources mid-launch (in the
+    // `launching` set, never committed to `running`) must release the
+    // reservation. Otherwise a cancel-during-eviction leaves the GPUs pinned
+    // and reconcile spares them until the TTL, black-holing the node.
+    #[tokio::test]
+    async fn cancel_releases_launching_reservation() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        // Reserve GPU 0 as a still-launching job (not committed, not in running).
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(7, 1, 0, &[0]).unwrap();
+        }
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "GPU reserved while launching"
+        );
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id: 7,
+            signal: 9,
+        }))
+        .await
+        .expect("cancel_job");
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "cancel must release a launching (never-committed) reservation"
+        );
+    }
+
+    // The launch reservation guard must release the allocation if the launch
+    // handler's future is dropped after reserving but before committing —
+    // cancellation no explicit error branch can catch.
+    #[tokio::test]
+    async fn reservation_guard_releases_on_drop_when_not_committed() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        {
+            svc.allocation
+                .lock()
+                .await
+                .allocate_for_job(9, 1, 0, &[0])
+                .unwrap();
+            let guard = LaunchReservationGuard::new(svc.allocation.clone(), 9);
+            assert_eq!(svc.free_gpu_count().await, 0, "reserved under guard");
+            drop(guard);
+        }
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "dropping an un-disarmed guard must release the reservation"
+        );
+
+        // A disarmed guard must NOT release (the job committed successfully).
+        {
+            svc.allocation
+                .lock()
+                .await
+                .allocate_for_job(10, 1, 0, &[0])
+                .unwrap();
+            svc.allocation.lock().await.commit_job(10);
+            let mut guard = LaunchReservationGuard::new(svc.allocation.clone(), 10);
+            guard.disarm();
+            drop(guard);
+        }
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "a disarmed guard must leave the committed reservation intact"
+        );
     }
 
     #[tokio::test]
