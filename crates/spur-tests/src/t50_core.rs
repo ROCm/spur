@@ -112,7 +112,8 @@ mod tests {
     fn t50_15_path_resolve_job_id() {
         let mut job = make_job("train");
         job.job_id = 42;
-        assert_eq!(job.resolved_stdout(), "spur-42.out");
+        // Relative default is anchored to work_dir (/tmp), matching Slurm.
+        assert_eq!(job.resolved_stdout(), "/tmp/spur-42.out");
     }
 
     #[test]
@@ -121,7 +122,7 @@ mod tests {
         job.job_id = 42;
         job.spec.user = "bob".into();
         job.spec.stdout_path = Some("output-%x-%u-%j.log".into());
-        assert_eq!(job.resolved_stdout(), "output-train-bob-42.log");
+        assert_eq!(job.resolved_stdout(), "/tmp/output-train-bob-42.log");
     }
 
     #[test]
@@ -130,7 +131,7 @@ mod tests {
         job.job_id = 10;
         job.allocated_nodes = vec!["gpu001".into()];
         job.spec.stdout_path = Some("out-%N-%j.log".into());
-        assert_eq!(job.resolved_stdout(), "out-gpu001-10.log");
+        assert_eq!(job.resolved_stdout(), "/tmp/out-gpu001-10.log");
     }
 
     // ── T50.18: Job run time ──────────────────────────────────────

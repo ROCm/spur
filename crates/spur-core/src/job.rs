@@ -663,9 +663,9 @@ pub struct Job {
     #[serde(default)]
     pub bb_stage_state: BbStageState,
 
-    /// Absolute output path the primary node's agent actually resolved at launch
-    /// (including the `/tmp` fallback). `None` until launch; queries fall back to
-    /// the computed `resolved_stdout`/`resolved_stderr` while unset.
+    /// Absolute path the primary agent resolved at launch (incl. `/tmp` fallback).
+    /// Best-effort, not Raft-replicated: `None` before launch and after a failover/
+    /// restart that missed it, when queries use `resolved_stdout`/`resolved_stderr`.
     #[serde(default)]
     pub actual_stdout_path: Option<String>,
     #[serde(default)]
@@ -799,7 +799,8 @@ impl Job {
         self.resolve_path(self.spec.stderr_path.as_deref().unwrap_or("spur-%j.out"))
     }
 
-    /// Resolve stdin path, if set.
+    /// Resolve stdin path, if set. Absolute (anchored like stdout/stderr) and
+    /// controller-display-only; the agent resolves stdin itself at launch.
     pub fn resolved_stdin(&self) -> Option<String> {
         self.spec
             .stdin_path
@@ -808,31 +809,71 @@ impl Job {
     }
 
     fn resolve_path(&self, pattern: &str) -> String {
-        let mut result = pattern.to_string();
-        result = result.replace("%j", &self.job_id.to_string());
-        result = result.replace("%J", &self.job_id.to_string());
-        result = result.replace("%x", &self.spec.name);
-        if let Some(tid) = self.spec.array_task_id {
-            result = result.replace("%a", &tid.to_string());
-            result = result.replace(
-                "%A",
-                &self.spec.array_job_id.unwrap_or(self.job_id).to_string(),
-            );
-        }
-        if let Some(node) = self.allocated_nodes.first() {
-            result = result.replace("%N", node);
-        }
-        result = result.replace("%u", &self.spec.user);
-        // Anchor relative patterns to the job's work_dir so the reported path is
-        // absolute (matching Slurm), mirroring how the agent joins its work_dir.
-        if std::path::Path::new(&result).is_relative() && !self.spec.work_dir.is_empty() {
-            result = std::path::Path::new(&self.spec.work_dir)
-                .join(&result)
-                .to_string_lossy()
-                .into_owned();
-        }
-        result
+        resolve_output_pattern(
+            pattern,
+            &OutputPathContext {
+                job_id: self.job_id,
+                name: &self.spec.name,
+                user: &self.spec.user,
+                work_dir: &self.spec.work_dir,
+                node: self.allocated_nodes.first().map(String::as_str),
+                array_job_id: self.spec.array_job_id,
+                array_task_id: self.spec.array_task_id,
+            },
+        )
     }
+}
+
+/// Inputs for expanding Slurm-style output path patterns. Shared by controller
+/// (fallback) and agent (actual) so both resolve the same location — else
+/// `scontrol` shows a path differing from the real output.
+pub struct OutputPathContext<'a> {
+    pub job_id: JobId,
+    pub name: &'a str,
+    pub user: &'a str,
+    pub work_dir: &'a str,
+    /// `%N`: controller passes the primary node, agent its own target (same for primary).
+    pub node: Option<&'a str>,
+    pub array_job_id: Option<JobId>,
+    pub array_task_id: Option<u32>,
+}
+
+/// Fallback work_dir when a job specifies none; the agent launches here, so
+/// path resolution anchors here too.
+pub const DEFAULT_WORK_DIR: &str = "/tmp";
+
+/// Expand `%j`/`%J`/`%x`/`%u`/`%N`/`%a`/`%A` and anchor a relative result to
+/// `work_dir` (or `DEFAULT_WORK_DIR` when empty) so it is absolute, matching
+/// Slurm. An empty pattern defaults to `spur-<id>.out`.
+pub fn resolve_output_pattern(pattern: &str, ctx: &OutputPathContext) -> String {
+    let mut result = if pattern.is_empty() {
+        format!("spur-{}.out", ctx.job_id)
+    } else {
+        pattern.to_string()
+    };
+    result = result.replace("%j", &ctx.job_id.to_string());
+    result = result.replace("%J", &ctx.job_id.to_string());
+    result = result.replace("%x", ctx.name);
+    if let Some(tid) = ctx.array_task_id {
+        result = result.replace("%a", &tid.to_string());
+        result = result.replace("%A", &ctx.array_job_id.unwrap_or(ctx.job_id).to_string());
+    }
+    if let Some(node) = ctx.node {
+        result = result.replace("%N", node);
+    }
+    result = result.replace("%u", ctx.user);
+    if std::path::Path::new(&result).is_relative() {
+        let base = if ctx.work_dir.is_empty() {
+            DEFAULT_WORK_DIR
+        } else {
+            ctx.work_dir
+        };
+        result = std::path::Path::new(base)
+            .join(&result)
+            .to_string_lossy()
+            .into_owned();
+    }
+    result
 }
 
 /// State transitions.
@@ -1000,6 +1041,22 @@ mod tests {
         );
         assert_eq!(job.resolved_stdout(), "/home/alice/spur-7.out");
         assert_eq!(job.resolved_stderr(), "/home/alice/spur-7.out");
+    }
+
+    #[test]
+    fn resolved_stdout_empty_work_dir_anchors_to_default() {
+        let job = Job::new(
+            7,
+            JobSpec {
+                work_dir: String::new(),
+                ..Default::default()
+            },
+        );
+        // Matches where the agent launches the job, so reported/computed paths agree.
+        assert_eq!(
+            job.resolved_stdout(),
+            format!("{}/spur-7.out", DEFAULT_WORK_DIR)
+        );
     }
 
     #[test]

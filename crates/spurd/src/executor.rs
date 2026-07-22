@@ -73,6 +73,12 @@ pub struct JobLaunchConfig {
     pub job_id: JobId,
     pub script: String,
     pub work_dir: String,
+    /// Needed to expand `%x`/`%u`/`%N`/`%a`/`%A` in output paths as the controller does.
+    pub name: String,
+    pub user: String,
+    pub node: String,
+    pub array_job_id: Option<JobId>,
+    pub array_task_id: Option<u32>,
     pub environment: HashMap<String, String>,
     pub stdout_path: String,
     pub stderr_path: String,
@@ -449,8 +455,8 @@ async fn spawn_job_process(
         ("/dev/null".to_string(), "/dev/null".to_string())
     } else {
         (
-            resolve_output_path(stdout_path, job_id, work_dir),
-            resolve_output_path(stderr_path, job_id, work_dir),
+            resolve_output_path(cfg, work_dir, stdout_path),
+            resolve_output_path(cfg, work_dir, stderr_path),
         )
     };
 
@@ -464,7 +470,7 @@ async fn spawn_job_process(
             let stdin_resolved = if stdin_path.is_empty() {
                 None
             } else {
-                let r = resolve_output_path(stdin_path, job_id, work_dir);
+                let r = resolve_output_path(cfg, work_dir, stdin_path);
                 if r == stdout_resolved || r == stderr_resolved {
                     anyhow::bail!(
                         "stdin path {} overlaps with an output path; this would truncate the input",
@@ -1145,23 +1151,21 @@ pub fn cleanup_job_spool(job_id: JobId) {
 }
 
 /// Resolve output path patterns (%j → job_id, etc.)
-fn resolve_output_path(pattern: &str, job_id: JobId, work_dir: &str) -> String {
-    let resolved = if pattern.is_empty() {
-        format!("spur-{}.out", job_id)
-    } else {
-        pattern
-            .replace("%j", &job_id.to_string())
-            .replace("%J", &job_id.to_string())
-    };
-
-    if Path::new(&resolved).is_absolute() {
-        resolved
-    } else {
-        PathBuf::from(work_dir)
-            .join(resolved)
-            .to_string_lossy()
-            .into()
-    }
+/// Resolve a pattern against the *effective* work_dir (may be the `/tmp`
+/// fallback) via the shared resolver, so agent and controller paths match.
+fn resolve_output_path(cfg: &JobLaunchConfig, work_dir: &str, pattern: &str) -> String {
+    spur_core::job::resolve_output_pattern(
+        pattern,
+        &spur_core::job::OutputPathContext {
+            job_id: cfg.job_id,
+            name: &cfg.name,
+            user: &cfg.user,
+            work_dir,
+            node: (!cfg.node.is_empty()).then_some(cfg.node.as_str()),
+            array_job_id: cfg.array_job_id,
+            array_task_id: cfg.array_task_id,
+        },
+    )
 }
 
 /// Launch a containerized job via explicit fork() + container_init().
@@ -1692,17 +1696,54 @@ mod tests {
         assert!(received.is_empty());
     }
 
+    fn launch_cfg_for_paths(job_id: JobId, name: &str, user: &str, node: &str) -> JobLaunchConfig {
+        JobLaunchConfig {
+            job_id,
+            script: String::new(),
+            work_dir: String::new(),
+            name: name.to_string(),
+            user: user.to_string(),
+            node: node.to_string(),
+            array_job_id: None,
+            array_task_id: None,
+            environment: HashMap::new(),
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            stdin_path: String::new(),
+            cpus: 1,
+            memory_mb: 0,
+            gpu_devices: Vec::new(),
+            cpu_ids: Vec::new(),
+            open_mode: None,
+            uid: 0,
+            gid: 0,
+            container: None,
+            prolog_script: None,
+            partition: String::new(),
+            nodelist: String::new(),
+            host_device_plan: None,
+            memlock: MemlockLimit::Unlimited,
+            io_mode: LaunchIo::File,
+        }
+    }
+
     #[test]
     fn test_resolve_output_path() {
+        let cfg = launch_cfg_for_paths(42, "train", "alice", "node7");
         assert_eq!(
-            resolve_output_path("spur-%j.out", 42, "/home/user"),
+            resolve_output_path(&cfg, "/home/user", "spur-%j.out"),
             "/home/user/spur-42.out"
         );
         assert_eq!(
-            resolve_output_path("/var/log/job-%j.log", 42, "/home/user"),
+            resolve_output_path(&cfg, "/home/user", "/var/log/job-%j.log"),
             "/var/log/job-42.log"
         );
-        assert_eq!(resolve_output_path("", 42, "/tmp"), "/tmp/spur-42.out");
+        assert_eq!(resolve_output_path(&cfg, "/tmp", ""), "/tmp/spur-42.out");
+        // Same codes as the controller (%x/%u/%N), so reported/computed never diverge.
+        assert_eq!(
+            resolve_output_path(&cfg, "/tmp", "out-%x-%u-%N.log"),
+            "/tmp/out-train-alice-node7.log"
+        );
     }
 
     #[test]

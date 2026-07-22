@@ -582,7 +582,7 @@ impl SlurmAgent for AgentService {
         );
 
         let work_dir = if spec.work_dir.is_empty() {
-            "/tmp".to_string()
+            spur_core::job::DEFAULT_WORK_DIR.to_string()
         } else {
             spec.work_dir.clone()
         };
@@ -891,6 +891,11 @@ impl SlurmAgent for AgentService {
             job_id,
             script: launch_script,
             work_dir: work_dir.clone(),
+            name: spec.name.clone(),
+            user: spec.user.clone(),
+            node: req.target_node.clone(),
+            array_job_id: (array_job_id != 0).then_some(array_job_id),
+            array_task_id: (array_job_id != 0).then_some(array_task_id),
             environment: env,
             stdout_path: spec.stdout_path.clone(),
             stderr_path: spec.stderr_path.clone(),

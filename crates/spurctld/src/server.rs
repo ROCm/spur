@@ -2394,6 +2394,31 @@ mod tests {
         assert_eq!(status.code(), Code::Internal);
     }
 
+    #[test]
+    fn job_to_proto_output_path_prefers_actual_else_absolute_computed() {
+        use spur_core::job::{Job, JobSpec};
+
+        let mut job = Job::new(
+            42,
+            JobSpec {
+                work_dir: "/home/alice".into(),
+                ..Default::default()
+            },
+        );
+
+        // Unset: absolute computed fallback.
+        let info = job_to_proto(&job);
+        assert_eq!(info.stdout_path, "/home/alice/spur-42.out");
+        assert_eq!(info.stderr_path, "/home/alice/spur-42.out");
+
+        // Set: reported path wins.
+        job.actual_stdout_path = Some("/tmp/spur-42.out".into());
+        job.actual_stderr_path = Some("/tmp/spur-42.out".into());
+        let info = job_to_proto(&job);
+        assert_eq!(info.stdout_path, "/tmp/spur-42.out");
+        assert_eq!(info.stderr_path, "/tmp/spur-42.out");
+    }
+
     fn make_node_info(name: &str) -> NodeInfo {
         NodeInfo {
             name: name.into(),

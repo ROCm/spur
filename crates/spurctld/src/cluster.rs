@@ -1569,15 +1569,15 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Record the absolute output paths resolved by the primary node's agent at
-    /// launch, so queries can report where output actually landed (including the
-    /// `/tmp` fallback). Advisory metadata: updated directly rather than through
-    /// the WAL, mirroring the non-WAL-tracked fields in `update_job`.
+    /// Record the primary agent's resolved output paths for `scontrol`. Display-only
+    /// advisory metadata written straight to the in-memory job, not via Raft/WAL, so
+    /// after failover/restart a leader that missed the launch shows the computed path.
+    /// Empty paths stay `None` (a mixed-version agent decodes the fields as "").
     pub fn set_job_output_paths(&self, job_id: JobId, stdout_path: String, stderr_path: String) {
         let mut jobs = self.jobs.write();
         if let Some(job) = jobs.get_mut(&job_id) {
-            job.actual_stdout_path = Some(stdout_path);
-            job.actual_stderr_path = Some(stderr_path);
+            job.actual_stdout_path = (!stdout_path.is_empty()).then_some(stdout_path);
+            job.actual_stderr_path = (!stderr_path.is_empty()).then_some(stderr_path);
         }
     }
 
@@ -3121,6 +3121,9 @@ impl ClusterManager {
         job.allocated_resources = None;
         job.per_node_alloc.clear();
         job.pending_reason = PendingReason::None;
+        // Stale after requeue (points at nodes the job left); next dispatch resets it.
+        job.actual_stdout_path = None;
+        job.actual_stderr_path = None;
     }
 
     /// Requeue after a dispatch failure or Timeout/NodeFail: counts against
@@ -10273,6 +10276,10 @@ mod tests {
         .unwrap();
         settle(&cm, id, JobState::Running);
 
+        // A reported path must not survive requeue (points at a node the job leaves).
+        cm.set_job_output_paths(id, "/tmp/spur.out".into(), "/tmp/spur.out".into());
+        assert!(cm.get_job(id).unwrap().actual_stdout_path.is_some());
+
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: id,
             exit_code: -1,
@@ -10305,6 +10312,24 @@ mod tests {
             "allocated_resources should be cleared"
         );
         assert_eq!(job.pending_reason, PendingReason::None);
+        assert!(
+            job.actual_stdout_path.is_none() && job.actual_stderr_path.is_none(),
+            "stale reported output path should be cleared on requeue"
+        );
+    }
+
+    // Empty ("" from a mixed-version agent) must not shadow the computed fallback.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_job_output_paths_ignores_empty() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("empty-paths"));
+
+        cm.set_job_output_paths(id, String::new(), String::new());
+        let job = cm.get_job(id).unwrap();
+        assert!(job.actual_stdout_path.is_none());
+        assert!(job.actual_stderr_path.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
