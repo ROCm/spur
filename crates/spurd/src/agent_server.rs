@@ -901,6 +901,7 @@ impl SlurmAgent for AgentService {
             Ok(plans) => plans,
             Err(e) => {
                 error!(job_id, error = %e, "device registry resolution failed");
+                self.cleanup_pmi_server(job_id).await;
                 return Err(Status::failed_precondition(format!(
                     "device resolution failed: {}",
                     e
@@ -924,6 +925,7 @@ impl SlurmAgent for AgentService {
                     Some(executor::ContainerLaunchConfig { config, rootfs })
                 }
                 _ => {
+                    self.cleanup_pmi_server(job_id).await;
                     return Err(Status::internal(
                         "internal error: container config missing after setup",
                     ));
@@ -991,6 +993,7 @@ impl SlurmAgent for AgentService {
                         job_id,
                         "reservation reclaimed during launch; aborting to avoid running unbacked"
                     );
+                    self.cleanup_pmi_server(job_id).await;
                     let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                     let cgroup = result.job.take_cgroup();
                     tokio::spawn(async move {
@@ -1059,6 +1062,7 @@ impl SlurmAgent for AgentService {
             }
             Err(e) => {
                 // reservation_guard releases the allocation on this return.
+                self.cleanup_pmi_server(job_id).await;
                 let is_prolog_failure = matches!(e, executor::LaunchError::PrologFailed(_));
                 let err_msg = e.to_string();
                 error!(job_id, error = %err_msg, "failed to launch job");
@@ -1868,6 +1872,14 @@ impl AgentService {
     async fn drop_tracked_job(&self, job_id: u32) {
         if self.running.lock().await.remove(&job_id).is_some() {
             self.allocation.lock().await.release_job(job_id);
+        }
+    }
+
+    /// Tear down the PMI server started for a job that aborts before it enters
+    /// the running set — the monitor loop's completion cleanup never runs for it.
+    async fn cleanup_pmi_server(&self, job_id: u32) {
+        if let Some(pmi) = self.pmi_servers.lock().await.remove(&job_id) {
+            pmi.cleanup();
         }
     }
 
@@ -3194,6 +3206,34 @@ mod tests {
             svc.free_gpu_count().await,
             1,
             "cancel must release a launching (never-committed) reservation"
+        );
+    }
+
+    // A launch that aborts before entering `running` must tear down its PMI
+    // server, since the monitor loop's completion cleanup never runs for it.
+    #[tokio::test]
+    async fn cleanup_pmi_server_removes_entry_and_socket() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let socket_path = format!("/tmp/spur-pmi-test-{}.sock", std::process::id());
+        let pmi = Arc::new(crate::pmi::PmiServer::new(&socket_path, 2));
+        std::fs::write(&socket_path, b"").expect("create fake socket");
+        svc.pmi_servers.lock().await.insert(42, pmi);
+
+        svc.cleanup_pmi_server(42).await;
+
+        assert!(
+            !svc.pmi_servers.lock().await.contains_key(&42),
+            "pmi server entry must be removed"
+        );
+        assert!(
+            !std::path::Path::new(&socket_path).exists(),
+            "pmi socket file must be removed"
         );
     }
 
