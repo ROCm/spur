@@ -11412,6 +11412,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn apply_default_qos_no_explicit_qos_resolves_pinned_default_from_allow_list() {
+        // The common real-world config: an allow-list plus a default that's
+        // a member of it. Omitting --qos must still resolve to the default.
+        let assoc = AssociationCache::new();
+        assoc.insert_allowed_qos("testuser", "research", &["a", "b"]);
+        assoc.insert_default_qos("testuser", "research", "b");
+        let qos = qos_cache_with(&["a", "b"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("b"));
+    }
+
     // ── array-parent dependency: cancel + display synthesis ──────
 
     /// Submit an array task job directly via the WAL (bypassing expansion) so

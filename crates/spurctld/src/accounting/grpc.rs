@@ -432,6 +432,10 @@ impl SlurmAccounting for AccountingService {
                     .map_err(|_| Status::invalid_argument("max_wall_minutes exceeds i32::MAX"))?,
             )
         };
+        // Store the trimmed/filtered form, not the raw request string, so
+        // `sacctmgr show user` echoes back what was actually validated
+        // above rather than stray whitespace or empty entries.
+        let allowed_qos_normalized = allowed_qos.join(",");
         db::add_user(
             &self.pool,
             &req.user,
@@ -439,7 +443,7 @@ impl SlurmAccounting for AccountingService {
             &req.admin_level,
             req.is_default,
             &req.default_qos,
-            &req.allowed_qos,
+            &allowed_qos_normalized,
             max_running_jobs,
             max_submit_jobs,
             max_tres_per_job,

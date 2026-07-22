@@ -532,7 +532,7 @@ async fn delete(entity: &str, params: &[String], addr: &str) -> Result<()> {
 }
 
 async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
-    let p = parse_params(params);
+    let mut p = parse_params(params);
 
     // Modify is an upsert — same RPCs as add, just re-sends the record
     match entity.to_lowercase().as_str() {
@@ -621,9 +621,39 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
             Ok(())
         }
         "user" => {
-            let fields = build_add_user_request(&p)?;
-
             let mut client = connect(addr).await?;
+
+            // `modify user` resends the whole association record (it shares
+            // AddUserRequest with `add user`), so a QOS field left out of
+            // this command must keep its stored value, not silently reset
+            // to unrestricted — unlike a resource limit, an omitted QOS
+            // field would otherwise widen the association's access.
+            if !p.contains_key("qos") || !p.contains_key("defaultqos") {
+                let name = p
+                    .get("name")
+                    .or_else(|| p.get("user"))
+                    .cloned()
+                    .unwrap_or_default();
+                let account = p.get("account").cloned().unwrap_or_default();
+                let existing = client
+                    .list_users(ListUsersRequest {
+                        account: account.clone(),
+                        user: name.clone(),
+                    })
+                    .await
+                    .context("ListUsers (modify lookup) RPC failed")?
+                    .into_inner()
+                    .users
+                    .into_iter()
+                    .find(|u| u.name == name && u.account == account);
+                if let Some(existing) = existing {
+                    p.entry("qos".to_string()).or_insert(existing.allowed_qos);
+                    p.entry("defaultqos".to_string())
+                        .or_insert(existing.default_qos);
+                }
+            }
+
+            let fields = build_add_user_request(&p)?;
             client
                 .add_user(AddUserRequest {
                     user: fields.name.clone(),

@@ -495,6 +495,65 @@ class TestSacctmgrQosAuthorization:
         )
         assert "not permitted" in out, f"expected an authorization rejection, got {out!r}"
 
+    def test_show_user_displays_qos_and_default_qos_columns(self, accounting_cluster):
+        c = accounting_cluster
+        user = c.nodes[0].user
+
+        c.sacctmgr(["add", "qos", "name=showqosa"])
+        c.sacctmgr(["add", "qos", "name=showqosb"])
+        c.sacctmgr(["add", "account", "name=showqos"])
+        c.sacctmgr(
+            [
+                "add",
+                "user",
+                f"name={user}",
+                "account=showqos",
+                "qos=showqosa,showqosb",
+                "defaultqos=showqosb",
+            ]
+        )
+
+        out = c.sacctmgr(["show", "user"])
+        row = next(line for line in out.splitlines() if "showqos" in line and user in line)
+        assert "showqosa,showqosb" in row, f"expected the QOS list in the row, got {row!r}"
+        assert "showqosb" in row, f"expected the default QOS in the row, got {row!r}"
+
+    def test_modify_user_without_qos_preserves_existing_allow_list(self, accounting_cluster):
+        # An unrelated `modify user` must not silently widen access by
+        # dropping a previously-granted QOS allow-list/default.
+        c = accounting_cluster
+        user = c.nodes[0].user
+
+        c.sacctmgr(["add", "qos", "name=keepqosa"])
+        c.sacctmgr(["add", "qos", "name=keepqosb"])
+        c.sacctmgr(["add", "account", "name=keepqos"])
+        c.sacctmgr(
+            [
+                "add",
+                "user",
+                f"name={user}",
+                "account=keepqos",
+                "qos=keepqosa,keepqosb",
+                "defaultqos=keepqosa",
+            ]
+        )
+
+        # Unrelated modify: touches only maxjobs, never mentions qos=/defaultqos=.
+        c.sacctmgr(["modify", "user", f"name={user}", "account=keepqos", "set", "maxjobs=5"])
+
+        out = c.sacctmgr(["show", "user"])
+        row = next(line for line in out.splitlines() if "keepqos" in line and user in line)
+        assert "keepqosa,keepqosb" in row, f"allow-list must survive an unrelated modify, got {row!r}"
+        assert "keepqosa" in row, f"default QOS must survive an unrelated modify, got {row!r}"
+
+        time.sleep(15)
+        script = c.write_file("qos-preserve.sh", "#!/bin/bash\ntrue\n")
+        still_allowed_id = parse_job_id(
+            c.sbatch(["-J", "qos-preserve", "-N", "1", "-A", "keepqos", "--qos=keepqosb", script])
+        )
+        assert still_allowed_id is not None, "keepqosb must still be usable after the unrelated modify"
+        wait_job(c, still_allowed_id, timeout=30)
+
 
 class TestSacctmgrInvalidInput:
     def test_add_qos_with_non_numeric_limit_fails_cleanly(self, accounting_cluster):
