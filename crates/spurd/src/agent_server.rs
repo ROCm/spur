@@ -68,12 +68,15 @@ struct CompletedJob {
     nodelist: String,
 }
 
+/// Per-node registry of running PMI servers, keyed by job id.
+type PmiServers = Arc<Mutex<HashMap<u32, Arc<PmiServer>>>>;
+
 pub struct AgentService {
     pub reporter: Arc<NodeReporter>,
     running: Arc<Mutex<HashMap<u32, TrackedJob>>>,
     allocation: Arc<Mutex<NodeAllocation>>,
     spank: Arc<Option<SpankHost>>,
-    pmi_servers: Arc<Mutex<HashMap<u32, Arc<PmiServer>>>>,
+    pmi_servers: PmiServers,
     hooks: Arc<HooksConfig>,
     memlock: spur_core::config::MemlockLimit,
     #[allow(dead_code)]
@@ -360,9 +363,12 @@ fn reconcile_orphaned_allocations(
 
 /// Releases a launch reservation if the handler exits between reserve and
 /// commit, including on future cancellation which no error path can catch.
-/// Disarmed once the job is committed to the running set.
+/// Also tears down a PMI server started for the launch (via `adopt_pmi`), since
+/// that too would leak on a cancelled launch. Disarmed once the job is
+/// committed to the running set.
 struct LaunchReservationGuard {
     allocation: Arc<Mutex<NodeAllocation>>,
+    pmi_servers: Option<PmiServers>,
     job_id: u32,
     armed: bool,
 }
@@ -371,9 +377,16 @@ impl LaunchReservationGuard {
     fn new(allocation: Arc<Mutex<NodeAllocation>>, job_id: u32) -> Self {
         Self {
             allocation,
+            pmi_servers: None,
             job_id,
             armed: true,
         }
+    }
+
+    /// Take ownership of the job's PMI server so it is torn down alongside the
+    /// reservation if the launch aborts.
+    fn adopt_pmi(&mut self, pmi_servers: PmiServers) {
+        self.pmi_servers = Some(pmi_servers);
     }
 
     fn disarm(&mut self) {
@@ -387,7 +400,8 @@ impl Drop for LaunchReservationGuard {
             return;
         }
         let job_id = self.job_id;
-        // Drop can't await; try_lock succeeds inline on this uncontended path.
+        // Drop can't await; try_lock succeeds inline on this uncontended path,
+        // else release off-thread so the reservation is never left stranded.
         if let Ok(mut alloc) = self.allocation.try_lock() {
             alloc.release_job(job_id);
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -397,6 +411,27 @@ impl Drop for LaunchReservationGuard {
             });
         }
         // No runtime (shutdown) and lock held: reconcile reclaims via the TTL.
+
+        if let Some(pmi_servers) = self.pmi_servers.take() {
+            let locked_inline = match pmi_servers.try_lock() {
+                Ok(mut map) => {
+                    if let Some(pmi) = map.remove(&job_id) {
+                        pmi.cleanup();
+                    }
+                    true
+                }
+                Err(_) => false,
+            };
+            if !locked_inline {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        if let Some(pmi) = pmi_servers.lock().await.remove(&job_id) {
+                            pmi.cleanup();
+                        }
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -847,19 +882,6 @@ impl SlurmAgent for AgentService {
             (script, crate::container::RootfsMode::Extracted)
         };
 
-        // PMI-1 server: if MPI mode is "pmi1" and multiple tasks, start a
-        // Unix socket KVS server so MPI ranks can bootstrap via PMI.
-        if spec.mpi == "pmi1" && tasks_per_node > 1 {
-            let socket_path = format!("/tmp/spur-pmi-{}.sock", job_id);
-            let pmi = Arc::new(PmiServer::new(&socket_path, spec.num_tasks));
-            let pmi_run = pmi.clone();
-            tokio::spawn(async move {
-                pmi_run.run().await;
-            });
-            env.insert("PMI_PORT".into(), socket_path.clone());
-            self.pmi_servers.lock().await.insert(job_id, pmi);
-        }
-
         // Multi-task per-node: wrap the user script so it forks N processes,
         // each with a distinct LOCAL_RANK. The wrapper backgrounds N copies and
         // waits for all to finish, so TrackedJob only tracks a single PID (the
@@ -893,6 +915,21 @@ impl SlurmAgent for AgentService {
         // cancelled launch future; disarmed once committed to `running`.
         let mut reservation_guard = LaunchReservationGuard::new(self.allocation.clone(), job_id);
 
+        // PMI-1 server: if MPI mode is "pmi1" and multiple tasks, start a
+        // Unix socket KVS server so MPI ranks can bootstrap via PMI. Started
+        // under the guard so an aborted launch tears it down with the reservation.
+        if spec.mpi == "pmi1" && tasks_per_node > 1 {
+            let socket_path = format!("/tmp/spur-pmi-{}.sock", job_id);
+            let pmi = Arc::new(PmiServer::new(&socket_path, spec.num_tasks));
+            let pmi_run = pmi.clone();
+            tokio::spawn(async move {
+                pmi_run.run().await;
+            });
+            env.insert("PMI_PORT".into(), socket_path);
+            self.pmi_servers.lock().await.insert(job_id, pmi);
+            reservation_guard.adopt_pmi(self.pmi_servers.clone());
+        }
+
         let injection = {
             let reg = self.device_registry.lock().await;
             reg.build_job_injection_plans("gpu", &allocated_device_ids, spec.uid, spec.gid)
@@ -901,7 +938,6 @@ impl SlurmAgent for AgentService {
             Ok(plans) => plans,
             Err(e) => {
                 error!(job_id, error = %e, "device registry resolution failed");
-                self.cleanup_pmi_server(job_id).await;
                 return Err(Status::failed_precondition(format!(
                     "device resolution failed: {}",
                     e
@@ -925,7 +961,6 @@ impl SlurmAgent for AgentService {
                     Some(executor::ContainerLaunchConfig { config, rootfs })
                 }
                 _ => {
-                    self.cleanup_pmi_server(job_id).await;
                     return Err(Status::internal(
                         "internal error: container config missing after setup",
                     ));
@@ -1063,8 +1098,7 @@ impl SlurmAgent for AgentService {
                 }))
             }
             Err(e) => {
-                // reservation_guard releases the allocation on this return.
-                self.cleanup_pmi_server(job_id).await;
+                // reservation_guard releases the allocation and PMI on this return.
                 let is_prolog_failure = matches!(e, executor::LaunchError::PrologFailed(_));
                 let err_msg = e.to_string();
                 error!(job_id, error = %err_msg, "failed to launch job");
@@ -3284,6 +3318,43 @@ mod tests {
         assert!(
             !std::path::Path::new(&socket_path).exists(),
             "pmi socket file must be removed"
+        );
+    }
+
+    // An armed guard that adopted a PMI server must tear it down on drop (the
+    // future-cancellation path); a disarmed guard must leave it for the monitor.
+    #[tokio::test]
+    async fn reservation_guard_tears_down_adopted_pmi_on_drop() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let socket_path = format!("/tmp/spur-pmi-guard-{}.sock", std::process::id());
+        std::fs::write(&socket_path, b"").expect("create fake socket");
+        svc.pmi_servers
+            .lock()
+            .await
+            .insert(88, Arc::new(crate::pmi::PmiServer::new(&socket_path, 2)));
+
+        {
+            let mut guard = LaunchReservationGuard::new(svc.allocation.clone(), 88);
+            guard.adopt_pmi(svc.pmi_servers.clone());
+            drop(guard);
+        }
+        // Drop's off-thread fallback (if try_lock lost) resolves synchronously
+        // here since the map is uncontended, but yield once to be safe.
+        tokio::task::yield_now().await;
+
+        assert!(
+            !svc.pmi_servers.lock().await.contains_key(&88),
+            "armed guard must remove the adopted PMI entry on drop"
+        );
+        assert!(
+            !std::path::Path::new(&socket_path).exists(),
+            "armed guard must remove the PMI socket on drop"
         );
     }
 
