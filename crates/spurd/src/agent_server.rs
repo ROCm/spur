@@ -974,6 +974,7 @@ impl SlurmAgent for AgentService {
 
         let launch_cfg = executor::JobLaunchConfig {
             job_id,
+            run_attempt,
             script: launch_script,
             work_dir: work_dir.clone(),
             environment: env,
@@ -2678,6 +2679,9 @@ mod tests {
     // before this agent would start accepting new LaunchJob calls.
     #[tokio::test]
     async fn reconcile_running_jobs_resumes_live_job_and_restores_allocation() {
+        // Serialize against other tests that scan the shared spool-root
+        // manifest tree — see MANIFEST_SCAN_TEST_LOCK.
+        let _guard = crate::MANIFEST_SCAN_TEST_LOCK.lock().await;
         let job_id = 987_654_326;
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
@@ -2748,6 +2752,7 @@ mod tests {
     // reported to the controller — it must not be left "Running" forever.
     #[tokio::test]
     async fn reconcile_running_jobs_reports_completion_for_job_finished_while_down() {
+        let _guard = crate::MANIFEST_SCAN_TEST_LOCK.lock().await;
         let job_id = 987_654_327;
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();

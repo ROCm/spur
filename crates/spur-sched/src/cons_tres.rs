@@ -194,8 +194,14 @@ impl NodeAllocation {
     }
 
     /// Re-adopt an already-committed allocation (e.g. after an agent restart),
-    /// pinning the exact ids rather than re-picking via first-fit.
+    /// pinning the exact ids rather than re-picking via first-fit. Idempotent:
+    /// a second call for the same job_id is a no-op, so a duplicate manifest
+    /// can't double-count memory (the cpu/gpu bitmaps are naturally
+    /// idempotent, but the memory counter isn't).
     pub fn restore_committed(&mut self, job_id: u32, alloc: AllocationResult) {
+        if self.owners.contains_key(&job_id) {
+            return;
+        }
         for &cpu in &alloc.cpu_ids {
             if let Some(a) = self.allocated_cpus.get_mut(cpu as usize) {
                 *a = true;

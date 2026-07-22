@@ -23,6 +23,14 @@ use spur_devices::DeviceRegistry;
 
 use reporter::NodeReporter;
 
+/// Tests that scan the shared spool-root manifest tree (`executor::
+/// scan_job_manifests`/`reconcile_running_jobs`) must serialize against each
+/// other, or one test can pick up a manifest a concurrently-running test left
+/// behind in the same shared directory.
+#[cfg(test)]
+pub(crate) static MANIFEST_SCAN_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 fn log_memlock_status(memlock: spur_core::config::MemlockLimit) {
     use spur_core::config::MemlockLimit;
     let configured_desc = match memlock {

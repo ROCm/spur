@@ -60,6 +60,9 @@ pub struct ContainerLaunchConfig {
 /// (JobSpec, scheduler allocation, agent config) into a single value.
 pub struct JobLaunchConfig {
     pub job_id: JobId,
+    /// Disambiguates the cgroup path across a same-node redispatch of the
+    /// same job_id, so displacing an old run can never SIGKILL the new one.
+    pub run_attempt: u32,
     pub script: String,
     pub work_dir: String,
     pub environment: HashMap<String, String>,
@@ -340,9 +343,14 @@ fn exit_status_path(spool_dir: &Path) -> PathBuf {
 /// Write a job's manifest. Best-effort: a failure here just means the job
 /// won't survive a spurd restart, same as not having this feature.
 pub fn write_job_manifest(spool_dir: &Path, manifest: &JobManifest) {
+    let path = manifest_path(spool_dir);
+    // The spool dir is world-writable (see create_job_spool_dir), so the job
+    // could have pre-created this path itself; unlink first so `fs::write`
+    // opens a fresh, root-owned inode rather than reusing one it doesn't own.
+    let _ = std::fs::remove_file(&path);
     match serde_json::to_vec(manifest) {
         Ok(bytes) => {
-            if let Err(e) = std::fs::write(manifest_path(spool_dir), bytes) {
+            if let Err(e) = std::fs::write(&path, bytes) {
                 warn!(job_id = manifest.job_id, error = %e, "failed to write job manifest");
             }
         }
@@ -460,7 +468,31 @@ pub fn scan_job_manifests() -> Vec<(PathBuf, JobManifest)> {
             }
         }
     }
-    found
+    dedup_manifests_by_job_id(found)
+}
+
+/// A job_id should only ever have one manifest (whichever `SPOOL_ROOT`/tmp
+/// base `create_job_spool_dir` used), but a stale leftover in the other base
+/// (e.g. from a run under a different privilege level) would otherwise make
+/// `reconcile_running_jobs` double-restore its allocation. Keep only the
+/// highest run_attempt per job_id.
+fn dedup_manifests_by_job_id(found: Vec<(PathBuf, JobManifest)>) -> Vec<(PathBuf, JobManifest)> {
+    let mut by_job: HashMap<JobId, (PathBuf, JobManifest)> = HashMap::new();
+    for (dir, manifest) in found {
+        match by_job.get(&manifest.job_id) {
+            Some((_, existing)) if existing.run_attempt >= manifest.run_attempt => {
+                warn!(
+                    job_id = manifest.job_id,
+                    dir = %dir.display(),
+                    "ignoring duplicate/stale job manifest"
+                );
+            }
+            _ => {
+                by_job.insert(manifest.job_id, (dir, manifest));
+            }
+        }
+    }
+    by_job.into_values().collect()
 }
 
 /// Decide whether a manifested job's process survived the restart.
@@ -525,6 +557,7 @@ async fn spawn_job_process(
 ) -> anyhow::Result<LaunchResult> {
     let JobLaunchConfig {
         job_id,
+        run_attempt,
         ref script,
         ref work_dir,
         ref environment,
@@ -544,7 +577,7 @@ async fn spawn_job_process(
     info!(job_id, work_dir, "launching job");
 
     // Set up cgroup for isolation
-    let cgroup_path = setup_cgroup(job_id, cpus, memory_mb, cpu_ids)?;
+    let cgroup_path = setup_cgroup(job_id, run_attempt, cpus, memory_mb, cpu_ids)?;
 
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
     // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
@@ -844,15 +877,23 @@ async fn spawn_job_process(
     })
 }
 
+/// The cgroup path for one job run. Keyed by job_id *and* run_attempt so a
+/// same-node redispatch never shares a cgroup with (and can't accidentally
+/// cgroup-wide-kill) a still-finishing prior run.
+fn cgroup_path_for(job_id: JobId, run_attempt: u32) -> PathBuf {
+    PathBuf::from(CGROUP_ROOT).join(format!("job_{}_{}", job_id, run_attempt))
+}
+
 /// Set up a cgroups v2 hierarchy for a job.
 fn setup_cgroup(
     job_id: JobId,
+    run_attempt: u32,
     cpus: u32,
     memory_mb: u64,
     cpu_ids: &[u32],
 ) -> anyhow::Result<Option<PathBuf>> {
     let cgroup_root = PathBuf::from(CGROUP_ROOT);
-    let cgroup_path = cgroup_root.join(format!("job_{}", job_id));
+    let cgroup_path = cgroup_path_for(job_id, run_attempt);
 
     // Delegate controllers to children: in cgroup-v2 a child only gets
     // memory.*/cpu.*/pids.* files if the parent lists them in subtree_control;
@@ -1212,23 +1253,26 @@ fn create_dir_as_user(dir: &Path, uid: u32, gid: u32) -> bool {
 
 /// Create a node-local spool directory for a job's scratch files. Prefers
 /// `SPOOL_ROOT`; falls back to a temp dir when it isn't writable (e.g. non-root
-/// dev runs). When spurd is root and the job targets a user, the dir is handed
-/// to that user so the job — which runs as the user — can traverse it.
-fn create_job_spool_dir(job_id: JobId, uid: u32, gid: u32) -> anyhow::Result<PathBuf> {
+/// dev runs).
+///
+/// The directory itself stays root-owned. When spurd is root and the job
+/// targets a user, it's made sticky + world-writable (like `/tmp`) instead of
+/// chowned: the job needs to create its own exit-status sentinel file here,
+/// but chowning the whole directory would let it delete/replace root-owned
+/// files in it too (e.g. the job manifest, trusted verbatim on the next
+/// spurd restart) — directory ownership, not file ownership, governs
+/// unlink/rename. The sticky bit lets it create files but not touch ones it
+/// doesn't own. Individual files the job needs to read/exec (the script) are
+/// still chowned to it directly by `write_job_scratch`.
+fn create_job_spool_dir(job_id: JobId, uid: u32, _gid: u32) -> anyhow::Result<PathBuf> {
     let mut last_err = None;
     for base in [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")] {
         let dir = base.join(format!("job{}", job_id));
         match std::fs::create_dir_all(&dir) {
             Ok(()) => {
                 if should_run_as_user(uid) {
-                    use nix::unistd::{Gid, Uid};
-                    // Path-based chown is safe here: the spool tree is
-                    // root-owned, not user-controlled, so no symlink TOCTOU.
-                    let _ = nix::unistd::chown(
-                        &dir,
-                        Some(Uid::from_raw(uid)),
-                        Some(Gid::from_raw(gid)),
-                    );
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777));
                 }
                 return Ok(dir);
             }
@@ -1326,7 +1370,13 @@ async fn launch_container_job(
     stderr_fd: std::fs::File,
 ) -> anyhow::Result<RunningJob> {
     let job_id = cfg.job_id;
-    let cgroup_path = setup_cgroup(job_id, cfg.cpus, cfg.memory_mb, &cfg.cpu_ids)?;
+    let cgroup_path = setup_cgroup(
+        job_id,
+        cfg.run_attempt,
+        cfg.cpus,
+        cfg.memory_mb,
+        &cfg.cpu_ids,
+    )?;
 
     // stdout_fd/stderr_fd are already opened as the submitting user by the
     // caller (open_job_output). The child dup2's these inherited fds directly,
@@ -1668,6 +1718,17 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_path_for_disambiguates_run_attempts_of_same_job() {
+        // A same-node redispatch must never land the new run in the old
+        // run's cgroup, or displacing the old run (cgroup-wide SIGKILL for a
+        // Resumed job) would kill the new run too.
+        let a = cgroup_path_for(42, 1);
+        let b = cgroup_path_for(42, 2);
+        assert_ne!(a, b);
+        assert_eq!(cgroup_path_for(42, 1), a, "must be deterministic");
+    }
+
+    #[test]
     fn cgroup_populated_reflects_events_file() {
         let dir = tempfile::tempdir().unwrap();
         // Missing file (no cgroup isolation) -> treated as done.
@@ -1782,6 +1843,9 @@ mod tests {
 
     #[test]
     fn manifest_round_trip_scan_and_reconcile_alive() {
+        // Serialize against other tests that scan the shared spool-root
+        // manifest tree — see MANIFEST_SCAN_TEST_LOCK.
+        let _guard = crate::MANIFEST_SCAN_TEST_LOCK.blocking_lock();
         let job_id: JobId = 987_654_324;
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
@@ -1842,6 +1906,7 @@ mod tests {
 
     #[test]
     fn reconcile_manifest_dead_reports_exit_status_from_sentinel() {
+        let _guard = crate::MANIFEST_SCAN_TEST_LOCK.blocking_lock();
         let job_id: JobId = 987_654_325;
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
