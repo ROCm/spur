@@ -87,6 +87,7 @@ pub struct LaunchResult {
     pub job: RunningJob,
     pub stdout_path: String,
     pub stderr_path: String,
+    pub spool_dir: PathBuf,
 }
 
 /// A running job process — either a tokio-managed child or a raw-forked container.
@@ -106,6 +107,19 @@ pub enum RunningJob {
     },
     /// Allocation registered without a batch process (standalone srun).
     AllocationOnly,
+    /// A job re-adopted from a manifest after spurd restarted; the new process
+    /// isn't spurd's child, so completion is detected via cgroup population
+    /// rather than waitpid. See `reconcile_running_jobs`.
+    Resumed {
+        pid: i32,
+        start_time: u64,
+        cgroup_path: Option<PathBuf>,
+        exit_status_path: PathBuf,
+        /// Container jobs can't reliably surface a real exit code across a
+        /// restart (the sentinel path isn't reachable from inside the
+        /// pivoted rootfs), so a resumed one reports an approximate -1/0.
+        forked: bool,
+    },
 }
 
 /// Split a finished process's wait status into (exit_code, signal).
@@ -160,6 +174,18 @@ impl RunningJob {
         match self {
             RunningJob::Managed { child, .. } => child.id(),
             RunningJob::Forked { pid, .. } => Some(*pid as u32),
+            RunningJob::Resumed { pid, .. } => Some(*pid as u32),
+            RunningJob::AllocationOnly => None,
+        }
+    }
+
+    /// Non-consuming peek at the cgroup path, for recording it in a job
+    /// manifest without disturbing `take_cgroup`'s completion-time handoff.
+    pub fn cgroup_path(&self) -> Option<&Path> {
+        match self {
+            RunningJob::Managed { cgroup_path, .. } => cgroup_path.as_deref(),
+            RunningJob::Forked { cgroup_path, .. } => cgroup_path.as_deref(),
+            RunningJob::Resumed { cgroup_path, .. } => cgroup_path.as_deref(),
             RunningJob::AllocationOnly => None,
         }
     }
@@ -200,6 +226,29 @@ impl RunningJob {
                     Err(e) => Err(e.into()),
                 }
             }
+            RunningJob::Resumed {
+                pid,
+                start_time,
+                cgroup_path,
+                exit_status_path,
+                forked,
+            } => {
+                let done = match cgroup_path {
+                    Some(cg) => !cgroup_populated(cg),
+                    None => !proc_alive(*pid, *start_time),
+                };
+                if !done {
+                    return Ok(None);
+                }
+                if *forked {
+                    return Ok(Some((-1, 0)));
+                }
+                Ok(Some(
+                    read_exit_status(exit_status_path)
+                        .map(decode_shell_exit)
+                        .unwrap_or((-1, 0)),
+                ))
+            }
             RunningJob::AllocationOnly => Ok(None),
         }
     }
@@ -228,6 +277,15 @@ impl RunningJob {
                 kill_process_tree(*pid, sig);
                 Ok(())
             }
+            RunningJob::Resumed {
+                pid, cgroup_path, ..
+            } => {
+                match cgroup_path {
+                    Some(cg) => cgroup_signal_all(cg, sig),
+                    None => kill_process_tree(*pid, sig),
+                }
+                Ok(())
+            }
             RunningJob::AllocationOnly => Ok(()),
         }
     }
@@ -236,8 +294,194 @@ impl RunningJob {
         match self {
             RunningJob::Managed { cgroup_path, .. } => cgroup_path.take(),
             RunningJob::Forked { cgroup_path, .. } => cgroup_path.take(),
+            RunningJob::Resumed { cgroup_path, .. } => cgroup_path.take(),
             RunningJob::AllocationOnly => None,
         }
+    }
+}
+
+const MANIFEST_SCHEMA_VERSION: u32 = 1;
+
+/// Everything spurd needs to re-adopt a job after restarting, written right
+/// after a successful spawn so a graceful restart doesn't lose track of (or
+/// double-book resources for) a job that's still running.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct JobManifest {
+    pub schema_version: u32,
+    pub job_id: JobId,
+    pub run_attempt: u32,
+    pub pid: i32,
+    pub start_time: u64,
+    pub cgroup_path: Option<PathBuf>,
+    pub forked: bool,
+    pub cpu_ids: Vec<u32>,
+    pub gpu_devices: Vec<u32>,
+    pub cpus: u32,
+    pub memory_mb: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub stdout_path: String,
+    pub stderr_path: String,
+    pub work_dir: String,
+    pub partition: String,
+    pub nodelist: String,
+    pub mpi: String,
+    pub rootfs_mode: crate::container::RootfsMode,
+}
+
+fn manifest_path(spool_dir: &Path) -> PathBuf {
+    spool_dir.join("manifest.json")
+}
+
+fn exit_status_path(spool_dir: &Path) -> PathBuf {
+    spool_dir.join("exit_status")
+}
+
+/// Write a job's manifest. Best-effort: a failure here just means the job
+/// won't survive a spurd restart, same as not having this feature.
+pub fn write_job_manifest(spool_dir: &Path, manifest: &JobManifest) {
+    match serde_json::to_vec(manifest) {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(manifest_path(spool_dir), bytes) {
+                warn!(job_id = manifest.job_id, error = %e, "failed to write job manifest");
+            }
+        }
+        Err(e) => warn!(job_id = manifest.job_id, error = %e, "failed to serialize job manifest"),
+    }
+}
+
+/// `/proc/<pid>/stat` field 22 (starttime) — disambiguates a live process
+/// from a different one that has since reused the same pid.
+pub fn proc_start_time(pid: i32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm (field 2) is parenthesized and may itself contain ')'; split on
+    // the last one so the fixed-width fields after it parse safely.
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+fn proc_alive(pid: i32, start_time: u64) -> bool {
+    proc_start_time(pid) == Some(start_time)
+}
+
+/// Cgroup-v2 `cgroup.events`; missing/unreadable means the cgroup is already
+/// gone, which only happens once everything in it has exited.
+fn cgroup_populated(cgroup_path: &Path) -> bool {
+    let Ok(events) = std::fs::read_to_string(cgroup_path.join("cgroup.events")) else {
+        return false;
+    };
+    events.lines().any(|line| line.trim() == "populated 1")
+}
+
+/// Signal every process in a cgroup, regardless of whether spurd is their
+/// parent. SIGKILL uses the atomic `cgroup.kill` (5.14+) when available;
+/// other signals, and older kernels, signal each `cgroup.procs` pid directly.
+fn cgroup_signal_all(cgroup_path: &Path, sig: Signal) {
+    if sig == Signal::SIGKILL && std::fs::write(cgroup_path.join("cgroup.kill"), "1").is_ok() {
+        return;
+    }
+    if let Ok(pids) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) {
+        for pid_str in pids.lines() {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                let _ = signal::kill(Pid::from_raw(pid), sig);
+            }
+        }
+    }
+}
+
+/// Decode a shell `$?` value the way `decode_wait_status` decodes a real wait
+/// status: 128+N means death by signal N.
+fn decode_shell_exit(raw: i32) -> (i32, i32) {
+    if (129..=192).contains(&raw) {
+        (0, raw - 128)
+    } else {
+        (raw, 0)
+    }
+}
+
+fn read_exit_status(path: &Path) -> Option<i32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Wrap a job script so its exit code survives even if spurd isn't around to
+/// `wait()` it — the subshell means an internal `exit` doesn't skip the
+/// trailing write. Re-exits with the same code so the wrapper process's own
+/// exit status (what the normal, non-restarted path already reports via
+/// `Child::try_wait`) is unchanged. Read back by `decode_shell_exit` on resume.
+fn wrap_with_exit_sentinel(script: &str, exit_status_path: &Path) -> String {
+    format!(
+        "(\n{}\n)\n_spur_rc=$?\necho $_spur_rc > {}\nexit $_spur_rc\n",
+        script,
+        exit_status_path.display()
+    )
+}
+
+/// Outcome of checking one manifest found on startup.
+pub enum ReconcileOutcome {
+    Alive {
+        job: RunningJob,
+        manifest: JobManifest,
+    },
+    /// The process is gone; the controller must not be left waiting forever
+    /// for a completion report that will never come.
+    Dead {
+        manifest: JobManifest,
+        exit_code: i32,
+        signal: i32,
+    },
+}
+
+/// Find every job manifest left behind by a previous spurd process.
+pub fn scan_job_manifests() -> Vec<(PathBuf, JobManifest)> {
+    let mut found = Vec::new();
+    for base in [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")] {
+        let Ok(entries) = std::fs::read_dir(&base) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let spool_dir = entry.path();
+            let Ok(bytes) = std::fs::read(manifest_path(&spool_dir)) else {
+                continue;
+            };
+            match serde_json::from_slice::<JobManifest>(&bytes) {
+                Ok(manifest) if manifest.schema_version == MANIFEST_SCHEMA_VERSION => {
+                    found.push((spool_dir, manifest));
+                }
+                Ok(manifest) => warn!(
+                    job_id = manifest.job_id,
+                    version = manifest.schema_version,
+                    "skipping job manifest with unknown schema version"
+                ),
+                Err(e) => warn!(dir = %spool_dir.display(), error = %e, "unreadable job manifest"),
+            }
+        }
+    }
+    found
+}
+
+/// Decide whether a manifested job's process survived the restart.
+pub fn reconcile_manifest(spool_dir: &Path, manifest: JobManifest) -> ReconcileOutcome {
+    if proc_alive(manifest.pid, manifest.start_time) {
+        let job = RunningJob::Resumed {
+            pid: manifest.pid,
+            start_time: manifest.start_time,
+            cgroup_path: manifest.cgroup_path.clone(),
+            exit_status_path: exit_status_path(spool_dir),
+            forked: manifest.forked,
+        };
+        return ReconcileOutcome::Alive { job, manifest };
+    }
+    let (exit_code, signal) = read_exit_status(&exit_status_path(spool_dir))
+        .map(decode_shell_exit)
+        .unwrap_or((-1, 0));
+    ReconcileOutcome::Dead {
+        manifest,
+        exit_code,
+        signal,
     }
 }
 
@@ -332,7 +576,9 @@ async fn spawn_job_process(
     // SPOOL_ROOT), so root-side writes survive NFS root_squash work_dirs.
     let spool_dir = create_job_spool_dir(job_id, uid, gid).context("create job spool dir")?;
     let script_path = spool_dir.join("spur_job.sh");
-    write_job_scratch(&script_path, script, uid, gid).context("failed to write job script")?;
+    let wrapped_script = wrap_with_exit_sentinel(script, &exit_status_path(&spool_dir));
+    write_job_scratch(&script_path, &wrapped_script, uid, gid)
+        .context("failed to write job script")?;
 
     // Resolve stdout/stderr paths
     let stdout_resolved = resolve_output_path(stdout_path, job_id, work_dir);
@@ -408,6 +654,7 @@ async fn spawn_job_process(
             job,
             stdout_path: stdout_resolved,
             stderr_path: stderr_resolved,
+            spool_dir,
         });
     }
 
@@ -593,6 +840,7 @@ async fn spawn_job_process(
         job: RunningJob::Managed { child, cgroup_path },
         stdout_path: stdout_resolved,
         stderr_path: stderr_resolved,
+        spool_dir,
     })
 }
 
@@ -1349,6 +1597,294 @@ fn wrap_with_burst_buffer(script: &str, bb: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_shell_exit_splits_normal_and_signal() {
+        assert_eq!(decode_shell_exit(0), (0, 0));
+        assert_eq!(decode_shell_exit(5), (5, 0));
+        assert_eq!(decode_shell_exit(137), (0, 9)); // 128 + SIGKILL
+        assert_eq!(decode_shell_exit(143), (0, 15)); // 128 + SIGTERM
+    }
+
+    #[test]
+    fn proc_start_time_matches_a_live_process_and_disappears_once_reaped() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("2")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let start_time = proc_start_time(pid).expect("live process must have a start time");
+        assert!(proc_alive(pid, start_time));
+        assert!(!proc_alive(pid, start_time.wrapping_add(1)));
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(proc_start_time(pid), None);
+        assert!(!proc_alive(pid, start_time));
+    }
+
+    #[test]
+    fn wrap_with_exit_sentinel_captures_normal_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let exit_path = dir.path().join("exit_status");
+        let script = wrap_with_exit_sentinel("exit 5", &exit_path);
+        let script_path = dir.path().join("script.sh");
+        std::fs::write(&script_path, script).unwrap();
+
+        let status = std::process::Command::new("bash")
+            .arg(&script_path)
+            .status()
+            .unwrap();
+        // The wrapper's own exit status must match the original script's, so
+        // the normal (non-restarted) Managed path's Child::try_wait is
+        // unaffected by wrapping.
+        assert_eq!(status.code(), Some(5));
+        assert_eq!(std::fs::read_to_string(&exit_path).unwrap().trim(), "5");
+    }
+
+    #[test]
+    fn wrap_with_exit_sentinel_captures_signal_death_via_subshell() {
+        // An `exit` inside a brace group would exit the whole outer script,
+        // skipping the sentinel write; the subshell must contain it instead.
+        // $BASHPID (not $$, which always names the top-level shell even
+        // inside a subshell) targets the subshell process itself.
+        let dir = tempfile::tempdir().unwrap();
+        let exit_path = dir.path().join("exit_status");
+        let script = wrap_with_exit_sentinel("kill -TERM $BASHPID; sleep 5", &exit_path);
+        let script_path = dir.path().join("script.sh");
+        std::fs::write(&script_path, script).unwrap();
+
+        let status = std::process::Command::new("bash")
+            .arg(&script_path)
+            .status()
+            .unwrap();
+        // Only the inner subshell was signaled, not the wrapper process
+        // itself — matching how bash already reports an unwrapped script
+        // whose last command dies by signal: a normal exit with code 128+N,
+        // not a raw process signal (that only happens if something signals
+        // the whole process group, e.g. spurd's own kill_signal).
+        assert_eq!(status.code(), Some(143));
+        assert_eq!(std::fs::read_to_string(&exit_path).unwrap().trim(), "143");
+    }
+
+    #[test]
+    fn cgroup_populated_reflects_events_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Missing file (no cgroup isolation) -> treated as done.
+        assert!(!cgroup_populated(dir.path()));
+        std::fs::write(dir.path().join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        assert!(cgroup_populated(dir.path()));
+        std::fs::write(dir.path().join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+        assert!(!cgroup_populated(dir.path()));
+    }
+
+    #[test]
+    fn cgroup_signal_all_uses_procs_list_for_non_kill_signals() {
+        // Non-SIGKILL signals (graceful_cancel's initial SIGTERM,
+        // suspend/resume) always go through the per-pid cgroup.procs path —
+        // only SIGKILL ever attempts the atomic cgroup.kill fast path.
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        std::fs::write(dir.path().join("cgroup.procs"), child.id().to_string()).unwrap();
+
+        cgroup_signal_all(dir.path(), Signal::SIGTERM);
+
+        use std::os::unix::process::ExitStatusExt;
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(15));
+    }
+
+    #[test]
+    fn cgroup_signal_all_falls_back_when_cgroup_kill_unwritable() {
+        // A plain tempdir would let `cgroup.kill` be created as an ordinary
+        // (inert) file, masking the fallback. Making the dir read-only
+        // forces the write to fail, like a kernel without cgroup.kill (<5.14)
+        // would, so this only exercises the intended fallback as non-root.
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        std::fs::write(dir.path().join("cgroup.procs"), child.id().to_string()).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        cgroup_signal_all(dir.path(), Signal::SIGKILL);
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(9));
+    }
+
+    #[test]
+    fn resumed_try_wait_uses_cgroup_population_when_available() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        let exit_path = dir.path().join("exit_status");
+        let mut job = RunningJob::Resumed {
+            pid: 1,
+            start_time: 0,
+            cgroup_path: Some(dir.path().to_path_buf()),
+            exit_status_path: exit_path.clone(),
+            forked: false,
+        };
+        assert_eq!(job.try_wait().unwrap(), None);
+
+        std::fs::write(dir.path().join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+        std::fs::write(&exit_path, "3\n").unwrap();
+        assert_eq!(job.try_wait().unwrap(), Some((3, 0)));
+    }
+
+    #[test]
+    fn resumed_try_wait_falls_back_to_proc_liveness_without_cgroup() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("2")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let start_time = proc_start_time(pid).unwrap();
+        let mut job = RunningJob::Resumed {
+            pid,
+            start_time,
+            cgroup_path: None,
+            exit_status_path: PathBuf::from("/nonexistent/exit_status"),
+            forked: false,
+        };
+        assert_eq!(job.try_wait().unwrap(), None);
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // No sentinel file for this fallback path -> best-effort -1.
+        assert_eq!(job.try_wait().unwrap(), Some((-1, 0)));
+    }
+
+    #[test]
+    fn resumed_try_wait_forked_reports_approximate_exit_code() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as i32;
+        child.wait().unwrap();
+        let mut job = RunningJob::Resumed {
+            pid,
+            start_time: 0,
+            cgroup_path: None,
+            exit_status_path: PathBuf::from("/nonexistent/exit_status"),
+            forked: true,
+        };
+        assert_eq!(job.try_wait().unwrap(), Some((-1, 0)));
+    }
+
+    #[test]
+    fn manifest_round_trip_scan_and_reconcile_alive() {
+        let job_id: JobId = 987_654_324;
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let spool_dir = create_job_spool_dir(job_id, uid, gid).unwrap();
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("2")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let start_time = proc_start_time(pid).unwrap();
+
+        write_job_manifest(
+            &spool_dir,
+            &JobManifest {
+                schema_version: MANIFEST_SCHEMA_VERSION,
+                job_id,
+                run_attempt: 1,
+                pid,
+                start_time,
+                cgroup_path: None,
+                forked: false,
+                cpu_ids: vec![0, 1],
+                gpu_devices: vec![],
+                cpus: 2,
+                memory_mb: 1024,
+                uid,
+                gid,
+                stdout_path: "/tmp/out".into(),
+                stderr_path: "/tmp/err".into(),
+                work_dir: "/tmp".into(),
+                partition: "default".into(),
+                nodelist: "n1".into(),
+                mpi: String::new(),
+                rootfs_mode: crate::container::RootfsMode::Extracted,
+            },
+        );
+
+        let (found_dir, found_manifest) = scan_job_manifests()
+            .into_iter()
+            .find(|(_, m)| m.job_id == job_id)
+            .expect("manifest not found by scan");
+        assert_eq!(found_dir, spool_dir);
+        assert_eq!(found_manifest.cpu_ids, vec![0, 1]);
+
+        match reconcile_manifest(&found_dir, found_manifest) {
+            ReconcileOutcome::Alive { job, manifest } => {
+                assert_eq!(manifest.job_id, job_id);
+                assert!(matches!(job, RunningJob::Resumed { pid: p, .. } if p == pid));
+            }
+            ReconcileOutcome::Dead { .. } => panic!("expected Alive outcome for a live process"),
+        }
+
+        child.kill().unwrap();
+        let _ = child.wait();
+        cleanup_job_spool(job_id);
+    }
+
+    #[test]
+    fn reconcile_manifest_dead_reports_exit_status_from_sentinel() {
+        let job_id: JobId = 987_654_325;
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let spool_dir = create_job_spool_dir(job_id, uid, gid).unwrap();
+
+        // Spawn and fully reap so the pid is verifiably gone before we
+        // reconcile, mirroring a job that finished while spurd was down.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as i32;
+        child.wait().unwrap();
+        std::fs::write(exit_status_path(&spool_dir), "7\n").unwrap();
+
+        let manifest = JobManifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            job_id,
+            run_attempt: 1,
+            pid,
+            start_time: 0,
+            cgroup_path: None,
+            forked: false,
+            cpu_ids: vec![],
+            gpu_devices: vec![],
+            cpus: 1,
+            memory_mb: 0,
+            uid,
+            gid,
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            work_dir: "/tmp".into(),
+            partition: "default".into(),
+            nodelist: "n1".into(),
+            mpi: String::new(),
+            rootfs_mode: crate::container::RootfsMode::Extracted,
+        };
+
+        match reconcile_manifest(&spool_dir, manifest) {
+            ReconcileOutcome::Dead {
+                exit_code, signal, ..
+            } => assert_eq!((exit_code, signal), (7, 0)),
+            ReconcileOutcome::Alive { .. } => panic!("gone process must not be Alive"),
+        }
+        cleanup_job_spool(job_id);
+    }
 
     #[test]
     fn decode_wait_status_splits_exit_and_signal() {

@@ -65,6 +65,18 @@ struct CompletedJob {
     nodelist: String,
 }
 
+/// Cloneable handle exposing only whether any jobs are tracked, for use after
+/// `AgentService` itself has moved into the gRPC server (see main's SIGTERM
+/// handler).
+#[derive(Clone)]
+pub struct RunningJobsHandle(Arc<Mutex<HashMap<u32, TrackedJob>>>);
+
+impl RunningJobsHandle {
+    pub async fn is_empty(&self) -> bool {
+        self.0.lock().await.is_empty()
+    }
+}
+
 pub struct AgentService {
     pub reporter: Arc<NodeReporter>,
     running: Arc<Mutex<HashMap<u32, TrackedJob>>>,
@@ -174,6 +186,82 @@ impl AgentService {
     /// Handle to the RPC-driven k0s component owner. spurd `main()` spawns its supervise loop.
     pub fn k0s(&self) -> Arc<crate::cluster::K0sAgent> {
         self.k0s.clone()
+    }
+
+    pub fn running_jobs_handle(&self) -> RunningJobsHandle {
+        RunningJobsHandle(self.running.clone())
+    }
+
+    /// Re-adopt jobs whose process survived a spurd restart, restoring their
+    /// resource allocation before this agent starts accepting new launches.
+    /// Must run before the gRPC server starts serving.
+    pub async fn reconcile_running_jobs(&self) {
+        for (spool_dir, manifest) in executor::scan_job_manifests() {
+            let job_id = manifest.job_id;
+            match executor::reconcile_manifest(&spool_dir, manifest) {
+                executor::ReconcileOutcome::Alive { job, manifest } => {
+                    let alloc = AllocationResult {
+                        cpu_ids: manifest.cpu_ids,
+                        gpu_ids: manifest.gpu_devices.clone(),
+                        memory_mb: manifest.memory_mb,
+                    };
+                    self.allocation
+                        .lock()
+                        .await
+                        .restore_committed(job_id, alloc);
+                    self.running.lock().await.insert(
+                        job_id,
+                        TrackedJob {
+                            job,
+                            rootfs_mode: manifest.rootfs_mode,
+                            stdout_path: manifest.stdout_path,
+                            stderr_path: manifest.stderr_path,
+                            has_pid_namespace: nix::unistd::geteuid().is_root(),
+                            work_dir: manifest.work_dir,
+                            uid: manifest.uid,
+                            gid: manifest.gid,
+                            partition: manifest.partition,
+                            gpu_devices: manifest.gpu_devices,
+                            cpus: manifest.cpus,
+                            memory_mb: manifest.memory_mb,
+                            nodelist: manifest.nodelist,
+                            mpi: manifest.mpi,
+                            run_attempt: manifest.run_attempt,
+                        },
+                    );
+                    info!(job_id, "re-adopted job that survived a spurd restart");
+                }
+                executor::ReconcileOutcome::Dead {
+                    manifest,
+                    exit_code,
+                    signal,
+                } => {
+                    warn!(
+                        job_id,
+                        exit_code, signal, "job finished while spurd was down"
+                    );
+                    crate::container::cleanup_rootfs(job_id, &manifest.rootfs_mode);
+                    if let Some(ref cgroup) = manifest.cgroup_path {
+                        executor::cleanup_cgroup(cgroup);
+                    }
+                    executor::cleanup_job_spool(job_id);
+                    let controller = self.reporter.controller_addr.clone();
+                    let node_name = self.reporter.hostname.clone();
+                    tokio::spawn(async move {
+                        report_completion(
+                            &controller,
+                            job_id,
+                            exit_code,
+                            signal,
+                            manifest.run_attempt,
+                            &node_name,
+                            None,
+                        )
+                        .await;
+                    });
+                }
+            }
+        }
     }
 
     /// Spawn a background task to monitor running jobs and report completions.
@@ -913,6 +1001,37 @@ impl SlurmAgent for AgentService {
 
         match executor::launch_job(&launch_cfg, (*self.spank).as_ref()).await {
             Ok(result) => {
+                // Written before this job is tracked anywhere else, so a spurd
+                // restart can re-adopt it (see reconcile_running_jobs) instead
+                // of losing track of a job whose process survives the restart.
+                if let Some(pid) = result.job.pid() {
+                    executor::write_job_manifest(
+                        &result.spool_dir,
+                        &executor::JobManifest {
+                            schema_version: 1,
+                            job_id,
+                            run_attempt,
+                            pid: pid as i32,
+                            start_time: executor::proc_start_time(pid as i32).unwrap_or(0),
+                            cgroup_path: result.job.cgroup_path().map(|p| p.to_path_buf()),
+                            forked: matches!(result.job, executor::RunningJob::Forked { .. }),
+                            cpu_ids: launch_cfg.cpu_ids.clone(),
+                            gpu_devices: launch_cfg.gpu_devices.clone(),
+                            cpus: launch_cfg.cpus,
+                            memory_mb: launch_cfg.memory_mb,
+                            uid: launch_cfg.uid,
+                            gid: launch_cfg.gid,
+                            stdout_path: result.stdout_path.clone(),
+                            stderr_path: result.stderr_path.clone(),
+                            work_dir: launch_cfg.work_dir.clone(),
+                            partition: launch_cfg.partition.clone(),
+                            nodelist: launch_cfg.nodelist.clone(),
+                            mpi: spec.mpi.clone(),
+                            rootfs_mode: rootfs_mode.clone(),
+                        },
+                    );
+                }
+
                 let mut jobs = self.running.lock().await;
                 // Commit the reservation: the job now has a tracked process, so
                 // it is no longer exempt from reconcile. Take the running lock
@@ -2552,6 +2671,136 @@ mod tests {
             1,
             "exactly the orphan's GPU must be reclaimed; the tracked job's is spared"
         );
+    }
+
+    // Simulates a spurd restart: a job manifest on disk for a still-running
+    // process must be re-adopted into `running` with its allocation restored,
+    // before this agent would start accepting new LaunchJob calls.
+    #[tokio::test]
+    async fn reconcile_running_jobs_resumes_live_job_and_restores_allocation() {
+        let job_id = 987_654_326;
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let spool_dir = std::env::temp_dir()
+            .join("spur")
+            .join(format!("job{job_id}"));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("2")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let start_time = executor::proc_start_time(pid).unwrap();
+
+        executor::write_job_manifest(
+            &spool_dir,
+            &executor::JobManifest {
+                schema_version: 1,
+                job_id,
+                run_attempt: 3,
+                pid,
+                start_time,
+                cgroup_path: None,
+                forked: false,
+                cpu_ids: vec![0],
+                gpu_devices: vec![],
+                cpus: 1,
+                memory_mb: 512,
+                uid,
+                gid,
+                stdout_path: "/dev/null".into(),
+                stderr_path: "/dev/null".into(),
+                work_dir: "/tmp".into(),
+                partition: "default".into(),
+                nodelist: "test-node".into(),
+                mpi: String::new(),
+                rootfs_mode: crate::container::RootfsMode::Extracted,
+            },
+        );
+
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let free_cpus_before = svc.allocation.lock().await.free_cpus();
+
+        svc.reconcile_running_jobs().await;
+
+        assert!(
+            svc.running.lock().await.contains_key(&job_id),
+            "resumed job must be tracked in `running`"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            free_cpus_before - 1,
+            "resumed job's cpu must be reflected in NodeAllocation before new launches are admitted"
+        );
+
+        child.kill().unwrap();
+        let _ = child.wait();
+        executor::cleanup_job_spool(job_id);
+    }
+
+    // A job that finished entirely while spurd was restarting must still be
+    // reported to the controller — it must not be left "Running" forever.
+    #[tokio::test]
+    async fn reconcile_running_jobs_reports_completion_for_job_finished_while_down() {
+        let job_id = 987_654_327;
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let spool_dir = std::env::temp_dir()
+            .join("spur")
+            .join(format!("job{job_id}"));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as i32;
+        child.wait().unwrap();
+        std::fs::write(spool_dir.join("exit_status"), "5\n").unwrap();
+
+        executor::write_job_manifest(
+            &spool_dir,
+            &executor::JobManifest {
+                schema_version: 1,
+                job_id,
+                run_attempt: 1,
+                pid,
+                start_time: 0,
+                cgroup_path: None,
+                forked: false,
+                cpu_ids: vec![],
+                gpu_devices: vec![],
+                cpus: 1,
+                memory_mb: 0,
+                uid,
+                gid,
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                work_dir: "/tmp".into(),
+                partition: "default".into(),
+                nodelist: "test-node".into(),
+                mpi: String::new(),
+                rootfs_mode: crate::container::RootfsMode::Extracted,
+            },
+        );
+
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        svc.reconcile_running_jobs().await;
+
+        assert!(
+            !svc.running.lock().await.contains_key(&job_id),
+            "a job that already finished must not be tracked as running"
+        );
+        // reconcile_running_jobs cleans up the spool dir for a dead job.
+        assert!(!spool_dir.exists());
     }
 
     #[tokio::test]

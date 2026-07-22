@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 
 use cluster::ClusterManager;
 use rpc_stats::RpcStatsCollector;
@@ -250,6 +250,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Start node health checker (only on leader).
     let hb_timeout = config.controller.heartbeat_timeout_secs.unwrap_or(90);
+    if hb_timeout < 30 {
+        warn!(
+            hb_timeout,
+            "heartbeat_timeout_secs is below 30s; a graceful spurd restart slower than this \
+             will fail its running jobs — this is now the only safety net for a restart, \
+             not just crash detection"
+        );
+    }
     let health_cluster = cluster.clone();
     let health_raft = raft_handle.clone();
     tokio::spawn(async move {

@@ -193,6 +193,23 @@ impl NodeAllocation {
         self.launching.remove(&job_id);
     }
 
+    /// Re-adopt an already-committed allocation (e.g. after an agent restart),
+    /// pinning the exact ids rather than re-picking via first-fit.
+    pub fn restore_committed(&mut self, job_id: u32, alloc: AllocationResult) {
+        for &cpu in &alloc.cpu_ids {
+            if let Some(a) = self.allocated_cpus.get_mut(cpu as usize) {
+                *a = true;
+            }
+        }
+        self.allocated_memory_mb += alloc.memory_mb;
+        for &device_id in &alloc.gpu_ids {
+            if let Some(idx) = self.gpus.iter().position(|g| g.device_id == device_id) {
+                self.gpu_allocated[idx] = true;
+            }
+        }
+        self.owners.insert(job_id, alloc);
+    }
+
     /// Release a job's allocation by id. Idempotent: releasing an unknown or
     /// already-released job is a no-op returning false.
     pub fn release_job(&mut self, job_id: u32) -> bool {
@@ -461,6 +478,37 @@ mod tests {
         assert!(node.release_job(1));
         assert!(node.release_job(3));
         assert_eq!(node.free_gpus(None), 4);
+    }
+
+    #[test]
+    fn test_restore_committed_pins_exact_ids_not_first_fit() {
+        let mut node = make_node_with_ids(4, 8_000, vec![0, 1], "mi300x");
+        // Simulate a spurd restart: nothing allocated yet in this fresh
+        // NodeAllocation, but a manifested job actually holds cpu 3 and gpu 1
+        // (not the first-fit picks allocate_for_job would make).
+        let alloc = AllocationResult {
+            cpu_ids: vec![3],
+            gpu_ids: vec![1],
+            memory_mb: 2_000,
+        };
+        node.restore_committed(42, alloc.clone());
+
+        assert_eq!(node.free_cpus(), 3);
+        assert_eq!(node.free_gpus(None), 1);
+        assert_eq!(node.free_memory_mb(), 6_000);
+        assert_eq!(node.allocated_gpu_ids(), vec![1]);
+
+        // A subsequent allocation must not double-book cpu 3 / gpu 1.
+        let next = node.allocate_for_job(43, 1, 0, &[0]).unwrap();
+        assert_eq!(next.cpu_ids, vec![0]);
+        assert!(!next.cpu_ids.contains(&3));
+
+        // Committed (not launching), so reconcile treats it like any other
+        // live job rather than sparing it as mid-launch.
+        let live: HashSet<u32> = [42, 43].into_iter().collect();
+        assert!(node.reconcile(&live).is_empty());
+        assert!(node.release_job(42));
+        assert_eq!(node.free_memory_mb(), 8_000);
     }
 
     #[test]

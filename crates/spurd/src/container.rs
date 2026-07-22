@@ -216,7 +216,7 @@ pub fn resolve_image(
 }
 
 /// How the rootfs was set up — determines cleanup strategy.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RootfsMode {
     /// Extracted via unsquashfs — cleanup by removing the directory.
     Extracted,
