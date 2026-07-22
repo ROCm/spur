@@ -57,6 +57,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let users_resp = client
         .list_users(ListUsersRequest {
             account: args.account.clone().unwrap_or_default(),
+            user: String::new(),
         })
         .await
         .context("failed to list users")?;

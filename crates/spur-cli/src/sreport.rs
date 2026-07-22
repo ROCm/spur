@@ -119,6 +119,7 @@ async fn report_account_utilization_by_user(
     let users_resp = client
         .list_users(ListUsersRequest {
             account: String::new(),
+            user: String::new(),
         })
         .await
         .context("failed to list users")?;
@@ -221,6 +222,7 @@ async fn report_user_utilization_by_account(
     let users_resp = client
         .list_users(ListUsersRequest {
             account: String::new(),
+            user: String::new(),
         })
         .await
         .context("failed to list users")?;
@@ -355,6 +357,7 @@ async fn report_job_sizes_by_user(
     let users_resp = client
         .list_users(ListUsersRequest {
             account: String::new(),
+            user: String::new(),
         })
         .await
         .context("failed to list users")?;

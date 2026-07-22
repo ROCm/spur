@@ -160,6 +160,10 @@ message JobSpec {
   map<string, string> container_env = 76; // Extra env vars for container
   string container_entrypoint = 77; // Override entrypoint
   bool container_remap_root = 78;  // Remap user to root inside container
+
+  // Standalone srun: reserve an allocation without launching a batch script;
+  // the user command runs as a job step after nodes are registered.
+  bool srun_job = 82;
 }
 
 message JobInfo {
@@ -204,6 +208,12 @@ message JobInfo {
   string reservation = 52;
 
   string comment = 53;
+
+  // True when standalone srun uses native step dispatch (not K8s batch fallback).
+  // Requires a matching spur CLI: clients that ignore this field against a
+  // step-dispatch controller will poll for batch completion while agents hold
+  // allocation-only state.
+  bool srun_step_dispatch = 54;
 }
 
 message NodeInfo {
@@ -268,6 +278,8 @@ service SlurmController {
   rpc GetJobs(GetJobsRequest) returns (GetJobsResponse);
   rpc GetJob(GetJobRequest) returns (JobInfo);
   rpc CancelJob(CancelJobRequest) returns (google.protobuf.Empty);
+  // Finish a standalone srun allocation after its step completes.
+  rpc CompleteJob(CompleteJobRequest) returns (google.protobuf.Empty);
   rpc SuspendJob(SuspendJobRequest) returns (google.protobuf.Empty);
   rpc ResumeJob(ResumeJobRequest) returns (google.protobuf.Empty);
   rpc UpdateJob(UpdateJobRequest) returns (google.protobuf.Empty);
@@ -324,9 +336,8 @@ service SlurmController {
   // Exec a command inside a running job's container (proxies to correct agent)
   rpc ExecInJob(ExecInJobRequest) returns (ExecInJobResponse);
 
-  // Run a step on one of an allocation's nodes — used by `srun` inside an
-  // `salloc` interactive shell. The controller picks an allocated node and
-  // proxies to its agent's RunCommand RPC (#146).
+  // Run a step across an allocation's nodes — used by srun inside sbatch/salloc
+  // and standalone srun. Fans out tasks via agent RunCommand RPCs.
   rpc RunStep(RunStepRequest) returns (RunStepResponse);
 
   // -- Native cluster (k0s) lifecycle: SPUR owns the k0s cluster --
@@ -344,8 +355,10 @@ service SlurmAgent {
   rpc SuspendJob(AgentSuspendJobRequest) returns (google.protobuf.Empty);
   rpc GetNodeResources(google.protobuf.Empty) returns (NodeResourcesResponse);
   rpc ExecInJob(ExecInJobRequest) returns (ExecInJobResponse);
-  // Run a one-shot command on this node (for srun-in-salloc step dispatch, #146)
+  // Run a one-shot command on this node (for srun step dispatch).
   rpc RunCommand(RunCommandRequest) returns (RunCommandResponse);
+  // Record an allocation on this node without launching a batch process.
+  rpc RegisterJobAllocation(RegisterJobAllocationRequest) returns (RegisterJobAllocationResponse);
   rpc StreamJobOutput(StreamJobOutputRequest) returns (stream StreamJobOutputChunk);
   // Interactive attach: bidirectional streaming for stdin/stdout forwarding
   rpc AttachJob(stream AttachJobInput) returns (stream AttachJobOutput);
@@ -430,6 +443,12 @@ message GetJobRequest {
 message CancelJobRequest {
   uint32 job_id = 1;
   int32 signal = 2;  // 0 = cancel, else signal number
+  string user = 3;   // For authorization
+}
+
+message CompleteJobRequest {
+  uint32 job_id = 1;
+  int32 exit_code = 2;
   string user = 3;   // For authorization
 }
 
@@ -673,8 +692,8 @@ message ExecInJobResponse {
 }
 
 // Controller-side request: run a step inside an allocation. The controller
-// selects a node from the allocation's allocated_nodes and forwards to that
-// agent's RunCommand RPC. Used for srun-in-salloc (#146).
+// fans out tasks across the allocation's nodes via each agent's RunCommand
+// RPC. Used by srun inside sbatch/salloc and standalone srun.
 message RunStepRequest {
   uint32 job_id = 1;
   repeated string command = 2;
@@ -683,13 +702,14 @@ message RunStepRequest {
   string work_dir = 5;
   map<string, string> environment = 6;
   uint32 step_id = 7;  // Step id from CreateJobStep, for recording completion
+  bool label = 8;      // Prefix output lines with [rank] (srun -l)
 }
 
 message RunStepResponse {
-  int32 exit_code = 1;
-  string stdout = 2;
-  string stderr = 3;
-  string node = 4;  // Hostname of the allocated node the command ran on
+  int32 exit_code = 1;   // Max exit code across all tasks in the step
+  string stdout = 2;     // Aggregated stdout from all tasks/nodes
+  string stderr = 3;     // Aggregated stderr from all tasks/nodes
+  string node = 4;       // Comma-separated hostnames that ran tasks
 }
 
 // -- Native cluster (k0s) lifecycle messages --
@@ -812,7 +832,28 @@ message RunCommandRequest {
   string work_dir = 4;
   map<string, string> environment = 5;
   uint32 job_id = 6;
+  uint32 num_tasks = 7;        // Tasks to launch on this node (default 1)
+  uint32 task_offset = 8;      // Global rank of the first local task
+  uint32 step_id = 9;
+  uint32 step_num_tasks = 10;  // Total tasks in the step (SLURM_NTASKS)
+  bool label = 11;             // Prefix output with [rank] inside wrapper
 }
+
+// Register a srun-only allocation on an agent without starting a batch process.
+message RegisterJobAllocationRequest {
+  uint32 job_id = 1;
+  string partition = 2;
+  string nodelist = 3;
+  uint32 uid = 4;
+  uint32 gid = 5;
+  uint32 cpus = 6;
+  uint64 memory_mb = 7;
+  repeated string gpu_devices = 8;
+  ResourceAllocations allocated = 9;
+  string mpi = 10;
+}
+
+message RegisterJobAllocationResponse {}
 
 message RunCommandResponse {
   int32 exit_code = 1;
@@ -939,6 +980,7 @@ message CreateAccountRequest {
   string parent_account = 4;
   double fairshare_weight = 5;
   uint32 max_running_jobs = 6;
+  string grp_tres = 7;
 }
 
 message DeleteAccountRequest {
@@ -958,6 +1000,7 @@ message AccountInfo {
   string parent_account = 4;
   double fairshare_weight = 5;
   uint32 max_running_jobs = 6;
+  string grp_tres = 7;
 }
 
 message AddUserRequest {
@@ -986,6 +1029,7 @@ message RemoveUserRequest {
 
 message ListUsersRequest {
   string account = 1;
+  string user = 2;
 }
 
 message ListUsersResponse {
@@ -1083,6 +1127,7 @@ message CreateReservationRequest {
   repeated string accounts = 5;
   repeated string users = 6;
   repeated string flags = 7;
+  string user = 8;            // requesting user; recorded as reservation owner
 }
 
 message UpdateReservationRequest {
@@ -1094,10 +1139,12 @@ message UpdateReservationRequest {
   repeated string remove_users = 6;
   repeated string add_accounts = 7;
   repeated string remove_accounts = 8;
+  string user = 9;              // requesting user; must be the owner (root and trusted internal callers always allowed; legacy reservations with no recorded owner are mutable by anyone)
 }
 
 message DeleteReservationRequest {
   string name = 1;
+  string user = 2;             // requesting user; must be the owner (root and trusted internal callers always allowed; legacy reservations with no recorded owner are mutable by anyone)
 }
 
 message ListReservationsRequest { }
@@ -1115,6 +1162,7 @@ message ReservationInfo {
   string users = 6;
   string flags = 7;
   string state = 8;
+  string owner = 9;
 }
 
 // ============================================================

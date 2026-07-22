@@ -89,18 +89,20 @@ impl PreemptMode {
     }
 }
 
-/// Partitions a job requests, resolved by name. `spec` is a comma-separated
-/// OR list, matching the backfill scheduler's node-matching convention.
+/// Non-empty names from a comma-separated partition OR-list.
+pub fn requested_partition_names(spec: Option<&str>) -> impl Iterator<Item = &str> {
+    spec.into_iter()
+        .flat_map(|spec| spec.split(','))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
+/// Partitions a job requests, resolved by name.
 pub fn matched_partitions<'a>(
     spec: Option<&str>,
     partitions: &'a [Partition],
 ) -> Vec<&'a Partition> {
-    let Some(spec) = spec.filter(|s| !s.is_empty()) else {
-        return Vec::new();
-    };
-    spec.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+    requested_partition_names(spec)
         .filter_map(|req| partitions.iter().find(|p| p.name == req))
         .collect()
 }
@@ -167,6 +169,15 @@ mod tests {
         ];
         assert_eq!(max_priority_tier(Some("low,high"), &parts), 9);
         assert_eq!(max_priority_tier(Some("high, low"), &parts), 9);
+    }
+
+    #[test]
+    fn requested_partition_names_trims_and_ignores_empty_entries() {
+        assert_eq!(
+            requested_partition_names(Some(" gpu, ,cpu,, ")).collect::<Vec<_>>(),
+            vec!["gpu", "cpu"]
+        );
+        assert!(requested_partition_names(None).next().is_none());
     }
 
     #[test]

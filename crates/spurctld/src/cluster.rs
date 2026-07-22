@@ -21,7 +21,7 @@ use spur_core::job::{
     PendingReason, TransitionOutcome,
 };
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
-use spur_core::partition::{Partition, PreemptMode};
+use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
 use spur_core::qos::{check_qos_limits, qos_adjusted_priority, QosCheckResult};
 use spur_core::reservation::{self, normalize_node_list, running_jobs_overlap_start, Reservation};
 use spur_core::resource::{ResourceAllocations, ResourceSet};
@@ -56,6 +56,7 @@ pub enum ReservationError {
     InvalidArgument(String),
     NotFound(String),
     AlreadyExists(String),
+    PermissionDenied(String),
     Raft(String),
 }
 
@@ -65,6 +66,7 @@ impl std::fmt::Display for ReservationError {
             Self::InvalidArgument(m)
             | Self::NotFound(m)
             | Self::AlreadyExists(m)
+            | Self::PermissionDenied(m)
             | Self::Raft(m) => f.write_str(m),
         }
     }
@@ -78,6 +80,43 @@ pub enum SubmitError {
     InvalidArgument(String),
     Internal(String),
 }
+
+/// Errors from completing a standalone srun allocation.
+#[derive(Debug)]
+pub enum SrunCompleteError {
+    NotFound(JobId),
+    NotSrunJob(JobId),
+    NotStepDispatch(JobId),
+    AlreadyTerminal { job_id: JobId, state: JobState },
+    NotOwner { job_id: JobId, user: String },
+    Internal { job_id: JobId, message: String },
+}
+
+impl std::fmt::Display for SrunCompleteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(id) => write!(f, "job {id} not found"),
+            Self::NotSrunJob(id) => write!(f, "job {id} is not an srun allocation"),
+            Self::NotStepDispatch(id) => {
+                write!(
+                    f,
+                    "job {id} does not use native step dispatch (CompleteJob is not valid)"
+                )
+            }
+            Self::AlreadyTerminal { job_id, state } => {
+                write!(f, "job {job_id} is already {state:?}")
+            }
+            Self::NotOwner { job_id, user } => {
+                write!(f, "user {user} is not permitted to complete job {job_id}")
+            }
+            Self::Internal { job_id, message } => {
+                write!(f, "job {job_id}: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SrunCompleteError {}
 
 impl std::fmt::Display for SubmitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -156,6 +195,10 @@ impl ReservationError {
 
     pub fn already_exists(msg: impl Into<String>) -> Self {
         Self::AlreadyExists(msg.into())
+    }
+
+    pub fn permission_denied(msg: impl Into<String>) -> Self {
+        Self::PermissionDenied(msg.into())
     }
 
     pub fn raft(msg: impl Into<String>) -> Self {
@@ -245,6 +288,7 @@ impl ClusterManager {
     /// Submit a new job. If it has an array spec, expand into individual tasks.
     pub fn submit_job(&self, mut spec: JobSpec) -> Result<JobId, SubmitError> {
         apply_default_partition(&mut spec, &self.partitions.read());
+        apply_default_time_limit(&mut spec, &self.partitions.read());
         apply_default_account(&mut spec, &self.association_cache);
         validate_user_account(&spec, &self.association_cache)?;
         self.validate_partition(&spec)?;
@@ -296,32 +340,40 @@ impl ClusterManager {
         Ok(job_id)
     }
 
-    /// Validate partition constraints: access control and node limits.
+    /// Validate requested partition names and partition account access control.
     fn validate_partition(&self, spec: &JobSpec) -> Result<(), SubmitError> {
-        let partition_name = match spec.partition.as_ref() {
+        let partition_spec = match spec.partition.as_deref() {
             Some(p) if !p.is_empty() => p,
             _ => return Ok(()), // Unset or empty partition name — nothing to validate
         };
 
         let partitions = self.partitions.read();
-        let part = match partitions.iter().find(|p| p.name == *partition_name) {
-            Some(p) => p,
-            None => {
-                return Err(SubmitError::invalid(format!(
-                    "partition '{partition_name}' not found"
-                )));
-            }
-        };
-
-        let needs_acl = !part.allow_accounts.is_empty() || !part.deny_accounts.is_empty();
-        if !needs_acl {
-            return Ok(());
+        let requested = requested_partition_names(Some(partition_spec))
+            .map(|name| {
+                partitions
+                    .iter()
+                    .find(|part| part.name == name)
+                    .ok_or_else(|| SubmitError::invalid(format!("partition '{name}' not found")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if requested.is_empty() {
+            return Err(SubmitError::invalid(format!(
+                "partition '{partition_spec}' not found"
+            )));
         }
+
+        let Some(first_acl_partition) = requested
+            .iter()
+            .copied()
+            .find(|part| !part.allow_accounts.is_empty() || !part.deny_accounts.is_empty())
+        else {
+            return Ok(());
+        };
 
         if !self.association_cache.is_loaded() {
             warn!(
                 user = %spec.user,
-                partition = %partition_name,
+                partition = %partition_spec,
                 "association cache unavailable; skipping partition account access checks"
             );
             return Ok(());
@@ -331,22 +383,28 @@ impl ClusterManager {
             Some(a) => a,
             None => {
                 return Err(SubmitError::invalid(format!(
-                    "no account for user '{}' on partition '{partition_name}'",
-                    spec.user
+                    "no account for user '{}' on partition '{}'",
+                    spec.user, first_acl_partition.name
                 )));
             }
         };
 
-        if !part.allow_accounts.is_empty() {
-            if !part.allow_accounts.iter().any(|a| a == account) {
+        for part in requested {
+            if !part.allow_accounts.is_empty() {
+                if part.allow_accounts.iter().any(|a| a == account) {
+                    continue;
+                }
                 return Err(SubmitError::invalid(format!(
-                    "account '{account}' not allowed on partition '{partition_name}'"
+                    "account '{account}' not allowed on partition '{}'",
+                    part.name
                 )));
             }
-        } else if part.deny_accounts.iter().any(|a| a == account) {
-            return Err(SubmitError::invalid(format!(
-                "account '{account}' denied on partition '{partition_name}'"
-            )));
+            if part.deny_accounts.iter().any(|a| a == account) {
+                return Err(SubmitError::invalid(format!(
+                    "account '{account}' denied on partition '{}'",
+                    part.name
+                )));
+            }
         }
 
         Ok(())
@@ -594,6 +652,54 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Complete a standalone srun allocation after its step finishes.
+    pub fn finish_srun_job(
+        &self,
+        job_id: JobId,
+        exit_code: i32,
+        user: &str,
+    ) -> Result<Job, SrunCompleteError> {
+        let job = {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or(SrunCompleteError::NotFound(job_id))?;
+            if !job.spec.srun_job {
+                return Err(SrunCompleteError::NotSrunJob(job_id));
+            }
+            if !job.srun_step_dispatch {
+                return Err(SrunCompleteError::NotStepDispatch(job_id));
+            }
+            if job.state.is_terminal() {
+                return Err(SrunCompleteError::AlreadyTerminal {
+                    job_id,
+                    state: job.state,
+                });
+            }
+            Self::check_job_owner(user, &job.spec.user, "complete").map_err(|_| {
+                SrunCompleteError::NotOwner {
+                    job_id,
+                    user: user.to_string(),
+                }
+            })?;
+            job.clone()
+        };
+
+        let state = if exit_code == 0 {
+            JobState::Completed
+        } else {
+            JobState::Failed
+        };
+        self.complete_job(job_id, exit_code, state).map_err(|e| {
+            warn!(job_id, error = %e, "finish_srun_job: complete_job failed");
+            SrunCompleteError::Internal {
+                job_id,
+                message: e.to_string(),
+            }
+        })?;
+        Ok(job)
+    }
+
     /// Suspend a running job: validate state, record through Raft. Allocation is retained.
     /// The requesting `user` must be the job owner, root, or empty (trusted internal calls).
     pub fn suspend_job(&self, job_id: JobId, user: &str) -> anyhow::Result<()> {
@@ -644,6 +750,17 @@ impl ClusterManager {
         resources: ResourceAllocations,
         per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
     ) -> anyhow::Result<()> {
+        self.start_job_impl(job_id, node_names, resources, per_node_alloc, false)
+    }
+
+    pub(crate) fn start_job_impl(
+        &self,
+        job_id: JobId,
+        node_names: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
+        srun_step_dispatch: bool,
+    ) -> anyhow::Result<()> {
         for name in &node_names {
             if !per_node_alloc.contains_key(name) {
                 anyhow::bail!(
@@ -682,6 +799,7 @@ impl ClusterManager {
             nodes: node_names.clone(),
             resources: resources.clone(),
             per_node_alloc: per_node_alloc.clone(),
+            srun_step_dispatch,
         })?;
 
         let node_count = node_names.len().max(1) as u32;
@@ -694,21 +812,25 @@ impl ClusterManager {
                     resources.memory_mb / node_count as u64,
                 )
             });
-        let batch_step = JobStep {
-            job_id,
-            step_id: STEP_BATCH,
-            name: "batch".into(),
-            state: StepState::Running,
-            num_tasks: 1,
-            cpus_per_task: per_node.cpus,
-            resources: per_node,
-            nodes: node_names,
-            distribution: spur_core::step::TaskDistribution::Block,
-            start_time: Some(Utc::now()),
-            end_time: None,
-            exit_code: None,
-        };
-        self.create_step(job_id, STEP_BATCH, batch_step);
+        if !srun_step_dispatch {
+            let batch_step = JobStep {
+                job_id,
+                step_id: STEP_BATCH,
+                name: "batch".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: per_node.cpus,
+                resources: per_node,
+                nodes: node_names,
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: Some(Utc::now()),
+                end_time: None,
+                exit_code: None,
+            };
+            if let Err(e) = self.create_step(batch_step) {
+                warn!(job_id, error = %e, "failed to record batch step");
+            }
+        }
 
         if spec_for_notify
             .mail_type
@@ -1679,10 +1801,15 @@ impl ClusterManager {
         Ok(resp.jobs_finalized)
     }
 
-    /// Create a job step.
-    pub fn create_step(&self, job_id: JobId, step_id: u32, step: JobStep) {
-        self.steps.write().insert((job_id, step_id), step);
+    /// Create a job step durably via Raft.
+    pub fn create_step(&self, step: JobStep) -> anyhow::Result<()> {
+        let job_id = step.job_id;
+        let step_id = step.step_id;
+        self.propose(WalOperation::JobStepCreate {
+            step: Box::new(step),
+        })?;
         debug!(job_id, step_id, "step created");
+        Ok(())
     }
 
     /// Record an srun step's completion via Raft so the step exit code and the
@@ -2307,7 +2434,10 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Update an existing reservation (validated, persisted via Raft).
+    /// Update an existing reservation (validated, persisted via Raft). The
+    /// requesting `user` must be the reservation owner, root, or empty (trusted
+    /// internal calls); legacy reservations with no recorded owner are
+    /// modifiable by anyone.
     #[allow(clippy::too_many_arguments)]
     pub fn update_reservation(
         &self,
@@ -2319,6 +2449,7 @@ impl ClusterManager {
         remove_users: &[String],
         add_accounts: &[String],
         remove_accounts: &[String],
+        user: &str,
     ) -> Result<(), ReservationError> {
         let mut preview = self
             .reservations
@@ -2329,6 +2460,13 @@ impl ClusterManager {
             .ok_or_else(|| {
                 ReservationError::not_found(format!("reservation '{}' not found", name))
             })?;
+
+        if !preview.can_be_managed_by(user) {
+            return Err(ReservationError::permission_denied(format!(
+                "user '{}' cannot modify reservation '{}' owned by '{}'",
+                user, name, preview.owner
+            )));
+        }
 
         if duration_minutes > 0 {
             preview.end_time =
@@ -2348,9 +2486,9 @@ impl ClusterManager {
             }
         }
         preview.nodes.retain(|n| !remove_nodes.contains(n));
-        for user in add_users {
-            if !preview.users.contains(user) {
-                preview.users.push(user.clone());
+        for add_user in add_users {
+            if !preview.users.contains(add_user) {
+                preview.users.push(add_user.clone());
             }
         }
         preview.users.retain(|u| !remove_users.contains(u));
@@ -2380,13 +2518,24 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Delete a reservation by name (persisted via Raft).
-    pub fn delete_reservation(&self, name: &str) -> Result<(), ReservationError> {
-        if !self.reservations.read().iter().any(|r| r.name == name) {
-            return Err(ReservationError::not_found(format!(
-                "reservation '{}' not found",
-                name
-            )));
+    /// Delete a reservation by name (persisted via Raft). The requesting `user`
+    /// must be the reservation owner, root, or empty (trusted internal calls);
+    /// legacy reservations with no recorded owner are deletable by anyone.
+    pub fn delete_reservation(&self, name: &str, user: &str) -> Result<(), ReservationError> {
+        {
+            let reservations = self.reservations.read();
+            let res = reservations
+                .iter()
+                .find(|r| r.name == name)
+                .ok_or_else(|| {
+                    ReservationError::not_found(format!("reservation '{}' not found", name))
+                })?;
+            if !res.can_be_managed_by(user) {
+                return Err(ReservationError::permission_denied(format!(
+                    "user '{}' cannot delete reservation '{}' owned by '{}'",
+                    user, name, res.owner
+                )));
+            }
         }
 
         for job in self.jobs.read().values() {
@@ -3220,6 +3369,7 @@ impl ClusterManager {
                 nodes: node_names,
                 resources,
                 per_node_alloc,
+                srun_step_dispatch,
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.start_time = Some(timestamp);
@@ -3227,6 +3377,7 @@ impl ClusterManager {
                     job.allocated_resources = Some(resources.clone());
                     job.per_node_alloc = per_node_alloc.clone();
                     job.pending_reason = PendingReason::None;
+                    job.srun_step_dispatch = *srun_step_dispatch;
                 }
                 let node_count = node_names.len().max(1) as u32;
                 for name in node_names {
@@ -3481,6 +3632,29 @@ impl ClusterManager {
                     }
                 }
             }
+            WalOperation::JobStepCreate { step } => match jobs.get(&step.job_id) {
+                None => {
+                    warn!(
+                        job_id = step.job_id,
+                        step_id = step.step_id,
+                        "JobStepCreate: skipping step for unknown job"
+                    );
+                }
+                Some(job) if job.state.is_terminal() => {
+                    warn!(
+                        job_id = step.job_id,
+                        step_id = step.step_id,
+                        state = ?job.state,
+                        "JobStepCreate: skipping step for terminal job"
+                    );
+                }
+                Some(_) => {
+                    let mut steps = self.steps.write();
+                    steps
+                        .entry((step.job_id, step.step_id))
+                        .or_insert_with(|| (**step).clone());
+                }
+            },
             WalOperation::JobPriorityChange {
                 job_id,
                 new_priority,
@@ -4082,35 +4256,62 @@ fn account_block_for(
     }
 }
 
-/// `PartitionInactive` if the partition is not Up, `PartitionConfig` if the
-/// request exceeds its node/time limits, else `None`. Shared by `pending_jobs()`
-/// and `tag_blocked_pending_reasons()` so drop and displayed reason agree.
+/// For a partition OR-list, returns `None` when any requested partition is Up
+/// and permits the request. Unknown names and limits rejected by every Up
+/// alternative return `PartitionConfig`; all-inactive alternatives return
+/// `PartitionInactive`.
 fn partition_block(job: &Job, partitions: &[Partition]) -> Option<spur_core::job::PendingReason> {
     use spur_core::job::PendingReason;
     use spur_core::partition::PartitionState;
 
-    let name = job.spec.partition.as_deref().filter(|p| !p.is_empty())?;
-    let Some(part) = partitions.iter().find(|p| p.name == name) else {
+    let partition_spec = job
+        .spec
+        .partition
+        .as_deref()
+        .filter(|spec| !spec.is_empty())?;
+    let requested = requested_partition_names(Some(partition_spec))
+        .map(|name| partitions.iter().find(|part| part.name == name))
+        .collect::<Option<Vec<_>>>();
+    let Some(requested) = requested else {
         return Some(PendingReason::PartitionConfig);
     };
-
-    if part.state != PartitionState::Up {
-        return Some(PendingReason::PartitionInactive);
+    if requested.is_empty() {
+        return Some(PendingReason::PartitionConfig);
     }
+
+    let mut has_up_partition = false;
+    for part in requested {
+        if part.state != PartitionState::Up {
+            continue;
+        }
+        has_up_partition = true;
+        if partition_limits_allow(job, part) {
+            return None;
+        }
+    }
+
+    Some(if has_up_partition {
+        PendingReason::PartitionConfig
+    } else {
+        PendingReason::PartitionInactive
+    })
+}
+
+fn partition_limits_allow(job: &Job, part: &Partition) -> bool {
     if let Some(max) = part.max_nodes {
         if job.spec.num_nodes > max {
-            return Some(PendingReason::PartitionConfig);
+            return false;
         }
     }
     if part.min_nodes > 0 && job.spec.num_nodes < part.min_nodes {
-        return Some(PendingReason::PartitionConfig);
+        return false;
     }
     if let (Some(max_mins), Some(tl)) = (part.max_time_minutes, &job.spec.time_limit) {
         if tl.num_minutes() > i64::from(max_mins) {
-            return Some(PendingReason::PartitionConfig);
+            return false;
         }
     }
-    None
+    true
 }
 
 fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> TresRecord {
@@ -4304,6 +4505,21 @@ fn apply_default_partition(spec: &mut JobSpec, partitions: &[Partition]) {
         } else if let Some(first) = partitions.first() {
             spec.partition = Some(first.name.clone());
         }
+    }
+}
+
+fn apply_default_time_limit(spec: &mut JobSpec, partitions: &[Partition]) {
+    if spec.time_limit.is_some() {
+        return;
+    }
+    let partition = spec
+        .partition
+        .as_deref()
+        .and_then(|name| partitions.iter().find(|p| p.name == name))
+        .or_else(|| partitions.iter().find(|p| p.is_default))
+        .or_else(|| partitions.first());
+    if let Some(minutes) = partition.and_then(|p| p.default_time_minutes) {
+        spec.time_limit = Some(chrono::Duration::minutes(minutes as i64));
     }
 }
 
@@ -4553,6 +4769,12 @@ mod tests {
         }
     }
 
+    fn srun_spec(name: &str) -> JobSpec {
+        let mut spec = basic_spec(name);
+        spec.srun_job = true;
+        spec
+    }
+
     fn scalar_alloc(cpus: u32, memory_mb: u64) -> ResourceAllocations {
         ResourceAllocations::with_scalar(cpus, memory_mb)
     }
@@ -4688,6 +4910,7 @@ mod tests {
             nodes: vec!["node1".into()],
             resources: resources.clone(),
             per_node_alloc: per_node_for(&["node1"], resources),
+            srun_step_dispatch: false,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -4722,6 +4945,7 @@ mod tests {
             nodes: vec!["node1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["node1"], alloc),
+            srun_step_dispatch: false,
         });
 
         cm.apply_operation(&WalOperation::JobComplete {
@@ -5209,6 +5433,7 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -5250,6 +5475,7 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -5292,6 +5518,7 @@ mod tests {
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
+            srun_step_dispatch: false,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -5357,6 +5584,7 @@ mod tests {
             nodes: vec!["n1".into()],
             resources: scalar_alloc(4, 8000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
+            srun_step_dispatch: false,
         });
 
         // Three srun steps exit 7, 3, 2 (in that order). DerivedExitCode tracks
@@ -5449,6 +5677,7 @@ mod tests {
             nodes: vec!["n1".into(), "n2".into()],
             resources: scalar_alloc(4, 8000),
             per_node_alloc: per_node_for(&["n1", "n2"], alloc),
+            srun_step_dispatch: false,
         });
 
         let r1 = cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -5499,6 +5728,7 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
         });
 
         let resp = cm.apply_operation(&WalOperation::JobComplete {
@@ -5538,6 +5768,7 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
         });
 
         let first = cm.apply_operation(&WalOperation::JobComplete {
@@ -5595,6 +5826,7 @@ mod tests {
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
+            srun_step_dispatch: false,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
@@ -5631,6 +5863,7 @@ mod tests {
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+            srun_step_dispatch: false,
         });
 
         cm.node_complete(1, "n1", 0, 9).unwrap();
@@ -5673,6 +5906,7 @@ mod tests {
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+            srun_step_dispatch: false,
         });
 
         // Step 2: the call the RPC makes after validation (wire state dropped).
@@ -5708,6 +5942,7 @@ mod tests {
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+            srun_step_dispatch: false,
         });
 
         cm.node_complete(1, "n1", 42, 0).unwrap();
@@ -5747,6 +5982,7 @@ mod tests {
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
+            srun_step_dispatch: false,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -5814,6 +6050,7 @@ mod tests {
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
+            srun_step_dispatch: false,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
@@ -6164,6 +6401,7 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
         });
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
@@ -6257,6 +6495,7 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
 
@@ -6611,6 +6850,7 @@ mod tests {
                 maint: true,
                 ..Default::default()
             },
+            owner: String::new(),
         }];
         let state = spur_sched::traits::ClusterState {
             nodes: &nodes,
@@ -6659,6 +6899,7 @@ mod tests {
                 maint: true,
                 ..Default::default()
             },
+            owner: String::new(),
         }];
         let state = spur_sched::traits::ClusterState {
             nodes: &nodes,
@@ -6815,6 +7056,53 @@ mod tests {
         assert!(
             !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
             "job in a non-Up partition must be dropped from scheduling"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multi_partition_job_reaches_scheduling_when_one_partition_is_eligible() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].state = "DOWN".into();
+        config.partitions[0].max_nodes = Some(1);
+        let mut batch = config.partitions[0].clone();
+        batch.name = "batch".into();
+        batch.default = false;
+        batch.state = "UP".into();
+        batch.max_nodes = Some(2);
+        config.partitions.push(batch);
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("multi-partition");
+        spec.partition = Some("default, batch".into());
+        spec.num_nodes = 2;
+        spec.num_tasks = 2;
+        let job_id = submit_and_wait(&cm, spec);
+
+        assert!(cm.pending_jobs().iter().any(|job| job.job_id == job_id));
+        assert_eq!(
+            cm.get_job(job_id).unwrap().spec.partition.as_deref(),
+            Some("default, batch")
+        );
+    }
+
+    #[test]
+    fn partition_block_rejects_mixed_known_and_unknown_partitions() {
+        let job = Job::new(
+            1,
+            JobSpec {
+                partition: Some("default,missing".into()),
+                ..basic_spec("mixed-partitions")
+            },
+        );
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        assert_eq!(
+            partition_block(&job, &partitions),
+            Some(PendingReason::PartitionConfig)
         );
     }
 
@@ -6992,6 +7280,43 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_rejects_nonexistent_partition_in_or_list() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let mut spec = basic_spec("badpart");
+        spec.partition = Some("default, does-not-exist".into());
+        let err = cm.submit_job(spec).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid("partition 'does-not-exist' not found")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_enforces_account_access_on_every_requested_partition() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].allow_accounts = vec!["research".into()];
+        let mut restricted = config.partitions[0].clone();
+        restricted.name = "restricted".into();
+        restricted.default = false;
+        restricted.allow_accounts = vec!["faculty".into()];
+        config.partitions.push(restricted);
+        let cm = test_cluster_with_config(&dir, config).await;
+        cm.association_cache()
+            .insert_association("testuser", "research");
+
+        let mut spec = basic_spec("mixed-access");
+        spec.partition = Some("default,restricted".into());
+        spec.account = Some("research".into());
+        let err = cm.submit_job(spec).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid("account 'research' not allowed on partition 'restricted'")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_partition_not_found_returns_invalid_argument() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -7033,6 +7358,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         let mut r1 = base.clone();
         r1.name = "r1".into();
@@ -7057,6 +7383,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         let mut r1 = base.clone();
         r1.name = "r1".into();
@@ -7082,6 +7409,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["testuser".into()],
             flags: Default::default(),
+            owner: String::new(),
         })
         .unwrap();
 
@@ -7248,6 +7576,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["testuser".into()],
             flags: Default::default(),
+            owner: String::new(),
         })
         .unwrap();
 
@@ -7284,6 +7613,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["testuser".into()],
             flags: Default::default(),
+            owner: String::new(),
         })
         .unwrap();
 
@@ -7444,6 +7774,7 @@ mod tests {
                 accounts: Vec::new(),
                 users: vec!["testuser".into()],
                 flags: Default::default(),
+                owner: String::new(),
             },
         });
 
@@ -7473,6 +7804,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         cm.apply_operation(&WalOperation::ReservationCreate {
             reservation: res.clone(),
@@ -7519,6 +7851,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         cm.apply_operation(&WalOperation::ReservationCreate {
             reservation: res.clone(),
@@ -7542,6 +7875,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         let cm1 = cm.clone();
         let cm2 = cm.clone();
@@ -7576,6 +7910,7 @@ mod tests {
                 accounts: Vec::new(),
                 users: vec!["alice".into()],
                 flags: Default::default(),
+                owner: String::new(),
             })
             .unwrap();
             assert_eq!(cm.get_reservations().len(), 1);
@@ -7605,6 +7940,7 @@ mod tests {
                 no_hold_jobs: true,
                 ..Default::default()
             },
+            owner: String::new(),
         })
         .unwrap();
 
@@ -7612,7 +7948,7 @@ mod tests {
         spec.reservation = Some("r1".into());
         let job_id = submit_and_wait(&cm, spec);
 
-        cm.delete_reservation("r1").unwrap();
+        cm.delete_reservation("r1", "root").unwrap();
         wait_for("reservation deleted", || cm.get_reservations().is_empty());
 
         let job = cm.get_job(job_id).unwrap();
@@ -7624,6 +7960,106 @@ mod tests {
             cm.pending_jobs().iter().any(|j| j.job_id == job_id),
             "job must remain schedulable after no_hold_jobs delete"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_reservation_rejects_non_owner() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "r1".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: Default::default(),
+            owner: "alice".into(),
+        })
+        .unwrap();
+
+        let err = cm.delete_reservation("r1", "bob").unwrap_err();
+        assert!(
+            matches!(err, ReservationError::PermissionDenied(_)),
+            "non-owner delete must be denied, got {err:?}"
+        );
+        assert_eq!(cm.get_reservations().len(), 1, "reservation must survive");
+
+        cm.delete_reservation("r1", "alice").unwrap();
+        assert!(
+            cm.get_reservations().is_empty(),
+            "owner delete must succeed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_reservation_rejects_non_owner() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "r1".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: Default::default(),
+            owner: "alice".into(),
+        })
+        .unwrap();
+
+        let err = cm
+            .update_reservation("r1", 30, &[], &[], &[], &[], &[], &[], "bob")
+            .unwrap_err();
+        assert!(
+            matches!(err, ReservationError::PermissionDenied(_)),
+            "non-owner update must be denied, got {err:?}"
+        );
+
+        cm.update_reservation("r1", 30, &[], &[], &[], &[], &[], &[], "alice")
+            .expect("owner update must succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_reservation_allows_root_and_unowned() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "owned".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: Default::default(),
+            owner: "alice".into(),
+        })
+        .unwrap();
+        cm.create_reservation(Reservation {
+            name: "legacy".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: spur_core::reservation::ReservationFlags {
+                overlap: true,
+                ..Default::default()
+            },
+            owner: String::new(),
+        })
+        .unwrap();
+
+        cm.delete_reservation("owned", "root")
+            .expect("root may delete any reservation");
+        cm.delete_reservation("legacy", "bob")
+            .expect("unowned reservation stays manageable by anyone");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7644,6 +8080,7 @@ mod tests {
                     no_hold_jobs: true,
                     ..Default::default()
                 },
+                owner: String::new(),
             },
         });
 
@@ -7677,6 +8114,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         })
         .unwrap();
 
@@ -7810,13 +8248,14 @@ mod tests {
                 accounts: Vec::new(),
                 users: vec!["testuser".into()],
                 flags: Default::default(),
+                owner: String::new(),
             })
             .unwrap();
 
             let mut spec = basic_spec("resv-hold");
             spec.reservation = Some("r1".into());
             let job_id = submit_and_wait(&cm, spec);
-            cm.delete_reservation("r1").unwrap();
+            cm.delete_reservation("r1", "root").unwrap();
             wait_for("job held after delete", || {
                 cm.get_job(job_id).is_some_and(|j| {
                     j.pending_reason == PendingReason::ReservationDeleted && j.priority == 0
@@ -7852,13 +8291,14 @@ mod tests {
                     no_hold_jobs: true,
                     ..Default::default()
                 },
+                owner: String::new(),
             })
             .unwrap();
 
             let mut spec = basic_spec("resv-no-hold");
             spec.reservation = Some("r1".into());
             job_id = submit_and_wait(&cm, spec);
-            cm.delete_reservation("r1").unwrap();
+            cm.delete_reservation("r1", "root").unwrap();
             wait_for("reservation detached from job", || {
                 cm.get_job(job_id)
                     .is_some_and(|j| j.spec.reservation.is_none() && j.priority > 0)
@@ -7886,13 +8326,14 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["testuser".into()],
             flags: Default::default(),
+            owner: String::new(),
         })
         .unwrap();
 
         let mut spec = basic_spec("release-me");
         spec.reservation = Some("r1".into());
         let job_id = submit_and_wait(&cm, spec);
-        cm.delete_reservation("r1").unwrap();
+        cm.delete_reservation("r1", "root").unwrap();
         wait_for("job held after delete", || {
             cm.get_job(job_id).is_some_and(|j| {
                 j.pending_reason == PendingReason::ReservationDeleted && j.priority == 0
@@ -9897,6 +10338,47 @@ mod tests {
     }
 
     #[test]
+    fn apply_default_time_limit_uses_partition_default() {
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: Some(30),
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(30)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_noop_when_set() {
+        let mut spec = basic_spec("j");
+        spec.time_limit = Some(chrono::Duration::minutes(5));
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: Some(30),
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(5)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_skips_when_partition_has_no_default() {
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: None,
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions);
+        assert!(spec.time_limit.is_none());
+    }
+
+    #[test]
     fn apply_default_partition_falls_back_to_first() {
         let mut spec = basic_spec("j");
         spec.partition = None;
@@ -10982,6 +11464,24 @@ mod tests {
             nodes: vec![node.into()],
             resources: scalar_alloc(1, 1000),
             per_node_alloc: per_node_for(&[node], scalar_alloc(1, 1000)),
+            srun_step_dispatch: false,
+        });
+    }
+
+    fn start_srun_job_on(cm: &ClusterManager, id: JobId, node: &str) {
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: id,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: id,
+            nodes: vec![node.into()],
+            resources: scalar_alloc(1, 1000),
+            per_node_alloc: per_node_for(&[node], scalar_alloc(1, 1000)),
+            srun_step_dispatch: true,
         });
     }
 
@@ -11377,5 +11877,91 @@ mod tests {
         );
 
         assert_eq!(nodes["n1"].state, NodeState::Drain);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_completes_running_allocation() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-alloc"));
+        start_srun_job_on(&cm, id, "n1");
+
+        let returned = cm.finish_srun_job(id, 0, "testuser").unwrap();
+        assert_eq!(returned.job_id, id);
+        settle(&cm, id, JobState::Completed);
+        assert_eq!(cm.get_job(id).unwrap().exit_code, Some(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_rejects_non_srun_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("batch"));
+        start_job_on(&cm, id, "n1");
+
+        assert!(matches!(
+            cm.finish_srun_job(id, 0, "testuser"),
+            Err(SrunCompleteError::NotSrunJob(j)) if j == id
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_rejects_terminal_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-done"));
+        start_srun_job_on(&cm, id, "n1");
+        cm.finish_srun_job(id, 0, "testuser").unwrap();
+        settle(&cm, id, JobState::Completed);
+
+        assert!(matches!(
+            cm.finish_srun_job(id, 0, "testuser"),
+            Err(SrunCompleteError::AlreadyTerminal {
+                job_id,
+                state: JobState::Completed,
+            }) if job_id == id
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_rejects_wrong_user() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-owner"));
+        start_srun_job_on(&cm, id, "n1");
+
+        assert!(matches!(
+            cm.finish_srun_job(id, 0, "otheruser"),
+            Err(SrunCompleteError::NotOwner { job_id, user }) if job_id == id && user == "otheruser"
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_rejects_batch_fallback_srun() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-batch-fallback"));
+        start_job_on(&cm, id, "n1");
+
+        assert!(matches!(
+            cm.finish_srun_job(id, 0, "testuser"),
+            Err(SrunCompleteError::NotStepDispatch(j)) if j == id
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_not_found() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        assert!(matches!(
+            cm.finish_srun_job(999, 0, "testuser"),
+            Err(SrunCompleteError::NotFound(999))
+        ));
     }
 }

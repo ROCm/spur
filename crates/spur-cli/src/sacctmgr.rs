@@ -127,6 +127,21 @@ const QOS_KEYS: &[&str] = &[
     "grpwall",
 ];
 
+/// Input keys the `add`/`modify account` handlers read (names + aliases). Gates
+/// mistyped fields the same way `QOS_KEYS` does, so an unsupported field errors
+/// loudly instead of being silently dropped.
+const ACCOUNT_KEYS: &[&str] = &[
+    "name",
+    "account",
+    "description",
+    "organization",
+    "parent",
+    "fairshare",
+    "maxrunningjobs",
+    "maxjobs",
+    "grptres",
+];
+
 /// Reject keys the command does not understand, so a mistyped or unsupported
 /// field errors loudly instead of being silently dropped (a dropped limit
 /// reads as "set" but never enforces).
@@ -234,11 +249,22 @@ fn build_add_user_request(
     })
 }
 
+fn list_user_filters(p: &std::collections::HashMap<String, String>) -> (String, String) {
+    (
+        p.get("account").cloned().unwrap_or_default(),
+        p.get("name")
+            .or_else(|| p.get("user"))
+            .cloned()
+            .unwrap_or_default(),
+    )
+}
+
 async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
     let p = parse_params(params);
 
     match entity.to_lowercase().as_str() {
         "account" => {
+            reject_unknown_keys(&p, ACCOUNT_KEYS)?;
             let name = p
                 .get("name")
                 .or_else(|| p.get("account"))
@@ -256,6 +282,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 .map(|v| parse_limit("maxjobs", v))
                 .transpose()?
                 .unwrap_or(0);
+            let grp_tres = p.get("grptres").cloned().unwrap_or_default();
 
             let mut client = connect(addr).await?;
             client
@@ -266,6 +293,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     parent_account: parent.clone(),
                     fairshare_weight: fairshare,
                     max_running_jobs: max_jobs,
+                    grp_tres,
                 })
                 .await
                 .context("CreateAccount RPC failed")?;
@@ -473,6 +501,7 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
     // Modify is an upsert — same RPCs as add, just re-sends the record
     match entity.to_lowercase().as_str() {
         "account" => {
+            reject_unknown_keys(&p, ACCOUNT_KEYS)?;
             let name = p
                 .get("name")
                 .or_else(|| p.get("account"))
@@ -495,6 +524,7 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
                         .map(|v| parse_limit("maxjobs", v))
                         .transpose()?
                         .unwrap_or(0),
+                    grp_tres: p.get("grptres").cloned().unwrap_or_default(),
                 })
                 .await
                 .context("CreateAccount (modify) RPC failed")?;
@@ -616,15 +646,15 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
             let accounts = resp.into_inner().accounts;
 
             println!(
-                "{:<20} {:<30} {:<15} {:<10} {:<10}",
-                "Account", "Descr", "Org", "Parent", "Share"
+                "{:<20} {:<30} {:<15} {:<10} {:<10} {:<10}",
+                "Account", "Descr", "Org", "Parent", "Share", "GrpTRES"
             );
-            println!("{}", "-".repeat(85));
+            println!("{}", "-".repeat(100));
 
             if accounts.is_empty() {
                 println!(
-                    "{:<20} {:<30} {:<15} {:<10} {:<10}",
-                    "(no accounts configured)", "", "", "", ""
+                    "{:<20} {:<30} {:<15} {:<10} {:<10} {:<10}",
+                    "(no accounts configured)", "", "", "", "", ""
                 );
             } else {
                 for a in &accounts {
@@ -634,20 +664,26 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
                         &a.parent_account
                     };
                     println!(
-                        "{:<20} {:<30} {:<15} {:<10} {:<10}",
-                        a.name, a.description, a.organization, parent, a.fairshare_weight as u32,
+                        "{:<20} {:<30} {:<15} {:<10} {:<10} {:<10}",
+                        a.name,
+                        a.description,
+                        a.organization,
+                        parent,
+                        a.fairshare_weight as u32,
+                        a.grp_tres,
                     );
                 }
             }
             Ok(())
         }
         "user" | "users" => {
-            let account_filter = p.get("account").cloned().unwrap_or_default();
+            let (account_filter, user_filter) = list_user_filters(&p);
 
             let mut client = connect(addr).await?;
             let resp = client
                 .list_users(ListUsersRequest {
                     account: account_filter,
+                    user: user_filter,
                 })
                 .await
                 .context("ListUsers RPC failed")?;
@@ -944,6 +980,52 @@ mod tests {
     }
 
     #[test]
+    fn reject_unknown_keys_accepts_every_parsed_account_field() {
+        // Every key the add/modify account handlers read must be allowlisted,
+        // otherwise reject_unknown_keys bounces it (the grpwall regression class).
+        let parsed_fields = [
+            "name",
+            "account",
+            "description",
+            "organization",
+            "parent",
+            "fairshare",
+            "maxrunningjobs",
+            "maxjobs",
+            "grptres",
+        ];
+        for field in parsed_fields {
+            let p = parse_params(&["name=acct".into(), format!("{field}=1")]);
+            assert!(
+                reject_unknown_keys(&p, ACCOUNT_KEYS).is_ok(),
+                "account field '{field}' is read by the handler but missing from ACCOUNT_KEYS"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_unknown_keys_flags_mistyped_account_grptres() {
+        // A typo'd limit key must error, not be silently dropped.
+        let p = parse_params(&["name=acct".into(), "grptre=cpu=8".into()]);
+        let err = reject_unknown_keys(&p, ACCOUNT_KEYS).unwrap_err();
+        assert!(err.to_string().contains("unknown field 'grptre'"));
+    }
+
+    #[test]
+    fn parse_params_keeps_account_grptres_value_intact() {
+        // The comma-separated TRES value must survive as a single value (the `add
+        // account` handler reads p["grptres"] and forwards it to the RPC verbatim).
+        let p = parse_params(&[
+            "name=physics".into(),
+            "grptres=cpu=16,mem=32768,gres/gpu=8".into(),
+        ]);
+        assert_eq!(
+            p.get("grptres").map(String::as_str),
+            Some("cpu=16,mem=32768,gres/gpu=8")
+        );
+    }
+
+    #[test]
     fn build_add_user_request_parses_account_limits() {
         let p = parse_params(&[
             "name=testuser".into(),
@@ -1197,5 +1279,25 @@ mod tests {
     fn qos_empty_format_string_produces_no_fields() {
         let fields = format_engine::parse_named_format("", &qos_field_spec, &qos_header);
         assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn list_user_filters_include_name() {
+        let p = parse_params(&["name=testuser".into(), "account=testacct".into()]);
+
+        let (account, user) = list_user_filters(&p);
+
+        assert_eq!(account, "testacct");
+        assert_eq!(user, "testuser");
+    }
+
+    #[test]
+    fn list_user_filters_include_user_alias() {
+        let p = parse_params(&["user=testuser".into()]);
+
+        let (account, user) = list_user_filters(&p);
+
+        assert!(account.is_empty());
+        assert_eq!(user, "testuser");
     }
 }

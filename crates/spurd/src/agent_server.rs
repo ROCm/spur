@@ -22,6 +22,7 @@ use spur_spank::{SpankContext, SpankHandle, SpankHook, SpankHost};
 
 use spur_core::config::HooksConfig;
 use spur_core::spur_env::SpurEnv;
+use spur_core::task_launch::build_multi_task_wrapper;
 use spur_devices::DeviceRegistry;
 
 use crate::executor;
@@ -42,6 +43,7 @@ struct TrackedJob {
     cpus: u32,
     memory_mb: u64,
     nodelist: String,
+    mpi: String,
 }
 
 struct CompletedJob {
@@ -369,6 +371,33 @@ mod completion_report_tests {
     }
 }
 
+/// Build a bash script that execs a command vector without shell interpretation.
+fn build_one_shot_command_script(command: &[String]) -> Result<String, Status> {
+    let joined = shlex::try_join(command.iter().map(String::as_str))
+        .map_err(|e| Status::invalid_argument(format!("command is not shell-safe: {e}")))?;
+    Ok(format!("#!/bin/bash\nexec {joined}\n"))
+}
+
+fn cleanup_step_scripts(dir: &std::path::Path, paths: &[&std::path::Path]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
+struct StepScriptCleanup {
+    dir: std::path::PathBuf,
+    paths: Vec<std::path::PathBuf>,
+}
+
+impl Drop for StepScriptCleanup {
+    fn drop(&mut self) {
+        let path_refs: Vec<&std::path::Path> =
+            self.paths.iter().map(std::path::PathBuf::as_path).collect();
+        cleanup_step_scripts(&self.dir, &path_refs);
+    }
+}
+
 /// Build the bash job script for a launch request.
 ///
 /// A non-empty `script` is used verbatim. Otherwise `argv` is a literal
@@ -594,8 +623,16 @@ impl SlurmAgent for AgentService {
         }
 
         // Spur-only vars
-        senv.set("SPUR_TASK_OFFSET", task_offset);
         senv.set("SPUR_NODE_RANK", node_rank);
+        if tasks_per_node == 1 {
+            SpurEnv::apply_task_rank(&mut senv, task_offset, 0, 1);
+        } else {
+            senv.set("SPUR_TASK_OFFSET", task_offset);
+            senv.set("LOCAL_RANK", "0");
+            senv.set("LOCAL_WORLD_SIZE", tasks_per_node);
+            senv.set("NPROC_PER_NODE", tasks_per_node);
+            senv.set("PMI_RANK", task_offset);
+        }
         if !peer_nodes.is_empty() {
             senv.set("SPUR_PEER_NODES", peer_nodes.join(","));
         }
@@ -607,15 +644,19 @@ impl SlurmAgent for AgentService {
         }
 
         // Third-party distributed training / MPI env vars
-        senv.set("LOCAL_RANK", "0");
-        senv.set("LOCAL_WORLD_SIZE", tasks_per_node);
-        senv.set("NPROC_PER_NODE", tasks_per_node);
+        if tasks_per_node > 1 {
+            senv.set("LOCAL_RANK", "0");
+            senv.set("LOCAL_WORLD_SIZE", tasks_per_node);
+            senv.set("NPROC_PER_NODE", tasks_per_node);
+        }
         senv.set("NODE_RANK", node_rank);
 
         senv.set("PMI_SIZE", spec.num_tasks);
         senv.set("PMI_UNIVERSE_SIZE", spec.num_tasks);
         senv.set("PMI_APPNUM", "0");
-        senv.set("PMI_RANK", task_offset);
+        if tasks_per_node > 1 {
+            senv.set("PMI_RANK", task_offset);
+        }
 
         if spec.mpi == "pmix" {
             senv.set("PMIX_SIZE", spec.num_tasks);
@@ -767,47 +808,7 @@ impl SlurmAgent for AgentService {
             }
 
             // Build the wrapper that launches N tasks with GPU partitioning
-            let mut wrapper = String::from("#!/bin/bash\n");
-            wrapper.push_str(&format!(
-                "_TASKS_ON_NODE={}\nSPUR_TASK_OFFSET=${{SPUR_TASK_OFFSET:-0}}\n",
-                tasks_per_node
-            ));
-            wrapper.push_str("for LOCAL_RANK in $(seq 0 $((_TASKS_ON_NODE - 1))); do\n");
-            wrapper.push_str("  export LOCAL_RANK\n");
-            wrapper.push_str(SpurEnv::per_task_bash_exports());
-            wrapper.push_str("  export PMI_RANK=$SPUR_PROCID\n");
-            wrapper.push_str("  export PMIX_RANK=$SPUR_PROCID\n");
-            wrapper.push_str("  export OMPI_COMM_WORLD_RANK=$SPUR_PROCID\n");
-            wrapper.push_str("  export OMPI_COMM_WORLD_LOCAL_RANK=$LOCAL_RANK\n");
-
-            // Partition GPUs across tasks if GPUs are allocated
-            wrapper.push_str("  if [ -n \"$SPUR_JOB_GPUS\" ]; then\n");
-            wrapper.push_str("    IFS=',' read -ra _ALL_GPUS <<< \"$SPUR_JOB_GPUS\"\n");
-            wrapper.push_str("    _GPUS_PER_TASK=$(( ${#_ALL_GPUS[@]} / _TASKS_ON_NODE ))\n");
-            wrapper.push_str("    if [ $_GPUS_PER_TASK -gt 0 ]; then\n");
-            wrapper.push_str("      _START=$((LOCAL_RANK * _GPUS_PER_TASK))\n");
-            wrapper.push_str(
-                "      _TASK_GPUS=$(echo \"${_ALL_GPUS[@]:$_START:$_GPUS_PER_TASK}\" | tr ' ' ',')\n",
-            );
-            wrapper.push_str("      export ROCR_VISIBLE_DEVICES=$_TASK_GPUS\n");
-            wrapper.push_str("      export CUDA_VISIBLE_DEVICES=$_TASK_GPUS\n");
-            wrapper.push_str("      export GPU_DEVICE_ORDINAL=$_TASK_GPUS\n");
-            wrapper.push_str("    fi\n");
-            wrapper.push_str("  fi\n");
-
-            wrapper.push_str("  if [ \"$SPUR_LABEL\" = \"1\" ]; then\n");
-            wrapper.push_str(&format!(
-                "    bash \"{}\" 2>&1 | sed \"s/^/[$SPUR_PROCID] /\" &\n",
-                user_script_path.replace('"', "\\\"")
-            ));
-            wrapper.push_str("  else\n");
-            wrapper.push_str(&format!(
-                "    bash \"{}\" &\n",
-                user_script_path.replace('"', "\\\"")
-            ));
-            wrapper.push_str("  fi\n");
-            wrapper.push_str("done\nwait\n");
-            wrapper
+            build_multi_task_wrapper(&user_script_path, tasks_per_node, None)
         } else {
             launch_script
         };
@@ -913,6 +914,7 @@ impl SlurmAgent for AgentService {
                         cpus: launch_cfg.cpus,
                         memory_mb: launch_cfg.memory_mb,
                         nodelist: launch_cfg.nodelist,
+                        mpi: spec.mpi.clone(),
                     },
                 );
                 Ok(Response::new(LaunchJobResponse {
@@ -1039,10 +1041,93 @@ impl SlurmAgent for AgentService {
         }))
     }
 
-    /// #146: run a one-shot command on this node, used by `srun` inside an
-    /// `salloc` interactive shell. Unlike ExecInJob, this does not require
-    /// a tracked job process — salloc allocations don't run anything until
-    /// `srun` dispatches a step.
+    /// Record a standalone-srun allocation on this node without launching a
+    /// batch script.
+    async fn register_job_allocation(
+        &self,
+        request: Request<RegisterJobAllocationRequest>,
+    ) -> Result<Response<RegisterJobAllocationResponse>, Status> {
+        let req = request.into_inner();
+        if req.job_id == 0 {
+            return Err(Status::invalid_argument("job_id is required"));
+        }
+
+        {
+            let jobs = self.running.lock().await;
+            if jobs.contains_key(&req.job_id) {
+                return Err(Status::already_exists(format!(
+                    "job {} already registered on this node",
+                    req.job_id
+                )));
+            }
+        }
+
+        let allocated = req.allocated.as_ref();
+        let mut controller_gpu_ids: Vec<u32> = allocated
+            .and_then(|a| a.devices.get("gpu"))
+            .map(|d| d.devices.iter().map(|dev| dev.device_id).collect())
+            .unwrap_or_default();
+        if controller_gpu_ids.is_empty() {
+            controller_gpu_ids = req
+                .gpu_devices
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+        }
+
+        let cpus = allocated.map(|a| a.cpus).unwrap_or(req.cpus).max(1);
+        let memory_mb = allocated.map(|a| a.memory_mb).unwrap_or(req.memory_mb);
+
+        {
+            let mut alloc = self.allocation.lock().await;
+            alloc
+                .allocate_for_job(req.job_id, cpus, memory_mb, &controller_gpu_ids)
+                .map_err(|e| match e {
+                    AllocError::GpusUnavailable => Status::resource_exhausted(
+                        "controller-allocated GPUs unavailable on this node",
+                    ),
+                    AllocError::DuplicateJob => Status::already_exists(format!(
+                        "job {} already registered on this node",
+                        req.job_id
+                    )),
+                })?;
+            alloc.commit_job(req.job_id);
+        }
+
+        info!(
+            job_id = req.job_id,
+            cpus,
+            memory_mb,
+            gpus = ?controller_gpu_ids,
+            "registered srun allocation"
+        );
+
+        self.running.lock().await.insert(
+            req.job_id,
+            TrackedJob {
+                job: executor::RunningJob::AllocationOnly,
+                rootfs_mode: crate::container::RootfsMode::Extracted,
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                has_pid_namespace: false,
+                work_dir: String::new(),
+                uid: req.uid,
+                gid: req.gid,
+                partition: req.partition,
+                gpu_devices: controller_gpu_ids,
+                cpus,
+                memory_mb,
+                nodelist: req.nodelist,
+                mpi: req.mpi,
+            },
+        );
+
+        Ok(Response::new(RegisterJobAllocationResponse {}))
+    }
+
+    /// Run a one-shot command on this node, used by srun inside an allocation.
+    /// Unlike ExecInJob, this does not require a tracked job process — salloc
+    /// allocations don't run anything until srun dispatches a step.
     async fn run_command(
         &self,
         request: Request<RunCommandRequest>,
@@ -1063,7 +1148,15 @@ impl SlurmAgent for AgentService {
             return Err(Status::invalid_argument("job_id is required"));
         }
 
-        let (gpu_devices, partition, cpus, memory_mb, nodelist) = {
+        let num_tasks = req.num_tasks.max(1);
+        let step_num_tasks = if req.step_num_tasks > 0 {
+            req.step_num_tasks
+        } else {
+            num_tasks
+        };
+        let step_id = req.step_id;
+
+        let (gpu_devices, partition, cpus, memory_mb, nodelist, mpi, num_tasks_total) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
                 Status::not_found(format!("job {} not running on this node", job_id))
@@ -1081,8 +1174,18 @@ impl SlurmAgent for AgentService {
                 tracked.cpus,
                 tracked.memory_mb,
                 nodelist,
+                tracked.mpi.clone(),
+                step_num_tasks,
             )
         };
+
+        let agent_hostname = self.reporter.hostname.clone();
+        let node_names: Vec<&str> = nodelist.split(',').filter(|s| !s.is_empty()).collect();
+        let num_nodes = node_names.len().max(1) as u32;
+        let node_id = node_names
+            .iter()
+            .position(|n| *n == agent_hostname)
+            .unwrap_or(0) as u32;
 
         let gpu_env = if gpu_devices.is_empty() {
             HashMap::new()
@@ -1107,9 +1210,103 @@ impl SlurmAgent for AgentService {
         senv.set_with_slurm_twin("SPUR_JOB_NODELIST", &nodelist);
         senv.set_with_slurm_twin("SPUR_CPUS_ON_NODE", cpus);
         senv.extend(&gpu_env);
+        let mut bind_env = HashMap::new();
+        spur_core::task_launch::apply_gpu_bind_env(&mut bind_env, &req.environment, &gpu_devices);
+        senv.extend(&bind_env);
+        if let Some(cpu_bind) = spur_core::task_launch::unsupported_cpu_bind(&req.environment) {
+            warn!(
+                job_id,
+                cpu_bind = %cpu_bind,
+                "topology CPU bind modes are not applied in srun step mode"
+            );
+        }
+        if let Some(err) =
+            spur_core::task_launch::map_cpu_bind_error(&req.environment, step_num_tasks).or_else(
+                || spur_core::task_launch::mask_cpu_bind_error(&req.environment, step_num_tasks),
+            )
+        {
+            return Err(Status::invalid_argument(err));
+        }
+        SpurEnv::apply_step_scope(
+            &mut senv,
+            job_id,
+            step_id,
+            step_num_tasks,
+            node_id,
+            num_nodes,
+        );
+        if req.label {
+            senv.set("SPUR_LABEL", "1");
+        }
 
-        let mut cmd = tokio::process::Command::new(&req.command[0]);
-        cmd.args(&req.command[1..]).current_dir(&work_dir);
+        let tasks_per_node = num_tasks;
+        senv.set("PMI_SIZE", num_tasks_total);
+        senv.set("PMI_UNIVERSE_SIZE", num_tasks_total);
+        senv.set("PMI_APPNUM", "0");
+        if mpi == "pmix" {
+            senv.set("PMIX_SIZE", num_tasks_total);
+            senv.set("PMIX_NAMESPACE", format!("spur.{job_id}"));
+            senv.set("OMPI_COMM_WORLD_SIZE", num_tasks_total);
+            senv.set("OMPI_COMM_WORLD_NODE_RANK", node_id);
+            senv.set("OMPI_COMM_WORLD_LOCAL_SIZE", tasks_per_node);
+        }
+
+        let (program, program_args, step_script_cleanup) = if num_tasks > 1 || req.label {
+            let step_dir =
+                crate::executor::prepare_step_script_dir(&work_dir, job_id, req.uid, req.gid)
+                    .map_err(|e| {
+                        Status::internal(format!("failed to create step script dir: {e}"))
+                    })?;
+            let mut guard = StepScriptCleanup {
+                dir: step_dir.clone(),
+                paths: Vec::new(),
+            };
+
+            let user_script_path = step_dir.join(format!("cmd_{node_id}.sh"));
+            let user_script = build_one_shot_command_script(&req.command)?;
+            crate::executor::write_job_scratch(&user_script_path, &user_script, req.uid, req.gid)
+                .map_err(|e| Status::internal(format!("failed to write step script: {e}")))?;
+            guard.paths.push(user_script_path.clone());
+
+            let wrapper_path = step_dir.join(format!("wrapper_{node_id}.sh"));
+            let wrapper = if num_tasks > 1 {
+                build_multi_task_wrapper(
+                    user_script_path.to_string_lossy().as_ref(),
+                    num_tasks,
+                    Some(&req.environment),
+                )
+            } else {
+                spur_core::task_launch::build_labeled_single_task_wrapper(
+                    user_script_path.to_string_lossy().as_ref(),
+                    req.task_offset,
+                    Some(&req.environment),
+                )
+            };
+            crate::executor::write_job_scratch(&wrapper_path, &wrapper, req.uid, req.gid)
+                .map_err(|e| Status::internal(format!("failed to write step wrapper: {e}")))?;
+            guard.paths.push(wrapper_path.clone());
+
+            if num_tasks > 1 {
+                senv.set("SPUR_TASK_OFFSET", req.task_offset);
+            } else {
+                SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0, 1);
+            }
+            let wrapper_path_string = wrapper_path.to_string_lossy().into_owned();
+            ("bash".to_string(), vec![wrapper_path_string], Some(guard))
+        } else {
+            SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0, 1);
+            let (program, args) = spur_core::task_launch::wrap_command_with_cpu_bind(
+                &req.command[0],
+                &req.command[1..],
+                &req.environment,
+                req.task_offset,
+            );
+            (program, args, None)
+        };
+        let _step_script_guard = step_script_cleanup;
+
+        let mut cmd = tokio::process::Command::new(&program);
+        cmd.args(&program_args).current_dir(&work_dir);
         for (k, v) in senv.into_map() {
             cmd.env(k, v);
         }
@@ -1133,12 +1330,13 @@ impl SlurmAgent for AgentService {
 
         info!(
             command = ?req.command,
+            num_tasks,
+            task_offset = req.task_offset,
             uid = req.uid,
             work_dir = %work_dir,
-            "RunCommand: executing one-shot step"
+            "RunCommand: executing step"
         );
 
-        // TaskProlog: run before the step command
         if let Some(ref task_prolog) = self.hooks.task_prolog {
             let ctx = spur_core::hooks::HookContext {
                 job_id,
@@ -1162,7 +1360,6 @@ impl SlurmAgent for AgentService {
             .await
             .map_err(|e| Status::internal(format!("command failed: {}", e)))?;
 
-        // TaskEpilog: run after the step command (failure logged, not fatal)
         if let Some(ref task_epilog) = self.hooks.task_epilog {
             let ctx = spur_core::hooks::HookContext {
                 job_id,
@@ -1182,7 +1379,7 @@ impl SlurmAgent for AgentService {
         }
 
         Ok(Response::new(RunCommandResponse {
-            exit_code: output.status.code().unwrap_or(-1),
+            exit_code: spur_core::process::shell_exit_code(&output.status),
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         }))
@@ -1635,6 +1832,12 @@ impl SlurmAgent for AgentService {
 }
 
 impl AgentService {
+    async fn drop_tracked_job(&self, job_id: u32) {
+        if self.running.lock().await.remove(&job_id).is_some() {
+            self.allocation.lock().await.release_job(job_id);
+        }
+    }
+
     /// Record controller-allocated GPUs and allocate local CPU/memory resources.
     async fn allocate_local_resources(
         &self,
@@ -1721,6 +1924,16 @@ impl AgentService {
 
     /// Send a user-specified signal to a running job.
     async fn send_explicit_signal(&self, job_id: u32, signal: i32) {
+        let is_allocation_only = {
+            let jobs = self.running.lock().await;
+            jobs.get(&job_id)
+                .is_some_and(|tracked| tracked.job.is_allocation_only())
+        };
+        if is_allocation_only {
+            self.drop_tracked_job(job_id).await;
+            return;
+        }
+
         let jobs = self.running.lock().await;
         let Some(tracked) = jobs.get(&job_id) else {
             return;
@@ -1748,6 +1961,16 @@ impl AgentService {
 
     /// SIGTERM now, escalate to SIGKILL after a 5-second grace period.
     async fn graceful_cancel(&self, job_id: u32) {
+        let is_allocation_only = {
+            let jobs = self.running.lock().await;
+            jobs.get(&job_id)
+                .is_some_and(|tracked| tracked.job.is_allocation_only())
+        };
+        if is_allocation_only {
+            self.drop_tracked_job(job_id).await;
+            return;
+        }
+
         {
             let jobs = self.running.lock().await;
             let Some(tracked) = jobs.get(&job_id) else {
@@ -1813,6 +2036,7 @@ impl TrackedJob {
             cpus: 1,
             memory_mb: 0,
             nodelist: String::new(),
+            mpi: String::new(),
         }
     }
 }
@@ -1993,7 +2217,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
-    // --- #146: srun-in-salloc step dispatch via RunCommand ---
+    // --- srun step dispatch via RunCommand ---
     //
     // Regression: srun's run_as_step previously called
     //   tokio::process::Command::new(args.command[0]).status()
@@ -2015,6 +2239,7 @@ mod tests {
             work_dir: String::new(),
             environment: HashMap::new(),
             job_id,
+            ..Default::default()
         });
         let resp = svc.run_command(req).await.unwrap().into_inner();
         assert_eq!(resp.exit_code, 0);
@@ -2032,6 +2257,7 @@ mod tests {
             work_dir: String::new(),
             environment: HashMap::new(),
             job_id,
+            ..Default::default()
         });
         let resp = svc.run_command(req).await.unwrap().into_inner();
         assert_eq!(resp.exit_code, 1, "false exits 1");
@@ -2049,6 +2275,7 @@ mod tests {
             work_dir: String::new(),
             environment: env,
             job_id,
+            ..Default::default()
         });
         let resp = svc.run_command(req).await.unwrap().into_inner();
         assert_eq!(resp.exit_code, 0);
@@ -2070,6 +2297,7 @@ mod tests {
             work_dir: String::new(),
             environment: HashMap::new(),
             job_id: 0,
+            ..Default::default()
         });
         let err = svc.run_command(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -2090,6 +2318,7 @@ mod tests {
             work_dir: String::new(),
             environment: HashMap::new(),
             job_id: 0,
+            ..Default::default()
         });
         let err = svc.run_command(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -2110,6 +2339,7 @@ mod tests {
             work_dir: String::new(),
             environment: HashMap::new(),
             job_id: 999,
+            ..Default::default()
         });
         let err = svc.run_command(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
@@ -2133,6 +2363,7 @@ mod tests {
             work_dir: tmp_canonical.to_string_lossy().into_owned(),
             environment: HashMap::new(),
             job_id,
+            ..Default::default()
         });
         let resp = svc.run_command(req).await.unwrap().into_inner();
         assert_eq!(resp.exit_code, 0);
@@ -2298,6 +2529,7 @@ mod tests {
             work_dir: String::new(),
             environment: HashMap::new(),
             job_id,
+            ..Default::default()
         });
         let resp = svc.run_command(req).await.unwrap().into_inner();
         assert_eq!(resp.exit_code, 0);
@@ -2384,6 +2616,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             nodelist: String::new(),
+            mpi: String::new(),
         };
         svc.insert_test_job(job_id, tracked).await;
 

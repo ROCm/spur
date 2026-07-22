@@ -273,14 +273,17 @@ pub struct ControllerConfig {
     #[serde(default = "default_one")]
     pub first_job_id: u32,
 
-    /// Raft peers for HA consensus. Each entry is "host:port" (Raft gRPC address).
-    /// If empty, single-node mode (no Raft, no replication).
+    /// Raft peers for HA consensus, "host:port" each. Empty = single-node mode.
+    /// Must be identically ordered on every controller: node ids derive from
+    /// list position, so a reordered list can form an inconsistent voter set.
     /// Example: ["node1:6821", "node2:6821", "node3:6821"]
     #[serde(default)]
     pub peers: Vec<String>,
 
-    /// This node's Raft ID. If not set, auto-derived from hostname ordinal
-    /// (e.g. spurctld-2 → node_id 3) or defaults to 1.
+    /// This node's Raft ID. Normally unset; single-node mode always uses 1.
+    /// Otherwise resolved as: explicit value, else position in `peers` (by
+    /// hostname), else hostname ordinal (IP-only peers). Must be in
+    /// `1..=peers.len()` and, if set, equal its position (index + 1).
     pub node_id: Option<u64>,
 
     /// Listen address for Raft internal gRPC traffic (separate from client API).

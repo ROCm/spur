@@ -771,10 +771,87 @@ impl RaftHandle {
     }
 }
 
-/// Auto-detect node_id from hostname ordinal (e.g., "spurctld-2" → 3).
-pub fn detect_node_id_from_hostname() -> Option<u64> {
-    let hostname = hostname::get().ok()?;
-    node_id_from_hostname(&hostname.to_string_lossy())
+/// The system hostname as a UTF-8 string.
+pub fn system_hostname() -> anyhow::Result<String> {
+    let name = hostname::get().map_err(|e| anyhow::anyhow!("failed to read hostname: {e}"))?;
+    Ok(name.to_string_lossy().into_owned())
+}
+
+/// How a node's Raft id was determined, for startup diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeIdSource {
+    Explicit,
+    PeersPosition,
+    HostnameOrdinal,
+}
+
+impl std::fmt::Display for NodeIdSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            NodeIdSource::Explicit => "explicit controller.node_id",
+            NodeIdSource::PeersPosition => "position in controller.peers",
+            NodeIdSource::HostnameOrdinal => "hostname ordinal",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Resolve this node's Raft id (multi-node; `peers` non-empty). Precedence:
+/// explicit -> position in `peers` -> hostname ordinal. Validated to be in
+/// `1..=peers.len()`, else fails fast (an out-of-range id splits brain).
+pub fn resolve_node_id(
+    explicit: Option<u64>,
+    hostname: &str,
+    peers: &[String],
+) -> anyhow::Result<(u64, NodeIdSource)> {
+    let n = peers.len() as u64;
+
+    if let Some(id) = explicit {
+        if !(1..=n).contains(&id) {
+            anyhow::bail!(
+                "controller.node_id = {id} is out of range for {n} configured \
+                 controller.peers (must be 1..={n})"
+            );
+        }
+        return Ok((id, NodeIdSource::Explicit));
+    }
+
+    if let Some(id) = node_id_from_peers(hostname, peers)? {
+        return Ok((id, NodeIdSource::PeersPosition));
+    }
+
+    // Ordinal fallback only fits IP-only peers (no hostname to match). With
+    // hostname peers a no-match is a misconfig: fail fast, don't guess an id.
+    if !all_peers_ip_only(peers) {
+        anyhow::bail!(
+            "this host ({hostname:?}) matched no entry in controller.peers; fix the \
+             hostname to match its peers entry or set controller.node_id in spur.conf"
+        );
+    }
+
+    // Accept the ordinal only if in range; out-of-range is a misconfig.
+    if let Some(id) = node_id_from_hostname(hostname) {
+        if (1..=n).contains(&id) {
+            return Ok((id, NodeIdSource::HostnameOrdinal));
+        }
+        anyhow::bail!(
+            "hostname {hostname:?} yields Raft node_id {id} via ordinal fallback, \
+             out of range for {n} configured controller.peers; fix the hostname \
+             to match its controller.peers entry or set controller.node_id"
+        );
+    }
+
+    anyhow::bail!(
+        "controller.peers are IP-only and hostname {hostname:?} has no ordinal to \
+         derive a node_id from; set controller.node_id in spur.conf"
+    )
+}
+
+/// True when every peer host is an IP literal (no hostname to match against).
+fn all_peers_ip_only(peers: &[String]) -> bool {
+    peers
+        .iter()
+        .all(|entry| peer_host(entry).parse::<std::net::IpAddr>().is_ok())
 }
 
 /// Parse a node_id from a hostname string. The ordinal after the last '-'
@@ -782,6 +859,91 @@ pub fn detect_node_id_from_hostname() -> Option<u64> {
 pub fn node_id_from_hostname(hostname: &str) -> Option<u64> {
     let ordinal: u64 = hostname.rsplit('-').next()?.parse().ok()?;
     Some(ordinal + 1)
+}
+
+/// Node id (index + 1) of the `peers` entry matching `hostname`, on the full
+/// name or first DNS label (so `spurctld-0` matches `spurctld-0.ns.svc...`).
+/// `Ok(None)` if none match; errors if several do (guessing risks split-brain).
+pub fn node_id_from_peers(hostname: &str, peers: &[String]) -> anyhow::Result<Option<u64>> {
+    let matches: Vec<u64> = peers
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| host_matches(hostname, peer_host(entry)))
+        .map(|(i, _)| i as u64 + 1)
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [id] => Ok(Some(*id)),
+        ids => anyhow::bail!(
+            "hostname {hostname:?} matches multiple controller.peers entries \
+             (node ids {ids:?}); set controller.node_id explicitly"
+        ),
+    }
+}
+
+/// Extract the host part from a `host:port` peer entry, handling bracketed IPv6
+/// (`[::1]:6821`) and bare hosts.
+fn peer_host(entry: &str) -> &str {
+    let entry = entry.trim();
+    if let Some(rest) = entry.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    // One ':' is "host:port"; more colons are an unbracketed IPv6 literal (no port).
+    match entry.rsplit_once(':') {
+        Some((host, _)) if !host.contains(':') => host,
+        _ => entry,
+    }
+}
+
+/// True if `hostname` matches `peer_host` in full or on the first DNS label.
+fn host_matches(hostname: &str, peer_host: &str) -> bool {
+    if hostname.eq_ignore_ascii_case(peer_host) {
+        return true;
+    }
+    first_label(hostname).eq_ignore_ascii_case(first_label(peer_host))
+}
+
+/// The segment of a hostname before the first '.' (its first DNS label).
+fn first_label(host: &str) -> &str {
+    host.split('.').next().unwrap_or(host)
+}
+
+/// Guard against a shifted node identity across restarts: the id is re-derived
+/// each boot but persisted Raft state belongs to the old id, so a reordered or
+/// renamed peer would orphan committed entries. Persist first, then verify.
+fn persist_or_verify_node_id(state_dir: &Path, node_id: NodeId) -> anyhow::Result<()> {
+    let raft_dir = state_dir.join("raft");
+    std::fs::create_dir_all(&raft_dir)?;
+    let path = raft_dir.join("node_id");
+
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => {
+            let prev: NodeId = contents.trim().parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "failed to parse persisted node_id {:?} at {}",
+                    contents.trim(),
+                    path.display()
+                )
+            })?;
+            if prev != node_id {
+                anyhow::bail!(
+                    "resolved Raft node_id {node_id} differs from persisted id {prev} at {}; \
+                     the controller.peers ordering or this host's name likely changed. \
+                     Running under a new id would orphan committed Raft state. Restore the \
+                     previous identity, or wipe the raft state dir to rejoin as a fresh member.",
+                    path.display()
+                );
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let tmp = raft_dir.join("node_id.tmp");
+            std::fs::write(&tmp, node_id.to_string())?;
+            std::fs::rename(&tmp, &path)?;
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!("failed to read {}: {e}", path.display())),
+    }
 }
 
 /// Build a 1-indexed peer map from the config peers list.
@@ -822,6 +984,8 @@ pub async fn start_raft_with_recovery_mode(
         ..Default::default()
     };
     let config = Arc::new(config.validate().map_err(|e| anyhow::anyhow!("{e}"))?);
+
+    persist_or_verify_node_id(state_dir, node_id)?;
 
     let store = Arc::new(SpurStore::new_with_recovery_mode(
         state_dir,
@@ -929,6 +1093,171 @@ mod tests {
     #[test]
     fn hostname_non_numeric_suffix() {
         assert_eq!(node_id_from_hostname("ctrl-abc"), None);
+    }
+
+    #[test]
+    fn peers_position_mapping() {
+        let peers = vec![
+            "hostA:6821".to_string(),
+            "hostB:6821".to_string(),
+            "hostC:6821".to_string(),
+        ];
+        assert_eq!(node_id_from_peers("hostA", &peers).unwrap(), Some(1));
+        assert_eq!(node_id_from_peers("hostB", &peers).unwrap(), Some(2));
+        assert_eq!(node_id_from_peers("hostC", &peers).unwrap(), Some(3));
+    }
+
+    #[test]
+    fn peers_short_hostname_matches_fqdn_entry() {
+        let peers = vec![
+            "spurctld-0.ns.svc.cluster.local:6821".to_string(),
+            "spurctld-1.ns.svc.cluster.local:6821".to_string(),
+        ];
+        assert_eq!(node_id_from_peers("spurctld-0", &peers).unwrap(), Some(1));
+        assert_eq!(node_id_from_peers("spurctld-1", &peers).unwrap(), Some(2));
+    }
+
+    #[test]
+    fn peers_fqdn_hostname_matches_short_entry() {
+        let peers = vec!["node1:6821".to_string(), "node2:6821".to_string()];
+        assert_eq!(
+            node_id_from_peers("node2.example.com", &peers).unwrap(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn peers_no_match_is_none() {
+        let peers = vec!["hostA:6821".to_string(), "hostB:6821".to_string()];
+        assert_eq!(node_id_from_peers("hostZ", &peers).unwrap(), None);
+    }
+
+    #[test]
+    fn peers_ambiguous_match_errors() {
+        // Same first DNS label in two different domains: both reduce to "n1".
+        let peers = vec!["n1.dc-a:6821".to_string(), "n1.dc-b:6821".to_string()];
+        assert!(node_id_from_peers("n1", &peers).is_err());
+    }
+
+    #[test]
+    fn peers_matches_bracketed_ipv6_entry() {
+        let peers = vec!["[::1]:6821".to_string(), "hostB:6821".to_string()];
+        assert_eq!(peer_host("[::1]:6821"), "::1");
+        assert_eq!(node_id_from_peers("hostB", &peers).unwrap(), Some(2));
+    }
+
+    #[test]
+    fn peer_host_parsing() {
+        assert_eq!(peer_host("host:6821"), "host");
+        assert_eq!(peer_host("host"), "host");
+        assert_eq!(peer_host("host.example.com:6821"), "host.example.com");
+        assert_eq!(peer_host("[2001:db8::1]:6821"), "2001:db8::1");
+    }
+
+    fn three_peers() -> Vec<String> {
+        vec![
+            "hostA:6821".to_string(),
+            "hostB:6821".to_string(),
+            "hostC:6821".to_string(),
+        ]
+    }
+
+    #[test]
+    fn resolve_explicit_wins() {
+        let (id, source) = resolve_node_id(Some(2), "hostA", &three_peers()).unwrap();
+        assert_eq!(id, 2);
+        assert_eq!(source, NodeIdSource::Explicit);
+    }
+
+    #[test]
+    fn resolve_explicit_out_of_range_errors() {
+        assert!(resolve_node_id(Some(9), "hostA", &three_peers()).is_err());
+        assert!(resolve_node_id(Some(0), "hostA", &three_peers()).is_err());
+    }
+
+    #[test]
+    fn resolve_peers_position() {
+        let (id, source) = resolve_node_id(None, "hostC", &three_peers()).unwrap();
+        assert_eq!(id, 3);
+        assert_eq!(source, NodeIdSource::PeersPosition);
+    }
+
+    #[test]
+    fn resolve_hostname_ordinal_fallback_for_ip_peers() {
+        // IP-only peers can't match a hostname; the ordinal fallback applies.
+        let peers = vec![
+            "10.0.0.1:6821".to_string(),
+            "10.0.0.2:6821".to_string(),
+            "10.0.0.3:6821".to_string(),
+        ];
+        let (id, source) = resolve_node_id(None, "spurctld-1", &peers).unwrap();
+        assert_eq!(id, 2);
+        assert_eq!(source, NodeIdSource::HostnameOrdinal);
+    }
+
+    #[test]
+    fn resolve_ordinal_out_of_range_errors() {
+        // spurctld-5 -> ordinal id 6, but only 3 IP-only peers exist.
+        let peers = vec![
+            "10.0.0.1:6821".to_string(),
+            "10.0.0.2:6821".to_string(),
+            "10.0.0.3:6821".to_string(),
+        ];
+        assert!(resolve_node_id(None, "spurctld-5", &peers).is_err());
+    }
+
+    #[test]
+    fn resolve_no_match_errors() {
+        assert!(resolve_node_id(None, "unknownhost", &three_peers()).is_err());
+    }
+
+    #[test]
+    fn resolve_hostname_peers_no_match_does_not_fall_back_to_ordinal() {
+        // spurctld-1 has a valid in-range ordinal (2), but hostname peers with
+        // no match must fail fast, not fall back to it.
+        let err = resolve_node_id(None, "spurctld-1", &three_peers()).unwrap_err();
+        assert!(
+            err.to_string().contains("matched no entry"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_ip_only_peers_without_ordinal_errors() {
+        let peers = vec!["10.0.0.1:6821".to_string(), "10.0.0.2:6821".to_string()];
+        assert!(resolve_node_id(None, "plainhost", &peers).is_err());
+    }
+
+    #[test]
+    fn node_id_persists_on_first_boot() {
+        let dir = TempDir::new().unwrap();
+        persist_or_verify_node_id(dir.path(), 2).unwrap();
+        let persisted = std::fs::read_to_string(dir.path().join("raft").join("node_id")).unwrap();
+        assert_eq!(persisted.trim(), "2");
+    }
+
+    #[test]
+    fn node_id_same_across_restart_is_ok() {
+        let dir = TempDir::new().unwrap();
+        persist_or_verify_node_id(dir.path(), 3).unwrap();
+        persist_or_verify_node_id(dir.path(), 3).unwrap();
+    }
+
+    #[test]
+    fn node_id_shift_across_restart_fails_fast() {
+        let dir = TempDir::new().unwrap();
+        persist_or_verify_node_id(dir.path(), 1).unwrap();
+        let err = persist_or_verify_node_id(dir.path(), 2).unwrap_err();
+        assert!(
+            err.to_string().contains("differs from persisted id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_ambiguous_match_errors() {
+        let peers = vec!["n1.dc-a:6821".to_string(), "n1.dc-b:6821".to_string()];
+        assert!(resolve_node_id(None, "n1", &peers).is_err());
     }
 
     #[test]

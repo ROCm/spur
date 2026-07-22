@@ -59,8 +59,20 @@ pub struct SallocArgs {
     pub constraint: Option<String>,
 
     /// Node list
-    #[arg(short = 'w', long)]
+    #[arg(
+        short = 'w',
+        long,
+        overrides_with_all = ["nodelist", "nodefile"]
+    )]
     pub nodelist: Option<String>,
+
+    /// Read the node list from a file
+    #[arg(
+        short = 'F',
+        long,
+        overrides_with_all = ["nodelist", "nodefile"]
+    )]
+    pub nodefile: Option<String>,
 
     /// Exclude nodes
     #[arg(short = 'x', long)]
@@ -91,6 +103,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let matches = SallocArgs::command().try_get_matches_from(&args)?;
     let mut args = SallocArgs::from_arg_matches(&matches)?;
     resolve_salloc_env(&matches, &mut args);
+    let nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
 
     let name = args.job_name.unwrap_or_else(|| "interactive".into());
     let mut gres = args.gres;
@@ -115,7 +128,6 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let controller = args.controller.clone();
     let exclusive = args.exclusive;
     let constraint = args.constraint;
-    let nodelist = args.nodelist;
     let exclude = args.exclude;
     let reservation = args.reservation;
     let partition = args.partition;
@@ -372,6 +384,19 @@ mod tests {
                 .expect("parse failed");
         assert_eq!(args.nodelist.as_deref(), Some("node001"));
         assert_eq!(args.exclude.as_deref(), Some("node002"));
+    }
+
+    #[test]
+    fn parses_nodefile_short_and_long() {
+        let short = SallocArgs::try_parse_from(["salloc", "-F", "nodes.txt"])
+            .expect("parse short nodefile");
+        assert_eq!(short.nodefile.as_deref(), Some("nodes.txt"));
+        assert!(short.nodelist.is_none());
+
+        let long = SallocArgs::try_parse_from(["salloc", "--nodefile=other.txt"])
+            .expect("parse long nodefile");
+        assert_eq!(long.nodefile.as_deref(), Some("other.txt"));
+        assert!(long.nodelist.is_none());
     }
 
     // These mutate process-global env vars, so they run serially and use the

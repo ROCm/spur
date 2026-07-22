@@ -128,19 +128,16 @@ async fn main() -> anyhow::Result<()> {
         info!("single-node Raft mode (no peers configured)");
         (vec![raft_addr], 1u64)
     } else {
-        let id = config
-            .controller
-            .node_id
-            .or_else(raft::detect_node_id_from_hostname)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Raft peers configured but node_id could not be determined. \
-                 Set controller.node_id in spur.conf or use a hostname ending \
-                 in -N (e.g. spurctld-0)."
-                )
-            })?;
+        let hostname = raft::system_hostname()?;
+        let (id, source) = raft::resolve_node_id(
+            config.controller.node_id,
+            &hostname,
+            &config.controller.peers,
+        )?;
         info!(
             node_id = id,
+            source = %source,
+            hostname,
             peers = ?config.controller.peers,
             "initializing Raft consensus"
         );

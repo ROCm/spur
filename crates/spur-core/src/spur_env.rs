@@ -64,6 +64,47 @@ impl SpurEnv {
             "  export SLURM_PROCID=$((SPUR_TASK_OFFSET + LOCAL_RANK))\n",
         )
     }
+
+    /// Step-scoped variables shared by every task in an srun step.
+    pub fn apply_step_scope(
+        senv: &mut SpurEnv,
+        job_id: u32,
+        step_id: u32,
+        step_num_tasks: u32,
+        node_id: u32,
+        num_nodes: u32,
+    ) {
+        senv.set_with_slurm_twin("SPUR_STEP_ID", step_id);
+        senv.set_with_slurm_twin("SPUR_STEPID", step_id);
+        senv.set_with_slurm_twin("SPUR_STEP_NUM_TASKS", step_num_tasks);
+        senv.set_with_slurm_twin("SPUR_NTASKS", step_num_tasks);
+        senv.set_with_slurm_twin("SPUR_NPROCS", step_num_tasks);
+        senv.set_with_slurm_twin("SPUR_NODEID", node_id);
+        senv.set_with_slurm_twin("SPUR_NNODES", num_nodes);
+        senv.set_with_slurm_twin("SPUR_JOB_NUM_NODES", num_nodes);
+        senv.set_with_slurm_twin("SPUR_JOB_ID", job_id);
+        senv.set_with_slurm_twin("SPUR_JOBID", job_id);
+    }
+
+    /// Per-task rank variables for a single-process step or batch launch.
+    pub fn apply_task_rank(
+        senv: &mut SpurEnv,
+        task_offset: u32,
+        local_rank: u32,
+        tasks_on_node: u32,
+    ) {
+        let procid = task_offset + local_rank;
+        senv.set("SPUR_TASK_OFFSET", task_offset);
+        senv.set("LOCAL_RANK", local_rank);
+        senv.set("LOCAL_WORLD_SIZE", tasks_on_node);
+        senv.set("NPROC_PER_NODE", tasks_on_node);
+        senv.set_with_slurm_twin("SPUR_LOCALID", local_rank);
+        senv.set_with_slurm_twin("SPUR_PROCID", procid);
+        senv.set("PMI_RANK", procid);
+        senv.set("PMIX_RANK", procid);
+        senv.set("OMPI_COMM_WORLD_RANK", procid);
+        senv.set("OMPI_COMM_WORLD_LOCAL_RANK", local_rank);
+    }
 }
 
 impl Default for SpurEnv {
@@ -159,5 +200,29 @@ mod tests {
         assert!(exports.contains("SLURM_LOCALID"));
         assert!(exports.contains("SPUR_PROCID"));
         assert!(exports.contains("SLURM_PROCID"));
+    }
+
+    #[test]
+    fn apply_task_rank_sets_procid_twins() {
+        let mut env = SpurEnv::new();
+        SpurEnv::apply_task_rank(&mut env, 1, 0, 1);
+        let map = env.into_map();
+        assert_eq!(map["SPUR_PROCID"], "1");
+        assert_eq!(map["SLURM_PROCID"], "1");
+        assert_eq!(map["SPUR_LOCALID"], "0");
+        assert_eq!(map["SLURM_LOCALID"], "0");
+    }
+
+    #[test]
+    fn apply_step_scope_sets_step_id_twins() {
+        let mut env = SpurEnv::new();
+        SpurEnv::apply_step_scope(&mut env, 42, 3, 8, 1, 2);
+        let map = env.into_map();
+        assert_eq!(map["SPUR_STEP_ID"], "3");
+        assert_eq!(map["SLURM_STEP_ID"], "3");
+        assert_eq!(map["SPUR_NTASKS"], "8");
+        assert_eq!(map["SLURM_NTASKS"], "8");
+        assert_eq!(map["SPUR_NODEID"], "1");
+        assert_eq!(map["SPUR_NNODES"], "2");
     }
 }

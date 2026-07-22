@@ -59,7 +59,7 @@ pub async fn association_maps(
     HashSet<(String, String)>,
     HashMap<(String, String), AccountLimits>,
 )> {
-    let users = db::list_users(pool, None).await?;
+    let users = db::list_users(pool, None, None).await?;
 
     let mut default_qos = HashMap::new();
     let mut default_account = HashMap::new();

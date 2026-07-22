@@ -266,6 +266,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                     remove_users: split_csv(&remove_users),
                     add_accounts: split_csv(&add_accounts),
                     remove_accounts: split_csv(&remove_accounts),
+                    user: whoami::username().unwrap_or_else(|_| "unknown".into()),
                 })
                 .await
                 .context("failed to update reservation")?;
@@ -456,6 +457,9 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 }
                 if !res.users.is_empty() {
                     println!("   Users={}", res.users);
+                }
+                if !res.owner.is_empty() {
+                    println!("   Owner={}", res.owner);
                 }
                 println!();
             }
@@ -736,6 +740,7 @@ async fn create_reservation(
             accounts: account_list,
             users: user_list,
             flags: flag_list,
+            user: whoami::username().unwrap_or_else(|_| "unknown".into()),
         })
         .await
         .context("failed to create reservation")?;
@@ -754,6 +759,7 @@ async fn delete_reservation(controller: &str, name: &str) -> Result<()> {
     client
         .delete_reservation(spur_proto::proto::DeleteReservationRequest {
             name: name.to_string(),
+            user: whoami::username().unwrap_or_else(|_| "unknown".into()),
         })
         .await
         .context("failed to delete reservation")?;

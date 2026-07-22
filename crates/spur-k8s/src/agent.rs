@@ -598,15 +598,20 @@ impl SlurmAgent for VirtualAgent {
         &self,
         _request: Request<RunCommandRequest>,
     ) -> Result<Response<RunCommandResponse>, Status> {
-        // #146: srun-in-salloc step dispatch. The K8s virtual agent does
-        // not currently support one-shot commands outside the job pod's
-        // lifecycle — salloc + srun-in-allocation is not a common K8s
-        // workflow. Implementations that need it could spawn a transient
-        // pod (e.g. via PodSpec with the same image as the allocation
-        // template), but that's a non-trivial design choice and the
-        // user-facing path uses the native spurd agent.
+        // Srun step dispatch. The K8s virtual agent does not currently support
+        // one-shot commands outside the job pod's lifecycle — salloc plus
+        // srun-in-allocation is not a common K8s workflow.
         Err(Status::unimplemented(
             "RunCommand is not yet supported by the K8s virtual agent",
+        ))
+    }
+
+    async fn register_job_allocation(
+        &self,
+        _request: Request<RegisterJobAllocationRequest>,
+    ) -> Result<Response<RegisterJobAllocationResponse>, Status> {
+        Err(Status::unimplemented(
+            "RegisterJobAllocation is not yet supported by the K8s virtual agent",
         ))
     }
 

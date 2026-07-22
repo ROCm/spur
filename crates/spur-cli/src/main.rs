@@ -9,6 +9,7 @@ mod image;
 mod k8s;
 mod net;
 mod node;
+mod nodelist;
 mod sacct;
 mod sacctmgr;
 mod salloc;
