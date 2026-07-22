@@ -1009,6 +1009,8 @@ impl SlurmAgent for AgentService {
                     return Ok(Response::new(LaunchJobResponse {
                         success: false,
                         error: "reservation reclaimed during launch".into(),
+                        stdout_path: String::new(),
+                        stderr_path: String::new(),
                     }));
                 }
 
@@ -1225,16 +1227,6 @@ impl SlurmAgent for AgentService {
             return Err(Status::invalid_argument("job_id is required"));
         }
 
-        {
-            let jobs = self.running.lock().await;
-            if jobs.contains_key(&req.job_id) {
-                return Err(Status::already_exists(format!(
-                    "job {} already registered on this node",
-                    req.job_id
-                )));
-            }
-        }
-
         let allocated = req.allocated.as_ref();
         let mut controller_gpu_ids: Vec<u32> = allocated
             .and_then(|a| a.devices.get("gpu"))
@@ -1251,9 +1243,16 @@ impl SlurmAgent for AgentService {
         let cpus = allocated.map(|a| a.cpus).unwrap_or(req.cpus).max(1);
         let memory_mb = allocated.map(|a| a.memory_mb).unwrap_or(req.memory_mb);
 
-        // running-before-allocation (as in commit) so the job is never
+        // Hold the running lock across the duplicate check, reserve+commit, and
+        // insert (running → allocation, as in commit) so the job is never
         // committed-but-absent-from-running, which the reclaim reads as stale.
         let mut jobs = self.running.lock().await;
+        if jobs.contains_key(&req.job_id) {
+            return Err(Status::already_exists(format!(
+                "job {} already registered on this node",
+                req.job_id
+            )));
+        }
         {
             let mut alloc = self.allocation.lock().await;
             alloc
@@ -1267,8 +1266,6 @@ impl SlurmAgent for AgentService {
                         req.job_id
                     )),
                 })?;
-            // Reserve and commit under one lock scope, so reconcile can't
-            // interleave and reclaim between them.
             let _ = alloc.commit_job(req.job_id);
         }
 
@@ -1305,6 +1302,7 @@ impl SlurmAgent for AgentService {
                 run_attempt: 0,
             },
         );
+        drop(jobs);
 
         Ok(Response::new(RegisterJobAllocationResponse {}))
     }
@@ -3171,6 +3169,58 @@ mod tests {
             .await;
         let err = res.expect_err("must reject: GPU 1's owner is still running");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    }
+
+    // A registered srun allocation must be committed AND tracked in `running`
+    // so a reconcile pass spares it — the reservation is backed, not orphaned.
+    #[tokio::test]
+    async fn register_job_allocation_survives_reconcile() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let mut devices = std::collections::HashMap::new();
+        devices.insert(
+            "gpu".to_string(),
+            DeviceAllocations {
+                devices: vec![AllocatedDevice {
+                    device_id: 0,
+                    count: 1,
+                }],
+            },
+        );
+        svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            job_id: 55,
+            cpus: 1,
+            allocated: Some(ResourceAllocations {
+                cpus: 1,
+                memory_mb: 0,
+                devices,
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("register");
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "registered allocation holds the GPU"
+        );
+
+        // The job is in `running`, so reconcile must spare it (not orphan-reclaim).
+        {
+            let jobs = svc.running.lock().await;
+            reconcile_orphaned_allocations(&jobs, &mut *svc.allocation.lock().await);
+        }
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "committed+tracked allocation must survive reconcile"
+        );
     }
 
     // CancelJob must release a still-launching (never-committed) reservation,
