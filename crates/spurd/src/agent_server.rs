@@ -336,7 +336,8 @@ struct DrainRequest {
 }
 
 /// Reclaim a launch reservation that never commits within this bound. Sized
-/// above a worst-case image pull + fork so an in-flight launch isn't reclaimed.
+/// above a typical image pull + fork so a normal launch is spared; one stalled
+/// past this bound is reclaimed.
 const LAUNCHING_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Reclaim allocations whose job is no longer tracked and is not mid-launch,
@@ -386,16 +387,16 @@ impl Drop for LaunchReservationGuard {
             return;
         }
         let job_id = self.job_id;
-        // Drop can't await; try_lock succeeds inline on this uncontended path,
-        // else spawn the release so the reservation is never left stranded.
+        // Drop can't await; try_lock succeeds inline on this uncontended path.
         if let Ok(mut alloc) = self.allocation.try_lock() {
             alloc.release_job(job_id);
-        } else {
+        } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let allocation = self.allocation.clone();
-            tokio::spawn(async move {
+            handle.spawn(async move {
                 allocation.lock().await.release_job(job_id);
             });
         }
+        // No runtime (shutdown) and lock held: reconcile reclaims via the TTL.
     }
 }
 

@@ -234,7 +234,9 @@ impl NodeAllocation {
                     return false;
                 }
                 match self.launching.get(id) {
-                    Some(reserved_at) => now.duration_since(*reserved_at) >= launching_ttl,
+                    Some(reserved_at) => {
+                        now.saturating_duration_since(*reserved_at) >= launching_ttl
+                    }
                     None => true,
                 }
             })
