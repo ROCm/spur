@@ -373,6 +373,29 @@ impl SlurmAccounting for AccountingService {
                 )));
             }
         }
+        let allowed_qos: Vec<&str> = req
+            .allowed_qos
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        for name in &allowed_qos {
+            let exists = db::qos_exists(&self.pool, name)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            if !exists {
+                return Err(Status::not_found(format!("QOS '{name}' does not exist")));
+            }
+        }
+        if !req.default_qos.is_empty()
+            && !allowed_qos.is_empty()
+            && !allowed_qos.contains(&req.default_qos.as_str())
+        {
+            return Err(Status::invalid_argument(format!(
+                "default QOS '{}' must be included in qos={}",
+                req.default_qos, req.allowed_qos
+            )));
+        }
         let max_running_jobs = if req.max_running_jobs == 0 {
             None
         } else {
@@ -416,6 +439,7 @@ impl SlurmAccounting for AccountingService {
             &req.admin_level,
             req.is_default,
             &req.default_qos,
+            &req.allowed_qos,
             max_running_jobs,
             max_submit_jobs,
             max_tres_per_job,
@@ -465,6 +489,7 @@ impl SlurmAccounting for AccountingService {
                 admin_level: r.admin_level,
                 default_account: r.default_account.unwrap_or_default(),
                 default_qos: r.default_qos.unwrap_or_default(),
+                allowed_qos: r.allowed_qos.unwrap_or_default(),
             })
             .collect();
 

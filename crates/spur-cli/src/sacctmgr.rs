@@ -127,6 +127,25 @@ const QOS_KEYS: &[&str] = &[
     "grpwall",
 ];
 
+/// Input keys the `add`/`modify user` handlers read (names + aliases). Gates
+/// mistyped fields the same way `QOS_KEYS`/`ACCOUNT_KEYS` do.
+const USER_KEYS: &[&str] = &[
+    "name",
+    "user",
+    "account",
+    "defaultaccount",
+    "adminlevel",
+    "defaultqos",
+    "qos",
+    "maxrunningjobs",
+    "maxjobs",
+    "maxsubmitjobs",
+    "maxtresperjob",
+    "grptres",
+    "maxwall",
+    "maxwallduration",
+];
+
 /// Input keys the `add`/`modify account` handlers read (names + aliases). Gates
 /// mistyped fields the same way `QOS_KEYS` does, so an unsupported field errors
 /// loudly instead of being silently dropped.
@@ -187,6 +206,7 @@ struct UserUpsertFields {
     account: String,
     admin: String,
     default_qos: String,
+    allowed_qos: String,
     max_running_jobs: u32,
     max_submit_jobs: u32,
     max_tres_per_job: String,
@@ -201,6 +221,7 @@ struct UserUpsertFields {
 fn build_add_user_request(
     p: &std::collections::HashMap<String, String>,
 ) -> Result<UserUpsertFields> {
+    reject_unknown_keys(p, USER_KEYS)?;
     let name = p
         .get("name")
         .or_else(|| p.get("user"))
@@ -216,6 +237,16 @@ fn build_add_user_request(
         .cloned()
         .unwrap_or_else(|| "none".into());
     let default_qos = p.get("defaultqos").cloned().unwrap_or_default();
+    let allowed_qos = p.get("qos").cloned().unwrap_or_default();
+    if !default_qos.is_empty()
+        && !allowed_qos.is_empty()
+        && !allowed_qos
+            .split(',')
+            .map(str::trim)
+            .any(|q| q == default_qos)
+    {
+        bail!("defaultqos={default_qos} must be included in qos={allowed_qos}");
+    }
     let max_running_jobs: u32 = p
         .get("maxrunningjobs")
         .or_else(|| p.get("maxjobs"))
@@ -241,6 +272,7 @@ fn build_add_user_request(
         account,
         admin,
         default_qos,
+        allowed_qos,
         max_running_jobs,
         max_submit_jobs,
         max_tres_per_job,
@@ -323,6 +355,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                         .map(|da| da == &fields.account)
                         .unwrap_or(true),
                     default_qos: fields.default_qos.clone(),
+                    allowed_qos: fields.allowed_qos.clone(),
                     max_running_jobs: fields.max_running_jobs,
                     max_submit_jobs: fields.max_submit_jobs,
                     max_tres_per_job: fields.max_tres_per_job.clone(),
@@ -336,6 +369,9 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 " Adding User(s)\n  Name       = {}\n  Account    = {}\n  Admin      = {}",
                 fields.name, fields.account, fields.admin
             );
+            if !fields.allowed_qos.is_empty() {
+                println!("  QOS        = {}", fields.allowed_qos);
+            }
             if !fields.default_qos.is_empty() {
                 println!("  DefQOS     = {}", fields.default_qos);
             }
@@ -598,6 +634,7 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
                         .map(|da| da == &fields.account)
                         .unwrap_or(true),
                     default_qos: fields.default_qos.clone(),
+                    allowed_qos: fields.allowed_qos.clone(),
                     max_running_jobs: fields.max_running_jobs,
                     max_submit_jobs: fields.max_submit_jobs,
                     max_tres_per_job: fields.max_tres_per_job.clone(),
@@ -608,6 +645,9 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 .context("AddUser (modify) RPC failed")?;
 
             println!(" Modified user '{}'.", fields.name);
+            if !fields.allowed_qos.is_empty() {
+                println!("  QOS        = {}", fields.allowed_qos);
+            }
             if !fields.default_qos.is_empty() {
                 println!("  DefQOS     = {}", fields.default_qos);
             }
@@ -691,15 +731,20 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
             let users = resp.into_inner().users;
 
             println!(
-                "{:<15} {:<20} {:<10} {:<20} {:<15}",
-                "User", "Account", "Admin", "Default Acct", "Def QOS"
+                "{:<15} {:<20} {:<10} {:<20} {:<20} {:<15}",
+                "User", "Account", "Admin", "Default Acct", "QOS", "Def QOS"
             );
-            println!("{}", "-".repeat(80));
+            println!("{}", "-".repeat(95));
 
             for u in &users {
                 println!(
-                    "{:<15} {:<20} {:<10} {:<20} {:<15}",
-                    u.name, u.account, u.admin_level, u.default_account, u.default_qos,
+                    "{:<15} {:<20} {:<10} {:<20} {:<20} {:<15}",
+                    u.name,
+                    u.account,
+                    u.admin_level,
+                    u.default_account,
+                    u.allowed_qos,
+                    u.default_qos,
                 );
             }
             Ok(())
@@ -924,6 +969,50 @@ mod tests {
     }
 
     #[test]
+    fn build_add_user_request_parses_qos_allow_list() {
+        let p = parse_params(&[
+            "name=testuser".into(),
+            "account=testacct".into(),
+            "qos=highprio,lowprio".into(),
+            "defaultqos=highprio".into(),
+        ]);
+        let fields = build_add_user_request(&p).unwrap();
+        assert_eq!(fields.allowed_qos, "highprio,lowprio");
+        assert_eq!(fields.default_qos, "highprio");
+    }
+
+    #[test]
+    fn build_add_user_request_allowed_qos_absent_is_empty() {
+        let p = parse_params(&["name=testuser".into(), "account=testacct".into()]);
+        let fields = build_add_user_request(&p).unwrap();
+        assert_eq!(fields.allowed_qos, "");
+    }
+
+    #[test]
+    fn build_add_user_request_rejects_default_qos_outside_allow_list() {
+        let p = parse_params(&[
+            "name=testuser".into(),
+            "account=testacct".into(),
+            "qos=highprio,lowprio".into(),
+            "defaultqos=other-teams-qos".into(),
+        ]);
+        let err = build_add_user_request(&p).unwrap_err();
+        assert!(err.to_string().contains("must be included in qos="));
+    }
+
+    #[test]
+    fn build_add_user_request_allows_defaultqos_alone_without_a_list() {
+        // Pinning only a default (no qos= list) is still valid — it's
+        // PR #490's single-QOS scoping, not a validation error.
+        let p = parse_params(&[
+            "name=testuser".into(),
+            "account=testacct".into(),
+            "defaultqos=highprio".into(),
+        ]);
+        assert!(build_add_user_request(&p).is_ok());
+    }
+
+    #[test]
     fn reject_unknown_keys_flags_dropped_field() {
         // A field the command doesn't read must error, not be silently dropped
         // (a dropped limit reads as "set" but never enforces).
@@ -958,6 +1047,44 @@ mod tests {
                 "QOS field '{field}' is read by the handler but missing from QOS_KEYS"
             );
         }
+    }
+
+    #[test]
+    fn reject_unknown_keys_accepts_every_parsed_user_field() {
+        let parsed_fields = [
+            "name",
+            "user",
+            "account",
+            "defaultaccount",
+            "adminlevel",
+            "defaultqos",
+            "qos",
+            "maxrunningjobs",
+            "maxjobs",
+            "maxsubmitjobs",
+            "maxtresperjob",
+            "grptres",
+            "maxwall",
+            "maxwallduration",
+        ];
+        for field in parsed_fields {
+            let p = parse_params(&["name=testuser".into(), format!("{field}=1")]);
+            assert!(
+                reject_unknown_keys(&p, USER_KEYS).is_ok(),
+                "user field '{field}' is read by the handler but missing from USER_KEYS"
+            );
+        }
+    }
+
+    #[test]
+    fn build_add_user_request_rejects_unknown_field() {
+        let p = parse_params(&[
+            "name=testuser".into(),
+            "account=testacct".into(),
+            "qoz=highprio".into(),
+        ]);
+        let err = build_add_user_request(&p).unwrap_err();
+        assert!(err.to_string().contains("unknown field 'qoz'"));
     }
 
     #[test]

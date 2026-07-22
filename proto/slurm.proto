@@ -1059,6 +1059,10 @@ message AddUserRequest {
   string max_tres_per_job = 8;
   string grp_tres = 9;
   uint32 max_wall_minutes = 10;
+  // Comma-separated QOS names this association may use. Same full-resend
+  // semantics: empty clears an existing allow-list back to unrestricted.
+  // default_qos must be a member when both are set.
+  string allowed_qos = 11;
 }
 
 message RemoveUserRequest {
@@ -1081,6 +1085,7 @@ message UserInfo {
   string admin_level = 3;
   string default_account = 4;
   string default_qos = 5;
+  string allowed_qos = 6;
 }
 
 message CreateQosRequest {

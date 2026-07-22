@@ -33,7 +33,7 @@ use spur_metrics::partition::PartitionMetricsSnapshot;
 use spur_metrics::user_acct::UserAcctMetricsSnapshot;
 
 use crate::accounting::{AccountingNotifier, JobStartRecord};
-use crate::association_cache::{AccountMembership, AssociationCache};
+use crate::association_cache::{qos_permitted, AccountMembership, AssociationCache};
 use crate::fairshare_cache::FairshareCache;
 use crate::limits_cache::QosCache;
 use crate::raft::{ClientResponse, JobFinalized, SpurRaft, StateMachineApply};
@@ -4683,7 +4683,7 @@ fn apply_default_account(spec: &mut JobSpec, assoc_cache: &AssociationCache) {
     if spec.account.as_deref().is_some_and(|a| !a.is_empty()) {
         return;
     }
-    let (account, _) = assoc_cache.resolve(&spec.user, None);
+    let (account, ..) = assoc_cache.resolve(&spec.user, None);
     if let Some(acct) = account.filter(|a| !a.is_empty()) {
         spec.account = Some(acct);
     }
@@ -4725,15 +4725,16 @@ fn apply_default_qos(
 ) -> Result<(), SubmitError> {
     let given_account = spec.account.as_deref().filter(|a| !a.is_empty());
     // Resolved once and shared by both branches below: `resolve()` reads
-    // account and default QOS under a single lock, so a concurrent cache
-    // refresh can't validate one against the other's stale snapshot.
-    let (account, default_qos) = assoc_cache.resolve(&spec.user, given_account);
+    // the account, default QOS, and allow-list under a single lock, so a
+    // concurrent cache refresh can't validate one against the other's
+    // stale snapshot.
+    let (account, default_qos, allowed_qos) = assoc_cache.resolve(&spec.user, given_account);
 
     if let Some(name) = spec.qos.as_deref().filter(|n| !n.is_empty()) {
         if qos_cache.get(name).is_none() {
             return Err(SubmitError::invalid(format!("QOS '{name}' does not exist")));
         }
-        if default_qos.as_deref().is_some_and(|d| d != name) {
+        if !qos_permitted(&allowed_qos, default_qos.as_deref(), name) {
             return Err(SubmitError::invalid(format!(
                 "QOS '{name}' is not permitted for user '{}' under account '{}'",
                 spec.user,
@@ -10347,6 +10348,46 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_qos_allows_any_member_of_the_allow_list() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache().insert(Qos {
+            name: "a".into(),
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "b".into(),
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "other-teams-qos".into(),
+            ..Default::default()
+        });
+        cm.association_cache()
+            .insert_allowed_qos("testuser", "research", &["a", "b"]);
+        let mut spec = basic_spec("q");
+        spec.account = Some("research".into());
+        let id = submit_and_wait(&cm, spec);
+
+        cm.update_job(id, None, None, None, None, None, Some("b".into()))
+            .unwrap();
+        assert_eq!(cm.get_job(id).unwrap().spec.qos.as_deref(), Some("b"));
+
+        let err = cm
+            .update_job(
+                id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("other-teams-qos".into()),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("is not permitted"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn update_node_state() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -11334,6 +11375,39 @@ mod tests {
             err,
             SubmitError::invalid(
                 "QOS 'primus-qos' is not permitted for user 'testuser' under account 'hyperloom'"
+            )
+        );
+    }
+
+    #[test]
+    fn apply_default_qos_explicit_allows_any_member_of_the_allow_list() {
+        let assoc = AssociationCache::new();
+        assoc.insert_allowed_qos("testuser", "research", &["a", "b", "c"]);
+        let qos = qos_cache_with(&["a", "b", "c"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        for name in ["a", "b", "c"] {
+            spec.qos = Some(name.into());
+            super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
+            assert_eq!(spec.qos.as_deref(), Some(name));
+        }
+    }
+
+    #[test]
+    fn apply_default_qos_explicit_rejects_qos_outside_the_allow_list() {
+        let assoc = AssociationCache::new();
+        assoc.insert_allowed_qos("testuser", "research", &["a", "b"]);
+        let qos = qos_cache_with(&["a", "b", "other-teams-qos"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+        spec.qos = Some("other-teams-qos".into());
+
+        let err = super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid(
+                "QOS 'other-teams-qos' is not permitted for user 'testuser' under account 'research'"
             )
         );
     }

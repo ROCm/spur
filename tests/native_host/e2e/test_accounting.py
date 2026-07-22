@@ -454,6 +454,47 @@ class TestSacctmgrQosAuthorization:
         )
         assert "not permitted" in out, f"expected an authorization rejection, got {out!r}"
 
+    def test_submission_allows_any_member_of_the_qos_allow_list(self, accounting_cluster):
+        # sacctmgr add/modify user qos=a,b grants a set, not just one pinned
+        # default — mirrors Slurm's per-association QOS allow-list.
+        c = accounting_cluster
+        user = c.nodes[0].user
+
+        c.sacctmgr(["add", "qos", "name=burstqos"])
+        c.sacctmgr(["add", "qos", "name=normalqos"])
+        c.sacctmgr(["add", "qos", "name=otherqos"])
+        c.sacctmgr(["add", "account", "name=qoslist"])
+        c.sacctmgr(
+            [
+                "add",
+                "user",
+                f"name={user}",
+                "account=qoslist",
+                "qos=burstqos,normalqos",
+                "defaultqos=normalqos",
+            ]
+        )
+        time.sleep(15)
+
+        script = c.write_file("qos-list.sh", "#!/bin/bash\ntrue\n")
+
+        first_id = parse_job_id(
+            c.sbatch(["-J", "qos-list-a", "-N", "1", "-A", "qoslist", "--qos=burstqos", script])
+        )
+        assert first_id is not None
+        wait_job(c, first_id, timeout=30)
+
+        second_id = parse_job_id(
+            c.sbatch(["-J", "qos-list-b", "-N", "1", "-A", "qoslist", "--qos=normalqos", script])
+        )
+        assert second_id is not None
+        wait_job(c, second_id, timeout=30)
+
+        out = c.cli_allow_fail(
+            ["sbatch", "-J", "qos-list-bad", "-N", "1", "-A", "qoslist", "--qos=otherqos", script]
+        )
+        assert "not permitted" in out, f"expected an authorization rejection, got {out!r}"
+
 
 class TestSacctmgrInvalidInput:
     def test_add_qos_with_non_numeric_limit_fails_cleanly(self, accounting_cluster):

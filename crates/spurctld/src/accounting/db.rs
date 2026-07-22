@@ -125,6 +125,8 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reservation TEXT NOT NULL DEFAULT '';
 -- No FK to qos(name): a stale reference (QOS deleted after being set as a
 -- default) must degrade gracefully at read time, not be blocked here.
 ALTER TABLE associations ADD COLUMN IF NOT EXISTS default_qos TEXT;
+-- Comma-separated QOS names, same degrade-gracefully rationale as default_qos.
+ALTER TABLE associations ADD COLUMN IF NOT EXISTS allowed_qos TEXT;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS grp_wall_min INTEGER;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS grp_tres TEXT;
 "#;
@@ -566,6 +568,7 @@ pub async fn add_user(
     admin_level: &str,
     is_default: bool,
     default_qos: &str,
+    allowed_qos: &str,
     max_running_jobs: Option<i32>,
     max_submit_jobs: Option<i32>,
     max_tres_per_job: Option<&str>,
@@ -599,8 +602,9 @@ pub async fn add_user(
     let updated = sqlx::query(
         r#"
         UPDATE associations SET is_default = $3, default_qos = NULLIF($4, ''),
-            max_running_jobs = $5, max_submit_jobs = $6, max_tres_per_job = $7,
-            grp_tres = $8, max_wall_min = $9
+            allowed_qos = NULLIF($5, ''),
+            max_running_jobs = $6, max_submit_jobs = $7, max_tres_per_job = $8,
+            grp_tres = $9, max_wall_min = $10
         WHERE user_name = $1 AND account = $2
           AND (partition_name IS NULL OR partition_name = '')
         "#,
@@ -609,6 +613,7 @@ pub async fn add_user(
     .bind(account)
     .bind(is_default)
     .bind(default_qos)
+    .bind(allowed_qos)
     .bind(max_running_jobs)
     .bind(max_submit_jobs)
     .bind(max_tres_per_job)
@@ -621,14 +626,16 @@ pub async fn add_user(
         sqlx::query(
             r#"
             INSERT INTO associations (user_name, account, is_default, default_qos,
-                max_running_jobs, max_submit_jobs, max_tres_per_job, grp_tres, max_wall_min)
-            VALUES ($1, $2, $3, NULLIF($4, ''), $5, $6, $7, $8, $9)
+                allowed_qos, max_running_jobs, max_submit_jobs, max_tres_per_job,
+                grp_tres, max_wall_min)
+            VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), $6, $7, $8, $9, $10)
             "#,
         )
         .bind(user)
         .bind(account)
         .bind(is_default)
         .bind(default_qos)
+        .bind(allowed_qos)
         .bind(max_running_jobs)
         .bind(max_submit_jobs)
         .bind(max_tres_per_job)
@@ -657,9 +664,10 @@ pub async fn remove_user(pool: &PgPool, user: &str, account: &str) -> anyhow::Re
     Ok(())
 }
 
-/// List users, joining each one's own association row for `default_qos`.
-/// `DISTINCT ON ... a.id DESC` picks the newest row if legacy duplicates
-/// exist (pre-dating the add_user upsert fix); it never touches the others.
+/// List users, joining each one's own association row for `default_qos`/
+/// `allowed_qos`. `DISTINCT ON ... a.id DESC` picks the newest row if legacy
+/// duplicates exist (pre-dating the add_user upsert fix); it never touches
+/// the others.
 pub async fn list_users(
     pool: &PgPool,
     account: Option<&str>,
@@ -668,7 +676,8 @@ pub async fn list_users(
     let rows = sqlx::query(
         r#"
         SELECT DISTINCT ON (u.name, u.account)
-            u.name, u.account, u.admin_level, u.default_account, a.default_qos
+            u.name, u.account, u.admin_level, u.default_account,
+            a.default_qos, a.allowed_qos
         FROM users u
         LEFT JOIN associations a
             ON a.user_name = u.name AND a.account = u.account
@@ -691,6 +700,7 @@ pub async fn list_users(
             admin_level: r.get("admin_level"),
             default_account: r.get("default_account"),
             default_qos: r.get("default_qos"),
+            allowed_qos: r.get("allowed_qos"),
         })
         .collect())
 }
@@ -702,6 +712,7 @@ pub struct UserRecord {
     pub admin_level: String,
     pub default_account: Option<String>,
     pub default_qos: Option<String>,
+    pub allowed_qos: Option<String>,
 }
 
 /// List every user-account association's resource limits, one row per
@@ -1213,7 +1224,7 @@ mod job_history_tests {
         .await?;
 
         add_user(
-            &pool, &user, &account, "none", true, &qos_name, None, None, None, None, None,
+            &pool, &user, &account, "none", true, &qos_name, "", None, None, None, None, None,
         )
         .await?;
         let got = list_users(&pool, Some(&account), None)
@@ -1226,7 +1237,7 @@ mod job_history_tests {
         // Upsert again with an empty default_qos: clears it (full resend,
         // not a partial patch — matches modify account/qos semantics).
         add_user(
-            &pool, &user, &account, "none", true, "", None, None, None, None, None,
+            &pool, &user, &account, "none", true, "", "", None, None, None, None, None,
         )
         .await?;
         let got = list_users(&pool, Some(&account), None)
@@ -1285,6 +1296,7 @@ mod job_history_tests {
             "none",
             true,
             "",
+            "",
             Some(2),
             Some(4),
             Some("cpu=8"),
@@ -1313,6 +1325,7 @@ mod job_history_tests {
             "none",
             true,
             "",
+            "",
             Some(10),
             Some(20),
             Some("cpu=16"),
@@ -1334,7 +1347,7 @@ mod job_history_tests {
         // Upsert again with no limits: clears them (full resend, not a
         // partial patch — matches every other field on this association).
         add_user(
-            &pool, &user, &account, "none", true, "", None, None, None, None, None,
+            &pool, &user, &account, "none", true, "", "", None, None, None, None, None,
         )
         .await?;
         let got = list_associations(&pool)
@@ -1395,6 +1408,7 @@ mod job_history_tests {
             "none",
             true,
             "",
+            "",
             None,
             None,
             None,
@@ -1408,6 +1422,7 @@ mod job_history_tests {
             &account,
             "none",
             true,
+            "",
             "",
             None,
             None,
@@ -1471,11 +1486,11 @@ mod job_history_tests {
         upsert_account(&pool, &account, "d", "o", None, 1, None, None).await?;
 
         add_user(
-            &pool, &user, &account, "none", true, "", None, None, None, None, None,
+            &pool, &user, &account, "none", true, "", "", None, None, None, None, None,
         )
         .await?;
         add_user(
-            &pool, &user, &account, "none", true, "", None, None, None, None, None,
+            &pool, &user, &account, "none", true, "", "", None, None, None, None, None,
         )
         .await?;
         add_user(
@@ -1485,6 +1500,7 @@ mod job_history_tests {
             "none",
             true,
             "highprio-does-not-need-to-exist",
+            "",
             None,
             None,
             None,

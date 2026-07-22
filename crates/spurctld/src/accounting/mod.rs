@@ -58,19 +58,33 @@ pub async fn association_maps(
     HashMap<String, String>,
     HashSet<(String, String)>,
     HashMap<(String, String), AccountLimits>,
+    HashMap<(String, String), HashSet<String>>,
 )> {
     let users = db::list_users(pool, None, None).await?;
 
     let mut default_qos = HashMap::new();
     let mut default_account = HashMap::new();
     let mut memberships = HashSet::new();
+    let mut allowed_qos = HashMap::new();
     for u in users {
-        memberships.insert((u.name.clone(), u.account.clone()));
+        let key = (u.name.clone(), u.account.clone());
+        memberships.insert(key.clone());
         if let Some(qos) = u.default_qos {
-            default_qos.insert((u.name.clone(), u.account), qos);
+            default_qos.insert(key.clone(), qos);
         }
         if let Some(acct) = u.default_account {
             default_account.insert(u.name, acct);
+        }
+        if let Some(list) = u.allowed_qos {
+            let set: HashSet<String> = list
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if !set.is_empty() {
+                allowed_qos.insert(key, set);
+            }
         }
     }
 
@@ -83,7 +97,13 @@ pub async fn association_maps(
         })
         .collect();
 
-    Ok((default_qos, default_account, memberships, limits))
+    Ok((
+        default_qos,
+        default_account,
+        memberships,
+        limits,
+        allowed_qos,
+    ))
 }
 
 fn account_limits_from_record(r: db::AssociationRecord) -> AccountLimits {
