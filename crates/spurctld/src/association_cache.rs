@@ -73,6 +73,23 @@ impl AssociationCache {
         AccountMembership::NotMember(accounts)
     }
 
+    /// Whether `qos` may be used by this (user, account) association. An
+    /// association with no default QOS on record has never been pinned to
+    /// one, so it stays unrestricted; one that has must match it exactly.
+    pub fn qos_allowed(&self, user: &str, account: &str, qos: &str) -> bool {
+        let snapshot = self.snapshot.read();
+        if !snapshot.loaded {
+            return true;
+        }
+        match snapshot
+            .default_qos
+            .get(&(user.to_owned(), account.to_owned()))
+        {
+            Some(default_qos) => default_qos == qos,
+            None => true,
+        }
+    }
+
     /// The effective account (given, or the user's default) and that
     /// association's default QOS, resolved under a single read lock so a
     /// concurrent refresh can't yield a torn old/new combination.
@@ -330,6 +347,34 @@ mod tests {
             cache.account_membership("carol", "missing"),
             AccountMembership::NotMember(Vec::new())
         );
+    }
+
+    #[test]
+    fn qos_allowed_unloaded_cache_is_permissive() {
+        let cache = AssociationCache::new();
+        assert!(cache.qos_allowed("alice", "research", "anything"));
+    }
+
+    #[test]
+    fn qos_allowed_matches_pinned_default() {
+        let cache = AssociationCache::new();
+        cache.insert_default_qos("alice", "research", "highprio");
+        assert!(cache.qos_allowed("alice", "research", "highprio"));
+        assert!(!cache.qos_allowed("alice", "research", "other-teams-qos"));
+    }
+
+    #[test]
+    fn qos_allowed_permissive_when_association_has_no_default_pinned() {
+        let cache = AssociationCache::new();
+        cache.insert_association("alice", "research");
+        assert!(cache.qos_allowed("alice", "research", "anything"));
+    }
+
+    #[test]
+    fn qos_allowed_permissive_for_unknown_association_on_loaded_cache() {
+        let cache = AssociationCache::new();
+        cache.insert_default_qos("bob", "eng", "highprio");
+        assert!(cache.qos_allowed("alice", "research", "anything"));
     }
 
     #[test]

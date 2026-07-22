@@ -393,6 +393,36 @@ class TestSacctmgrUserAssociationLimits:
         assert reason == "AssocMaxJobsLimit", f"expected AssocMaxJobsLimit, got {reason!r}"
 
 
+class TestSacctmgrQosAuthorization:
+    """A user submitting an explicit --qos outside their association's
+    pinned default QOS must be rejected (SPUR-101), not silently accepted."""
+
+    def test_submission_rejects_qos_outside_association_default(self, accounting_cluster):
+        c = accounting_cluster
+        user = c.nodes[0].user
+
+        c.sacctmgr(["add", "qos", "name=authqos"])
+        c.sacctmgr(["add", "qos", "name=otherqos"])
+        c.sacctmgr(["add", "account", "name=qosauthz"])
+        c.sacctmgr(["add", "user", f"name={user}", "account=qosauthz", "defaultqos=authqos"])
+        # Wait past the association cache refresh floor (10s) before
+        # submitting, else the pinned default hasn't loaded yet.
+        time.sleep(15)
+
+        script = c.write_file("qos-authz.sh", "#!/bin/bash\ntrue\n")
+
+        out = c.cli_allow_fail(
+            ["sbatch", "-J", "qos-bad", "-N", "1", "-A", "qosauthz", "--qos=otherqos", script]
+        )
+        assert "not permitted" in out, f"expected an authorization rejection, got {out!r}"
+
+        good_id = parse_job_id(
+            c.sbatch(["-J", "qos-good", "-N", "1", "-A", "qosauthz", "--qos=authqos", script])
+        )
+        assert good_id is not None
+        wait_job(c, good_id, timeout=30)
+
+
 class TestSacctmgrInvalidInput:
     def test_add_qos_with_non_numeric_limit_fails_cleanly(self, accounting_cluster):
         c = accounting_cluster
