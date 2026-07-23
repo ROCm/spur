@@ -2430,13 +2430,14 @@ mod tests {
                 .iter()
                 .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
                 .collect();
-            cm.start_job(
-                job_id,
-                nodes.clone(),
-                ResourceAllocations::with_scalar(2, 0),
-                per_node_allocs.clone(),
-            )
-            .unwrap();
+            let run_attempt = cm
+                .start_job(
+                    job_id,
+                    nodes.clone(),
+                    ResourceAllocations::with_scalar(2, 0),
+                    per_node_allocs.clone(),
+                )
+                .unwrap();
             settle(&cm, job_id, JobState::Running);
 
             dispatch_job_to_nodes(
@@ -2448,6 +2449,7 @@ mod tests {
                 per_node_allocs,
                 "n1,n2".into(),
                 1,
+                run_attempt,
             )
             .await;
 
@@ -2496,13 +2498,14 @@ mod tests {
                 .iter()
                 .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
                 .collect();
-            cm.start_job(
-                job_id,
-                nodes.clone(),
-                ResourceAllocations::with_scalar(2, 0),
-                per_node_allocs.clone(),
-            )
-            .unwrap();
+            let run_attempt = cm
+                .start_job(
+                    job_id,
+                    nodes.clone(),
+                    ResourceAllocations::with_scalar(2, 0),
+                    per_node_allocs.clone(),
+                )
+                .unwrap();
             settle(&cm, job_id, JobState::Running);
 
             dispatch_job_to_nodes(
@@ -2514,6 +2517,7 @@ mod tests {
                 per_node_allocs,
                 "n1,n2".into(),
                 1,
+                run_attempt,
             )
             .await;
 
@@ -2557,13 +2561,14 @@ mod tests {
                 .iter()
                 .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
                 .collect();
-            cm.start_job(
-                job_id,
-                nodes.clone(),
-                ResourceAllocations::with_scalar(2, 0),
-                per_node_allocs.clone(),
-            )
-            .unwrap();
+            let run_attempt = cm
+                .start_job(
+                    job_id,
+                    nodes.clone(),
+                    ResourceAllocations::with_scalar(2, 0),
+                    per_node_allocs.clone(),
+                )
+                .unwrap();
             settle(&cm, job_id, JobState::Running);
 
             dispatch_job_to_nodes(
@@ -2575,6 +2580,7 @@ mod tests {
                 per_node_allocs,
                 "n1,n2".into(),
                 1,
+                run_attempt,
             )
             .await;
 
