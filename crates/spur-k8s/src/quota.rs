@@ -146,7 +146,9 @@ pub fn role(account: &str) -> Role {
         verbs: verbs.iter().map(|s| s.to_string()).collect(),
         ..Default::default()
     };
-    let rw = &["get", "list", "watch", "create", "update", "patch", "delete"];
+    let rw = &[
+        "get", "list", "watch", "create", "update", "patch", "delete",
+    ];
     Role {
         metadata: meta(ROLE_NAME, Some(&ns), account),
         rules: Some(vec![
@@ -271,8 +273,10 @@ mod tests {
         let rb = role_binding(&aq);
         let subs = rb.subjects.unwrap();
         assert_eq!(subs.len(), 2);
-        assert!(subs.iter().all(|s| s.kind == "ServiceAccount"
-            && s.namespace.as_deref() == Some("spur-acct-physics")));
+        assert!(subs
+            .iter()
+            .all(|s| s.kind == "ServiceAccount"
+                && s.namespace.as_deref() == Some("spur-acct-physics")));
         assert_eq!(subs[0].name, "spur-user-alice");
         assert_eq!(rb.role_ref.name, ROLE_NAME);
         assert_eq!(rb.role_ref.kind, "Role");
