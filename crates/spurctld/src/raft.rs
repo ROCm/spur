@@ -76,6 +76,8 @@ pub struct ClientResponse {
     pub jobs_finalized: Vec<JobFinalized>,
     #[serde(default)]
     pub reservation_created: bool,
+    #[serde(default)]
+    pub partition_created: bool,
 }
 
 /// Trait for applying committed Raft entries to the cluster state.

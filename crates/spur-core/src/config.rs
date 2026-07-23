@@ -492,6 +492,10 @@ pub struct PartitionConfig {
     #[serde(default)]
     pub deny_accounts: Vec<String>,
     #[serde(default)]
+    pub deny_qos: Vec<String>,
+    #[serde(default)]
+    pub allow_qos: Vec<String>,
+    #[serde(default)]
     pub priority_tier: u32,
     #[serde(default)]
     pub preempt_mode: String,
@@ -1148,6 +1152,11 @@ impl SlurmConfig {
                 default_time_minutes: pc.default_time.as_ref().and_then(|t| parse_time_minutes(t)),
                 max_nodes: pc.max_nodes,
                 min_nodes: pc.min_nodes,
+                allow_accounts: pc.allow_accounts.clone(),
+                allow_groups: pc.allow_groups.clone(),
+                deny_accounts: pc.deny_accounts.clone(),
+                deny_qos: pc.deny_qos.clone(),
+                allow_qos: pc.allow_qos.clone(),
                 priority_tier: pc.priority_tier,
                 preempt_mode: match pc.preempt_mode.to_lowercase().as_str() {
                     "cancel" => PreemptMode::Cancel,
@@ -1155,8 +1164,6 @@ impl SlurmConfig {
                     "suspend" => PreemptMode::Suspend,
                     _ => PreemptMode::Off,
                 },
-                allow_accounts: pc.allow_accounts.clone(),
-                deny_accounts: pc.deny_accounts.clone(),
                 ..Default::default()
             })
             .collect()

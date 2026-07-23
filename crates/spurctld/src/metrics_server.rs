@@ -99,7 +99,7 @@ async fn metrics_scheduler(State(state): State<Arc<MetricsState>>) -> Response {
 }
 
 async fn metrics_jobs_users_accts(State(state): State<Arc<MetricsState>>) -> Response {
-    if !state.cluster.config.metrics.high_cardinality {
+    if !state.cluster.config().metrics.high_cardinality {
         return (
             StatusCode::NOT_FOUND,
             "jobs-users-accts metrics disabled (set metrics.high_cardinality = true)",
@@ -161,6 +161,8 @@ mod tests {
                 allow_accounts: Vec::new(),
                 allow_groups: Vec::new(),
                 deny_accounts: Vec::new(),
+                deny_qos: Vec::new(),
+                allow_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
             }],

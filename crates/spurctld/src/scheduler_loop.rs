@@ -44,13 +44,17 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     tokio::spawn(async move {
         manage_power(power_cluster, power_raft).await;
     });
-    let interval_secs = cluster.config.scheduler.interval_secs.max(1) as u64;
-    let max_jobs = cluster.config.scheduler.max_jobs_per_cycle as usize;
+    // Captured once at loop start: the tick interval, per-cycle job cap, and
+    // topology tree are baked into loop-local state and are NOT picked up by
+    // `scontrol reconfigure` — changing them needs a controller restart.
+    let startup_config = cluster.config();
+    let interval_secs = startup_config.scheduler.interval_secs.max(1) as u64;
+    let max_jobs = startup_config.scheduler.max_jobs_per_cycle as usize;
 
     let mut scheduler = BackfillScheduler::new(max_jobs);
 
     // Build topology tree from config (if configured)
-    let topology = cluster.config.topology.as_ref().and_then(|topo_config| {
+    let topology = startup_config.topology.as_ref().and_then(|topo_config| {
         use spur_core::topology::TopologyTree;
         match topo_config.plugin.as_str() {
             "tree" => {
@@ -186,7 +190,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 try_preempt(&cluster, &partitions, &unscheduled).await;
 
                 // Federation: forward still-unschedulable jobs to peer clusters.
-                if !cluster.config.federation.clusters.is_empty() {
+                if !cluster.config().federation.clusters.is_empty() {
                     let jobs_to_fwd: Vec<spur_core::job::Job> =
                         unscheduled.iter().map(|j| (*j).clone()).collect();
                     let fed_cluster = cluster.clone();
@@ -296,7 +300,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             };
 
             // Run PrologSlurmctld if configured
-            if let Some(ref prolog_ctld) = cluster.config.hooks.prolog_slurmctld {
+            if let Some(prolog_ctld) = cluster.config().hooks.prolog_slurmctld.clone() {
                 let ctx = spur_core::hooks::HookContext {
                     job_id: assignment.job_id,
                     work_dir: job.spec.work_dir.clone(),
@@ -309,7 +313,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                     cpus: job.spec.cpus_per_task,
                     memory_mb: job.spec.memory_per_node_mb.unwrap_or(0),
                 };
-                if let Err(e) = spur_core::hooks::run_hook(prolog_ctld, &ctx).await {
+                if let Err(e) = spur_core::hooks::run_hook(&prolog_ctld, &ctx).await {
                     error!(
                         job_id = assignment.job_id,
                         error = %e,
@@ -609,7 +613,8 @@ fn preempt_overlaps_pending_nodes(
 /// Tries each peer in order; stops forwarding a job as soon as one peer accepts it.
 /// Failed peer connections are logged as warnings and skipped.
 async fn forward_to_federation(cluster: &ClusterManager, jobs: &[spur_core::job::Job]) {
-    let peers = &cluster.config.federation.clusters;
+    let config = cluster.config();
+    let peers = &config.federation.clusters;
     for job in jobs {
         for peer in peers {
             match SlurmControllerClient::connect(peer.address.clone())
@@ -1273,7 +1278,7 @@ async fn enforce_completing_timeout(cluster: Arc<ClusterManager>, raft: Arc<Raft
         }
 
         let now = Utc::now();
-        let wait = chrono::Duration::seconds(cluster.config.scheduler.complete_wait_secs as i64);
+        let wait = chrono::Duration::seconds(cluster.config().scheduler.complete_wait_secs as i64);
 
         let completing = cluster.get_jobs(
             &[spur_core::job::JobState::Completing],
@@ -1357,7 +1362,10 @@ fn spawn_power_command(cmd: &str, node_name: &str, action: &str) {
 ///
 /// Disabled when `power.suspend_timeout_secs` is not set in the config.
 async fn manage_power(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
-    let suspend_timeout = match cluster.config.power.suspend_timeout_secs {
+    // Whether power management runs at all (and its idle timeout) is decided
+    // once here; toggling power on/off or changing the timeout needs a restart.
+    // The suspend/resume *commands* below are read live each cycle.
+    let suspend_timeout = match cluster.config().power.suspend_timeout_secs {
         Some(t) => t,
         None => return,
     };
@@ -1392,7 +1400,7 @@ async fn manage_power(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 spur_core::node::NodeState::Suspended,
                 Some("Power saving".into()),
             );
-            if let Some(ref cmd) = cluster.config.power.suspend_command {
+            if let Some(ref cmd) = cluster.config().power.suspend_command {
                 spawn_power_command(&cmd.replace("{node}", &node.name), &node.name, "suspend");
             }
         }
@@ -1407,7 +1415,7 @@ async fn manage_power(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 info!(node = %node.name, "resuming suspended node for pending jobs");
                 let _ =
                     cluster.update_node_state(&node.name, spur_core::node::NodeState::Idle, None);
-                if let Some(ref cmd) = cluster.config.power.resume_command {
+                if let Some(ref cmd) = cluster.config().power.resume_command {
                     spawn_power_command(&cmd.replace("{node}", &node.name), &node.name, "resume");
                 }
             }
@@ -2120,6 +2128,8 @@ mod tests {
                     allow_accounts: Vec::new(),
                     allow_groups: Vec::new(),
                     deny_accounts: Vec::new(),
+                    allow_qos: Vec::new(),
+                    deny_qos: Vec::new(),
                     priority_tier: 1,
                     preempt_mode: String::new(),
                 }],
