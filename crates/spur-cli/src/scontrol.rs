@@ -442,49 +442,36 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             priority_tier,
             preempt_mode,
         } => {
-            update_partition(
-                &args.controller,
-                &name,
+            let selector_map = match selector {
+                Some(ref s) => parse_selector(s)?,
+                None => HashMap::new(),
+            };
+            let req = spur_proto::proto::UpdatePartitionRequest {
+                name,
                 nodes,
-                selector,
-                clear_selector,
+                selector: selector_map,
+                set_selector: clear_selector || selector.is_some(),
                 state,
-                default,
+                is_default: default,
                 max_time,
                 default_time,
-                max_nodes,
+                max_nodes_value: max_nodes,
                 clear_max_nodes,
                 min_nodes,
-                if set_allow_accounts {
-                    Some(&allow_accounts)
-                } else {
-                    None
-                },
-                if set_allow_groups {
-                    Some(&allow_groups)
-                } else {
-                    None
-                },
+                allow_accounts: split_csv(&allow_accounts),
                 set_allow_accounts,
+                allow_groups: split_csv(&allow_groups),
                 set_allow_groups,
-                if set_deny_accounts {
-                    Some(&deny_accounts)
-                } else {
-                    None
-                },
-                if set_deny_qos { Some(&deny_qos) } else { None },
+                deny_accounts: split_csv(&deny_accounts),
                 set_deny_accounts,
+                deny_qos: split_csv(&deny_qos),
                 set_deny_qos,
-                if set_allow_qos {
-                    Some(&allow_qos)
-                } else {
-                    None
-                },
+                allow_qos: split_csv(&allow_qos),
                 set_allow_qos,
                 priority_tier,
                 preempt_mode,
-            )
-            .await
+            };
+            update_partition(&args.controller, req).await
         }
         ScontrolCommand::DeletePartition { name } => {
             delete_partition(&args.controller, &name).await
@@ -521,12 +508,6 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             add_accounts,
             remove_accounts,
         } => {
-            let split_csv = |s: &str| -> Vec<String> {
-                s.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            };
             let channel = spur_client::connect_channel(&args.controller)
                 .await
                 .context("failed to connect to spurctld")?;
@@ -1217,59 +1198,34 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
         anyhow::bail!("scontrol update: PartitionName= is required");
     }
 
-    let set_allow_accounts = allow_accounts.is_some();
-    let set_allow_groups = allow_groups.is_some();
-    let set_deny_accounts = deny_accounts.is_some();
-    let set_deny_qos = deny_qos.is_some();
-    let set_allow_qos = allow_qos.is_some();
-
-    update_partition(
-        controller,
-        &name,
+    // An ACL is applied only when its key appeared; an empty value clears it.
+    let req = spur_proto::proto::UpdatePartitionRequest {
+        name,
         nodes,
-        None, // selector not supported in inline syntax
-        false,
+        selector: HashMap::new(), // selector not supported in inline syntax
+        set_selector: false,
         state,
         is_default,
         max_time,
         default_time,
-        max_nodes,
+        max_nodes_value: max_nodes,
         clear_max_nodes,
         min_nodes,
-        if set_allow_accounts {
-            allow_accounts.as_deref()
-        } else {
-            None
-        },
-        if set_allow_groups {
-            allow_groups.as_deref()
-        } else {
-            None
-        },
-        set_allow_accounts,
-        set_allow_groups,
-        if set_deny_accounts {
-            deny_accounts.as_deref()
-        } else {
-            None
-        },
-        if set_deny_qos {
-            deny_qos.as_deref()
-        } else {
-            None
-        },
-        set_deny_accounts,
-        set_deny_qos,
-        if set_allow_qos {
-            allow_qos.as_deref()
-        } else {
-            None
-        },
-        set_allow_qos,
+        set_allow_accounts: allow_accounts.is_some(),
+        allow_accounts: allow_accounts.as_deref().map(split_csv).unwrap_or_default(),
+        set_allow_groups: allow_groups.is_some(),
+        allow_groups: allow_groups.as_deref().map(split_csv).unwrap_or_default(),
+        set_deny_accounts: deny_accounts.is_some(),
+        deny_accounts: deny_accounts.as_deref().map(split_csv).unwrap_or_default(),
+        set_deny_qos: deny_qos.is_some(),
+        deny_qos: deny_qos.as_deref().map(split_csv).unwrap_or_default(),
+        set_allow_qos: allow_qos.is_some(),
+        allow_qos: allow_qos.as_deref().map(split_csv).unwrap_or_default(),
         priority_tier,
         preempt_mode,
-    )
-    .await
+    };
+
+    update_partition(controller, req).await
 }
 
 /// Update a node's state via the controller.
@@ -1312,6 +1268,14 @@ async fn update_node(
     Ok(())
 }
 
+/// Split a comma-separated list into trimmed, non-empty entries.
+fn split_csv(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// Parse "KEY=VALUE,KEY2=VALUE2" into a HashMap.
 fn parse_selector(s: &str) -> Result<HashMap<String, String>> {
     let mut map = HashMap::new();
@@ -1351,13 +1315,6 @@ async fn create_partition(
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
 
-    let split_csv = |s: &str| -> Vec<String> {
-        s.split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    };
-
     client
         .create_partition(spur_proto::proto::CreatePartitionRequest {
             name: name.to_string(),
@@ -1384,78 +1341,21 @@ async fn create_partition(
     Ok(())
 }
 
-/// Update a partition via the controller.
-#[allow(clippy::too_many_arguments)]
+/// Update a partition via the controller. The request is already the proto
+/// struct, so callers assemble it directly rather than threading a long
+/// positional field list through this sender.
 async fn update_partition(
     controller: &str,
-    name: &str,
-    nodes: Option<String>,
-    selector: Option<String>,
-    clear_selector: bool,
-    state: Option<String>,
-    is_default: Option<bool>,
-    max_time: Option<String>,
-    default_time: Option<String>,
-    max_nodes: Option<u32>,
-    clear_max_nodes: bool,
-    min_nodes: Option<u32>,
-    allow_accounts: Option<&str>,
-    allow_groups: Option<&str>,
-    set_allow_accounts: bool,
-    set_allow_groups: bool,
-    deny_accounts: Option<&str>,
-    deny_qos: Option<&str>,
-    set_deny_accounts: bool,
-    set_deny_qos: bool,
-    allow_qos: Option<&str>,
-    set_allow_qos: bool,
-    priority_tier: Option<u32>,
-    preempt_mode: Option<String>,
+    req: spur_proto::proto::UpdatePartitionRequest,
 ) -> Result<()> {
     let channel = spur_client::connect_channel(controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
 
-    let split_csv = |s: &str| -> Vec<String> {
-        s.split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    };
-
-    let selector_map = if let Some(ref s) = selector {
-        parse_selector(s)?
-    } else {
-        HashMap::new()
-    };
-
+    let name = req.name.clone();
     client
-        .update_partition(spur_proto::proto::UpdatePartitionRequest {
-            name: name.to_string(),
-            nodes,
-            selector: selector_map,
-            set_selector: clear_selector || selector.is_some(),
-            state,
-            is_default,
-            max_time,
-            default_time,
-            max_nodes_value: max_nodes,
-            clear_max_nodes,
-            min_nodes,
-            allow_accounts: allow_accounts.map(split_csv).unwrap_or_default(),
-            set_allow_accounts,
-            allow_groups: allow_groups.map(split_csv).unwrap_or_default(),
-            set_allow_groups,
-            deny_accounts: deny_accounts.map(split_csv).unwrap_or_default(),
-            set_deny_accounts,
-            deny_qos: deny_qos.map(split_csv).unwrap_or_default(),
-            set_deny_qos,
-            allow_qos: allow_qos.map(split_csv).unwrap_or_default(),
-            set_allow_qos,
-            priority_tier,
-            preempt_mode,
-        })
+        .update_partition(req)
         .await
         .context("failed to update partition")?;
 

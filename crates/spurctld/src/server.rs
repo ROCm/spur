@@ -1429,13 +1429,8 @@ impl SlurmController for ControllerService {
         } else {
             None
         };
-        // `clear_max_nodes` and a literal 0 both mean "no limit" (0 documented
-        // as "clear limit" in the proto); neither can express a real 0-node cap.
-        let max_nodes = if req.clear_max_nodes || req.max_nodes_value == Some(0) {
-            None
-        } else {
-            req.max_nodes_value
-        };
+        let (max_nodes, clear_max_nodes) =
+            resolve_max_nodes_update(req.max_nodes_value, req.clear_max_nodes);
 
         let selector = if req.set_selector || !req.selector.is_empty() {
             Some(req.selector.into_iter().collect())
@@ -1455,7 +1450,7 @@ impl SlurmController for ControllerService {
                 max_time,
                 req.default_time,
                 max_nodes,
-                req.clear_max_nodes,
+                clear_max_nodes,
                 min_nodes,
                 allow_accounts,
                 allow_groups,
@@ -2602,6 +2597,20 @@ fn partition_rpc_status(err: PartitionError) -> Status {
     }
 }
 
+/// Resolve an `UpdatePartitionRequest`'s max-nodes intent into the
+/// `(max_nodes, clear)` pair `ClusterManager::update_partition` expects.
+///
+/// `clear_max_nodes` and a literal `max_nodes_value == 0` both mean "no limit"
+/// (0 is documented as "clear limit" in the proto); neither can express a real
+/// 0-node cap. The two inputs must be collapsed into a single `clear` bool that
+/// is passed through — forwarding the raw request flag would drop a `--max-nodes
+/// 0` clear, since that arrives as `Some(0)` with the flag unset.
+fn resolve_max_nodes_update(max_nodes_value: Option<u32>, clear_flag: bool) -> (Option<u32>, bool) {
+    let clear = clear_flag || max_nodes_value == Some(0);
+    let max_nodes = if clear { None } else { max_nodes_value };
+    (max_nodes, clear)
+}
+
 fn cluster_err_to_status(err: anyhow::Error) -> Status {
     if err.downcast_ref::<spur_core::auth::AuthError>().is_some() {
         return Status::permission_denied(err.to_string());
@@ -2725,6 +2734,20 @@ mod tests {
 
         let status = submit_rpc_status(SubmitError::internal("raft propose failed"));
         assert_eq!(status.code(), Code::Internal);
+    }
+
+    #[test]
+    fn resolve_max_nodes_update_maps_intents() {
+        // `--max-nodes 0` (Some(0), flag unset) must resolve to a clear, not a
+        // silent no-op: cluster.rs only clears when the passed bool is true.
+        assert_eq!(resolve_max_nodes_update(Some(0), false), (None, true));
+        // Explicit clear flag, regardless of value.
+        assert_eq!(resolve_max_nodes_update(None, true), (None, true));
+        assert_eq!(resolve_max_nodes_update(Some(4), true), (None, true));
+        // A real positive cap is preserved and does not clear.
+        assert_eq!(resolve_max_nodes_update(Some(4), false), (Some(4), false));
+        // No value and no flag means "leave unchanged".
+        assert_eq!(resolve_max_nodes_update(None, false), (None, false));
     }
 
     fn make_node_info(name: &str) -> NodeInfo {
