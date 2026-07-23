@@ -315,7 +315,7 @@ class TestQosLimitReasons:
         )
 
     def test_grp_cpu_cap_not_oversubscribed_by_concurrent_jobs(self, accounting_cluster):
-        # SPUR-84: a QOS group cap must hold across a burst of submissions, not
+        # A QOS group cap must hold across a burst of submissions, not
         # just one job. Three 1-cpu jobs each fit the grptres=cpu=2 cap on their
         # own, but a single scheduling pass must never run more than two at once
         # — the third pends with QOSGrpCpuLimit until one finishes.

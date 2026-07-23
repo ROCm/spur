@@ -1914,11 +1914,6 @@ impl ClusterManager {
             .map(|job| (job.job_id, self.resolve_qos(job)))
             .collect();
 
-        // Account/association and QoS aggregate enforcement is applied after the
-        // priority sort below, so group (`grp_tres`) and per-user caps are
-        // reserved highest-priority-first and a single pass cannot over-subscribe
-        // them. License enforcement follows for the same reason.
-
         // Reservation validation: reject jobs targeting expired/nonexistent reservations
         {
             let reservations = self.get_reservations();
@@ -8904,7 +8899,7 @@ mod tests {
     async fn pending_jobs_does_not_oversubscribe_qos_grp_node_within_one_pass() {
         // Three pending 1-node jobs share a QOS capped at grp_tres node=2. Each
         // fits against the empty running total, but a single pass must admit at
-        // most 2 or the QOSGrpNodeLimit is over-subscribed (SPUR-84).
+        // most 2 or the QOSGrpNodeLimit is over-subscribed.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 64, 128000);
@@ -9010,6 +9005,39 @@ mod tests {
         assert_eq!(
             granted, 2,
             "pending_jobs() returned {granted} account jobs but grp_tres node=2 allows 2"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_does_not_oversubscribe_account_max_running_jobs_within_one_pass() {
+        // Same guard as the QOS max_jobs_per_user test, one layer up: an account
+        // association capped at max_running_jobs=2 must not admit 3 pending jobs
+        // from one user in a single pass even though none is running yet.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        cm.association_cache().insert_limits(
+            "testuser",
+            "research",
+            spur_core::accounting::AccountLimits {
+                max_running_jobs: Some(2),
+                ..Default::default()
+            },
+        );
+
+        let ids: Vec<JobId> = (0..3)
+            .map(|i| {
+                let mut s = basic_spec(&format!("m{i}"));
+                s.account = Some("research".into());
+                submit_and_wait(&cm, s)
+            })
+            .collect();
+
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        let granted = ids.iter().filter(|id| pending.contains(id)).count();
+        assert_eq!(
+            granted, 2,
+            "pending_jobs() returned {granted} account jobs but max_running_jobs=2 allows 2"
         );
     }
 
