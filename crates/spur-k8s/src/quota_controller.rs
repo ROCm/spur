@@ -66,10 +66,11 @@ async fn reconcile_once(
         .into_inner()
         .accounts;
 
-    // One ListUsers (empty account = all) grouped client-side, instead of one RPC per account.
+    // One ListUsers (empty account/user = all) grouped client-side, instead of one RPC per account.
     let all_users = acct
         .list_users(ListUsersRequest {
             account: String::new(),
+            user: String::new(),
         })
         .await
         .context("ListUsers RPC")?
