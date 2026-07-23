@@ -4,7 +4,7 @@
 //! Projects a SPUR account's allocation into the native Kubernetes objects that ENFORCE it:
 //! a Namespace (tenancy), a ResourceQuota (hard caps from the account's `grp_tres` allocation),
 //! a LimitRange (default requests so unset-request pods can't dodge the quota), and RBAC (a Role
-//! + a RoleBinding to the account's members). Pure — no I/O — so the whole mapping is unit-tested
+//! and a RoleBinding to the account's members). Pure — no I/O — so the whole mapping is unit-tested
 //! here; the quota controller applies what these return and drift-corrects.
 
 use std::collections::BTreeMap;
