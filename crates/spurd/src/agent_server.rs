@@ -65,15 +65,25 @@ struct CompletedJob {
     nodelist: String,
 }
 
-/// Cloneable handle exposing only whether any jobs are tracked, for use after
+/// Cloneable handle exposing only whether any jobs are active, for use after
 /// `AgentService` itself has moved into the gRPC server (see main's SIGTERM
 /// handler).
 #[derive(Clone)]
-pub struct RunningJobsHandle(Arc<Mutex<HashMap<u32, TrackedJob>>>);
+pub struct RunningJobsHandle {
+    running: Arc<Mutex<HashMap<u32, TrackedJob>>>,
+    allocation: Arc<Mutex<NodeAllocation>>,
+}
 
 impl RunningJobsHandle {
-    pub async fn is_empty(&self) -> bool {
-        self.0.lock().await.is_empty()
+    /// True when no job is tracked AND none is mid-launch. A job spawned but not
+    /// yet inserted into `running` still holds a `launching` reservation, so
+    /// checking both closes the window where a SIGTERM would deregister (and
+    /// force-evict) an in-flight launch.
+    pub async fn has_no_active_jobs(&self) -> bool {
+        if !self.running.lock().await.is_empty() {
+            return false;
+        }
+        !self.allocation.lock().await.has_launching()
     }
 }
 
@@ -189,7 +199,10 @@ impl AgentService {
     }
 
     pub fn running_jobs_handle(&self) -> RunningJobsHandle {
-        RunningJobsHandle(self.running.clone())
+        RunningJobsHandle {
+            running: self.running.clone(),
+            allocation: self.allocation.clone(),
+        }
     }
 
     /// Re-adopt jobs whose process survived a spurd restart, restoring their

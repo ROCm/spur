@@ -65,6 +65,11 @@ impl NodeAllocation {
         }
     }
 
+    /// Whether any job is mid-launch (reserved, not yet committed to `running`).
+    pub fn has_launching(&self) -> bool {
+        !self.launching.is_empty()
+    }
+
     /// Available (unallocated) CPU count.
     pub fn free_cpus(&self) -> u32 {
         self.allocated_cpus.iter().filter(|&&a| !a).count() as u32
@@ -172,7 +177,7 @@ impl NodeAllocation {
             }
         }
 
-        self.allocated_memory_mb += memory_mb;
+        self.allocated_memory_mb = self.allocated_memory_mb.saturating_add(memory_mb);
         for &idx in &gpu_indices {
             self.gpu_allocated[idx] = true;
         }
@@ -207,7 +212,7 @@ impl NodeAllocation {
                 *a = true;
             }
         }
-        self.allocated_memory_mb += alloc.memory_mb;
+        self.allocated_memory_mb = self.allocated_memory_mb.saturating_add(alloc.memory_mb);
         for &device_id in &alloc.gpu_ids {
             if let Some(idx) = self.gpus.iter().position(|g| g.device_id == device_id) {
                 self.gpu_allocated[idx] = true;
@@ -515,6 +520,47 @@ mod tests {
         assert!(node.reconcile(&live).is_empty());
         assert!(node.release_job(42));
         assert_eq!(node.free_memory_mb(), 8_000);
+    }
+
+    #[test]
+    fn test_has_launching_tracks_in_flight_launch() {
+        let mut node = make_node_with_ids(4, 8_000, vec![0], "mi300x");
+        assert!(!node.has_launching());
+        node.allocate_for_job(1, 1, 0, &[0]).unwrap();
+        assert!(
+            node.has_launching(),
+            "reserved-but-not-committed job is launching"
+        );
+        node.commit_job(1);
+        assert!(
+            !node.has_launching(),
+            "committed job is no longer launching"
+        );
+    }
+
+    #[test]
+    fn test_restore_committed_memory_saturates_on_overflow() {
+        // A corrupt/tampered manifest with a huge memory_mb must not wrap the
+        // accounting counter (which would silently corrupt free-memory math).
+        let mut node = make_node_with_ids(4, 8_000, vec![0], "mi300x");
+        node.restore_committed(
+            1,
+            AllocationResult {
+                cpu_ids: vec![],
+                gpu_ids: vec![],
+                memory_mb: u64::MAX,
+            },
+        );
+        node.restore_committed(
+            2,
+            AllocationResult {
+                cpu_ids: vec![],
+                gpu_ids: vec![],
+                memory_mb: u64::MAX,
+            },
+        );
+        // Saturated rather than wrapped; free memory floors at 0.
+        assert_eq!(node.free_memory_mb(), 0);
     }
 
     #[test]

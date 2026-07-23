@@ -305,7 +305,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::select! {
         result = server_future => { result?; }
         _ = sigterm.recv() => {
-            if running_jobs.is_empty().await {
+            if running_jobs.has_no_active_jobs().await {
                 info!("received SIGTERM, deregistering from controller");
                 let dereg_reporter = reporter.clone();
                 match tokio::time::timeout(

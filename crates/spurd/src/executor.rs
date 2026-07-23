@@ -49,6 +49,18 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup/spur";
 /// never hit an NFS root_squash mount. Mirrors Slurm's SlurmdSpoolDir.
 const SPOOL_ROOT: &str = "/var/spool/spur";
 
+/// Candidate spool bases, highest priority first. The user-controlled temp
+/// fallback is only used when spurd is NOT root — root must never scan or write
+/// a world-reachable base (a user could plant a manifest there and have root
+/// trust it verbatim on restart).
+fn spool_bases() -> Vec<PathBuf> {
+    let mut bases = vec![PathBuf::from(SPOOL_ROOT)];
+    if !nix::unistd::geteuid().is_root() {
+        bases.push(std::env::temp_dir().join("spur"));
+    }
+    bases
+}
+
 pub struct ContainerLaunchConfig {
     pub config: ContainerConfig,
     pub rootfs: PathBuf,
@@ -344,10 +356,6 @@ fn exit_status_path(spool_dir: &Path) -> PathBuf {
 /// won't survive a spurd restart, same as not having this feature.
 pub fn write_job_manifest(spool_dir: &Path, manifest: &JobManifest) {
     let path = manifest_path(spool_dir);
-    // The spool dir is world-writable (see create_job_spool_dir), so the job
-    // could have pre-created this path itself; unlink first so `fs::write`
-    // opens a fresh, root-owned inode rather than reusing one it doesn't own.
-    let _ = std::fs::remove_file(&path);
     match serde_json::to_vec(manifest) {
         Ok(bytes) => {
             if let Err(e) = std::fs::write(&path, bytes) {
@@ -446,7 +454,7 @@ pub enum ReconcileOutcome {
 /// Find every job manifest left behind by a previous spurd process.
 pub fn scan_job_manifests() -> Vec<(PathBuf, JobManifest)> {
     let mut found = Vec::new();
-    for base in [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")] {
+    for base in spool_bases() {
         let Ok(entries) = std::fs::read_dir(&base) else {
             continue;
         };
@@ -612,6 +620,10 @@ async fn spawn_job_process(
     let wrapped_script = wrap_with_exit_sentinel(script, &exit_status_path(&spool_dir));
     write_job_scratch(&script_path, &wrapped_script, uid, gid)
         .context("failed to write job script")?;
+    // Pre-create the exit-status sentinel owned by the job, so the wrapped
+    // script can truncate-write it without the spool dir being world-writable.
+    write_job_scratch(&exit_status_path(&spool_dir), "", uid, gid)
+        .context("failed to create exit-status sentinel")?;
 
     // Resolve stdout/stderr paths
     let stdout_resolved = resolve_output_path(stdout_path, job_id, work_dir);
@@ -1255,24 +1267,20 @@ fn create_dir_as_user(dir: &Path, uid: u32, gid: u32) -> bool {
 /// `SPOOL_ROOT`; falls back to a temp dir when it isn't writable (e.g. non-root
 /// dev runs).
 ///
-/// The directory itself stays root-owned. When spurd is root and the job
-/// targets a user, it's made sticky + world-writable (like `/tmp`) instead of
-/// chowned: the job needs to create its own exit-status sentinel file here,
-/// but chowning the whole directory would let it delete/replace root-owned
-/// files in it too (e.g. the job manifest, trusted verbatim on the next
-/// spurd restart) — directory ownership, not file ownership, governs
-/// unlink/rename. The sticky bit lets it create files but not touch ones it
-/// doesn't own. Individual files the job needs to read/exec (the script) are
-/// still chowned to it directly by `write_job_scratch`.
+/// Stays root-owned and non-writable by the job (0o711): the job only needs to
+/// traverse in to open its pre-created, chowned files (script + exit-status
+/// sentinel), never to create files itself. A world-writable dir would let a
+/// co-located user plant a symlink over the root-authored manifest (trusted
+/// verbatim on the next spurd restart) or tamper with another job's files.
 fn create_job_spool_dir(job_id: JobId, uid: u32, _gid: u32) -> anyhow::Result<PathBuf> {
     let mut last_err = None;
-    for base in [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")] {
+    for base in spool_bases() {
         let dir = base.join(format!("job{}", job_id));
         match std::fs::create_dir_all(&dir) {
             Ok(()) => {
                 if should_run_as_user(uid) {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777));
+                    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o711));
                 }
                 return Ok(dir);
             }
@@ -1329,7 +1337,7 @@ pub(crate) fn write_job_scratch(
 /// batchdir after completion. Tries both candidate roots since the fallback
 /// location isn't recorded.
 pub fn cleanup_job_spool(job_id: JobId) {
-    for base in [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")] {
+    for base in spool_bases() {
         let _ = std::fs::remove_dir_all(base.join(format!("job{}", job_id)));
     }
 }
