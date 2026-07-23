@@ -1570,8 +1570,9 @@ impl ClusterManager {
     }
 
     /// Record the primary agent's resolved output paths for `scontrol`. Display-only
-    /// advisory metadata written straight to the in-memory job, not via Raft/WAL, so
-    /// after failover/restart a leader that missed the launch shows the computed path.
+    /// advisory metadata written straight to the in-memory job — not applied via a WAL
+    /// op (though it may ride along in a periodic snapshot), so a failover before the
+    /// next snapshot falls back to the computed path.
     /// Empty paths stay `None` (a mixed-version agent decodes the fields as "").
     pub fn set_job_output_paths(&self, job_id: JobId, stdout_path: String, stderr_path: String) {
         let mut jobs = self.jobs.write();
@@ -6357,6 +6358,34 @@ mod tests {
 
         let job = cm.get_job(job_id).unwrap();
         assert_eq!(job.state, JobState::Cancelled);
+    }
+
+    // A cancelled job keeps its reported path (unlike requeue): the file was
+    // created there, so scontrol should still point at it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_preserves_output_path() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("cancel-me"));
+
+        let alloc = scalar_alloc(2, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            alloc.clone(),
+            per_node_for(&["n1"], alloc),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+
+        cm.set_job_output_paths(id, "/tmp/spur.out".into(), "/tmp/spur.out".into());
+        cm.cancel_job(id, "testuser").unwrap();
+        settle(&cm, id, JobState::Cancelled);
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.actual_stdout_path.as_deref(), Some("/tmp/spur.out"));
+        assert_eq!(job.actual_stderr_path.as_deref(), Some("/tmp/spur.out"));
     }
 
     /// Drive a fresh job all the way to RUNNING on `node`, returning its id.

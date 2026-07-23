@@ -664,8 +664,9 @@ pub struct Job {
     pub bb_stage_state: BbStageState,
 
     /// Absolute path the primary agent resolved at launch (incl. `/tmp` fallback).
-    /// Best-effort, not Raft-replicated: `None` before launch and after a failover/
-    /// restart that missed it, when queries use `resolved_stdout`/`resolved_stderr`.
+    /// Best-effort advisory: set post-launch, not via WAL replay (may ride along in a
+    /// snapshot). `None` before launch or after a failover that missed it, when
+    /// queries fall back to `resolved_stdout`/`resolved_stderr`.
     #[serde(default)]
     pub actual_stdout_path: Option<String>,
     #[serde(default)]
@@ -846,34 +847,66 @@ pub const DEFAULT_WORK_DIR: &str = "/tmp";
 /// `work_dir` (or `DEFAULT_WORK_DIR` when empty) so it is absolute, matching
 /// Slurm. An empty pattern defaults to `spur-<id>.out`.
 pub fn resolve_output_pattern(pattern: &str, ctx: &OutputPathContext) -> String {
-    let mut result = if pattern.is_empty() {
-        format!("spur-{}.out", ctx.job_id)
+    let default;
+    let template: &str = if pattern.is_empty() {
+        default = format!("spur-{}.out", ctx.job_id);
+        &default
     } else {
-        pattern.to_string()
+        pattern
     };
-    result = result.replace("%j", &ctx.job_id.to_string());
-    result = result.replace("%J", &ctx.job_id.to_string());
-    result = result.replace("%x", ctx.name);
-    if let Some(tid) = ctx.array_task_id {
-        result = result.replace("%a", &tid.to_string());
-        result = result.replace("%A", &ctx.array_job_id.unwrap_or(ctx.job_id).to_string());
+
+    // Decide anchoring from the raw pattern, not the expanded result: a crafted
+    // job name (`%x`) could otherwise inject a leading `/` and escape work_dir.
+    let anchor = std::path::Path::new(template).is_relative();
+    let expanded = expand_pattern_codes(template, ctx);
+    if !anchor {
+        return expanded;
     }
-    if let Some(node) = ctx.node {
-        result = result.replace("%N", node);
+
+    let base = if ctx.work_dir.is_empty() {
+        DEFAULT_WORK_DIR
+    } else {
+        ctx.work_dir
+    };
+    // Join by hand (not `Path::join`, which a substituted leading `/` would
+    // short-circuit) so an injected absolute value still lands under `base`.
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        expanded.trim_start_matches('/')
+    )
+}
+
+/// Single-pass `%`-code expansion. Unlike a chain of `str::replace`, a value
+/// spliced in for one code is never rescanned for a later code. Unknown or
+/// inapplicable codes (`%a`/`%A`/`%N` off an array/node) are left verbatim.
+fn expand_pattern_codes(template: &str, ctx: &OutputPathContext) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('j') | Some('J') => out.push_str(&ctx.job_id.to_string()),
+            Some('x') => out.push_str(ctx.name),
+            Some('u') => out.push_str(ctx.user),
+            Some('a') if ctx.array_task_id.is_some() => {
+                out.push_str(&ctx.array_task_id.unwrap_or_default().to_string());
+            }
+            Some('A') if ctx.array_task_id.is_some() => {
+                out.push_str(&ctx.array_job_id.unwrap_or(ctx.job_id).to_string());
+            }
+            Some('N') if ctx.node.is_some() => out.push_str(ctx.node.unwrap_or_default()),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
     }
-    result = result.replace("%u", ctx.user);
-    if std::path::Path::new(&result).is_relative() {
-        let base = if ctx.work_dir.is_empty() {
-            DEFAULT_WORK_DIR
-        } else {
-            ctx.work_dir
-        };
-        result = std::path::Path::new(base)
-            .join(&result)
-            .to_string_lossy()
-            .into_owned();
-    }
-    result
+    out
 }
 
 /// State transitions.
@@ -1083,6 +1116,53 @@ mod tests {
             },
         );
         assert_eq!(job.resolved_stdout(), "/shared/job-9.out");
+    }
+
+    // A crafted job name must not turn a relative pattern absolute and escape
+    // work_dir: relativity is judged on the pattern, not the substituted value.
+    #[test]
+    fn resolved_stdout_injected_absolute_name_stays_under_work_dir() {
+        let job = Job::new(
+            5,
+            JobSpec {
+                name: "/abs/evil".into(),
+                work_dir: "/work".into(),
+                stdout_path: Some("%x.out".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.resolved_stdout(), "/work/abs/evil.out");
+    }
+
+    // A `%` code appearing inside a substituted value is not re-expanded.
+    #[test]
+    fn resolved_stdout_substituted_value_not_re_expanded() {
+        let job = Job::new(
+            7,
+            JobSpec {
+                name: "%u".into(),
+                user: "bob".into(),
+                work_dir: "/work".into(),
+                stdout_path: Some("%x.out".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.resolved_stdout(), "/work/%u.out");
+    }
+
+    // Absoluteness is guaranteed at submission (CLI cwd, agent /tmp fallback),
+    // not fabricated here: a relative work_dir yields a relative path.
+    #[test]
+    fn resolved_stdout_relative_work_dir_anchored_as_is() {
+        let job = Job::new(
+            3,
+            JobSpec {
+                work_dir: "relwork".into(),
+                stdout_path: Some("out.log".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.resolved_stdout(), "relwork/out.log");
     }
 
     #[test]

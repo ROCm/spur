@@ -2524,6 +2524,67 @@ mod tests {
             );
             assert!(job.actual_stderr_path.is_none());
         }
+
+        // A secondary-node failure (primary succeeds) still evicts/requeues the
+        // job, so the `failures == 0` gate must skip storing the primary's path.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn secondary_failure_leaves_output_path_unset() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            // Primary (n1) accepts; secondary (n2) is unreachable.
+            let (good_addr, _) = spawn_mock_agent().await;
+            let bad_addr = unreachable_addr().await;
+            register_node_at(&cm, "n1", good_addr);
+            register_node_at(&cm, "n2", bad_addr);
+
+            let spec = JobSpec {
+                name: "secondary-fail".into(),
+                user: "testuser".into(),
+                num_nodes: 2,
+                num_tasks: 2,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            };
+            let job_id = submit_and_wait(&cm, spec.clone());
+            let spec = cm.get_job(job_id).unwrap().spec;
+
+            let nodes = vec!["n1".to_string(), "n2".to_string()];
+            let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
+                .iter()
+                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+            cm.start_job(
+                job_id,
+                nodes.clone(),
+                ResourceAllocations::with_scalar(2, 0),
+                per_node_allocs.clone(),
+            )
+            .unwrap();
+            settle(&cm, job_id, JobState::Running);
+
+            dispatch_job_to_nodes(
+                cm.clone(),
+                job_id,
+                nodes,
+                spec,
+                Vec::new(),
+                per_node_allocs,
+                "n1,n2".into(),
+                1,
+            )
+            .await;
+
+            let job = cm.get_job(job_id).unwrap();
+            assert!(
+                job.actual_stdout_path.is_none(),
+                "a partial dispatch failure must not record an output path"
+            );
+            assert!(job.actual_stderr_path.is_none());
+        }
     }
 
     #[test]
