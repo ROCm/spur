@@ -1064,7 +1064,7 @@ impl SlurmAgent for AgentService {
 
         let mut cmd = if entry.has_namespaces() {
             let mut c = tokio::process::Command::new("nsenter");
-            for arg in entry.nsenter_args() {
+            for arg in entry.nsenter_args_with_priv_drop() {
                 c.arg(arg);
             }
             c.arg("--");
@@ -1081,6 +1081,8 @@ impl SlurmAgent for AgentService {
             c.current_dir(&entry.work_dir);
             c
         };
+
+        entry.apply_privilege_drop(&mut cmd);
 
         let output = cmd
             .output()
@@ -1167,7 +1169,7 @@ impl SlurmAgent for AgentService {
                 has_user_namespace: false,
                 has_mount_namespace: false,
                 _pty_master: None,
-                work_dir: String::new(),
+                work_dir: req.work_dir.clone(),
                 uid: req.uid,
                 gid: req.gid,
                 partition: req.partition,
@@ -1922,9 +1924,9 @@ impl AgentService {
         let tracked = jobs
             .get(&job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not running on this node", job_id)))?;
-        let pid = tracked.job.pid().ok_or_else(|| {
-            Status::failed_precondition(format!("job {} has no tracked PID", job_id))
-        })?;
+
+        let pid = tracked.job.pid().unwrap_or(0);
+
         Ok(crate::job_entry::JobEntry {
             pid: pid as i32,
             has_pid_namespace: tracked.has_pid_namespace,
@@ -2024,7 +2026,9 @@ impl AgentService {
                             }
                         }
                         Some(Err(_)) | None => {
-                            unsafe { libc::kill(child_pid, libc::SIGHUP); }
+                            let _ = crate::pty::signal_foreground(
+                                master_raw, child_pid, libc::SIGHUP,
+                            );
                             break;
                         }
                     }
@@ -2122,7 +2126,7 @@ impl AgentService {
             .map_err(|e| Status::internal(format!("openpty: {e}")))?;
 
         let shell = if argv.is_empty() {
-            let bash_exists = if entry.has_mount_namespace {
+            let bash_exists = if entry.pid > 0 && entry.has_mount_namespace {
                 std::path::Path::new(&format!("/proc/{}/root/bin/bash", entry.pid)).exists()
             } else {
                 std::path::Path::new("/bin/bash").exists()
@@ -2136,17 +2140,8 @@ impl AgentService {
             argv.to_vec()
         };
 
-        let drop_priv = entry.uid > 0 && nix::unistd::geteuid().is_root();
-
         let (launch_cmd, launch_args) = if entry.has_namespaces() {
-            let mut args = entry.nsenter_args();
-            // nsenter needs root to open /proc/<pid>/ns/*; drop privileges
-            // inside the namespace via --setuid/--setgid instead of
-            // Command::uid()/gid() which would drop before exec.
-            if drop_priv {
-                args.push(format!("--setuid={}", entry.uid));
-                args.push(format!("--setgid={}", entry.gid));
-            }
+            let mut args = entry.nsenter_args_with_priv_drop();
             args.push("--".into());
             args.extend(shell);
             ("nsenter".to_string(), args)
@@ -2155,14 +2150,23 @@ impl AgentService {
         };
 
         let mut cmd = tokio::process::Command::new(&launch_cmd);
+        let work_dir = if entry.work_dir.is_empty() {
+            "/tmp"
+        } else {
+            &entry.work_dir
+        };
         cmd.args(&launch_args)
-            .current_dir(&entry.work_dir)
+            .current_dir(work_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
-        for (k, v) in Self::read_proc_environ(entry.pid as u32) {
-            cmd.env(k, v);
+        entry.apply_privilege_drop(&mut cmd);
+
+        if entry.pid > 0 {
+            for (k, v) in Self::read_proc_environ(entry.pid as u32) {
+                cmd.env(k, v);
+            }
         }
         for (k, v) in entry.env_vars(job_id) {
             cmd.env(k, v);
@@ -2175,11 +2179,6 @@ impl AgentService {
         unsafe {
             cmd.pre_exec(move || raw.wire());
         }
-
-        debug_assert!(
-            !drop_priv || entry.has_namespaces(),
-            "root spurd always has namespaces; direct priv drop should be unreachable"
-        );
 
         let child = cmd
             .spawn()
@@ -2886,6 +2885,9 @@ mod tests {
                 stdout_path: "/dev/null".into(),
                 stderr_path: "/dev/null".into(),
                 has_pid_namespace: false,
+                has_user_namespace: false,
+                has_mount_namespace: false,
+                _pty_master: None,
                 work_dir: "/tmp".into(),
                 uid: 0,
                 gid: 0,
@@ -3111,11 +3113,9 @@ mod tests {
             .unwrap();
 
         let mut collected = Vec::new();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let remaining = deadline.duration_since(tokio::time::Instant::now());
-            match tokio::time::timeout(remaining, out_rx.recv()).await {
-                Ok(Some(Ok(msg))) => match msg.msg {
+        for _ in 0..1000 {
+            match out_rx.recv().await {
+                Some(Ok(msg)) => match msg.msg {
                     Some(interactive_output::Msg::Data(d)) => {
                         collected.extend_from_slice(&d);
                         if collected.windows(5).any(|w| w == b"hello") {
@@ -3136,11 +3136,9 @@ mod tests {
 
         drop(in_tx);
 
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let remaining = deadline.duration_since(tokio::time::Instant::now());
-            match tokio::time::timeout(remaining, out_rx.recv()).await {
-                Ok(Some(Ok(msg))) => {
+        for _ in 0..1000 {
+            match out_rx.recv().await {
+                Some(Ok(msg)) => {
                     if let Some(interactive_output::Msg::ExitStatus(_code)) = msg.msg {
                         return;
                     }

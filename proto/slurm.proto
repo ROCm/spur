@@ -859,6 +859,7 @@ message RegisterJobAllocationRequest {
   repeated string gpu_devices = 8;
   ResourceAllocations allocated = 9;
   string mpi = 10;
+  string work_dir = 11;
 }
 
 message RegisterJobAllocationResponse {}

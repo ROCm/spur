@@ -47,6 +47,34 @@ impl JobEntry {
             ("SLURM_JOB_ID".into(), job_id.to_string()),
         ]
     }
+
+    /// Configure privilege drop on a Command for the non-namespace path.
+    ///
+    /// When spurd runs as root and the job belongs to a non-root user, the
+    /// spawned process must not inherit root. For namespace paths, nsenter
+    /// handles this via --setuid/--setgid. For the direct-spawn path (no
+    /// namespaces), we set uid/gid on the Command itself.
+    pub fn apply_privilege_drop(&self, cmd: &mut tokio::process::Command) {
+        let is_root_spurd = nix::unistd::geteuid().is_root();
+        if is_root_spurd && self.uid > 0 && !self.has_namespaces() {
+            cmd.uid(self.uid);
+            cmd.gid(self.gid);
+        }
+    }
+
+    /// Build nsenter arguments with privilege drop included.
+    ///
+    /// When spurd runs as root and the job belongs to a non-root user,
+    /// appends --setuid/--setgid to drop privileges inside the namespace.
+    pub fn nsenter_args_with_priv_drop(&self) -> Vec<String> {
+        let mut args = self.nsenter_args();
+        let is_root_spurd = nix::unistd::geteuid().is_root();
+        if is_root_spurd && self.uid > 0 {
+            args.push(format!("--setuid={}", self.uid));
+            args.push(format!("--setgid={}", self.gid));
+        }
+        args
+    }
 }
 
 #[cfg(test)]

@@ -486,11 +486,7 @@ fn build_srun_job_spec(args: &SrunArgs, work_dir: &str, io: &ResolvedIoPaths) ->
         cpus_per_task: args.cpus_per_task,
         memory_per_node_mb: memory_mb,
         gres,
-        script: if args.pty {
-            "#!/bin/sh\nsleep infinity\n".to_string()
-        } else {
-            build_command_script(&args.command)?
-        },
+        script: build_command_script(&args.command)?,
         work_dir: work_dir.to_string(),
         stdout_path: io.stdout.clone(),
         stderr_path: io.stderr.clone(),
@@ -526,7 +522,7 @@ fn install_ctrl_c_cancel(
     client: SlurmControllerClient<tonic::transport::Channel>,
     job_id: u32,
     user: String,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut client = client;
         if tokio::signal::ctrl_c().await.is_ok() {
@@ -540,7 +536,7 @@ fn install_ctrl_c_cancel(
                 .await;
             std::process::exit(130);
         }
-    });
+    })
 }
 
 async fn wait_for_job_running(
@@ -746,7 +742,7 @@ async fn run_standalone_srun(args: &SrunArgs, hooks: &HooksConfig, work_dir: &st
 
     eprintln!("srun: Pending job allocation {}...", job_id);
 
-    install_ctrl_c_cancel(client.clone(), job_id, user.clone());
+    let ctrl_c_handle = install_ctrl_c_cancel(client.clone(), job_id, user.clone());
 
     let nodelist = wait_for_job_running(&mut client, job_id).await?;
     if !nodelist.is_empty() {
@@ -754,6 +750,7 @@ async fn run_standalone_srun(args: &SrunArgs, hooks: &HooksConfig, work_dir: &st
     }
 
     if args.pty {
+        ctrl_c_handle.abort();
         eprintln!("srun: opening interactive session on {}", nodelist);
         let result = run_interactive_pty(&args.controller, job_id, args.command.clone()).await;
         let _ = client

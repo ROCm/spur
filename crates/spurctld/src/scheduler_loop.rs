@@ -895,6 +895,7 @@ struct AllocationRegisterParams {
     mpi: String,
     allocated_nodelist: String,
     allocated: spur_core::resource::ResourceAllocations,
+    work_dir: String,
 }
 
 /// Register a srun-only allocation on a node agent without launching a batch process.
@@ -924,6 +925,7 @@ async fn register_allocation_to_agent(
                 .collect(),
             allocated: Some(crate::server::allocations_to_proto(&params.allocated)),
             mpi: params.mpi.clone(),
+            work_dir: params.work_dir.clone(),
         })
         .await?;
 
@@ -977,6 +979,7 @@ async fn register_allocation_on_nodes(
             mpi: spec.mpi.clone().unwrap_or_default(),
             allocated_nodelist: allocated_nodelist.clone(),
             allocated,
+            work_dir: spec.work_dir.clone(),
         };
         set.spawn(async move {
             let result = register_allocation_to_agent(&agent_addr, &params).await;
