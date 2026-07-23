@@ -108,6 +108,10 @@ pub struct SrunArgs {
     #[arg(long)]
     pub reservation: Option<String>,
 
+    /// Exclusive node allocation
+    #[arg(long)]
+    pub exclusive: bool,
+
     /// MPI type (none, pmix, pmi2)
     #[arg(long, default_value = "none")]
     pub mpi: String,
@@ -488,6 +492,7 @@ fn build_srun_job_spec(args: &SrunArgs, work_dir: &str, io: &ResolvedIoPaths) ->
         nodelist: args.nodelist.clone().unwrap_or_default(),
         exclude: args.exclude.clone().unwrap_or_default(),
         reservation: args.reservation.clone().unwrap_or_default(),
+        exclusive: args.exclusive,
         mpi: args.mpi.clone(),
         licenses: args.licenses.clone(),
         container_image: args.container_image.clone().unwrap_or_default(),
@@ -1308,6 +1313,18 @@ mod tests {
     }
 
     #[test]
+    fn build_srun_job_spec_sets_exclusive() {
+        let args = SrunArgs::try_parse_from(["srun", "--exclusive", "hostname"]).expect("parse");
+        let io = ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        };
+        let spec = build_srun_job_spec(&args, "/tmp/work", &io).expect("spec");
+        assert!(spec.exclusive);
+    }
+
+    #[test]
     fn build_srun_job_spec_qos_defaults_empty() {
         let args = SrunArgs::try_parse_from(["srun", "hostname"]).expect("parse");
         let io = ResolvedIoPaths {
@@ -1582,6 +1599,7 @@ mod tests {
         assert_eq!(args.cpus_per_task, 1);
         assert!(args.partition.is_none());
         assert_eq!(args.mpi, "none");
+        assert!(!args.exclusive);
         assert!(!args.label);
     }
 
