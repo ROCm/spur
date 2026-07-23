@@ -215,6 +215,13 @@ fn resolve_node_field(
         }
         'O' => node.cpu_load.to_string(),
         'e' => node.free_memory_mb.to_string(),
+        'f' => {
+            if node.features.is_empty() {
+                "(null)".into()
+            } else {
+                node.features.join(",")
+            }
+        }
         'l' => "UNLIMITED".into(), // Would need partition context
         _ => "?".into(),
     }
@@ -458,6 +465,29 @@ mod tests {
         assert!(lines[0].contains("idle"));
         assert!(lines[1].contains("n2"));
         assert!(lines[1].contains("down"));
+    }
+
+    #[test]
+    fn node_oriented_output_displays_available_features() {
+        let fields = format_engine::parse_format("%n|%f", &format_engine::sinfo_header);
+        let partitions = vec![make_partition("gpu", true)];
+        let mut node = make_node("gpu-node1", NodeState::NodeIdle, "gpu");
+        node.features = vec!["mi350x".into(), "atl".into()];
+
+        let lines = render_sinfo_output(&fields, &partitions, &[node], true);
+
+        assert_eq!(lines, ["gpu-node1|mi350x,atl"]);
+    }
+
+    #[test]
+    fn node_oriented_output_displays_null_when_features_are_empty() {
+        let fields = format_engine::parse_format("%n|%f", &format_engine::sinfo_header);
+        let partitions = vec![make_partition("cpu", true)];
+        let node = make_node("cpu-node1", NodeState::NodeIdle, "cpu");
+
+        let lines = render_sinfo_output(&fields, &partitions, &[node], true);
+
+        assert_eq!(lines, ["cpu-node1|(null)"]);
     }
 
     // --- effective_state_str tests ---

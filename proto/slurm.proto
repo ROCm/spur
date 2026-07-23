@@ -239,6 +239,7 @@ message NodeInfo {
   string active_reservation = 50;
   map<string, string> labels = 51;
   bool reservation_maint = 52;
+  repeated string features = 53;
 }
 
 message PartitionInfo {

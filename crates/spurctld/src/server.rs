@@ -2131,6 +2131,7 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         active_reservation: String::new(),
         labels: node.labels.clone(),
         reservation_maint: false,
+        features: node.features.clone(),
     }
 }
 
@@ -2407,6 +2408,16 @@ mod tests {
             spur_core::node::Node::new(name.into(), spur_core::resource::ResourceSet::default());
         n.partitions = vec![partition.into()];
         n
+    }
+
+    #[test]
+    fn node_info_includes_available_features() {
+        let mut node = core_node("gpu-node1", "gpu");
+        node.features = vec!["mi350x".into(), "atl".into()];
+
+        let info = node_to_proto(&node);
+
+        assert_eq!(info.features, ["mi350x", "atl"]);
     }
 
     fn names(pattern: &str) -> Option<HashSet<String>> {
