@@ -23,6 +23,14 @@ use spur_devices::DeviceRegistry;
 
 use reporter::NodeReporter;
 
+/// Tests that scan the shared spool-root manifest tree (`executor::
+/// scan_job_manifests`/`reconcile_running_jobs`) must serialize against each
+/// other, or one test can pick up a manifest a concurrently-running test left
+/// behind in the same shared directory.
+#[cfg(test)]
+pub(crate) static MANIFEST_SCAN_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 fn log_memlock_status(memlock: spur_core::config::MemlockLimit) {
     use spur_core::config::MemlockLimit;
     let configured_desc = match memlock {
@@ -274,7 +282,16 @@ async fn main() -> anyhow::Result<()> {
     k0s.adopt_running_unit().await;
     tokio::spawn(k0s.supervise());
 
+    // Re-adopt batch jobs whose process survived a prior spurd's restart,
+    // before this agent starts accepting new launches (must not double-book
+    // resources still held by a job it doesn't yet know about).
+    agent_service.reconcile_running_jobs().await;
+
     agent_service.start_monitor(args.controller.clone());
+
+    // Read before agent_service moves into the server, so a SIGTERM with
+    // running jobs can be told apart from a plain idle-node shutdown.
+    let running_jobs = agent_service.running_jobs_handle();
 
     let addr = args.listen.parse()?;
     info!(%addr, "agent gRPC server listening");
@@ -288,17 +305,25 @@ async fn main() -> anyhow::Result<()> {
     tokio::select! {
         result = server_future => { result?; }
         _ = sigterm.recv() => {
-            info!("received SIGTERM, deregistering from controller");
-            let dereg_reporter = reporter.clone();
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                dereg_reporter.deregister("agent shutdown"),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!(error = %e, "deregistration failed"),
-                Err(_) => warn!("deregistration timed out"),
+            if running_jobs.has_no_active_jobs().await {
+                info!("received SIGTERM, deregistering from controller");
+                let dereg_reporter = reporter.clone();
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    dereg_reporter.deregister("agent shutdown"),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!(error = %e, "deregistration failed"),
+                    Err(_) => warn!("deregistration timed out"),
+                }
+            } else {
+                // Do not deregister: that would force-evict running jobs
+                // immediately. Their manifests let a restarted spurd re-adopt
+                // them; the controller's heartbeat timeout is the backstop if
+                // this agent doesn't come back in time.
+                info!("received SIGTERM with running jobs, shutting down without deregistering");
             }
         }
     }

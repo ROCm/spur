@@ -180,6 +180,70 @@ class TestAgentSelfDeregistration:
         _wait_node_gone(cluster, node1, timeout=30)
 
 
+class TestAgentRestartPreservesRunningJob:
+    """Restarting spurd in place (e.g. a binary upgrade via `systemctl
+    restart spurd`) must not interrupt a running job, as long as the
+    restart completes within heartbeat_timeout_secs.
+
+    This is the acceptance test for the seamless-upgrade fix: a graceful
+    SIGTERM must not force-evict the node (unlike TestForcedEviction, which
+    covers the deliberate `--force` admin path), and spurd must reconcile
+    the still-running job — and its resource allocation — on restart
+    instead of losing track of it and stranding or double-booking the
+    node's CPUs.
+
+    NOTE: this currently fails on an unfixed spurd, which force-deregisters
+    (and thus evicts) the node on every SIGTERM regardless of running jobs.
+    """
+
+    HB_TIMEOUT = 15
+
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return {"controller": {"heartbeat_timeout_secs": self.HB_TIMEOUT}}
+
+    def test_restart_agent_mid_job_survives(self, multi_node_cluster):
+        cluster = multi_node_cluster
+        node0 = cluster.node_names[0]
+
+        script = cluster.write_file(
+            "restart_survive.sh", "#!/bin/bash\nsleep 20\necho done\n"
+        )
+        sbatch_out = cluster.sbatch(
+            ["-N", "1", "-c", "2", f"--nodelist={node0}", script]
+        )
+        job_id = parse_job_id(sbatch_out)
+        assert job_id is not None
+
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if job_state(cluster.squeue_all(), job_id) == "R":
+                break
+            time.sleep(1)
+        assert job_state(cluster.squeue_all(), job_id) == "R"
+
+        node_before = cluster.scontrol_show_node(node0)
+        assert "CPUAlloc=2" in node_before, node_before
+
+        # Simulate an in-place binary upgrade: graceful SIGTERM + relaunch,
+        # well within heartbeat_timeout_secs.
+        cluster.restart_agent(0)
+
+        state = job_state(cluster.squeue_all(), job_id)
+        assert state not in (None, "NF", "F"), (
+            f"job was interrupted by agent restart, state={state}"
+        )
+
+        state = _wait_job_terminal(cluster, job_id, timeout=60)
+        assert state == "CD", f"expected COMPLETED after restart, got {state}"
+
+        # Allocation must not have been stranded (leaked as still-allocated
+        # after the job finished) or double-booked (reserved twice across
+        # the restart) — once the job's done, CPUAlloc must fall back to 0.
+        node_after = cluster.scontrol_show_node(node0)
+        assert "CPUAlloc=0" in node_after, node_after
+
+
 class TestDownNodeFailsJobs:
     """Verify the bug fix: jobs on downed nodes transition to NODE_FAIL."""
 
