@@ -102,7 +102,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         }
     } else {
         // Filter-based cancellation: get matching jobs, then cancel each
-        let states = filter_states(args.state.as_deref());
+        let states = filter_states(args.state.as_deref())?;
 
         let response = client
             .get_jobs(spur_proto::proto::GetJobsRequest {
@@ -159,31 +159,36 @@ fn is_cancellable(proto_state: i32) -> bool {
     }
 }
 
-fn filter_states(state: Option<&str>) -> Vec<i32> {
-    state
-        .map(|states| {
-            states
-                .split(',')
-                .filter_map(|state| parse_state(state.trim()))
+fn filter_states(state: Option<&str>) -> Result<Vec<i32>> {
+    let Some(states) = state else {
+        return Ok(cancellable_states());
+    };
+
+    let states = states
+        .split(',')
+        .map(str::trim)
+        .filter(|state| !state.is_empty())
+        .map(|state| {
+            parse_state(state)
                 .map(|state| state as i32)
-                .collect()
+                .ok_or_else(|| anyhow::anyhow!("scancel: invalid job state: {state}"))
         })
-        .unwrap_or_else(cancellable_states)
+        .collect::<Result<Vec<_>>>()?;
+
+    // Comma-only or whitespace-only input leaves no tokens after normalization.
+    if states.is_empty() {
+        bail!("scancel: invalid job state: (empty)");
+    }
+
+    Ok(states)
 }
 
 fn cancellable_states() -> Vec<i32> {
-    use spur_proto::proto::JobState;
-
-    [
-        JobState::JobPending,
-        JobState::JobRunning,
-        JobState::JobCompleting,
-        JobState::JobPreempted,
-        JobState::JobSuspended,
-    ]
-    .into_iter()
-    .map(|state| state as i32)
-    .collect()
+    spur_core::job::JobState::ALL
+        .iter()
+        .filter(|state| !state.is_terminal())
+        .map(|state| state.to_proto_i32())
+        .collect()
 }
 
 fn parse_signal(s: Option<&str>) -> Result<i32> {
@@ -235,7 +240,7 @@ mod tests {
 
     #[test]
     fn default_filter_requests_only_cancellable_states() {
-        let states = filter_states(None);
+        let states = filter_states(None).unwrap();
 
         assert!(states.contains(&(JobState::JobPending as i32)));
         assert!(states.contains(&(JobState::JobRunning as i32)));
@@ -254,9 +259,23 @@ mod tests {
     #[test]
     fn explicit_filter_uses_requested_states() {
         assert_eq!(
-            filter_states(Some("PD,R")),
+            filter_states(Some("PD,R")).unwrap(),
             vec![JobState::JobPending as i32, JobState::JobRunning as i32,]
         );
+    }
+
+    #[test]
+    fn invalid_explicit_filter_is_rejected() {
+        let error = filter_states(Some("PD,BANANA")).unwrap_err();
+
+        assert_eq!(error.to_string(), "scancel: invalid job state: BANANA");
+    }
+
+    #[test]
+    fn empty_explicit_filter_is_rejected() {
+        let error = filter_states(Some(" , ")).unwrap_err();
+
+        assert_eq!(error.to_string(), "scancel: invalid job state: (empty)");
     }
 
     #[test]
