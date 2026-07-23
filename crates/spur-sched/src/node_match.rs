@@ -17,7 +17,8 @@ use spur_core::reservation::Reservation;
 /// Job placement constraints, parsed once and reused across all candidate nodes.
 pub struct NodePlacement<'a> {
     job: &'a Job,
-    /// Explicit `--nodelist` allow-list (expanded from hostlist), if any.
+    /// Expanded, deduplicated `--nodelist`, whose cardinality determines
+    /// whether the request is a candidate pool or an additive requirement.
     nodelist: Option<HashSet<String>>,
     /// `--exclude` deny-list (expanded from hostlist).
     exclude: HashSet<String>,
@@ -77,11 +78,24 @@ impl<'a> NodePlacement<'a> {
     /// Name-only check: no partition, feature, capacity, or state involved.
     pub fn allows_name(&self, name: &str) -> bool {
         if let Some(ref allowed) = self.nodelist {
-            if !allowed.contains(name) {
+            if !self.nodelist_is_additive() && !allowed.contains(name) {
                 return false;
             }
         }
         !self.exclude.contains(name)
+    }
+
+    pub fn nodelist_is_additive(&self) -> bool {
+        let Some(ref nodelist) = self.nodelist else {
+            return false;
+        };
+        (self.job.spec.num_nodes as usize).max(1) > nodelist.len()
+    }
+
+    pub fn is_listed(&self, name: &str) -> bool {
+        self.nodelist
+            .as_ref()
+            .is_some_and(|nodelist| nodelist.contains(name))
     }
 
     /// True if the node is in one of the job's requested partitions (or the job
@@ -165,7 +179,7 @@ impl<'a> NodePlacement<'a> {
 /// Falls back to a plain comma-split if the pattern is malformed, so existing
 /// behaviour is preserved for simple comma-separated lists.
 pub fn expand_hostlist_or_split(pattern: &str) -> Vec<String> {
-    match spur_core::hostlist::expand(pattern) {
+    let names = match spur_core::hostlist::expand(pattern) {
         Ok(names) => names,
         Err(e) => {
             warn!(
@@ -175,7 +189,8 @@ pub fn expand_hostlist_or_split(pattern: &str) -> Vec<String> {
             );
             pattern.split(',').map(|s| s.trim().to_string()).collect()
         }
-    }
+    };
+    names.into_iter().filter(|name| !name.is_empty()).collect()
 }
 
 #[cfg(test)]
@@ -225,6 +240,21 @@ mod tests {
         );
         // Plain comma list is not a hostlist pattern; fallback splits it.
         assert_eq!(expand_hostlist_or_split("a,b,c"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn empty_hostlist_entries_are_ignored() {
+        assert_eq!(
+            expand_hostlist_or_split("node001,,node002,"),
+            vec!["node001", "node002"]
+        );
+
+        let job = job_with(JobSpec {
+            nodelist: Some("node001,".into()),
+            num_nodes: 2,
+            ..base_spec()
+        });
+        assert!(NodePlacement::new(&job).nodelist_is_additive());
     }
 
     #[test]
