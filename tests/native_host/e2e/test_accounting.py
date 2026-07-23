@@ -554,6 +554,136 @@ class TestSacctmgrQosAuthorization:
         assert still_allowed_id is not None, "keepqosb must still be usable after the unrelated modify"
         wait_job(c, still_allowed_id, timeout=30)
 
+    def test_modify_user_explicit_empty_qos_clears_the_allow_list(self, accounting_cluster):
+        # The other half of the preserve-semantics fix: an *explicit* empty
+        # qos= must actually clear the allow-list (unlike omitting qos=
+        # entirely, which preserves it — see the test above).
+        c = accounting_cluster
+        user = c.nodes[0].user
+
+        c.sacctmgr(["add", "qos", "name=clearqosa"])
+        c.sacctmgr(["add", "qos", "name=clearqosb"])
+        c.sacctmgr(["add", "account", "name=clearqos"])
+        c.sacctmgr(
+            [
+                "add",
+                "user",
+                f"name={user}",
+                "account=clearqos",
+                "qos=clearqosa,clearqosb",
+                "defaultqos=clearqosa",
+            ]
+        )
+
+        c.sacctmgr(["modify", "user", f"name={user}", "account=clearqos", "set", "qos="])
+
+        out = c.sacctmgr(["show", "user"])
+        row = next(line for line in out.splitlines() if "clearqos" in line and user in line)
+        assert "clearqosa,clearqosb" not in row, f"allow-list must be cleared, got {row!r}"
+        assert "clearqosa" in row, f"pinned default must survive the explicit clear, got {row!r}"
+
+        time.sleep(15)
+        script = c.write_file("qos-cleared.sh", "#!/bin/bash\ntrue\n")
+
+        out = c.cli_allow_fail(
+            ["sbatch", "-J", "qos-cleared-bad", "-N", "1", "-A", "clearqos", "--qos=clearqosb", script]
+        )
+        assert "not permitted" in out, f"cleared allow-list member must now be rejected, got {out!r}"
+
+        still_default_id = parse_job_id(
+            c.sbatch(["-J", "qos-cleared-ok", "-N", "1", "-A", "clearqos", "--qos=clearqosa", script])
+        )
+        assert still_default_id is not None, "the pinned default must still be usable"
+        wait_job(c, still_default_id, timeout=30)
+
+    def test_stale_association_default_does_not_block_unrelated_explicit_qos(self, accounting_cluster):
+        # An association's pinned default can go stale (its QOS deleted
+        # cluster-wide) without disturbing authorization for an unrelated,
+        # still-valid explicit --qos.
+        c = accounting_cluster
+        user = c.nodes[0].user
+
+        c.sacctmgr(["add", "qos", "name=stalegoal"])
+        c.sacctmgr(["add", "qos", "name=stalesurvivor"])
+        c.sacctmgr(["add", "account", "name=staleacct"])
+        c.sacctmgr(["add", "user", f"name={user}", "account=staleacct", "defaultqos=stalegoal"])
+        c.sacctmgr(["delete", "qos", "name=stalegoal"])
+        time.sleep(15)
+
+        script = c.write_file("qos-stale-default.sh", "#!/bin/bash\ntrue\n")
+        job_id = parse_job_id(
+            c.sbatch(["-J", "qos-stale", "-N", "1", "-A", "staleacct", "--qos=stalesurvivor", script])
+        )
+        assert job_id is not None, "explicit --qos must succeed despite a stale pinned default"
+        wait_job(c, job_id, timeout=30)
+
+    def test_cluster_fallback_qos_withheld_when_outside_association_allow_list(self, accounting_cluster):
+        # A restricted association omitting --qos must not silently receive
+        # the cluster-wide fallback QOS when that fallback isn't in its
+        # allow-list — closes the gap where the fallback chain bypassed
+        # per-association authorization entirely.
+        c = accounting_cluster
+        user = c.nodes[0].user
+
+        c.sacctmgr(["add", "qos", "name=fallbackqos"])
+        c.sacctmgr(["add", "qos", "name=restrictedqos"])
+        c.sacctmgr(["add", "account", "name=fallbackacct"])
+        c.sacctmgr(["add", "user", f"name={user}", "account=fallbackacct", "qos=restrictedqos"])
+
+        deep_merge(c.config_overrides, {"accounting": {"default_qos": "fallbackqos"}})
+        c._write_config()
+        c.restart_controller()
+        time.sleep(15)
+
+        script = c.write_file("qos-fallback-outside.sh", "#!/bin/bash\ntrue\n")
+        job_id = parse_job_id(
+            c.sbatch(["-J", "qos-fallback", "-N", "1", "-A", "fallbackacct", script])
+        )
+        assert job_id is not None, "job with no --qos must still be accepted"
+        wait_job(c, job_id, timeout=30)
+
+        show = c.scontrol("show", "job", str(job_id))
+        assert "QOS=fallbackqos" not in show, (
+            f"unauthorized cluster fallback must not be silently granted: {show!r}"
+        )
+
+    def test_update_job_qos_rejects_unauthorized_and_account_spoofing(self, accounting_cluster):
+        # scontrol update job qos= must enforce the same per-association
+        # authorization as submission, including when qos= and account= are
+        # changed together to an account the user has no association with
+        # (the account-spoofing bypass this PR closes).
+        c = accounting_cluster
+        user = c.nodes[0].user
+
+        c.sacctmgr(["add", "qos", "name=updateallowed"])
+        c.sacctmgr(["add", "qos", "name=updateforbidden"])
+        c.sacctmgr(["add", "account", "name=updateacct"])
+        c.sacctmgr(["add", "account", "name=updatestranger"])
+        c.sacctmgr(["add", "user", f"name={user}", "account=updateacct", "defaultqos=updateallowed"])
+        time.sleep(15)
+
+        script = c.write_file("qos-update.sh", "#!/bin/bash\nsleep 30\n")
+        job_id = parse_job_id(
+            c.sbatch(["-J", "qos-update", "-N", "1", "-t", "60", "-A", "updateacct", script])
+        )
+        assert job_id is not None
+
+        out = c.cli_allow_fail(["scontrol", "update", f"jobid={job_id}", "qos=updateforbidden"])
+        assert "not permitted" in out, f"expected an authorization rejection, got {out!r}"
+        show = c.scontrol("show", "job", str(job_id))
+        assert "QOS=updateallowed" in show, f"job QOS must be unchanged after rejected update: {show!r}"
+
+        out = c.cli_allow_fail(
+            ["scontrol", "update", f"jobid={job_id}", "qos=updateforbidden", "account=updatestranger"]
+        )
+        assert "not associated" in out, f"expected a membership rejection, got {out!r}"
+        show = c.scontrol("show", "job", str(job_id))
+        assert "QOS=updateallowed" in show and "Account=updateacct" in show, (
+            f"job must be untouched after a rejected account-spoofing update: {show!r}"
+        )
+
+        c.scancel(str(job_id))
+
 
 class TestSacctmgrInvalidInput:
     def test_add_qos_with_non_numeric_limit_fails_cleanly(self, accounting_cluster):
