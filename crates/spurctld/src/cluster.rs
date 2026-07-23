@@ -4715,8 +4715,9 @@ fn validate_user_account(
 
 /// Resolve a job's QOS at submit, in Slurm's order: explicit `--qos` (must
 /// exist and be permitted for the association) → association default →
-/// cluster fallback (`accounting.default_qos`) → reject if
-/// `accounting.require_qos`, else accept with no QOS.
+/// cluster fallback (`accounting.default_qos`, also gated by the
+/// association's allow-list) → reject if `accounting.require_qos`, else
+/// accept with no QOS.
 fn apply_default_qos(
     spec: &mut JobSpec,
     assoc_cache: &AssociationCache,
@@ -4729,12 +4730,20 @@ fn apply_default_qos(
     // concurrent cache refresh can't validate one against the other's
     // stale snapshot.
     let (account, default_qos, allowed_qos) = assoc_cache.resolve(&spec.user, given_account);
+    // A stale pinned default (removed from qos_cache since it was set) is
+    // treated as unset for authorization, matching how the fallback chain
+    // below already ignores it rather than letting it block every explicit
+    // `--qos` a user could otherwise submit.
+    let default_qos_for_auth = default_qos
+        .as_deref()
+        .filter(|d| qos_cache.get(d).is_some())
+        .map(str::to_owned);
 
     if let Some(name) = spec.qos.as_deref().filter(|n| !n.is_empty()) {
         if qos_cache.get(name).is_none() {
             return Err(SubmitError::invalid(format!("QOS '{name}' does not exist")));
         }
-        if !qos_permitted(&allowed_qos, default_qos.as_deref(), name) {
+        if !qos_permitted(&allowed_qos, default_qos_for_auth.as_deref(), name) {
             return Err(SubmitError::invalid(format!(
                 "QOS '{name}' is not permitted for user '{}' under account '{}'",
                 spec.user,
@@ -4758,7 +4767,10 @@ fn apply_default_qos(
     }
 
     // A configured fallback naming a nonexistent QOS is a hard error — silently
-    // ignoring it would leave the job unenforced, the gap this closes.
+    // ignoring it would leave the job unenforced, the gap this closes. A fallback
+    // that exists but isn't permitted for this association degrades like a stale
+    // default instead, since it reflects the association's own restriction, not
+    // a misconfiguration.
     let fallback = accounting.default_qos.trim();
     if !fallback.is_empty() {
         if qos_cache.get(fallback).is_none() {
@@ -4766,8 +4778,16 @@ fn apply_default_qos(
                 "configured default QOS '{fallback}' does not exist"
             )));
         }
-        spec.qos = Some(fallback.to_string());
-        return Ok(());
+        if qos_permitted(&allowed_qos, default_qos_for_auth.as_deref(), fallback) {
+            spec.qos = Some(fallback.to_string());
+            return Ok(());
+        }
+        warn!(
+            user = %spec.user,
+            account = account.as_deref().unwrap_or_default(),
+            qos = %fallback,
+            "cluster default QOS not permitted for this association, ignoring"
+        );
     }
 
     if accounting.require_qos {
@@ -11221,6 +11241,82 @@ mod tests {
 
         super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg_with("normal", false)).unwrap();
         assert_eq!(spec.qos.as_deref(), Some("normal"));
+    }
+
+    #[test]
+    fn apply_default_qos_explicit_permitted_despite_stale_association_default() {
+        // Association's pinned default was deleted from the cluster; that must
+        // not poison authorization for an unrelated, unrestricted explicit --qos.
+        let assoc = AssociationCache::new();
+        assoc.insert_default_qos("testuser", "research", "deleted-qos");
+        let qos = qos_cache_with(&["highprio"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+        spec.qos = Some("highprio".into());
+
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("highprio"));
+    }
+
+    #[test]
+    fn apply_default_qos_cluster_fallback_ignored_outside_allow_list() {
+        // Association is restricted to an allow-list that omits the cluster
+        // fallback; omitting --qos must not silently grant it.
+        let assoc = AssociationCache::new();
+        assoc.insert_allowed_qos("testuser", "research", &["a", "b"]);
+        let qos = qos_cache_with(&["a", "b", "cluster-default"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        super::apply_default_qos(
+            &mut spec,
+            &assoc,
+            &qos,
+            &acct_cfg_with("cluster-default", false),
+        )
+        .unwrap();
+        assert_eq!(spec.qos, None, "unauthorized fallback must not be assigned");
+    }
+
+    #[test]
+    fn apply_default_qos_cluster_fallback_outside_allow_list_with_require_qos_errors() {
+        let assoc = AssociationCache::new();
+        assoc.insert_allowed_qos("testuser", "research", &["a", "b"]);
+        let qos = qos_cache_with(&["a", "b", "cluster-default"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        let err = super::apply_default_qos(
+            &mut spec,
+            &assoc,
+            &qos,
+            &acct_cfg_with("cluster-default", true),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid(
+                "no QOS specified and no default QOS is configured for this user/account"
+            )
+        );
+    }
+
+    #[test]
+    fn apply_default_qos_cluster_fallback_permitted_when_in_allow_list() {
+        let assoc = AssociationCache::new();
+        assoc.insert_allowed_qos("testuser", "research", &["cluster-default"]);
+        let qos = qos_cache_with(&["cluster-default"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        super::apply_default_qos(
+            &mut spec,
+            &assoc,
+            &qos,
+            &acct_cfg_with("cluster-default", false),
+        )
+        .unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("cluster-default"));
     }
 
     #[test]
