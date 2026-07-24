@@ -460,9 +460,17 @@ impl SlurmAccounting for AccountingService {
         request: Request<RemoveUserRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
-        db::remove_user(&self.pool, &req.user, &req.account)
+        let deleted = db::remove_user(&self.pool, &req.user, &req.account)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        if deleted == 0 {
+            let target = if req.account.is_empty() {
+                format!("user '{}'", req.user)
+            } else {
+                format!("user '{}' in account '{}'", req.user, req.account)
+            };
+            return Err(Status::not_found(format!("{target} does not exist")));
+        }
         Ok(Response::new(()))
     }
 

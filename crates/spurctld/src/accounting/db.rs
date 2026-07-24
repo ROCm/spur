@@ -649,19 +649,22 @@ pub async fn add_user(
     Ok(())
 }
 
-/// Remove a user from an account.
-pub async fn remove_user(pool: &PgPool, user: &str, account: &str) -> anyhow::Result<()> {
-    sqlx::query("DELETE FROM users WHERE name = $1 AND account = $2")
+/// Remove a user from one account, or every account when `account` is empty.
+pub async fn remove_user(pool: &PgPool, user: &str, account: &str) -> anyhow::Result<u64> {
+    let mut tx = pool.begin().await?;
+    let associations =
+        sqlx::query("DELETE FROM associations WHERE user_name = $1 AND ($2 = '' OR account = $2)")
+            .bind(user)
+            .bind(account)
+            .execute(&mut *tx)
+            .await?;
+    let users = sqlx::query("DELETE FROM users WHERE name = $1 AND ($2 = '' OR account = $2)")
         .bind(user)
         .bind(account)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM associations WHERE user_name = $1 AND account = $2")
-        .bind(user)
-        .bind(account)
-        .execute(pool)
-        .await?;
-    Ok(())
+    tx.commit().await?;
+    Ok(associations.rows_affected() + users.rows_affected())
 }
 
 /// List users, joining each one's own association row for `default_qos`/
@@ -1531,6 +1534,66 @@ mod job_history_tests {
             .await?;
         sqlx::query("DELETE FROM accounts WHERE name = $1")
             .bind(&account)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn remove_user_deletes_one_or_all_account_associations() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let user = format!("spur_remove_user_{pid}");
+        let account_one = format!("spur_remove_acct_one_{pid}");
+        let account_two = format!("spur_remove_acct_two_{pid}");
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name IN ($1, $2)")
+            .bind(&account_one)
+            .bind(&account_two)
+            .execute(&pool)
+            .await?;
+
+        upsert_account(&pool, &account_one, "d", "o", None, 1, None).await?;
+        upsert_account(&pool, &account_two, "d", "o", None, 1, None).await?;
+        add_user(&pool, &user, &account_one, "none", true, "").await?;
+        add_user(&pool, &user, &account_two, "none", false, "").await?;
+
+        let deleted = remove_user(&pool, &user, &account_one).await?;
+        assert_eq!(deleted, 2);
+        let remaining = list_users(&pool, None).await?;
+        assert!(!remaining
+            .iter()
+            .any(|record| record.name == user && record.account == account_one));
+        assert!(remaining
+            .iter()
+            .any(|record| record.name == user && record.account == account_two));
+
+        let deleted = remove_user(&pool, &user, "").await?;
+        assert_eq!(deleted, 2);
+        let remaining = list_users(&pool, None).await?;
+        assert!(!remaining.iter().any(|record| record.name == user));
+        let association_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM associations WHERE user_name = $1")
+                .bind(&user)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(association_count, 0);
+
+        let deleted = remove_user(&pool, &user, "").await?;
+        assert_eq!(deleted, 0);
+
+        sqlx::query("DELETE FROM accounts WHERE name IN ($1, $2)")
+            .bind(&account_one)
+            .bind(&account_two)
             .execute(&pool)
             .await?;
         Ok(())
