@@ -1331,12 +1331,9 @@ async fn enforce_completing_timeout(cluster: Arc<ClusterManager>, raft: Arc<Raft
     }
 }
 
-/// Force-finish a job the controller has waited on past `complete_wait_secs`.
-///
-/// The unreported nodes are about to have their resources freed here, but their
-/// agents may still hold the allocation, so cancel the job on those nodes first
-/// or the next dispatch is rejected and the victim requeues to JobHoldMaxRequeue.
-/// Best-effort; the agent-side reclaim covers a cancel that arrives too late.
+/// Force-finish a job stuck in Completing past `complete_wait_secs`, cancelling
+/// it on the unreported nodes first so their agents release the allocation
+/// before the controller frees those nodes. Best-effort; the agent reclaim backs it.
 async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_core::job::Job) {
     let missing: Vec<_> = job
         .allocated_nodes
@@ -2413,10 +2410,8 @@ mod tests {
             assert!(job.allocated_nodes.is_empty());
         }
 
-        // On a completing-timeout force-finish, the controller frees the
-        // still-unreported node in its accounting. It must first cancel the job
-        // on exactly that node — otherwise its agent keeps the stale local
-        // allocation and rejects the next dispatch, stranding the node.
+        // Force-finish must cancel the job on the unreported node before freeing
+        // it, or the agent keeps the stale allocation and rejects the next dispatch.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn completing_timeout_cancels_only_the_unreported_node() {
             use spur_core::job::JobState;

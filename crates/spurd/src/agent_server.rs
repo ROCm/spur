@@ -1825,10 +1825,8 @@ impl AgentService {
         ) {
             Ok(result) => result,
             Err(AllocError::GpusUnavailable) => {
-                // The controller only re-launches after freeing the prior job,
-                // so a conflicting owner absent from the live set is stale (a
-                // lost release); reclaim it and retry. Launching owners are
-                // spared by conflicting_owners — a real duplicate, not a strand.
+                // A conflicting owner absent from the live set is stale (the
+                // controller only re-launches after freeing it); reclaim and retry.
                 let stale: Vec<u32> = alloc
                     .conflicting_owners(&controller_gpu_ids)
                     .into_iter()
@@ -2842,11 +2840,8 @@ mod tests {
         );
     }
 
-    // A dispatch whose controller-allocated GPUs are still owned locally by a
-    // prior job that is NO LONGER running must reclaim those stale GPUs and
-    // succeed, instead of rejecting and stranding the node. The controller only
-    // re-issues a launch after freeing the prior job, so an owner absent from
-    // `running` is definitionally stale.
+    // A conflicting owner no longer in `running` is stale and must be reclaimed
+    // so the dispatch succeeds instead of stranding the node.
     #[tokio::test]
     async fn dispatch_reclaims_stale_gpu_owner_not_running() {
         let svc = AgentService::new(
@@ -2895,9 +2890,8 @@ mod tests {
         );
     }
 
-    // The reclaim must NOT free a GPU still held by a job that is actually
-    // running: that would double-allocate the device. A conflicting owner that
-    // IS in `running` keeps the dispatch rejected.
+    // A conflicting owner still in `running` must never be reclaimed (that would
+    // double-allocate the GPU); the dispatch stays rejected.
     #[tokio::test]
     async fn dispatch_rejects_when_conflicting_owner_still_running() {
         let svc = AgentService::new(
@@ -2943,9 +2937,8 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
     }
 
-    // A conflicting owner still mid-launch (reserved, not yet committed) is a
-    // real concurrent duplicate, not a strand: the reclaim must spare it, so the
-    // retry still fails and the dispatch is rejected.
+    // A still-launching conflicting owner is a real duplicate: the reclaim must
+    // spare it, so the retry fails and the dispatch stays rejected.
     #[tokio::test]
     async fn dispatch_rejects_when_conflicting_owner_still_launching() {
         let svc = AgentService::new(

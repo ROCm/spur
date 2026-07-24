@@ -86,11 +86,8 @@ impl NodeAllocation {
             .collect()
     }
 
-    /// Job ids that own any of `device_ids` and are NOT mid-launch. A launching
-    /// job is deliberately excluded: a launch in flight for overlapping GPUs is a
-    /// genuine concurrent duplicate, never a reclaimable stale owner. Used by the
-    /// agent to reclaim a stale committed reservation on dispatch when the owning
-    /// job is no longer running locally.
+    /// Job ids owning any of `device_ids`, excluding mid-launch owners (a launch
+    /// in flight is a real duplicate, not a reclaimable stale owner).
     pub fn conflicting_owners(&self, device_ids: &[u32]) -> Vec<u32> {
         self.owners
             .iter()
@@ -466,9 +463,7 @@ mod tests {
         assert_eq!(node.conflicting_owners(&[1]), vec![1]);
         // A dispatch onto GPU 3 (free) conflicts with nobody.
         assert!(node.conflicting_owners(&[3]).is_empty());
-        // A dispatch onto GPU 2 conflicts with a still-launching job, which must
-        // NOT be reported — a launch in flight is a real concurrent duplicate,
-        // never a reclaimable stale owner.
+        // GPU 2's owner is still launching — a real duplicate, never reported.
         assert!(node.conflicting_owners(&[2]).is_empty());
         // A dispatch spanning a committed and a launching device reports only the
         // committed owner.
