@@ -102,7 +102,7 @@ async fn cmd_import_dockerd(image: &str) -> Result<()> {
     eprintln!("Importing from Docker daemon: {}", image);
 
     let image_dir = resolve_image_dir();
-    let name = spur_net::oci::sanitize_name(image);
+    let name = spur_net::oci::image_file_stem(image);
     let output_path = image_dir.join(format!("{}.sqsh", name));
     if output_path.exists() {
         eprintln!("Image already imported: {}", output_path.display());
@@ -155,7 +155,7 @@ async fn cmd_import_podman(image: &str) -> Result<()> {
     eprintln!("Importing from Podman: {}", image);
 
     let image_dir = resolve_image_dir();
-    let name = spur_net::oci::sanitize_name(image);
+    let name = spur_net::oci::image_file_stem(image);
     let output_path = image_dir.join(format!("{}.sqsh", name));
     if output_path.exists() {
         eprintln!("Image already imported: {}", output_path.display());
@@ -311,7 +311,7 @@ fn cmd_list() -> Result<()> {
 
     println!("{:<50} {:>10}", "IMAGE", "SIZE");
     for (name, size) in &images {
-        let display_name = name.replace('+', "/");
+        let display_name = spur_net::oci::display_name(name);
         let size_str = if *size > 1_073_741_824 {
             format!("{:.1} GB", *size as f64 / 1_073_741_824.0)
         } else {
@@ -324,7 +324,7 @@ fn cmd_list() -> Result<()> {
 }
 
 fn cmd_remove(name: &str) -> Result<()> {
-    let sanitized = spur_net::oci::sanitize_name(name);
+    let sanitized = spur_net::oci::image_file_stem(name);
     let image_dir = resolve_image_dir();
     let path = image_dir.join(format!("{}.sqsh", sanitized));
 

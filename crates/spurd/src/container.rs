@@ -191,7 +191,7 @@ pub fn resolve_image(
     }
 
     let dirs = image_dirs_for_job(job_user, job_uid);
-    let sanitized = sanitize_name(image);
+    let sanitized = spur_net::oci::image_file_stem(image);
 
     for dir in &dirs {
         // Try with .sqsh extension
@@ -1139,7 +1139,7 @@ pub fn list_images() -> Vec<(String, u64)> {
 
 /// Remove an imported image.
 pub fn remove_image(name: &str) -> anyhow::Result<()> {
-    let path = image_dir().join(format!("{}.sqsh", sanitize_name(name)));
+    let path = image_dir().join(format!("{}.sqsh", spur_net::oci::image_file_stem(name)));
     if !path.exists() {
         bail!("image '{}' not found", name);
     }
@@ -1469,7 +1469,12 @@ mod tests {
         // test_resolve_job_user_home_for_current_uid +
         // test_compose_image_dirs_includes_existing_user_home_dir.)
         let images_dir = tempfile::tempdir().unwrap();
-        let image_path = images_dir.path().join("myimage.sqsh");
+        // Stored under the canonical stem, matching how `spur image import`
+        // names files (registry+repository+tag).
+        let image_path = images_dir.path().join(format!(
+            "{}.sqsh",
+            spur_net::oci::image_file_stem("myimage")
+        ));
         std::fs::write(&image_path, b"fake squashfs").unwrap();
 
         // Use SPUR_IMAGE_DIR to inject a known dir into the search path.
@@ -1488,6 +1493,34 @@ mod tests {
         }
 
         let resolved = result.expect("resolve_image must find myimage.sqsh");
+        assert_eq!(resolved, image_path);
+    }
+
+    #[test]
+    fn test_resolve_image_cross_form_reference() {
+        let images_dir = tempfile::tempdir().unwrap();
+        // Import under one form...
+        let image_path = images_dir.path().join(format!(
+            "{}.sqsh",
+            spur_net::oci::image_file_stem("docker://busybox:latest")
+        ));
+        std::fs::write(&image_path, b"fake squashfs").unwrap();
+
+        let _guard = env_lock();
+        let prev = std::env::var_os("SPUR_IMAGE_DIR");
+        std::env::set_var("SPUR_IMAGE_DIR", images_dir.path());
+
+        // ...resolve under a different equivalent form.
+        let result = resolve_image("busybox", None, None);
+
+        match prev {
+            Some(v) => std::env::set_var("SPUR_IMAGE_DIR", v),
+            None => std::env::remove_var("SPUR_IMAGE_DIR"),
+        }
+
+        let resolved = result.expect(
+            "resolve_image('busybox') must find image imported as 'docker://busybox:latest'",
+        );
         assert_eq!(resolved, image_path);
     }
 
