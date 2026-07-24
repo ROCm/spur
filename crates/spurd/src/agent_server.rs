@@ -1161,6 +1161,9 @@ impl SlurmAgent for AgentService {
         let cpus = allocated.map(|a| a.cpus).unwrap_or(req.cpus).max(1);
         let memory_mb = allocated.map(|a| a.memory_mb).unwrap_or(req.memory_mb);
 
+        // running-before-allocation (as in commit) so the job is never
+        // committed-but-absent-from-running, which the reclaim reads as stale.
+        let mut jobs = self.running.lock().await;
         {
             let mut alloc = self.allocation.lock().await;
             alloc
@@ -1185,7 +1188,7 @@ impl SlurmAgent for AgentService {
             "registered srun allocation"
         );
 
-        self.running.lock().await.insert(
+        jobs.insert(
             req.job_id,
             TrackedJob {
                 job: executor::RunningJob::AllocationOnly,
@@ -1822,14 +1825,10 @@ impl AgentService {
         ) {
             Ok(result) => result,
             Err(AllocError::GpusUnavailable) => {
-                // The conflicting GPUs may be held by a prior job that already
-                // ended locally but whose release never ran (e.g. the controller
-                // force-finished it after a lost completion report). The
-                // controller only re-issues a launch after freeing the prior job,
-                // so any conflicting owner absent from the live running set is
-                // stale: reclaim it and retry once. A still-launching owner is
-                // spared by conflicting_owners — that is a real concurrent
-                // duplicate, not a strand.
+                // The controller only re-launches after freeing the prior job,
+                // so a conflicting owner absent from the live set is stale (a
+                // lost release); reclaim it and retry. Launching owners are
+                // spared by conflicting_owners — a real duplicate, not a strand.
                 let stale: Vec<u32> = alloc
                     .conflicting_owners(&controller_gpu_ids)
                     .into_iter()

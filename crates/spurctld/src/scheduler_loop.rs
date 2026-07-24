@@ -1333,14 +1333,10 @@ async fn enforce_completing_timeout(cluster: Arc<ClusterManager>, raft: Arc<Raft
 
 /// Force-finish a job the controller has waited on past `complete_wait_secs`.
 ///
-/// The nodes that never reported are about to have their resources freed in the
-/// controller's accounting. Their agents may still hold the local allocation
-/// (their completion report was lost or the process never exited), so cancel the
-/// job on exactly those nodes first — otherwise the controller re-advertises a
-/// node the agent still owns, the next dispatch is rejected with
-/// "controller-allocated GPUs unavailable", and the victim job requeues to
-/// JobHoldMaxRequeue. The cancel is bounded and best-effort; the agent-side
-/// stale-owner reclaim covers the case where it does not arrive in time.
+/// The unreported nodes are about to have their resources freed here, but their
+/// agents may still hold the allocation, so cancel the job on those nodes first
+/// or the next dispatch is rejected and the victim requeues to JobHoldMaxRequeue.
+/// Best-effort; the agent-side reclaim covers a cancel that arrives too late.
 async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_core::job::Job) {
     let missing: Vec<_> = job
         .allocated_nodes
