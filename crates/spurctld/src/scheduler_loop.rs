@@ -1326,49 +1326,67 @@ async fn enforce_completing_timeout(cluster: Arc<ClusterManager>, raft: Arc<Raft
                 continue;
             }
 
-            let missing: Vec<_> = job
-                .allocated_nodes
-                .iter()
-                .filter(|n| !job.node_completions.contains_key(*n))
-                .cloned()
-                .collect();
-
-            // Empty when no nodes allocated; derived_completion falls back to worst completion.
-            let primary = job.allocated_nodes.first().cloned().unwrap_or_default();
-            let (mut state, mut exit_code, _signal) =
-                spur_core::job::Job::derived_completion(&job.node_completions, &primary);
-            if job.node_completions.is_empty() {
-                state = spur_core::job::JobState::Failed;
-                exit_code = -1;
-            } else if !missing.is_empty() {
-                warn!(
-                    job_id = job.job_id,
-                    missing = ?missing,
-                    reported = job.node_completions.len(),
-                    expected = job.allocated_nodes.len(),
-                    "completing timeout — not all nodes reported"
-                );
-                state = spur_core::job::JobState::Failed;
-                if exit_code == 0 {
-                    exit_code = 1;
-                }
-            }
-
-            info!(
-                job_id = job.job_id,
-                state = ?state,
-                exit_code,
-                "completing timeout expired — force-finishing job"
-            );
-
-            if let Err(e) = cluster.complete_job(job.job_id, exit_code, state) {
-                warn!(
-                    job_id = job.job_id,
-                    error = %e,
-                    "failed to force-finish job after completing timeout"
-                );
-            }
+            force_finish_completing_job(&cluster, &job).await;
         }
+    }
+}
+
+/// Force-finish a job the controller has waited on past `complete_wait_secs`.
+///
+/// The nodes that never reported are about to have their resources freed in the
+/// controller's accounting. Their agents may still hold the local allocation
+/// (their completion report was lost or the process never exited), so cancel the
+/// job on exactly those nodes first — otherwise the controller re-advertises a
+/// node the agent still owns, the next dispatch is rejected with
+/// "controller-allocated GPUs unavailable", and the victim job requeues to
+/// JobHoldMaxRequeue. The cancel is bounded and best-effort; the agent-side
+/// stale-owner reclaim covers the case where it does not arrive in time.
+async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_core::job::Job) {
+    let missing: Vec<_> = job
+        .allocated_nodes
+        .iter()
+        .filter(|n| !job.node_completions.contains_key(*n))
+        .cloned()
+        .collect();
+
+    // Empty when no nodes allocated; derived_completion falls back to worst completion.
+    let primary = job.allocated_nodes.first().cloned().unwrap_or_default();
+    let (mut state, mut exit_code, _signal) =
+        spur_core::job::Job::derived_completion(&job.node_completions, &primary);
+    if job.node_completions.is_empty() {
+        state = spur_core::job::JobState::Failed;
+        exit_code = -1;
+    } else if !missing.is_empty() {
+        warn!(
+            job_id = job.job_id,
+            missing = ?missing,
+            reported = job.node_completions.len(),
+            expected = job.allocated_nodes.len(),
+            "completing timeout — not all nodes reported"
+        );
+        state = spur_core::job::JobState::Failed;
+        if exit_code == 0 {
+            exit_code = 1;
+        }
+    }
+
+    if !missing.is_empty() {
+        cancel_job_on_nodes(cluster, job.job_id, &missing, 9).await;
+    }
+
+    info!(
+        job_id = job.job_id,
+        state = ?state,
+        exit_code,
+        "completing timeout expired — force-finishing job"
+    );
+
+    if let Err(e) = cluster.complete_job(job.job_id, exit_code, state) {
+        warn!(
+            job_id = job.job_id,
+            error = %e,
+            "failed to force-finish job after completing timeout"
+        );
     }
 }
 
@@ -2397,6 +2415,67 @@ mod tests {
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(job.state, JobState::Pending);
             assert!(job.allocated_nodes.is_empty());
+        }
+
+        // On a completing-timeout force-finish, the controller frees the
+        // still-unreported node in its accounting. It must first cancel the job
+        // on exactly that node — otherwise its agent keeps the stale local
+        // allocation and rejects the next dispatch, stranding the node.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn completing_timeout_cancels_only_the_unreported_node() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (addr1, cancel1) = spawn_mock_agent().await;
+            let (addr2, cancel2) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr1);
+            register_node_at(&cm, "n2", addr2);
+
+            let spec = JobSpec {
+                name: "completing-timeout".into(),
+                user: "testuser".into(),
+                num_nodes: 2,
+                num_tasks: 2,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            };
+            let job_id = submit_and_wait(&cm, spec);
+
+            let nodes = vec!["n1".to_string(), "n2".to_string()];
+            let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
+                .iter()
+                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+            let run_attempt = cm
+                .start_job(
+                    job_id,
+                    nodes,
+                    ResourceAllocations::with_scalar(2, 0),
+                    per_node_allocs,
+                )
+                .unwrap();
+            settle(&cm, job_id, JobState::Running);
+
+            // n1 reports completion; n2 never does, so the job stays Completing.
+            cm.node_complete(job_id, "n1", 0, 0, run_attempt).unwrap();
+            settle(&cm, job_id, JobState::Completing);
+
+            let job = cm.get_job(job_id).unwrap();
+            force_finish_completing_job(&cm, &job).await;
+
+            assert_eq!(
+                cancel2.load(Ordering::SeqCst),
+                1,
+                "the unreported node n2 must be cancelled before its resources are freed"
+            );
+            assert_eq!(
+                cancel1.load(Ordering::SeqCst),
+                0,
+                "the node that already reported must not be cancelled"
+            );
         }
 
         // Mock agents echo an offset-keyed path; the stored path must be the
