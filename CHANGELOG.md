@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.6.0](https://github.com/ROCm/spur/compare/v0.5.1...v0.6.0) (2026-07-24)
+
+
+### Features
+
+* **cluster:** SPUR-native k0s clusters via spur k8s up/down + mesh-native CNI ([#432](https://github.com/ROCm/spur/issues/432)) ([7c95efe](https://github.com/ROCm/spur/commit/7c95efe2ca34cede227a0fa2e6592173118f5c8e))
+* **spur-cli:** accept --qos for srun ([#481](https://github.com/ROCm/spur/issues/481)) ([765f319](https://github.com/ROCm/spur/commit/765f31956f413afe12fc674934557a91ddf4bbb4))
+* **spur-cli:** interactive PTY sessions via srun --pty and sattach ([#482](https://github.com/ROCm/spur/issues/482)) ([a1b28fb](https://github.com/ROCm/spur/commit/a1b28fb046dc861060b512e9e4cce6450a681786))
+* **spur-cli:** persist and display account-level grp_tres allocation ([#477](https://github.com/ROCm/spur/issues/477)) ([b1fa1ee](https://github.com/ROCm/spur/commit/b1fa1ee9f02d5afe5b5789d67de9cea0df5a74be))
+* **spur-cli:** support exclusive srun allocations ([#496](https://github.com/ROCm/spur/issues/496)) ([c56b873](https://github.com/ROCm/spur/commit/c56b87301f305c50990b07e9098c3d83961190fb))
+* **spur-cli:** support nodefile-based nodelists ([#467](https://github.com/ROCm/spur/issues/467)) ([9947815](https://github.com/ROCm/spur/commit/9947815ef70522463824a0b53bf4c5ae078c3ce4))
+* **spur-sched:** make nodelist selection additive ([#472](https://github.com/ROCm/spur/issues/472)) ([a4a29e6](https://github.com/ROCm/spur/commit/a4a29e62f699ea692c93944f4955f53502de7070))
+* **spurctld:** auto-derive raft node_id from controller.peers position ([#459](https://github.com/ROCm/spur/issues/459)) ([6967f29](https://github.com/ROCm/spur/commit/6967f29009e0635558018106e095fdc45c3042c9))
+* **spurctld:** report node-resolved job output path in scontrol ([#488](https://github.com/ROCm/spur/issues/488)) ([bb7e9f8](https://github.com/ROCm/spur/commit/bb7e9f85d6e0b231f83eef70ba24e2ebdfcd0f7d))
+* **spurctld:** show valid accounts in association errors ([#446](https://github.com/ROCm/spur/issues/446)) ([db7bef1](https://github.com/ROCm/spur/commit/db7bef1dca12beb7cda2e86ae70ef45f843dadde))
+
+
+### Bug Fixes
+
+* **accounting:** filter users by name ([#447](https://github.com/ROCm/spur/issues/447)) ([b3e16a1](https://github.com/ROCm/spur/commit/b3e16a1418d64a10b8e769c9a73d3725ff2090db))
+* **oci:** key container images by canonical reference ([#497](https://github.com/ROCm/spur/issues/497)) ([5bc467c](https://github.com/ROCm/spur/commit/5bc467c27c5f4784fdf27f5266d2a03bb1b93700))
+* **spur-cli:** display node features in sinfo ([#493](https://github.com/ROCm/spur/issues/493)) ([f3ee133](https://github.com/ROCm/spur/commit/f3ee133b8ba12406ade6578cf10efed6c67e80e8))
+* **spur-cli:** limit user cancellation to active jobs ([#483](https://github.com/ROCm/spur/issues/483)) ([42750ac](https://github.com/ROCm/spur/commit/42750ace253366355255957fea212a818efc95ac))
+* **spur-cli:** skip terminal jobs in filter-based scancel ([#462](https://github.com/ROCm/spur/issues/462)) ([c615aa5](https://github.com/ROCm/spur/commit/c615aa5e870e3a9d27250a8b2136d330ea1d0597))
+* **spur-sched:** spread equal-weight jobs across idle nodes ([#453](https://github.com/ROCm/spur/issues/453)) ([c41f188](https://github.com/ROCm/spur/commit/c41f188450011df8d8a6510f63442913d0cf0176))
+* **spurctld:** drop stale completion reports from preempted-and-requeued runs ([#474](https://github.com/ROCm/spur/issues/474)) ([e4e3288](https://github.com/ROCm/spur/commit/e4e32889145b6e0221fd0350d218e9e5e96311b9))
+* **spurctld:** enforce ownership on reservation delete and update ([#463](https://github.com/ROCm/spur/issues/463)) ([d7fc6cd](https://github.com/ROCm/spur/commit/d7fc6cd76172501f4afd2a0e82f7006dba5c868b))
+* **spurctld:** prevent single scheduling pass from over-subscribing QOS/account aggregate limits ([#478](https://github.com/ROCm/spur/issues/478)) ([f656944](https://github.com/ROCm/spur/commit/f65694402550cda8d91e4939d5f559612d2b8af1))
+* **spurctld:** reject job QOS not authorized for the submitting association ([#490](https://github.com/ROCm/spur/issues/490)) ([59b7180](https://github.com/ROCm/spur/commit/59b718030d70b0d4541b2f89a591d730dddec8e1))
+* **spurctld:** schedule jobs across partition OR-lists ([#468](https://github.com/ROCm/spur/issues/468)) ([90986b5](https://github.com/ROCm/spur/commit/90986b5d97226155baa5f41e9d5ab7fa7a73b964))
+* **spurctld:** update upsert_account test call for grp_tres arity ([#485](https://github.com/ROCm/spur/issues/485)) ([1ed491a](https://github.com/ROCm/spur/commit/1ed491a6ca56005a57bbec5706f4c0b01be51049))
+* **spurd:** release GPU reservations stranded mid-launch ([#489](https://github.com/ROCm/spur/issues/489)) ([c5b52cd](https://github.com/ROCm/spur/commit/c5b52cd948ba4ce066d353b4d8a63d32a6113895))
+* **spur:** reclaim node resources when completion and eviction desync ([#498](https://github.com/ROCm/spur/issues/498)) ([9c2098c](https://github.com/ROCm/spur/commit/9c2098ce013481b4d2799e52463c7751f4b2a864))
+* **srun:** fan out tasks across nodes in standalone and step mode ([#473](https://github.com/ROCm/spur/issues/473)) ([c74abac](https://github.com/ROCm/spur/commit/c74abac900ff64ae18dd349db212869f6b5cecd9))
+
 ## [0.5.1](https://github.com/ROCm/spur/compare/v0.5.0...v0.5.1) (2026-07-17)
 
 
