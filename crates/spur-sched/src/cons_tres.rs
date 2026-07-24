@@ -86,6 +86,17 @@ impl NodeAllocation {
             .collect()
     }
 
+    /// Job ids owning any of `device_ids`, excluding mid-launch owners (a launch
+    /// in flight is a real duplicate, not a reclaimable stale owner).
+    pub fn conflicting_owners(&self, device_ids: &[u32]) -> Vec<u32> {
+        self.owners
+            .iter()
+            .filter(|(id, _)| !self.launching.contains(id))
+            .filter(|(_, alloc)| alloc.gpu_ids.iter().any(|g| device_ids.contains(g)))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     /// Available GPU count (optionally filtered by type).
     pub fn free_gpus(&self, gpu_type: Option<&str>) -> u32 {
         self.gpu_allocated
@@ -437,6 +448,26 @@ mod tests {
         assert_eq!(node.free_gpus(None), 1);
         // The failed job left no owner entry.
         assert!(!node.release_job(2));
+    }
+
+    #[test]
+    fn test_conflicting_owners_reports_committed_but_not_launching() {
+        let mut node = make_node_with_ids(64, 256_000, vec![0, 1, 2, 3], "mi300x");
+        // job 1: committed, owns GPUs 0 and 1.
+        node.allocate_for_job(1, 4, 8_000, &[0, 1]).unwrap();
+        node.commit_job(1);
+        // job 2: still launching (reserved, not committed), owns GPU 2.
+        node.allocate_for_job(2, 4, 8_000, &[2]).unwrap();
+
+        // A new dispatch onto GPU 1 conflicts with committed job 1.
+        assert_eq!(node.conflicting_owners(&[1]), vec![1]);
+        // A dispatch onto GPU 3 (free) conflicts with nobody.
+        assert!(node.conflicting_owners(&[3]).is_empty());
+        // GPU 2's owner is still launching — a real duplicate, never reported.
+        assert!(node.conflicting_owners(&[2]).is_empty());
+        // A dispatch spanning a committed and a launching device reports only the
+        // committed owner.
+        assert_eq!(node.conflicting_owners(&[1, 2]), vec![1]);
     }
 
     #[test]
