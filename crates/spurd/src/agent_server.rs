@@ -1031,12 +1031,19 @@ impl SlurmAgent for AgentService {
                     self.cleanup_pmi_server(job_id).await;
                     let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                     let cgroup = result.job.take_cgroup();
+                    let running = self.running.clone();
                     tokio::spawn(async move {
-                        while let Ok(None) = result.job.try_wait() {
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        reap_killed_job(result.job).await;
+                        // rootfs/spool paths are derived from job_id, so the
+                        // controller re-dispatching the same id to this node
+                        // would reuse them. Skip that cleanup if a live run for
+                        // job_id reappeared, or this reap would delete its files.
+                        // The cgroup handle is this launch's own, so it is always
+                        // safe to release.
+                        if !running.lock().await.contains_key(&job_id) {
+                            crate::container::cleanup_rootfs(job_id, &rootfs_mode);
+                            crate::executor::cleanup_job_spool(job_id);
                         }
-                        crate::container::cleanup_rootfs(job_id, &rootfs_mode);
-                        crate::executor::cleanup_job_spool(job_id);
                         if let Some(ref cg) = cgroup {
                             crate::executor::cleanup_cgroup(cg);
                         }
