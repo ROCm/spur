@@ -116,6 +116,18 @@ pub fn image_file_stem(image: &str) -> String {
     sanitize_name(&parse_image_ref(image).canonical())
 }
 
+/// Render a stored filename stem back to a canonical image reference for display.
+///
+/// The last `+` is always the tag separator (canonical form guarantees a tag),
+/// and remaining `+` map back to `/`. Port-bearing registries lose the port
+/// colon (shown as `/`) since `sanitize_name` maps both `:` and `/` to `+`.
+pub fn display_name(stem: &str) -> String {
+    match stem.rsplit_once('+') {
+        Some((path, tag)) => format!("{}:{}", path.replace('+', "/"), tag),
+        None => stem.to_string(),
+    }
+}
+
 /// Pull an image from a registry and create a squashfs file.
 ///
 /// Returns the path to the squashfs file.
@@ -128,7 +140,7 @@ pub async fn pull_image(image: &str, output_dir: &Path) -> anyhow::Result<PathBu
         "pulling image"
     );
 
-    let sanitized = image_file_stem(image);
+    let sanitized = sanitize_name(&image_ref.canonical());
     let sqsh_path = output_dir.join(format!("{}.sqsh", sanitized));
 
     if sqsh_path.exists() {
@@ -800,6 +812,29 @@ mod tests {
             image_file_stem("nvcr.io/nvidia/pytorch:24.01"),
             "nvcr.io+nvidia+pytorch+24.01"
         );
+    }
+
+    #[test]
+    fn test_canonical_port_bearing_registry() {
+        let r = parse_image_ref("localhost:5000/myimage:dev");
+        assert_eq!(r.canonical(), "localhost:5000/myimage:dev");
+        assert_eq!(
+            image_file_stem("localhost:5000/myimage:dev"),
+            "localhost+5000+myimage+dev"
+        );
+    }
+
+    #[test]
+    fn test_display_name() {
+        assert_eq!(
+            display_name("docker.io+library+busybox+latest"),
+            "docker.io/library/busybox:latest"
+        );
+        assert_eq!(
+            display_name("nvcr.io+nvidia+pytorch+24.01"),
+            "nvcr.io/nvidia/pytorch:24.01"
+        );
+        assert_eq!(display_name("alpine"), "alpine");
     }
 
     #[test]

@@ -1496,6 +1496,34 @@ mod tests {
         assert_eq!(resolved, image_path);
     }
 
+    #[test]
+    fn test_resolve_image_cross_form_reference() {
+        let images_dir = tempfile::tempdir().unwrap();
+        // Import under one form...
+        let image_path = images_dir.path().join(format!(
+            "{}.sqsh",
+            spur_net::oci::image_file_stem("docker://busybox:latest")
+        ));
+        std::fs::write(&image_path, b"fake squashfs").unwrap();
+
+        let _guard = env_lock();
+        let prev = std::env::var_os("SPUR_IMAGE_DIR");
+        std::env::set_var("SPUR_IMAGE_DIR", images_dir.path());
+
+        // ...resolve under a different equivalent form.
+        let result = resolve_image("busybox", None, None);
+
+        match prev {
+            Some(v) => std::env::set_var("SPUR_IMAGE_DIR", v),
+            None => std::env::remove_var("SPUR_IMAGE_DIR"),
+        }
+
+        let resolved = result.expect(
+            "resolve_image('busybox') must find image imported as 'docker://busybox:latest'",
+        );
+        assert_eq!(resolved, image_path);
+    }
+
     // --- create_mount_target: source-type detection ---
 
     #[test]

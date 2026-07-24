@@ -618,7 +618,7 @@ fn resolve_container_image(image: Option<&str>) -> String {
     }
 
     // Try to find the .sqsh file in the image directory
-    let sanitized = spur_net::oci::sanitize_name(image);
+    let sanitized = spur_net::oci::image_file_stem(image);
 
     // Check $SPUR_IMAGE_DIR first, then system default, then user fallback
     let candidates = {
@@ -1301,6 +1301,34 @@ echo "hello world"
         assert_eq!(
             wrap_command_body("#SBATCH --nodes=9"),
             "#!/bin/sh\n# This script was created by sbatch --wrap.\n\n#SBATCH --nodes=9\n"
+        );
+    }
+
+    #[test]
+    fn test_resolve_container_image_cross_form() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let stem = spur_net::oci::image_file_stem("docker://busybox:latest");
+        let image_path = dir.path().join(format!("{}.sqsh", stem));
+        std::fs::write(&image_path, b"fake").unwrap();
+
+        let prev = std::env::var_os("SPUR_IMAGE_DIR");
+        std::env::set_var("SPUR_IMAGE_DIR", dir.path());
+
+        let resolved = resolve_container_image(Some("busybox"));
+
+        match prev {
+            Some(v) => std::env::set_var("SPUR_IMAGE_DIR", v),
+            None => std::env::remove_var("SPUR_IMAGE_DIR"),
+        }
+
+        assert_eq!(
+            resolved,
+            image_path.to_string_lossy(),
+            "bare 'busybox' must resolve to the image imported as 'docker://busybox:latest'"
         );
     }
 }

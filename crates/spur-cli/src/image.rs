@@ -311,7 +311,7 @@ fn cmd_list() -> Result<()> {
 
     println!("{:<50} {:>10}", "IMAGE", "SIZE");
     for (name, size) in &images {
-        let display_name = name.replace('+', "/");
+        let display_name = spur_net::oci::display_name(name);
         let size_str = if *size > 1_073_741_824 {
             format!("{:.1} GB", *size as f64 / 1_073_741_824.0)
         } else {
