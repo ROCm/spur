@@ -16,6 +16,7 @@ struct Snapshot {
     default_account: HashMap<String, String>,
     memberships: HashSet<(String, String)>,
     limits: HashMap<(String, String), AccountLimits>,
+    allowed_qos: HashMap<(String, String), HashSet<String>>,
     loaded: bool,
 }
 
@@ -33,6 +34,13 @@ pub struct AssociationCache {
     snapshot: RwLock<Snapshot>,
 }
 
+/// Whether `qos` is usable given an association's allow-list and pinned
+/// default: unrestricted if neither is set, otherwise it must be a member
+/// of the allow-list or match the default exactly.
+pub(crate) fn qos_permitted(allowed: &HashSet<String>, default: Option<&str>, qos: &str) -> bool {
+    (allowed.is_empty() && default.is_none()) || allowed.contains(qos) || default == Some(qos)
+}
+
 impl AssociationCache {
     pub fn new() -> Self {
         Self {
@@ -41,6 +49,7 @@ impl AssociationCache {
                 default_account: HashMap::new(),
                 memberships: HashSet::new(),
                 limits: HashMap::new(),
+                allowed_qos: HashMap::new(),
                 loaded: false,
             }),
         }
@@ -73,10 +82,46 @@ impl AssociationCache {
         AccountMembership::NotMember(accounts)
     }
 
-    /// The effective account (given, or the user's default) and that
-    /// association's default QOS, resolved under a single read lock so a
-    /// concurrent refresh can't yield a torn old/new combination.
-    pub fn resolve(&self, user: &str, account: Option<&str>) -> (Option<String>, Option<String>) {
+    /// Check `qos` is usable by this concrete (user, account) association:
+    /// the association must exist, and if it's been scoped to an allow-list
+    /// and/or a pinned default QOS, `qos` must be one of them. Membership
+    /// and QOS are read under one lock so a concurrent refresh can't
+    /// validate one against the other's stale snapshot (see `resolve()`).
+    /// Permissive while the cache hasn't loaded — at startup before the
+    /// first fetch completes, or while the accounting DB stays
+    /// unreachable/erroring.
+    pub fn check_qos_authorized(&self, user: &str, account: &str, qos: &str) -> Result<(), String> {
+        let snapshot = self.snapshot.read();
+        if !snapshot.loaded {
+            return Ok(());
+        }
+        let key = (user.to_owned(), account.to_owned());
+        if !snapshot.memberships.contains(&key) {
+            return Err(format!(
+                "user '{user}' is not associated with account '{account}'"
+            ));
+        }
+        let empty = HashSet::new();
+        let allowed = snapshot.allowed_qos.get(&key).unwrap_or(&empty);
+        let default = snapshot.default_qos.get(&key);
+        if qos_permitted(allowed, default.map(String::as_str), qos) {
+            Ok(())
+        } else {
+            Err(format!(
+                "QOS '{qos}' is not permitted for user '{user}' under account '{account}'"
+            ))
+        }
+    }
+
+    /// The effective account (given, or the user's default), that
+    /// association's default QOS, and its allow-list (empty if unscoped),
+    /// resolved under a single read lock so a concurrent refresh can't
+    /// yield a torn old/new combination.
+    pub fn resolve(
+        &self,
+        user: &str,
+        account: Option<&str>,
+    ) -> (Option<String>, Option<String>, HashSet<String>) {
         let snapshot = self.snapshot.read();
         let effective_account = account
             .filter(|a| !a.is_empty())
@@ -94,7 +139,12 @@ impl AssociationCache {
                 .get(&(user.to_owned(), acct.clone()))
                 .cloned()
         });
-        (effective_account, default_qos)
+        let allowed_qos = effective_account
+            .as_ref()
+            .and_then(|acct| snapshot.allowed_qos.get(&(user.to_owned(), acct.clone())))
+            .cloned()
+            .unwrap_or_default();
+        (effective_account, default_qos, allowed_qos)
     }
 
     /// Resource limits for a (user, account) association; unset/unknown fields
@@ -114,12 +164,14 @@ impl AssociationCache {
         default_account: HashMap<String, String>,
         memberships: HashSet<(String, String)>,
         limits: HashMap<(String, String), AccountLimits>,
+        allowed_qos: HashMap<(String, String), HashSet<String>>,
     ) {
         *self.snapshot.write() = Snapshot {
             default_qos,
             default_account,
             memberships,
             limits,
+            allowed_qos,
             loaded: true,
         };
     }
@@ -140,6 +192,18 @@ impl AssociationCache {
             .insert((user.to_owned(), account.to_owned()));
         snap.default_qos
             .insert((user.to_owned(), account.to_owned()), qos.to_owned());
+        snap.loaded = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_allowed_qos(&self, user: &str, account: &str, qos: &[&str]) {
+        let mut snap = self.snapshot.write();
+        snap.memberships
+            .insert((user.to_owned(), account.to_owned()));
+        snap.allowed_qos.insert(
+            (user.to_owned(), account.to_owned()),
+            qos.iter().map(|q| q.to_string()).collect(),
+        );
         snap.loaded = true;
     }
 
@@ -179,15 +243,16 @@ impl AssociationCache {
             )
             .await
             {
-                Ok(Ok((qos, accounts, memberships, limits))) => {
+                Ok(Ok((qos, accounts, memberships, limits, allowed_qos))) => {
                     info!(
                         default_qos = qos.len(),
                         default_account = accounts.len(),
                         memberships = memberships.len(),
                         limits = limits.len(),
+                        allowed_qos = allowed_qos.len(),
                         "association cache initialized"
                     );
-                    cache.replace(qos, accounts, memberships, limits);
+                    cache.replace(qos, accounts, memberships, limits, allowed_qos);
                 }
                 Ok(Err(e)) => {
                     warn!(error = %e, "initial association fetch failed, will retry in background");
@@ -206,8 +271,8 @@ impl AssociationCache {
                 )
                 .await
                 {
-                    Ok(Ok((qos, accounts, memberships, limits))) => {
-                        cache.replace(qos, accounts, memberships, limits)
+                    Ok(Ok((qos, accounts, memberships, limits, allowed_qos))) => {
+                        cache.replace(qos, accounts, memberships, limits, allowed_qos)
                     }
                     Ok(Err(e)) => {
                         warn!(error = %e, "association refresh failed, retaining stale data")
@@ -228,14 +293,14 @@ mod tests {
         let cache = AssociationCache::new();
         assert_eq!(
             cache.resolve("alice", Some("research")),
-            (Some("research".into()), None)
+            (Some("research".into()), None, HashSet::new())
         );
     }
 
     #[test]
     fn resolve_unknown_user_with_no_account_given_resolves_nothing() {
         let cache = AssociationCache::new();
-        assert_eq!(cache.resolve("alice", None), (None, None));
+        assert_eq!(cache.resolve("alice", None), (None, None, HashSet::new()));
     }
 
     #[test]
@@ -244,9 +309,25 @@ mod tests {
         cache.insert_default_qos("alice", "research", "highprio");
         assert_eq!(
             cache.resolve("alice", Some("research")),
-            (Some("research".into()), Some("highprio".into()))
+            (
+                Some("research".into()),
+                Some("highprio".into()),
+                HashSet::new()
+            )
         );
-        assert_eq!(cache.resolve("alice", Some("other")), (None, None));
+        assert_eq!(
+            cache.resolve("alice", Some("other")),
+            (None, None, HashSet::new())
+        );
+    }
+
+    #[test]
+    fn resolve_returns_allowed_qos_for_the_effective_account() {
+        let cache = AssociationCache::new();
+        cache.insert_allowed_qos("alice", "research", &["a", "b"]);
+        let (account, _, allowed) = cache.resolve("alice", Some("research"));
+        assert_eq!(account.as_deref(), Some("research"));
+        assert_eq!(allowed, HashSet::from(["a".to_string(), "b".to_string()]));
     }
 
     #[test]
@@ -258,15 +339,19 @@ mod tests {
             HashMap::from([("bob".to_string(), "eng".to_string())]),
             HashSet::from([("bob".to_string(), "eng".to_string())]),
             HashMap::new(),
+            HashMap::new(),
         );
-        assert_eq!(cache.resolve("alice", Some("research")), (None, None));
+        assert_eq!(
+            cache.resolve("alice", Some("research")),
+            (None, None, HashSet::new())
+        );
         assert_eq!(
             cache.resolve("bob", Some("eng")),
-            (Some("eng".into()), Some("new".into()))
+            (Some("eng".into()), Some("new".into()), HashSet::new())
         );
         assert_eq!(
             cache.resolve("bob", None),
-            (Some("eng".into()), Some("new".into()))
+            (Some("eng".into()), Some("new".into()), HashSet::new())
         );
     }
 
@@ -275,7 +360,7 @@ mod tests {
         let cache = AssociationCache::new();
         cache.insert_default_account("alice", "research");
         cache.insert_default_qos("alice", "other", "highprio");
-        let (account, qos) = cache.resolve("alice", Some("other"));
+        let (account, qos, _) = cache.resolve("alice", Some("other"));
         assert_eq!(account.as_deref(), Some("other"));
         assert_eq!(qos.as_deref(), Some("highprio"));
     }
@@ -285,7 +370,7 @@ mod tests {
         let cache = AssociationCache::new();
         cache.insert_default_account("alice", "research");
         cache.insert_default_qos("alice", "research", "highprio");
-        let (account, qos) = cache.resolve("alice", None);
+        let (account, qos, _) = cache.resolve("alice", None);
         assert_eq!(account.as_deref(), Some("research"));
         assert_eq!(qos.as_deref(), Some("highprio"));
     }
@@ -299,8 +384,9 @@ mod tests {
             HashMap::new(),
             HashSet::from([("bob".to_string(), "eng".to_string())]),
             HashMap::new(),
+            HashMap::new(),
         );
-        let (account, qos) = cache.resolve("alice", None);
+        let (account, qos, _) = cache.resolve("alice", None);
         assert_eq!(
             account, None,
             "old default_account must not survive the swap"
@@ -330,6 +416,72 @@ mod tests {
             cache.account_membership("carol", "missing"),
             AccountMembership::NotMember(Vec::new())
         );
+    }
+
+    #[test]
+    fn check_qos_authorized_unloaded_cache_is_permissive() {
+        let cache = AssociationCache::new();
+        assert!(cache
+            .check_qos_authorized("alice", "research", "anything")
+            .is_ok());
+    }
+
+    #[test]
+    fn check_qos_authorized_matches_pinned_default() {
+        let cache = AssociationCache::new();
+        cache.insert_default_qos("alice", "research", "highprio");
+        assert!(cache
+            .check_qos_authorized("alice", "research", "highprio")
+            .is_ok());
+        assert!(cache
+            .check_qos_authorized("alice", "research", "other-teams-qos")
+            .is_err());
+    }
+
+    #[test]
+    fn check_qos_authorized_permissive_when_association_has_no_default_pinned() {
+        let cache = AssociationCache::new();
+        cache.insert_association("alice", "research");
+        assert!(cache
+            .check_qos_authorized("alice", "research", "anything")
+            .is_ok());
+    }
+
+    #[test]
+    fn check_qos_authorized_rejects_non_member_account_on_loaded_cache() {
+        // A bogus or unaffiliated account must not be a back door: unlike a
+        // missing default QOS, a missing *association* is a hard reject.
+        let cache = AssociationCache::new();
+        cache.insert_default_qos("bob", "eng", "highprio");
+        let err = cache
+            .check_qos_authorized("alice", "research", "anything")
+            .unwrap_err();
+        assert!(err.contains("not associated with account 'research'"));
+    }
+
+    #[test]
+    fn check_qos_authorized_allows_any_member_of_the_allow_list() {
+        let cache = AssociationCache::new();
+        cache.insert_allowed_qos("alice", "research", &["a", "b", "c"]);
+        assert!(cache.check_qos_authorized("alice", "research", "a").is_ok());
+        assert!(cache.check_qos_authorized("alice", "research", "c").is_ok());
+        assert!(cache
+            .check_qos_authorized("alice", "research", "other-teams-qos")
+            .is_err());
+    }
+
+    #[test]
+    fn check_qos_authorized_default_qos_alone_still_scopes_to_one() {
+        // Pinning only a default (no explicit allow-list) keeps PR #490's
+        // original single-QOS behavior for associations never given a list.
+        let cache = AssociationCache::new();
+        cache.insert_default_qos("alice", "research", "highprio");
+        assert!(cache
+            .check_qos_authorized("alice", "research", "highprio")
+            .is_ok());
+        assert!(cache
+            .check_qos_authorized("alice", "research", "other-teams-qos")
+            .is_err());
     }
 
     #[test]
@@ -373,6 +525,7 @@ mod tests {
                     ..Default::default()
                 },
             )]),
+            HashMap::new(),
         );
         assert_eq!(
             cache.limits("alice", "research"),
