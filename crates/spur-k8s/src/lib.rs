@@ -7,3 +7,5 @@ pub mod health;
 pub mod heartbeat;
 pub mod job_controller;
 pub mod node_watcher;
+pub mod quota;
+pub mod quota_controller;

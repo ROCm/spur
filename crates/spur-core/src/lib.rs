@@ -17,6 +17,7 @@ pub mod node;
 pub mod partition;
 pub mod process;
 pub mod qos;
+pub mod quota_names;
 pub mod reservation;
 pub mod resource;
 pub mod spur_env;

@@ -2103,10 +2103,10 @@ mod tests {
                 Err(tonic::Status::unimplemented("not used in tests"))
             }
 
-            async fn get_admin_kubeconfig(
+            async fn get_kubeconfig(
                 &self,
-                _request: tonic::Request<spur_proto::proto::GetAdminKubeconfigRequest>,
-            ) -> Result<tonic::Response<spur_proto::proto::GetAdminKubeconfigResponse>, tonic::Status>
+                _request: tonic::Request<spur_proto::proto::GetKubeconfigRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::GetKubeconfigResponse>, tonic::Status>
             {
                 Err(tonic::Status::unimplemented("not used in tests"))
             }

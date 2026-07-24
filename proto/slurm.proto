@@ -376,10 +376,11 @@ service SlurmAgent {
 
   // -- Control-plane-only cluster admin: the controller calls these on
   //    the control-plane node's agent, which shells `k0s` against the running
-  //    controller. Worker joins need a fresh token; ClusterKubeconfig needs the
-  //    admin kubeconfig. Erroring on a non-control-plane node is expected. --
+  //    controller. Worker joins need a fresh token; GetKubeconfig returns either
+  //    the admin kubeconfig or a scoped per-user token. Erroring on a
+  //    non-control-plane node is expected. --
   rpc CreateK0sJoinToken(CreateK0sJoinTokenRequest) returns (CreateK0sJoinTokenResponse);
-  rpc GetAdminKubeconfig(GetAdminKubeconfigRequest) returns (GetAdminKubeconfigResponse);
+  rpc GetKubeconfig(GetKubeconfigRequest) returns (GetKubeconfigResponse);
 
   // Apply the full-mesh WireGuard membership on this node: the controller pushes the
   // authoritative peer set so a native-routing CNI (Calico bird) can ride the mesh. Additive +
@@ -759,9 +760,14 @@ message ClusterNodeStatus {
   bool enabled = 4;
 }
 
-message ClusterKubeconfigRequest {}
+message ClusterKubeconfigRequest {
+  // Empty -> the cluster-admin kubeconfig. Set -> a namespace-scoped kubeconfig for this SPUR user
+  // (a ServiceAccount + bound token in the user's account namespace).
+  string user = 1;
+}
 message ClusterKubeconfigResponse {
-  // Admin kubeconfig YAML (server rewritten to the control-plane's mesh IP).
+  // Admin kubeconfig YAML (server rewritten to the control-plane's mesh IP), or the scoped kubeconfig
+  // when `user` was set.
   string kubeconfig = 1;
 }
 
@@ -808,9 +814,17 @@ message CreateK0sJoinTokenResponse {
   string join_token = 1;
 }
 
-message GetAdminKubeconfigRequest {}
-message GetAdminKubeconfigResponse {
-  // Admin kubeconfig YAML read from the control-plane node.
+message GetKubeconfigRequest {
+  // Empty `user` -> the cluster-admin kubeconfig (namespace/service_account ignored). When `user` is
+  // set, the control-plane node mints a scoped kubeconfig: a bound token for `service_account` in
+  // `namespace` (created if absent), with the admin cluster CA + server. spurctld resolves the SPUR
+  // user -> account namespace + SA name.
+  string user = 1;
+  string namespace = 2;
+  string service_account = 3;
+}
+message GetKubeconfigResponse {
+  // Admin (or scoped) kubeconfig YAML read/minted on the control-plane node.
   string kubeconfig = 1;
 }
 
