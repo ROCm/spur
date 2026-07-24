@@ -66,17 +66,13 @@ pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()
     for (k, v) in env.into_map() {
         cmd.env(k, v);
     }
-    let child = cmd
-        .current_dir(&ctx.work_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| {
-            format!(
-                "{} script failed to execute: {}",
-                ctx.script_context, script_path
-            )
-        })?;
+    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+    let child = spawn_hook_in_work_dir(&mut cmd, &ctx.work_dir).with_context(|| {
+        format!(
+            "{} script failed to execute: {}",
+            ctx.script_context, script_path
+        )
+    })?;
 
     let output = child
         .wait_with_output()
@@ -104,6 +100,27 @@ pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()
     }
 
     Ok(())
+}
+
+/// Spawn a hook in `work_dir`, retrying from `/tmp` if the spawn fails there.
+/// A missing or untraversable `work_dir` (permissions, NFS root_squash) must not
+/// fail the hook, or spurd would drain the node for a user-side path error; only
+/// a failure that persists from `/tmp` is real. Retrying rather than pre-checking
+/// also avoids the TOCTOU and not-traversable gaps of a stat-based check.
+fn spawn_hook_in_work_dir(
+    cmd: &mut Command,
+    work_dir: &str,
+) -> std::io::Result<tokio::process::Child> {
+    if work_dir.is_empty() || work_dir == "/tmp" {
+        return cmd.current_dir("/tmp").spawn();
+    }
+    let first_err = match cmd.current_dir(work_dir).spawn() {
+        Ok(child) => return Ok(child),
+        Err(e) => e,
+    };
+    let child = cmd.current_dir("/tmp").spawn()?;
+    warn!(work_dir, error = %first_err, "hook could not start in work_dir, ran from /tmp instead");
+    Ok(child)
 }
 
 fn resolve_username(uid: u32) -> String {
@@ -227,5 +244,79 @@ mod tests {
         let ctx = test_ctx();
         let result = run_hook(script.to_str().unwrap(), &ctx).await;
         assert!(result.is_ok());
+    }
+
+    // A missing work_dir must not fail the hook (spurd would drain the node).
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn hook_with_missing_work_dir_still_runs() {
+        let script = make_script("exit 0");
+        let mut ctx = test_ctx();
+        ctx.work_dir = "/nonexistent/path/that/does/not/exist".into();
+        let result = run_hook(script.to_str().unwrap(), &ctx).await;
+        assert!(result.is_ok());
+    }
+
+    // An existing-but-untraversable work_dir (NFS root_squash) also fails to
+    // spawn, which a stat-based precheck would miss. Root bypasses perm checks.
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn hook_with_untraversable_work_dir_still_runs() {
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let script = make_script("exit 0");
+        let mut ctx = test_ctx();
+        ctx.work_dir = dir.path().to_string_lossy().into_owned();
+        let result = run_hook(script.to_str().unwrap(), &ctx).await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn hook_runs_in_work_dir_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        let marker = NamedTempFile::new().unwrap();
+        let marker_path = marker.path().to_str().unwrap().to_string();
+        let body = format!("pwd -P > {}", marker_path);
+        let script = make_script(&body);
+        let mut ctx = test_ctx();
+        ctx.work_dir = canonical.to_string_lossy().into_owned();
+        run_hook(script.to_str().unwrap(), &ctx).await.unwrap();
+        let content = std::fs::read_to_string(&marker_path).unwrap();
+        assert_eq!(content.trim(), canonical.to_string_lossy());
+    }
+
+    // SPUR_JOB_WORK_DIR still reports the submitted path when the CWD falls back.
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn hook_reports_submitted_work_dir_when_cwd_falls_back() {
+        let marker = NamedTempFile::new().unwrap();
+        let marker_path = marker.path().to_str().unwrap().to_string();
+        let body = format!("echo \"$SPUR_JOB_WORK_DIR|$(pwd)\" > {}", marker_path);
+        let script = make_script(&body);
+        let mut ctx = test_ctx();
+        ctx.work_dir = "/nonexistent/submitted/dir".into();
+        run_hook(script.to_str().unwrap(), &ctx).await.unwrap();
+
+        let content = std::fs::read_to_string(&marker_path).unwrap();
+        let parts: Vec<&str> = content.trim().split('|').collect();
+        assert_eq!(parts[0], "/nonexistent/submitted/dir");
+        assert_eq!(parts[1], "/tmp");
+    }
+
+    // A genuinely broken script still errors — the /tmp retry doesn't mask it.
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn hook_missing_script_still_errors_after_fallback() {
+        let mut ctx = test_ctx();
+        ctx.work_dir = "/nonexistent/submitted/dir".into();
+        let result = run_hook("/nonexistent/hook_script.sh", &ctx).await;
+        assert!(result.is_err());
     }
 }
