@@ -82,13 +82,17 @@ pub struct SbatchArgs {
     #[arg(short = 'L', long)]
     pub licenses: Vec<String>,
 
-    /// GPUs (shorthand, e.g., "4" or "mi300x:4")
+    /// GPUs total across the job (e.g., "4" or "mi300x:4")
     #[arg(short = 'G', long, overrides_with = "gpus")]
     pub gpus: Option<String>,
 
     /// GPUs per node
     #[arg(long, overrides_with = "gpus_per_node")]
     pub gpus_per_node: Option<String>,
+
+    /// GPUs per task
+    #[arg(long, overrides_with = "gpus_per_task")]
+    pub gpus_per_task: Option<String>,
 
     /// Time limit (e.g., "4:00:00", "1-00:00:00")
     #[arg(short = 't', long, env = "SBATCH_TIMELIMIT", overrides_with = "time")]
@@ -402,6 +406,7 @@ fn merge_resolved(cli_matches: &clap::ArgMatches, cli: SbatchArgs, dir: SbatchAr
     fallback!(mem_per_cpu, "mem_per_cpu");
     fallback!(gpus, "gpus");
     fallback!(gpus_per_node, "gpus_per_node");
+    fallback!(gpus_per_task, "gpus_per_task");
     fallback!(time, "time");
     fallback!(time_min, "time_min");
     fallback!(chdir, "chdir");
@@ -595,6 +600,42 @@ fn parse_memory_mb(s: &str) -> Result<u64> {
     }
 }
 
+/// Parse a GPU flag value ("4" or "mi300x:4") into a proto GpuRequest.
+pub(crate) fn parse_gpu_flag(value: Option<&str>) -> Result<Option<spur_proto::proto::GpuRequest>> {
+    match value {
+        Some(v) if !v.is_empty() => {
+            let req = spur_core::gpu_request::GpuRequest::parse_flag(v)
+                .with_context(|| format!("invalid GPU specification '{v}'"))?;
+            Ok(req.as_ref().map(Into::into))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Reject mutually-exclusive GPU flags client-side for a clear early error.
+/// A `gpu:` entry in `gres` counts as an implicit per-node request.
+pub(crate) fn validate_gpu_flags(
+    gpus: bool,
+    gpus_per_node: bool,
+    gpus_per_task: bool,
+    gres: &[String],
+) -> Result<()> {
+    let gres_gpu = gres
+        .iter()
+        .filter_map(|g| spur_core::resource::parse_gres(g))
+        .any(|(name, _, _)| name == "gpu");
+    let count = [gpus, gpus_per_node, gpus_per_task, gres_gpu]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+    if count > 1 {
+        anyhow::bail!(
+            "only one of --gpus, --gpus-per-node, --gpus-per-task, or --gres=gpu:* may be set"
+        );
+    }
+    Ok(())
+}
+
 /// Resolve a container image name to an absolute squashfs path if possible.
 ///
 /// When an image is imported via `spur image import`, it is stored in the
@@ -710,14 +751,19 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
 
     let name = default_job_name(args.job_name.as_deref(), args.script.as_deref(), is_wrap);
 
-    // Build GRES list
-    let mut gres = args.gres;
-    if let Some(gpus) = &args.gpus {
-        gres.push(format!("gpu:{}", gpus));
-    }
-    if let Some(gpn) = &args.gpus_per_node {
-        gres.push(format!("gpu:{}", gpn));
-    }
+    // GPU requests are carried in dedicated proto fields (not folded into
+    // gres) so the controller can distinguish total vs per-node vs per-task.
+    // `--gres=gpu:N` still flows through `gres` as an implicit per-node request.
+    let gres = args.gres;
+    let gpus = parse_gpu_flag(args.gpus.as_deref())?;
+    let gpus_per_node = parse_gpu_flag(args.gpus_per_node.as_deref())?;
+    let gpus_per_task = parse_gpu_flag(args.gpus_per_task.as_deref())?;
+    validate_gpu_flags(
+        gpus.is_some(),
+        gpus_per_node.is_some(),
+        gpus_per_task.is_some(),
+        &gres,
+    )?;
     // Don't push licenses into gres here — proto_to_job_spec already folds them in.
 
     // Parse time limit — use parse_time_seconds so that short values like
@@ -771,6 +817,9 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         memory_per_node_mb: memory_per_node.unwrap_or(0),
         memory_per_cpu_mb: memory_per_cpu.unwrap_or(0),
         gres,
+        gpus,
+        gpus_per_node,
+        gpus_per_task,
         script,
         argv: Vec::new(),
         script_args: args.script_args.clone(),
@@ -997,6 +1046,47 @@ echo "hello world"
     fn test_repeated_gres_flag_replaces() {
         let args = parse_merged(&[], &["sbatch", "--gres=gpu:2", "--gres=gpu:5"]);
         assert_eq!(args.gres, vec!["gpu:5"]);
+    }
+
+    #[test]
+    fn parse_gpu_flag_count_only() {
+        let req = parse_gpu_flag(Some("4")).unwrap().unwrap();
+        assert_eq!(req.count, 4);
+        assert_eq!(req.gpu_type, "");
+    }
+
+    #[test]
+    fn parse_gpu_flag_typed() {
+        let req = parse_gpu_flag(Some("mi300x:8")).unwrap().unwrap();
+        assert_eq!(req.count, 8);
+        assert_eq!(req.gpu_type, "mi300x");
+    }
+
+    #[test]
+    fn parse_gpu_flag_empty_is_none() {
+        assert!(parse_gpu_flag(None).unwrap().is_none());
+        assert!(parse_gpu_flag(Some("")).unwrap().is_none());
+    }
+
+    #[test]
+    fn validate_gpu_flags_rejects_multiple_sources() {
+        // --gpus and --gpus-per-node together.
+        assert!(validate_gpu_flags(true, true, false, &[]).is_err());
+        // --gpus and --gres=gpu together.
+        assert!(validate_gpu_flags(true, false, false, &["gpu:2".into()]).is_err());
+    }
+
+    #[test]
+    fn validate_gpu_flags_allows_single_source() {
+        assert!(validate_gpu_flags(true, false, false, &[]).is_ok());
+        assert!(validate_gpu_flags(false, false, false, &["gpu:2".into()]).is_ok());
+        assert!(validate_gpu_flags(false, false, false, &["fpga:1".into()]).is_ok());
+    }
+
+    #[test]
+    fn gpus_per_task_flag_parses() {
+        let args = parse_merged(&[], &["sbatch", "--gpus-per-task=2"]);
+        assert_eq!(args.gpus_per_task.as_deref(), Some("2"));
     }
 
     #[test]

@@ -161,6 +161,14 @@ fn resolve_job_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
         'e' => format_timestamp(job.end_time.as_ref()),
         'k' => job.comment.clone(),
         'A' => job.job_id.to_string(),
+        // Generic resources (GRES) requested, e.g. "gpu:8" or "gpu:mi300x:4/node".
+        'b' => {
+            if job.req_gpus_detail.is_empty() {
+                "N/A".into()
+            } else {
+                job.req_gpus_detail.clone()
+            }
+        }
         _ => "?".into(),
     }
 }

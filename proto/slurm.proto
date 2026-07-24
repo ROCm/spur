@@ -76,6 +76,14 @@ enum NodeState {
   NODE_SUSPENDED = 8;
 }
 
+// A GPU resource request. `count` is interpreted per the field it populates
+// on JobSpec: `gpus` = total across the job, `gpus_per_node` = per node,
+// `gpus_per_task` = per task. `gpu_type` is optional (e.g. "mi300x").
+message GpuRequest {
+  uint32 count = 1;
+  string gpu_type = 2;
+}
+
 message JobSpec {
   string name = 1;
   string partition = 2;
@@ -92,6 +100,14 @@ message JobSpec {
   uint64 memory_per_node_mb = 14;
   uint64 memory_per_cpu_mb = 15;
   repeated string gres = 16;  // "gpu:mi300x:4"
+
+  // GPU requests (mutually exclusive; at most one may be set). Distinct from
+  // `gres` so the controller can tell "total across the job" (`gpus`) apart
+  // from per-node/per-task counts. `--gres=gpu:N` continues to arrive via
+  // `gres` and is normalized to `gpus_per_node` by the controller.
+  GpuRequest gpus = 17;           // --gpus / -G: total across the whole job
+  GpuRequest gpus_per_node = 18;  // --gpus-per-node
+  GpuRequest gpus_per_task = 19;  // --gpus-per-task
 
   // Execution
   string script = 20;
@@ -218,6 +234,12 @@ message JobInfo {
   // step-dispatch controller will poll for batch completion while agents hold
   // allocation-only state.
   bool srun_step_dispatch = 54;
+
+  // Requested GPUs (observability). `req_gpus` is the job total; `req_gpus_detail`
+  // is a human summary such as "gpu:8" (total), "gpu:mi300x:4/node", or
+  // "gpu:2/task".
+  uint32 req_gpus = 55;
+  string req_gpus_detail = 56;
 }
 
 message NodeInfo {

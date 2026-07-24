@@ -1837,7 +1837,11 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         gres.push(format!("license:{}", lic));
     }
 
-    Ok(spur_core::job::JobSpec {
+    let gpus = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus);
+    let gpus_per_node = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus_per_node);
+    let gpus_per_task = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus_per_task);
+
+    let job_spec = spur_core::job::JobSpec {
         name: spec.name,
         partition: if spec.partition.is_empty() {
             None
@@ -1871,6 +1875,9 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
             None
         },
         gres,
+        gpus,
+        gpus_per_node,
+        gpus_per_task,
         script: if spec.script.is_empty() {
             None
         } else {
@@ -2037,7 +2044,12 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
             Some(spec.open_mode)
         },
         pty: spec.pty,
-    })
+    };
+
+    spur_core::gpu_request::resolve_gpu_demand(&job_spec)
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+    Ok(job_spec)
 }
 
 fn proto_to_resource_set(r: spur_proto::proto::ResourceSet) -> spur_core::resource::ResourceSet {
@@ -2126,6 +2138,40 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         reservation: job.spec.reservation.clone().unwrap_or_default(),
         comment: job.spec.comment.clone().unwrap_or_default(),
         srun_step_dispatch: job.srun_step_dispatch,
+        req_gpus: spur_core::job::effective_gpus(&job.spec, job.spec.num_nodes) as u32,
+        req_gpus_detail: requested_gpus_detail(&job.spec),
+    }
+}
+
+/// Human-readable summary of a job's GPU request for display.
+fn requested_gpus_detail(spec: &spur_core::job::JobSpec) -> String {
+    let ty = |t: Option<&str>| t.map(|t| format!("{t}:")).unwrap_or_default();
+
+    // Per-task form: render from the raw spec field (before resolution into PerNode).
+    if let Some(ref r) = spec.gpus_per_task {
+        return format!("gpu:{}{}/task", ty(r.gpu_type.as_deref()), r.count);
+    }
+
+    use spur_core::gpu_request::GpuDemand;
+    let Ok(demand) = spur_core::gpu_request::resolve_gpu_demand(spec) else {
+        return String::new();
+    };
+    match demand {
+        GpuDemand::None => String::new(),
+        GpuDemand::Total { count, gpu_type } => format!("gpu:{}{}", ty(gpu_type.as_deref()), count),
+        GpuDemand::PerNode { counts, gpu_type } => {
+            let first = counts.first().copied().unwrap_or(0);
+            if counts.iter().all(|&c| c == first) {
+                format!("gpu:{}{}/node", ty(gpu_type.as_deref()), first)
+            } else {
+                let list = counts
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("gpu:{}[{}]", ty(gpu_type.as_deref()), list)
+            }
+        }
     }
 }
 
@@ -2690,5 +2736,65 @@ mod tests {
         let err = validate_completion_report_state_for_rpc(JobState::Running, 0).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("invalid completion state"));
+    }
+
+    #[test]
+    fn requested_gpus_detail_per_task() {
+        use spur_core::gpu_request::GpuRequest;
+        use spur_core::job::JobSpec;
+
+        let spec = JobSpec {
+            num_nodes: 2,
+            num_tasks: 4,
+            cpus_per_task: 1,
+            gpus_per_task: Some(GpuRequest::new(2, None)),
+            ..Default::default()
+        };
+        assert_eq!(requested_gpus_detail(&spec), "gpu:2/task");
+    }
+
+    #[test]
+    fn requested_gpus_detail_per_task_typed() {
+        use spur_core::gpu_request::GpuRequest;
+        use spur_core::job::JobSpec;
+
+        let spec = JobSpec {
+            num_nodes: 2,
+            num_tasks: 4,
+            cpus_per_task: 1,
+            gpus_per_task: Some(GpuRequest::new(4, Some("mi300x".into()))),
+            ..Default::default()
+        };
+        assert_eq!(requested_gpus_detail(&spec), "gpu:mi300x:4/task");
+    }
+
+    #[test]
+    fn requested_gpus_detail_total() {
+        use spur_core::gpu_request::GpuRequest;
+        use spur_core::job::JobSpec;
+
+        let spec = JobSpec {
+            num_nodes: 2,
+            num_tasks: 2,
+            cpus_per_task: 1,
+            gpus: Some(GpuRequest::new(8, None)),
+            ..Default::default()
+        };
+        assert_eq!(requested_gpus_detail(&spec), "gpu:8");
+    }
+
+    #[test]
+    fn requested_gpus_detail_per_node() {
+        use spur_core::gpu_request::GpuRequest;
+        use spur_core::job::JobSpec;
+
+        let spec = JobSpec {
+            num_nodes: 2,
+            num_tasks: 2,
+            cpus_per_task: 1,
+            gpus_per_node: Some(GpuRequest::new(4, None)),
+            ..Default::default()
+        };
+        assert_eq!(requested_gpus_detail(&spec), "gpu:4/node");
     }
 }

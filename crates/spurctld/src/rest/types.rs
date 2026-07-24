@@ -157,6 +157,12 @@ pub struct SubmitJobFields {
     pub script: Option<String>,
     #[serde(default)]
     pub environment: HashMap<String, String>,
+    #[serde(default)]
+    pub gres: Vec<String>,
+    /// GPU requests ("4" or "mi300x:4"); at most one may be set.
+    pub gpus: Option<String>,
+    pub gpus_per_node: Option<String>,
+    pub gpus_per_task: Option<String>,
 }
 
 #[derive(Serialize)]

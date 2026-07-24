@@ -377,6 +377,15 @@ pub struct JobSpec {
     pub memory_per_node_mb: Option<u64>,
     pub memory_per_cpu_mb: Option<u64>,
     pub gres: Vec<String>,
+    /// GPU requests. At most one is set (see `gpu_request::resolve_gpu_demand`).
+    /// `gpus` = total across the job, the others are per-node / per-task. A
+    /// `gpu:` entry in `gres` is treated as an implicit `gpus_per_node`.
+    #[serde(default)]
+    pub gpus: Option<crate::gpu_request::GpuRequest>,
+    #[serde(default)]
+    pub gpus_per_node: Option<crate::gpu_request::GpuRequest>,
+    #[serde(default)]
+    pub gpus_per_task: Option<crate::gpu_request::GpuRequest>,
 
     // Execution
     pub script: Option<String>,
@@ -496,6 +505,9 @@ impl Default for JobSpec {
             memory_per_node_mb: None,
             memory_per_cpu_mb: None,
             gres: Vec::new(),
+            gpus: None,
+            gpus_per_node: None,
+            gpus_per_task: None,
             script: None,
             argv: Vec::new(),
             script_args: Vec::new(),
@@ -568,19 +580,41 @@ pub fn effective_memory_mb(spec: &JobSpec, num_nodes: u32) -> u64 {
         .unwrap_or(0)
 }
 
-/// Total GPUs a job requests across all its nodes. GRES `gpu` counts are
-/// per-node (like `memory_per_node_mb`), so the total is the per-node sum
-/// times `num_nodes`, matching how the scheduler allocates one node's GRES
-/// set to each of the job's nodes.
+/// Total GPUs a job requests across all its nodes.
+///
+/// `--gpus=N` is a job total; `--gpus-per-node=K` and `--gres=gpu:K` are
+/// K per node (total `K * num_nodes`); `--gpus-per-task=K` is `K * num_tasks`.
+/// Resolution (including the per-task task layout) lives in
+/// [`crate::gpu_request::resolve_gpu_demand`]; this is a thin, non-failing
+/// wrapper for QoS/accounting that treats an invalid request as its total.
 pub fn effective_gpus(spec: &JobSpec, num_nodes: u32) -> u64 {
-    let per_node: u64 = spec
-        .gres
-        .iter()
-        .filter_map(|g| crate::resource::parse_gres(g))
-        .filter(|(name, _, _)| name == "gpu")
-        .map(|(_, _, count)| count as u64)
-        .sum();
-    per_node * num_nodes as u64
+    let num_nodes = num_nodes.max(1);
+    match crate::gpu_request::resolve_gpu_demand_for(spec, num_nodes) {
+        Ok(demand) => demand.total(),
+        // On conflict/invalid, fall back to the largest declared intent so
+        // limits are not silently under-counted.
+        Err(_) => {
+            let per_node: u64 = spec
+                .gres
+                .iter()
+                .filter_map(|g| crate::resource::parse_gres(g))
+                .filter(|(name, _, _)| name == "gpu")
+                .map(|(_, _, count)| count as u64)
+                .sum();
+            let total = spec.gpus.as_ref().map(|r| r.count as u64).unwrap_or(0);
+            let pn = spec
+                .gpus_per_node
+                .as_ref()
+                .map(|r| r.count as u64 * num_nodes as u64)
+                .unwrap_or(0);
+            let pt = spec
+                .gpus_per_task
+                .as_ref()
+                .map(|r| r.count as u64 * spec.num_tasks as u64)
+                .unwrap_or(0);
+            total.max(pn).max(pt).max(per_node * num_nodes as u64)
+        }
+    }
 }
 
 /// One node's completion outcome for a job: the raw process wait status,
@@ -1231,6 +1265,29 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(effective_gpus(&spec, 1), 3);
+    }
+
+    #[test]
+    fn effective_gpus_total_is_not_multiplied_by_nodes() {
+        // SPUR-95: --gpus=N is a job total, not per-node.
+        let spec = JobSpec {
+            num_nodes: 2,
+            gpus: Some(crate::gpu_request::GpuRequest::new(8, None)),
+            ..Default::default()
+        };
+        assert_eq!(effective_gpus(&spec, 2), 8);
+    }
+
+    #[test]
+    fn effective_gpus_per_task_scales_with_tasks() {
+        let spec = JobSpec {
+            num_nodes: 2,
+            num_tasks: 4,
+            tasks_per_node: Some(2),
+            gpus_per_task: Some(crate::gpu_request::GpuRequest::new(1, None)),
+            ..Default::default()
+        };
+        assert_eq!(effective_gpus(&spec, 2), 4);
     }
 
     #[test]

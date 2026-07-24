@@ -136,7 +136,8 @@ fn default_one() -> u32 {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GpuRequirement {
-    /// Number of GPUs needed.
+    /// Number of GPUs per node (maps to a gres entry). Unlike the CLI/REST
+    /// `--gpus` flag which specifies a job total, this field is always per-node.
     #[serde(default)]
     pub count: u32,
     /// GPU type filter (e.g., "mi300x", "h100").
