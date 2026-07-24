@@ -682,6 +682,9 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
         memory_per_node_mb: s.memory_per_node_mb.unwrap_or(0),
         memory_per_cpu_mb: s.memory_per_cpu_mb.unwrap_or(0),
         gres,
+        gpus: s.gpus.as_ref().map(Into::into),
+        gpus_per_node: s.gpus_per_node.as_ref().map(Into::into),
+        gpus_per_task: s.gpus_per_task.as_ref().map(Into::into),
         licenses,
         script: s.script.clone().unwrap_or_default(),
         argv: s.argv.clone(),
@@ -779,6 +782,28 @@ async fn dispatch_to_agent(
         .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
 
     let spec = params.spec;
+
+    // The scheduler distributes GPUs per node (a --gpus total may be uneven
+    // across nodes). Rewrite this node's `gres` to its concrete GPU count so the
+    // agent's fallback and any display see the real per-node figure; the agent
+    // itself binds the exact device IDs from `allocated`.
+    let node_gpu_count = params.allocated.total_device_count("gpu") as u32;
+    let gpu_type = spur_core::gpu_request::resolve_gpu_demand(spec)
+        .ok()
+        .and_then(|d| d.gpu_type().map(str::to_string));
+    let mut per_node_gres: Vec<String> = spec
+        .gres
+        .iter()
+        .filter(|g| !(g.starts_with("gpu:") || g.as_str() == "gpu"))
+        .cloned()
+        .collect();
+    if node_gpu_count > 0 {
+        per_node_gres.push(match &gpu_type {
+            Some(t) => format!("gpu:{}:{}", t, node_gpu_count),
+            None => format!("gpu:{}", node_gpu_count),
+        });
+    }
+
     let proto_spec = ProtoJobSpec {
         name: spec.name.clone(),
         partition: spec.partition.clone().unwrap_or_default(),
@@ -792,7 +817,12 @@ async fn dispatch_to_agent(
         cpus_per_task: spec.cpus_per_task,
         memory_per_node_mb: spec.memory_per_node_mb.unwrap_or(0),
         memory_per_cpu_mb: spec.memory_per_cpu_mb.unwrap_or(0),
-        gres: spec.gres.clone(),
+        gres: per_node_gres,
+        // Per-node count is carried in `gres` above; the explicit GPU request
+        // fields are controller-side scheduling inputs the agent does not use.
+        gpus: None,
+        gpus_per_node: None,
+        gpus_per_task: None,
         script: spec.script.clone().unwrap_or_default(),
         argv: spec.argv.clone(),
         script_args: spec.script_args.clone(),

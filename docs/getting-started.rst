@@ -97,3 +97,35 @@ Or create symlinks for full drop-in compatibility:
    for cmd in sbatch srun squeue scancel sinfo sacct scontrol; do
        ln -sf spur $cmd
    done
+
+Requesting GPUs
+---------------
+
+Three flags control GPU allocation, matching Slurm semantics:
+
+``--gpus=N`` (or ``-G N``)
+   Request *N* GPUs total across the job. Spur distributes them greedily
+   across the assigned nodes (most-available first), guaranteeing at least
+   one GPU per node. The request is rejected if *N* is less than the number
+   of nodes.
+
+``--gpus-per-node=K`` (or ``--gres=gpu:K``)
+   Request exactly *K* GPUs on every node.
+
+``--gpus-per-task=K``
+   Request *K* GPUs per task. The per-node GPU count follows the task
+   layout (nodes running more tasks get more GPUs).
+
+Only one of the three forms may be specified per job. An optional GPU type
+can be prefixed (e.g., ``--gpus=mi300x:4``).
+
+.. code-block:: bash
+
+   # 8 GPUs total, distributed across 2 nodes
+   spur sbatch -N2 --gpus=8 train.sh
+
+   # 4 GPUs on every node
+   spur sbatch -N4 --gpus-per-node=4 train.sh
+
+   # 2 GPUs per task (4 tasks across 2 nodes)
+   spur sbatch -N2 -n4 --gpus-per-task=2 train.sh

@@ -225,6 +225,8 @@ impl SlurmAccounting for AccountingService {
                 reservation: r.reservation.clone(),
                 comment: String::new(),
                 srun_step_dispatch: false,
+                req_gpus: 0,
+                req_gpus_detail: String::new(),
             })
             .collect();
 
