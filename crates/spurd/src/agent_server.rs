@@ -2989,6 +2989,90 @@ mod tests {
         );
     }
 
+    fn gpu_alloc_request(device_ids: &[u32]) -> ResourceAllocations {
+        let devices = device_ids
+            .iter()
+            .map(|id| AllocatedDevice {
+                device_id: *id,
+                count: 1,
+            })
+            .collect();
+        let mut map = std::collections::HashMap::new();
+        map.insert("gpu".to_string(), DeviceAllocations { devices });
+        ResourceAllocations {
+            cpus: 1,
+            memory_mb: 0,
+            devices: map,
+        }
+    }
+
+    // A dispatch spanning two GPUs each held by a distinct stale owner must
+    // reclaim both and succeed.
+    #[tokio::test]
+    async fn dispatch_reclaims_multiple_stale_owners() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0, 1]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(98, 1, 0, &[0]).unwrap();
+            alloc.commit_job(98);
+            alloc.allocate_for_job(99, 1, 0, &[1]).unwrap();
+            alloc.commit_job(99);
+        }
+        assert_eq!(svc.free_gpu_count().await, 0);
+
+        let spec = JobSpec {
+            cpus_per_task: 1,
+            gres: vec!["gpu:2".into()],
+            ..Default::default()
+        };
+        let res = svc
+            .allocate_local_resources(100, &spec, Some(&gpu_alloc_request(&[0, 1])))
+            .await;
+        assert!(
+            res.is_ok(),
+            "both stale owners must be reclaimed, got {res:?}"
+        );
+    }
+
+    // A dispatch spanning a stale GPU and a still-running GPU must reject: the
+    // running owner cannot be reclaimed, so the retry still fails.
+    #[tokio::test]
+    async fn dispatch_rejects_partial_overlap_with_running_owner() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0, 1]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        // Job 98 (GPU 0) is stale; job 99 (GPU 1) is actively running.
+        svc.insert_test_job(99, TrackedJob::dummy(0)).await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(98, 1, 0, &[0]).unwrap();
+            alloc.commit_job(98);
+            alloc.allocate_for_job(99, 1, 0, &[1]).unwrap();
+            alloc.commit_job(99);
+        }
+
+        let spec = JobSpec {
+            cpus_per_task: 1,
+            gres: vec!["gpu:2".into()],
+            ..Default::default()
+        };
+        let res = svc
+            .allocate_local_resources(100, &spec, Some(&gpu_alloc_request(&[0, 1])))
+            .await;
+        let err = res.expect_err("must reject: GPU 1's owner is still running");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    }
+
     #[tokio::test]
     async fn run_command_injects_gpu_env_from_tracked_job() {
         let svc = AgentService::new(
