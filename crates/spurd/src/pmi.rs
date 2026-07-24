@@ -16,6 +16,10 @@ pub struct PmiServer {
     kvs: Arc<Mutex<HashMap<String, String>>>,
     barrier_count: Arc<std::sync::atomic::AtomicU32>,
     barrier_notify: Arc<Notify>,
+    // Signals `run`'s accept loop to exit so the bound listener fd and the
+    // accept task are released, not just the socket path. `notify_one` stores a
+    // permit, so a shutdown raised between loop iterations is not lost.
+    shutdown: Arc<Notify>,
 }
 
 impl PmiServer {
@@ -26,6 +30,7 @@ impl PmiServer {
             kvs: Arc::new(Mutex::new(HashMap::new())),
             barrier_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             barrier_notify: Arc::new(Notify::new()),
+            shutdown: Arc::new(Notify::new()),
         }
     }
 
@@ -39,9 +44,12 @@ impl PmiServer {
         };
 
         loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(_) => break,
+            let (stream, _) = tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok(s) => s,
+                    Err(_) => break,
+                },
+                _ = self.shutdown.notified() => break,
             };
             let kvs = self.kvs.clone();
             let num_ranks = self.num_ranks;
@@ -65,6 +73,7 @@ impl PmiServer {
     }
 
     pub fn cleanup(&self) {
+        self.shutdown.notify_one();
         let _ = std::fs::remove_file(&self.socket_path);
     }
 }
@@ -174,5 +183,41 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let resp = rt.block_on(handle_pmi_command("cmd=get_appnum", &kvs, 4, &bc, &bn));
         assert!(resp.contains("appnum=0"));
+    }
+
+    // cleanup() must stop run()'s accept loop, not just unlink the socket, so
+    // the bound listener fd and the accept task are released. Awaiting the run
+    // handle is deterministic: it only resolves once the loop has exited.
+    #[tokio::test]
+    async fn cleanup_stops_accept_loop() {
+        let socket_path = format!("/tmp/spur-pmi-shutdown-{}.sock", std::process::id());
+        let _ = std::fs::remove_file(&socket_path);
+        let server = Arc::new(PmiServer::new(&socket_path, 2));
+
+        let run_server = server.clone();
+        let handle = tokio::spawn(async move { run_server.run().await });
+
+        // The server is live once run() has bound the listener. The spawn above
+        // may not have reached bind yet, so retry the connect (yielding, no fixed
+        // sleep) until it succeeds — proving the accept loop is actually up.
+        let mut connected = false;
+        for _ in 0..1000 {
+            if tokio::net::UnixStream::connect(&socket_path).await.is_ok() {
+                connected = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(connected, "PMI server never became connectable");
+
+        server.cleanup();
+
+        // run() must return now that shutdown was signalled; if the loop still
+        // blocked on accept(), this await would hang.
+        handle.await.expect("run task must exit after cleanup");
+        assert!(
+            !std::path::Path::new(&socket_path).exists(),
+            "cleanup must also remove the socket file"
+        );
     }
 }

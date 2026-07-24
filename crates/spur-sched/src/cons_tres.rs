@@ -7,6 +7,7 @@
 //! This is the equivalent of Slurm's select/cons_tres plugin.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use spur_core::resource::{GpuResource, ResourceSet};
 
@@ -44,9 +45,9 @@ pub struct NodeAllocation {
     /// orphans reconciled. Source of truth; the bitmaps above are a derived
     /// index for fast free-count queries.
     owners: HashMap<u32, AllocationResult>,
-    /// Reserved but not yet committed to the running set (mid-launch: image
-    /// pull, fork). Reconcile spares these — not yet tracked, but not orphaned.
-    launching: HashSet<u32>,
+    /// Reserved but not yet committed, with reserve time. Reconcile spares
+    /// these until they exceed a TTL so a dropped launch can't pin resources.
+    launching: HashMap<u32, Instant>,
 }
 
 impl NodeAllocation {
@@ -61,7 +62,7 @@ impl NodeAllocation {
             gpu_allocated: vec![false; num_gpus],
             gpus: resources.gpus.clone(),
             owners: HashMap::new(),
-            launching: HashSet::new(),
+            launching: HashMap::new(),
         }
     }
 
@@ -91,7 +92,7 @@ impl NodeAllocation {
     pub fn conflicting_owners(&self, device_ids: &[u32]) -> Vec<u32> {
         self.owners
             .iter()
-            .filter(|(id, _)| !self.launching.contains(id))
+            .filter(|(id, _)| !self.launching.contains_key(id))
             .filter(|(_, alloc)| alloc.gpu_ids.iter().any(|g| device_ids.contains(g)))
             .map(|(id, _)| *id)
             .collect()
@@ -151,7 +152,7 @@ impl NodeAllocation {
     ) -> Result<AllocationResult, AllocError> {
         // A launch still in flight (reserved, not yet committed or released) is
         // a genuine concurrent duplicate: a second launch would double-count.
-        if self.launching.contains(&job_id) {
+        if self.launching.contains_key(&job_id) {
             return Err(AllocError::DuplicateJob);
         }
         // A committed reservation still owned here means a prior run's teardown
@@ -194,14 +195,17 @@ impl NodeAllocation {
             memory_mb,
         };
         self.owners.insert(job_id, result.clone());
-        self.launching.insert(job_id);
+        self.launching.insert(job_id, Instant::now());
         Ok(result)
     }
 
     /// Mark a job's allocation as committed (its process is now tracked), so it
-    /// is no longer exempt from reconcile.
-    pub fn commit_job(&mut self, job_id: u32) {
+    /// is no longer exempt from reconcile. Returns false if the reservation no
+    /// longer exists — reconcile reclaimed it after the launch exceeded the TTL,
+    /// so the caller must not treat the job as backed by an allocation.
+    pub fn commit_job(&mut self, job_id: u32) -> bool {
         self.launching.remove(&job_id);
+        self.owners.contains_key(&job_id)
     }
 
     /// Release a job's allocation by id. Idempotent: releasing an unknown or
@@ -215,16 +219,30 @@ impl NodeAllocation {
         true
     }
 
-    /// Release every owned allocation whose job is neither in `live` nor still
-    /// launching, returning the reclaimed ids. Self-healing backstop: if a
-    /// teardown ever fails to release, resources are recovered here instead of
-    /// stranding the node until spurd restart.
-    pub fn reconcile(&mut self, live: &HashSet<u32>) -> Vec<u32> {
+    /// Release owned allocations whose job is neither live nor launching within
+    /// `launching_ttl`, returning the reclaimed ids. Recovers a failed teardown
+    /// or a dropped launch instead of stranding the node until spurd restart.
+    pub fn reconcile(
+        &mut self,
+        live: &HashSet<u32>,
+        now: Instant,
+        launching_ttl: Duration,
+    ) -> Vec<u32> {
         let orphaned: Vec<u32> = self
             .owners
             .keys()
             .copied()
-            .filter(|id| !live.contains(id) && !self.launching.contains(id))
+            .filter(|id| {
+                if live.contains(id) {
+                    return false;
+                }
+                match self.launching.get(id) {
+                    Some(reserved_at) => {
+                        now.saturating_duration_since(*reserved_at) >= launching_ttl
+                    }
+                    None => true,
+                }
+            })
             .collect();
         for &id in &orphaned {
             self.release_job(id);
@@ -479,19 +497,63 @@ mod tests {
         // job 2: committed but NOT live (teardown failed to release — orphan).
         node.allocate_for_job(2, 4, 8_000, &[1]).unwrap();
         node.commit_job(2);
-        // job 3: still launching (reserved, not yet committed) — must be spared.
+        // job 3: launching within TTL — spared.
         node.allocate_for_job(3, 4, 8_000, &[2]).unwrap();
 
         let live: HashSet<u32> = [1].into_iter().collect();
-        let mut reclaimed = node.reconcile(&live);
+        let ttl = Duration::from_secs(120);
+        let mut reclaimed = node.reconcile(&live, Instant::now(), ttl);
         reclaimed.sort();
         assert_eq!(reclaimed, vec![2], "only the orphan (job 2) is reclaimed");
 
-        // job 1 (live) and job 3 (launching) still hold their resources.
         assert!(!node.release_job(2), "job 2 already reconciled");
         assert!(node.release_job(1));
         assert!(node.release_job(3));
         assert_eq!(node.free_gpus(None), 4);
+    }
+
+    #[test]
+    fn test_reconcile_reclaims_launching_past_ttl() {
+        let mut node = make_node_with_ids(64, 256_000, vec![0, 1, 2, 3], "mi300x");
+        // A launch reserved but never committed must be reclaimed past the TTL.
+        node.allocate_for_job(1, 4, 8_000, &[0]).unwrap();
+
+        let live: HashSet<u32> = HashSet::new();
+        let ttl = Duration::from_secs(120);
+
+        assert!(node.reconcile(&live, Instant::now(), ttl).is_empty());
+        assert_eq!(node.free_gpus(None), 3, "still reserved within TTL");
+
+        let future = Instant::now() + Duration::from_secs(121);
+        assert_eq!(node.reconcile(&live, future, ttl), vec![1]);
+        assert_eq!(node.free_gpus(None), 4, "reclaimed after TTL");
+    }
+
+    #[test]
+    fn test_commit_job_reports_reclaimed_reservation() {
+        let mut node = make_node_with_ids(64, 256_000, vec![0, 1], "mi300x");
+        node.allocate_for_job(1, 4, 8_000, &[0]).unwrap();
+        assert!(
+            node.commit_job(1),
+            "commit of a live reservation returns true"
+        );
+
+        // A launch whose reservation reconcile reclaimed before commit: the
+        // owner is gone, so commit must report false and stay a no-op. Keep
+        // job 1 in the live set so only the past-TTL launch (job 2) is reclaimed.
+        node.allocate_for_job(2, 4, 8_000, &[1]).unwrap();
+        let live: HashSet<u32> = [1].into_iter().collect();
+        let past = Instant::now() + Duration::from_secs(121);
+        node.reconcile(&live, past, Duration::from_secs(120));
+        assert!(
+            !node.commit_job(2),
+            "commit of a reclaimed reservation returns false"
+        );
+        assert_eq!(
+            node.free_gpus(None),
+            1,
+            "reclaimed GPU stays free after the no-op commit"
+        );
     }
 
     #[test]

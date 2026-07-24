@@ -68,12 +68,15 @@ struct CompletedJob {
     nodelist: String,
 }
 
+/// Per-node registry of running PMI servers, keyed by job id.
+type PmiServers = Arc<Mutex<HashMap<u32, Arc<PmiServer>>>>;
+
 pub struct AgentService {
     pub reporter: Arc<NodeReporter>,
     running: Arc<Mutex<HashMap<u32, TrackedJob>>>,
     allocation: Arc<Mutex<NodeAllocation>>,
     spank: Arc<Option<SpankHost>>,
-    pmi_servers: Arc<Mutex<HashMap<u32, Arc<PmiServer>>>>,
+    pmi_servers: PmiServers,
     hooks: Arc<HooksConfig>,
     memlock: spur_core::config::MemlockLimit,
     #[allow(dead_code)]
@@ -335,6 +338,11 @@ struct DrainRequest {
     reason: String,
 }
 
+/// Reclaim a launch reservation that never commits within this bound. Sized
+/// above a typical image pull + fork so a normal launch is spared; one stalled
+/// past this bound is reclaimed.
+const LAUNCHING_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Reclaim allocations whose job is no longer tracked and is not mid-launch,
 /// using the running set as ground truth. Callers hold the `running` lock
 /// across building `running` and this call so the live set is a consistent
@@ -344,12 +352,86 @@ fn reconcile_orphaned_allocations(
     allocation: &mut NodeAllocation,
 ) {
     let live: std::collections::HashSet<u32> = running.keys().copied().collect();
-    let reclaimed = allocation.reconcile(&live);
+    let reclaimed = allocation.reconcile(&live, std::time::Instant::now(), LAUNCHING_TTL);
     if !reclaimed.is_empty() {
         warn!(
             ?reclaimed,
             "reconciled orphaned resource allocations with no tracked job"
         );
+    }
+}
+
+/// Releases a launch reservation if the handler exits between reserve and
+/// commit, including on future cancellation which no error path can catch.
+/// Also tears down a PMI server started for the launch (via `adopt_pmi`), since
+/// that too would leak on a cancelled launch. Disarmed once the job is
+/// committed to the running set.
+struct LaunchReservationGuard {
+    allocation: Arc<Mutex<NodeAllocation>>,
+    pmi_servers: Option<PmiServers>,
+    job_id: u32,
+    armed: bool,
+}
+
+impl LaunchReservationGuard {
+    fn new(allocation: Arc<Mutex<NodeAllocation>>, job_id: u32) -> Self {
+        Self {
+            allocation,
+            pmi_servers: None,
+            job_id,
+            armed: true,
+        }
+    }
+
+    /// Take ownership of the job's PMI server so it is torn down alongside the
+    /// reservation if the launch aborts.
+    fn adopt_pmi(&mut self, pmi_servers: PmiServers) {
+        self.pmi_servers = Some(pmi_servers);
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LaunchReservationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let job_id = self.job_id;
+        // Drop can't await; try_lock succeeds inline on this uncontended path,
+        // else release off-thread so the reservation is never left stranded.
+        if let Ok(mut alloc) = self.allocation.try_lock() {
+            alloc.release_job(job_id);
+        } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let allocation = self.allocation.clone();
+            handle.spawn(async move {
+                allocation.lock().await.release_job(job_id);
+            });
+        }
+        // No runtime (shutdown) and lock held: reconcile reclaims via the TTL.
+
+        if let Some(pmi_servers) = self.pmi_servers.take() {
+            let locked_inline = match pmi_servers.try_lock() {
+                Ok(mut map) => {
+                    if let Some(pmi) = map.remove(&job_id) {
+                        pmi.cleanup();
+                    }
+                    true
+                }
+                Err(_) => false,
+            };
+            if !locked_inline {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        if let Some(pmi) = pmi_servers.lock().await.remove(&job_id) {
+                            pmi.cleanup();
+                        }
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -800,19 +882,6 @@ impl SlurmAgent for AgentService {
             (script, crate::container::RootfsMode::Extracted)
         };
 
-        // PMI-1 server: if MPI mode is "pmi1" and multiple tasks, start a
-        // Unix socket KVS server so MPI ranks can bootstrap via PMI.
-        if spec.mpi == "pmi1" && tasks_per_node > 1 {
-            let socket_path = format!("/tmp/spur-pmi-{}.sock", job_id);
-            let pmi = Arc::new(PmiServer::new(&socket_path, spec.num_tasks));
-            let pmi_run = pmi.clone();
-            tokio::spawn(async move {
-                pmi_run.run().await;
-            });
-            env.insert("PMI_PORT".into(), socket_path.clone());
-            self.pmi_servers.lock().await.insert(job_id, pmi);
-        }
-
         // Multi-task per-node: wrap the user script so it forks N processes,
         // each with a distinct LOCAL_RANK. The wrapper backgrounds N copies and
         // waits for all to finish, so TrackedJob only tracks a single PID (the
@@ -842,9 +911,25 @@ impl SlurmAgent for AgentService {
             .allocate_local_resources(job_id, &spec, req.allocated.as_ref())
             .await?;
 
-        // Any failure before commit must release the reservation, or the GPUs
-        // stay in-use with no tracked job while the controller sees the node
-        // IDLE. Reconcile is a backstop; releasing eagerly reclaims at once.
+        // Release the reservation on any exit before commit, including a
+        // cancelled launch future; disarmed once committed to `running`.
+        let mut reservation_guard = LaunchReservationGuard::new(self.allocation.clone(), job_id);
+
+        // PMI-1 server: if MPI mode is "pmi1" and multiple tasks, start a
+        // Unix socket KVS server so MPI ranks can bootstrap via PMI. Started
+        // under the guard so an aborted launch tears it down with the reservation.
+        if spec.mpi == "pmi1" && tasks_per_node > 1 {
+            let socket_path = format!("/tmp/spur-pmi-{}.sock", job_id);
+            let pmi = Arc::new(PmiServer::new(&socket_path, spec.num_tasks));
+            let pmi_run = pmi.clone();
+            tokio::spawn(async move {
+                pmi_run.run().await;
+            });
+            env.insert("PMI_PORT".into(), socket_path);
+            self.pmi_servers.lock().await.insert(job_id, pmi);
+            reservation_guard.adopt_pmi(self.pmi_servers.clone());
+        }
+
         let injection = {
             let reg = self.device_registry.lock().await;
             reg.build_job_injection_plans("gpu", &allocated_device_ids, spec.uid, spec.gid)
@@ -853,7 +938,6 @@ impl SlurmAgent for AgentService {
             Ok(plans) => plans,
             Err(e) => {
                 error!(job_id, error = %e, "device registry resolution failed");
-                self.allocation.lock().await.release_job(job_id);
                 return Err(Status::failed_precondition(format!(
                     "device resolution failed: {}",
                     e
@@ -870,14 +954,13 @@ impl SlurmAgent for AgentService {
         let cpu_ids: Vec<u32> = alloc_result.cpu_ids.clone();
 
         // Guard rather than unwrap: these are always Some when the image is
-        // set, but an early exit before commit must release the reservation.
+        // set. An early return here releases the reservation via the guard.
         let container_launch = if !spec.container_image.is_empty() {
             match (container_config.take(), rootfs_path.take()) {
                 (Some(config), Some(rootfs)) => {
                     Some(executor::ContainerLaunchConfig { config, rootfs })
                 }
                 _ => {
-                    self.allocation.lock().await.release_job(job_id);
                     return Err(Status::internal(
                         "internal error: container config missing after setup",
                     ));
@@ -925,13 +1008,54 @@ impl SlurmAgent for AgentService {
         };
 
         match executor::launch_job(&launch_cfg, (*self.spank).as_ref()).await {
-            Ok(result) => {
+            Ok(mut result) => {
                 let mut jobs = self.running.lock().await;
                 // Commit the reservation: the job now has a tracked process, so
                 // it is no longer exempt from reconcile. Take the running lock
                 // first so a job is never briefly absent from BOTH `running` and
                 // `launching` (which would let reconcile reclaim it).
-                self.allocation.lock().await.commit_job(job_id);
+                let committed = self.allocation.lock().await.commit_job(job_id);
+                reservation_guard.disarm();
+
+                // reconcile reclaimed the reservation mid-launch (launch exceeded
+                // the TTL). Don't track a job with no backing allocation — kill,
+                // reap, and clean up its cgroup/rootfs/spool (mirroring the
+                // monitor loop's completion teardown, which never runs since the
+                // job never enters `running`), then fail the launch.
+                if !committed {
+                    drop(jobs);
+                    warn!(
+                        job_id,
+                        "reservation reclaimed during launch; aborting to avoid running unbacked"
+                    );
+                    self.cleanup_pmi_server(job_id).await;
+                    let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
+                    let cgroup = result.job.take_cgroup();
+                    let running = self.running.clone();
+                    tokio::spawn(async move {
+                        reap_killed_job(result.job).await;
+                        // rootfs/spool paths are derived from job_id, so the
+                        // controller re-dispatching the same id to this node
+                        // would reuse them. Skip that cleanup if a live run for
+                        // job_id reappeared, or this reap would delete its files.
+                        // The cgroup handle is this launch's own, so it is always
+                        // safe to release.
+                        if !running.lock().await.contains_key(&job_id) {
+                            crate::container::cleanup_rootfs(job_id, &rootfs_mode);
+                            crate::executor::cleanup_job_spool(job_id);
+                        }
+                        if let Some(ref cg) = cgroup {
+                            crate::executor::cleanup_cgroup(cg);
+                        }
+                    });
+                    return Ok(Response::new(LaunchJobResponse {
+                        success: false,
+                        error: "reservation reclaimed during launch".into(),
+                        stdout_path: String::new(),
+                        stderr_path: String::new(),
+                    }));
+                }
+
                 info!(job_id, gpus = ?launch_cfg.gpu_devices, "job launched successfully");
                 let is_root = nix::unistd::geteuid().is_root();
                 let is_container = launch_cfg.container.is_some();
@@ -981,8 +1105,7 @@ impl SlurmAgent for AgentService {
                 }))
             }
             Err(e) => {
-                self.allocation.lock().await.release_job(job_id);
-
+                // reservation_guard releases the allocation and PMI on this return.
                 let is_prolog_failure = matches!(e, executor::LaunchError::PrologFailed(_));
                 let err_msg = e.to_string();
                 error!(job_id, error = %err_msg, "failed to launch job");
@@ -1030,6 +1153,16 @@ impl SlurmAgent for AgentService {
         } else {
             self.graceful_cancel(job_id).await;
         }
+
+        // The signal paths only act on a running job; release a still-launching
+        // reservation so a cancel-during-eviction doesn't strand it until the
+        // TTL. Hold the running lock across the release (matching launch_job's
+        // commit order) so this can't free a job that just became running.
+        let jobs = self.running.lock().await;
+        if !jobs.contains_key(&job_id) {
+            self.allocation.lock().await.release_job(job_id);
+        }
+        drop(jobs);
 
         Ok(Response::new(()))
     }
@@ -1135,16 +1268,6 @@ impl SlurmAgent for AgentService {
             return Err(Status::invalid_argument("job_id is required"));
         }
 
-        {
-            let jobs = self.running.lock().await;
-            if jobs.contains_key(&req.job_id) {
-                return Err(Status::already_exists(format!(
-                    "job {} already registered on this node",
-                    req.job_id
-                )));
-            }
-        }
-
         let allocated = req.allocated.as_ref();
         let mut controller_gpu_ids: Vec<u32> = allocated
             .and_then(|a| a.devices.get("gpu"))
@@ -1161,9 +1284,16 @@ impl SlurmAgent for AgentService {
         let cpus = allocated.map(|a| a.cpus).unwrap_or(req.cpus).max(1);
         let memory_mb = allocated.map(|a| a.memory_mb).unwrap_or(req.memory_mb);
 
-        // running-before-allocation (as in commit) so the job is never
+        // Hold the running lock across the duplicate check, reserve+commit, and
+        // insert (running → allocation, as in commit) so the job is never
         // committed-but-absent-from-running, which the reclaim reads as stale.
         let mut jobs = self.running.lock().await;
+        if jobs.contains_key(&req.job_id) {
+            return Err(Status::already_exists(format!(
+                "job {} already registered on this node",
+                req.job_id
+            )));
+        }
         {
             let mut alloc = self.allocation.lock().await;
             alloc
@@ -1177,7 +1307,7 @@ impl SlurmAgent for AgentService {
                         req.job_id
                     )),
                 })?;
-            alloc.commit_job(req.job_id);
+            let _ = alloc.commit_job(req.job_id);
         }
 
         info!(
@@ -1213,6 +1343,7 @@ impl SlurmAgent for AgentService {
                 run_attempt: 0,
             },
         );
+        drop(jobs);
 
         Ok(Response::new(RegisterJobAllocationResponse {}))
     }
@@ -1780,6 +1911,14 @@ impl AgentService {
     async fn drop_tracked_job(&self, job_id: u32) {
         if self.running.lock().await.remove(&job_id).is_some() {
             self.allocation.lock().await.release_job(job_id);
+        }
+    }
+
+    /// Tear down the PMI server started for a job that aborts before it enters
+    /// the running set — the monitor loop's completion cleanup never runs for it.
+    async fn cleanup_pmi_server(&self, job_id: u32) {
+        if let Some(pmi) = self.pmi_servers.lock().await.remove(&job_id) {
+            pmi.cleanup();
         }
     }
 
@@ -3071,6 +3210,205 @@ mod tests {
             .await;
         let err = res.expect_err("must reject: GPU 1's owner is still running");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    }
+
+    // A registered srun allocation must be committed AND tracked in `running`
+    // so a reconcile pass spares it — the reservation is backed, not orphaned.
+    #[tokio::test]
+    async fn register_job_allocation_survives_reconcile() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let mut devices = std::collections::HashMap::new();
+        devices.insert(
+            "gpu".to_string(),
+            DeviceAllocations {
+                devices: vec![AllocatedDevice {
+                    device_id: 0,
+                    count: 1,
+                }],
+            },
+        );
+        svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            job_id: 55,
+            cpus: 1,
+            allocated: Some(ResourceAllocations {
+                cpus: 1,
+                memory_mb: 0,
+                devices,
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("register");
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "registered allocation holds the GPU"
+        );
+
+        // The job is in `running`, so reconcile must spare it (not orphan-reclaim).
+        {
+            let jobs = svc.running.lock().await;
+            reconcile_orphaned_allocations(&jobs, &mut *svc.allocation.lock().await);
+        }
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "committed+tracked allocation must survive reconcile"
+        );
+    }
+
+    // CancelJob must release a still-launching (never-committed) reservation,
+    // else a cancel-during-eviction strands it until the TTL.
+    #[tokio::test]
+    async fn cancel_releases_launching_reservation() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        // Reserve GPU 0 as a still-launching job (not committed, not in running).
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(7, 1, 0, &[0]).unwrap();
+        }
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "GPU reserved while launching"
+        );
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id: 7,
+            signal: 9,
+        }))
+        .await
+        .expect("cancel_job");
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "cancel must release a launching (never-committed) reservation"
+        );
+    }
+
+    // A launch that aborts before entering `running` must tear down its PMI
+    // server, since the monitor loop's completion cleanup never runs for it.
+    #[tokio::test]
+    async fn cleanup_pmi_server_removes_entry_and_socket() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let socket_path = format!("/tmp/spur-pmi-test-{}.sock", std::process::id());
+        let pmi = Arc::new(crate::pmi::PmiServer::new(&socket_path, 2));
+        std::fs::write(&socket_path, b"").expect("create fake socket");
+        svc.pmi_servers.lock().await.insert(42, pmi);
+
+        svc.cleanup_pmi_server(42).await;
+
+        assert!(
+            !svc.pmi_servers.lock().await.contains_key(&42),
+            "pmi server entry must be removed"
+        );
+        assert!(
+            !std::path::Path::new(&socket_path).exists(),
+            "pmi socket file must be removed"
+        );
+    }
+
+    // An armed guard that adopted a PMI server must tear it down on drop (the
+    // future-cancellation path); a disarmed guard must leave it for the monitor.
+    #[tokio::test]
+    async fn reservation_guard_tears_down_adopted_pmi_on_drop() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let socket_path = format!("/tmp/spur-pmi-guard-{}.sock", std::process::id());
+        std::fs::write(&socket_path, b"").expect("create fake socket");
+        svc.pmi_servers
+            .lock()
+            .await
+            .insert(88, Arc::new(crate::pmi::PmiServer::new(&socket_path, 2)));
+
+        {
+            let mut guard = LaunchReservationGuard::new(svc.allocation.clone(), 88);
+            guard.adopt_pmi(svc.pmi_servers.clone());
+            drop(guard);
+        }
+        // Drop's off-thread fallback (if try_lock lost) resolves synchronously
+        // here since the map is uncontended, but yield once to be safe.
+        tokio::task::yield_now().await;
+
+        assert!(
+            !svc.pmi_servers.lock().await.contains_key(&88),
+            "armed guard must remove the adopted PMI entry on drop"
+        );
+        assert!(
+            !std::path::Path::new(&socket_path).exists(),
+            "armed guard must remove the PMI socket on drop"
+        );
+    }
+
+    // The guard must release the reservation when dropped before commit
+    // (the future-cancellation path), and leave it intact once disarmed.
+    #[tokio::test]
+    async fn reservation_guard_releases_on_drop_when_not_committed() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        {
+            svc.allocation
+                .lock()
+                .await
+                .allocate_for_job(9, 1, 0, &[0])
+                .unwrap();
+            let guard = LaunchReservationGuard::new(svc.allocation.clone(), 9);
+            assert_eq!(svc.free_gpu_count().await, 0, "reserved under guard");
+            drop(guard);
+        }
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "dropping an un-disarmed guard must release the reservation"
+        );
+
+        // A disarmed guard must NOT release (the job committed successfully).
+        {
+            svc.allocation
+                .lock()
+                .await
+                .allocate_for_job(10, 1, 0, &[0])
+                .unwrap();
+            svc.allocation.lock().await.commit_job(10);
+            let mut guard = LaunchReservationGuard::new(svc.allocation.clone(), 10);
+            guard.disarm();
+            drop(guard);
+        }
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "a disarmed guard must leave the committed reservation intact"
+        );
     }
 
     #[tokio::test]
