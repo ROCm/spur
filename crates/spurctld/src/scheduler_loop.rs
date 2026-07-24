@@ -2478,6 +2478,57 @@ mod tests {
             );
         }
 
+        // When no node reported (e.g. a suspended job's tasks died out-of-band),
+        // every allocated node is unreported and must be cancelled on force-finish.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn completing_timeout_cancels_all_nodes_when_none_reported() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (addr1, cancel1) = spawn_mock_agent().await;
+            let (addr2, cancel2) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr1);
+            register_node_at(&cm, "n2", addr2);
+
+            let spec = JobSpec {
+                name: "completing-none".into(),
+                user: "testuser".into(),
+                num_nodes: 2,
+                num_tasks: 2,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            };
+            let job_id = submit_and_wait(&cm, spec);
+
+            let nodes = vec!["n1".to_string(), "n2".to_string()];
+            let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
+                .iter()
+                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+            cm.start_job(
+                job_id,
+                nodes,
+                ResourceAllocations::with_scalar(2, 0),
+                per_node_allocs,
+            )
+            .unwrap();
+            settle(&cm, job_id, JobState::Running);
+
+            // Suspend routes through Completing; no node reports completion.
+            cm.suspend_job(job_id, "").unwrap();
+            settle(&cm, job_id, JobState::Suspended);
+            let mut job = cm.get_job(job_id).unwrap();
+            job.transition(JobState::Completing).unwrap();
+
+            force_finish_completing_job(&cm, &job).await;
+
+            assert_eq!(cancel1.load(Ordering::SeqCst), 1, "n1 must be cancelled");
+            assert_eq!(cancel2.load(Ordering::SeqCst), 1, "n2 must be cancelled");
+        }
+
         // Mock agents echo an offset-keyed path; the stored path must be the
         // primary's (task_offset == 0) regardless of which response arrives first.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

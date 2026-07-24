@@ -1802,11 +1802,10 @@ impl AgentService {
             )));
         }
 
-        // Snapshot the live set BEFORE taking the allocation lock, matching the
-        // launch commit's lock order (running then allocation) so the reclaim
-        // below cannot deadlock or race a concurrent commit.
-        let live: std::collections::HashSet<u32> =
-            self.running.lock().await.keys().copied().collect();
+        // Hold running across the reclaim (running-then-allocation, as in commit)
+        // so a concurrent commit can't make a live owner look stale.
+        let running = self.running.lock().await;
+        let live: std::collections::HashSet<u32> = running.keys().copied().collect();
 
         let mut alloc = self.allocation.lock().await;
 
@@ -2943,6 +2942,59 @@ mod tests {
             .await;
         let err = res.expect_err("must reject: the conflicting GPU owner is still running");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    }
+
+    // A conflicting owner still mid-launch (reserved, not yet committed) is a
+    // real concurrent duplicate, not a strand: the reclaim must spare it, so the
+    // retry still fails and the dispatch is rejected.
+    #[tokio::test]
+    async fn dispatch_rejects_when_conflicting_owner_still_launching() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        // Prior job 99 owns GPU 0 and is still launching (never committed).
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(99, 1, 0, &[0]).unwrap();
+        }
+
+        let mut devices = std::collections::HashMap::new();
+        devices.insert(
+            "gpu".to_string(),
+            DeviceAllocations {
+                devices: vec![AllocatedDevice {
+                    device_id: 0,
+                    count: 1,
+                }],
+            },
+        );
+        let spec = JobSpec {
+            cpus_per_task: 1,
+            gres: vec!["gpu:1".into()],
+            ..Default::default()
+        };
+        let allocated = ResourceAllocations {
+            cpus: 1,
+            memory_mb: 0,
+            devices,
+        };
+
+        let res = svc
+            .allocate_local_resources(100, &spec, Some(&allocated))
+            .await;
+        let err = res.expect_err("must reject: the conflicting GPU owner is still launching");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+
+        // The launching owner must NOT have been reclaimed.
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "launching owner must be spared"
+        );
     }
 
     #[tokio::test]
