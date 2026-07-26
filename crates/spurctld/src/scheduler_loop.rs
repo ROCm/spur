@@ -763,6 +763,7 @@ struct AgentDispatchParams<'a> {
     allocated: &'a spur_core::resource::ResourceAllocations,
     allocated_nodelist: &'a str,
     run_attempt: u32,
+    pmix_tmpdir: &'a str,
 }
 
 /// Resolved output paths reported by an agent after a successful launch.
@@ -804,6 +805,21 @@ async fn dispatch_to_agent(
         });
     }
 
+    let tasks_per_node = if spec.tasks_per_node.unwrap_or(0) > 0 {
+        spec.tasks_per_node.unwrap_or(1)
+    } else {
+        (spec.num_tasks / spec.num_nodes.max(1)).max(1)
+    };
+    let mpi = spec.mpi.clone().unwrap_or_default();
+    let pmix_plan = spur_core::mpi::maybe_local_pmix_plan(
+        &mpi,
+        params.job_id,
+        spec.num_tasks,
+        params.task_offset,
+        tasks_per_node,
+        params.pmix_tmpdir,
+    )
+    .map(spur_core::mpi::plan_to_proto);
     let proto_spec = ProtoJobSpec {
         name: spec.name.clone(),
         partition: spec.partition.clone().unwrap_or_default(),
@@ -899,6 +915,7 @@ async fn dispatch_to_agent(
             array_job_id: spec.array_job_id.unwrap_or(0),
             array_task_id: spec.array_task_id.unwrap_or(0),
             run_attempt: params.run_attempt,
+            pmix_plan,
         })
         .await?;
 
@@ -1096,6 +1113,7 @@ async fn dispatch_job_to_nodes(
     // this flag rather than arrival order.
     let mut primary_outcome: Option<LaunchOutcome> = None;
 
+    let pmix_tmpdir = cluster.config.mpi.pmix_tmpdir.clone();
     let mut set = tokio::task::JoinSet::new();
     for (node_idx, node_name) in dispatch_nodes.iter().enumerate() {
         let node_info = cluster.get_node(node_name);
@@ -1121,6 +1139,7 @@ async fn dispatch_job_to_nodes(
         let result_node = node_name.clone();
         let allocated = per_node_allocs.get(node_name).cloned().unwrap_or_default();
         let allocated_nodelist = allocated_nodelist.clone();
+        let pmix_tmpdir = pmix_tmpdir.clone();
         set.spawn(async move {
             let result = dispatch_to_agent(
                 &agent_addr,
@@ -1133,6 +1152,7 @@ async fn dispatch_job_to_nodes(
                     allocated: &allocated,
                     allocated_nodelist: &allocated_nodelist,
                     run_attempt,
+                    pmix_tmpdir: &pmix_tmpdir,
                 },
             )
             .await;
@@ -2225,6 +2245,7 @@ mod tests {
                 devices: Default::default(),
                 admission: Default::default(),
                 rlimits: Default::default(),
+                mpi: Default::default(),
             }
         }
 

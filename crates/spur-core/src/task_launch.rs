@@ -285,6 +285,7 @@ pub fn build_multi_task_wrapper(
     user_script_path: &str,
     tasks_on_node: u32,
     environment: Option<&HashMap<String, String>>,
+    mpi_bootstrap: bool,
 ) -> String {
     let escaped = user_script_path.replace('"', "\\\"");
     let bind = environment.map(parse_cpu_bind).unwrap_or(CpuBind::None);
@@ -309,10 +310,12 @@ pub fn build_multi_task_wrapper(
     wrapper.push_str("for LOCAL_RANK in $(seq 0 $((_TASKS_ON_NODE - 1))); do\n");
     wrapper.push_str("  export LOCAL_RANK\n");
     wrapper.push_str(SpurEnv::per_task_bash_exports());
-    wrapper.push_str("  export PMI_RANK=$SPUR_PROCID\n");
-    wrapper.push_str("  export PMIX_RANK=$SPUR_PROCID\n");
-    wrapper.push_str("  export OMPI_COMM_WORLD_RANK=$SPUR_PROCID\n");
-    wrapper.push_str("  export OMPI_COMM_WORLD_LOCAL_RANK=$LOCAL_RANK\n");
+    if mpi_bootstrap {
+        wrapper.push_str("  export PMI_RANK=$SPUR_PROCID\n");
+        wrapper.push_str("  export PMIX_RANK=$SPUR_PROCID\n");
+        wrapper.push_str("  export OMPI_COMM_WORLD_RANK=$SPUR_PROCID\n");
+        wrapper.push_str("  export OMPI_COMM_WORLD_LOCAL_RANK=$LOCAL_RANK\n");
+    }
 
     wrapper.push_str("  if [ -n \"$SPUR_JOB_GPUS\" ]; then\n");
     wrapper.push_str("    IFS=',' read -ra _ALL_GPUS <<< \"$SPUR_JOB_GPUS\"\n");
@@ -423,7 +426,7 @@ mod tests {
 
     #[test]
     fn multi_task_wrapper_exports_procid() {
-        let script = build_multi_task_wrapper("/tmp/work.sh", 2, None);
+        let script = build_multi_task_wrapper("/tmp/work.sh", 2, None, false);
         assert!(script.contains("SPUR_PROCID"));
         assert!(script.contains("SLURM_PROCID"));
         assert!(script.contains("_TASKS_ON_NODE=2"));
@@ -434,7 +437,7 @@ mod tests {
     fn multi_task_wrapper_applies_map_cpu_bind() {
         let mut env = HashMap::new();
         env.insert("SPUR_CPU_BIND".into(), "map_cpu:0,4".into());
-        let script = build_multi_task_wrapper("/tmp/work.sh", 2, Some(&env));
+        let script = build_multi_task_wrapper("/tmp/work.sh", 2, Some(&env), false);
         assert!(script.contains("_CPU_MAP=(0 4)"));
         assert!(script.contains("_CPU_IDX\" -ge"));
         assert!(script.contains("taskset -c ${_CPU_MAP[$_CPU_IDX]}"));
@@ -442,7 +445,7 @@ mod tests {
 
     #[test]
     fn multi_task_wrapper_honors_spur_label_env() {
-        let script = build_multi_task_wrapper("/tmp/work.sh", 1, None);
+        let script = build_multi_task_wrapper("/tmp/work.sh", 1, None, false);
         assert!(script.contains("SPUR_LABEL"));
         assert!(script.contains("sed \"s/^/[$SPUR_PROCID] /\""));
     }

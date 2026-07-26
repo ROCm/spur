@@ -13,6 +13,7 @@ members = [
     "crates/spur-cli",
     "crates/spur-ffi",
     "crates/spur-spank",
+    "crates/spur-mpi-pmix",
     "crates/spur-k8s",
     "crates/spur-tests",
     "crates/spur-update",

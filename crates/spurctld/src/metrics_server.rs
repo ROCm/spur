@@ -183,6 +183,7 @@ mod tests {
             admission: Default::default(),
             burst_buffer: Default::default(),
             rlimits: Default::default(),
+            mpi: Default::default(),
         }
     }
 

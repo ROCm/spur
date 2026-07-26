@@ -26,6 +26,7 @@ mod sprio;
 mod squeue;
 mod sreport;
 mod srun;
+mod spur_config;
 mod sshare;
 mod sstat;
 mod strigger;

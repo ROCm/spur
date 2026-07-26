@@ -35,6 +35,9 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 ARG SPUR_GIT_SHA
 ARG SPUR_GIT_DIRTY
+ARG BUILD_MPI_PLUGIN=0
+# BUILD_MPI_PLUGIN=1 links against libpmix and installs a functional spur_mpi_pmix.so
+# into dist artifacts. Default 0 builds the stub plugin (not copied to dist).
 ENV SPUR_GIT_SHA=$SPUR_GIT_SHA
 ENV SPUR_GIT_DIRTY=$SPUR_GIT_DIRTY
 
@@ -47,6 +50,16 @@ RUN cargo build --release --locked \
     --bin spurctld \
     --bin spurd \
     --bin spur-k8s-operator
+
+RUN if [ "$BUILD_MPI_PLUGIN" = "1" ]; then \
+        dnf install -y openpmix-devel && dnf clean all; \
+    fi && \
+    cargo build --release --locked -p spur-mpi-pmix
+
+RUN mkdir -p /dist/lib/spur && \
+    if [ "$BUILD_MPI_PLUGIN" = "1" ]; then \
+        cp target/release/libspur_mpi_pmix.so /dist/lib/spur/spur_mpi_pmix.so; \
+    fi
 
 RUN echo "=== Required GLIBC versions ===" && \
     for bin in spur spurctld spurd spur-k8s-operator; do \
@@ -79,3 +92,5 @@ COPY --from=builder /build/target/release/spur /bin/
 COPY --from=builder /build/target/release/spurctld /bin/
 COPY --from=builder /build/target/release/spurd /bin/
 COPY --from=builder /build/target/release/spur-k8s-operator /bin/
+# spur_mpi_pmix.so is included only when BUILD_MPI_PLUGIN=1 (see builder stage).
+COPY --from=builder /dist/lib/spur/ /lib/spur/

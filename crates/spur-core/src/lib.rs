@@ -14,6 +14,7 @@ pub mod hooks;
 pub mod hostlist;
 pub mod job;
 pub mod k0s;
+pub mod mpi;
 pub mod node;
 pub mod partition;
 pub mod process;

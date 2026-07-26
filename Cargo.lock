@@ -3659,6 +3659,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "spur-mpi-pmix"
+version = "0.5.1"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
+
+[[package]]
 name = "spur-net"
 version = "0.5.1"
 dependencies = [
@@ -3792,6 +3800,7 @@ dependencies = [
  "clap",
  "hostname",
  "libc",
+ "libloading",
  "nix",
  "prost-types",
  "serde",

@@ -92,6 +92,7 @@ impl SpurEnv {
         task_offset: u32,
         local_rank: u32,
         tasks_on_node: u32,
+        mpi_bootstrap: bool,
     ) {
         let procid = task_offset + local_rank;
         senv.set("SPUR_TASK_OFFSET", task_offset);
@@ -100,10 +101,12 @@ impl SpurEnv {
         senv.set("NPROC_PER_NODE", tasks_on_node);
         senv.set_with_slurm_twin("SPUR_LOCALID", local_rank);
         senv.set_with_slurm_twin("SPUR_PROCID", procid);
-        senv.set("PMI_RANK", procid);
-        senv.set("PMIX_RANK", procid);
-        senv.set("OMPI_COMM_WORLD_RANK", procid);
-        senv.set("OMPI_COMM_WORLD_LOCAL_RANK", local_rank);
+        if mpi_bootstrap {
+            senv.set("PMI_RANK", procid);
+            senv.set("PMIX_RANK", procid);
+            senv.set("OMPI_COMM_WORLD_RANK", procid);
+            senv.set("OMPI_COMM_WORLD_LOCAL_RANK", local_rank);
+        }
     }
 }
 
@@ -205,7 +208,7 @@ mod tests {
     #[test]
     fn apply_task_rank_sets_procid_twins() {
         let mut env = SpurEnv::new();
-        SpurEnv::apply_task_rank(&mut env, 1, 0, 1);
+        SpurEnv::apply_task_rank(&mut env, 1, 0, 1, false);
         let map = env.into_map();
         assert_eq!(map["SPUR_PROCID"], "1");
         assert_eq!(map["SLURM_PROCID"], "1");

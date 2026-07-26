@@ -10,6 +10,7 @@ mod landlock;
 pub mod pmi;
 pub(crate) mod privdrop;
 pub(crate) mod pty;
+mod mpi_plugin;
 mod reporter;
 mod seccomp;
 
@@ -259,12 +260,17 @@ async fn main() -> anyhow::Result<()> {
         .as_ref()
         .map(|c| c.cluster.clone())
         .unwrap_or_default();
+    let mpi_config = config
+        .as_ref()
+        .map(|c| c.mpi.clone())
+        .unwrap_or_default();
     let agent_service = agent_server::AgentService::with_cluster_config(
         reporter.clone(),
         hooks_config,
         registry.clone(),
         &cluster_config,
         memlock,
+        mpi_config,
     );
 
     // the RPC-driven k0s component owner is idle until the controller sends

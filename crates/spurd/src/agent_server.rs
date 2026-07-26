@@ -20,12 +20,14 @@ use spur_sched::cons_tres::{AllocError, AllocationResult, NodeAllocation};
 
 use spur_spank::{SpankContext, SpankHandle, SpankHook, SpankHost};
 
-use spur_core::config::HooksConfig;
+use spur_core::config::{HooksConfig, MpiConfig};
+use spur_core::mpi::MPI_PMIX;
 use spur_core::spur_env::SpurEnv;
 use spur_core::task_launch::build_multi_task_wrapper;
 use spur_devices::DeviceRegistry;
 
 use crate::executor;
+use crate::mpi_plugin::{self, MpiPluginHost, PmixLaunchGuard};
 use crate::pmi::PmiServer;
 use crate::reporter::NodeReporter;
 
@@ -66,6 +68,7 @@ struct CompletedJob {
     cpus: u32,
     memory_mb: u64,
     nodelist: String,
+    mpi: String,
 }
 
 /// Per-node registry of running PMI servers, keyed by job id.
@@ -77,6 +80,7 @@ pub struct AgentService {
     allocation: Arc<Mutex<NodeAllocation>>,
     spank: Arc<Option<SpankHost>>,
     pmi_servers: PmiServers,
+    mpi_host: Arc<MpiPluginHost>,
     hooks: Arc<HooksConfig>,
     memlock: spur_core::config::MemlockLimit,
     #[allow(dead_code)]
@@ -101,6 +105,7 @@ impl AgentService {
             device_registry,
             &spur_core::config::ClusterConfig::default(),
             memlock,
+            MpiConfig::default(),
         )
     }
 
@@ -112,6 +117,7 @@ impl AgentService {
         device_registry: Arc<Mutex<DeviceRegistry>>,
         cluster: &spur_core::config::ClusterConfig,
         memlock: spur_core::config::MemlockLimit,
+        mpi: MpiConfig,
     ) -> Self {
         let allocation = NodeAllocation::new(
             hostname::get()
@@ -170,6 +176,7 @@ impl AgentService {
             allocation: Arc::new(Mutex::new(allocation)),
             spank: Arc::new(spank),
             pmi_servers: Arc::new(Mutex::new(HashMap::new())),
+            mpi_host: Arc::new(MpiPluginHost::new(mpi)),
             hooks: Arc::new(hooks),
             memlock,
             device_registry,
@@ -187,7 +194,7 @@ impl AgentService {
         let running = self.running.clone();
         let allocation = self.allocation.clone();
         let spank = self.spank.clone();
-        let pmi_servers = self.pmi_servers.clone();
+        let mpi_host = self.mpi_host.clone();
         let hooks = self.hooks.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
@@ -225,6 +232,7 @@ impl AgentService {
                                 cpus: tracked.cpus,
                                 memory_mb: tracked.memory_mb,
                                 nodelist: tracked.nodelist.clone(),
+                                mpi: tracked.mpi.clone(),
                             });
                         }
                         Ok(None) => {}
@@ -242,8 +250,10 @@ impl AgentService {
                         crate::executor::cleanup_cgroup(cgroup);
                     }
                     allocation.lock().await.release_job(c.job_id);
-                    if let Some(pmi) = pmi_servers.lock().await.remove(&c.job_id) {
-                        pmi.cleanup();
+                    if c.mpi == MPI_PMIX || mpi_host.has_active_pmix(c.job_id) {
+                        if let Err(e) = mpi_host.stop_pmix_server(c.job_id) {
+                            warn!(job_id = c.job_id, error = %e, "PMIx plugin stop failed");
+                        }
                     }
                 }
 
@@ -732,13 +742,12 @@ impl SlurmAgent for AgentService {
         // Spur-only vars
         senv.set("SPUR_NODE_RANK", node_rank);
         if tasks_per_node == 1 {
-            SpurEnv::apply_task_rank(&mut senv, task_offset, 0, 1);
+            SpurEnv::apply_task_rank(&mut senv, task_offset, 0, 1, spec.mpi == MPI_PMIX);
         } else {
             senv.set("SPUR_TASK_OFFSET", task_offset);
             senv.set("LOCAL_RANK", "0");
             senv.set("LOCAL_WORLD_SIZE", tasks_per_node);
             senv.set("NPROC_PER_NODE", tasks_per_node);
-            senv.set("PMI_RANK", task_offset);
         }
         if !peer_nodes.is_empty() {
             senv.set("SPUR_PEER_NODES", peer_nodes.join(","));
@@ -758,24 +767,6 @@ impl SlurmAgent for AgentService {
         }
         senv.set("NODE_RANK", node_rank);
 
-        senv.set("PMI_SIZE", spec.num_tasks);
-        senv.set("PMI_UNIVERSE_SIZE", spec.num_tasks);
-        senv.set("PMI_APPNUM", "0");
-        if tasks_per_node > 1 {
-            senv.set("PMI_RANK", task_offset);
-        }
-
-        if spec.mpi == "pmix" {
-            senv.set("PMIX_SIZE", spec.num_tasks);
-            senv.set("PMIX_NAMESPACE", format!("spur.{}", job_id));
-            senv.set("PMIX_RANK", task_offset);
-            senv.set("OMPI_COMM_WORLD_SIZE", spec.num_tasks);
-            senv.set("OMPI_COMM_WORLD_RANK", task_offset);
-            senv.set("OMPI_COMM_WORLD_LOCAL_RANK", "0");
-            senv.set("OMPI_COMM_WORLD_LOCAL_SIZE", tasks_per_node);
-            senv.set("OMPI_COMM_WORLD_NODE_RANK", node_rank);
-        }
-
         if peer_nodes.len() > 1 {
             if let Some(first_peer) = peer_nodes.first() {
                 let master_addr = first_peer
@@ -791,6 +782,29 @@ impl SlurmAgent for AgentService {
         }
 
         let mut env = senv.into_map();
+
+        let mut pmix_guard = None;
+        if spec.mpi == MPI_PMIX {
+            let plan = req
+                .pmix_plan
+                .as_ref()
+                .map(mpi_plugin::plan_from_proto)
+                .ok_or_else(|| {
+                    Status::failed_precondition(
+                        "missing PMIx launch plan for --mpi=pmix job",
+                    )
+                })?;
+            pmix_guard = Some(PmixLaunchGuard::start(self.mpi_host.clone(), &plan).map_err(
+                Status::failed_precondition,
+            )?);
+            // Single-node Mode 1: one PMIX_SERVER_URI in the parent env; the multi-task
+            // wrapper overrides PMIX_RANK per fork via SPUR_PROCID.
+            let pmix_env = self
+                .mpi_host
+                .pmix_env_for_rank(&plan, task_offset)
+                .map_err(Status::failed_precondition)?;
+            env.extend(pmix_env);
+        }
 
         // If container image is specified, prepare rootfs and config for
         // the Rust container runtime (fork + container_init + pivot_root).
@@ -902,7 +916,7 @@ impl SlurmAgent for AgentService {
             }
 
             // Build the wrapper that launches N tasks with GPU partitioning
-            build_multi_task_wrapper(&user_script_path, tasks_per_node, None)
+            build_multi_task_wrapper(&user_script_path, tasks_per_node, None, spec.mpi == MPI_PMIX)
         } else {
             launch_script
         };
@@ -1009,6 +1023,7 @@ impl SlurmAgent for AgentService {
 
         match executor::launch_job(&launch_cfg, (*self.spank).as_ref()).await {
             Ok(mut result) => {
+                pmix_guard.as_mut().map(PmixLaunchGuard::disarm);
                 let mut jobs = self.running.lock().await;
                 // Commit the reservation: the job now has a tracked process, so
                 // it is no longer exempt from reconcile. Take the running lock
@@ -1379,7 +1394,7 @@ impl SlurmAgent for AgentService {
         };
         let step_id = req.step_id;
 
-        let (gpu_devices, partition, cpus, memory_mb, nodelist, mpi, num_tasks_total) = {
+        let (gpu_devices, partition, cpus, memory_mb, nodelist, _mpi) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
                 Status::not_found(format!("job {} not running on this node", job_id))
@@ -1398,7 +1413,6 @@ impl SlurmAgent for AgentService {
                 tracked.memory_mb,
                 nodelist,
                 tracked.mpi.clone(),
-                step_num_tasks,
             )
         };
 
@@ -1462,17 +1476,7 @@ impl SlurmAgent for AgentService {
             senv.set("SPUR_LABEL", "1");
         }
 
-        let tasks_per_node = num_tasks;
-        senv.set("PMI_SIZE", num_tasks_total);
-        senv.set("PMI_UNIVERSE_SIZE", num_tasks_total);
-        senv.set("PMI_APPNUM", "0");
-        if mpi == "pmix" {
-            senv.set("PMIX_SIZE", num_tasks_total);
-            senv.set("PMIX_NAMESPACE", format!("spur.{job_id}"));
-            senv.set("OMPI_COMM_WORLD_SIZE", num_tasks_total);
-            senv.set("OMPI_COMM_WORLD_NODE_RANK", node_id);
-            senv.set("OMPI_COMM_WORLD_LOCAL_SIZE", tasks_per_node);
-        }
+        let step_mpi = req.pmix_plan.is_some();
 
         let (program, program_args, step_script_cleanup) = if num_tasks > 1 || req.label {
             let step_dir =
@@ -1497,6 +1501,7 @@ impl SlurmAgent for AgentService {
                     user_script_path.to_string_lossy().as_ref(),
                     num_tasks,
                     Some(&req.environment),
+                    step_mpi,
                 )
             } else {
                 spur_core::task_launch::build_labeled_single_task_wrapper(
@@ -1512,12 +1517,12 @@ impl SlurmAgent for AgentService {
             if num_tasks > 1 {
                 senv.set("SPUR_TASK_OFFSET", req.task_offset);
             } else {
-                SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0, 1);
+                SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0, 1, step_mpi);
             }
             let wrapper_path_string = wrapper_path.to_string_lossy().into_owned();
             ("bash".to_string(), vec![wrapper_path_string], Some(guard))
         } else {
-            SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0, 1);
+            SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0, 1, step_mpi);
             let (program, args) = spur_core::task_launch::wrap_command_with_cpu_bind(
                 &req.command[0],
                 &req.command[1..],
@@ -1528,9 +1533,26 @@ impl SlurmAgent for AgentService {
         };
         let _step_script_guard = step_script_cleanup;
 
+        let mut env = senv.into_map();
+        if let Some(proto_plan) = req.pmix_plan.as_ref() {
+            let plan = mpi_plugin::plan_from_proto(proto_plan);
+            let mut pmix_guard =
+                PmixLaunchGuard::start(self.mpi_host.clone(), &plan).map_err(
+                    Status::failed_precondition,
+                )?;
+            // Same single-uri bootstrap as batch launch; per-rank PMIX_RANK comes from
+            // the multi-task wrapper when num_tasks > 1.
+            let pmix_env = self
+                .mpi_host
+                .pmix_env_for_rank(&plan, req.task_offset)
+                .map_err(Status::failed_precondition)?;
+            pmix_guard.disarm();
+            env.extend(pmix_env);
+        }
+
         let mut cmd = tokio::process::Command::new(&program);
         cmd.args(&program_args).current_dir(&work_dir);
-        for (k, v) in senv.into_map() {
+        for (k, v) in env {
             cmd.env(k, v);
         }
 
