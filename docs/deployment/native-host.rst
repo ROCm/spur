@@ -185,7 +185,7 @@ Build and install the plugin on every agent node:
    cargo build --release -p spur-mpi-pmix
    sudo install -D target/release/libspur_mpi_pmix.so /usr/lib/spur/spur_mpi_pmix.so
 
-The plugin requires **libpmix** at runtime (``pkg-config libpmix`` when building).
+The plugin requires **libpmix** at runtime (``pkg-config pmix`` when building).
 Open MPI on the node must be built against a compatible PMIx version.
 
 Add to ``spur.conf`` on agents (and match ``plugin_dir`` to the install path):

@@ -82,7 +82,9 @@ pub fn parse_mpi_option(value: &str) -> Result<Option<String>, String> {
     }
     match value {
         MPI_NONE | MPI_PMIX => Ok(Some(value.to_string())),
-        other => Err(format!("invalid --mpi value '{other}' (supported: none, pmix)")),
+        other => Err(format!(
+            "invalid --mpi value '{other}' (supported: none, pmix)"
+        )),
     }
 }
 

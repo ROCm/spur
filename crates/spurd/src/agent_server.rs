@@ -783,29 +783,6 @@ impl SlurmAgent for AgentService {
 
         let mut env = senv.into_map();
 
-        let mut pmix_guard = None;
-        if spec.mpi == MPI_PMIX {
-            let plan = req
-                .pmix_plan
-                .as_ref()
-                .map(mpi_plugin::plan_from_proto)
-                .ok_or_else(|| {
-                    Status::failed_precondition(
-                        "missing PMIx launch plan for --mpi=pmix job",
-                    )
-                })?;
-            pmix_guard = Some(PmixLaunchGuard::start(self.mpi_host.clone(), &plan).map_err(
-                Status::failed_precondition,
-            )?);
-            // Single-node Mode 1: one PMIX_SERVER_URI in the parent env; the multi-task
-            // wrapper overrides PMIX_RANK per fork via SPUR_PROCID.
-            let pmix_env = self
-                .mpi_host
-                .pmix_env_for_rank(&plan, task_offset)
-                .map_err(Status::failed_precondition)?;
-            env.extend(pmix_env);
-        }
-
         // If container image is specified, prepare rootfs and config for
         // the Rust container runtime (fork + container_init + pivot_root).
         let mut container_config: Option<crate::container::ContainerConfig> = None;
@@ -916,7 +893,12 @@ impl SlurmAgent for AgentService {
             }
 
             // Build the wrapper that launches N tasks with GPU partitioning
-            build_multi_task_wrapper(&user_script_path, tasks_per_node, None, spec.mpi == MPI_PMIX)
+            build_multi_task_wrapper(
+                &user_script_path,
+                tasks_per_node,
+                None,
+                spec.mpi == MPI_PMIX,
+            )
         } else {
             launch_script
         };
@@ -965,6 +947,75 @@ impl SlurmAgent for AgentService {
             cfg.device_plan = Some(container_device_plan);
         }
 
+        if let Some(ref prolog) = self.hooks.prolog {
+            let ctx = spur_core::hooks::HookContext {
+                job_id,
+                work_dir: work_dir.clone(),
+                uid: spec.uid,
+                gid: spec.gid,
+                partition: spec.partition.clone(),
+                nodelist: spec.nodelist.clone(),
+                script_context: "prolog_slurmd".into(),
+                gpu_devices: allocated_device_ids.clone(),
+                cpus: spec.cpus_per_task.max(1),
+                memory_mb: spec.memory_per_node_mb,
+            };
+            if let Err(e) = spur_core::hooks::run_hook(prolog, &ctx).await {
+                let err_msg = format!("prolog failed: {e}");
+                error!(job_id, error = %err_msg, "prolog hook failed before launch");
+                let controller = self.reporter.controller_addr.clone();
+                let node_name = self.reporter.hostname.clone();
+                let drain_reason = err_msg.clone();
+                tokio::spawn(async move {
+                    let drain = DrainRequest {
+                        reason: drain_reason.clone(),
+                    };
+                    report_completion(
+                        &controller,
+                        job_id,
+                        -1,
+                        0,
+                        run_attempt,
+                        &node_name,
+                        Some(&drain),
+                    )
+                    .await;
+                });
+                return Ok(Response::new(LaunchJobResponse {
+                    success: false,
+                    error: err_msg,
+                    stdout_path: String::new(),
+                    stderr_path: String::new(),
+                }));
+            }
+        }
+
+        let mut pmix_guard = None;
+        if spec.mpi == MPI_PMIX {
+            let plan = req
+                .pmix_plan
+                .as_ref()
+                .map(mpi_plugin::plan_from_proto)
+                .ok_or_else(|| {
+                    Status::failed_precondition("missing PMIx launch plan for --mpi=pmix job")
+                })?;
+            pmix_guard = Some(
+                PmixLaunchGuard::start(self.mpi_host.clone(), &plan)
+                    .map_err(Status::failed_precondition)?,
+            );
+            // Single-node Mode 1: one PMIX_SERVER_URI in the parent env; the multi-task
+            // wrapper overrides PMIX_RANK per fork via SPUR_PROCID.
+            let pmix_env = self
+                .mpi_host
+                .pmix_env_for_rank(&plan, task_offset)
+                .map_err(Status::failed_precondition)?;
+            env.extend(pmix_env);
+        }
+
+        if let Some(ref mut cfg) = container_config {
+            cfg.environment = env.clone();
+        }
+
         let cpu_ids: Vec<u32> = alloc_result.cpu_ids.clone();
 
         // Guard rather than unwrap: these are always Some when the image is
@@ -1009,7 +1060,7 @@ impl SlurmAgent for AgentService {
             uid: spec.uid,
             gid: spec.gid,
             container: container_launch,
-            prolog_script: self.hooks.prolog.clone(),
+            prolog_script: None,
             partition: spec.partition.clone(),
             nodelist: spec.nodelist.clone(),
             host_device_plan: Some(host_device_plan),
@@ -1044,6 +1095,9 @@ impl SlurmAgent for AgentService {
                         "reservation reclaimed during launch; aborting to avoid running unbacked"
                     );
                     self.cleanup_pmi_server(job_id).await;
+                    if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
+                        warn!(job_id, error = %e, "PMIx stop failed after reclaimed reservation");
+                    }
                     let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                     let cgroup = result.job.take_cgroup();
                     let running = self.running.clone();
@@ -1533,20 +1587,40 @@ impl SlurmAgent for AgentService {
         };
         let _step_script_guard = step_script_cleanup;
 
+        if let Some(ref task_prolog) = self.hooks.task_prolog {
+            let ctx = spur_core::hooks::HookContext {
+                job_id,
+                work_dir: work_dir.clone(),
+                uid: req.uid,
+                gid: req.gid,
+                partition: partition.clone(),
+                nodelist: nodelist.clone(),
+                script_context: "prolog_task".into(),
+                gpu_devices: gpu_devices.clone(),
+                cpus,
+                memory_mb,
+            };
+            if let Err(e) = spur_core::hooks::run_hook(task_prolog, &ctx).await {
+                return Err(Status::aborted(format!("TaskProlog failed: {}", e)));
+            }
+        }
+
         let mut env = senv.into_map();
+        let mut _pmix_step_guard = None;
         if let Some(proto_plan) = req.pmix_plan.as_ref() {
             let plan = mpi_plugin::plan_from_proto(proto_plan);
-            let mut pmix_guard =
-                PmixLaunchGuard::start(self.mpi_host.clone(), &plan).map_err(
-                    Status::failed_precondition,
-                )?;
+            if !self.mpi_host.has_active_pmix(plan.job_id) {
+                _pmix_step_guard = Some(
+                    PmixLaunchGuard::start(self.mpi_host.clone(), &plan)
+                        .map_err(Status::failed_precondition)?,
+                );
+            }
             // Same single-uri bootstrap as batch launch; per-rank PMIX_RANK comes from
             // the multi-task wrapper when num_tasks > 1.
             let pmix_env = self
                 .mpi_host
                 .pmix_env_for_rank(&plan, req.task_offset)
                 .map_err(Status::failed_precondition)?;
-            pmix_guard.disarm();
             env.extend(pmix_env);
         }
 
@@ -1577,24 +1651,6 @@ impl SlurmAgent for AgentService {
             work_dir = %work_dir,
             "RunCommand: executing step"
         );
-
-        if let Some(ref task_prolog) = self.hooks.task_prolog {
-            let ctx = spur_core::hooks::HookContext {
-                job_id,
-                work_dir: work_dir.clone(),
-                uid: req.uid,
-                gid: req.gid,
-                partition: partition.clone(),
-                nodelist: nodelist.clone(),
-                script_context: "prolog_task".into(),
-                gpu_devices: gpu_devices.clone(),
-                cpus,
-                memory_mb,
-            };
-            if let Err(e) = spur_core::hooks::run_hook(task_prolog, &ctx).await {
-                return Err(Status::aborted(format!("TaskProlog failed: {}", e)));
-            }
-        }
 
         let output = cmd
             .output()
@@ -1933,6 +1989,9 @@ impl AgentService {
     async fn drop_tracked_job(&self, job_id: u32) {
         if self.running.lock().await.remove(&job_id).is_some() {
             self.allocation.lock().await.release_job(job_id);
+            if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
+                warn!(job_id, error = %e, "PMIx stop failed on job drop");
+            }
         }
     }
 

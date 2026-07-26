@@ -43,10 +43,15 @@ struct SpurMpiLaunchPlan {
 
 type VersionFn = unsafe extern "C" fn() -> c_int;
 type RuntimeVersionFn = unsafe extern "C" fn(*mut c_char, usize) -> c_int;
-type ServerStartFn =
-    unsafe extern "C" fn(*const SpurMpiLaunchPlan, *mut c_char, usize) -> c_int;
+type ServerStartFn = unsafe extern "C" fn(*const SpurMpiLaunchPlan, *mut c_char, usize) -> c_int;
 type ServerStopFn = unsafe extern "C" fn(*const c_char, *mut c_char, usize) -> c_int;
-type EnvFn = unsafe extern "C" fn(*const SpurMpiLaunchPlan, c_uint, *const c_char, *mut c_char, usize) -> c_int;
+type EnvFn = unsafe extern "C" fn(
+    *const SpurMpiLaunchPlan,
+    c_uint,
+    *const c_char,
+    *mut c_char,
+    usize,
+) -> c_int;
 
 struct PluginApi {
     _library: Library,
@@ -115,7 +120,10 @@ impl MpiPluginHost {
     }
 
     fn load_plugin(&self) -> Result<(), String> {
-        let mut guard = self.plugin.lock().map_err(|_| "plugin lock poisoned".to_string())?;
+        let mut guard = self
+            .plugin
+            .lock()
+            .map_err(|_| "plugin lock poisoned".to_string())?;
         if guard.is_some() {
             return Ok(());
         }
@@ -200,8 +208,13 @@ impl MpiPluginHost {
         let c_plan = plan_to_c(plan);
         let mut errbuf = vec![0i8; 512];
         let rc = {
-            let guard = self.plugin.lock().map_err(|_| "plugin lock poisoned".to_string())?;
-            let api = guard.as_ref().ok_or_else(|| "MPI plugin not loaded".to_string())?;
+            let guard = self
+                .plugin
+                .lock()
+                .map_err(|_| "plugin lock poisoned".to_string())?;
+            let api = guard
+                .as_ref()
+                .ok_or_else(|| "MPI plugin not loaded".to_string())?;
             unsafe { (api.server_start)(&c_plan, errbuf.as_mut_ptr(), errbuf.len()) }
         };
         if rc != 0 {
@@ -257,13 +270,7 @@ impl MpiPluginHost {
             let api = guard
                 .as_ref()
                 .ok_or_else(|| "MPI plugin not loaded".to_string())?;
-            unsafe {
-                (api.server_stop)(
-                    c_namespace.as_ptr(),
-                    errbuf.as_mut_ptr(),
-                    errbuf.len(),
-                )
-            }
+            unsafe { (api.server_stop)(c_namespace.as_ptr(), errbuf.as_mut_ptr(), errbuf.len()) }
         };
         if rc != 0 {
             let err = c_str_to_string(&errbuf);
@@ -294,7 +301,9 @@ impl MpiPluginHost {
                     .plugin
                     .lock()
                     .map_err(|_| "plugin lock poisoned".to_string())?;
-                let api = guard.as_ref().ok_or_else(|| "MPI plugin not loaded".to_string())?;
+                let api = guard
+                    .as_ref()
+                    .ok_or_else(|| "MPI plugin not loaded".to_string())?;
                 unsafe {
                     (api.env)(
                         &c_plan,
@@ -311,12 +320,7 @@ impl MpiPluginHost {
                     out.insert(key.to_string(), value);
                 }
             } else {
-                debug!(
-                    job_id = plan.job_id,
-                    rank,
-                    key,
-                    "PMIx env key unavailable"
-                );
+                debug!(job_id = plan.job_id, rank, key, "PMIx env key unavailable");
             }
         }
         validate_pmix_env(&out)?;
@@ -432,7 +436,10 @@ mod tests {
             universe_size: 300,
             task_offset: 0,
             local_procs: (0..257)
-                .map(|rank| mpi::PmixLocalProc { rank, local_rank: rank })
+                .map(|rank| mpi::PmixLocalProc {
+                    rank,
+                    local_rank: rank,
+                })
                 .collect(),
             tmpdir: "/tmp/pmix".into(),
         };

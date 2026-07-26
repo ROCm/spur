@@ -19,7 +19,21 @@ typedef struct {
     char namespace_[256];
     char tmpdir[512];
     uint32_t universe_size;
+    uint32_t num_local_procs;
+    uint32_t local_ranks[256];
 } spur_pmix_session_t;
+
+static int local_procs_match(const spur_pmix_session_t *session, const spur_mpi_launch_plan_t *plan) {
+    if (session->num_local_procs != plan->num_local_procs) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < plan->num_local_procs; i++) {
+        if (session->local_ranks[i] != plan->local_procs[i].rank) {
+            return 0;
+        }
+    }
+    return 1;
+}
 
 static spur_pmix_session_t g_sessions[SPUR_PMIX_MAX_SESSIONS];
 static pthread_mutex_t g_session_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -81,7 +95,7 @@ static pmix_status_t spur_fence(
     (void)nprocs;
     (void)directives;
     (void)ndirs;
-    /* Single-node Mode 1: no cross-agent fence. PR2 multi-node must synchronize here. */
+    /* Single-node only; multi-node must synchronize here. */
     if (cbfunc != NULL) {
         cbfunc(PMIX_SUCCESS, NULL, 0, cbdata, NULL, NULL);
     }
@@ -162,7 +176,36 @@ int spur_mpi_pmix_server_start(const spur_mpi_launch_plan_t *plan, char *errbuf,
         return -1;
     }
 
-    if (find_session(plan->namespace_) != NULL) {
+    spur_pmix_session_t *existing = find_session(plan->namespace_);
+    if (existing != NULL) {
+        if (existing->universe_size != plan->universe_size) {
+            if (errbuf != NULL && errlen > 0) {
+                snprintf(
+                    errbuf,
+                    errlen,
+                    "namespace %s already registered with universe_size %u (requested %u)",
+                    plan->namespace_,
+                    existing->universe_size,
+                    plan->universe_size
+                );
+            }
+            pthread_mutex_unlock(&g_session_lock);
+            return -1;
+        }
+        if (!local_procs_match(existing, plan)) {
+            if (errbuf != NULL && errlen > 0) {
+                snprintf(
+                    errbuf,
+                    errlen,
+                    "namespace %s already registered with %u local procs (requested %u)",
+                    plan->namespace_,
+                    existing->num_local_procs,
+                    plan->num_local_procs
+                );
+            }
+            pthread_mutex_unlock(&g_session_lock);
+            return -1;
+        }
         spur_mpi_debug(
             "spur_mpi_pmix: namespace %s already registered\n",
             plan->namespace_
@@ -181,7 +224,6 @@ int spur_mpi_pmix_server_start(const spur_mpi_launch_plan_t *plan, char *errbuf,
     }
 
     for (uint32_t i = 0; i < plan->num_local_procs; i++) {
-        PMIX_PROC_CREATE(&procs[i], 1);
         PMIX_LOAD_PROCID(&procs[i], plan->namespace_, plan->local_procs[i].rank);
     }
 
@@ -192,9 +234,6 @@ int spur_mpi_pmix_server_start(const spur_mpi_launch_plan_t *plan, char *errbuf,
         NULL,
         0
     );
-    for (uint32_t i = 0; i < plan->num_local_procs; i++) {
-        PMIX_PROC_RELEASE(&procs[i]);
-    }
     free(procs);
 
     if (rc != PMIX_SUCCESS) {
@@ -230,6 +269,10 @@ int spur_mpi_pmix_server_start(const spur_mpi_launch_plan_t *plan, char *errbuf,
     }
 
     session->universe_size = plan->universe_size;
+    session->num_local_procs = plan->num_local_procs;
+    for (uint32_t i = 0; i < plan->num_local_procs && i < 256; i++) {
+        session->local_ranks[i] = plan->local_procs[i].rank;
+    }
     strncpy(session->tmpdir, plan->tmpdir, sizeof(session->tmpdir) - 1);
     session->tmpdir[sizeof(session->tmpdir) - 1] = '\0';
 
@@ -305,13 +348,11 @@ int spur_mpi_pmix_env(
     }
 
     pmix_proc_t proc;
-    PMIX_PROC_CREATE(&proc, 1);
     PMIX_LOAD_PROCID(&proc, plan->namespace_, rank);
 
     pmix_info_t *info = NULL;
     size_t ninfo = 0;
     pmix_status_t rc = PMIx_server_setup_fork(&proc, &info, &ninfo);
-    PMIX_PROC_RELEASE(&proc);
     if (rc != PMIX_SUCCESS) {
         spur_mpi_debug(
             "spur_mpi_pmix: PMIx_server_setup_fork rank=%u key=%s failed: %s\n",

@@ -1533,11 +1533,7 @@ impl SlurmController for ControllerService {
         let gid = req.gid;
         let step_id = req.step_id;
         let label = req.label;
-        let job_mpi = job
-            .spec
-            .mpi
-            .as_deref()
-            .unwrap_or(spur_core::mpi::MPI_NONE);
+        let job_mpi = job.spec.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
         let mpi = spur_core::mpi::resolve_step_mpi(req.mpi.as_str(), job_mpi);
         spur_core::mpi::validate_pmix_step_agents(mpi, plan.len())
             .map_err(Status::invalid_argument)?;

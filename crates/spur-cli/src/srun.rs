@@ -1530,7 +1530,8 @@ mod tests {
             stderr: String::new(),
             stdin: String::new(),
         };
-        let spec = build_srun_job_spec(&args, "/tmp/work", &io, "none").expect("spec");
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
         assert_eq!(spec.qos, "high");
     }
 
@@ -1542,7 +1543,8 @@ mod tests {
             stderr: String::new(),
             stdin: String::new(),
         };
-        let spec = build_srun_job_spec(&args, "/tmp/work", &io).expect("spec");
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
         assert!(spec.exclusive);
     }
 
@@ -1554,7 +1556,8 @@ mod tests {
             stderr: String::new(),
             stdin: String::new(),
         };
-        let spec = build_srun_job_spec(&args, "/tmp/work", &io).expect("spec");
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
         assert!(spec.qos.is_empty());
     }
 
