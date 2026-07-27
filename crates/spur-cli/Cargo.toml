@@ -28,7 +28,7 @@ tokio-stream = "0.1"
 whoami = "2.1.1"
 nix = { workspace = true, features = ["user"] }
 libc = "0.2"
-crossterm = "0.28"
+crossterm = "0.29"
 flate2 = { workspace = true }
 tar = { workspace = true }
 shlex = "2"
