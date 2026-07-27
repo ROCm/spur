@@ -24,7 +24,7 @@ use anyhow::{bail, Context};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::header::{ACCEPT, AUTHORIZATION};
 use serde::Deserialize;
-use tracing::{debug, info};
+use tracing::{debug, info, warn, Level};
 
 /// A parsed container image reference.
 #[derive(Debug, Clone)]
@@ -157,7 +157,11 @@ pub async fn pull_image(image: &str, output_dir: &Path) -> anyhow::Result<PathBu
     let rootfs_dir = tmp_dir.join("rootfs");
     std::fs::create_dir_all(&rootfs_dir)?;
 
-    let result = pull_and_extract(&image_ref, &rootfs_dir).await;
+    let cache_dir = layer_cache_dir(
+        output_dir,
+        std::env::var_os("SPUR_IMAGE_CACHE").map(PathBuf::from),
+    );
+    let result = pull_and_extract(&image_ref, &rootfs_dir, &cache_dir).await;
     if let Err(e) = &result {
         let _ = std::fs::remove_dir_all(&tmp_dir);
         return Err(anyhow::anyhow!("{}", e));
@@ -211,7 +215,11 @@ pub async fn pull_image(image: &str, output_dir: &Path) -> anyhow::Result<PathBu
 }
 
 /// Download manifest and layers, extract to rootfs directory.
-async fn pull_and_extract(image_ref: &ImageRef, rootfs_dir: &Path) -> anyhow::Result<()> {
+async fn pull_and_extract(
+    image_ref: &ImageRef,
+    rootfs_dir: &Path,
+    cache_dir: &Path,
+) -> anyhow::Result<()> {
     let client = reqwest::Client::builder().user_agent("spur/0.1").build()?;
 
     // Get auth token
@@ -279,12 +287,25 @@ async fn pull_and_extract(image_ref: &ImageRef, rootfs_dir: &Path) -> anyhow::Re
 
     info!(layers = manifest.layers.len(), "downloading layers");
 
-    // Layer cache directory
-    let cache_dir = PathBuf::from(
-        std::env::var("SPUR_IMAGE_CACHE")
-            .unwrap_or_else(|_| "/var/spool/spur/images/.layers".into()),
-    );
-    let _ = std::fs::create_dir_all(&cache_dir);
+    let cache_enabled = match std::fs::create_dir_all(cache_dir) {
+        Ok(()) => true,
+        Err(error) => {
+            if tracing::enabled!(Level::WARN) {
+                warn!(
+                    path = %cache_dir.display(),
+                    %error,
+                    "failed to create image layer cache; continuing without cache"
+                );
+            } else {
+                eprintln!(
+                    "Warning: failed to create image layer cache at {}; continuing without cache: {}",
+                    cache_dir.display(),
+                    error
+                );
+            }
+            false
+        }
+    };
 
     // Download layers in parallel, then extract sequentially (order matters)
     let mut layer_data: Vec<(usize, bytes::Bytes)> = Vec::new();
@@ -294,11 +315,11 @@ async fn pull_and_extract(image_ref: &ImageRef, rootfs_dir: &Path) -> anyhow::Re
     for (i, layer) in manifest.layers.iter().enumerate() {
         let digest = layer.digest.clone();
         let size = layer.size;
-        let cache_path = cache_dir.join(digest.replace(':', "_"));
+        let cache_path = cache_enabled.then(|| cache_dir.join(digest.replace(':', "_")));
 
         // Check layer cache
-        if cache_path.exists() {
-            if let Ok(cached) = std::fs::read(&cache_path) {
+        if let Some(cache_path) = &cache_path {
+            if let Ok(cached) = std::fs::read(cache_path) {
                 info!(
                     layer = i + 1,
                     total = manifest.layers.len(),
@@ -337,8 +358,23 @@ async fn pull_and_extract(image_ref: &ImageRef, rootfs_dir: &Path) -> anyhow::Re
 
             let data = resp.bytes().await.context("failed to read layer body")?;
 
-            // Cache the layer
-            let _ = std::fs::write(&cache_path, &data);
+            if let Some(cache_path) = cache_path {
+                if let Err(error) = std::fs::write(&cache_path, &data) {
+                    if tracing::enabled!(Level::WARN) {
+                        warn!(
+                            path = %cache_path.display(),
+                            %error,
+                            "failed to cache image layer"
+                        );
+                    } else {
+                        eprintln!(
+                            "Warning: failed to cache image layer at {}: {}",
+                            cache_path.display(),
+                            error
+                        );
+                    }
+                }
+            }
 
             Ok::<(usize, bytes::Bytes), anyhow::Error>((i, data))
         });
@@ -362,6 +398,10 @@ async fn pull_and_extract(image_ref: &ImageRef, rootfs_dir: &Path) -> anyhow::Re
     }
 
     Ok(())
+}
+
+fn layer_cache_dir(output_dir: &Path, override_dir: Option<PathBuf>) -> PathBuf {
+    override_dir.unwrap_or_else(|| output_dir.join(".layers"))
 }
 
 /// Registry credentials loaded from file or environment.
@@ -961,6 +1001,27 @@ mod tests {
         assert_eq!(
             sanitize_name("docker://nvcr.io/nvidia/pytorch:24.01"),
             "nvcr.io+nvidia+pytorch+24.01"
+        );
+    }
+
+    #[test]
+    fn layer_cache_defaults_below_output_directory() {
+        let output_dir = Path::new("/home/alice/.spur/images");
+
+        assert_eq!(
+            layer_cache_dir(output_dir, None),
+            output_dir.join(".layers")
+        );
+    }
+
+    #[test]
+    fn layer_cache_honors_environment_override() {
+        let output_dir = Path::new("/home/alice/.spur/images");
+        let override_dir = PathBuf::from("/mnt/shared/spur-layers");
+
+        assert_eq!(
+            layer_cache_dir(output_dir, Some(override_dir.clone())),
+            override_dir
         );
     }
 }
