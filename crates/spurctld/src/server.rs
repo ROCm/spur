@@ -27,6 +27,11 @@ use crate::sched_stats::SchedStatsCollector;
 const FORWARDED_HEADER: &str = "x-spur-forwarded";
 const LEADER_HEADER: &str = "x-spur-leader";
 
+/// Forwarding decision for read RPCs, split out so it's unit-testable.
+fn read_forwarding_policy(is_leader: bool, is_forwarded: bool) -> bool {
+    !is_leader && !is_forwarded
+}
+
 pub struct ControllerService {
     cluster: Arc<ClusterManager>,
     raft: Arc<RaftHandle>,
@@ -88,6 +93,14 @@ impl LeaderProxy {
         *cached = Some((leader_id, client.clone()));
         Ok(client)
     }
+
+    /// `None` instead of an error when no leader is reachable, so read RPCs can
+    /// fall back to local state rather than failing.
+    async fn try_get_leader_client(
+        &self,
+    ) -> Option<SlurmControllerClient<tonic::transport::Channel>> {
+        self.get_leader_client().await.ok()
+    }
 }
 
 impl ControllerService {
@@ -103,6 +116,45 @@ impl ControllerService {
         }
 
         Err(self.not_leader_status())
+    }
+
+    /// Reads never require the leader (every node applies the committed log),
+    /// so forwarding is only an optional freshness hop. Skipping already-
+    /// forwarded requests avoids forward loops between non-leaders.
+    fn read_should_forward<T>(&self, request: &Request<T>) -> bool {
+        read_forwarding_policy(
+            self.raft.is_leader(),
+            request.metadata().get(FORWARDED_HEADER).is_some(),
+        )
+    }
+
+    /// Best-effort forward of a read to the leader. `Some` only when the leader
+    /// answered; `None` (skip, unreachable, or forwarded call errored) tells the
+    /// caller to serve local state. `rpc` names the call for the fallback log.
+    async fn forward_read_optional<T, R, F, Fut>(
+        &self,
+        forward: bool,
+        payload: T,
+        rpc: &str,
+        call: F,
+    ) -> Option<Response<R>>
+    where
+        F: FnOnce(SlurmControllerClient<tonic::transport::Channel>, Request<T>) -> Fut,
+        Fut: std::future::Future<Output = Result<Response<R>, Status>>,
+    {
+        if !forward {
+            return None;
+        }
+        let client = self.leader_proxy.try_get_leader_client().await?;
+        let mut fwd = Request::new(payload);
+        *fwd.metadata_mut() = Self::forwarded_metadata();
+        match call(client, fwd).await {
+            Ok(resp) => Some(resp),
+            Err(e) => {
+                warn!("forwarding {rpc} to leader failed, serving locally: {e}");
+                None
+            }
+        }
     }
 
     fn not_leader_status(&self) -> Status {
@@ -230,17 +282,16 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetJobsRequest>,
     ) -> Result<Response<GetJobsResponse>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.get_jobs(fwd).await;
-            }
-        }
-
+        let forward = self.read_should_forward(&request);
         let req = request.into_inner();
+        if let Some(resp) = self
+            .forward_read_optional(forward, req.clone(), "get_jobs", |mut c, r| async move {
+                c.get_jobs(r).await
+            })
+            .await
+        {
+            return Ok(resp);
+        }
 
         let states: Vec<spur_core::job::JobState> = req
             .states
@@ -279,17 +330,18 @@ impl SlurmController for ControllerService {
     }
 
     async fn get_job(&self, request: Request<GetJobRequest>) -> Result<Response<JobInfo>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.get_job(fwd).await;
-            }
+        let forward = self.read_should_forward(&request);
+        let req = request.into_inner();
+        if let Some(resp) = self
+            .forward_read_optional(forward, req, "get_job", |mut c, r| async move {
+                c.get_job(r).await
+            })
+            .await
+        {
+            return Ok(resp);
         }
 
-        let job_id = request.into_inner().job_id;
+        let job_id = req.job_id;
         let job = self
             .cluster
             .get_job_for_display(job_id)
@@ -514,17 +566,17 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetNodesRequest>,
     ) -> Result<Response<GetNodesResponse>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.get_nodes(fwd).await;
-            }
+        let forward = self.read_should_forward(&request);
+        let req = request.into_inner();
+        if let Some(resp) = self
+            .forward_read_optional(forward, req.clone(), "get_nodes", |mut c, r| async move {
+                c.get_nodes(r).await
+            })
+            .await
+        {
+            return Ok(resp);
         }
 
-        let req = request.into_inner();
         let nodes = self.cluster.get_nodes();
 
         let nodelist = req.nodelist.trim();
@@ -552,17 +604,18 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetNodeRequest>,
     ) -> Result<Response<NodeInfo>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.get_node(fwd).await;
-            }
+        let forward = self.read_should_forward(&request);
+        let req = request.into_inner();
+        if let Some(resp) = self
+            .forward_read_optional(forward, req.clone(), "get_node", |mut c, r| async move {
+                c.get_node(r).await
+            })
+            .await
+        {
+            return Ok(resp);
         }
 
-        let name = request.into_inner().name;
+        let name = req.name;
         let node = self
             .cluster
             .get_node(&name)
@@ -749,14 +802,17 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetPartitionsRequest>,
     ) -> Result<Response<GetPartitionsResponse>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.get_partitions(fwd).await;
-            }
+        let forward = self.read_should_forward(&request);
+        if let Some(resp) = self
+            .forward_read_optional(
+                forward,
+                request.into_inner(),
+                "get_partitions",
+                |mut c, r| async move { c.get_partitions(r).await },
+            )
+            .await
+        {
+            return Ok(resp);
         }
 
         let partitions = self.cluster.get_partitions();
@@ -787,14 +843,14 @@ impl SlurmController for ControllerService {
     }
 
     async fn get_job_metrics(&self, request: Request<()>) -> Result<Response<JobMetrics>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.get_job_metrics(fwd).await;
-            }
+        let forward = self.read_should_forward(&request);
+        if let Some(resp) = self
+            .forward_read_optional(forward, (), "get_job_metrics", |mut c, r| async move {
+                c.get_job_metrics(r).await
+            })
+            .await
+        {
+            return Ok(resp);
         }
 
         let snap = self.cluster.job_metrics();
@@ -807,14 +863,14 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<()>,
     ) -> Result<Response<NodeMetrics>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.get_node_metrics(fwd).await;
-            }
+        let forward = self.read_should_forward(&request);
+        if let Some(resp) = self
+            .forward_read_optional(forward, (), "get_node_metrics", |mut c, r| async move {
+                c.get_node_metrics(r).await
+            })
+            .await
+        {
+            return Ok(resp);
         }
 
         let snap = self.cluster.node_metrics();
@@ -1185,17 +1241,18 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetJobStepsRequest>,
     ) -> Result<Response<GetJobStepsResponse>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.get_job_steps(fwd).await;
-            }
+        let forward = self.read_should_forward(&request);
+        let req = request.into_inner();
+        if let Some(resp) = self
+            .forward_read_optional(forward, req, "get_job_steps", |mut c, r| async move {
+                c.get_job_steps(r).await
+            })
+            .await
+        {
+            return Ok(resp);
         }
 
-        let job_id = request.into_inner().job_id;
+        let job_id = req.job_id;
         let steps = self.cluster.get_steps(job_id);
         let step_infos: Vec<JobStepInfo> = steps
             .iter()
@@ -1401,14 +1458,17 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<ListReservationsRequest>,
     ) -> Result<Response<ListReservationsResponse>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.list_reservations(fwd).await;
-            }
+        let forward = self.read_should_forward(&request);
+        if let Some(resp) = self
+            .forward_read_optional(
+                forward,
+                request.into_inner(),
+                "list_reservations",
+                |mut c, r| async move { c.list_reservations(r).await },
+            )
+            .await
+        {
+            return Ok(resp);
         }
         let reservations = self.cluster.get_reservations();
         let now = Utc::now();
@@ -2503,6 +2563,84 @@ mod tests {
         let (namespace, sa) = resolve_user_namespace_sa(&cache, "alice").unwrap();
         assert_eq!(namespace, "spur-acct-physics");
         assert_eq!(sa, "spur-user-alice");
+    }
+
+    #[test]
+    fn read_forwards_only_when_follower_and_not_already_forwarded() {
+        // Leader serves reads locally; never forwards.
+        assert!(!read_forwarding_policy(true, false));
+        assert!(!read_forwarding_policy(true, true));
+        // Follower forwards a fresh read to the leader.
+        assert!(read_forwarding_policy(false, false));
+        // An already-forwarded read is served locally to avoid forward loops.
+        assert!(!read_forwarding_policy(false, true));
+    }
+
+    /// A non-leader that can't reach a leader must still answer reads
+    /// from local applied state, not fail with "no leader elected yet".
+    #[tokio::test]
+    async fn get_jobs_serves_locally_when_no_leader_elected() {
+        use crate::raft::StateMachineApply;
+        use crate::rpc_stats::RpcStatsCollector;
+        use crate::sched_stats::SchedStatsCollector;
+        use spur_core::job::JobSpec;
+        use spur_core::wal::WalOperation;
+
+        let config: spur_core::config::SlurmConfig =
+            serde_json::from_str(r#"{"cluster_name":"test"}"#).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster = Arc::new(crate::cluster::ClusterManager::new(config, dir.path()).unwrap());
+
+        // Mirrors a follower applying a committed entry, without a leader.
+        let spec = JobSpec {
+            name: "job-a".into(),
+            user: "alice".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+            cluster.as_ref(),
+            &WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(spec),
+            },
+        );
+
+        // Unreachable peers: no quorum, so this node never becomes leader.
+        let handle = crate::raft::start_raft(
+            1,
+            &["[::1]:0".into(), "[::1]:0".into(), "[::1]:0".into()],
+            dir.path(),
+            cluster.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!handle.is_leader());
+        assert_eq!(handle.current_leader(), None);
+
+        let raft = Arc::new(handle);
+        let client_addrs: BTreeMap<u64, String> = BTreeMap::new();
+        let service = ControllerService {
+            cluster: cluster.clone(),
+            raft: raft.clone(),
+            leader_proxy: LeaderProxy::new(raft.clone(), client_addrs.clone()),
+            client_addrs,
+            rpc_stats: Arc::new(RpcStatsCollector::new()),
+            sched_stats: Arc::new(SchedStatsCollector::new("sched/backfill")),
+        };
+
+        let resp = service
+            .get_jobs(Request::new(GetJobsRequest::default()))
+            .await;
+        let jobs = resp
+            .expect("get_jobs must serve local state, not fail with 'no leader elected yet'")
+            .into_inner()
+            .jobs;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_id, 1);
     }
 
     #[test]
