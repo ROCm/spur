@@ -1222,6 +1222,9 @@ impl SlurmController for ControllerService {
             )));
         }
 
+        let target_node =
+            select_step_node(&job.allocated_nodes, &req.node).map_err(Status::invalid_argument)?;
+
         let existing_steps = self.cluster.get_steps(job_id);
         let step_id = existing_steps
             .iter()
@@ -1247,10 +1250,9 @@ impl SlurmController for ControllerService {
             .create_step(step)
             .map_err(|e| Status::internal(format!("failed to create job step: {e}")))?;
 
-        let node_addr = job
-            .allocated_nodes
-            .first()
-            .and_then(|name| self.cluster.get_node(name))
+        let node_addr = self
+            .cluster
+            .get_node(target_node)
             .map(|n| {
                 let host = n.address.as_deref().unwrap_or(&n.name);
                 format!("{}:{}", host, n.port)
@@ -1825,6 +1827,23 @@ pub async fn serve(
     router.serve(addr).await?;
 
     Ok(())
+}
+
+/// Resolve the node an interactive step attaches to. Empty request = the first
+/// allocated node (legacy default); a named node must be one the job actually
+/// holds, otherwise the step would attach outside the allocation.
+fn select_step_node<'a>(allocated: &'a [String], requested: &str) -> Result<&'a str, String> {
+    if requested.is_empty() {
+        return allocated
+            .first()
+            .map(String::as_str)
+            .ok_or_else(|| "job has no allocated nodes".to_string());
+    }
+    allocated
+        .iter()
+        .find(|n| n.as_str() == requested)
+        .map(String::as_str)
+        .ok_or_else(|| format!("node {requested} is not allocated to this job"))
 }
 
 // ---- Proto conversion helpers ----
@@ -2438,6 +2457,32 @@ mod tests {
 
         let status = submit_rpc_status(SubmitError::internal("raft propose failed"));
         assert_eq!(status.code(), Code::Internal);
+    }
+
+    #[test]
+    fn select_step_node_empty_request_uses_first_allocated() {
+        let allocated = vec!["node001".to_string(), "node002".to_string()];
+        assert_eq!(select_step_node(&allocated, ""), Ok("node001"));
+    }
+
+    #[test]
+    fn select_step_node_named_request_targets_that_node() {
+        let allocated = vec!["node001".to_string(), "node002".to_string()];
+        assert_eq!(select_step_node(&allocated, "node002"), Ok("node002"));
+    }
+
+    #[test]
+    fn select_step_node_rejects_node_outside_allocation() {
+        let allocated = vec!["node001".to_string(), "node002".to_string()];
+        let err = select_step_node(&allocated, "node999").unwrap_err();
+        assert!(err.contains("node999"));
+        assert!(err.contains("not allocated"));
+    }
+
+    #[test]
+    fn select_step_node_empty_request_no_nodes_errors() {
+        let allocated: Vec<String> = Vec::new();
+        assert!(select_step_node(&allocated, "").is_err());
     }
 
     #[test]

@@ -1178,6 +1178,7 @@ message CreateJobStepRequest {
   bool overlap = 5;           // Share resources with existing step (--overlap)
   bool pty = 6;               // Allocate a PTY for the step
   WindowSize winsize = 7;     // Initial terminal dimensions
+  string node = 8;            // Target node (-w); empty = first allocated node
 }
 
 message CreateJobStepResponse {

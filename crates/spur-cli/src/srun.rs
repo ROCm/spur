@@ -212,7 +212,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         if !args.overlap {
             anyhow::bail!("--jobid requires --overlap");
         }
-        let exit_code = run_interactive_pty(&args.controller, job_id, args.command.clone()).await?;
+        let node = args.nodelist.clone().unwrap_or_default();
+        let exit_code =
+            run_interactive_pty(&args.controller, job_id, args.command.clone(), node).await?;
         std::process::exit(exit_code);
     }
 
@@ -673,6 +675,7 @@ async fn dispatch_step(
             overlap: false,
             pty: false,
             winsize: None,
+            node: String::new(),
         })
         .await
         .context("failed to create job step")?
@@ -801,7 +804,13 @@ async fn run_standalone_srun(args: &SrunArgs, hooks: &HooksConfig, work_dir: &st
     if args.pty {
         ctrl_c_handle.abort();
         eprintln!("srun: opening interactive session on {}", nodelist);
-        let result = run_interactive_pty(&args.controller, job_id, args.command.clone()).await;
+        let result = run_interactive_pty(
+            &args.controller,
+            job_id,
+            args.command.clone(),
+            String::new(),
+        )
+        .await;
         let _ = client
             .cancel_job(CancelJobRequest {
                 job_id,
@@ -1104,7 +1113,12 @@ fn warn_unsupported_cpu_bind(environment: &HashMap<String, String>) {
 ///
 /// Retries transient failures (job not yet visible on agent after controller
 /// reports it as Running) up to a few seconds before giving up.
-async fn run_interactive_pty(controller: &str, job_id: u32, command: Vec<String>) -> Result<i32> {
+async fn run_interactive_pty(
+    controller: &str,
+    job_id: u32,
+    command: Vec<String>,
+    node: String,
+) -> Result<i32> {
     let channel = spur_client::connect_channel(controller)
         .await
         .context("cannot connect to controller")?;
@@ -1132,6 +1146,7 @@ async fn run_interactive_pty(controller: &str, job_id: u32, command: Vec<String>
                     overlap: true,
                     pty: true,
                     winsize: Some(winsize),
+                    node: node.clone(),
                 })
                 .await
             {
