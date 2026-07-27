@@ -132,6 +132,34 @@ class TestSacctmgrShowQos:
         assert "cpu=32" in row
 
 
+class TestSacctmgrShowAccount:
+    """Verify sacctmgr show account honors format= field selection, the same
+    way show qos does."""
+
+    def test_default_output_shows_legacy_columns(self, accounting_cluster):
+        c = accounting_cluster
+        c.sacctmgr(["add", "account", "name=physics", "description=Physics",
+                     "organization=sciences", "grptres=cpu=16"])
+        time.sleep(15)
+        out = c.sacctmgr(["show", "account"])
+        header = next(line for line in out.splitlines() if line.strip())
+        for column in ("Account", "Descr", "Org", "Parent", "Share", "GrpTRES"):
+            assert column in header, f"missing column {column!r}: {header!r}"
+        assert "physics" in out
+
+    def test_format_selects_specific_fields(self, accounting_cluster):
+        c = accounting_cluster
+        c.sacctmgr(["add", "account", "name=fmtacct", "description=Formatted",
+                     "grptres=cpu=32"])
+        time.sleep(15)
+        out = c.sacctmgr(["show", "account", "format=Account,GrpTRES"])
+        assert "fmtacct" in out
+        assert "cpu=32" in out, f"GrpTRES missing: {out!r}"
+        header = next(line for line in out.splitlines() if line.strip())
+        assert "Descr" not in header, f"Descr should be absent: {header!r}"
+        assert "Org" not in header, f"Org should be absent: {header!r}"
+
+
 class TestQosLimitReasons:
     def test_wall_cap_sets_qos_pending_reason(self, accounting_cluster):
         c = accounting_cluster
