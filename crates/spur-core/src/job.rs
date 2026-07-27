@@ -486,6 +486,7 @@ pub struct JobSpec {
     pub open_mode: Option<String>,
 
     // Interactive PTY
+    #[serde(default)]
     pub pty: bool,
 }
 
@@ -1095,6 +1096,15 @@ mod tests {
     fn effective_memory_mb_defaults_to_zero_when_unset() {
         let spec = JobSpec::default();
         assert_eq!(effective_memory_mb(&spec, 1), 0);
+    }
+
+    // Pre-`pty` JobSpec must still deserialize, or spurctld crashes on replay.
+    #[test]
+    fn job_spec_deserializes_without_pty_field() {
+        let mut value = serde_json::to_value(JobSpec::default()).unwrap();
+        value.as_object_mut().unwrap().remove("pty");
+        let spec: JobSpec = serde_json::from_value(value).unwrap();
+        assert!(!spec.pty);
     }
 
     #[test]
