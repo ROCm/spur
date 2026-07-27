@@ -95,7 +95,7 @@ sha2 = "0.11"
 base64 = "0.23"
 rand = "0.10"
 subtle = "2"
-serial_test = "3"
+serial_test = "4"
 
 # Internal
 spur-update = { path = "crates/spur-update" }
