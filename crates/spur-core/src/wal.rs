@@ -340,21 +340,8 @@ mod reservation_wal_tests {
     }
 }
 
-// Backward-compatibility guard for the WAL log-entry surface. spurctld persists
-// every `WalOperation` as JSON and replays it on startup under strict recovery, so
-// a field added to any embedded type without `#[serde(default)]` (or `Option`)
-// makes old entries fail to deserialize and crashes the controller on upgrade.
-//
-// Each `FIXTURES` entry is a frozen JSON blob for one variant; collections hold at
-// least one element so serde descends into the element structs (an empty Vec/Map
-// would leave them unguarded). They must NOT be regenerated: a failure here means a
-// new field needs `#[serde(default)]`, not a fixture edit. `variant_tag` is an
-// exhaustive match (no `_` arm), so a new `WalOperation` variant breaks compilation
-// until an arm — and a matching frozen fixture — is added.
-//
-// Scope/limits: this guards only the added-non-defaulted-field case (serde ignores
-// unknown fields, so renames/removals are not caught here). The separate snapshot
-// blob (`ClusterSnapshot`, full `Job`/`Node`) is a distinct surface, not covered.
+// Frozen old WAL payloads: a new field without `#[serde(default)]` breaks replay and
+// crashes spurctld on upgrade. Do not regenerate — fix the field, not the fixture.
 #[cfg(test)]
 mod backcompat_fixtures {
     use super::*;
@@ -485,7 +472,7 @@ mod backcompat_fixtures {
     fn every_frozen_fixture_still_deserializes() {
         for (tag, json) in FIXTURES {
             let op: WalOperation = serde_json::from_str(json).unwrap_or_else(|e| {
-                panic!("frozen {tag} WAL entry no longer deserializes ({e}); a new field needs #[serde(default)], or a variant/field was renamed or removed — none of which old Raft logs can survive")
+                panic!("frozen {tag} no longer deserializes ({e}); new field needs #[serde(default)], or a rename/removal broke replay")
             });
             assert_eq!(
                 variant_tag(&op),
@@ -495,9 +482,7 @@ mod backcompat_fixtures {
         }
     }
 
-    // Fails if a variant is missing from FIXTURES. Combined with the exhaustive
-    // `variant_tag` match (which breaks the build on a new variant), this makes a
-    // new WalOperation variant impossible to ship without a frozen fixture.
+    // New variant → exhaustive `variant_tag` won't compile; this catches a missing fixture.
     #[test]
     fn every_variant_has_a_fixture() {
         let covered: std::collections::HashSet<&str> =
@@ -512,8 +497,7 @@ mod backcompat_fixtures {
         }
     }
 
-    // One constructed instance per variant, used only to enumerate the variant set
-    // at runtime. Add a variant here when you add one to `WalOperation`.
+    // One instance per variant. Add here when you add a `WalOperation` variant.
     fn all_variants() -> Vec<WalOperation> {
         use crate::job::JobSpec;
         use crate::reservation::Reservation;
@@ -525,8 +509,7 @@ mod backcompat_fixtures {
         let dt = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        // Non-empty so serde actually descends into the element structs — an empty
-        // Vec/Map would leave GpuResource/AllocatedDevice untraversed and unguarded.
+        // Non-empty so serde descends into the element structs.
         let resource_set = ResourceSet {
             cpus: 0,
             memory_mb: 0,
