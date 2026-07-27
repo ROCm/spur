@@ -67,12 +67,13 @@ pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()
         cmd.env(k, v);
     }
     cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-    let child = spawn_hook_in_work_dir(&mut cmd, &ctx.work_dir).with_context(|| {
-        format!(
-            "{} script failed to execute: {}",
-            ctx.script_context, script_path
-        )
-    })?;
+    let child = spawn_hook_in_work_dir(&mut cmd, &ctx.work_dir, ctx.job_id, &ctx.script_context)
+        .with_context(|| {
+            format!(
+                "{} script failed to execute: {}",
+                ctx.script_context, script_path
+            )
+        })?;
 
     let output = child
         .wait_with_output()
@@ -108,8 +109,10 @@ pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()
 fn spawn_hook_in_work_dir(
     cmd: &mut Command,
     work_dir: &str,
+    job_id: JobId,
+    script_context: &str,
 ) -> std::io::Result<tokio::process::Child> {
-    if work_dir.is_empty() || work_dir == "/tmp" {
+    if work_dir.is_empty() {
         return cmd.current_dir("/tmp").spawn();
     }
     let first_err = match cmd.current_dir(work_dir).spawn() {
@@ -117,7 +120,13 @@ fn spawn_hook_in_work_dir(
         Err(e) => e,
     };
     let child = cmd.current_dir("/tmp").spawn()?;
-    warn!(work_dir, error = %first_err, "hook could not start in work_dir, ran from /tmp instead");
+    warn!(
+        job_id,
+        hook = %script_context,
+        work_dir,
+        error = %first_err,
+        "hook could not start in work_dir, ran from /tmp instead"
+    );
     Ok(child)
 }
 
