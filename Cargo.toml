@@ -66,7 +66,7 @@ schemars = "1"
 nix = { version = "0.31", features = ["process", "signal", "fs", "user", "sched", "mount", "socket", "term"] }
 
 # Auth
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 
 # Logging
 tracing = "0.1"
