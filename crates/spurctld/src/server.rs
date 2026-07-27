@@ -2486,6 +2486,12 @@ mod tests {
     }
 
     #[test]
+    fn select_step_node_rejects_comma_joined_request() {
+        let allocated = vec!["node001".to_string(), "node002".to_string()];
+        assert!(select_step_node(&allocated, "node001,node002").is_err());
+    }
+
+    #[test]
     fn job_to_proto_output_path_prefers_actual_else_absolute_computed() {
         use spur_core::job::{Job, JobSpec};
 

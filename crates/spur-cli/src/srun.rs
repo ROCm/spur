@@ -212,7 +212,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         if !args.overlap {
             anyhow::bail!("--jobid requires --overlap");
         }
-        let node = args.nodelist.clone().unwrap_or_default();
+        let node = first_node(args.nodelist.as_deref().unwrap_or_default());
         let exit_code =
             run_interactive_pty(&args.controller, job_id, args.command.clone(), node).await?;
         std::process::exit(exit_code);
@@ -904,6 +904,19 @@ fn build_command_script(command: &[String]) -> Result<String> {
     Ok(format!("#!/bin/bash\n{cmd_line}\n"))
 }
 
+/// First node of a `-w` value. Interactive `--pty` attaches to a single node,
+/// so a comma list reduces to its head; an empty value stays empty (controller
+/// then defaults to the first allocated node). Hostlist brackets are not
+/// expanded here — the controller rejects an unmatched name with a clear error.
+fn first_node(nodelist: &str) -> String {
+    nodelist
+        .split(',')
+        .next()
+        .unwrap_or(nodelist)
+        .trim()
+        .to_string()
+}
+
 async fn try_stream_output(
     controller: &mut SlurmControllerClient<tonic::transport::Channel>,
     nodelist: &str,
@@ -1292,6 +1305,26 @@ fn srun_hook_context(script_context: &str, work_dir: &str) -> spur_core::hooks::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_node_reduces_comma_list_to_head() {
+        assert_eq!(first_node("node001,node002"), "node001");
+    }
+
+    #[test]
+    fn first_node_bare_name_passes_through() {
+        assert_eq!(first_node("node007"), "node007");
+    }
+
+    #[test]
+    fn first_node_trims_whitespace() {
+        assert_eq!(first_node(" node003 , node004"), "node003");
+    }
+
+    #[test]
+    fn first_node_empty_stays_empty() {
+        assert_eq!(first_node(""), "");
+    }
 
     #[test]
     fn parses_nodelist_and_exclude_short() {
