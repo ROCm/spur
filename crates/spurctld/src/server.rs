@@ -1534,8 +1534,8 @@ impl SlurmController for ControllerService {
         let step_id = req.step_id;
         let label = req.label;
         let job_mpi = job.spec.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
-        let mpi = spur_core::mpi::resolve_step_mpi(req.mpi.as_str(), job_mpi);
-        spur_core::mpi::validate_pmix_step_agents(mpi, plan.len())
+        let mpi = spur_core::mpi::resolve_step_mpi(req.mpi.as_str(), job_mpi).to_string();
+        spur_core::mpi::validate_pmix_step_agents(mpi.as_str(), plan.len())
             .map_err(Status::invalid_argument)?;
         let pmix_tmpdir = self.cluster.config.mpi.pmix_tmpdir.clone();
 
@@ -1585,8 +1585,9 @@ impl SlurmController for ControllerService {
             let work_dir = work_dir.clone();
             let environment = environment.clone();
             let pmix_tmpdir = pmix_tmpdir.clone();
+            let step_mpi = mpi.clone();
             let pmix_plan = spur_core::mpi::maybe_local_pmix_plan(
-                mpi,
+                step_mpi.as_str(),
                 job_id,
                 step_num_tasks,
                 node_tasks.task_offset,
@@ -1617,6 +1618,7 @@ impl SlurmController for ControllerService {
                         step_num_tasks,
                         label,
                         pmix_plan,
+                        mpi: step_mpi,
                     })
                     .await
                     .map_err(|e| {

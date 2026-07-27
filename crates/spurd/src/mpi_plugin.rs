@@ -60,13 +60,35 @@ struct PluginApi {
     env: EnvFn,
 }
 
+pub(crate) struct ActiveNamespace {
+    pub(crate) namespace: String,
+    pub(crate) refs: u32,
+}
+
+struct NamespaceReservation<'a> {
+    host: &'a MpiPluginHost,
+    job_id: u32,
+    keep: bool,
+}
+
+impl Drop for NamespaceReservation<'_> {
+    fn drop(&mut self) {
+        if self.keep {
+            return;
+        }
+        if let Ok(mut guard) = self.host.active_namespaces.lock() {
+            guard.remove(&self.job_id);
+        }
+    }
+}
+
 pub struct MpiPluginHost {
     config: MpiConfig,
     plugin: Mutex<Option<PluginApi>>,
-    active_namespaces: Mutex<HashMap<u32, String>>,
+    pub(crate) active_namespaces: Mutex<HashMap<u32, ActiveNamespace>>,
 }
 
-/// Rolls back PMIx server registration when launch fails before the job is committed.
+/// Rolls back a PMIx namespace reference when launch fails before the job is committed.
 pub struct PmixLaunchGuard {
     host: Arc<MpiPluginHost>,
     job_id: u32,
@@ -93,8 +115,8 @@ impl Drop for PmixLaunchGuard {
         if !self.rollback {
             return;
         }
-        if let Err(err) = self.host.stop_pmix_server(self.job_id) {
-            warn!(job_id = self.job_id, error = %err, "PMIx rollback stop failed");
+        if let Err(err) = self.host.release_pmix_server(self.job_id) {
+            warn!(job_id = self.job_id, error = %err, "PMIx rollback release failed");
         }
     }
 }
@@ -112,11 +134,12 @@ impl MpiPluginHost {
         self.config.resolve_pmix_plugin_path()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn has_active_pmix(&self, job_id: u32) -> bool {
-        self.active_namespaces
-            .lock()
-            .ok()
-            .is_some_and(|guard| guard.contains_key(&job_id))
+        match self.active_namespaces.lock() {
+            Ok(guard) => guard.contains_key(&job_id),
+            Err(_) => true,
+        }
     }
 
     fn load_plugin(&self) -> Result<(), String> {
@@ -197,15 +220,8 @@ impl MpiPluginHost {
         Ok(())
     }
 
-    pub fn start_pmix_server(&self, plan: &PmixLaunchPlan) -> Result<(), String> {
-        if plan.local_procs.len() > 256 {
-            return Err(format!(
-                "PMIx launch plan has {} local procs (max 256)",
-                plan.local_procs.len()
-            ));
-        }
-        self.load_plugin()?;
-        let c_plan = plan_to_c(plan);
+    fn call_server_start(&self, plan: &PmixLaunchPlan) -> Result<(), String> {
+        let c_plan = plan_to_c(plan)?;
         let mut errbuf = vec![0i8; 512];
         let rc = {
             let guard = self
@@ -218,7 +234,99 @@ impl MpiPluginHost {
             unsafe { (api.server_start)(&c_plan, errbuf.as_mut_ptr(), errbuf.len()) }
         };
         if rc != 0 {
+            return Err(c_str_to_string(&errbuf));
+        }
+        Ok(())
+    }
+
+    fn call_server_stop(&self, job_id: u32, namespace: &str) -> Result<(), String> {
+        let c_namespace =
+            CString::new(namespace).map_err(|_| "invalid PMIx namespace".to_string())?;
+        let guard = self
+            .plugin
+            .lock()
+            .map_err(|_| "plugin lock poisoned".to_string())?;
+        let Some(api) = guard.as_ref() else {
+            warn!(
+                job_id,
+                namespace, "PMIx plugin not loaded during stop; skipping C server_stop"
+            );
+            return Ok(());
+        };
+        let mut errbuf = vec![0i8; 256];
+        let rc =
+            unsafe { (api.server_stop)(c_namespace.as_ptr(), errbuf.as_mut_ptr(), errbuf.len()) };
+        if rc != 0 {
             let err = c_str_to_string(&errbuf);
+            warn!(job_id, namespace, error = %err, "PMIx server stop failed");
+            return Err(err);
+        }
+        info!(job_id, namespace, "PMIx server stopped");
+        Ok(())
+    }
+
+    fn decrement_ref(&self, job_id: u32) {
+        if let Ok(mut guard) = self.active_namespaces.lock() {
+            if let Some(entry) = guard.get_mut(&job_id) {
+                entry.refs = entry.refs.saturating_sub(1);
+                if entry.refs == 0 {
+                    guard.remove(&job_id);
+                }
+            }
+        }
+    }
+
+    /// Acquire a reference to the PMIx namespace for `job_id`, registering with the plugin when
+    /// needed. Returns `Ok(true)` on first registration, `Ok(false)` when joining an active
+    /// namespace (refcount incremented). Always calls into the plugin so C can validate the plan.
+    pub fn start_pmix_server(&self, plan: &PmixLaunchPlan) -> Result<bool, String> {
+        mpi::validate_pmix_plan(plan)?;
+
+        let joined = {
+            let mut namespaces = self
+                .active_namespaces
+                .lock()
+                .map_err(|_| "namespace lock poisoned".to_string())?;
+            if let Some(entry) = namespaces.get_mut(&plan.job_id) {
+                if entry.namespace != plan.namespace {
+                    return Err(format!(
+                        "PMIx namespace mismatch for job {} (active {}, requested {})",
+                        plan.job_id, entry.namespace, plan.namespace
+                    ));
+                }
+                entry.refs = entry.refs.saturating_add(1);
+                true
+            } else {
+                namespaces.insert(
+                    plan.job_id,
+                    ActiveNamespace {
+                        namespace: plan.namespace.clone(),
+                        refs: 1,
+                    },
+                );
+                false
+            }
+        };
+
+        let mut reservation = if joined {
+            None
+        } else {
+            Some(NamespaceReservation {
+                host: self,
+                job_id: plan.job_id,
+                keep: false,
+            })
+        };
+
+        let start_result = (|| {
+            self.load_plugin()?;
+            self.call_server_start(plan)
+        })();
+
+        if let Err(err) = start_result {
+            if joined {
+                self.decrement_ref(plan.job_id);
+            }
             warn!(
                 job_id = plan.job_id,
                 namespace = %plan.namespace,
@@ -227,61 +335,77 @@ impl MpiPluginHost {
             );
             return Err(err);
         }
-        self.active_namespaces
-            .lock()
-            .map_err(|_| "namespace lock poisoned".to_string())?
-            .insert(plan.job_id, plan.namespace.clone());
-        info!(
-            job_id = plan.job_id,
-            namespace = %plan.namespace,
-            universe_size = plan.universe_size,
-            local_procs = plan.local_procs.len(),
-            "PMIx server started"
-        );
-        Ok(())
+
+        if let Some(ref mut reservation) = reservation {
+            reservation.keep = true;
+        }
+
+        if joined {
+            debug!(
+                job_id = plan.job_id,
+                namespace = %plan.namespace,
+                "PMIx namespace reference acquired"
+            );
+        } else {
+            info!(
+                job_id = plan.job_id,
+                namespace = %plan.namespace,
+                universe_size = plan.universe_size,
+                local_procs = plan.local_procs.len(),
+                "PMIx server started"
+            );
+        }
+        Ok(!joined)
     }
 
-    pub fn stop_pmix_server(&self, job_id: u32) -> Result<(), String> {
-        let namespace = self
-            .active_namespaces
-            .lock()
-            .map_err(|_| "namespace lock poisoned".to_string())?
-            .get(&job_id)
-            .cloned();
-        let Some(namespace) = namespace else {
-            return Ok(());
-        };
-        if self
-            .plugin
-            .lock()
-            .map_err(|_| "plugin lock poisoned".to_string())?
-            .is_none()
-        {
-            return Ok(());
-        }
-        let c_namespace =
-            CString::new(namespace.clone()).map_err(|_| "invalid PMIx namespace".to_string())?;
-        let mut errbuf = vec![0i8; 256];
-        let rc = {
-            let guard = self
-                .plugin
+    /// Release one reference to a PMIx namespace; stops the C server when the last ref drops.
+    pub fn release_pmix_server(&self, job_id: u32) -> Result<(), String> {
+        let namespace = {
+            let mut guard = self
+                .active_namespaces
                 .lock()
-                .map_err(|_| "plugin lock poisoned".to_string())?;
-            let api = guard
-                .as_ref()
-                .ok_or_else(|| "MPI plugin not loaded".to_string())?;
-            unsafe { (api.server_stop)(c_namespace.as_ptr(), errbuf.as_mut_ptr(), errbuf.len()) }
+                .map_err(|_| "namespace lock poisoned".to_string())?;
+            let Some(entry) = guard.get_mut(&job_id) else {
+                return Ok(());
+            };
+            entry.refs = entry.refs.saturating_sub(1);
+            if entry.refs > 0 {
+                return Ok(());
+            }
+            entry.namespace.clone()
         };
-        if rc != 0 {
-            let err = c_str_to_string(&errbuf);
-            warn!(job_id, namespace = %namespace, error = %err, "PMIx server stop failed");
+        if let Err(err) = self.call_server_stop(job_id, &namespace) {
+            if let Ok(mut guard) = self.active_namespaces.lock() {
+                if let Some(entry) = guard.get_mut(&job_id) {
+                    entry.refs = entry.refs.saturating_add(1);
+                }
+            }
             return Err(err);
         }
         self.active_namespaces
             .lock()
             .map_err(|_| "namespace lock poisoned".to_string())?
             .remove(&job_id);
-        info!(job_id, namespace = %namespace, "PMIx server stopped");
+        Ok(())
+    }
+
+    /// Force-stop a PMIx namespace regardless of refcount (cancel / reclaim teardown).
+    pub fn stop_pmix_server(&self, job_id: u32) -> Result<(), String> {
+        let namespace = {
+            let guard = self
+                .active_namespaces
+                .lock()
+                .map_err(|_| "namespace lock poisoned".to_string())?;
+            guard.get(&job_id).map(|entry| entry.namespace.clone())
+        };
+        let Some(namespace) = namespace else {
+            return Ok(());
+        };
+        self.call_server_stop(job_id, &namespace)?;
+        self.active_namespaces
+            .lock()
+            .map_err(|_| "namespace lock poisoned".to_string())?
+            .remove(&job_id);
         Ok(())
     }
 
@@ -290,29 +414,28 @@ impl MpiPluginHost {
         plan: &PmixLaunchPlan,
         rank: u32,
     ) -> Result<HashMap<String, String>, String> {
+        mpi::validate_pmix_plan(plan)?;
         self.load_plugin()?;
-        let c_plan = plan_to_c(plan);
+        let c_plan = plan_to_c(plan)?;
         let mut out = HashMap::new();
+        let guard = self
+            .plugin
+            .lock()
+            .map_err(|_| "plugin lock poisoned".to_string())?;
+        let api = guard
+            .as_ref()
+            .ok_or_else(|| "MPI plugin not loaded".to_string())?;
         for key in PMIX_ENV_KEYS {
             let c_key = CString::new(*key).map_err(|_| format!("invalid env key {key}"))?;
             let mut valbuf = vec![0i8; 4096];
-            let rc = {
-                let guard = self
-                    .plugin
-                    .lock()
-                    .map_err(|_| "plugin lock poisoned".to_string())?;
-                let api = guard
-                    .as_ref()
-                    .ok_or_else(|| "MPI plugin not loaded".to_string())?;
-                unsafe {
-                    (api.env)(
-                        &c_plan,
-                        rank,
-                        c_key.as_ptr(),
-                        valbuf.as_mut_ptr(),
-                        valbuf.len(),
-                    )
-                }
+            let rc = unsafe {
+                (api.env)(
+                    &c_plan,
+                    rank,
+                    c_key.as_ptr(),
+                    valbuf.as_mut_ptr(),
+                    valbuf.len(),
+                )
             };
             if rc == 0 {
                 let value = c_str_to_string(&valbuf);
@@ -338,38 +461,44 @@ fn validate_pmix_env(env: &HashMap<String, String>) -> Result<(), String> {
     Ok(())
 }
 
-fn plan_to_c(plan: &PmixLaunchPlan) -> SpurMpiLaunchPlan {
+fn plan_to_c(plan: &PmixLaunchPlan) -> Result<SpurMpiLaunchPlan, String> {
     let mut c_plan = SpurMpiLaunchPlan {
         job_id: plan.job_id,
         namespace: [0; 256],
         universe_size: plan.universe_size,
         task_offset: plan.task_offset,
-        num_local_procs: plan.local_procs.len().min(256) as c_uint,
+        num_local_procs: plan.local_procs.len() as c_uint,
         local_procs: [SpurMpiProc {
             rank: 0,
             local_rank: 0,
         }; 256],
         tmpdir: [0; 512],
     };
-    write_c_str(&mut c_plan.namespace, &plan.namespace);
-    write_c_str(&mut c_plan.tmpdir, &plan.tmpdir);
-    for (idx, proc) in plan.local_procs.iter().take(256).enumerate() {
+    write_c_str(&mut c_plan.namespace, &plan.namespace)?;
+    write_c_str(&mut c_plan.tmpdir, &plan.tmpdir)?;
+    for (idx, proc) in plan.local_procs.iter().enumerate() {
         c_plan.local_procs[idx] = SpurMpiProc {
             rank: proc.rank,
             local_rank: proc.local_rank,
         };
     }
-    c_plan
+    Ok(c_plan)
 }
 
-fn write_c_str(dest: &mut [c_char], value: &str) {
+fn write_c_str(dest: &mut [c_char], value: &str) -> Result<(), String> {
+    if dest.is_empty() {
+        return Ok(());
+    }
     let bytes = value.as_bytes();
     let limit = dest.len().saturating_sub(1);
-    let copy_len = bytes.len().min(limit);
-    for (idx, byte) in bytes.iter().take(copy_len).enumerate() {
+    if bytes.len() > limit {
+        return Err(format!("string exceeds max length {limit}"));
+    }
+    for (idx, byte) in bytes.iter().enumerate() {
         dest[idx] = *byte as c_char;
     }
-    dest[copy_len] = 0;
+    dest[bytes.len()] = 0;
+    Ok(())
 }
 
 fn c_str_to_string(buf: &[c_char]) -> String {
@@ -378,8 +507,10 @@ fn c_str_to_string(buf: &[c_char]) -> String {
         .into_owned()
 }
 
-pub fn plan_from_proto(proto: &spur_proto::proto::PmixLaunchPlan) -> PmixLaunchPlan {
-    PmixLaunchPlan {
+pub fn plan_from_proto(
+    proto: &spur_proto::proto::PmixLaunchPlan,
+) -> Result<PmixLaunchPlan, String> {
+    let plan = PmixLaunchPlan {
         job_id: proto.job_id,
         namespace: if proto.namespace.is_empty() {
             PmixLaunchPlan::namespace_for_job(proto.job_id)
@@ -397,7 +528,9 @@ pub fn plan_from_proto(proto: &spur_proto::proto::PmixLaunchPlan) -> PmixLaunchP
             })
             .collect(),
         tmpdir: proto.tmpdir.clone(),
-    }
+    };
+    mpi::validate_pmix_plan(&plan)?;
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -448,6 +581,70 @@ mod tests {
     }
 
     #[test]
+    fn start_join_rejects_namespace_mismatch() {
+        let host = MpiPluginHost::new(MpiConfig::default());
+        host.active_namespaces.lock().unwrap().insert(
+            6,
+            ActiveNamespace {
+                namespace: "spur.6".into(),
+                refs: 1,
+            },
+        );
+        let plan = PmixLaunchPlan {
+            job_id: 6,
+            namespace: "other.6".into(),
+            universe_size: 1,
+            task_offset: 0,
+            local_procs: vec![mpi::PmixLocalProc {
+                rank: 0,
+                local_rank: 0,
+            }],
+            tmpdir: "/tmp/pmix".into(),
+        };
+        let err = host.start_pmix_server(&plan).unwrap_err();
+        assert!(err.contains("namespace mismatch"));
+        assert_eq!(
+            host.active_namespaces.lock().unwrap().get(&6).unwrap().refs,
+            1
+        );
+    }
+
+    #[test]
+    fn start_join_rolls_back_ref_on_plugin_failure() {
+        let host = MpiPluginHost::new(MpiConfig {
+            plugin_dir: "/nonexistent/spur/plugins".into(),
+            ..MpiConfig::default()
+        });
+        host.active_namespaces.lock().unwrap().insert(
+            5,
+            ActiveNamespace {
+                namespace: "spur.5".into(),
+                refs: 1,
+            },
+        );
+        let plan = PmixLaunchPlan::local_tasks(5, 1, 0, 1, "/tmp/pmix");
+        assert!(host.start_pmix_server(&plan).is_err());
+        assert_eq!(
+            host.active_namespaces.lock().unwrap().get(&5).unwrap().refs,
+            1,
+            "failed join must not leak a reference"
+        );
+    }
+
+    #[test]
+    fn write_c_str_rejects_overlong_value() {
+        let mut dest = [0i8; 8];
+        assert!(write_c_str(&mut dest, "1234567").is_ok());
+        assert!(write_c_str(&mut dest, "12345678").is_err());
+    }
+
+    #[test]
+    fn write_c_str_noop_on_empty_dest() {
+        let mut dest: [c_char; 0] = [];
+        write_c_str(&mut dest, "hello").unwrap();
+    }
+
+    #[test]
     fn pmix_launch_guard_start_failure_leaves_no_active_namespace() {
         let host = Arc::new(MpiPluginHost::new(MpiConfig {
             plugin_dir: "/nonexistent/spur/plugins".into(),
@@ -456,6 +653,72 @@ mod tests {
         let plan = PmixLaunchPlan::local_tasks(9, 1, 0, 1, "/tmp/pmix");
         assert!(PmixLaunchGuard::start(host.clone(), &plan).is_err());
         assert!(!host.has_active_pmix(plan.job_id));
+    }
+
+    #[test]
+    fn release_keeps_namespace_until_last_ref() {
+        let host = MpiPluginHost::new(MpiConfig::default());
+        host.active_namespaces.lock().unwrap().insert(
+            3,
+            ActiveNamespace {
+                namespace: "spur.3".into(),
+                refs: 2,
+            },
+        );
+        host.release_pmix_server(3).unwrap();
+        assert!(host.has_active_pmix(3));
+        host.release_pmix_server(3).unwrap();
+        assert!(!host.has_active_pmix(3));
+    }
+
+    #[test]
+    fn stop_pmix_server_clears_entry_even_when_plugin_unloaded() {
+        let host = MpiPluginHost::new(MpiConfig::default());
+        host.active_namespaces.lock().unwrap().insert(
+            4,
+            ActiveNamespace {
+                namespace: "spur.4".into(),
+                refs: 2,
+            },
+        );
+        host.stop_pmix_server(4).unwrap();
+        assert!(!host.has_active_pmix(4));
+    }
+
+    #[test]
+    fn release_restores_ref_when_stop_fails() {
+        let host = MpiPluginHost::new(MpiConfig::default());
+        host.active_namespaces.lock().unwrap().insert(
+            5,
+            ActiveNamespace {
+                namespace: "bad\0namespace".into(),
+                refs: 1,
+            },
+        );
+        assert!(host.release_pmix_server(5).is_err());
+        assert!(host.has_active_pmix(5));
+        assert_eq!(
+            host.active_namespaces.lock().unwrap().get(&5).unwrap().refs,
+            1
+        );
+    }
+
+    #[test]
+    fn stop_pmix_server_keeps_entry_when_stop_fails() {
+        let host = MpiPluginHost::new(MpiConfig::default());
+        host.active_namespaces.lock().unwrap().insert(
+            6,
+            ActiveNamespace {
+                namespace: "bad\0namespace".into(),
+                refs: 2,
+            },
+        );
+        assert!(host.stop_pmix_server(6).is_err());
+        assert!(host.has_active_pmix(6));
+        assert_eq!(
+            host.active_namespaces.lock().unwrap().get(&6).unwrap().refs,
+            2
+        );
     }
 
     #[test]

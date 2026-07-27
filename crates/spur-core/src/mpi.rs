@@ -55,6 +55,62 @@ impl PmixLaunchPlan {
 pub const MPI_NONE: &str = "none";
 pub const MPI_PMIX: &str = "pmix";
 
+/// Max bytes for PMIx namespace strings passed to the C plugin (NUL excluded).
+pub const PMIX_NAMESPACE_MAX: usize = 255;
+/// Max bytes for PMIx tmpdir strings passed to the C plugin (NUL excluded).
+pub const PMIX_TMPDIR_MAX: usize = 511;
+
+/// Validate a PMIx launch plan before calling the agent plugin.
+pub fn validate_pmix_plan(plan: &PmixLaunchPlan) -> Result<(), String> {
+    if plan.namespace.is_empty() {
+        return Err("PMIx namespace must not be empty".into());
+    }
+    if plan.namespace.len() > PMIX_NAMESPACE_MAX {
+        return Err(format!("PMIx namespace exceeds {PMIX_NAMESPACE_MAX} bytes"));
+    }
+    if plan.tmpdir.is_empty() {
+        return Err("PMIx tmpdir must not be empty".into());
+    }
+    if plan.tmpdir.len() > PMIX_TMPDIR_MAX {
+        return Err(format!("PMIx tmpdir exceeds {PMIX_TMPDIR_MAX} bytes"));
+    }
+    if plan.universe_size == 0 {
+        return Err("PMIx universe_size must be > 0".into());
+    }
+    if plan.local_procs.is_empty() {
+        return Err("PMIx launch plan has no local procs".into());
+    }
+    if plan.local_procs.len() > 256 {
+        return Err(format!(
+            "PMIx launch plan has {} local procs (max 256)",
+            plan.local_procs.len()
+        ));
+    }
+    for (idx, proc) in plan.local_procs.iter().enumerate() {
+        let expected_local = idx as u32;
+        if proc.local_rank != expected_local {
+            return Err(format!(
+                "PMIx local proc {idx} has local_rank {} (expected {expected_local})",
+                proc.local_rank
+            ));
+        }
+        if proc.rank != plan.task_offset + proc.local_rank {
+            return Err(format!(
+                "PMIx local proc {idx} rank {} != task_offset + local_rank",
+                proc.rank
+            ));
+        }
+    }
+    let local_count = plan.local_procs.len() as u32;
+    if plan.task_offset.saturating_add(local_count) > plan.universe_size {
+        return Err(format!(
+            "PMIx local procs exceed universe_size (task_offset {} + {} local > {})",
+            plan.task_offset, local_count, plan.universe_size
+        ));
+    }
+    Ok(())
+}
+
 pub fn maybe_local_pmix_plan(
     mpi: &str,
     job_id: u32,
@@ -222,5 +278,56 @@ mod tests {
         assert!(version_at_least("4.1.0", "4.1.0"));
         assert!(!version_at_least("4.0.9", "4.1.0"));
         assert!(version_at_least("4.10.0", "4.9.0"));
+    }
+
+    #[test]
+    fn validate_pmix_plan_rejects_empty_tmpdir() {
+        let mut plan = PmixLaunchPlan::local_tasks(1, 1, 0, 1, "/tmp/pmix");
+        plan.tmpdir.clear();
+        assert!(validate_pmix_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn validate_pmix_plan_rejects_inconsistent_ranks() {
+        let plan = PmixLaunchPlan {
+            job_id: 1,
+            namespace: "spur.1".into(),
+            universe_size: 2,
+            task_offset: 0,
+            local_procs: vec![
+                PmixLocalProc {
+                    rank: 0,
+                    local_rank: 0,
+                },
+                PmixLocalProc {
+                    rank: 2,
+                    local_rank: 1,
+                },
+            ],
+            tmpdir: "/tmp/pmix".into(),
+        };
+        assert!(validate_pmix_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn validate_pmix_plan_rejects_local_procs_beyond_universe_size() {
+        let plan = PmixLaunchPlan {
+            job_id: 1,
+            namespace: "spur.1".into(),
+            universe_size: 2,
+            task_offset: 1,
+            local_procs: vec![
+                PmixLocalProc {
+                    rank: 1,
+                    local_rank: 0,
+                },
+                PmixLocalProc {
+                    rank: 2,
+                    local_rank: 1,
+                },
+            ],
+            tmpdir: "/tmp/pmix".into(),
+        };
+        assert!(validate_pmix_plan(&plan).is_err());
     }
 }
