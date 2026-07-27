@@ -315,6 +315,15 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                     "   NumNodes={} NumTasks={} CPUs/Task={}",
                     job.num_nodes, job.num_tasks, job.cpus_per_task
                 );
+                if job.req_gpus > 0 || !job.req_gpus_detail.is_empty() {
+                    let detail = if job.req_gpus_detail.is_empty() {
+                        format!("gpu:{}", job.req_gpus)
+                    } else {
+                        job.req_gpus_detail.clone()
+                    };
+                    let label = gpu_tres_label(&detail);
+                    println!("   {}={} ReqGPUs={}", label, detail, job.req_gpus);
+                }
                 if !job.nodelist.is_empty() {
                     println!("   NodeList={}", job.nodelist);
                 }
@@ -766,4 +775,37 @@ async fn delete_reservation(controller: &str, name: &str) -> Result<()> {
 
     println!("Reservation {} deleted", name);
     Ok(())
+}
+
+fn gpu_tres_label(detail: &str) -> &'static str {
+    if detail.ends_with("/node") {
+        "TresPerNode"
+    } else if detail.ends_with("/task") {
+        "TresPerTask"
+    } else {
+        "TresPerJob"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_tres_label_per_node() {
+        assert_eq!(gpu_tres_label("gpu:4/node"), "TresPerNode");
+        assert_eq!(gpu_tres_label("gpu:mi300x:2/node"), "TresPerNode");
+    }
+
+    #[test]
+    fn gpu_tres_label_per_task() {
+        assert_eq!(gpu_tres_label("gpu:2/task"), "TresPerTask");
+        assert_eq!(gpu_tres_label("gpu:h100:1/task"), "TresPerTask");
+    }
+
+    #[test]
+    fn gpu_tres_label_total() {
+        assert_eq!(gpu_tres_label("gpu:8"), "TresPerJob");
+        assert_eq!(gpu_tres_label("gpu:mi300x:4"), "TresPerJob");
+    }
 }

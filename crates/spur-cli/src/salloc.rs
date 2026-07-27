@@ -50,9 +50,17 @@ pub struct SallocArgs {
     #[arg(long, value_delimiter = ',', overrides_with = "gres")]
     pub gres: Vec<String>,
 
-    /// GPUs
+    /// GPUs total across the job (e.g., "4" or "mi300x:4")
     #[arg(short = 'G', long)]
     pub gpus: Option<String>,
+
+    /// GPUs per node
+    #[arg(long)]
+    pub gpus_per_node: Option<String>,
+
+    /// GPUs per task
+    #[arg(long)]
+    pub gpus_per_task: Option<String>,
 
     /// Required node features (e.g., "mi300x,nvlink")
     #[arg(short = 'C', long)]
@@ -106,10 +114,16 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
 
     let name = args.job_name.unwrap_or_else(|| "interactive".into());
-    let mut gres = args.gres;
-    if let Some(gpus) = &args.gpus {
-        gres.push(format!("gpu:{}", gpus));
-    }
+    let gres = args.gres;
+    let gpus = crate::sbatch::parse_gpu_flag(args.gpus.as_deref())?;
+    let gpus_per_node = crate::sbatch::parse_gpu_flag(args.gpus_per_node.as_deref())?;
+    let gpus_per_task = crate::sbatch::parse_gpu_flag(args.gpus_per_task.as_deref())?;
+    crate::sbatch::validate_gpu_flags(
+        gpus.is_some(),
+        gpus_per_node.is_some(),
+        gpus_per_task.is_some(),
+        &gres,
+    )?;
 
     let time_limit =
         spur_core::config::parse_time_minutes(&args.time).map(|mins| prost_types::Duration {
@@ -153,6 +167,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         cpus_per_task,
         memory_per_node_mb: memory_mb,
         gres,
+        gpus,
+        gpus_per_node,
+        gpus_per_task,
         script: "#!/bin/bash\nsleep infinity\n".into(),
         time_limit,
         exclusive,
@@ -332,6 +349,18 @@ fn resolve_salloc_env(matches: &ArgMatches, args: &mut SallocArgs) {
         "gpus",
         &["SPUR_GPUS", "SALLOC_GPUS"],
         &mut args.gpus,
+    );
+    apply_str(
+        matches,
+        "gpus_per_node",
+        &["SPUR_GPUS_PER_NODE", "SALLOC_GPUS_PER_NODE"],
+        &mut args.gpus_per_node,
+    );
+    apply_str(
+        matches,
+        "gpus_per_task",
+        &["SPUR_GPUS_PER_TASK", "SALLOC_GPUS_PER_TASK"],
+        &mut args.gpus_per_task,
     );
     apply_str(
         matches,

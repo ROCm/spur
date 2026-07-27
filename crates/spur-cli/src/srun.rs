@@ -63,9 +63,17 @@ pub struct SrunArgs {
     #[arg(short = 'L', long)]
     pub licenses: Vec<String>,
 
-    /// GPUs
+    /// GPUs total across the job (e.g., "4" or "mi300x:4")
     #[arg(short = 'G', long)]
     pub gpus: Option<String>,
+
+    /// GPUs per node
+    #[arg(long)]
+    pub gpus_per_node: Option<String>,
+
+    /// GPUs per task
+    #[arg(long)]
+    pub gpus_per_task: Option<String>,
 
     /// Working directory
     #[arg(short = 'D', long)]
@@ -333,6 +341,18 @@ fn resolve_srun_env(matches: &ArgMatches, args: &mut SrunArgs) -> Result<()> {
     );
     apply_str(
         matches,
+        "gpus_per_node",
+        &["SPUR_GPUS_PER_NODE", "SLURM_GPUS_PER_NODE"],
+        &mut args.gpus_per_node,
+    );
+    apply_str(
+        matches,
+        "gpus_per_task",
+        &["SPUR_GPUS_PER_TASK", "SLURM_GPUS_PER_TASK"],
+        &mut args.gpus_per_task,
+    );
+    apply_str(
+        matches,
         "chdir",
         &[
             "SPUR_REMOTE_CWD",
@@ -462,10 +482,17 @@ fn srun_dispatch_environment(args: &SrunArgs) -> HashMap<String, String> {
 }
 
 fn build_srun_job_spec(args: &SrunArgs, work_dir: &str, io: &ResolvedIoPaths) -> Result<JobSpec> {
-    let mut gres = args.gres.clone();
-    if let Some(gpus) = &args.gpus {
-        gres.push(format!("gpu:{}", gpus));
-    }
+    // GPU requests use dedicated proto fields; --gres=gpu:* stays in gres.
+    let gres = args.gres.clone();
+    let gpus = crate::sbatch::parse_gpu_flag(args.gpus.as_deref())?;
+    let gpus_per_node = crate::sbatch::parse_gpu_flag(args.gpus_per_node.as_deref())?;
+    let gpus_per_task = crate::sbatch::parse_gpu_flag(args.gpus_per_task.as_deref())?;
+    crate::sbatch::validate_gpu_flags(
+        gpus.is_some(),
+        gpus_per_node.is_some(),
+        gpus_per_task.is_some(),
+        &gres,
+    )?;
 
     let time_limit = args
         .time
@@ -501,6 +528,9 @@ fn build_srun_job_spec(args: &SrunArgs, work_dir: &str, io: &ResolvedIoPaths) ->
         cpus_per_task: args.cpus_per_task,
         memory_per_node_mb: memory_mb,
         gres,
+        gpus,
+        gpus_per_node,
+        gpus_per_task,
         script: build_command_script(&args.command)?,
         work_dir: work_dir.to_string(),
         stdout_path: io.stdout.clone(),

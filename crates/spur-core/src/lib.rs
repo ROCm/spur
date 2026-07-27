@@ -9,6 +9,7 @@ pub mod auth;
 pub mod burst_buffer;
 pub mod config;
 pub mod dependency;
+pub mod gpu_request;
 pub mod hooks;
 pub mod hostlist;
 pub mod job;
