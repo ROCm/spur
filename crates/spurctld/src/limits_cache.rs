@@ -8,6 +8,7 @@
 //! this cache so the dormant `QOS*` pending-reasons fire against real limits.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,12 +20,14 @@ use spur_core::accounting::{Qos, QosLimits, QosPreemptMode, TresRecord};
 
 pub struct QosCache {
     qos: RwLock<HashMap<String, Qos>>,
+    loaded: AtomicBool,
 }
 
 impl QosCache {
     pub fn new() -> Self {
         Self {
             qos: RwLock::new(HashMap::new()),
+            loaded: AtomicBool::new(false),
         }
     }
 
@@ -32,14 +35,21 @@ impl QosCache {
         self.qos.read().get(name).cloned()
     }
 
+    /// True after at least one successful fetch from the accounting database.
+    pub fn is_loaded(&self) -> bool {
+        self.loaded.load(Ordering::Acquire)
+    }
+
     fn replace(&self, new_qos: HashMap<String, Qos>) {
         *self.qos.write() = new_qos;
+        self.loaded.store(true, Ordering::Release);
     }
 
     /// Test-only seam: populates the cache without a database.
     #[cfg(test)]
     pub(crate) fn insert(&self, qos: Qos) {
         self.qos.write().insert(qos.name.clone(), qos);
+        self.loaded.store(true, Ordering::Release);
     }
 
     pub fn spawn_refresh_loop(self: &Arc<Self>, pool: PgPool, refresh_interval_secs: u64) {

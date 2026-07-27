@@ -1523,7 +1523,12 @@ impl ClusterManager {
                     anyhow::bail!("cannot clear a job's QOS");
                 }
                 if self.qos_cache.get(&q).is_none() {
-                    anyhow::bail!("QOS '{q}' does not exist");
+                    let hint = if self.qos_cache.is_loaded() {
+                        ""
+                    } else {
+                        " (hint: accounting may not be enabled on this controller — check controller logs)"
+                    };
+                    anyhow::bail!("QOS '{q}' does not exist{hint}");
                 }
                 // Treat account="" as unset so we authorize against the
                 // job's existing account, rather than erroring on a blank
@@ -4741,7 +4746,14 @@ fn apply_default_qos(
 
     if let Some(name) = spec.qos.as_deref().filter(|n| !n.is_empty()) {
         if qos_cache.get(name).is_none() {
-            return Err(SubmitError::invalid(format!("QOS '{name}' does not exist")));
+            let hint = if qos_cache.is_loaded() {
+                String::new()
+            } else {
+                " (hint: accounting may not be enabled on this controller — check controller logs)".into()
+            };
+            return Err(SubmitError::invalid(format!(
+                "QOS '{name}' does not exist{hint}"
+            )));
         }
         if !qos_permitted(&allowed_qos, default_qos_for_auth.as_deref(), name) {
             return Err(SubmitError::invalid(format!(
@@ -4774,8 +4786,13 @@ fn apply_default_qos(
     let fallback = accounting.default_qos.trim();
     if !fallback.is_empty() {
         if qos_cache.get(fallback).is_none() {
+            let hint = if qos_cache.is_loaded() {
+                String::new()
+            } else {
+                " (hint: accounting may not be enabled on this controller — check controller logs)".into()
+            };
             return Err(SubmitError::invalid(format!(
-                "configured default QOS '{fallback}' does not exist"
+                "configured default QOS '{fallback}' does not exist{hint}"
             )));
         }
         if qos_permitted(&allowed_qos, default_qos_for_auth.as_deref(), fallback) {
