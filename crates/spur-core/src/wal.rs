@@ -344,20 +344,13 @@ mod reservation_wal_tests {
 mod tests {
     use super::*;
 
-    // Frozen v0.5.1 JobSubmit payload, captured before `gpus*`, `pty`, and
-    // `srun_job` were added to JobSpec. spurctld persists Raft log entries as
-    // JSON and replays them on startup under strict recovery, so a new JobSpec
-    // field without `#[serde(default)]` makes this exact blob fail to
-    // deserialize and crashes the controller on upgrade. This literal must NOT
-    // be regenerated when fields are added — its whole purpose is to stay
-    // frozen at the old shape. If it fails to deserialize, the newly added
-    // field needs `#[serde(default)]` (or to be `Option`), not a fixture edit.
-    const JOB_SUBMIT_V0_5_1: &str = r#"{"JobSubmit":{"job_id":7,"spec":{"name":"fixture","partition":null,"account":null,"user":"alice","uid":1000,"gid":1000,"num_nodes":1,"num_tasks":1,"tasks_per_node":null,"cpus_per_task":1,"memory_per_node_mb":null,"memory_per_cpu_mb":null,"gres":[],"script":null,"argv":[],"script_args":[],"work_dir":"/home/alice","stdout_path":null,"stderr_path":null,"stdin_path":null,"environment":{},"time_limit":null,"time_min":null,"qos":null,"priority":null,"reservation":null,"dependency":[],"nodelist":null,"exclude":null,"constraint":null,"mpi":null,"distribution":null,"het_group":null,"array_spec":null,"array_job_id":null,"array_task_id":null,"array_max_concurrent":null,"requeue":false,"exclusive":false,"hold":false,"interactive":false,"mail_type":[],"mail_user":null,"comment":null,"wckey":null,"container_image":null,"container_mounts":[],"container_workdir":null,"container_name":null,"container_readonly":false,"container_mount_home":false,"container_env":{},"container_entrypoint":null,"container_remap_root":false,"burst_buffer":null,"begin_time":null,"deadline":null,"spread_job":false,"topology":null,"host_network":false,"privileged":false,"host_ipc":false,"shm_size":null,"extra_resources":{},"open_mode":null}}}"#;
-
-    // A JobSubmit entry written by v0.5.1 must still deserialize on current code,
-    // or spurctld crashes replaying its Raft log across the upgrade.
+    // Frozen pre-`pty` v0.5.1 Raft entry; must still deserialize or spurctld
+    // crashes on upgrade replay. Never regenerate — a failure here means a new
+    // field needs `#[serde(default)]`, not a fixture edit.
     #[test]
     fn job_submit_v0_5_1_payload_still_deserializes() {
+        const JOB_SUBMIT_V0_5_1: &str = r#"{"JobSubmit":{"job_id":7,"spec":{"name":"fixture","partition":null,"account":null,"user":"alice","uid":1000,"gid":1000,"num_nodes":1,"num_tasks":1,"tasks_per_node":null,"cpus_per_task":1,"memory_per_node_mb":null,"memory_per_cpu_mb":null,"gres":[],"script":null,"argv":[],"script_args":[],"work_dir":"/home/alice","stdout_path":null,"stderr_path":null,"stdin_path":null,"environment":{},"time_limit":null,"time_min":null,"qos":null,"priority":null,"reservation":null,"dependency":[],"nodelist":null,"exclude":null,"constraint":null,"mpi":null,"distribution":null,"het_group":null,"array_spec":null,"array_job_id":null,"array_task_id":null,"array_max_concurrent":null,"requeue":false,"exclusive":false,"hold":false,"interactive":false,"mail_type":[],"mail_user":null,"comment":null,"wckey":null,"container_image":null,"container_mounts":[],"container_workdir":null,"container_name":null,"container_readonly":false,"container_mount_home":false,"container_env":{},"container_entrypoint":null,"container_remap_root":false,"burst_buffer":null,"begin_time":null,"deadline":null,"spread_job":false,"topology":null,"host_network":false,"privileged":false,"host_ipc":false,"shm_size":null,"extra_resources":{},"open_mode":null}}}"#;
+
         let op: WalOperation = serde_json::from_str(JOB_SUBMIT_V0_5_1).expect(
             "v0.5.1 JobSubmit must deserialize; a new JobSpec field needs #[serde(default)]",
         );
@@ -366,7 +359,6 @@ mod tests {
                 assert_eq!(job_id, 7);
                 assert_eq!(spec.name, "fixture");
                 assert_eq!(spec.work_dir, "/home/alice");
-                // Fields added after v0.5.1 fall back to their defaults.
                 assert!(!spec.pty);
                 assert!(!spec.srun_job);
                 assert!(spec.gpus.is_none());

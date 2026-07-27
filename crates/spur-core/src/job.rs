@@ -1098,8 +1098,7 @@ mod tests {
         assert_eq!(effective_memory_mb(&spec, 1), 0);
     }
 
-    // A JobSpec serialized before the `pty` field existed (v0.5.1 Raft log
-    // entries) must still deserialize, or spurctld crashes on upgrade replay.
+    // Pre-`pty` JobSpec must still deserialize, or spurctld crashes on replay.
     #[test]
     fn job_spec_deserializes_without_pty_field() {
         let mut value = serde_json::to_value(JobSpec::default()).unwrap();
