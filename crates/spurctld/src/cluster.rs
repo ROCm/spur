@@ -1538,7 +1538,12 @@ impl ClusterManager {
                     anyhow::bail!("cannot clear a job's QOS");
                 }
                 if self.qos_cache.get(&q).is_none() {
-                    anyhow::bail!("QOS '{q}' does not exist");
+                    let hint = if self.qos_cache.is_loaded() {
+                        ""
+                    } else {
+                        QOS_ACCOUNTING_HINT
+                    };
+                    anyhow::bail!("QOS '{q}' does not exist{hint}");
                 }
                 // Treat account="" as unset so we authorize against the
                 // job's existing account, rather than erroring on a blank
@@ -4694,6 +4699,9 @@ fn validate_user_account(
     }
 }
 
+const QOS_ACCOUNTING_HINT: &str =
+    " (hint: accounting may not be enabled on this controller -- check controller logs)";
+
 /// Resolve a job's QOS at submit, in Slurm's order: explicit `--qos` (must
 /// exist and be permitted for the association) → association default →
 /// cluster fallback (`accounting.default_qos`, also gated by the
@@ -4722,7 +4730,14 @@ fn apply_default_qos(
 
     if let Some(name) = spec.qos.as_deref().filter(|n| !n.is_empty()) {
         if qos_cache.get(name).is_none() {
-            return Err(SubmitError::invalid(format!("QOS '{name}' does not exist")));
+            let hint = if qos_cache.is_loaded() {
+                String::new()
+            } else {
+                QOS_ACCOUNTING_HINT.into()
+            };
+            return Err(SubmitError::invalid(format!(
+                "QOS '{name}' does not exist{hint}"
+            )));
         }
         if !qos_permitted(&allowed_qos, default_qos_for_auth.as_deref(), name) {
             return Err(SubmitError::invalid(format!(
@@ -4755,8 +4770,13 @@ fn apply_default_qos(
     let fallback = accounting.default_qos.trim();
     if !fallback.is_empty() {
         if qos_cache.get(fallback).is_none() {
+            let hint = if qos_cache.is_loaded() {
+                String::new()
+            } else {
+                QOS_ACCOUNTING_HINT.into()
+            };
             return Err(SubmitError::invalid(format!(
-                "configured default QOS '{fallback}' does not exist"
+                "configured default QOS '{fallback}' does not exist{hint}"
             )));
         }
         if qos_permitted(&allowed_qos, default_qos_for_auth.as_deref(), fallback) {
@@ -10432,6 +10452,7 @@ mod tests {
             .update_job(id, None, None, None, None, None, Some("ghost".into()))
             .unwrap_err();
         assert!(err.to_string().contains("QOS 'ghost' does not exist"));
+        assert!(!err.to_string().contains("accounting may not be enabled"));
         assert_eq!(cm.get_job(id).unwrap().spec.qos, None);
 
         // Empty QOS (clear-to-limitless) rejected.
@@ -10448,6 +10469,21 @@ mod tests {
             cm.get_job(id).unwrap().spec.qos.as_deref(),
             Some("highprio")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_qos_hints_when_cache_unloaded() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("q"));
+        assert_eq!(cm.get_job(id).unwrap().spec.qos, None);
+
+        let err = cm
+            .update_job(id, None, None, None, None, None, Some("any-qos".into()))
+            .unwrap_err();
+        assert!(err.to_string().contains("QOS 'any-qos' does not exist"));
+        assert!(err.to_string().contains("accounting may not be enabled"));
+        assert_eq!(cm.get_job(id).unwrap().spec.qos, None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11346,6 +11382,19 @@ mod tests {
             err,
             SubmitError::invalid("QOS 'doesnotexist' does not exist")
         );
+        assert!(!err.to_string().contains("accounting may not be enabled"));
+    }
+
+    #[test]
+    fn apply_default_qos_explicit_invalid_hints_when_cache_unloaded() {
+        let assoc = AssociationCache::new();
+        let qos = QosCache::new();
+        let mut spec = basic_spec("j");
+        spec.qos = Some("any-qos".into());
+
+        let err = super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap_err();
+        assert!(err.to_string().contains("QOS 'any-qos' does not exist"));
+        assert!(err.to_string().contains("accounting may not be enabled"));
     }
 
     #[test]
@@ -11544,6 +11593,26 @@ mod tests {
             err,
             SubmitError::invalid("configured default QOS 'ghost' does not exist")
         );
+        assert!(!err.to_string().contains("accounting may not be enabled"));
+    }
+
+    #[test]
+    fn apply_default_qos_cluster_default_hints_when_cache_unloaded() {
+        let assoc = AssociationCache::new();
+        let qos = QosCache::new();
+        let mut spec = basic_spec("j");
+
+        let err = super::apply_default_qos(
+            &mut spec,
+            &assoc,
+            &qos,
+            &acct_cfg_with("fallback-qos", false),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("configured default QOS 'fallback-qos' does not exist"));
+        assert!(err.to_string().contains("accounting may not be enabled"));
     }
 
     #[test]

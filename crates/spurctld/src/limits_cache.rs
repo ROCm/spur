@@ -17,29 +17,46 @@ use tracing::{info, warn};
 
 use spur_core::accounting::{Qos, QosLimits, QosPreemptMode, TresRecord};
 
+struct Snapshot {
+    qos: HashMap<String, Qos>,
+    loaded: bool,
+}
+
 pub struct QosCache {
-    qos: RwLock<HashMap<String, Qos>>,
+    snapshot: RwLock<Snapshot>,
 }
 
 impl QosCache {
     pub fn new() -> Self {
         Self {
-            qos: RwLock::new(HashMap::new()),
+            snapshot: RwLock::new(Snapshot {
+                qos: HashMap::new(),
+                loaded: false,
+            }),
         }
     }
 
     pub fn get(&self, name: &str) -> Option<Qos> {
-        self.qos.read().get(name).cloned()
+        self.snapshot.read().qos.get(name).cloned()
+    }
+
+    /// True after at least one successful fetch from the accounting database.
+    pub fn is_loaded(&self) -> bool {
+        self.snapshot.read().loaded
     }
 
     fn replace(&self, new_qos: HashMap<String, Qos>) {
-        *self.qos.write() = new_qos;
+        let mut snap = self.snapshot.write();
+        snap.qos = new_qos;
+        snap.loaded = true;
     }
 
     /// Test-only seam: populates the cache without a database.
     #[cfg(test)]
     pub(crate) fn insert(&self, qos: Qos) {
-        self.qos.write().insert(qos.name.clone(), qos);
+        let mut snap = self.snapshot.write();
+        snap.qos.insert(qos.name.clone(), qos);
+        snap.loaded = true;
     }
 
     pub fn spawn_refresh_loop(self: &Arc<Self>, pool: PgPool, refresh_interval_secs: u64) {
