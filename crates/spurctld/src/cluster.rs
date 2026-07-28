@@ -1899,8 +1899,8 @@ impl ClusterManager {
         self.classify_pending_jobs().jobs
     }
 
-    /// Classify pending jobs once, apply displayed block reasons, and return the
-    /// jobs eligible for scheduling.
+    /// Classify pending jobs once, apply displayed block reasons, advance burst-buffer
+    /// stage-in for selected candidates, and return the jobs eligible for scheduling.
     pub fn pending_jobs_and_tag_reasons(&self) -> Vec<Job> {
         let classification = self.classify_pending_jobs();
         self.apply_blocked_pending_reasons(classification.blocked);
@@ -1924,12 +1924,10 @@ impl ClusterManager {
             .filter(|job| job.state == JobState::Pending)
             .filter(|job| !job.pending_reason.is_scheduling_hold())
             .filter_map(|job| {
-                let active_begin_hold = job.pending_reason == PendingReason::BeginTime
-                    && job.spec.begin_time.is_some_and(|begin| now < begin);
-                if active_begin_hold {
+                let before_begin_time = job.spec.begin_time.is_some_and(|begin| now < begin);
+                if before_begin_time && job.pending_reason == PendingReason::BeginTime {
                     return None;
                 }
-                let before_begin_time = job.spec.begin_time.is_some_and(|begin| now < begin);
                 Some(PendingJobCandidate {
                     job: job.clone(),
                     scheduling_eligible: !before_begin_time,
@@ -1939,6 +1937,8 @@ impl ClusterManager {
             .collect();
         let mut blocked = Vec::new();
 
+        // Structural blockers retain their precedence before begin-time eligibility;
+        // unlike consumables, they do not reserve capacity while the job waits.
         {
             let partitions = self.partitions.read();
             retain_unblocked(&mut candidates, &mut blocked, |job| {
@@ -2385,11 +2385,11 @@ impl ClusterManager {
         cancelled
     }
 
-    #[cfg(test)]
     /// Reclassify pending jobs and apply their displayed block reasons.
     /// Leader-only; enforced by the scheduler-loop caller, not this function
     /// itself (mirrors `cancel_unsatisfiable_dependency_jobs()`).
-    pub fn tag_blocked_pending_reasons(&self) {
+    #[cfg(test)]
+    fn tag_blocked_pending_reasons(&self) {
         let blocked = self.classify_pending_jobs().blocked;
         self.apply_blocked_pending_reasons(blocked);
     }
