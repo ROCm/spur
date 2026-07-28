@@ -42,9 +42,9 @@ pub struct SbatchArgs {
     #[arg(short = 'N', long, default_value = "1", overrides_with = "nodes")]
     pub nodes: u32,
 
-    /// Number of tasks
-    #[arg(short = 'n', long, default_value = "1", overrides_with = "ntasks")]
-    pub ntasks: u32,
+    /// Number of tasks (default: one per node)
+    #[arg(short = 'n', long, overrides_with = "ntasks")]
+    pub ntasks: Option<u32>,
 
     /// Tasks per node
     #[arg(long, overrides_with = "ntasks_per_node")]
@@ -703,6 +703,12 @@ fn candidate_script_path(cli_args: &[String]) -> Option<String> {
     pre.script
 }
 
+/// Slurm allocates one task per node unless `-n` is given, so the default
+/// scales with `-N` instead of being a fixed 1.
+fn effective_ntasks(ntasks: Option<u32>, nodes: u32) -> u32 {
+    ntasks.unwrap_or(nodes)
+}
+
 /// Default job name: explicit `-J`, else `"wrap"` for wrap-mode, else the
 /// script filename, else `"sbatch"` (stdin).
 fn default_job_name(job_name: Option<&str>, script: Option<&str>, is_wrap: bool) -> String {
@@ -811,7 +817,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         uid: nix::unistd::getuid().as_raw(),
         gid: nix::unistd::getgid().as_raw(),
         num_nodes: args.nodes,
-        num_tasks: args.ntasks,
+        num_tasks: effective_ntasks(args.ntasks, args.nodes),
         tasks_per_node: args.ntasks_per_node.unwrap_or(0),
         cpus_per_task: args.cpus_per_task,
         memory_per_node_mb: memory_per_node.unwrap_or(0),
@@ -1030,6 +1036,52 @@ echo "hello world"
     fn test_cli_only_when_no_directive() {
         let args = parse_merged(&[], &["sbatch", "--nodes=4"]);
         assert_eq!(args.nodes, 4);
+    }
+
+    #[test]
+    fn test_ntasks_defaults_to_node_count() {
+        let args = parse_merged(&[], &["sbatch", "-N", "4"]);
+        assert_eq!(args.ntasks, None);
+        assert_eq!(effective_ntasks(args.ntasks, args.nodes), 4);
+    }
+
+    #[test]
+    fn test_explicit_ntasks_overrides_node_default() {
+        let args = parse_merged(&[], &["sbatch", "-N", "4", "-n", "2"]);
+        assert_eq!(effective_ntasks(args.ntasks, args.nodes), 2);
+    }
+
+    #[test]
+    fn test_ntasks_directive_used_when_no_cli() {
+        let args = parse_merged(&["--ntasks=8"], &["sbatch", "-N", "4"]);
+        assert_eq!(effective_ntasks(args.ntasks, args.nodes), 8);
+    }
+
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn test_submit_path_builds_spec_with_defaulted_ntasks() {
+        // Guarded because a stray SBATCH_* var in the runner's environment
+        // could fail the parse long before the spec is built.
+        let _env = SbatchEnvGuard::new();
+        let err = main_with_args(vec![
+            "sbatch".into(),
+            "--controller".into(),
+            "http://127.0.0.1:1".into(),
+            "--export".into(),
+            "NONE".into(),
+            "-N".into(),
+            "4".into(),
+            "--wrap".into(),
+            "echo hi".into(),
+        ])
+        .await
+        .unwrap_err();
+        // Failing at the connect means the whole JobSpec was built first,
+        // including num_tasks defaulting to the node count.
+        assert!(
+            err.to_string().contains("failed to connect to spurctld"),
+            "expected a connect failure, got: {err}"
+        );
     }
 
     #[test]
