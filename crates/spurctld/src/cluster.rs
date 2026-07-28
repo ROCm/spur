@@ -2062,13 +2062,13 @@ impl ClusterManager {
             let available = self.available_licenses_with(&jobs);
             let mut remaining = available.clone();
             candidates.retain(|candidate| {
+                if !candidate.scheduling_eligible {
+                    return true;
+                }
                 let job = &candidate.job;
                 if let Some(reason) = license_block(job, &available) {
                     record_blocked(&mut blocked, candidate, reason);
                     return false;
-                }
-                if !candidate.scheduling_eligible {
-                    return true;
                 }
                 let req = extract_license_requirements(&job.spec);
                 if req
@@ -2091,6 +2091,9 @@ impl ClusterManager {
             let available = self.available_bb_with(&jobs);
             let mut remaining = available;
             candidates.retain(|candidate| {
+                if !candidate.scheduling_eligible {
+                    return true;
+                }
                 let job = &candidate.job;
                 if job.bb_stage_state == BbStageState::Staging {
                     record_blocked(&mut blocked, candidate, PendingReason::BurstBufferStageIn);
@@ -2099,9 +2102,6 @@ impl ClusterManager {
                 if let Some(reason) = burst_buffer_block(job, available) {
                     record_blocked(&mut blocked, candidate, reason);
                     return false;
-                }
-                if !candidate.scheduling_eligible {
-                    return true;
                 }
                 let req = extract_bb_requirement(&job.spec);
                 if req == 0 {
@@ -9470,6 +9470,48 @@ mod tests {
             .collect();
         assert!(pending.contains(&solo));
         assert!(!pending.contains(&t2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn future_begin_jobs_do_not_receive_consumable_block_reasons() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        *cm.burst_buffer_total_gb.write() = 100;
+        let begin_time = Utc::now() + chrono::Duration::hours(1);
+
+        let mut license_spec = basic_spec("future-license");
+        license_spec.begin_time = Some(begin_time);
+        license_spec.gres = vec!["license:missing:1".into()];
+        let license_id = submit_and_wait(&cm, license_spec);
+
+        let mut bb_spec = basic_spec("future-bb");
+        bb_spec.begin_time = Some(begin_time);
+        bb_spec.burst_buffer = Some("capacity=500".into());
+        let bb_id = submit_and_wait(&cm, bb_spec);
+
+        {
+            let mut jobs = cm.jobs.write();
+            jobs.get_mut(&license_id).unwrap().pending_reason = PendingReason::Priority;
+            jobs.get_mut(&bb_id).unwrap().pending_reason = PendingReason::Priority;
+        }
+
+        let pending: Vec<JobId> = cm
+            .pending_jobs_and_tag_reasons()
+            .iter()
+            .map(|job| job.job_id)
+            .collect();
+
+        assert!(!pending.contains(&license_id));
+        assert!(!pending.contains(&bb_id));
+        assert_eq!(
+            cm.get_job(license_id).unwrap().pending_reason,
+            PendingReason::Priority
+        );
+        assert_eq!(
+            cm.get_job(bb_id).unwrap().pending_reason,
+            PendingReason::Priority
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
