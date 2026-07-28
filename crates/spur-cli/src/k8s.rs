@@ -44,8 +44,13 @@ pub enum K8sCommand {
     },
     /// Show cluster phase + per-node component status.
     Status,
-    /// Print the admin kubeconfig to stdout.
-    Kubeconfig,
+    /// Print a kubeconfig to stdout. Default: the cluster-admin kubeconfig. With `--user`, a
+    /// namespace-scoped kubeconfig (a ServiceAccount token in that user's account namespace).
+    Kubeconfig {
+        /// Mint a scoped kubeconfig for this SPUR user instead of the admin one.
+        #[arg(long)]
+        user: Option<String>,
+    },
     /// Download + install the k0s binary on THIS node (local; no controller needed).
     /// Run as root for the default /usr/local/bin path.
     InstallK0s {
@@ -72,7 +77,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         K8sCommand::Up { control_plane_node } => cmd_up(&controller, control_plane_node).await,
         K8sCommand::Down { reset } => cmd_down(&controller, reset).await,
         K8sCommand::Status => cmd_status(&controller).await,
-        K8sCommand::Kubeconfig => cmd_kubeconfig(&controller).await,
+        K8sCommand::Kubeconfig { user } => cmd_kubeconfig(&controller, user).await,
         K8sCommand::InstallK0s {
             version,
             path,
@@ -149,10 +154,12 @@ async fn cmd_status(controller: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_kubeconfig(controller: &str) -> Result<()> {
+async fn cmd_kubeconfig(controller: &str, user: Option<String>) -> Result<()> {
     let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
     let resp = client
-        .cluster_kubeconfig(ClusterKubeconfigRequest {})
+        .cluster_kubeconfig(ClusterKubeconfigRequest {
+            user: user.unwrap_or_default(),
+        })
         .await?
         .into_inner();
     // stdout = data (the YAML), so it can be redirected to a kubeconfig file.
