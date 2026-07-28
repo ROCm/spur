@@ -1057,6 +1057,33 @@ echo "hello world"
         assert_eq!(effective_ntasks(args.ntasks, args.nodes), 8);
     }
 
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn test_submit_path_builds_spec_with_defaulted_ntasks() {
+        // Guarded because a stray SBATCH_* var in the runner's environment
+        // could fail the parse long before the spec is built.
+        let _env = SbatchEnvGuard::new();
+        let err = main_with_args(vec![
+            "sbatch".into(),
+            "--controller".into(),
+            "http://127.0.0.1:1".into(),
+            "--export".into(),
+            "NONE".into(),
+            "-N".into(),
+            "4".into(),
+            "--wrap".into(),
+            "echo hi".into(),
+        ])
+        .await
+        .unwrap_err();
+        // Failing at the connect means the whole JobSpec was built first,
+        // including num_tasks defaulting to the node count.
+        assert!(
+            err.to_string().contains("failed to connect to spurctld"),
+            "expected a connect failure, got: {err}"
+        );
+    }
+
     #[test]
     fn test_vec_args_accumulate_from_both_sources() {
         // Repeatable options accumulate directive and CLI values by design.
