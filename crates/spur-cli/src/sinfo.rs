@@ -69,6 +69,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     let fields = format_engine::parse_format(&fmt, &format_engine::sinfo_header);
 
+    // Built before connecting so an invalid `-t` fails without a round-trip.
+    let nodes_req = build_get_nodes_request(&args)?;
+
     let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
@@ -86,11 +89,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     // Get nodes
     let nodes_resp = client
-        .get_nodes(GetNodesRequest {
-            states: Vec::new(),
-            partition: args.partition.unwrap_or_default(),
-            nodelist: args.nodes.unwrap_or_default(),
-        })
+        .get_nodes(nodes_req)
         .await
         .context("failed to get nodes")?;
 
@@ -105,6 +104,48 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn build_get_nodes_request(args: &SinfoArgs) -> Result<GetNodesRequest> {
+    let states = match args.states.as_deref() {
+        Some(s) => parse_states_arg(s)?,
+        None => Vec::new(),
+    };
+
+    Ok(GetNodesRequest {
+        states: states.iter().map(|s| *s as i32).collect(),
+        partition: args.partition.clone().unwrap_or_default(),
+        nodelist: args.nodes.clone().unwrap_or_default(),
+    })
+}
+
+/// Parse `-t` / `--states` (comma-separated). Whole-string `all` means no state filter.
+/// Unknown tokens are rejected (Slurm exits with an error rather than showing all nodes).
+fn parse_states_arg(s: &str) -> Result<Vec<spur_proto::proto::NodeState>> {
+    use spur_core::node::NodeState;
+
+    let trimmed = s.trim();
+    if trimmed.eq_ignore_ascii_case("all") {
+        return Ok(Vec::new());
+    }
+
+    let tokens: Vec<&str> = trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    if tokens.is_empty() {
+        anyhow::bail!("Invalid node state specified: (empty)");
+    }
+
+    let mut states = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let core = NodeState::from_short_or_name(token)
+            .ok_or_else(|| anyhow::anyhow!("Invalid node state specified: {token}"))?;
+        states.push(core.to_proto());
+    }
+    Ok(states)
 }
 
 fn group_nodes_by_display_state<'a>(nodes: &[&'a NodeInfo]) -> Vec<(String, Vec<&'a NodeInfo>)> {
@@ -308,6 +349,77 @@ mod tests {
             format_engine::SINFO_DEFAULT_FORMAT,
             &format_engine::sinfo_header,
         )
+    }
+
+    // --- state filter plumbing tests ---
+
+    /// `-h` is `--noheader` here, so the auto-generated help flag has to be
+    /// dropped before clap will build the command outside of `main`.
+    fn parse_sinfo_args(argv: &[&str]) -> SinfoArgs {
+        use clap::{CommandFactory, FromArgMatches};
+
+        let matches = SinfoArgs::command()
+            .disable_help_flag(true)
+            .try_get_matches_from(argv)
+            .unwrap();
+        SinfoArgs::from_arg_matches(&matches).unwrap()
+    }
+
+    #[test]
+    fn state_filter_reaches_the_request() {
+        let args = parse_sinfo_args(&["sinfo", "-t", "idle"]);
+        let req = build_get_nodes_request(&args).unwrap();
+        assert_eq!(req.states, vec![NodeState::NodeIdle as i32]);
+    }
+
+    #[test]
+    fn state_filter_accepts_comma_separated_short_and_long_names() {
+        let args = parse_sinfo_args(&["sinfo", "--states", "alloc,DOWN,draining"]);
+        let req = build_get_nodes_request(&args).unwrap();
+        assert_eq!(
+            req.states,
+            vec![
+                NodeState::NodeAllocated as i32,
+                NodeState::NodeDown as i32,
+                NodeState::NodeDraining as i32,
+            ]
+        );
+    }
+
+    #[test]
+    fn no_state_filter_leaves_request_states_empty() {
+        let args = parse_sinfo_args(&["sinfo"]);
+        let req = build_get_nodes_request(&args).unwrap();
+        assert!(req.states.is_empty());
+    }
+
+    #[test]
+    fn state_filter_all_means_no_filter() {
+        for spec in ["all", "ALL"] {
+            let args = parse_sinfo_args(&["sinfo", "-t", spec]);
+            assert!(build_get_nodes_request(&args).unwrap().states.is_empty());
+        }
+    }
+
+    #[test]
+    fn state_filter_rejects_unknown_state() {
+        let args = parse_sinfo_args(&["sinfo", "-t", "BOGUS"]);
+        let err = build_get_nodes_request(&args).unwrap_err();
+        assert!(err.to_string().contains("BOGUS"), "{err}");
+    }
+
+    #[test]
+    fn state_filter_rejects_empty_list() {
+        let args = parse_sinfo_args(&["sinfo", "-t", "  ,  "]);
+        assert!(build_get_nodes_request(&args).is_err());
+    }
+
+    #[test]
+    fn partition_and_nodelist_still_reach_the_request() {
+        let args = parse_sinfo_args(&["sinfo", "-p", "batch", "-n", "n[1-2]"]);
+        let req = build_get_nodes_request(&args).unwrap();
+        assert_eq!(req.partition, "batch");
+        assert_eq!(req.nodelist, "n[1-2]");
     }
 
     #[test]

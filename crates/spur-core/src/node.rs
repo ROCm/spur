@@ -194,6 +194,16 @@ impl NodeState {
     pub fn to_proto_i32(self) -> i32 {
         self.to_proto() as i32
     }
+
+    /// Parse from a short sinfo suffix ("idle", "alloc", "mix") or full name
+    /// ("idle", "allocated", "mixed"). Case-insensitive.
+    pub fn from_short_or_name(s: &str) -> Option<Self> {
+        let lower = s.to_lowercase();
+        Self::ALL
+            .iter()
+            .find(|st| st.short() == lower || st.display() == lower)
+            .copied()
+    }
 }
 
 impl std::fmt::Display for NodeState {
@@ -575,5 +585,23 @@ mod tests {
             assert_eq!(NodeState::from_proto_i32(core.to_proto_i32()), Some(core));
             assert_eq!(NodeState::from_proto(core.to_proto()), core);
         }
+    }
+
+    #[test]
+    fn node_state_from_short_or_name_roundtrip() {
+        for &state in &NodeState::ALL {
+            assert_eq!(NodeState::from_short_or_name(state.short()), Some(state));
+            assert_eq!(NodeState::from_short_or_name(state.display()), Some(state));
+            assert_eq!(
+                NodeState::from_short_or_name(&state.short().to_uppercase()),
+                Some(state)
+            );
+        }
+    }
+
+    #[test]
+    fn node_state_from_short_or_name_rejects_unknown() {
+        assert_eq!(NodeState::from_short_or_name("bogus"), None);
+        assert_eq!(NodeState::from_short_or_name(""), None);
     }
 }
