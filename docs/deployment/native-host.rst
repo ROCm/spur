@@ -171,6 +171,50 @@ The default can be changed in ``spur.conf``:
    the ``spurd`` systemd unit is no longer required. The agent raises the limit
    itself while still privileged.
 
+MPI (PMIx)
+----------
+
+Spur supports single-node Open MPI jobs via ``--mpi=pmix``. The controller and
+CLI do not link libpmix; each compute node loads ``spur_mpi_pmix.so`` from
+``[mpi].plugin_dir`` when a PMIx job starts.
+
+Build and install the plugin on every agent node:
+
+.. code-block:: bash
+
+   cargo build --release -p spur-mpi-pmix
+   sudo install -D target/release/libspur_mpi_pmix.so /usr/lib/spur/spur_mpi_pmix.so
+
+The plugin requires **libpmix** at runtime (``pkg-config pmix`` when building).
+Open MPI on the node must be built against a compatible PMIx version.
+
+Add to ``spur.conf`` on agents (and match ``plugin_dir`` to the install path):
+
+.. code-block:: toml
+
+   [mpi]
+   plugin_dir = "/usr/lib/spur"
+   pmix_tmpdir = "/tmp/spur-pmix"
+   pmix_min_version = "4.1.0"
+
+Submit PMIx jobs with ``srun``, ``sbatch``, or step mode inside an allocation:
+
+.. code-block:: bash
+
+   srun --mpi=pmix -n4 ./hello_mpi
+   sbatch --mpi=pmix -n4 batch.sh
+
+Inside an interactive allocation (``salloc``), enable PMIx per step:
+
+.. code-block:: bash
+
+   srun --mpi=pmix -n4 ./hello_mpi
+
+Set ``SPUR_MPI_DEBUG=1`` on ``spurd`` for plugin debug logs. Each agent holds at
+most 64 active PMIx namespaces; additional concurrent ``--mpi=pmix`` jobs on the
+same node fail with "PMIx session table full" until a running job finishes.
+Multi-node PMIx coordination is not yet supported in this release.
+
 Submitting Jobs
 ---------------
 

@@ -1555,6 +1555,11 @@ impl SlurmController for ControllerService {
         let gid = req.gid;
         let step_id = req.step_id;
         let label = req.label;
+        let job_mpi = job.spec.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
+        let mpi = spur_core::mpi::resolve_step_mpi(req.mpi.as_str(), job_mpi).to_string();
+        spur_core::mpi::validate_pmix_step_agents(mpi.as_str(), plan.len())
+            .map_err(Status::invalid_argument)?;
+        let pmix_tmpdir = self.cluster.config.mpi.pmix_tmpdir.clone();
 
         struct NodeDispatch {
             node_name: String,
@@ -1601,6 +1606,17 @@ impl SlurmController for ControllerService {
             let command = command.clone();
             let work_dir = work_dir.clone();
             let environment = environment.clone();
+            let pmix_tmpdir = pmix_tmpdir.clone();
+            let step_mpi = mpi.clone();
+            let pmix_plan = spur_core::mpi::maybe_local_pmix_plan(
+                step_mpi.as_str(),
+                job_id,
+                step_num_tasks,
+                node_tasks.task_offset,
+                node_tasks.tasks_on_node,
+                &pmix_tmpdir,
+            )
+            .map(spur_core::mpi::plan_to_proto);
             set.spawn(async move {
                 let mut agent = SlurmAgentClient::connect(agent_addr.clone())
                     .await
@@ -1623,6 +1639,8 @@ impl SlurmController for ControllerService {
                         step_id,
                         step_num_tasks,
                         label,
+                        pmix_plan,
+                        mpi: step_mpi,
                     })
                     .await
                     .map_err(|e| {

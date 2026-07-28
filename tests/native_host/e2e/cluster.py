@@ -120,7 +120,7 @@ class SshNode:
 
 
 def ensure_bins(nodes: list[SshNode], binaries_dir: str, bin_dir: str,
-                with_accounting: bool = False):
+                with_accounting: bool = False, with_mpi_plugin: bool = False):
     """
     Upload binaries to all nodes if not already present (or size differs).
     bin_dir is the remote directory where binaries are installed.
@@ -163,6 +163,25 @@ def ensure_bins(nodes: list[SshNode], binaries_dir: str, bin_dir: str,
     )
     for node in nodes:
         node.exec_allow_fail(symlink_cmd)
+
+    if with_mpi_plugin:
+        plugin_local = os.environ.get("SPUR_TEST_MPI_PLUGIN", "").strip()
+        if not plugin_local:
+            plugin_local = str(Path(binaries_dir).parent / "lib" / "spur" / "spur_mpi_pmix.so")
+            if not Path(plugin_local).is_file():
+                plugin_local = str(Path(binaries_dir) / "libspur_mpi_pmix.so")
+        plugin_path = Path(plugin_local)
+        if not plugin_path.is_file():
+            raise FileNotFoundError(
+                f"Missing MPI plugin: {plugin_path}\n"
+                "Build with: cargo build --release -p spur-mpi-pmix\n"
+                "Or set SPUR_TEST_MPI_PLUGIN"
+            )
+        remote_plugin_dir = str(Path(bin_dir).parent / "lib" / "spur")
+        for node in nodes:
+            node.exec(f"mkdir -p '{remote_plugin_dir}'")
+            remote_plugin = f"{remote_plugin_dir}/spur_mpi_pmix.so"
+            node.upload(str(plugin_path), remote_plugin)
 
     logger.info("Binaries ready at %s on all nodes", bin_dir)
 
@@ -372,6 +391,19 @@ class SpurCluster:
     def srun_with_exit(self, args: list[str]) -> tuple[int, str]:
         """Run srun and return (exit_code, combined stdout+stderr)."""
         cmd_parts = [
+            f"SPUR_CONTROLLER_ADDR={shlex.quote(self.controller_addr)}",
+            f"PATH={shlex.quote(self.bin_dir)}:$PATH",
+            shlex.quote(f"{self.bin_dir}/srun"),
+        ]
+        cmd_parts.extend(shlex.quote(a) for a in args)
+        _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
+        code = stdout.channel.recv_exit_status()
+        return code, stdout.read().decode() + stderr.read().decode()
+
+    def srun_in_allocation(self, job_id: int, args: list[str]) -> tuple[int, str]:
+        """Run srun inside an existing allocation (step mode, as after salloc)."""
+        cmd_parts = [
+            f"SPUR_JOB_ID={job_id}",
             f"SPUR_CONTROLLER_ADDR={shlex.quote(self.controller_addr)}",
             f"PATH={shlex.quote(self.bin_dir)}:$PATH",
             shlex.quote(f"{self.bin_dir}/srun"),
@@ -607,6 +639,66 @@ class SpurCluster:
             if not node.exec_allow_fail(f"test -x '{remote_bin}' && echo OK").strip():
                 pytest.skip(f"hipcc could not build {hip_filename} on {node.host}")
         return remote_bin
+
+    def mpi_preflight(self, min_nodes: int = 1):
+        """Skip unless MPI plugin, libpmix, and mpicc are available."""
+        missing = []
+        plugin_local = os.environ.get("SPUR_TEST_MPI_PLUGIN", "").strip()
+        if not plugin_local:
+            binaries_dir = os.environ.get(
+                "SPUR_TEST_BINARIES_DIR",
+                str(Path(__file__).resolve().parents[3] / "target" / "release"),
+            )
+            candidates = [
+                Path(binaries_dir).parent / "lib" / "spur" / "spur_mpi_pmix.so",
+                Path(binaries_dir) / "libspur_mpi_pmix.so",
+            ]
+            plugin_local = next((str(p) for p in candidates if p.is_file()), "")
+        if not plugin_local or not Path(plugin_local).is_file():
+            missing.append("spur_mpi_pmix.so (build -p spur-mpi-pmix or set SPUR_TEST_MPI_PLUGIN)")
+
+        if len(self.nodes) < min_nodes:
+            pytest.skip(
+                f"MPI tests require at least {min_nodes} node(s) "
+                f"(got {len(self.nodes)})"
+            )
+
+        for i, node in enumerate(self.nodes[:min_nodes]):
+            libpmix = node.exec_allow_fail(
+                "ldconfig -p 2>/dev/null | grep -q libpmix && echo OK || echo MISSING"
+            )
+            if "OK" not in libpmix:
+                missing.append(f"libpmix on {self.node_names[i]}")
+
+        mpicc = os.environ.get("SPUR_TEST_MPICC", "mpicc").strip() or "mpicc"
+        build_node = self.nodes[0]
+        mpicc_ok = build_node.exec_allow_fail(
+            f"command -v {shlex.quote(mpicc)} >/dev/null && echo OK || echo MISSING"
+        )
+        if "OK" not in mpicc_ok:
+            missing.append(f"{mpicc} on controller node {self.node_names[0]}")
+
+        if missing:
+            pytest.skip("MPI preflight failed: " + "; ".join(missing))
+
+    def compile_mpi_fixture(self, source_name: str = "hello_mpi.c") -> str:
+        """Ship and compile an MPI C fixture on all nodes. Returns remote binary path."""
+        self.mpi_preflight(1)
+        self.ship_fixture(source_name)
+        bin_name = source_name.rsplit(".", 1)[0]
+        remote_src = f"{self.remote_dir}/{source_name}"
+        remote_bin = f"{self.remote_dir}/{bin_name}"
+        mpicc = os.environ.get("SPUR_TEST_MPICC", "mpicc").strip() or "mpicc"
+        for node in self.nodes:
+            node.exec(
+                f"{shlex.quote(mpicc)} -o {shlex.quote(remote_bin)} {shlex.quote(remote_src)}"
+            )
+            if not node.exec_allow_fail(f"test -x '{remote_bin}' && echo OK").strip():
+                pytest.skip(f"{mpicc} could not build {source_name} on {node.host}")
+        return remote_bin
+
+    def mpi_plugin_dir(self) -> str:
+        return str(Path(self.bin_dir).parent / "lib" / "spur")
 
     def restart_agent(self, node_index: int = 0):
         """Restart spurd on one node without touching the controller."""

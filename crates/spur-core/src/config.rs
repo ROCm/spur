@@ -111,6 +111,10 @@ pub struct SlurmConfig {
     /// POSIX per-process resource limits applied to job steps at launch.
     #[serde(default)]
     pub rlimits: RlimitsConfig,
+
+    /// MPI plugin settings for `--mpi=pmix` job steps.
+    #[serde(default)]
+    pub mpi: MpiConfig,
 }
 
 /// Configuration for auto-update checking and self-update.
@@ -950,6 +954,51 @@ pub enum AdmissionMode {
     #[default]
     Open,
     Token,
+}
+
+/// PMIx plugin settings for `--mpi=pmix` jobs (batch launch and srun steps).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MpiConfig {
+    #[serde(default = "default_mpi_plugin_dir")]
+    pub plugin_dir: String,
+    #[serde(default)]
+    pub pmix_plugin: String,
+    #[serde(default = "default_pmix_tmpdir")]
+    pub pmix_tmpdir: String,
+    #[serde(default = "default_pmix_min_version")]
+    pub pmix_min_version: String,
+}
+
+fn default_mpi_plugin_dir() -> String {
+    "/usr/lib/spur".into()
+}
+
+fn default_pmix_tmpdir() -> String {
+    "/tmp/spur-pmix".into()
+}
+
+fn default_pmix_min_version() -> String {
+    "4.1.0".into()
+}
+
+impl Default for MpiConfig {
+    fn default() -> Self {
+        Self {
+            plugin_dir: default_mpi_plugin_dir(),
+            pmix_plugin: String::new(),
+            pmix_tmpdir: default_pmix_tmpdir(),
+            pmix_min_version: default_pmix_min_version(),
+        }
+    }
+}
+
+impl MpiConfig {
+    pub fn resolve_pmix_plugin_path(&self) -> std::path::PathBuf {
+        if !self.pmix_plugin.is_empty() {
+            return std::path::PathBuf::from(&self.pmix_plugin);
+        }
+        std::path::Path::new(&self.plugin_dir).join("spur_mpi_pmix.so")
+    }
 }
 
 /// POSIX per-process resource limits (`RLIMIT_*`) applied to job steps at launch.

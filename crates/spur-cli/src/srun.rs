@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::env_defaults::{apply_csv, apply_flag, apply_num, apply_str, apply_string};
+use crate::env_defaults::{apply_csv, apply_flag, apply_num, apply_str, was_cli_set};
 use anyhow::{Context, Result};
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use spur_core::config::HooksConfig;
@@ -119,9 +119,9 @@ pub struct SrunArgs {
     #[arg(long)]
     pub exclusive: bool,
 
-    /// MPI type (none, pmix, pmi2)
-    #[arg(long, default_value = "none")]
-    pub mpi: String,
+    /// MPI type (none, pmix). Inside an allocation, omit to inherit the job setting.
+    #[arg(long)]
+    pub mpi: Option<String>,
 
     /// Stdout file path (supports %j for job ID)
     #[arg(short = 'o', long)]
@@ -216,6 +216,20 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         std::process::exit(exit_code);
     }
 
+    if args.mpi.as_deref() == Some("list") {
+        let mpi_cfg = load_mpi_config();
+        for line in spur_core::mpi::mpi_list_lines(&mpi_cfg.plugin_dir) {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+
+    let step_mode = std::env::var("SPUR_JOB_ID")
+        .ok()
+        .and_then(|id| id.parse::<u32>().ok())
+        .is_some();
+    let resolved_mpi = resolve_srun_mpi(&args, &matches, step_mode)?;
+
     if args.command.is_empty() {
         eprintln!("srun: no command specified");
         std::process::exit(1);
@@ -246,11 +260,24 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     // Step mode: if running inside an allocation, create a step instead of a new job
     if let Ok(parent_job_id) = std::env::var("SPUR_JOB_ID") {
         if let Ok(job_id) = parent_job_id.parse::<u32>() {
-            return run_as_step(&args, job_id, &hooks, &work_dir).await;
+            return run_as_step(&args, job_id, &hooks, &work_dir, &resolved_mpi).await;
         }
     }
 
-    run_standalone_srun(&args, &hooks, &work_dir).await
+    run_standalone_srun(&args, &hooks, &work_dir, &resolved_mpi).await
+}
+
+/// Resolve `--mpi` for standalone srun vs step mode inside an allocation.
+fn resolve_srun_mpi(args: &SrunArgs, matches: &ArgMatches, step_mode: bool) -> Result<String> {
+    let mpi_explicit = was_cli_set(matches, "mpi")
+        || crate::env_defaults::env_first(&["SPUR_MPI_TYPE", "SLURM_MPI_TYPE"]).is_some();
+    if step_mode && !mpi_explicit && args.mpi.is_none() {
+        return Ok(String::new());
+    }
+    let raw = args.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
+    Ok(spur_core::mpi::parse_mpi_option(raw)
+        .map_err(|e| anyhow::anyhow!(e))?
+        .expect("list handled above"))
 }
 
 /// Apply environment-variable defaults to any flag not set on the command
@@ -386,7 +413,7 @@ fn resolve_srun_env(matches: &ArgMatches, args: &mut SrunArgs) -> Result<()> {
         &["SPUR_RESERVATION", "SLURM_RESERVATION"],
         &mut args.reservation,
     );
-    apply_string(
+    apply_str(
         matches,
         "mpi",
         &["SPUR_MPI_TYPE", "SLURM_MPI_TYPE"],
@@ -481,7 +508,12 @@ fn srun_dispatch_environment(args: &SrunArgs) -> HashMap<String, String> {
     environment
 }
 
-fn build_srun_job_spec(args: &SrunArgs, work_dir: &str, io: &ResolvedIoPaths) -> Result<JobSpec> {
+fn build_srun_job_spec(
+    args: &SrunArgs,
+    work_dir: &str,
+    io: &ResolvedIoPaths,
+    mpi: &str,
+) -> Result<JobSpec> {
     // GPU requests use dedicated proto fields; --gres=gpu:* stays in gres.
     let gres = args.gres.clone();
     let gpus = crate::sbatch::parse_gpu_flag(args.gpus.as_deref())?;
@@ -543,7 +575,7 @@ fn build_srun_job_spec(args: &SrunArgs, work_dir: &str, io: &ResolvedIoPaths) ->
         exclude: args.exclude.clone().unwrap_or_default(),
         reservation: args.reservation.clone().unwrap_or_default(),
         exclusive: args.exclusive,
-        mpi: args.mpi.clone(),
+        mpi: mpi.to_string(),
         licenses: args.licenses.clone(),
         container_image: args.container_image.clone().unwrap_or_default(),
         container_mounts: args.container_mounts.clone(),
@@ -657,13 +689,22 @@ async fn emit_step_output(
     }
 }
 
+struct StepDispatchParams<'a> {
+    args: &'a SrunArgs,
+    work_dir: &'a str,
+    io: &'a ResolvedIoPaths,
+    mpi: &'a str,
+}
+
 async fn dispatch_step(
     client: &mut SlurmControllerClient<tonic::transport::Channel>,
-    args: &SrunArgs,
     job_id: u32,
-    work_dir: &str,
-    io: &ResolvedIoPaths,
+    params: &StepDispatchParams<'_>,
 ) -> Result<StepDispatchResult> {
+    let args = params.args;
+    let work_dir = params.work_dir;
+    let io = params.io;
+    let step_mpi = params.mpi;
     let step_id = client
         .create_job_step(CreateJobStepRequest {
             job_id,
@@ -700,6 +741,7 @@ async fn dispatch_step(
             environment,
             step_id,
             label: args.label,
+            mpi: step_mpi.to_string(),
         })
         .await
         .context("RunStep dispatch failed")?
@@ -752,18 +794,15 @@ async fn release_srun_allocation(
 
 async fn dispatch_step_cancellable(
     client: &mut SlurmControllerClient<tonic::transport::Channel>,
-    args: &SrunArgs,
     job_id: u32,
-    _user: &str,
-    work_dir: &str,
-    io: &ResolvedIoPaths,
+    params: &StepDispatchParams<'_>,
     cancel_job_on_interrupt: bool,
 ) -> Result<StepDispatchResult> {
     if cancel_job_on_interrupt {
-        return dispatch_step(client, args, job_id, work_dir, io).await;
+        return dispatch_step(client, job_id, params).await;
     }
     tokio::select! {
-        result = dispatch_step(client, args, job_id, work_dir, io) => result,
+        result = dispatch_step(client, job_id, params) => result,
         _ = tokio::signal::ctrl_c() => {
             eprintln!("\nsrun: step interrupted");
             std::process::exit(130);
@@ -771,7 +810,12 @@ async fn dispatch_step_cancellable(
     }
 }
 
-async fn run_standalone_srun(args: &SrunArgs, hooks: &HooksConfig, work_dir: &str) -> Result<()> {
+async fn run_standalone_srun(
+    args: &SrunArgs,
+    hooks: &HooksConfig,
+    work_dir: &str,
+    mpi: &str,
+) -> Result<()> {
     let io = resolve_io_paths(args);
     let channel = spur_client::connect_channel(&args.controller)
         .await
@@ -779,7 +823,7 @@ async fn run_standalone_srun(args: &SrunArgs, hooks: &HooksConfig, work_dir: &st
     let mut client = SlurmControllerClient::new(channel);
     let user = whoami::username().unwrap_or_else(|_| "unknown".into());
 
-    let job_spec = build_srun_job_spec(args, work_dir, &io)?;
+    let job_spec = build_srun_job_spec(args, work_dir, &io, mpi)?;
     let job_id = client
         .submit_job(SubmitJobRequest {
             spec: Some(job_spec),
@@ -819,8 +863,14 @@ async fn run_standalone_srun(args: &SrunArgs, hooks: &HooksConfig, work_dir: &st
         .into_inner();
 
     if job.srun_step_dispatch {
+        let step_params = StepDispatchParams {
+            args,
+            work_dir,
+            io: &io,
+            mpi,
+        };
         let dispatch_result =
-            dispatch_step_cancellable(&mut client, args, job_id, &user, work_dir, &io, true).await;
+            dispatch_step_cancellable(&mut client, job_id, &step_params, true).await;
         let exit_code = match &dispatch_result {
             Ok(result) => result.exit_code,
             Err(_) => 1,
@@ -1202,6 +1252,7 @@ async fn run_as_step(
     job_id: u32,
     hooks: &HooksConfig,
     work_dir: &str,
+    step_mpi: &str,
 ) -> Result<()> {
     let channel = spur_client::connect_channel(&args.controller)
         .await
@@ -1213,10 +1264,15 @@ async fn run_as_step(
     }
 
     let io = resolve_io_paths(args);
-    let user = whoami::username().unwrap_or_else(|_| "unknown".into());
 
+    let step_params = StepDispatchParams {
+        args,
+        work_dir,
+        io: &io,
+        mpi: step_mpi,
+    };
     let dispatch_result =
-        dispatch_step_cancellable(&mut client, args, job_id, &user, work_dir, &io, false).await?;
+        dispatch_step_cancellable(&mut client, job_id, &step_params, false).await?;
 
     let state = if dispatch_result.exit_code == 0 {
         JobState::JobCompleted
@@ -1248,12 +1304,11 @@ fn parse_memory_mb(s: &str) -> Result<u64> {
 }
 
 fn load_hooks_config() -> HooksConfig {
-    let path_str = std::env::var("SPUR_CONF").unwrap_or_else(|_| "/etc/spur/spur.conf".to_string());
-    let path = std::path::Path::new(&path_str);
-    match spur_core::config::SlurmConfig::load_from_file(path) {
-        Ok(config) => config.hooks,
-        Err(_) => HooksConfig::default(),
-    }
+    crate::spur_config::load_spur_config().hooks
+}
+
+fn load_mpi_config() -> spur_core::config::MpiConfig {
+    crate::spur_config::load_spur_config().mpi
 }
 
 fn srun_hook_context(script_context: &str, work_dir: &str) -> spur_core::hooks::HookContext {
@@ -1447,7 +1502,7 @@ mod tests {
             stderr: String::new(),
             stdin: String::new(),
         };
-        let spec = build_srun_job_spec(&args, "/tmp/work", &io).expect("spec");
+        let spec = build_srun_job_spec(&args, "/tmp/work", &io, "none").expect("spec");
         assert!(spec.srun_job);
         assert_eq!(spec.num_nodes, 2);
         assert_eq!(spec.num_tasks, 4);
@@ -1475,7 +1530,8 @@ mod tests {
             stderr: String::new(),
             stdin: String::new(),
         };
-        let spec = build_srun_job_spec(&args, "/tmp/work", &io).expect("spec");
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
         assert_eq!(spec.qos, "high");
     }
 
@@ -1487,7 +1543,8 @@ mod tests {
             stderr: String::new(),
             stdin: String::new(),
         };
-        let spec = build_srun_job_spec(&args, "/tmp/work", &io).expect("spec");
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
         assert!(spec.exclusive);
     }
 
@@ -1499,7 +1556,8 @@ mod tests {
             stderr: String::new(),
             stdin: String::new(),
         };
-        let spec = build_srun_job_spec(&args, "/tmp/work", &io).expect("spec");
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
         assert!(spec.qos.is_empty());
     }
 
@@ -1765,7 +1823,7 @@ mod tests {
         assert_eq!(args.ntasks, 1);
         assert_eq!(args.cpus_per_task, 1);
         assert!(args.partition.is_none());
-        assert_eq!(args.mpi, "none");
+        assert!(args.mpi.is_none());
         assert!(!args.exclusive);
         assert!(!args.label);
     }

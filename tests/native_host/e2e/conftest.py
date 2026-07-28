@@ -13,9 +13,16 @@ from pathlib import Path
 
 import pytest
 
-from cluster import SshNode, SpurCluster, ensure_bins, make_remote_dir
+from cluster import SshNode, SpurCluster, deep_merge, ensure_bins, make_remote_dir
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "mpi: MPI end-to-end tests requiring spur_mpi_pmix.so, libpmix, and mpicc",
+    )
 
 
 def _get_nodes_config() -> list[str]:
@@ -274,5 +281,36 @@ def label_cluster(ssh_nodes, remote_bin_dir):
         },
         agent_labels={0: {"gpu": "mi300x"}},
     )
+    yield c
+    c.teardown()
+
+
+@pytest.fixture
+def mpi_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
+    """Single-node MPI tests with spur_mpi_pmix.so deployed."""
+    if len(ssh_nodes) < 1:
+        pytest.skip("MPI tests require at least one node in SPUR_TEST_NODES")
+    try:
+        ensure_bins(
+            ssh_nodes,
+            _get_binaries_dir(),
+            remote_bin_dir,
+            with_mpi_plugin=True,
+        )
+    except FileNotFoundError as exc:
+        pytest.skip(str(exc))
+
+    plugin_dir = str(Path(remote_bin_dir).parent / "lib" / "spur")
+    mpi_cfg = {
+        "mpi": {
+            "plugin_dir": plugin_dir,
+            "pmix_tmpdir": "/tmp/spur-pmix",
+        }
+    }
+    overrides = cluster_config_overrides or {}
+    merged = deep_merge(dict(overrides), mpi_cfg) if isinstance(overrides, dict) else mpi_cfg
+
+    c = _deploy_cluster(ssh_nodes, remote_bin_dir, config_overrides=merged)
+    c.mpi_preflight(1)
     yield c
     c.teardown()

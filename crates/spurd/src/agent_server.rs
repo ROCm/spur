@@ -20,12 +20,14 @@ use spur_sched::cons_tres::{AllocError, AllocationResult, NodeAllocation};
 
 use spur_spank::{SpankContext, SpankHandle, SpankHook, SpankHost};
 
-use spur_core::config::HooksConfig;
+use spur_core::config::{HooksConfig, MpiConfig};
+use spur_core::mpi::{resolve_step_mpi, MPI_NONE, MPI_PMIX};
 use spur_core::spur_env::SpurEnv;
 use spur_core::task_launch::build_multi_task_wrapper;
 use spur_devices::DeviceRegistry;
 
 use crate::executor;
+use crate::mpi_plugin::{self, MpiPluginHost, PmixLaunchGuard};
 use crate::pmi::PmiServer;
 use crate::reporter::NodeReporter;
 
@@ -66,10 +68,27 @@ struct CompletedJob {
     cpus: u32,
     memory_mb: u64,
     nodelist: String,
+    mpi: String,
 }
 
 /// Per-node registry of running PMI servers, keyed by job id.
 type PmiServers = Arc<Mutex<HashMap<u32, Arc<PmiServer>>>>;
+
+async fn cleanup_completed_job_mpi(
+    job_id: u32,
+    mpi: &str,
+    pmi_servers: &PmiServers,
+    mpi_host: &MpiPluginHost,
+) {
+    if let Some(pmi) = pmi_servers.lock().await.remove(&job_id) {
+        pmi.cleanup();
+    }
+    if mpi == MPI_PMIX {
+        if let Err(e) = mpi_host.release_pmix_server(job_id) {
+            warn!(job_id, error = %e, "PMIx batch ref release failed");
+        }
+    }
+}
 
 pub struct AgentService {
     pub reporter: Arc<NodeReporter>,
@@ -77,6 +96,7 @@ pub struct AgentService {
     allocation: Arc<Mutex<NodeAllocation>>,
     spank: Arc<Option<SpankHost>>,
     pmi_servers: PmiServers,
+    mpi_host: Arc<MpiPluginHost>,
     hooks: Arc<HooksConfig>,
     memlock: spur_core::config::MemlockLimit,
     #[allow(dead_code)]
@@ -101,6 +121,7 @@ impl AgentService {
             device_registry,
             &spur_core::config::ClusterConfig::default(),
             memlock,
+            MpiConfig::default(),
         )
     }
 
@@ -112,6 +133,7 @@ impl AgentService {
         device_registry: Arc<Mutex<DeviceRegistry>>,
         cluster: &spur_core::config::ClusterConfig,
         memlock: spur_core::config::MemlockLimit,
+        mpi: MpiConfig,
     ) -> Self {
         let allocation = NodeAllocation::new(
             hostname::get()
@@ -170,6 +192,7 @@ impl AgentService {
             allocation: Arc::new(Mutex::new(allocation)),
             spank: Arc::new(spank),
             pmi_servers: Arc::new(Mutex::new(HashMap::new())),
+            mpi_host: Arc::new(MpiPluginHost::new(mpi)),
             hooks: Arc::new(hooks),
             memlock,
             device_registry,
@@ -187,6 +210,7 @@ impl AgentService {
         let running = self.running.clone();
         let allocation = self.allocation.clone();
         let spank = self.spank.clone();
+        let mpi_host = self.mpi_host.clone();
         let pmi_servers = self.pmi_servers.clone();
         let hooks = self.hooks.clone();
         tokio::spawn(async move {
@@ -225,6 +249,7 @@ impl AgentService {
                                 cpus: tracked.cpus,
                                 memory_mb: tracked.memory_mb,
                                 nodelist: tracked.nodelist.clone(),
+                                mpi: tracked.mpi.clone(),
                             });
                         }
                         Ok(None) => {}
@@ -242,9 +267,7 @@ impl AgentService {
                         crate::executor::cleanup_cgroup(cgroup);
                     }
                     allocation.lock().await.release_job(c.job_id);
-                    if let Some(pmi) = pmi_servers.lock().await.remove(&c.job_id) {
-                        pmi.cleanup();
-                    }
+                    cleanup_completed_job_mpi(c.job_id, &c.mpi, &pmi_servers, &mpi_host).await;
                 }
 
                 // Self-heal backstop: reclaim allocations with no tracked,
@@ -732,13 +755,12 @@ impl SlurmAgent for AgentService {
         // Spur-only vars
         senv.set("SPUR_NODE_RANK", node_rank);
         if tasks_per_node == 1 {
-            SpurEnv::apply_task_rank(&mut senv, task_offset, 0, 1);
+            SpurEnv::apply_task_rank(&mut senv, task_offset, 0, 1, spec.mpi == MPI_PMIX);
         } else {
             senv.set("SPUR_TASK_OFFSET", task_offset);
             senv.set("LOCAL_RANK", "0");
             senv.set("LOCAL_WORLD_SIZE", tasks_per_node);
             senv.set("NPROC_PER_NODE", tasks_per_node);
-            senv.set("PMI_RANK", task_offset);
         }
         if !peer_nodes.is_empty() {
             senv.set("SPUR_PEER_NODES", peer_nodes.join(","));
@@ -757,24 +779,6 @@ impl SlurmAgent for AgentService {
             senv.set("NPROC_PER_NODE", tasks_per_node);
         }
         senv.set("NODE_RANK", node_rank);
-
-        senv.set("PMI_SIZE", spec.num_tasks);
-        senv.set("PMI_UNIVERSE_SIZE", spec.num_tasks);
-        senv.set("PMI_APPNUM", "0");
-        if tasks_per_node > 1 {
-            senv.set("PMI_RANK", task_offset);
-        }
-
-        if spec.mpi == "pmix" {
-            senv.set("PMIX_SIZE", spec.num_tasks);
-            senv.set("PMIX_NAMESPACE", format!("spur.{}", job_id));
-            senv.set("PMIX_RANK", task_offset);
-            senv.set("OMPI_COMM_WORLD_SIZE", spec.num_tasks);
-            senv.set("OMPI_COMM_WORLD_RANK", task_offset);
-            senv.set("OMPI_COMM_WORLD_LOCAL_RANK", "0");
-            senv.set("OMPI_COMM_WORLD_LOCAL_SIZE", tasks_per_node);
-            senv.set("OMPI_COMM_WORLD_NODE_RANK", node_rank);
-        }
 
         if peer_nodes.len() > 1 {
             if let Some(first_peer) = peer_nodes.first() {
@@ -902,7 +906,12 @@ impl SlurmAgent for AgentService {
             }
 
             // Build the wrapper that launches N tasks with GPU partitioning
-            build_multi_task_wrapper(&user_script_path, tasks_per_node, None)
+            build_multi_task_wrapper(
+                &user_script_path,
+                tasks_per_node,
+                None,
+                spec.mpi == MPI_PMIX,
+            )
         } else {
             launch_script
         };
@@ -951,6 +960,77 @@ impl SlurmAgent for AgentService {
             cfg.device_plan = Some(container_device_plan);
         }
 
+        if let Some(ref prolog) = self.hooks.prolog {
+            let ctx = spur_core::hooks::HookContext {
+                job_id,
+                work_dir: work_dir.clone(),
+                uid: spec.uid,
+                gid: spec.gid,
+                partition: spec.partition.clone(),
+                nodelist: spec.nodelist.clone(),
+                script_context: "prolog_slurmd".into(),
+                gpu_devices: allocated_device_ids.clone(),
+                cpus: spec.cpus_per_task.max(1),
+                memory_mb: spec.memory_per_node_mb,
+            };
+            if let Err(e) = spur_core::hooks::run_hook(prolog, &ctx).await {
+                let err_msg = format!("prolog failed: {e}");
+                error!(job_id, error = %err_msg, "prolog hook failed before launch");
+                let controller = self.reporter.controller_addr.clone();
+                let node_name = self.reporter.hostname.clone();
+                let drain_reason = err_msg.clone();
+                tokio::spawn(async move {
+                    let drain = DrainRequest {
+                        reason: drain_reason.clone(),
+                    };
+                    report_completion(
+                        &controller,
+                        job_id,
+                        -1,
+                        0,
+                        run_attempt,
+                        &node_name,
+                        Some(&drain),
+                    )
+                    .await;
+                });
+                return Ok(Response::new(LaunchJobResponse {
+                    success: false,
+                    error: err_msg,
+                    stdout_path: String::new(),
+                    stderr_path: String::new(),
+                }));
+            }
+        }
+
+        let mut pmix_guard = None;
+        if spec.mpi == MPI_PMIX {
+            let plan = req
+                .pmix_plan
+                .as_ref()
+                .ok_or_else(|| {
+                    Status::failed_precondition("missing PMIx launch plan for --mpi=pmix job")
+                })
+                .and_then(|proto| {
+                    mpi_plugin::plan_from_proto(proto).map_err(Status::failed_precondition)
+                })?;
+            pmix_guard = Some(
+                PmixLaunchGuard::start(self.mpi_host.clone(), &plan)
+                    .map_err(Status::failed_precondition)?,
+            );
+            // Single-node Mode 1: one PMIX_SERVER_URI in the parent env; the multi-task
+            // wrapper overrides PMIX_RANK per fork via SPUR_PROCID.
+            let pmix_env = self
+                .mpi_host
+                .pmix_env_for_rank(&plan, task_offset)
+                .map_err(Status::failed_precondition)?;
+            env.extend(pmix_env);
+        }
+
+        if let Some(ref mut cfg) = container_config {
+            cfg.environment = env.clone();
+        }
+
         let cpu_ids: Vec<u32> = alloc_result.cpu_ids.clone();
 
         // Guard rather than unwrap: these are always Some when the image is
@@ -995,7 +1075,7 @@ impl SlurmAgent for AgentService {
             uid: spec.uid,
             gid: spec.gid,
             container: container_launch,
-            prolog_script: self.hooks.prolog.clone(),
+            prolog_script: None,
             partition: spec.partition.clone(),
             nodelist: spec.nodelist.clone(),
             host_device_plan: Some(host_device_plan),
@@ -1009,6 +1089,7 @@ impl SlurmAgent for AgentService {
 
         match executor::launch_job(&launch_cfg, (*self.spank).as_ref()).await {
             Ok(mut result) => {
+                pmix_guard.as_mut().map(PmixLaunchGuard::disarm);
                 let mut jobs = self.running.lock().await;
                 // Commit the reservation: the job now has a tracked process, so
                 // it is no longer exempt from reconcile. Take the running lock
@@ -1029,6 +1110,9 @@ impl SlurmAgent for AgentService {
                         "reservation reclaimed during launch; aborting to avoid running unbacked"
                     );
                     self.cleanup_pmi_server(job_id).await;
+                    if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
+                        warn!(job_id, error = %e, "PMIx stop failed after reclaimed reservation");
+                    }
                     let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                     let cgroup = result.job.take_cgroup();
                     let running = self.running.clone();
@@ -1379,7 +1463,7 @@ impl SlurmAgent for AgentService {
         };
         let step_id = req.step_id;
 
-        let (gpu_devices, partition, cpus, memory_mb, nodelist, mpi, num_tasks_total) = {
+        let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
                 Status::not_found(format!("job {} not running on this node", job_id))
@@ -1398,7 +1482,6 @@ impl SlurmAgent for AgentService {
                 tracked.memory_mb,
                 nodelist,
                 tracked.mpi.clone(),
-                step_num_tasks,
             )
         };
 
@@ -1462,16 +1545,20 @@ impl SlurmAgent for AgentService {
             senv.set("SPUR_LABEL", "1");
         }
 
-        let tasks_per_node = num_tasks;
-        senv.set("PMI_SIZE", num_tasks_total);
-        senv.set("PMI_UNIVERSE_SIZE", num_tasks_total);
-        senv.set("PMI_APPNUM", "0");
-        if mpi == "pmix" {
-            senv.set("PMIX_SIZE", num_tasks_total);
-            senv.set("PMIX_NAMESPACE", format!("spur.{job_id}"));
-            senv.set("OMPI_COMM_WORLD_SIZE", num_tasks_total);
-            senv.set("OMPI_COMM_WORLD_NODE_RANK", node_id);
-            senv.set("OMPI_COMM_WORLD_LOCAL_SIZE", tasks_per_node);
+        let step_mpi_type = resolve_step_mpi(req.mpi.as_str(), job_mpi.as_str());
+        if !step_mpi_type.is_empty() && step_mpi_type != MPI_NONE && step_mpi_type != MPI_PMIX {
+            return Err(Status::invalid_argument(format!(
+                "invalid step mpi type '{step_mpi_type}'"
+            )));
+        }
+        let step_mpi = step_mpi_type == MPI_PMIX;
+        if req.pmix_plan.is_some() && !step_mpi {
+            return Err(Status::invalid_argument("pmix_plan requires step mpi=pmix"));
+        }
+        if step_mpi && req.pmix_plan.is_none() {
+            return Err(Status::invalid_argument(
+                "step mpi=pmix requires a PMIx launch plan",
+            ));
         }
 
         let (program, program_args, step_script_cleanup) = if num_tasks > 1 || req.label {
@@ -1497,6 +1584,7 @@ impl SlurmAgent for AgentService {
                     user_script_path.to_string_lossy().as_ref(),
                     num_tasks,
                     Some(&req.environment),
+                    step_mpi,
                 )
             } else {
                 spur_core::task_launch::build_labeled_single_task_wrapper(
@@ -1512,12 +1600,12 @@ impl SlurmAgent for AgentService {
             if num_tasks > 1 {
                 senv.set("SPUR_TASK_OFFSET", req.task_offset);
             } else {
-                SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0, 1);
+                SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0, 1, step_mpi);
             }
             let wrapper_path_string = wrapper_path.to_string_lossy().into_owned();
             ("bash".to_string(), vec![wrapper_path_string], Some(guard))
         } else {
-            SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0, 1);
+            SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0, 1, step_mpi);
             let (program, args) = spur_core::task_launch::wrap_command_with_cpu_bind(
                 &req.command[0],
                 &req.command[1..],
@@ -1528,9 +1616,46 @@ impl SlurmAgent for AgentService {
         };
         let _step_script_guard = step_script_cleanup;
 
+        if let Some(ref task_prolog) = self.hooks.task_prolog {
+            let ctx = spur_core::hooks::HookContext {
+                job_id,
+                work_dir: work_dir.clone(),
+                uid: req.uid,
+                gid: req.gid,
+                partition: partition.clone(),
+                nodelist: nodelist.clone(),
+                script_context: "prolog_task".into(),
+                gpu_devices: gpu_devices.clone(),
+                cpus,
+                memory_mb,
+            };
+            if let Err(e) = spur_core::hooks::run_hook(task_prolog, &ctx).await {
+                return Err(Status::aborted(format!("TaskProlog failed: {}", e)));
+            }
+        }
+
+        let mut env = senv.into_map();
+        let mut _pmix_step_guard = None;
+        if step_mpi {
+            let proto_plan = req
+                .pmix_plan
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("missing PMIx launch plan"))?;
+            let plan = mpi_plugin::plan_from_proto(proto_plan).map_err(Status::invalid_argument)?;
+            _pmix_step_guard = Some(
+                PmixLaunchGuard::start(self.mpi_host.clone(), &plan)
+                    .map_err(Status::failed_precondition)?,
+            );
+            let pmix_env = self
+                .mpi_host
+                .pmix_env_for_rank(&plan, req.task_offset)
+                .map_err(Status::failed_precondition)?;
+            env.extend(pmix_env);
+        }
+
         let mut cmd = tokio::process::Command::new(&program);
         cmd.args(&program_args).current_dir(&work_dir);
-        for (k, v) in senv.into_map() {
+        for (k, v) in env {
             cmd.env(k, v);
         }
 
@@ -1555,24 +1680,6 @@ impl SlurmAgent for AgentService {
             work_dir = %work_dir,
             "RunCommand: executing step"
         );
-
-        if let Some(ref task_prolog) = self.hooks.task_prolog {
-            let ctx = spur_core::hooks::HookContext {
-                job_id,
-                work_dir: work_dir.clone(),
-                uid: req.uid,
-                gid: req.gid,
-                partition: partition.clone(),
-                nodelist: nodelist.clone(),
-                script_context: "prolog_task".into(),
-                gpu_devices: gpu_devices.clone(),
-                cpus,
-                memory_mb,
-            };
-            if let Err(e) = spur_core::hooks::run_hook(task_prolog, &ctx).await {
-                return Err(Status::aborted(format!("TaskProlog failed: {}", e)));
-            }
-        }
 
         let output = cmd
             .output()
@@ -1919,6 +2026,9 @@ impl AgentService {
     async fn drop_tracked_job(&self, job_id: u32) {
         if self.running.lock().await.remove(&job_id).is_some() {
             self.allocation.lock().await.release_job(job_id);
+            if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
+                warn!(job_id, error = %e, "PMIx stop failed on job drop");
+            }
         }
     }
 
@@ -3333,6 +3443,60 @@ mod tests {
         assert!(
             !std::path::Path::new(&socket_path).exists(),
             "pmi socket file must be removed"
+        );
+    }
+
+    // Monitor completion must tear down PMI servers for pmi1 multi-task jobs.
+    #[tokio::test]
+    async fn completion_cleanup_removes_pmi_server() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let socket_path = format!("/tmp/spur-pmi-complete-{}.sock", std::process::id());
+        let pmi = Arc::new(crate::pmi::PmiServer::new(&socket_path, 2));
+        std::fs::write(&socket_path, b"").expect("create fake socket");
+        svc.pmi_servers.lock().await.insert(42, pmi);
+
+        cleanup_completed_job_mpi(42, "pmi1", &svc.pmi_servers, &svc.mpi_host).await;
+
+        assert!(
+            !svc.pmi_servers.lock().await.contains_key(&42),
+            "completion cleanup must remove the PMI entry"
+        );
+        assert!(
+            !std::path::Path::new(&socket_path).exists(),
+            "completion cleanup must remove the PMI socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_cleanup_releases_batch_pmix_ref_without_force_stop() {
+        use crate::mpi_plugin::ActiveNamespace;
+
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        svc.mpi_host.active_namespaces.lock().unwrap().insert(
+            99,
+            ActiveNamespace {
+                namespace: "spur.99".into(),
+                refs: 2,
+            },
+        );
+
+        cleanup_completed_job_mpi(99, MPI_PMIX, &svc.pmi_servers, &svc.mpi_host).await;
+
+        assert!(
+            svc.mpi_host.has_active_pmix(99),
+            "batch completion must release one ref, not force-stop an active step namespace"
         );
     }
 

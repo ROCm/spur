@@ -18,6 +18,27 @@ Build
 
 All crates build in one invocation — no separate steps needed.
 
+MPI plugin (optional)
+~~~~~~~~~~~~~~~~~~~~~
+
+Single-node Open MPI jobs use ``--mpi=pmix``, which loads ``spur_mpi_pmix.so`` on
+compute nodes at runtime (``spurd`` itself does not link libpmix). Build the
+plugin when libpmix development packages are installed (``pkg-config pmix`` must
+succeed):
+
+.. code-block:: bash
+
+   cargo build --release -p spur-mpi-pmix
+   sudo install -D target/release/libspur_mpi_pmix.so /usr/lib/spur/spur_mpi_pmix.so
+
+Without libpmix, the crate still builds a stub plugin that fails at load time with
+an actionable error. Container images can include a functional plugin by building
+with ``BUILD_MPI_PLUGIN=1`` (see ``Dockerfile``).
+
+Native-host MPI E2E tests (``pytest -m mpi``) additionally require ``mpicc`` on
+the test nodes and ``SPUR_TEST_MPI_PLUGIN`` (or the default plugin path under
+``target/release/../lib/spur/``).
+
 Running Tests
 -------------
 

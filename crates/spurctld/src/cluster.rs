@@ -295,6 +295,9 @@ impl ClusterManager {
         apply_default_account(&mut spec, &self.association_cache);
         validate_user_account(&spec, &self.association_cache)?;
         self.validate_partition(&spec)?;
+        let mpi = spec.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
+        spur_core::mpi::validate_single_node_pmix(mpi, spec.num_nodes)
+            .map_err(SubmitError::invalid)?;
         apply_default_qos(
             &mut spec,
             &self.association_cache,
@@ -4920,6 +4923,7 @@ mod tests {
             devices: Default::default(),
             admission: Default::default(),
             rlimits: Default::default(),
+            mpi: Default::default(),
         }
     }
 

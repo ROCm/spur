@@ -23,6 +23,7 @@ mod sdiag;
 mod sinfo;
 mod smd;
 mod sprio;
+mod spur_config;
 mod squeue;
 mod sreport;
 mod srun;

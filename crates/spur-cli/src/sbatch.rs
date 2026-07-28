@@ -197,7 +197,7 @@ pub struct SbatchArgs {
     #[arg(long, overrides_with = "open_mode")]
     pub open_mode: Option<String>,
 
-    /// MPI type (none, pmix, pmi2)
+    /// MPI type (none, pmix)
     #[arg(long, default_value = "none", overrides_with = "mpi")]
     pub mpi: String,
 
@@ -732,6 +732,17 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
 
     let mut args = resolve_sbatch_args(&directive_args, &cli_args)?;
     let nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
+
+    if args.mpi == "list" {
+        let plugin_dir = crate::spur_config::load_spur_config().mpi.plugin_dir;
+        for line in spur_core::mpi::mpi_list_lines(&plugin_dir) {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+    args.mpi = spur_core::mpi::parse_mpi_option(&args.mpi)
+        .map_err(|e| anyhow::anyhow!(e))?
+        .expect("list handled above");
 
     // Build the job spec
     let is_wrap = args.wrap.is_some();
