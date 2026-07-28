@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Environment-variable defaults for `srun` and `salloc` flags.
+//! Environment-variable defaults for `srun`, `salloc`, and `sbatch` flags.
 //!
 //! clap's `#[arg(env = ...)]` accepts a single variable name, but Slurm
 //! defines several aliases per flag (e.g. `--nodes` reads `SLURM_NNODES` and
@@ -136,10 +136,10 @@ where
 
 /// Test-only guard that isolates env-var tests from the runner's environment.
 ///
-/// Clears every `SPUR_/SLURM_/SALLOC_/SRUN_`-prefixed variable on construction
-/// and on drop, so a CI runner that injects `SLURM_*` vars cannot perturb the
-/// resolvers and a panicking test cannot leak state into the next one. Tests
-/// using it must be `#[serial]`.
+/// Clears every `SPUR_/SLURM_/SALLOC_/SRUN_/SBATCH_`-prefixed variable on
+/// construction and on drop, so a CI runner that injects `SLURM_*` vars cannot
+/// perturb the resolvers and a panicking test cannot leak state into the next
+/// one. Tests using it must be `#[serial]`.
 #[cfg(test)]
 pub(crate) struct EnvGuard;
 
@@ -162,6 +162,7 @@ impl EnvGuard {
                     || k.starts_with("SLURM_")
                     || k.starts_with("SALLOC_")
                     || k.starts_with("SRUN_")
+                    || k.starts_with("SBATCH_")
             })
             .collect();
         for k in stale {
