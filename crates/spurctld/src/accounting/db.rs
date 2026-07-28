@@ -7,11 +7,27 @@ use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgConnection, PgRow};
 use sqlx::{PgPool, QueryBuilder, Row};
 
-/// Run database migrations (create tables if they don't exist).
+/// Apply the database schema, serialized across controllers by a fixed advisory
+/// lock: migrate now also rewrites data (default-account dedup) and builds a
+/// unique index, so concurrent runs against a shared database must not overlap.
+/// The lock is transaction-scoped, so it releases even if the apply fails.
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
-    sqlx::raw_sql(SCHEMA).execute(pool).await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(SCHEMA_LOCK_CLASS)
+        .bind(SCHEMA_LOCK_OBJ)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::raw_sql(SCHEMA).execute(&mut *tx).await?;
+    tx.commit().await?;
     Ok(())
 }
+
+// Advisory-lock keys that serialize `migrate` across controllers. The two-int4
+// form is a distinct lock space from the single-bigint per-user locks
+// `add_user` takes, so the keys can never collide.
+const SCHEMA_LOCK_CLASS: i32 = 0x5350_5552; // 'SPUR'
+const SCHEMA_LOCK_OBJ: i32 = 1;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS jobs (
@@ -92,7 +108,6 @@ CREATE TABLE IF NOT EXISTS associations (
     account         TEXT NOT NULL REFERENCES accounts(name),
     partition_name  TEXT,
     fairshare_weight INTEGER NOT NULL DEFAULT 1,
-    is_default      BOOLEAN NOT NULL DEFAULT false,
     max_running_jobs INTEGER,
     max_submit_jobs INTEGER,
     max_tres_per_job TEXT,
@@ -129,6 +144,26 @@ ALTER TABLE associations ADD COLUMN IF NOT EXISTS default_qos TEXT;
 ALTER TABLE associations ADD COLUMN IF NOT EXISTS allowed_qos TEXT;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS grp_wall_min INTEGER;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS grp_tres TEXT;
+
+-- users.default_account is the single source of truth for a user's default
+-- account (the scheduler reads it via the association cache). associations
+-- once carried a redundant is_default flag that nothing read; drop it so the
+-- two representations can't drift.
+ALTER TABLE associations DROP COLUMN IF EXISTS is_default;
+
+-- One default account per user. Pre-fix rows could mark several accounts
+-- default; collapse each user to one (the lowest account name) before the index
+-- below, which would otherwise fail to build. Idempotent: a no-op once clean.
+UPDATE users u SET default_account = NULL
+WHERE default_account IS NOT NULL
+  AND EXISTS (
+    SELECT 1 FROM users o
+    WHERE o.name = u.name
+      AND o.default_account IS NOT NULL
+      AND o.account < u.account
+  );
+CREATE UNIQUE INDEX IF NOT EXISTS one_default_account_per_user
+    ON users (name) WHERE default_account IS NOT NULL;
 "#;
 
 /// Record a job start in the database.
@@ -486,32 +521,145 @@ use chrono::Timelike;
 // Account / User / QOS management (sacctmgr operations)
 // ============================================================
 
-/// Create or update an account. Like `upsert_qos`/`add_user`, this is a full
-/// resend on modify, not a partial patch: a `None` `grp_tres` clears it.
-#[allow(clippy::too_many_arguments)]
-pub async fn upsert_account(
+/// A single bound value in a dynamically built accounting write. The variant
+/// carries the concrete type so one builder can mix columns; the `Null*`
+/// variants bind SQL `NULL` for `None`, which is how a nullable column is
+/// cleared.
+#[derive(Clone, Copy)]
+enum SqlVal<'a> {
+    Text(&'a str),
+    NullText(Option<&'a str>),
+    Int(i32),
+    NullInt(Option<i32>),
+    Real(f64),
+}
+
+fn push_bound(qb: &mut QueryBuilder<sqlx::Postgres>, val: SqlVal<'_>) {
+    match val {
+        SqlVal::Text(v) => qb.push_bind(v),
+        SqlVal::NullText(v) => qb.push_bind(v),
+        SqlVal::Int(v) => qb.push_bind(v),
+        SqlVal::NullInt(v) => qb.push_bind(v),
+        SqlVal::Real(v) => qb.push_bind(v),
+    };
+}
+
+/// The tables `upsert_row` can target. A closed set of variants (not a free
+/// `&str`) so the table name and ON CONFLICT target spliced into the SQL text
+/// can only ever be known literals — no caller can route user input into a
+/// SQL identifier position, even by mistake in future edits.
+#[derive(Clone, Copy)]
+enum UpsertTable {
+    Accounts,
+    Qos,
+}
+
+impl UpsertTable {
+    fn name(self) -> &'static str {
+        match self {
+            UpsertTable::Accounts => "accounts",
+            UpsertTable::Qos => "qos",
+        }
+    }
+
+    fn conflict_target(self) -> &'static str {
+        match self {
+            UpsertTable::Accounts | UpsertTable::Qos => "name",
+        }
+    }
+}
+
+/// Insert `keys` + `updates`, updating only `updates` columns on conflict
+/// (identity `keys` never overwritten; absent columns keep their stored value,
+/// take the schema default on insert — the partial-patch contract). No `updates`
+/// = create-if-absent. Table is a closed enum, columns `&'static str` — injection-safe.
+async fn upsert_row(
     pool: &PgPool,
-    name: &str,
-    description: &str,
-    organization: &str,
-    parent: Option<&str>,
-    fairshare: i32,
-    max_running_jobs: Option<i32>,
-    grp_tres: Option<&str>,
+    table: UpsertTable,
+    keys: &[(&'static str, SqlVal<'_>)],
+    updates: &[(&'static str, SqlVal<'_>)],
 ) -> anyhow::Result<()> {
-    sqlx::query(
-        r#"
-        INSERT INTO accounts (name, description, organization, parent_account, fairshare_weight, max_running_jobs, grp_tres)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (name) DO UPDATE SET
-            description = $2, organization = $3, parent_account = $4,
-            fairshare_weight = $5, max_running_jobs = $6, grp_tres = $7
-        "#,
-    )
-    .bind(name).bind(description).bind(organization)
-    .bind(parent).bind(fairshare).bind(max_running_jobs).bind(grp_tres)
-    .execute(pool).await?;
+    let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new("INSERT INTO ");
+    qb.push(table.name()).push(" (");
+    let mut first = true;
+    for (col, _) in keys.iter().chain(updates.iter()) {
+        if !first {
+            qb.push(", ");
+        }
+        first = false;
+        qb.push(*col);
+    }
+    qb.push(") VALUES (");
+    first = true;
+    for (_, val) in keys.iter().chain(updates.iter()) {
+        if !first {
+            qb.push(", ");
+        }
+        first = false;
+        push_bound(&mut qb, *val);
+    }
+    qb.push(") ON CONFLICT (")
+        .push(table.conflict_target())
+        .push(")");
+    if updates.is_empty() {
+        qb.push(" DO NOTHING");
+    } else {
+        qb.push(" DO UPDATE SET ");
+        first = true;
+        for (col, _) in updates {
+            if !first {
+                qb.push(", ");
+            }
+            first = false;
+            qb.push(*col).push(" = EXCLUDED.").push(*col);
+        }
+    }
+    qb.build().execute(pool).await?;
     Ok(())
+}
+
+/// Partial-patch fields for [`upsert_account`]. Outer `None` leaves the column
+/// unchanged (partial patch on modify); for nullable columns the inner `None`
+/// clears it to SQL `NULL`.
+#[derive(Default)]
+pub struct AccountUpdate<'a> {
+    pub description: Option<&'a str>,
+    pub organization: Option<&'a str>,
+    pub parent: Option<Option<&'a str>>,
+    pub fairshare: Option<i32>,
+    pub max_running_jobs: Option<Option<i32>>,
+    pub grp_tres: Option<Option<&'a str>>,
+}
+
+/// Create or update an account, writing only the fields set in `u`. `modify`
+/// sends just the restated fields, so unset columns are preserved; `add` sets
+/// all of them.
+pub async fn upsert_account<'a>(
+    pool: &PgPool,
+    name: &'a str,
+    u: AccountUpdate<'a>,
+) -> anyhow::Result<()> {
+    let keys = [("name", SqlVal::Text(name))];
+    let mut updates: Vec<(&'static str, SqlVal)> = Vec::new();
+    if let Some(v) = u.description {
+        updates.push(("description", SqlVal::Text(v)));
+    }
+    if let Some(v) = u.organization {
+        updates.push(("organization", SqlVal::Text(v)));
+    }
+    if let Some(v) = u.parent {
+        updates.push(("parent_account", SqlVal::NullText(v)));
+    }
+    if let Some(v) = u.fairshare {
+        updates.push(("fairshare_weight", SqlVal::Int(v)));
+    }
+    if let Some(v) = u.max_running_jobs {
+        updates.push(("max_running_jobs", SqlVal::NullInt(v)));
+    }
+    if let Some(v) = u.grp_tres {
+        updates.push(("grp_tres", SqlVal::NullText(v)));
+    }
+    upsert_row(pool, UpsertTable::Accounts, &keys, &updates).await
 }
 
 /// Delete an account.
@@ -555,94 +703,148 @@ pub struct AccountRecord {
     pub grp_tres: Option<String>,
 }
 
-/// Add a user-account association. Like `upsert_account`/`upsert_qos`, this
-/// is a full resend on modify, not a partial patch: an empty `default_qos`,
-/// or a `None`/zero limit, clears any existing value rather than preserving
-/// it. Numeric limits use `None` (not 0) for "no limit", matching how
-/// `list_associations`/`AssociationCache` read an unset limit back out.
-#[allow(clippy::too_many_arguments)]
-pub async fn add_user(
-    pool: &PgPool,
+/// Update the partition-less association's provided columns, inserting the row
+/// if none exists. Serialized per (user, account) by the caller's advisory lock
+/// so a concurrent first-time write can't double-insert: `partition_name` is
+/// nullable (NULL != NULL), so `ON CONFLICT` can't dedupe it here.
+async fn upsert_association(
+    conn: &mut PgConnection,
     user: &str,
     account: &str,
-    admin_level: &str,
-    is_default: bool,
-    default_qos: &str,
-    allowed_qos: &str,
-    max_running_jobs: Option<i32>,
-    max_submit_jobs: Option<i32>,
-    max_tres_per_job: Option<&str>,
-    grp_tres: Option<&str>,
-    max_wall_min: Option<i32>,
+    updates: &[(&'static str, SqlVal<'_>)],
 ) -> anyhow::Result<()> {
-    sqlx::query(
-        r#"
-        INSERT INTO users (name, account, admin_level, default_account)
-        VALUES ($1, $2, $3, CASE WHEN $4 THEN $2 ELSE NULL END)
-        ON CONFLICT (name, account) DO UPDATE SET admin_level = $3
-        "#,
-    )
-    .bind(user)
-    .bind(account)
-    .bind(admin_level)
-    .bind(is_default)
-    .execute(pool)
-    .await?;
+    let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new("UPDATE associations SET ");
+    let mut first = true;
+    for (col, val) in updates {
+        if !first {
+            qb.push(", ");
+        }
+        first = false;
+        qb.push(*col).push(" = ");
+        push_bound(&mut qb, *val);
+    }
+    qb.push(" WHERE user_name = ").push_bind(user);
+    qb.push(" AND account = ").push_bind(account);
+    qb.push(" AND (partition_name IS NULL OR partition_name = '')");
+    let updated = qb.build().execute(&mut *conn).await?;
+    if updated.rows_affected() > 0 {
+        return Ok(());
+    }
 
-    // partition_name is nullable (NULL != NULL), so ON CONFLICT on it can't
-    // upsert; update explicitly, serialized per (user, account) so two
-    // concurrent first-time calls can't both insert.
+    let mut qb: QueryBuilder<sqlx::Postgres> =
+        QueryBuilder::new("INSERT INTO associations (user_name, account");
+    for (col, _) in updates {
+        qb.push(", ").push(*col);
+    }
+    qb.push(") VALUES (");
+    qb.push_bind(user).push(", ").push_bind(account);
+    for (_, val) in updates {
+        qb.push(", ");
+        push_bound(&mut qb, *val);
+    }
+    qb.push(")");
+    qb.build().execute(&mut *conn).await?;
+    Ok(())
+}
+
+/// Partial-patch fields for [`add_user`]. Outer `None` leaves the field
+/// unchanged (partial patch on modify); for nullable columns the inner `None`
+/// clears it. Numeric limits use `None` (not 0) for "no limit", matching how
+/// `list_associations`/`AssociationCache` read an unset limit back out.
+#[derive(Default)]
+pub struct UserUpdate<'a> {
+    pub admin_level: Option<&'a str>,
+    pub is_default: Option<bool>,
+    pub default_qos: Option<Option<&'a str>>,
+    pub allowed_qos: Option<Option<&'a str>>,
+    pub max_running_jobs: Option<Option<i32>>,
+    pub max_submit_jobs: Option<Option<i32>>,
+    pub max_tres_per_job: Option<Option<&'a str>>,
+    pub grp_tres: Option<Option<&'a str>>,
+    pub max_wall_min: Option<Option<i32>>,
+}
+
+/// Add or modify a user-account association, writing only the fields set in `u`
+/// (partial patch: `modify` restates a subset, `add` sets all). The users row is
+/// ensured; limits/QOS live in a separate association row. `is_default = Some(true)`
+/// demotes the user's other accounts, so at most one is ever the default.
+pub async fn add_user<'a>(
+    pool: &PgPool,
+    user: &'a str,
+    account: &'a str,
+    u: UserUpdate<'a>,
+) -> anyhow::Result<()> {
+    // Per-user advisory lock so concurrent modifies of two different accounts
+    // for the same user serialize — otherwise both could win the demote race
+    // below and end up default. Cheap: add_user is admin-path.
     let mut tx = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1 || ':' || $2)::bigint)")
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
         .bind(user)
-        .bind(account)
         .execute(&mut *tx)
         .await?;
 
-    let updated = sqlx::query(
-        r#"
-        UPDATE associations SET is_default = $3, default_qos = NULLIF($4, ''),
-            allowed_qos = NULLIF($5, ''),
-            max_running_jobs = $6, max_submit_jobs = $7, max_tres_per_job = $8,
-            grp_tres = $9, max_wall_min = $10
-        WHERE user_name = $1 AND account = $2
-          AND (partition_name IS NULL OR partition_name = '')
-        "#,
-    )
-    .bind(user)
-    .bind(account)
-    .bind(is_default)
-    .bind(default_qos)
-    .bind(allowed_qos)
-    .bind(max_running_jobs)
-    .bind(max_submit_jobs)
-    .bind(max_tres_per_job)
-    .bind(grp_tres)
-    .bind(max_wall_min)
-    .execute(&mut *tx)
-    .await?;
-
-    if updated.rows_affected() == 0 {
+    // Clear the default on the user's other rows *before* the upsert sets it
+    // here, so the `one_default_account_per_user` unique index never sees two
+    // non-null default_account rows mid-transaction.
+    if u.is_default == Some(true) {
         sqlx::query(
-            r#"
-            INSERT INTO associations (user_name, account, is_default, default_qos,
-                allowed_qos, max_running_jobs, max_submit_jobs, max_tres_per_job,
-                grp_tres, max_wall_min)
-            VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), $6, $7, $8, $9, $10)
-            "#,
+            "UPDATE users SET default_account = NULL \
+             WHERE name = $1 AND account <> $2 AND default_account IS NOT NULL",
         )
         .bind(user)
         .bind(account)
-        .bind(is_default)
-        .bind(default_qos)
-        .bind(allowed_qos)
-        .bind(max_running_jobs)
-        .bind(max_submit_jobs)
-        .bind(max_tres_per_job)
-        .bind(grp_tres)
-        .bind(max_wall_min)
         .execute(&mut *tx)
         .await?;
+    }
+
+    // Partial-patch contract: COALESCE/CASE keep the stored admin_level and
+    // default_account when the request omits them ($3/$4 NULL). is_default = true
+    // makes this account the default, false clears it.
+    sqlx::query(
+        r#"
+        INSERT INTO users (name, account, admin_level, default_account)
+        VALUES ($1, $2, COALESCE($3, 'none'), CASE WHEN $4::bool THEN $2 END)
+        ON CONFLICT (name, account) DO UPDATE SET
+            admin_level = COALESCE($3, users.admin_level),
+            default_account = CASE
+                WHEN $4::bool IS NULL THEN users.default_account
+                WHEN $4::bool THEN $2
+                ELSE NULL
+            END
+        "#,
+    )
+    .bind(user)
+    .bind(account)
+    .bind(u.admin_level)
+    .bind(u.is_default)
+    .execute(&mut *tx)
+    .await?;
+
+    let mut assoc: Vec<(&'static str, SqlVal)> = Vec::new();
+    if let Some(v) = u.default_qos {
+        assoc.push(("default_qos", SqlVal::NullText(v)));
+    }
+    if let Some(v) = u.allowed_qos {
+        assoc.push(("allowed_qos", SqlVal::NullText(v)));
+    }
+    if let Some(v) = u.max_running_jobs {
+        assoc.push(("max_running_jobs", SqlVal::NullInt(v)));
+    }
+    if let Some(v) = u.max_submit_jobs {
+        assoc.push(("max_submit_jobs", SqlVal::NullInt(v)));
+    }
+    if let Some(v) = u.max_tres_per_job {
+        assoc.push(("max_tres_per_job", SqlVal::NullText(v)));
+    }
+    if let Some(v) = u.grp_tres {
+        assoc.push(("grp_tres", SqlVal::NullText(v)));
+    }
+    if let Some(v) = u.max_wall_min {
+        assoc.push(("max_wall_min", SqlVal::NullInt(v)));
+    }
+    // Touch the association row (limits/QOS) only when a field was restated.
+    if !assoc.is_empty() {
+        upsert_association(&mut tx, user, account, &assoc).await?;
     }
 
     tx.commit().await?;
@@ -758,51 +960,64 @@ pub struct AssociationRecord {
     pub max_wall_min: Option<i32>,
 }
 
-/// Create or update a QOS.
-#[allow(clippy::too_many_arguments)]
-pub async fn upsert_qos(
-    pool: &PgPool,
-    name: &str,
-    description: &str,
-    priority: i32,
-    preempt_mode: &str,
-    usage_factor: f64,
-    max_jobs_per_user: Option<i32>,
-    max_wall_min: Option<i32>,
-    max_tres_per_job: Option<&str>,
-    max_submit_per_user: Option<i32>,
-    max_tres_per_user: Option<&str>,
-    grp_tres: Option<&str>,
-    grp_wall_min: Option<i32>,
-) -> anyhow::Result<()> {
-    sqlx::query(
-        r#"
-        INSERT INTO qos (name, description, priority, preempt_mode, usage_factor,
-                         max_jobs_per_user, max_wall_min, max_tres_per_job,
-                         max_submit_per_user, max_tres_per_user, grp_tres, grp_wall_min)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-        ON CONFLICT (name) DO UPDATE SET
-            description = $2, priority = $3, preempt_mode = $4, usage_factor = $5,
-            max_jobs_per_user = $6, max_wall_min = $7, max_tres_per_job = $8,
-            max_submit_per_user = $9, max_tres_per_user = $10, grp_tres = $11,
-            grp_wall_min = $12
-        "#,
-    )
-    .bind(name)
-    .bind(description)
-    .bind(priority)
-    .bind(preempt_mode)
-    .bind(usage_factor)
-    .bind(max_jobs_per_user)
-    .bind(max_wall_min)
-    .bind(max_tres_per_job)
-    .bind(max_submit_per_user)
-    .bind(max_tres_per_user)
-    .bind(grp_tres)
-    .bind(grp_wall_min)
-    .execute(pool)
-    .await?;
-    Ok(())
+/// Partial-patch fields for [`upsert_qos`]. Outer `None` leaves the column
+/// unchanged (partial patch on modify); for nullable columns the inner `None`
+/// clears it to SQL `NULL`.
+#[derive(Default)]
+pub struct QosUpdate<'a> {
+    pub description: Option<&'a str>,
+    pub priority: Option<i32>,
+    pub preempt_mode: Option<&'a str>,
+    pub usage_factor: Option<f64>,
+    pub max_jobs_per_user: Option<Option<i32>>,
+    pub max_wall_min: Option<Option<i32>>,
+    pub max_tres_per_job: Option<Option<&'a str>>,
+    pub max_submit_per_user: Option<Option<i32>>,
+    pub max_tres_per_user: Option<Option<&'a str>>,
+    pub grp_tres: Option<Option<&'a str>>,
+    pub grp_wall_min: Option<Option<i32>>,
+}
+
+/// Create or update a QOS, writing only the fields set in `u`. `modify` sends
+/// just the restated fields, so unset columns are preserved; `add` sets all of
+/// them.
+pub async fn upsert_qos<'a>(pool: &PgPool, name: &'a str, u: QosUpdate<'a>) -> anyhow::Result<()> {
+    let keys = [("name", SqlVal::Text(name))];
+    let mut updates: Vec<(&'static str, SqlVal)> = Vec::new();
+    if let Some(v) = u.description {
+        updates.push(("description", SqlVal::Text(v)));
+    }
+    if let Some(v) = u.priority {
+        updates.push(("priority", SqlVal::Int(v)));
+    }
+    if let Some(v) = u.preempt_mode {
+        updates.push(("preempt_mode", SqlVal::Text(v)));
+    }
+    if let Some(v) = u.usage_factor {
+        updates.push(("usage_factor", SqlVal::Real(v)));
+    }
+    if let Some(v) = u.max_jobs_per_user {
+        updates.push(("max_jobs_per_user", SqlVal::NullInt(v)));
+    }
+    if let Some(v) = u.max_wall_min {
+        updates.push(("max_wall_min", SqlVal::NullInt(v)));
+    }
+    if let Some(v) = u.max_tres_per_job {
+        updates.push(("max_tres_per_job", SqlVal::NullText(v)));
+    }
+    if let Some(v) = u.max_submit_per_user {
+        updates.push(("max_submit_per_user", SqlVal::NullInt(v)));
+    }
+    if let Some(v) = u.max_tres_per_user {
+        updates.push(("max_tres_per_user", SqlVal::NullText(v)));
+    }
+    if let Some(v) = u.grp_tres {
+        updates.push(("grp_tres", SqlVal::NullText(v)));
+    }
+    if let Some(v) = u.grp_wall_min {
+        updates.push(("grp_wall_min", SqlVal::NullInt(v)));
+    }
+    upsert_row(pool, UpsertTable::Qos, &keys, &updates).await
 }
 
 /// Delete a QOS.
@@ -823,6 +1038,25 @@ pub async fn qos_exists(pool: &PgPool, name: &str) -> anyhow::Result<bool> {
         .fetch_optional(pool)
         .await?;
     Ok(row.is_some())
+}
+
+/// Of the given QOS names, return those that don't exist, in input order.
+/// A single query regardless of list length, so validating a user's allow-list
+/// doesn't scale DB round-trips with the number of names in it.
+pub async fn missing_qos(pool: &PgPool, names: &[&str]) -> anyhow::Result<Vec<String>> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let existing: Vec<String> = sqlx::query_scalar("SELECT name FROM qos WHERE name = ANY($1)")
+        .bind(names)
+        .fetch_all(pool)
+        .await?;
+    Ok(names
+        .iter()
+        .copied()
+        .filter(|n| !existing.iter().any(|e| e == n))
+        .map(str::to_string)
+        .collect())
 }
 
 /// List all QOS.
@@ -1155,17 +1389,19 @@ mod job_history_tests {
         upsert_qos(
             &pool,
             &name,
-            "d",
-            5,
-            "cluster",
-            1.5,
-            Some(3),
-            Some(60),
-            Some("cpu=2"),
-            Some(4),
-            Some("cpu=16"),
-            Some("cpu=64"),
-            Some(120),
+            QosUpdate {
+                description: Some("d"),
+                priority: Some(5),
+                preempt_mode: Some("cluster"),
+                usage_factor: Some(1.5),
+                max_jobs_per_user: Some(Some(3)),
+                max_wall_min: Some(Some(60)),
+                max_tres_per_job: Some(Some("cpu=2")),
+                max_submit_per_user: Some(Some(4)),
+                max_tres_per_user: Some(Some("cpu=16")),
+                grp_tres: Some(Some("cpu=64")),
+                grp_wall_min: Some(Some(120)),
+            },
         )
         .await?;
 
@@ -1217,14 +1453,36 @@ mod job_history_tests {
             .execute(&pool)
             .await?;
 
-        upsert_account(&pool, &account, "d", "o", None, 1, None, None).await?;
+        upsert_account(
+            &pool,
+            &account,
+            AccountUpdate {
+                description: Some("d"),
+                organization: Some("o"),
+                ..Default::default()
+            },
+        )
+        .await?;
         upsert_qos(
-            &pool, &qos_name, "d", 0, "off", 1.0, None, None, None, None, None, None, None,
+            &pool,
+            &qos_name,
+            QosUpdate {
+                description: Some("d"),
+                ..Default::default()
+            },
         )
         .await?;
 
         add_user(
-            &pool, &user, &account, "none", true, &qos_name, "", None, None, None, None, None,
+            &pool,
+            &user,
+            &account,
+            UserUpdate {
+                admin_level: Some("none"),
+                is_default: Some(true),
+                default_qos: Some(Some(&qos_name)),
+                ..Default::default()
+            },
         )
         .await?;
         let got = list_users(&pool, Some(&account), None)
@@ -1234,10 +1492,35 @@ mod job_history_tests {
             .expect("user present");
         assert_eq!(got.default_qos.as_deref(), Some(qos_name.as_str()));
 
-        // Upsert again with an empty default_qos: clears it (full resend,
-        // not a partial patch — matches modify account/qos semantics).
+        // A partial update that doesn't restate default_qos must preserve it
+        // (the core SPUR-96 guarantee), while still applying the field it did
+        // restate.
         add_user(
-            &pool, &user, &account, "none", true, "", "", None, None, None, None, None,
+            &pool,
+            &user,
+            &account,
+            UserUpdate {
+                max_running_jobs: Some(Some(5)),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let got = list_users(&pool, Some(&account), None)
+            .await?
+            .into_iter()
+            .find(|u| u.name == user)
+            .expect("user present");
+        assert_eq!(got.default_qos.as_deref(), Some(qos_name.as_str()));
+
+        // An explicit empty default_qos clears it.
+        add_user(
+            &pool,
+            &user,
+            &account,
+            UserUpdate {
+                default_qos: Some(None),
+                ..Default::default()
+            },
         )
         .await?;
         let got = list_users(&pool, Some(&account), None)
@@ -1268,6 +1551,412 @@ mod job_history_tests {
 
     #[tokio::test]
     #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn add_user_is_default_patches_default_account_only_when_restated() -> anyhow::Result<()>
+    {
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let user = format!("spur_defacct_user_{pid}");
+        let account = format!("spur_defacct_acct_{pid}");
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+
+        upsert_account(
+            &pool,
+            &account,
+            AccountUpdate {
+                description: Some("d"),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let default_account = |pool: PgPool, account: String, user: String| async move {
+            list_users(&pool, Some(&account), None)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|u| u.name == user)
+                .expect("user present")
+                .default_account
+        };
+
+        // add with is_default=true records this account as the user's default.
+        add_user(
+            &pool,
+            &user,
+            &account,
+            UserUpdate {
+                is_default: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(
+            default_account(pool.clone(), account.clone(), user.clone())
+                .await
+                .as_deref(),
+            Some(account.as_str())
+        );
+
+        // A partial update that doesn't restate is_default must preserve
+        // default_account (the reported bug cleared it via the ON CONFLICT gap).
+        add_user(
+            &pool,
+            &user,
+            &account,
+            UserUpdate {
+                max_running_jobs: Some(Some(5)),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(
+            default_account(pool.clone(), account.clone(), user.clone())
+                .await
+                .as_deref(),
+            Some(account.as_str()),
+            "unrestated is_default must not touch default_account"
+        );
+
+        // Restating is_default=false clears it — this is the change the old
+        // UPDATE dropped on the floor.
+        add_user(
+            &pool,
+            &user,
+            &account,
+            UserUpdate {
+                is_default: Some(false),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(
+            default_account(pool.clone(), account.clone(), user.clone()).await,
+            None
+        );
+
+        // Restating is_default=true sets it back.
+        add_user(
+            &pool,
+            &user,
+            &account,
+            UserUpdate {
+                is_default: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(
+            default_account(pool.clone(), account.clone(), user.clone())
+                .await
+                .as_deref(),
+            Some(account.as_str())
+        );
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn add_user_default_account_is_unique_per_user() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let user = format!("spur_1def_user_{pid}");
+        let acct_a = format!("spur_1def_a_{pid}");
+        let acct_b = format!("spur_1def_b_{pid}");
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        for a in [&acct_a, &acct_b] {
+            sqlx::query("DELETE FROM accounts WHERE name = $1")
+                .bind(a)
+                .execute(&pool)
+                .await?;
+            upsert_account(
+                &pool,
+                a,
+                AccountUpdate {
+                    description: Some("d"),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+
+        // alice's default starts as account A, then B is made the default.
+        add_user(
+            &pool,
+            &user,
+            &acct_a,
+            UserUpdate {
+                is_default: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
+        add_user(
+            &pool,
+            &user,
+            &acct_b,
+            UserUpdate {
+                is_default: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        // Only B remains the user's default in the users table; A is demoted.
+        let users = list_users(&pool, None, Some(&user)).await?;
+        let a_row = users
+            .iter()
+            .find(|u| u.account == acct_a)
+            .expect("A row present");
+        let b_row = users
+            .iter()
+            .find(|u| u.account == acct_b)
+            .expect("B row present");
+        assert_eq!(
+            a_row.default_account, None,
+            "A must be demoted when B becomes default"
+        );
+        assert_eq!(b_row.default_account.as_deref(), Some(acct_b.as_str()));
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        for a in [&acct_a, &acct_b] {
+            sqlx::query("DELETE FROM accounts WHERE name = $1")
+                .bind(a)
+                .execute(&pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn migrate_upgrades_pre_fix_default_account_schema() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let user = format!("spur_dedup_user_{pid}");
+        // Names chosen so acct_a sorts before acct_b: the dedup keeps the lowest.
+        let acct_a = format!("spur_dedup_a_{pid}");
+        let acct_b = format!("spur_dedup_b_{pid}");
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        for a in [&acct_a, &acct_b] {
+            sqlx::query("DELETE FROM accounts WHERE name = $1")
+                .bind(a)
+                .execute(&pool)
+                .await?;
+            upsert_account(
+                &pool,
+                a,
+                AccountUpdate {
+                    description: Some("d"),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+
+        // Reconstruct a pre-fix database: the dead is_default column present and
+        // two rows marked default (which the live index forbids). Drop the index,
+        // restore the column, inject the rows, then let migrate() run the upgrade.
+        sqlx::query("DROP INDEX IF EXISTS one_default_account_per_user")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "ALTER TABLE associations \
+             ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT false",
+        )
+        .execute(&pool)
+        .await?;
+        for a in [&acct_a, &acct_b] {
+            sqlx::query(
+                "INSERT INTO users (name, account, admin_level, default_account) \
+                 VALUES ($1, $2, 'none', $2)",
+            )
+            .bind(&user)
+            .bind(a)
+            .execute(&pool)
+            .await?;
+            sqlx::query(
+                "INSERT INTO associations (user_name, account, is_default) VALUES ($1, $2, true)",
+            )
+            .bind(&user)
+            .bind(a)
+            .execute(&pool)
+            .await?;
+        }
+
+        // Re-running the schema drops the dead column, collapses the duplicates,
+        // then rebuilds the index on the now-clean data.
+        migrate(&pool).await?;
+
+        let has_is_default: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+             WHERE table_name = 'associations' AND column_name = 'is_default')",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert!(
+            !has_is_default,
+            "migrate must drop the redundant is_default column"
+        );
+
+        let users = list_users(&pool, None, Some(&user)).await?;
+        let with_default: Vec<&str> = users
+            .iter()
+            .filter(|u| u.default_account.is_some())
+            .map(|u| u.account.as_str())
+            .collect();
+        assert_eq!(
+            with_default,
+            vec![acct_a.as_str()],
+            "exactly one default survives, the lowest account name"
+        );
+
+        // The rebuilt index now rejects a second default for the user.
+        let dup = sqlx::query(
+            "UPDATE users SET default_account = account WHERE name = $1 AND account = $2",
+        )
+        .bind(&user)
+        .bind(&acct_b)
+        .execute(&pool)
+        .await;
+        assert!(
+            dup.is_err(),
+            "unique index must reject a second default account"
+        );
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        for a in [&acct_a, &acct_b] {
+            sqlx::query("DELETE FROM accounts WHERE name = $1")
+                .bind(a)
+                .execute(&pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn migrate_serializes_concurrent_runs() -> anyhow::Result<()> {
+        // Two controllers booting against one database run migrate() at once;
+        // the advisory lock must serialize them so neither errors nor deadlocks.
+        let pool = test_pool().await?;
+        let (first, second) = tokio::join!(migrate(&pool), migrate(&pool));
+        first?;
+        second?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn missing_qos_reports_only_absent_names() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let present_a = format!("spur_mq_a_{pid}");
+        let present_b = format!("spur_mq_b_{pid}");
+        let absent = format!("spur_mq_absent_{pid}");
+
+        for q in [&present_a, &present_b, &absent] {
+            sqlx::query("DELETE FROM qos WHERE name = $1")
+                .bind(q)
+                .execute(&pool)
+                .await?;
+        }
+        for q in [&present_a, &present_b] {
+            upsert_qos(
+                &pool,
+                q,
+                QosUpdate {
+                    description: Some("d"),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+
+        // Empty input short-circuits without a query and reports nothing.
+        assert!(missing_qos(&pool, &[]).await?.is_empty());
+
+        // Only the absent name is returned, preserving input order and
+        // ignoring existing names in any position.
+        let missing = missing_qos(
+            &pool,
+            &[present_a.as_str(), absent.as_str(), present_b.as_str()],
+        )
+        .await?;
+        assert_eq!(missing, vec![absent.clone()]);
+
+        // All-present resolves to no missing.
+        assert!(
+            missing_qos(&pool, &[present_a.as_str(), present_b.as_str()])
+                .await?
+                .is_empty()
+        );
+
+        for q in [&present_a, &present_b, &absent] {
+            sqlx::query("DELETE FROM qos WHERE name = $1")
+                .bind(q)
+                .execute(&pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
     async fn add_user_round_trips_account_limits() -> anyhow::Result<()> {
         let pool = test_pool().await?;
         let pid = std::process::id();
@@ -1287,21 +1976,31 @@ mod job_history_tests {
             .execute(&pool)
             .await?;
 
-        upsert_account(&pool, &account, "d", "o", None, 1, None, None).await?;
+        upsert_account(
+            &pool,
+            &account,
+            AccountUpdate {
+                description: Some("d"),
+                organization: Some("o"),
+                ..Default::default()
+            },
+        )
+        .await?;
 
         add_user(
             &pool,
             &user,
             &account,
-            "none",
-            true,
-            "",
-            "",
-            Some(2),
-            Some(4),
-            Some("cpu=8"),
-            Some("cpu=32"),
-            Some(60),
+            UserUpdate {
+                admin_level: Some("none"),
+                is_default: Some(true),
+                max_running_jobs: Some(Some(2)),
+                max_submit_jobs: Some(Some(4)),
+                max_tres_per_job: Some(Some("cpu=8")),
+                grp_tres: Some(Some("cpu=32")),
+                max_wall_min: Some(Some(60)),
+                ..Default::default()
+            },
         )
         .await?;
 
@@ -1316,21 +2015,16 @@ mod job_history_tests {
         assert_eq!(got.grp_tres.as_deref(), Some("cpu=32"));
         assert_eq!(got.max_wall_min, Some(60));
 
-        // Upsert again with different non-zero limits: the UPDATE branch
-        // must overwrite the existing values, not merge with them.
+        // A partial update that restates only max_running_jobs must overwrite
+        // that one limit while preserving every limit it didn't restate.
         add_user(
             &pool,
             &user,
             &account,
-            "none",
-            true,
-            "",
-            "",
-            Some(10),
-            Some(20),
-            Some("cpu=16"),
-            Some("cpu=64"),
-            Some(120),
+            UserUpdate {
+                max_running_jobs: Some(Some(10)),
+                ..Default::default()
+            },
         )
         .await?;
         let got = list_associations(&pool)
@@ -1339,15 +2033,24 @@ mod job_history_tests {
             .find(|a| a.user_name == user && a.account == account)
             .expect("association present");
         assert_eq!(got.max_running_jobs, Some(10));
-        assert_eq!(got.max_submit_jobs, Some(20));
-        assert_eq!(got.max_tres_per_job.as_deref(), Some("cpu=16"));
-        assert_eq!(got.grp_tres.as_deref(), Some("cpu=64"));
-        assert_eq!(got.max_wall_min, Some(120));
+        assert_eq!(got.max_submit_jobs, Some(4));
+        assert_eq!(got.max_tres_per_job.as_deref(), Some("cpu=8"));
+        assert_eq!(got.grp_tres.as_deref(), Some("cpu=32"));
+        assert_eq!(got.max_wall_min, Some(60));
 
-        // Upsert again with no limits: clears them (full resend, not a
-        // partial patch — matches every other field on this association).
+        // Explicitly clearing each limit (inner None) sets it back to no-limit.
         add_user(
-            &pool, &user, &account, "none", true, "", "", None, None, None, None, None,
+            &pool,
+            &user,
+            &account,
+            UserUpdate {
+                max_running_jobs: Some(None),
+                max_submit_jobs: Some(None),
+                max_tres_per_job: Some(None),
+                grp_tres: Some(None),
+                max_wall_min: Some(None),
+                ..Default::default()
+            },
         )
         .await?;
         let got = list_associations(&pool)
@@ -1400,35 +2103,36 @@ mod job_history_tests {
             .execute(&pool)
             .await?;
 
-        upsert_account(&pool, &account, "d", "o", None, 1, None, None).await?;
+        upsert_account(
+            &pool,
+            &account,
+            AccountUpdate {
+                description: Some("d"),
+                organization: Some("o"),
+                ..Default::default()
+            },
+        )
+        .await?;
         add_user(
             &pool,
             &matching_user,
             &account,
-            "none",
-            true,
-            "",
-            "",
-            None,
-            None,
-            None,
-            None,
-            None,
+            UserUpdate {
+                admin_level: Some("none"),
+                is_default: Some(true),
+                ..Default::default()
+            },
         )
         .await?;
         add_user(
             &pool,
             &other_user,
             &account,
-            "none",
-            true,
-            "",
-            "",
-            None,
-            None,
-            None,
-            None,
-            None,
+            UserUpdate {
+                admin_level: Some("none"),
+                is_default: Some(true),
+                ..Default::default()
+            },
         )
         .await?;
 
@@ -1483,29 +2187,33 @@ mod job_history_tests {
             .execute(&pool)
             .await?;
 
-        upsert_account(&pool, &account, "d", "o", None, 1, None, None).await?;
+        upsert_account(
+            &pool,
+            &account,
+            AccountUpdate {
+                description: Some("d"),
+                organization: Some("o"),
+                ..Default::default()
+            },
+        )
+        .await?;
 
-        add_user(
-            &pool, &user, &account, "none", true, "", "", None, None, None, None, None,
-        )
-        .await?;
-        add_user(
-            &pool, &user, &account, "none", true, "", "", None, None, None, None, None,
-        )
-        .await?;
+        let base = || UserUpdate {
+            admin_level: Some("none"),
+            is_default: Some(true),
+            max_running_jobs: Some(Some(1)),
+            ..Default::default()
+        };
+        add_user(&pool, &user, &account, base()).await?;
+        add_user(&pool, &user, &account, base()).await?;
         add_user(
             &pool,
             &user,
             &account,
-            "none",
-            true,
-            "highprio-does-not-need-to-exist",
-            "",
-            None,
-            None,
-            None,
-            None,
-            None,
+            UserUpdate {
+                default_qos: Some(Some("highprio-does-not-need-to-exist")),
+                ..base()
+            },
         )
         .await?;
 
@@ -1560,7 +2268,16 @@ mod job_history_tests {
             .execute(&pool)
             .await?;
 
-        upsert_account(&pool, &account, "d", "o", None, 1, None, None).await?;
+        upsert_account(
+            &pool,
+            &account,
+            AccountUpdate {
+                description: Some("d"),
+                organization: Some("o"),
+                ..Default::default()
+            },
+        )
+        .await?;
         sqlx::query("INSERT INTO users (name, account, admin_level) VALUES ($1, $2, 'none')")
             .bind(&user)
             .bind(&account)
@@ -1614,7 +2331,16 @@ mod job_history_tests {
             .execute(&pool)
             .await?;
 
-        upsert_account(&pool, &account, "d", "o", None, 1, None, None).await?;
+        upsert_account(
+            &pool,
+            &account,
+            AccountUpdate {
+                description: Some("d"),
+                organization: Some("o"),
+                ..Default::default()
+            },
+        )
+        .await?;
         sqlx::query(
             "INSERT INTO associations \
              (user_name, account, max_running_jobs, max_submit_jobs, max_tres_per_job, grp_tres, max_wall_min) \
@@ -1649,7 +2375,7 @@ mod job_history_tests {
 
     #[tokio::test]
     #[ignore = "requires DATABASE_URL and PostgreSQL"]
-    async fn account_grp_tres_round_trips_and_clears() -> anyhow::Result<()> {
+    async fn account_grp_tres_preserves_on_omit_and_clears_on_explicit() -> anyhow::Result<()> {
         let pool = test_pool().await?;
         let account = format!("spur_acct_grptres_{}", std::process::id());
         sqlx::query("DELETE FROM accounts WHERE name = $1")
@@ -1660,12 +2386,12 @@ mod job_history_tests {
         upsert_account(
             &pool,
             &account,
-            "d",
-            "o",
-            None,
-            1,
-            None,
-            Some("cpu=16,mem=32768,gres/gpu=8"),
+            AccountUpdate {
+                description: Some("d"),
+                organization: Some("o"),
+                grp_tres: Some(Some("cpu=16,mem=32768,gres/gpu=8")),
+                ..Default::default()
+            },
         )
         .await?;
         let got = list_accounts(&pool)
@@ -1675,8 +2401,35 @@ mod job_history_tests {
             .expect("account present");
         assert_eq!(got.grp_tres.as_deref(), Some("cpu=16,mem=32768,gres/gpu=8"));
 
-        // Full-resend upsert with no allocation clears it (same contract as qos/user).
-        upsert_account(&pool, &account, "d", "o", None, 1, None, None).await?;
+        // A partial update that doesn't restate grp_tres preserves it (the
+        // SPUR-96 fix) while applying the field it does restate.
+        upsert_account(
+            &pool,
+            &account,
+            AccountUpdate {
+                fairshare: Some(5),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let got = list_accounts(&pool)
+            .await?
+            .into_iter()
+            .find(|a| a.name == account)
+            .expect("account present");
+        assert_eq!(got.grp_tres.as_deref(), Some("cpu=16,mem=32768,gres/gpu=8"));
+        assert_eq!(got.fairshare_weight, 5);
+
+        // An explicit empty grp_tres (inner None) clears it.
+        upsert_account(
+            &pool,
+            &account,
+            AccountUpdate {
+                grp_tres: Some(None),
+                ..Default::default()
+            },
+        )
+        .await?;
         let got = list_accounts(&pool)
             .await?
             .into_iter()

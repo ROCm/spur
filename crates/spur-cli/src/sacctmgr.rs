@@ -198,6 +198,34 @@ fn parse_wall_limit(key: &str, val: &str) -> Result<u32> {
     parse_wall_time(val).ok_or_else(|| anyhow::anyhow!("invalid value for {key}=: '{val}'"))
 }
 
+/// Parse a floating-point field (e.g. `fairshare=`/`usagefactor=`), failing
+/// loudly instead of silently defaulting so a typo never quietly changes a
+/// weight on a partial `modify`.
+fn parse_f64(key: &str, val: &str) -> Result<f64> {
+    val.parse()
+        .map_err(|_| anyhow::anyhow!("invalid value for {key}=: '{val}'"))
+}
+
+/// Parse a signed integer field (e.g. `priority=`), failing loudly rather than
+/// silently defaulting, for the same reason as `parse_f64`.
+fn parse_i32(key: &str, val: &str) -> Result<i32> {
+    val.parse()
+        .map_err(|_| anyhow::anyhow!("invalid value for {key}=: '{val}'"))
+}
+
+/// Look up a field by its accepted aliases in priority order, returning the key
+/// the caller actually wrote alongside its value. Parsers use the returned key
+/// so an invalid-value error names the exact parameter the user passed (e.g.
+/// `maxrunningjobs`) rather than a canonical alias (`maxjobs`).
+fn find_alias<'a>(
+    p: &'a std::collections::HashMap<String, String>,
+    keys: &[&'a str],
+) -> Option<(&'a str, &'a str)> {
+    keys.iter()
+        .copied()
+        .find_map(|k| p.get(k).map(|v| (k, v.as_str())))
+}
+
 /// Fields shared by `add user` and `modify user` (both upsert via the same
 /// `AddUserRequest`).
 #[derive(Debug, PartialEq)]
@@ -214,6 +242,26 @@ struct UserUpsertFields {
     max_wall_minutes: u32,
 }
 
+/// Resolve the association account for `add`/`modify user`. `account=` picks the
+/// association to write and `defaultaccount=` marks the user's default; both map
+/// to one `(account, is_default)` pair, so two different accounts are rejected —
+/// honoring it would modify one association while silently clearing the default.
+fn resolve_user_account(p: &std::collections::HashMap<String, String>) -> Result<String> {
+    let account = match (p.get("account"), p.get("defaultaccount")) {
+        (Some(a), Some(d)) if a != d => bail!(
+            "account={a} and defaultaccount={d} name different accounts; \
+             set the default with defaultaccount= alone or a matching account="
+        ),
+        (Some(a), _) => a,
+        (None, Some(d)) => d,
+        (None, None) => bail!("account= required"),
+    };
+    if account.is_empty() {
+        bail!("account= must not be empty");
+    }
+    Ok(account.clone())
+}
+
 /// Parse the key=value params for `add user`/`modify user` into the shared
 /// upsert shape. Numeric/TRES aliases mirror `add account`'s
 /// `maxrunningjobs`/`maxjobs` and `add qos`'s `maxwall` for consistency
@@ -227,11 +275,7 @@ fn build_add_user_request(
         .or_else(|| p.get("user"))
         .ok_or_else(|| anyhow::anyhow!("name= required"))?
         .clone();
-    let account = p
-        .get("account")
-        .or_else(|| p.get("defaultaccount"))
-        .ok_or_else(|| anyhow::anyhow!("account= required"))?
-        .clone();
+    let account = resolve_user_account(p)?;
     let admin = p
         .get("adminlevel")
         .cloned()
@@ -247,10 +291,8 @@ fn build_add_user_request(
     {
         bail!("defaultqos={default_qos} must be included in qos={allowed_qos}");
     }
-    let max_running_jobs: u32 = p
-        .get("maxrunningjobs")
-        .or_else(|| p.get("maxjobs"))
-        .map(|v| parse_limit("maxjobs", v))
+    let max_running_jobs: u32 = find_alias(p, &["maxrunningjobs", "maxjobs"])
+        .map(|(k, v)| parse_limit(k, v))
         .transpose()?
         .unwrap_or(0);
     let max_submit_jobs: u32 = p
@@ -260,10 +302,8 @@ fn build_add_user_request(
         .unwrap_or(0);
     let max_tres_per_job = p.get("maxtresperjob").cloned().unwrap_or_default();
     let grp_tres = p.get("grptres").cloned().unwrap_or_default();
-    let max_wall_minutes: u32 = p
-        .get("maxwall")
-        .or_else(|| p.get("maxwallduration"))
-        .map(|v| parse_wall_limit("maxwall", v))
+    let max_wall_minutes: u32 = find_alias(p, &["maxwall", "maxwallduration"])
+        .map(|(k, v)| parse_wall_limit(k, v))
         .transpose()?
         .unwrap_or(0);
 
@@ -308,10 +348,8 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 .get("fairshare")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1.0);
-            let max_jobs: u32 = p
-                .get("maxrunningjobs")
-                .or_else(|| p.get("maxjobs"))
-                .map(|v| parse_limit("maxjobs", v))
+            let max_jobs: u32 = find_alias(&p, &["maxrunningjobs", "maxjobs"])
+                .map(|(k, v)| parse_limit(k, v))
                 .transpose()?
                 .unwrap_or(0);
             let grp_tres = p.get("grptres").cloned().unwrap_or_default();
@@ -320,12 +358,12 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
             client
                 .create_account(CreateAccountRequest {
                     name: name.clone(),
-                    description: desc.clone(),
-                    organization: org.clone(),
-                    parent_account: parent.clone(),
-                    fairshare_weight: fairshare,
-                    max_running_jobs: max_jobs,
-                    grp_tres,
+                    description: Some(desc.clone()),
+                    organization: Some(org.clone()),
+                    parent_account: Some(parent.clone()),
+                    fairshare_weight: Some(fairshare),
+                    max_running_jobs: Some(max_jobs),
+                    grp_tres: Some(grp_tres),
                 })
                 .await
                 .context("CreateAccount RPC failed")?;
@@ -349,18 +387,19 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 .add_user(AddUserRequest {
                     user: fields.name.clone(),
                     account: fields.account.clone(),
-                    admin_level: fields.admin.clone(),
-                    is_default: p
-                        .get("defaultaccount")
-                        .map(|da| da == &fields.account)
-                        .unwrap_or(true),
-                    default_qos: fields.default_qos.clone(),
-                    allowed_qos: fields.allowed_qos.clone(),
-                    max_running_jobs: fields.max_running_jobs,
-                    max_submit_jobs: fields.max_submit_jobs,
-                    max_tres_per_job: fields.max_tres_per_job.clone(),
-                    grp_tres: fields.grp_tres.clone(),
-                    max_wall_minutes: fields.max_wall_minutes,
+                    admin_level: Some(fields.admin.clone()),
+                    is_default: Some(
+                        p.get("defaultaccount")
+                            .map(|da| da == &fields.account)
+                            .unwrap_or(true),
+                    ),
+                    default_qos: Some(fields.default_qos.clone()),
+                    allowed_qos: Some(fields.allowed_qos.clone()),
+                    max_running_jobs: Some(fields.max_running_jobs),
+                    max_submit_jobs: Some(fields.max_submit_jobs),
+                    max_tres_per_job: Some(fields.max_tres_per_job.clone()),
+                    grp_tres: Some(fields.grp_tres.clone()),
+                    max_wall_minutes: Some(fields.max_wall_minutes),
                 })
                 .await
                 .context("AddUser RPC failed")?;
@@ -409,10 +448,8 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                 .get("usagefactor")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1.0);
-            let max_jobs: u32 = p
-                .get("maxjobsperuser")
-                .or_else(|| p.get("maxjobspu"))
-                .map(|v| parse_limit("maxjobsperuser", v))
+            let max_jobs: u32 = find_alias(&p, &["maxjobsperuser", "maxjobspu"])
+                .map(|(k, v)| parse_limit(k, v))
                 .transpose()?
                 .unwrap_or(0);
             let max_wall: u32 = p
@@ -431,21 +468,22 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
             client
                 .create_qos(CreateQosRequest {
                     name: name.clone(),
-                    description: desc,
-                    priority,
-                    preempt_mode: preempt.clone(),
-                    usage_factor,
-                    max_jobs_per_user: max_jobs,
-                    max_wall_minutes: max_wall,
-                    max_tres_per_job: max_tres,
-                    max_submit_jobs_per_user: p
-                        .get("maxsubmitjobsperuser")
-                        .map(|v| parse_limit("maxsubmitjobsperuser", v))
-                        .transpose()?
-                        .unwrap_or(0),
-                    max_tres_per_user: p.get("maxtresperuser").cloned().unwrap_or_default(),
-                    grp_tres: p.get("grptres").cloned().unwrap_or_default(),
-                    grp_wall_minutes: grp_wall,
+                    description: Some(desc),
+                    priority: Some(priority),
+                    preempt_mode: Some(preempt.clone()),
+                    usage_factor: Some(usage_factor),
+                    max_jobs_per_user: Some(max_jobs),
+                    max_wall_minutes: Some(max_wall),
+                    max_tres_per_job: Some(max_tres),
+                    max_submit_jobs_per_user: Some(
+                        p.get("maxsubmitjobsperuser")
+                            .map(|v| parse_limit("maxsubmitjobsperuser", v))
+                            .transpose()?
+                            .unwrap_or(0),
+                    ),
+                    max_tres_per_user: Some(p.get("maxtresperuser").cloned().unwrap_or_default()),
+                    grp_tres: Some(p.get("grptres").cloned().unwrap_or_default()),
+                    grp_wall_minutes: Some(grp_wall),
                 })
                 .await
                 .context("CreateQos RPC failed")?;
@@ -531,171 +569,158 @@ async fn delete(entity: &str, params: &[String], addr: &str) -> Result<()> {
     }
 }
 
-async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
-    let mut p = parse_params(params);
+/// Build a partial-patch `CreateAccountRequest` for `modify account`: a field
+/// is `Some` only when the command restated it (so the server leaves every
+/// other column untouched), and an explicitly empty value clears it.
+fn build_modify_account_request(
+    p: &std::collections::HashMap<String, String>,
+) -> Result<CreateAccountRequest> {
+    reject_unknown_keys(p, ACCOUNT_KEYS)?;
+    let name = p
+        .get("name")
+        .or_else(|| p.get("account"))
+        .ok_or_else(|| anyhow::anyhow!("name= required"))?
+        .clone();
+    Ok(CreateAccountRequest {
+        name,
+        description: p.get("description").cloned(),
+        organization: p.get("organization").cloned(),
+        parent_account: p.get("parent").cloned(),
+        fairshare_weight: p
+            .get("fairshare")
+            .map(|v| parse_f64("fairshare", v))
+            .transpose()?,
+        max_running_jobs: find_alias(p, &["maxrunningjobs", "maxjobs"])
+            .map(|(k, v)| parse_limit(k, v))
+            .transpose()?,
+        grp_tres: p.get("grptres").cloned(),
+    })
+}
 
-    // Modify is an upsert — same RPCs as add, just re-sends the record
+/// Build a partial-patch `CreateQosRequest` for `modify qos` (see
+/// `build_modify_account_request` for the presence contract).
+fn build_modify_qos_request(
+    p: &std::collections::HashMap<String, String>,
+) -> Result<CreateQosRequest> {
+    reject_unknown_keys(p, QOS_KEYS)?;
+    let name = p
+        .get("name")
+        .or_else(|| p.get("qos"))
+        .ok_or_else(|| anyhow::anyhow!("name= required"))?
+        .clone();
+    Ok(CreateQosRequest {
+        name,
+        description: p.get("description").cloned(),
+        priority: p
+            .get("priority")
+            .map(|v| parse_i32("priority", v))
+            .transpose()?,
+        preempt_mode: p.get("preemptmode").cloned(),
+        usage_factor: p
+            .get("usagefactor")
+            .map(|v| parse_f64("usagefactor", v))
+            .transpose()?,
+        max_jobs_per_user: find_alias(p, &["maxjobsperuser", "maxjobspu"])
+            .map(|(k, v)| parse_limit(k, v))
+            .transpose()?,
+        max_wall_minutes: p
+            .get("maxwall")
+            .map(|v| parse_wall_limit("maxwall", v))
+            .transpose()?,
+        max_tres_per_job: p.get("maxtresperjob").cloned(),
+        max_submit_jobs_per_user: p
+            .get("maxsubmitjobsperuser")
+            .map(|v| parse_limit("maxsubmitjobsperuser", v))
+            .transpose()?,
+        max_tres_per_user: p.get("maxtresperuser").cloned(),
+        grp_tres: p.get("grptres").cloned(),
+        grp_wall_minutes: p
+            .get("grpwall")
+            .map(|v| parse_wall_limit("grpwall", v))
+            .transpose()?,
+    })
+}
+
+/// Build a partial-patch `AddUserRequest` for `modify user` (see
+/// `build_modify_account_request` for the presence contract). Unlike `add user`,
+/// an omitted `qos`/`defaultqos` stays `None` so the server keeps the stored
+/// value; the default-in-allow-list check runs only when both are restated.
+fn build_modify_user_request(
+    p: &std::collections::HashMap<String, String>,
+) -> Result<AddUserRequest> {
+    reject_unknown_keys(p, USER_KEYS)?;
+    let user = p
+        .get("name")
+        .or_else(|| p.get("user"))
+        .ok_or_else(|| anyhow::anyhow!("name= required"))?
+        .clone();
+    let account = resolve_user_account(p)?;
+    let default_qos = p.get("defaultqos").cloned();
+    let allowed_qos = p.get("qos").cloned();
+    if let (Some(dq), Some(list)) = (default_qos.as_deref(), allowed_qos.as_deref()) {
+        if !dq.is_empty() && !list.is_empty() && !list.split(',').map(str::trim).any(|q| q == dq) {
+            bail!("defaultqos={dq} must be included in qos={list}");
+        }
+    }
+    Ok(AddUserRequest {
+        user,
+        is_default: p.get("defaultaccount").map(|da| da == &account),
+        account,
+        admin_level: p.get("adminlevel").cloned(),
+        default_qos,
+        allowed_qos,
+        max_running_jobs: find_alias(p, &["maxrunningjobs", "maxjobs"])
+            .map(|(k, v)| parse_limit(k, v))
+            .transpose()?,
+        max_submit_jobs: p
+            .get("maxsubmitjobs")
+            .map(|v| parse_limit("maxsubmitjobs", v))
+            .transpose()?,
+        max_tres_per_job: p.get("maxtresperjob").cloned(),
+        grp_tres: p.get("grptres").cloned(),
+        max_wall_minutes: find_alias(p, &["maxwall", "maxwallduration"])
+            .map(|(k, v)| parse_wall_limit(k, v))
+            .transpose()?,
+    })
+}
+
+/// Modify shares `add`'s upsert RPCs, but sends only the restated fields
+/// (proto3 presence) so the server preserves every unstated column.
+async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
+    let p = parse_params(params);
+
     match entity.to_lowercase().as_str() {
         "account" => {
-            reject_unknown_keys(&p, ACCOUNT_KEYS)?;
-            let name = p
-                .get("name")
-                .or_else(|| p.get("account"))
-                .ok_or_else(|| anyhow::anyhow!("name= required"))?;
-
+            let req = build_modify_account_request(&p)?;
+            let name = req.name.clone();
             let mut client = connect(addr).await?;
             client
-                .create_account(CreateAccountRequest {
-                    name: name.clone(),
-                    description: p.get("description").cloned().unwrap_or_default(),
-                    organization: p.get("organization").cloned().unwrap_or_default(),
-                    parent_account: p.get("parent").cloned().unwrap_or_default(),
-                    fairshare_weight: p
-                        .get("fairshare")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(1.0),
-                    max_running_jobs: p
-                        .get("maxrunningjobs")
-                        .or_else(|| p.get("maxjobs"))
-                        .map(|v| parse_limit("maxjobs", v))
-                        .transpose()?
-                        .unwrap_or(0),
-                    grp_tres: p.get("grptres").cloned().unwrap_or_default(),
-                })
+                .create_account(req)
                 .await
                 .context("CreateAccount (modify) RPC failed")?;
-
             println!(" Modified account '{}'.", name);
             Ok(())
         }
         "qos" => {
-            reject_unknown_keys(&p, QOS_KEYS)?;
-            let name = p
-                .get("name")
-                .or_else(|| p.get("qos"))
-                .ok_or_else(|| anyhow::anyhow!("name= required"))?;
-
+            let req = build_modify_qos_request(&p)?;
+            let name = req.name.clone();
             let mut client = connect(addr).await?;
             client
-                .create_qos(CreateQosRequest {
-                    name: name.clone(),
-                    description: p.get("description").cloned().unwrap_or_default(),
-                    priority: p.get("priority").and_then(|v| v.parse().ok()).unwrap_or(0),
-                    preempt_mode: p
-                        .get("preemptmode")
-                        .cloned()
-                        .unwrap_or_else(|| "off".into()),
-                    usage_factor: p
-                        .get("usagefactor")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(1.0),
-                    max_jobs_per_user: p
-                        .get("maxjobsperuser")
-                        .or_else(|| p.get("maxjobspu"))
-                        .map(|v| parse_limit("maxjobsperuser", v))
-                        .transpose()?
-                        .unwrap_or(0),
-                    max_wall_minutes: p
-                        .get("maxwall")
-                        .map(|v| parse_wall_limit("maxwall", v))
-                        .transpose()?
-                        .unwrap_or(0),
-                    max_tres_per_job: p.get("maxtresperjob").cloned().unwrap_or_default(),
-                    max_submit_jobs_per_user: p
-                        .get("maxsubmitjobsperuser")
-                        .map(|v| parse_limit("maxsubmitjobsperuser", v))
-                        .transpose()?
-                        .unwrap_or(0),
-                    max_tres_per_user: p.get("maxtresperuser").cloned().unwrap_or_default(),
-                    grp_tres: p.get("grptres").cloned().unwrap_or_default(),
-                    grp_wall_minutes: p
-                        .get("grpwall")
-                        .map(|v| parse_wall_limit("grpwall", v))
-                        .transpose()?
-                        .unwrap_or(0),
-                })
+                .create_qos(req)
                 .await
                 .context("CreateQos (modify) RPC failed")?;
-
             println!(" Modified QOS '{}'.", name);
             Ok(())
         }
         "user" => {
+            let req = build_modify_user_request(&p)?;
+            let name = req.user.clone();
             let mut client = connect(addr).await?;
-
-            // `modify user` resends the whole association record (it shares
-            // AddUserRequest with `add user`), so a QOS field left out of
-            // this command must keep its stored value, not silently reset
-            // to unrestricted — unlike a resource limit, an omitted QOS
-            // field would otherwise widen the association's access.
-            if !p.contains_key("qos") || !p.contains_key("defaultqos") {
-                let name = p
-                    .get("name")
-                    .or_else(|| p.get("user"))
-                    .cloned()
-                    .unwrap_or_default();
-                let account = p.get("account").cloned().unwrap_or_default();
-                let existing = client
-                    .list_users(ListUsersRequest {
-                        account: account.clone(),
-                        user: name.clone(),
-                    })
-                    .await
-                    .context("ListUsers (modify lookup) RPC failed")?
-                    .into_inner()
-                    .users
-                    .into_iter()
-                    .find(|u| u.name == name && u.account == account);
-                if let Some(existing) = existing {
-                    p.entry("qos".to_string()).or_insert(existing.allowed_qos);
-                    p.entry("defaultqos".to_string())
-                        .or_insert(existing.default_qos);
-                }
-            }
-
-            let fields = build_add_user_request(&p)?;
             client
-                .add_user(AddUserRequest {
-                    user: fields.name.clone(),
-                    account: fields.account.clone(),
-                    admin_level: fields.admin.clone(),
-                    is_default: p
-                        .get("defaultaccount")
-                        .map(|da| da == &fields.account)
-                        .unwrap_or(true),
-                    default_qos: fields.default_qos.clone(),
-                    allowed_qos: fields.allowed_qos.clone(),
-                    max_running_jobs: fields.max_running_jobs,
-                    max_submit_jobs: fields.max_submit_jobs,
-                    max_tres_per_job: fields.max_tres_per_job.clone(),
-                    grp_tres: fields.grp_tres.clone(),
-                    max_wall_minutes: fields.max_wall_minutes,
-                })
+                .add_user(req)
                 .await
                 .context("AddUser (modify) RPC failed")?;
-
-            println!(" Modified user '{}'.", fields.name);
-            if !fields.allowed_qos.is_empty() {
-                println!("  QOS        = {}", fields.allowed_qos);
-            }
-            if !fields.default_qos.is_empty() {
-                println!("  DefQOS     = {}", fields.default_qos);
-            }
-            if fields.max_running_jobs > 0 {
-                println!("  MaxJobs    = {}", fields.max_running_jobs);
-            }
-            if fields.max_submit_jobs > 0 {
-                println!("  MaxSubmit  = {}", fields.max_submit_jobs);
-            }
-            if fields.max_wall_minutes > 0 {
-                println!("  MaxWall    = {} min", fields.max_wall_minutes);
-            }
-            if !fields.max_tres_per_job.is_empty() {
-                println!("  MaxTRES    = {}", fields.max_tres_per_job);
-            }
-            if !fields.grp_tres.is_empty() {
-                println!("  GrpTRES    = {}", fields.grp_tres);
-            }
+            println!(" Modified user '{}'.", name);
             Ok(())
         }
         other => bail!("sacctmgr: unknown entity type '{}'", other),
@@ -1310,25 +1335,194 @@ mod tests {
     }
 
     #[test]
-    fn build_add_user_request_add_and_modify_produce_the_same_shape() {
-        // add and modify both funnel through the same helper, so `sacctmgr
-        // add user name=X account=Y defaultqos=Z` and `sacctmgr modify user
-        // name=X account=Y set defaultqos=Z` build identical requests.
-        let add_params = parse_params(&[
-            "name=testuser".into(),
-            "account=testacct".into(),
-            "defaultqos=highprio".into(),
-        ]);
-        let modify_params = parse_params(&[
-            "name=testuser".into(),
-            "account=testacct".into(),
-            "set".into(),
-            "defaultqos=highprio".into(),
-        ]);
+    fn build_modify_account_request_omits_unrestated_fields() {
+        // The core of SPUR-96: `modify account name=X set fairshare=2` must
+        // send only fairshare; every other field is None so the server leaves
+        // it untouched.
+        let p = parse_params(&["name=physics".into(), "set".into(), "fairshare=2".into()]);
+        let req = build_modify_account_request(&p).unwrap();
+        assert_eq!(req.name, "physics");
+        assert_eq!(req.fairshare_weight, Some(2.0));
+        assert_eq!(req.description, None);
+        assert_eq!(req.organization, None);
+        assert_eq!(req.parent_account, None);
+        assert_eq!(req.max_running_jobs, None);
+        assert_eq!(req.grp_tres, None);
+    }
+
+    #[test]
+    fn build_modify_account_request_explicit_empty_clears() {
+        // An explicit `grptres=` is a request to clear, distinct from omitting
+        // it (which preserves).
+        let p = parse_params(&["name=physics".into(), "grptres=".into()]);
+        let req = build_modify_account_request(&p).unwrap();
+        assert_eq!(req.grp_tres, Some(String::new()));
+    }
+
+    #[test]
+    fn build_modify_account_request_rejects_invalid_fairshare() {
+        let p = parse_params(&["name=physics".into(), "fairshare=abc".into()]);
+        assert!(build_modify_account_request(&p).is_err());
+    }
+
+    #[test]
+    fn find_alias_returns_the_key_the_caller_wrote() {
+        // The priority alias wins and is reported as written.
+        let p = parse_params(&["maxrunningjobs=3".into()]);
         assert_eq!(
-            build_add_user_request(&add_params).unwrap(),
-            build_add_user_request(&modify_params).unwrap()
+            find_alias(&p, &["maxrunningjobs", "maxjobs"]),
+            Some(("maxrunningjobs", "3"))
         );
+        // The fallback alias is reported under its own name, not the canonical.
+        let p = parse_params(&["maxjobs=4".into()]);
+        assert_eq!(
+            find_alias(&p, &["maxrunningjobs", "maxjobs"]),
+            Some(("maxjobs", "4"))
+        );
+        // No alias present.
+        let p = parse_params(&["other=1".into()]);
+        assert_eq!(find_alias(&p, &["maxrunningjobs", "maxjobs"]), None);
+    }
+
+    #[test]
+    fn build_modify_account_request_error_names_the_typed_alias() {
+        // An invalid maxrunningjobs must report that key, not the canonical
+        // `maxjobs` the user never typed.
+        let p = parse_params(&["name=physics".into(), "maxrunningjobs=abc".into()]);
+        let msg = build_modify_account_request(&p).unwrap_err().to_string();
+        assert!(msg.contains("maxrunningjobs"), "got: {msg}");
+        assert!(
+            !msg.contains("maxjobs"),
+            "reported canonical alias instead: {msg}"
+        );
+
+        // The fallback alias is reported under its own name too.
+        let p = parse_params(&["name=physics".into(), "maxjobs=abc".into()]);
+        let msg = build_modify_account_request(&p).unwrap_err().to_string();
+        assert!(msg.contains("maxjobs"), "got: {msg}");
+    }
+
+    #[test]
+    fn build_modify_qos_request_error_names_the_typed_alias() {
+        let p = parse_params(&["name=normal".into(), "maxjobspu=abc".into()]);
+        let msg = build_modify_qos_request(&p).unwrap_err().to_string();
+        assert!(msg.contains("maxjobspu"), "got: {msg}");
+        assert!(
+            !msg.contains("maxjobsperuser"),
+            "reported canonical alias instead: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_modify_user_request_error_names_the_typed_alias() {
+        let p = parse_params(&[
+            "name=alice".into(),
+            "account=physics".into(),
+            "maxwallduration=nope".into(),
+        ]);
+        let msg = build_modify_user_request(&p).unwrap_err().to_string();
+        assert!(msg.contains("maxwallduration"), "got: {msg}");
+    }
+
+    #[test]
+    fn build_modify_qos_request_omits_unrestated_fields() {
+        let p = parse_params(&["name=normal".into(), "set".into(), "priority=10".into()]);
+        let req = build_modify_qos_request(&p).unwrap();
+        assert_eq!(req.name, "normal");
+        assert_eq!(req.priority, Some(10));
+        assert_eq!(req.description, None);
+        assert_eq!(req.grp_tres, None);
+        assert_eq!(req.max_tres_per_job, None);
+        assert_eq!(req.preempt_mode, None);
+        assert_eq!(req.usage_factor, None);
+    }
+
+    #[test]
+    fn build_modify_user_request_omits_unrestated_limits_and_qos() {
+        // `modify user ... set maxjobs=5` must not touch the QOS allow-list or
+        // the other limits — the association-limit half of SPUR-96.
+        let p = parse_params(&[
+            "name=alice".into(),
+            "account=physics".into(),
+            "set".into(),
+            "maxjobs=5".into(),
+        ]);
+        let req = build_modify_user_request(&p).unwrap();
+        assert_eq!(req.user, "alice");
+        assert_eq!(req.account, "physics");
+        assert_eq!(req.max_running_jobs, Some(5));
+        assert_eq!(req.default_qos, None);
+        assert_eq!(req.allowed_qos, None);
+        assert_eq!(req.grp_tres, None);
+        assert_eq!(req.max_submit_jobs, None);
+        assert_eq!(req.admin_level, None);
+        assert_eq!(req.is_default, None);
+    }
+
+    #[test]
+    fn build_modify_user_request_explicit_empty_qos_clears() {
+        let p = parse_params(&["name=alice".into(), "account=physics".into(), "qos=".into()]);
+        let req = build_modify_user_request(&p).unwrap();
+        assert_eq!(req.allowed_qos, Some(String::new()));
+    }
+
+    #[test]
+    fn build_modify_user_request_rejects_default_outside_restated_list() {
+        let p = parse_params(&[
+            "name=alice".into(),
+            "account=physics".into(),
+            "qos=a,b".into(),
+            "defaultqos=c".into(),
+        ]);
+        assert!(build_modify_user_request(&p).is_err());
+    }
+
+    #[test]
+    fn build_modify_user_request_defaultaccount_alone_marks_default() {
+        let p = parse_params(&["name=alice".into(), "defaultaccount=physics".into()]);
+        let req = build_modify_user_request(&p).unwrap();
+        assert_eq!(req.account, "physics");
+        assert_eq!(req.is_default, Some(true));
+    }
+
+    #[test]
+    fn build_modify_user_request_matching_account_and_defaultaccount_marks_default() {
+        let p = parse_params(&[
+            "name=alice".into(),
+            "account=physics".into(),
+            "defaultaccount=physics".into(),
+        ]);
+        let req = build_modify_user_request(&p).unwrap();
+        assert_eq!(req.account, "physics");
+        assert_eq!(req.is_default, Some(true));
+    }
+
+    #[test]
+    fn build_modify_user_request_rejects_conflicting_account_and_defaultaccount() {
+        // Two different accounts can't collapse into one association without
+        // silently clearing the default, so the command must fail loudly.
+        let p = parse_params(&[
+            "name=alice".into(),
+            "account=physics".into(),
+            "defaultaccount=chemistry".into(),
+        ]);
+        assert!(build_modify_user_request(&p).is_err());
+    }
+
+    #[test]
+    fn build_modify_user_request_rejects_empty_account() {
+        let p = parse_params(&["name=alice".into(), "account=".into()]);
+        assert!(build_modify_user_request(&p).is_err());
+    }
+
+    #[test]
+    fn build_add_user_request_rejects_conflicting_account_and_defaultaccount() {
+        let p = parse_params(&[
+            "name=alice".into(),
+            "account=physics".into(),
+            "defaultaccount=chemistry".into(),
+        ]);
+        assert!(build_add_user_request(&p).is_err());
     }
 
     fn stub_qos() -> QosInfo {

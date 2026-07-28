@@ -685,6 +685,84 @@ class TestSacctmgrQosAuthorization:
         c.scancel(str(job_id))
 
 
+class TestSacctmgrModifyPartialPatch:
+    """SPUR-96: `sacctmgr modify` restates only the fields it names; every
+    unstated field keeps its stored value, and an explicitly empty field
+    clears it. Covers accounts and QOS (the user-QOS case is covered by
+    TestSacctmgrQosAuthorization)."""
+
+    def _row(self, cluster, entity_show_args, needle):
+        out = cluster.sacctmgr(entity_show_args)
+        return next(
+            (line for line in out.splitlines() if needle in line),
+            None,
+        )
+
+    def test_modify_account_preserves_unstated_fields_and_clears_explicit(
+        self, accounting_cluster
+    ):
+        c = accounting_cluster
+        c.sacctmgr(
+            [
+                "add",
+                "account",
+                "name=patchacct",
+                "description=PhysicsDept",
+                "organization=Science",
+                "grptres=cpu=32",
+            ]
+        )
+
+        # Unrelated modify: only fairshare is restated. grptres/description
+        # must survive (the SPUR-96 regression).
+        c.sacctmgr(["modify", "account", "name=patchacct", "set", "fairshare=7"])
+        row = self._row(c, ["show", "account"], "patchacct")
+        assert row is not None, "patchacct not found after modify"
+        assert "cpu=32" in row, f"grptres cleared by an unrelated modify: {row!r}"
+        assert "PhysicsDept" in row, f"description cleared by an unrelated modify: {row!r}"
+        assert "7" in row.split(), f"fairshare not applied: {row!r}"
+
+        # Explicit empty grptres clears just that field; description survives.
+        c.sacctmgr(["modify", "account", "name=patchacct", "set", "grptres="])
+        row = self._row(c, ["show", "account"], "patchacct")
+        assert row is not None
+        assert "cpu=32" not in row, f"explicit grptres= did not clear it: {row!r}"
+        assert "PhysicsDept" in row, f"description lost on explicit grptres clear: {row!r}"
+
+    def test_modify_qos_preserves_unstated_limits_and_clears_explicit(
+        self, accounting_cluster
+    ):
+        c = accounting_cluster
+        c.sacctmgr(
+            [
+                "add",
+                "qos",
+                "name=patchqos",
+                "priority=10",
+                "grptres=cpu=32",
+                "maxwall=30",
+            ]
+        )
+
+        fmt = "format=Name,Priority,GrpTRES,MaxWall"
+        # Unrelated modify: only priority is restated. grptres/maxwall must
+        # survive.
+        c.sacctmgr(["modify", "qos", "name=patchqos", "set", "priority=99"])
+        row = self._row(c, ["show", "qos", fmt], "patchqos")
+        assert row is not None, "patchqos not found after modify"
+        assert "cpu=32" in row, f"grptres cleared by an unrelated modify: {row!r}"
+        assert "30" in row.split(), f"maxwall cleared by an unrelated modify: {row!r}"
+        assert "99" in row.split(), f"priority not applied: {row!r}"
+
+        # Explicit empty grptres clears just that field; maxwall/priority stay.
+        c.sacctmgr(["modify", "qos", "name=patchqos", "set", "grptres="])
+        row = self._row(c, ["show", "qos", fmt], "patchqos")
+        assert row is not None
+        assert "cpu=32" not in row, f"explicit grptres= did not clear it: {row!r}"
+        assert "30" in row.split(), f"maxwall lost on explicit grptres clear: {row!r}"
+        assert "99" in row.split(), f"priority lost on explicit grptres clear: {row!r}"
+
+
 class TestSacctmgrInvalidInput:
     def test_add_qos_with_non_numeric_limit_fails_cleanly(self, accounting_cluster):
         c = accounting_cluster

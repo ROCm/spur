@@ -22,6 +22,39 @@ fn validate_tres(field: &str, raw: &str) -> Result<(), Status> {
         .map_err(|e| Status::invalid_argument(format!("invalid {field}: {e}")))
 }
 
+/// Map an optional TRES/text proto field to a nullable-column patch: unset ->
+/// keep, empty -> clear (SQL NULL), otherwise -> set.
+fn nullable_str(field: &Option<String>) -> Option<Option<&str>> {
+    field
+        .as_deref()
+        .map(|s| if s.is_empty() { None } else { Some(s) })
+}
+
+/// Map an optional u32 limit proto field to a nullable-int patch: unset ->
+/// keep, 0 -> clear (no limit), n -> set. Errors if `n` overflows i32.
+fn nullable_limit(field: Option<u32>, what: &str) -> Result<Option<Option<i32>>, Status> {
+    match field {
+        None => Ok(None),
+        Some(0) => Ok(Some(None)),
+        Some(n) => Ok(Some(Some(i32::try_from(n).map_err(|_| {
+            Status::invalid_argument(format!("{what} exceeds i32::MAX"))
+        })?))),
+    }
+}
+
+/// Fairshare is a whole share count stored as `INTEGER`, but the proto carries
+/// it as `double` (kept for wire stability). Reject a fractional, negative, or
+/// out-of-range value rather than silently truncating it (e.g. 2.9 -> 2).
+fn fairshare_to_i32(v: f64) -> Result<i32, Status> {
+    if !v.is_finite() || v.fract() != 0.0 || v < 0.0 || v > f64::from(i32::MAX) {
+        return Err(Status::invalid_argument(format!(
+            "fairshare must be a whole number in [0, {}], got {v}",
+            i32::MAX
+        )));
+    }
+    Ok(v as i32)
+}
+
 pub(crate) struct AccountingService {
     pool: PgPool,
 }
@@ -293,34 +326,20 @@ impl SlurmAccounting for AccountingService {
         request: Request<CreateAccountRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
-        validate_tres("grptres", &req.grp_tres)?;
-        let parent = if req.parent_account.is_empty() {
-            None
-        } else {
-            Some(req.parent_account.as_str())
+        if let Some(g) = &req.grp_tres {
+            validate_tres("grptres", g)?;
+        }
+        let update = db::AccountUpdate {
+            description: req.description.as_deref(),
+            organization: req.organization.as_deref(),
+            parent: nullable_str(&req.parent_account),
+            fairshare: req.fairshare_weight.map(fairshare_to_i32).transpose()?,
+            max_running_jobs: nullable_limit(req.max_running_jobs, "max_running_jobs")?,
+            grp_tres: nullable_str(&req.grp_tres),
         };
-        let max_running = if req.max_running_jobs == 0 {
-            None
-        } else {
-            Some(req.max_running_jobs as i32)
-        };
-        let grp_tres = if req.grp_tres.is_empty() {
-            None
-        } else {
-            Some(req.grp_tres.as_str())
-        };
-        db::upsert_account(
-            &self.pool,
-            &req.name,
-            &req.description,
-            &req.organization,
-            parent,
-            req.fairshare_weight as i32,
-            max_running,
-            grp_tres,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+        db::upsert_account(&self.pool, &req.name, update)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(()))
     }
 
@@ -361,99 +380,78 @@ impl SlurmAccounting for AccountingService {
 
     async fn add_user(&self, request: Request<AddUserRequest>) -> Result<Response<()>, Status> {
         let req = request.into_inner();
-        // Validated against the live DB, not QosCache: a QOS created just
-        // now may not have reached the cache's next refresh yet, same
-        // inherent lag job submission already accepts for QosCache reads.
-        if !req.default_qos.is_empty() {
-            let exists = db::qos_exists(&self.pool, &req.default_qos)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-            if !exists {
-                return Err(Status::not_found(format!(
-                    "QOS '{}' does not exist",
-                    req.default_qos
+        // QOS references are validated against the live DB, not QosCache: a QOS
+        // created just now may not have reached the cache's next refresh yet,
+        // the same lag job submission already accepts for QosCache reads. Each
+        // check runs only for a field the request actually restated.
+        if let Some(dq) = req.default_qos.as_deref() {
+            if !dq.is_empty() {
+                let exists = db::qos_exists(&self.pool, dq)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                if !exists {
+                    return Err(Status::not_found(format!("QOS '{dq}' does not exist")));
+                }
+            }
+        }
+        // Normalize + validate an explicitly restated allow-list. `None` leaves
+        // the stored allow-list untouched; an explicit empty clears it.
+        let allowed_qos_normalized: Option<String> = match req.allowed_qos.as_deref() {
+            None => None,
+            Some(list) => {
+                let names: Vec<&str> = list
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let missing = db::missing_qos(&self.pool, &names)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                if let Some(name) = missing.first() {
+                    return Err(Status::not_found(format!("QOS '{name}' does not exist")));
+                }
+                Some(names.join(","))
+            }
+        };
+        // Cross-check the default is in the allow-list only when both are
+        // restated here; a preserved (unset) side can't be validated without a
+        // read and is left to the stored value.
+        if let (Some(dq), Some(list)) = (
+            req.default_qos.as_deref(),
+            allowed_qos_normalized.as_deref(),
+        ) {
+            if !dq.is_empty() && !list.is_empty() && !list.split(',').any(|q| q == dq) {
+                return Err(Status::invalid_argument(format!(
+                    "default QOS '{dq}' must be included in qos={list}"
                 )));
             }
         }
-        let allowed_qos: Vec<&str> = req
-            .allowed_qos
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
-        for name in &allowed_qos {
-            let exists = db::qos_exists(&self.pool, name)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-            if !exists {
-                return Err(Status::not_found(format!("QOS '{name}' does not exist")));
-            }
+        if let Some(t) = &req.max_tres_per_job {
+            validate_tres("maxtresperjob", t)?;
         }
-        if !req.default_qos.is_empty()
-            && !allowed_qos.is_empty()
-            && !allowed_qos.contains(&req.default_qos.as_str())
-        {
-            return Err(Status::invalid_argument(format!(
-                "default QOS '{}' must be included in qos={}",
-                req.default_qos, req.allowed_qos
-            )));
+        if let Some(t) = &req.grp_tres {
+            validate_tres("grptres", t)?;
         }
-        let max_running_jobs = if req.max_running_jobs == 0 {
-            None
-        } else {
-            Some(
-                i32::try_from(req.max_running_jobs)
-                    .map_err(|_| Status::invalid_argument("max_running_jobs exceeds i32::MAX"))?,
-            )
+        let update = db::UserUpdate {
+            admin_level: req.admin_level.as_deref(),
+            is_default: req.is_default,
+            default_qos: nullable_str(&req.default_qos),
+            allowed_qos: allowed_qos_normalized.as_deref().map(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            }),
+            max_running_jobs: nullable_limit(req.max_running_jobs, "max_running_jobs")?,
+            max_submit_jobs: nullable_limit(req.max_submit_jobs, "max_submit_jobs")?,
+            max_tres_per_job: nullable_str(&req.max_tres_per_job),
+            grp_tres: nullable_str(&req.grp_tres),
+            max_wall_min: nullable_limit(req.max_wall_minutes, "max_wall_minutes")?,
         };
-        let max_submit_jobs = if req.max_submit_jobs == 0 {
-            None
-        } else {
-            Some(
-                i32::try_from(req.max_submit_jobs)
-                    .map_err(|_| Status::invalid_argument("max_submit_jobs exceeds i32::MAX"))?,
-            )
-        };
-        validate_tres("maxtresperjob", &req.max_tres_per_job)?;
-        validate_tres("grptres", &req.grp_tres)?;
-        let max_tres_per_job = if req.max_tres_per_job.is_empty() {
-            None
-        } else {
-            Some(req.max_tres_per_job.as_str())
-        };
-        let grp_tres = if req.grp_tres.is_empty() {
-            None
-        } else {
-            Some(req.grp_tres.as_str())
-        };
-        let max_wall_minutes = if req.max_wall_minutes == 0 {
-            None
-        } else {
-            Some(
-                i32::try_from(req.max_wall_minutes)
-                    .map_err(|_| Status::invalid_argument("max_wall_minutes exceeds i32::MAX"))?,
-            )
-        };
-        // Store the trimmed/filtered form, not the raw request string, so
-        // `sacctmgr show user` echoes back what was actually validated
-        // above rather than stray whitespace or empty entries.
-        let allowed_qos_normalized = allowed_qos.join(",");
-        db::add_user(
-            &self.pool,
-            &req.user,
-            &req.account,
-            &req.admin_level,
-            req.is_default,
-            &req.default_qos,
-            &allowed_qos_normalized,
-            max_running_jobs,
-            max_submit_jobs,
-            max_tres_per_job,
-            grp_tres,
-            max_wall_minutes,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+        db::add_user(&self.pool, &req.user, &req.account, update)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(()))
     }
 
@@ -504,72 +502,34 @@ impl SlurmAccounting for AccountingService {
 
     async fn create_qos(&self, request: Request<CreateQosRequest>) -> Result<Response<()>, Status> {
         let req = request.into_inner();
-        validate_tres("maxtresperjob", &req.max_tres_per_job)?;
-        validate_tres("maxtresperuser", &req.max_tres_per_user)?;
-        validate_tres("grptres", &req.grp_tres)?;
-        let max_jobs = if req.max_jobs_per_user == 0 {
-            None
-        } else {
-            Some(
-                i32::try_from(req.max_jobs_per_user)
-                    .map_err(|_| Status::invalid_argument("max_jobs_per_user exceeds i32::MAX"))?,
-            )
+        if let Some(t) = &req.max_tres_per_job {
+            validate_tres("maxtresperjob", t)?;
+        }
+        if let Some(t) = &req.max_tres_per_user {
+            validate_tres("maxtresperuser", t)?;
+        }
+        if let Some(t) = &req.grp_tres {
+            validate_tres("grptres", t)?;
+        }
+        let update = db::QosUpdate {
+            description: req.description.as_deref(),
+            priority: req.priority,
+            preempt_mode: req.preempt_mode.as_deref(),
+            usage_factor: req.usage_factor,
+            max_jobs_per_user: nullable_limit(req.max_jobs_per_user, "max_jobs_per_user")?,
+            max_wall_min: nullable_limit(req.max_wall_minutes, "max_wall_minutes")?,
+            max_tres_per_job: nullable_str(&req.max_tres_per_job),
+            max_submit_per_user: nullable_limit(
+                req.max_submit_jobs_per_user,
+                "max_submit_jobs_per_user",
+            )?,
+            max_tres_per_user: nullable_str(&req.max_tres_per_user),
+            grp_tres: nullable_str(&req.grp_tres),
+            grp_wall_min: nullable_limit(req.grp_wall_minutes, "grp_wall_minutes")?,
         };
-        let max_wall = if req.max_wall_minutes == 0 {
-            None
-        } else {
-            Some(
-                i32::try_from(req.max_wall_minutes)
-                    .map_err(|_| Status::invalid_argument("max_wall_minutes exceeds i32::MAX"))?,
-            )
-        };
-        let max_tres = if req.max_tres_per_job.is_empty() {
-            None
-        } else {
-            Some(req.max_tres_per_job.as_str())
-        };
-        let max_submit = if req.max_submit_jobs_per_user == 0 {
-            None
-        } else {
-            Some(i32::try_from(req.max_submit_jobs_per_user).map_err(|_| {
-                Status::invalid_argument("max_submit_jobs_per_user exceeds i32::MAX")
-            })?)
-        };
-        let max_tres_user = if req.max_tres_per_user.is_empty() {
-            None
-        } else {
-            Some(req.max_tres_per_user.as_str())
-        };
-        let grp_tres = if req.grp_tres.is_empty() {
-            None
-        } else {
-            Some(req.grp_tres.as_str())
-        };
-        let grp_wall = if req.grp_wall_minutes == 0 {
-            None
-        } else {
-            Some(
-                i32::try_from(req.grp_wall_minutes)
-                    .map_err(|_| Status::invalid_argument("grp_wall_minutes exceeds i32::MAX"))?,
-            )
-        };
-        db::upsert_qos(
-            &self.pool,
-            &req.name,
-            &req.description,
-            req.priority,
-            &req.preempt_mode,
-            req.usage_factor,
-            max_jobs,
-            max_wall,
-            max_tres,
-            max_submit,
-            max_tres_user,
-            grp_tres,
-            grp_wall,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+        db::upsert_qos(&self.pool, &req.name, update)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(()))
     }
 
@@ -685,5 +645,34 @@ mod tests {
     fn validate_tres_rejects_unknown_type() {
         let err = validate_tres("maxtresperuser", "bogus=5").unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn fairshare_to_i32_accepts_whole_numbers() {
+        assert_eq!(fairshare_to_i32(0.0).unwrap(), 0);
+        assert_eq!(fairshare_to_i32(2.0).unwrap(), 2);
+        assert_eq!(fairshare_to_i32(f64::from(i32::MAX)).unwrap(), i32::MAX);
+    }
+
+    #[test]
+    fn fairshare_to_i32_rejects_fractional_instead_of_truncating() {
+        // The bug this guards: 2.9 must not silently become 2.
+        let err = fairshare_to_i32(2.9).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("whole number"));
+    }
+
+    #[test]
+    fn fairshare_to_i32_rejects_negative_and_out_of_range() {
+        assert_eq!(
+            fairshare_to_i32(-1.0).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            fairshare_to_i32(f64::from(i32::MAX) + 1.0)
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
     }
 }
