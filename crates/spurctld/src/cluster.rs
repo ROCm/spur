@@ -1526,7 +1526,7 @@ impl ClusterManager {
                     let hint = if self.qos_cache.is_loaded() {
                         ""
                     } else {
-                        " (hint: accounting may not be enabled on this controller — check controller logs)"
+                        QOS_ACCOUNTING_HINT
                     };
                     anyhow::bail!("QOS '{q}' does not exist{hint}");
                 }
@@ -4718,6 +4718,9 @@ fn validate_user_account(
     }
 }
 
+const QOS_ACCOUNTING_HINT: &str =
+    " (hint: accounting may not be enabled on this controller -- check controller logs)";
+
 /// Resolve a job's QOS at submit, in Slurm's order: explicit `--qos` (must
 /// exist and be permitted for the association) → association default →
 /// cluster fallback (`accounting.default_qos`, also gated by the
@@ -4749,8 +4752,7 @@ fn apply_default_qos(
             let hint = if qos_cache.is_loaded() {
                 String::new()
             } else {
-                " (hint: accounting may not be enabled on this controller — check controller logs)"
-                    .into()
+                QOS_ACCOUNTING_HINT.into()
             };
             return Err(SubmitError::invalid(format!(
                 "QOS '{name}' does not exist{hint}"
@@ -4790,8 +4792,7 @@ fn apply_default_qos(
             let hint = if qos_cache.is_loaded() {
                 String::new()
             } else {
-                " (hint: accounting may not be enabled on this controller — check controller logs)"
-                    .into()
+                QOS_ACCOUNTING_HINT.into()
             };
             return Err(SubmitError::invalid(format!(
                 "configured default QOS '{fallback}' does not exist{hint}"
@@ -10255,6 +10256,7 @@ mod tests {
             .update_job(id, None, None, None, None, None, Some("ghost".into()))
             .unwrap_err();
         assert!(err.to_string().contains("QOS 'ghost' does not exist"));
+        assert!(!err.to_string().contains("accounting may not be enabled"));
         assert_eq!(cm.get_job(id).unwrap().spec.qos, None);
 
         // Empty QOS (clear-to-limitless) rejected.
@@ -11184,6 +11186,7 @@ mod tests {
             err,
             SubmitError::invalid("QOS 'doesnotexist' does not exist")
         );
+        assert!(!err.to_string().contains("accounting may not be enabled"));
     }
 
     #[test]
@@ -11394,6 +11397,7 @@ mod tests {
             err,
             SubmitError::invalid("configured default QOS 'ghost' does not exist")
         );
+        assert!(!err.to_string().contains("accounting may not be enabled"));
     }
 
     #[test]
