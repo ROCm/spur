@@ -704,9 +704,18 @@ fn candidate_script_path(cli_args: &[String]) -> Option<String> {
 }
 
 /// Slurm allocates one task per node unless `-n` is given, so the default
-/// scales with `-N` instead of being a fixed 1.
-fn effective_ntasks(ntasks: Option<u32>, nodes: u32) -> u32 {
-    ntasks.unwrap_or(nodes)
+/// scales with `-N` instead of being a fixed 1. `--ntasks-per-node=K` raises
+/// that default to `nodes * K`, keeping `SLURM_NTASKS` and accounting in step
+/// with the number of tasks actually launched.
+fn effective_ntasks(ntasks: Option<u32>, ntasks_per_node: Option<u32>, nodes: u32) -> u32 {
+    if let Some(n) = ntasks {
+        return n;
+    }
+    // Zero tasks-per-node means "unset" everywhere downstream.
+    match ntasks_per_node.filter(|&k| k > 0) {
+        Some(k) => nodes.saturating_mul(k),
+        None => nodes,
+    }
 }
 
 /// Default job name: explicit `-J`, else `"wrap"` for wrap-mode, else the
@@ -828,7 +837,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         uid: nix::unistd::getuid().as_raw(),
         gid: nix::unistd::getgid().as_raw(),
         num_nodes: args.nodes,
-        num_tasks: effective_ntasks(args.ntasks, args.nodes),
+        num_tasks: effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
         tasks_per_node: args.ntasks_per_node.unwrap_or(0),
         cpus_per_task: args.cpus_per_task,
         memory_per_node_mb: memory_per_node.unwrap_or(0),
@@ -1053,19 +1062,71 @@ echo "hello world"
     fn test_ntasks_defaults_to_node_count() {
         let args = parse_merged(&[], &["sbatch", "-N", "4"]);
         assert_eq!(args.ntasks, None);
-        assert_eq!(effective_ntasks(args.ntasks, args.nodes), 4);
+        assert_eq!(
+            effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
+            4
+        );
     }
 
     #[test]
     fn test_explicit_ntasks_overrides_node_default() {
         let args = parse_merged(&[], &["sbatch", "-N", "4", "-n", "2"]);
-        assert_eq!(effective_ntasks(args.ntasks, args.nodes), 2);
+        assert_eq!(
+            effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
+            2
+        );
     }
 
     #[test]
     fn test_ntasks_directive_used_when_no_cli() {
         let args = parse_merged(&["--ntasks=8"], &["sbatch", "-N", "4"]);
-        assert_eq!(effective_ntasks(args.ntasks, args.nodes), 8);
+        assert_eq!(
+            effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
+            8
+        );
+    }
+
+    #[test]
+    fn test_ntasks_per_node_scales_default_by_node_count() {
+        let args = parse_merged(&[], &["sbatch", "-N", "2", "--ntasks-per-node=4"]);
+        assert_eq!(args.ntasks, None);
+        assert_eq!(
+            effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
+            8
+        );
+    }
+
+    #[test]
+    fn test_explicit_ntasks_overrides_ntasks_per_node_default() {
+        let args = parse_merged(
+            &[],
+            &["sbatch", "-N", "2", "--ntasks-per-node=4", "-n", "3"],
+        );
+        assert_eq!(
+            effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
+            3
+        );
+    }
+
+    #[test]
+    fn test_ntasks_directive_overrides_ntasks_per_node_default() {
+        let args = parse_merged(
+            &["--ntasks=3"],
+            &["sbatch", "-N", "2", "--ntasks-per-node=4"],
+        );
+        assert_eq!(
+            effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
+            3
+        );
+    }
+
+    #[test]
+    fn test_ntasks_per_node_directive_scales_default() {
+        let args = parse_merged(&["--ntasks-per-node=4"], &["sbatch", "-N", "2"]);
+        assert_eq!(
+            effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
+            8
+        );
     }
 
     #[tokio::test]
