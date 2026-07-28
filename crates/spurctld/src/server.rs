@@ -1250,14 +1250,11 @@ impl SlurmController for ControllerService {
             .create_step(step)
             .map_err(|e| Status::internal(format!("failed to create job step: {e}")))?;
 
-        let node_addr = self
-            .cluster
-            .get_node(target_node)
-            .map(|n| {
-                let host = n.address.as_deref().unwrap_or(&n.name);
-                format!("{}:{}", host, n.port)
-            })
-            .unwrap_or_default();
+        let node = self.cluster.get_node(target_node).ok_or_else(|| {
+            Status::unavailable(format!("node {target_node} is not currently registered"))
+        })?;
+        let host = node.address.as_deref().unwrap_or(&node.name);
+        let node_addr = format!("{}:{}", host, node.port);
 
         Ok(Response::new(CreateJobStepResponse { step_id, node_addr }))
     }
@@ -1829,9 +1826,8 @@ pub async fn serve(
     Ok(())
 }
 
-/// Resolve the node an interactive step attaches to. Empty request = the first
-/// allocated node (legacy default); a named node must be one the job actually
-/// holds, otherwise the step would attach outside the allocation.
+/// Resolve the target node for a job step. Empty = first allocated (legacy
+/// default); a named node must be one the job holds, else it targets outside it.
 fn select_step_node<'a>(allocated: &'a [String], requested: &str) -> Result<&'a str, String> {
     if requested.is_empty() {
         return allocated
