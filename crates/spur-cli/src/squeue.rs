@@ -47,8 +47,8 @@ pub struct SqueueArgs {
     #[arg(short = 'h', long)]
     pub noheader: bool,
 
-    /// Sort by field
-    #[arg(short = 'S', long)]
+    /// Sort by field(s), comma-separated, each optionally prefixed with + (asc) or - (desc)
+    #[arg(short = 'S', long, allow_hyphen_values = true)]
     pub sort: Option<String>,
 
     /// Controller address
@@ -113,7 +113,15 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .await
         .context("failed to get jobs")?;
 
-    let jobs = response.into_inner().jobs;
+    let mut jobs = response.into_inner().jobs;
+
+    // Slurm sorts client-side; its default job sort is "P,t,-p". The trailing
+    // jobid tiebreak is ours, so equal-priority jobs order deterministically.
+    let sort_keys = match args.sort.as_deref() {
+        Some(s) => parse_sort_arg(s)?,
+        None => default_sort_keys(),
+    };
+    sort_jobs(&mut jobs, &sort_keys);
 
     // Print header
     if !args.noheader {
@@ -171,6 +179,132 @@ fn resolve_job_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
         }
         _ => "?".into(),
     }
+}
+
+/// One field in a sort spec, with direction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SortKey {
+    spec: char,
+    descending: bool,
+}
+
+/// Slurm's documented default job sort: partition asc, state asc, priority desc.
+/// A trailing jobid asc keeps equal-priority jobs deterministically ordered.
+fn default_sort_keys() -> Vec<SortKey> {
+    vec![
+        SortKey {
+            spec: 'P',
+            descending: false,
+        },
+        SortKey {
+            spec: 't',
+            descending: false,
+        },
+        SortKey {
+            spec: 'p',
+            descending: true,
+        },
+        SortKey {
+            spec: 'i',
+            descending: false,
+        },
+    ]
+}
+
+/// Parse `-S` / `--sort`: comma-separated fields, each optionally prefixed with
+/// `+` (asc, default) or `-` (desc). Reuses the format-spec letters.
+fn parse_sort_arg(s: &str) -> Result<Vec<SortKey>> {
+    let mut keys = Vec::new();
+    for token in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let (descending, rest) = match token.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, token.strip_prefix('+').unwrap_or(token)),
+        };
+        let mut chars = rest.chars();
+        let spec = chars
+            .next()
+            .filter(|_| chars.next().is_none())
+            .ok_or_else(|| anyhow::anyhow!("Invalid sort specification: {token}"))?;
+        if format_engine::squeue_header(spec) == "?" {
+            anyhow::bail!("Invalid sort specification: {token}");
+        }
+        keys.push(SortKey { spec, descending });
+    }
+    if keys.is_empty() {
+        anyhow::bail!("Invalid sort specification: (empty)");
+    }
+    Ok(keys)
+}
+
+fn sort_jobs(jobs: &mut [spur_proto::proto::JobInfo], keys: &[SortKey]) {
+    jobs.sort_by(|a, b| {
+        for key in keys {
+            let ord = compare_field(a, b, key.spec);
+            let ord = if key.descending { ord.reverse() } else { ord };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+}
+
+/// Compare two jobs on a single field. Numeric fields compare numerically;
+/// timestamps by epoch seconds; everything else lexically on the rendered value.
+fn compare_field(
+    a: &spur_proto::proto::JobInfo,
+    b: &spur_proto::proto::JobInfo,
+    spec: char,
+) -> std::cmp::Ordering {
+    match spec {
+        'i' | 'A' => a.job_id.cmp(&b.job_id),
+        'p' => a.priority.cmp(&b.priority),
+        'D' => a.num_nodes.cmp(&b.num_nodes),
+        'C' => a.cpus_per_task.cmp(&b.cpus_per_task),
+        't' | 'T' => state_sort_rank(a.state).cmp(&state_sort_rank(b.state)),
+        'M' => run_time_secs(a).cmp(&run_time_secs(b)),
+        'l' => time_limit_secs(a).cmp(&time_limit_secs(b)),
+        'S' => ts_secs(a.start_time.as_ref()).cmp(&ts_secs(b.start_time.as_ref())),
+        'V' => ts_secs(a.submit_time.as_ref()).cmp(&ts_secs(b.submit_time.as_ref())),
+        'e' => ts_secs(a.end_time.as_ref()).cmp(&ts_secs(b.end_time.as_ref())),
+        _ => resolve_job_field(a, spec).cmp(&resolve_job_field(b, spec)),
+    }
+}
+
+/// Rank a proto state by Slurm's base job-state order (SUSPENDED sits right
+/// after RUNNING, before the terminal states) so `-S t` matches Slurm.
+fn state_sort_rank(state: i32) -> u8 {
+    use spur_proto::proto::JobState as S;
+    match S::try_from(state) {
+        Ok(S::JobPending) => 0,
+        Ok(S::JobRunning) => 1,
+        Ok(S::JobSuspended) => 2,
+        Ok(S::JobCompleting) => 3,
+        Ok(S::JobCompleted) => 4,
+        Ok(S::JobCancelled) => 5,
+        Ok(S::JobFailed) => 6,
+        Ok(S::JobTimeout) => 7,
+        Ok(S::JobNodeFail) => 8,
+        Ok(S::JobPreempted) => 9,
+        Ok(S::JobDeadline) => 10,
+        Ok(S::JobOutOfMemory) => 11,
+        Err(_) => u8::MAX,
+    }
+}
+
+fn run_time_secs(job: &spur_proto::proto::JobInfo) -> i64 {
+    job.run_time.as_ref().map(|d| d.seconds).unwrap_or(0)
+}
+
+fn time_limit_secs(job: &spur_proto::proto::JobInfo) -> i64 {
+    job.time_limit
+        .as_ref()
+        .map(|d| d.seconds)
+        .unwrap_or(i64::MAX)
+}
+
+fn ts_secs(ts: Option<&prost_types::Timestamp>) -> i64 {
+    ts.map(|t| t.seconds).unwrap_or(0)
 }
 
 fn state_code(state: i32) -> String {
@@ -310,5 +444,145 @@ mod tests {
     fn parse_states_arg_rejects_empty_list() {
         assert!(parse_states_arg("").is_err());
         assert!(parse_states_arg("  ,  ").is_err());
+    }
+
+    fn job(id: u32, partition: &str, state: P, priority: u32) -> spur_proto::proto::JobInfo {
+        spur_proto::proto::JobInfo {
+            job_id: id,
+            partition: partition.into(),
+            state: state as i32,
+            priority,
+            ..Default::default()
+        }
+    }
+
+    fn ids(jobs: &[spur_proto::proto::JobInfo]) -> Vec<u32> {
+        jobs.iter().map(|j| j.job_id).collect()
+    }
+
+    #[test]
+    fn parse_sort_arg_directions() {
+        let keys = parse_sort_arg("P,-p,+i").unwrap();
+        assert_eq!(keys.len(), 3);
+        assert_eq!(
+            keys[0],
+            SortKey {
+                spec: 'P',
+                descending: false
+            }
+        );
+        assert_eq!(
+            keys[1],
+            SortKey {
+                spec: 'p',
+                descending: true
+            }
+        );
+        assert_eq!(
+            keys[2],
+            SortKey {
+                spec: 'i',
+                descending: false
+            }
+        );
+    }
+
+    #[test]
+    fn parse_sort_arg_rejects_bad_tokens() {
+        assert!(parse_sort_arg("").is_err());
+        assert!(parse_sort_arg("ii").is_err());
+        assert!(parse_sort_arg("-").is_err());
+    }
+
+    #[test]
+    fn sort_ascending_and_descending_jobid() {
+        let mut jobs = vec![
+            job(70, "default", P::JobRunning, 100),
+            job(72, "default", P::JobRunning, 100),
+            job(71, "default", P::JobRunning, 100),
+        ];
+        sort_jobs(&mut jobs, &parse_sort_arg("i").unwrap());
+        assert_eq!(ids(&jobs), vec![70, 71, 72]);
+        sort_jobs(&mut jobs, &parse_sort_arg("-i").unwrap());
+        assert_eq!(ids(&jobs), vec![72, 71, 70]);
+    }
+
+    #[test]
+    fn default_sort_matches_slurm_p_t_negp() {
+        // partition asc, then state asc (PD<R), then priority desc, then jobid asc
+        let mut jobs = vec![
+            job(10, "b", P::JobRunning, 100),
+            job(11, "a", P::JobRunning, 50),
+            job(12, "a", P::JobPending, 200),
+            job(13, "a", P::JobRunning, 50),
+        ];
+        sort_jobs(&mut jobs, &default_sort_keys());
+        assert_eq!(ids(&jobs), vec![12, 11, 13, 10]);
+    }
+
+    #[test]
+    fn sort_by_priority_desc_then_jobid_tiebreak() {
+        let mut jobs = vec![
+            job(70, "default", P::JobPending, 100),
+            job(71, "default", P::JobPending, 300),
+            job(72, "default", P::JobPending, 300),
+        ];
+        sort_jobs(&mut jobs, &parse_sort_arg("-p,i").unwrap());
+        assert_eq!(ids(&jobs), vec![71, 72, 70]);
+    }
+
+    #[test]
+    fn parse_sort_arg_rejects_unknown_spec() {
+        let err = parse_sort_arg("x").unwrap_err();
+        assert!(err.to_string().contains("Invalid sort specification"));
+        assert!(parse_sort_arg("-z").is_err());
+        assert!(parse_sort_arg("i,x").is_err());
+    }
+
+    #[test]
+    fn state_sort_places_suspended_after_running() {
+        let mut jobs = vec![
+            job(1, "default", P::JobFailed, 0),
+            job(2, "default", P::JobSuspended, 0),
+            job(3, "default", P::JobRunning, 0),
+            job(4, "default", P::JobPending, 0),
+        ];
+        sort_jobs(&mut jobs, &parse_sort_arg("t").unwrap());
+        assert_eq!(ids(&jobs), vec![4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn sort_by_timelimit_puts_unlimited_last() {
+        let mut a = job(1, "default", P::JobRunning, 0);
+        a.time_limit = Some(prost_types::Duration {
+            seconds: 600,
+            nanos: 0,
+        });
+        let b = job(2, "default", P::JobRunning, 0);
+        let mut c = job(3, "default", P::JobRunning, 0);
+        c.time_limit = Some(prost_types::Duration {
+            seconds: 60,
+            nanos: 0,
+        });
+        let mut jobs = vec![a, b, c];
+        sort_jobs(&mut jobs, &parse_sort_arg("l").unwrap());
+        assert_eq!(ids(&jobs), vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn sort_by_submit_time_ascending() {
+        let mut a = job(1, "default", P::JobPending, 0);
+        a.submit_time = Some(prost_types::Timestamp {
+            seconds: 300,
+            nanos: 0,
+        });
+        let mut b = job(2, "default", P::JobPending, 0);
+        b.submit_time = Some(prost_types::Timestamp {
+            seconds: 100,
+            nanos: 0,
+        });
+        let mut jobs = vec![a, b];
+        sort_jobs(&mut jobs, &parse_sort_arg("V").unwrap());
+        assert_eq!(ids(&jobs), vec![2, 1]);
     }
 }
