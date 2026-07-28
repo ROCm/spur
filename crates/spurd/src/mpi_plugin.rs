@@ -16,6 +16,7 @@ use tracing::{debug, info, warn};
 
 const PMIX_ENV_KEYS: &[&str] = &[
     "PMIX_SERVER_URI",
+    "PMIX_SERVER_URI4",
     "PMIX_NAMESPACE",
     "PMIX_RANK",
     "PMIX_SIZE",
@@ -445,6 +446,12 @@ impl MpiPluginHost {
             } else {
                 debug!(job_id = plan.job_id, rank, key, "PMIx env key unavailable");
             }
+        }
+        // Open MPI 4.x expects URI4/URI3; same aliases in pmix_server.c and task_launch.rs.
+        if let Some(uri) = out.get("PMIX_SERVER_URI").cloned() {
+            out.entry("PMIX_SERVER_URI4".into())
+                .or_insert_with(|| uri.clone());
+            out.entry("PMIX_SERVER_URI3".into()).or_insert(uri);
         }
         validate_pmix_env(&out)?;
         Ok(out)

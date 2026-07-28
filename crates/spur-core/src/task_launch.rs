@@ -276,8 +276,49 @@ pub fn wrap_command_with_cpu_bind(
     }
 }
 
+/// Bash prefix shared by PMIx/Open MPI launch wrappers.
+///
+/// Open MPI 4.x expects `PMIX_SERVER_URI4`/`URI3`; the same aliases exist in
+/// `spurd::mpi_plugin` and `crates/spur-mpi-pmix/c/pmix_server.c`.
+fn mpi_launch_preamble() -> &'static str {
+    concat!(
+        "if [ -z \"${SPUR_MPIRUN:-}\" ]; then\n",
+        "  if command -v mpirun >/dev/null 2>&1; then SPUR_MPIRUN=$(command -v mpirun)\n",
+        "  elif [ -n \"${OPAL_PREFIX:-}\" ] && [ -x \"${OPAL_PREFIX}/bin/mpirun\" ]; then SPUR_MPIRUN=\"${OPAL_PREFIX}/bin/mpirun\"\n",
+        "  else SPUR_MPIRUN=mpirun; fi\n",
+        "fi\n",
+        "export PMIX_SERVER_URI4=${PMIX_SERVER_URI4:-$PMIX_SERVER_URI}\n",
+        "export PMIX_SERVER_URI3=${PMIX_SERVER_URI3:-$PMIX_SERVER_URI}\n",
+        "while IFS= read -r _v; do unset \"$_v\"; done < <(env | sed -n 's/^\\(SLURM_[^=]*\\)=.*/\\1/p')\n",
+    )
+}
+
+/// Launch multi-rank MPI jobs via a single `mpirun` instead of forking independent
+/// processes. Open MPI 4.x direct-launched tasks otherwise spawn per-process PMIx
+/// servers and never form a shared `MPI_COMM_WORLD`.
+pub fn build_mpi_mpirun_wrapper(user_script_path: &str, tasks_on_node: u32) -> String {
+    let escaped = user_script_path.replace('"', "\\\"");
+    format!(
+        concat!(
+            "#!/bin/bash\n",
+            "_TASKS_ON_NODE={tasks_on_node}\n",
+            "{preamble}",
+            "if [ \"$SPUR_LABEL\" = \"1\" ]; then\n",
+            "  exec \"$SPUR_MPIRUN\" -np \"$_TASKS_ON_NODE\" --bind-to none --tag-output \"{escaped}\"\n",
+            "else\n",
+            "  exec \"$SPUR_MPIRUN\" -np \"$_TASKS_ON_NODE\" --bind-to none \"{escaped}\"\n",
+            "fi\n",
+        ),
+        tasks_on_node = tasks_on_node,
+        preamble = mpi_launch_preamble(),
+        escaped = escaped,
+    )
+}
+
 /// Build a bash wrapper that forks `tasks_on_node` copies of `user_script_path`,
 /// assigning distinct `LOCAL_RANK` / `SLURM_PROCID` values in each fork.
+///
+/// When `mpi_bootstrap` is true, uses [`build_mpi_mpirun_wrapper`] instead.
 ///
 /// Output labeling is controlled at runtime via the `SPUR_LABEL=1` environment
 /// variable (matching batch `launch_job` and srun `-l`).
@@ -287,6 +328,9 @@ pub fn build_multi_task_wrapper(
     environment: Option<&HashMap<String, String>>,
     mpi_bootstrap: bool,
 ) -> String {
+    if mpi_bootstrap {
+        return build_mpi_mpirun_wrapper(user_script_path, tasks_on_node);
+    }
     let escaped = user_script_path.replace('"', "\\\"");
     let bind = environment.map(parse_cpu_bind).unwrap_or(CpuBind::None);
     let map_cpus: Vec<&str> = match &bind {
@@ -310,12 +354,6 @@ pub fn build_multi_task_wrapper(
     wrapper.push_str("for LOCAL_RANK in $(seq 0 $((_TASKS_ON_NODE - 1))); do\n");
     wrapper.push_str("  export LOCAL_RANK\n");
     wrapper.push_str(SpurEnv::per_task_bash_exports());
-    if mpi_bootstrap {
-        wrapper.push_str("  export PMI_RANK=$SPUR_PROCID\n");
-        wrapper.push_str("  export PMIX_RANK=$SPUR_PROCID\n");
-        wrapper.push_str("  export OMPI_COMM_WORLD_RANK=$SPUR_PROCID\n");
-        wrapper.push_str("  export OMPI_COMM_WORLD_LOCAL_RANK=$LOCAL_RANK\n");
-    }
 
     wrapper.push_str("  if [ -n \"$SPUR_JOB_GPUS\" ]; then\n");
     wrapper.push_str("    IFS=',' read -ra _ALL_GPUS <<< \"$SPUR_JOB_GPUS\"\n");
@@ -448,6 +486,22 @@ mod tests {
         let script = build_multi_task_wrapper("/tmp/work.sh", 1, None, false);
         assert!(script.contains("SPUR_LABEL"));
         assert!(script.contains("sed \"s/^/[$SPUR_PROCID] /\""));
+    }
+
+    #[test]
+    fn mpi_wrapper_uses_mpirun_not_fork() {
+        let script = build_multi_task_wrapper("/tmp/hello_mpi", 4, None, true);
+        assert!(script.contains("\"$SPUR_MPIRUN\" -np \"$_TASKS_ON_NODE\""));
+        assert!(script.contains("_TASKS_ON_NODE=4"));
+        assert!(script.contains("PMIX_SERVER_URI4"));
+        assert!(script.contains("unset \"$_v\""));
+        assert!(!script.contains("for LOCAL_RANK in"));
+    }
+
+    #[test]
+    fn mpi_wrapper_tag_output_when_labeled() {
+        let script = build_multi_task_wrapper("/tmp/hello_mpi", 4, None, true);
+        assert!(script.contains("--tag-output"));
     }
 
     #[test]
