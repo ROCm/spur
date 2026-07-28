@@ -1,7 +1,9 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::env_defaults::{apply_csv, apply_flag, apply_num, apply_str, was_cli_set};
+use crate::env_defaults::{
+    apply_csv, apply_flag, apply_num, apply_num_opt, apply_str, was_cli_set,
+};
 use anyhow::{Context, Result};
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use spur_core::config::HooksConfig;
@@ -37,9 +39,9 @@ pub struct SrunArgs {
     #[arg(short = 'N', long, default_value = "1")]
     pub nodes: u32,
 
-    /// Number of tasks
-    #[arg(short = 'n', long, default_value = "1")]
-    pub ntasks: u32,
+    /// Number of tasks (default: one per node)
+    #[arg(short = 'n', long)]
+    pub ntasks: Option<u32>,
 
     /// CPUs per task
     #[arg(short = 'c', long, default_value = "1")]
@@ -330,7 +332,7 @@ fn resolve_srun_env(matches: &ArgMatches, args: &mut SrunArgs) -> Result<()> {
         ],
         &mut args.nodes,
     )?;
-    apply_num(
+    apply_num_opt(
         matches,
         "ntasks",
         &["SPUR_NTASKS", "SPUR_NPROCS", "SLURM_NTASKS", "SLURM_NPROCS"],
@@ -556,7 +558,7 @@ fn build_srun_job_spec(
         uid: nix::unistd::getuid().as_raw(),
         gid: nix::unistd::getgid().as_raw(),
         num_nodes: args.nodes,
-        num_tasks: args.ntasks,
+        num_tasks: crate::sbatch::effective_ntasks(args.ntasks, None, args.nodes),
         cpus_per_task: args.cpus_per_task,
         memory_per_node_mb: memory_mb,
         gres,
@@ -705,11 +707,12 @@ async fn dispatch_step(
     let work_dir = params.work_dir;
     let io = params.io;
     let step_mpi = params.mpi;
+    let ntasks = crate::sbatch::effective_ntasks(args.ntasks, None, args.nodes);
     let step_id = client
         .create_job_step(CreateJobStepRequest {
             job_id,
             command: args.command.clone(),
-            num_tasks: args.ntasks,
+            num_tasks: ntasks,
             cpus_per_task: args.cpus_per_task,
             overlap: false,
             pty: false,
@@ -726,8 +729,8 @@ async fn dispatch_step(
 
     let environment = srun_dispatch_environment(args);
     warn_unsupported_cpu_bind(&environment);
-    if let Some(err) = spur_core::task_launch::map_cpu_bind_error(&environment, args.ntasks)
-        .or_else(|| spur_core::task_launch::mask_cpu_bind_error(&environment, args.ntasks))
+    if let Some(err) = spur_core::task_launch::map_cpu_bind_error(&environment, ntasks)
+        .or_else(|| spur_core::task_launch::mask_cpu_bind_error(&environment, ntasks))
     {
         anyhow::bail!("{err}");
     }
@@ -1512,6 +1515,34 @@ mod tests {
     }
 
     #[test]
+    fn build_srun_job_spec_ntasks_defaults_to_node_count() {
+        let args = SrunArgs::try_parse_from(["srun", "-N", "4", "hostname"]).expect("parse");
+        assert_eq!(args.ntasks, None);
+        let io = ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        };
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
+        assert_eq!(spec.num_tasks, 4);
+    }
+
+    #[test]
+    fn build_srun_job_spec_explicit_ntasks_overrides_node_default() {
+        let args =
+            SrunArgs::try_parse_from(["srun", "-N", "4", "-n", "2", "hostname"]).expect("parse");
+        let io = ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        };
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
+        assert_eq!(spec.num_tasks, 2);
+    }
+
+    #[test]
     fn parses_qos_short_and_long() {
         let short =
             SrunArgs::try_parse_from(["srun", "-q", "high", "hostname"]).expect("parse short qos");
@@ -1718,7 +1749,7 @@ mod tests {
     fn ntasks_nprocs_fallback() {
         let env = EnvGuard::new();
         env.set("SLURM_NPROCS", "7");
-        assert_eq!(resolve_from(&["srun", "hostname"]).ntasks, 7);
+        assert_eq!(resolve_from(&["srun", "hostname"]).ntasks, Some(7));
     }
 
     #[test]
@@ -1734,7 +1765,7 @@ mod tests {
     fn numeric_env_trims_whitespace() {
         let env = EnvGuard::new();
         env.set("SLURM_NTASKS", " 4 ");
-        assert_eq!(resolve_from(&["srun", "hostname"]).ntasks, 4);
+        assert_eq!(resolve_from(&["srun", "hostname"]).ntasks, Some(4));
     }
 
     #[test]
@@ -1820,7 +1851,7 @@ mod tests {
         let _env = EnvGuard::new();
         let args = resolve_from(&["srun", "hostname"]);
         assert_eq!(args.nodes, 1);
-        assert_eq!(args.ntasks, 1);
+        assert_eq!(args.ntasks, None);
         assert_eq!(args.cpus_per_task, 1);
         assert!(args.partition.is_none());
         assert!(args.mpi.is_none());
@@ -1841,13 +1872,40 @@ mod tests {
         env.set("SLURM_CPUS_PER_TASK", "2");
         env.set("SLURM_JOB_NUM_NODES", "3");
         let args = resolve_from(&["srun", "hostname"]);
-        assert_eq!(args.ntasks, 4);
+        assert_eq!(args.ntasks, Some(4));
         assert_eq!(args.cpus_per_task, 2);
         assert_eq!(args.nodes, 3);
 
         // An explicit CLI value still wins over the inherited allocation env.
         let overridden = resolve_from(&["srun", "-n", "1", "hostname"]);
-        assert_eq!(overridden.ntasks, 1);
+        assert_eq!(overridden.ntasks, Some(1));
+    }
+
+    /// Outside an allocation there is no `SLURM_NTASKS` to inherit, so the task
+    /// count follows the node count — including when `-N` itself came from env.
+    #[test]
+    #[serial(env_injection)]
+    fn ntasks_defaults_to_node_count_from_env() {
+        let env = EnvGuard::new();
+        env.set("SLURM_NNODES", "3");
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(args.ntasks, None);
+        assert_eq!(
+            crate::sbatch::effective_ntasks(args.ntasks, None, args.nodes),
+            3
+        );
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn invalid_ntasks_env_errors() {
+        let env = EnvGuard::new();
+        env.set("SLURM_NTASKS", "abc");
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "hostname"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        assert!(resolve_srun_env(&matches, &mut args).is_err());
     }
 
     /// Allocation context is exported under the `*_JOB_*` names

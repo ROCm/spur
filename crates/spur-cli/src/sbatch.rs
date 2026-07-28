@@ -707,7 +707,11 @@ fn candidate_script_path(cli_args: &[String]) -> Option<String> {
 /// scales with `-N` instead of being a fixed 1. `--ntasks-per-node=K` raises
 /// that default to `nodes * K`, keeping `SLURM_NTASKS` and accounting in step
 /// with the number of tasks actually launched.
-fn effective_ntasks(ntasks: Option<u32>, ntasks_per_node: Option<u32>, nodes: u32) -> u32 {
+pub(crate) fn effective_ntasks(
+    ntasks: Option<u32>,
+    ntasks_per_node: Option<u32>,
+    nodes: u32,
+) -> u32 {
     if let Some(n) = ntasks {
         return n;
     }

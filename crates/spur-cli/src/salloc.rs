@@ -28,9 +28,9 @@ pub struct SallocArgs {
     #[arg(short = 'N', long, default_value = "1")]
     pub nodes: u32,
 
-    /// Number of tasks
-    #[arg(short = 'n', long, default_value = "1")]
-    pub ntasks: u32,
+    /// Number of tasks (default: one per node)
+    #[arg(short = 'n', long)]
+    pub ntasks: Option<u32>,
 
     /// CPUs per task
     #[arg(short = 'c', long, default_value = "1")]
@@ -146,7 +146,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let reservation = args.reservation;
     let partition = args.partition;
     let account = args.account;
-    let ntasks = args.ntasks;
+    let ntasks = crate::sbatch::effective_ntasks(args.ntasks, None, nodes);
     let cpus_per_task = args.cpus_per_task;
 
     let channel = spur_client::connect_channel(&controller)
@@ -413,6 +413,26 @@ mod tests {
                 .expect("parse failed");
         assert_eq!(args.nodelist.as_deref(), Some("node001"));
         assert_eq!(args.exclude.as_deref(), Some("node002"));
+    }
+
+    #[test]
+    fn ntasks_defaults_to_node_count() {
+        let args = SallocArgs::try_parse_from(["salloc", "-N", "4"]).expect("parse failed");
+        assert_eq!(args.ntasks, None);
+        assert_eq!(
+            crate::sbatch::effective_ntasks(args.ntasks, None, args.nodes),
+            4
+        );
+    }
+
+    #[test]
+    fn explicit_ntasks_overrides_node_default() {
+        let args =
+            SallocArgs::try_parse_from(["salloc", "-N", "4", "-n", "2"]).expect("parse failed");
+        assert_eq!(
+            crate::sbatch::effective_ntasks(args.ntasks, None, args.nodes),
+            2
+        );
     }
 
     #[test]

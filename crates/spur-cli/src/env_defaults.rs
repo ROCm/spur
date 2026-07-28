@@ -112,9 +112,26 @@ pub fn apply_flag(matches: &ArgMatches, id: &str, names: &[&str], target: &mut b
     }
 }
 
-/// Apply a numeric env default. The error names the specific variable that
-/// supplied the bad value so a misconfigured `SLURM_NNODES=abc` is easy to
-/// diagnose.
+/// Parse the first set variable in `names`. The error names the specific
+/// variable that supplied the bad value so a misconfigured `SLURM_NNODES=abc`
+/// is easy to diagnose.
+fn parse_first_num<T>(names: &[&str]) -> Result<Option<T>>
+where
+    T: FromStr,
+    T::Err: Display,
+{
+    first_set(names)
+        .map(|(name, v)| {
+            // Trim so values with incidental whitespace (e.g. `SLURM_NTASKS="4 "`)
+            // parse instead of erroring.
+            v.trim()
+                .parse()
+                .map_err(|e| anyhow!("invalid value {:?} for {}: {}", v, name, e))
+        })
+        .transpose()
+}
+
+/// Apply a numeric env default to a flag carrying a clap default value.
 pub fn apply_num<T>(matches: &ArgMatches, id: &str, names: &[&str], target: &mut T) -> Result<()>
 where
     T: FromStr,
@@ -123,13 +140,29 @@ where
     if was_cli_set(matches, id) {
         return Ok(());
     }
-    if let Some((name, v)) = first_set(names) {
-        // Trim so values with incidental whitespace (e.g. `SLURM_NTASKS="4 "`)
-        // parse instead of erroring.
-        let trimmed = v.trim();
-        *target = trimmed
-            .parse()
-            .map_err(|e| anyhow!("invalid value {:?} for {}: {}", v, name, e))?;
+    if let Some(v) = parse_first_num(names)? {
+        *target = v;
+    }
+    Ok(())
+}
+
+/// Apply a numeric env default to an `Option<T>` flag, i.e. one with no clap
+/// default where staying unset carries meaning.
+pub fn apply_num_opt<T>(
+    matches: &ArgMatches,
+    id: &str,
+    names: &[&str],
+    target: &mut Option<T>,
+) -> Result<()>
+where
+    T: FromStr,
+    T::Err: Display,
+{
+    if was_cli_set(matches, id) {
+        return Ok(());
+    }
+    if let Some(v) = parse_first_num(names)? {
+        *target = Some(v);
     }
     Ok(())
 }
