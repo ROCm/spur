@@ -128,13 +128,13 @@ impl ControllerService {
         )
     }
 
-    /// Best-effort forward of a read to the leader. `Some` only when the leader
-    /// answered; `None` (skip, unreachable, or forwarded call errored) tells the
-    /// caller to serve local state. `rpc` names the call for the fallback log.
+    /// Best-effort forward of a read to the leader: `Some(payload)` forwards
+    /// (clone lazily via `forward.then(|| ...)`), `None` serves local state. Any
+    /// forward error is swallowed to local — safe only while read handlers return
+    /// Ok/NotFound; a handler with a real error (e.g. InvalidArgument) masks it.
     async fn forward_read_optional<T, R, F, Fut>(
         &self,
-        forward: bool,
-        payload: T,
+        payload: Option<T>,
         rpc: &str,
         call: F,
     ) -> Option<Response<R>>
@@ -142,9 +142,7 @@ impl ControllerService {
         F: FnOnce(SlurmControllerClient<tonic::transport::Channel>, Request<T>) -> Fut,
         Fut: std::future::Future<Output = Result<Response<R>, Status>>,
     {
-        if !forward {
-            return None;
-        }
+        let payload = payload?;
         let client = self.leader_proxy.try_get_leader_client().await?;
         let mut fwd = Request::new(payload);
         *fwd.metadata_mut() = Self::forwarded_metadata();
@@ -285,9 +283,11 @@ impl SlurmController for ControllerService {
         let forward = self.read_should_forward(&request);
         let req = request.into_inner();
         if let Some(resp) = self
-            .forward_read_optional(forward, req.clone(), "get_jobs", |mut c, r| async move {
-                c.get_jobs(r).await
-            })
+            .forward_read_optional(
+                forward.then(|| req.clone()),
+                "get_jobs",
+                |mut c, r| async move { c.get_jobs(r).await },
+            )
             .await
         {
             return Ok(resp);
@@ -333,7 +333,7 @@ impl SlurmController for ControllerService {
         let forward = self.read_should_forward(&request);
         let req = request.into_inner();
         if let Some(resp) = self
-            .forward_read_optional(forward, req, "get_job", |mut c, r| async move {
+            .forward_read_optional(forward.then_some(req), "get_job", |mut c, r| async move {
                 c.get_job(r).await
             })
             .await
@@ -569,9 +569,11 @@ impl SlurmController for ControllerService {
         let forward = self.read_should_forward(&request);
         let req = request.into_inner();
         if let Some(resp) = self
-            .forward_read_optional(forward, req.clone(), "get_nodes", |mut c, r| async move {
-                c.get_nodes(r).await
-            })
+            .forward_read_optional(
+                forward.then(|| req.clone()),
+                "get_nodes",
+                |mut c, r| async move { c.get_nodes(r).await },
+            )
             .await
         {
             return Ok(resp);
@@ -607,9 +609,11 @@ impl SlurmController for ControllerService {
         let forward = self.read_should_forward(&request);
         let req = request.into_inner();
         if let Some(resp) = self
-            .forward_read_optional(forward, req.clone(), "get_node", |mut c, r| async move {
-                c.get_node(r).await
-            })
+            .forward_read_optional(
+                forward.then(|| req.clone()),
+                "get_node",
+                |mut c, r| async move { c.get_node(r).await },
+            )
             .await
         {
             return Ok(resp);
@@ -805,8 +809,7 @@ impl SlurmController for ControllerService {
         let forward = self.read_should_forward(&request);
         if let Some(resp) = self
             .forward_read_optional(
-                forward,
-                request.into_inner(),
+                forward.then(|| request.into_inner()),
                 "get_partitions",
                 |mut c, r| async move { c.get_partitions(r).await },
             )
@@ -845,9 +848,11 @@ impl SlurmController for ControllerService {
     async fn get_job_metrics(&self, request: Request<()>) -> Result<Response<JobMetrics>, Status> {
         let forward = self.read_should_forward(&request);
         if let Some(resp) = self
-            .forward_read_optional(forward, (), "get_job_metrics", |mut c, r| async move {
-                c.get_job_metrics(r).await
-            })
+            .forward_read_optional(
+                forward.then_some(()),
+                "get_job_metrics",
+                |mut c, r| async move { c.get_job_metrics(r).await },
+            )
             .await
         {
             return Ok(resp);
@@ -865,9 +870,11 @@ impl SlurmController for ControllerService {
     ) -> Result<Response<NodeMetrics>, Status> {
         let forward = self.read_should_forward(&request);
         if let Some(resp) = self
-            .forward_read_optional(forward, (), "get_node_metrics", |mut c, r| async move {
-                c.get_node_metrics(r).await
-            })
+            .forward_read_optional(
+                forward.then_some(()),
+                "get_node_metrics",
+                |mut c, r| async move { c.get_node_metrics(r).await },
+            )
             .await
         {
             return Ok(resp);
@@ -1244,9 +1251,11 @@ impl SlurmController for ControllerService {
         let forward = self.read_should_forward(&request);
         let req = request.into_inner();
         if let Some(resp) = self
-            .forward_read_optional(forward, req, "get_job_steps", |mut c, r| async move {
-                c.get_job_steps(r).await
-            })
+            .forward_read_optional(
+                forward.then_some(req),
+                "get_job_steps",
+                |mut c, r| async move { c.get_job_steps(r).await },
+            )
             .await
         {
             return Ok(resp);
@@ -1461,8 +1470,7 @@ impl SlurmController for ControllerService {
         let forward = self.read_should_forward(&request);
         if let Some(resp) = self
             .forward_read_optional(
-                forward,
-                request.into_inner(),
+                forward.then(|| request.into_inner()),
                 "list_reservations",
                 |mut c, r| async move { c.list_reservations(r).await },
             )
@@ -2576,20 +2584,57 @@ mod tests {
         assert!(!read_forwarding_policy(false, true));
     }
 
+    fn test_slurm_config() -> spur_core::config::SlurmConfig {
+        serde_json::from_str(r#"{"cluster_name":"test"}"#).unwrap()
+    }
+
+    /// A `ControllerService` on a node that can never elect a leader: three
+    /// unreachable peers mean no quorum, so `current_leader` stays `None`.
+    async fn no_leader_service(
+        cluster: Arc<crate::cluster::ClusterManager>,
+        dir: &std::path::Path,
+    ) -> ControllerService {
+        use crate::rpc_stats::RpcStatsCollector;
+        use crate::sched_stats::SchedStatsCollector;
+
+        let handle = crate::raft::start_raft(
+            1,
+            &[
+                "[::1]:0".to_string(),
+                "[::1]:0".to_string(),
+                "[::1]:0".to_string(),
+            ],
+            dir,
+            cluster.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!handle.is_leader());
+        assert_eq!(handle.current_leader(), None);
+
+        let raft = Arc::new(handle);
+        let client_addrs: BTreeMap<u64, String> = BTreeMap::new();
+        ControllerService {
+            cluster,
+            raft: raft.clone(),
+            leader_proxy: LeaderProxy::new(raft.clone(), client_addrs.clone()),
+            client_addrs,
+            rpc_stats: Arc::new(RpcStatsCollector::new()),
+            sched_stats: Arc::new(SchedStatsCollector::new("sched/backfill")),
+        }
+    }
+
     /// A non-leader that can't reach a leader must still answer reads
     /// from local applied state, not fail with "no leader elected yet".
     #[tokio::test]
     async fn get_jobs_serves_locally_when_no_leader_elected() {
         use crate::raft::StateMachineApply;
-        use crate::rpc_stats::RpcStatsCollector;
-        use crate::sched_stats::SchedStatsCollector;
         use spur_core::job::JobSpec;
         use spur_core::wal::WalOperation;
 
-        let config: spur_core::config::SlurmConfig =
-            serde_json::from_str(r#"{"cluster_name":"test"}"#).unwrap();
         let dir = tempfile::TempDir::new().unwrap();
-        let cluster = Arc::new(crate::cluster::ClusterManager::new(config, dir.path()).unwrap());
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
 
         // Mirrors a follower applying a committed entry, without a leader.
         let spec = JobSpec {
@@ -2609,28 +2654,7 @@ mod tests {
             },
         );
 
-        // Unreachable peers: no quorum, so this node never becomes leader.
-        let handle = crate::raft::start_raft(
-            1,
-            &["[::1]:0".into(), "[::1]:0".into(), "[::1]:0".into()],
-            dir.path(),
-            cluster.clone(),
-        )
-        .await
-        .unwrap();
-        assert!(!handle.is_leader());
-        assert_eq!(handle.current_leader(), None);
-
-        let raft = Arc::new(handle);
-        let client_addrs: BTreeMap<u64, String> = BTreeMap::new();
-        let service = ControllerService {
-            cluster: cluster.clone(),
-            raft: raft.clone(),
-            leader_proxy: LeaderProxy::new(raft.clone(), client_addrs.clone()),
-            client_addrs,
-            rpc_stats: Arc::new(RpcStatsCollector::new()),
-            sched_stats: Arc::new(SchedStatsCollector::new("sched/backfill")),
-        };
+        let service = no_leader_service(cluster, dir.path()).await;
 
         let resp = service
             .get_jobs(Request::new(GetJobsRequest::default()))
@@ -2641,6 +2665,24 @@ mod tests {
             .jobs;
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].job_id, 1);
+    }
+
+    /// The write side of the contract: with no leader, writes must fail rather
+    /// than fall back to local state — guards against a refactor extending the
+    /// read fallback to writes.
+    #[tokio::test]
+    async fn submit_job_fails_when_no_leader_elected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        let service = no_leader_service(cluster, dir.path()).await;
+
+        let status = service
+            .submit_job(Request::new(SubmitJobRequest::default()))
+            .await
+            .expect_err("submit_job must not serve locally when there is no leader");
+        assert_eq!(status.code(), Code::Unavailable);
+        assert_eq!(status.message(), "not the Raft leader");
     }
 
     #[test]
