@@ -276,6 +276,11 @@ pub fn wrap_command_with_cpu_bind(
     }
 }
 
+/// Wrap `value` in single quotes for safe embedding in generated bash scripts.
+fn bash_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// Bash prefix shared by PMIx/Open MPI launch wrappers.
 ///
 /// Open MPI 4.x expects `PMIX_SERVER_URI4`/`URI3`; the same aliases exist in
@@ -297,21 +302,21 @@ fn mpi_launch_preamble() -> &'static str {
 /// processes. Open MPI 4.x direct-launched tasks otherwise spawn per-process PMIx
 /// servers and never form a shared `MPI_COMM_WORLD`.
 pub fn build_mpi_mpirun_wrapper(user_script_path: &str, tasks_on_node: u32) -> String {
-    let escaped = user_script_path.replace('"', "\\\"");
+    let quoted = bash_single_quote(user_script_path);
     format!(
         concat!(
             "#!/bin/bash\n",
             "_TASKS_ON_NODE={tasks_on_node}\n",
             "{preamble}",
             "if [ \"$SPUR_LABEL\" = \"1\" ]; then\n",
-            "  exec \"$SPUR_MPIRUN\" -np \"$_TASKS_ON_NODE\" --bind-to none --tag-output \"{escaped}\"\n",
+            "  exec \"$SPUR_MPIRUN\" -np \"$_TASKS_ON_NODE\" --bind-to none --tag-output {quoted}\n",
             "else\n",
-            "  exec \"$SPUR_MPIRUN\" -np \"$_TASKS_ON_NODE\" --bind-to none \"{escaped}\"\n",
+            "  exec \"$SPUR_MPIRUN\" -np \"$_TASKS_ON_NODE\" --bind-to none {quoted}\n",
             "fi\n",
         ),
         tasks_on_node = tasks_on_node,
         preamble = mpi_launch_preamble(),
-        escaped = escaped,
+        quoted = quoted,
     )
 }
 
@@ -495,7 +500,15 @@ mod tests {
         assert!(script.contains("_TASKS_ON_NODE=4"));
         assert!(script.contains("PMIX_SERVER_URI4"));
         assert!(script.contains("unset \"$_v\""));
+        assert!(script.contains("'/tmp/hello_mpi'"));
         assert!(!script.contains("for LOCAL_RANK in"));
+    }
+
+    #[test]
+    fn mpi_wrapper_single_quotes_user_script() {
+        let script = build_mpi_mpirun_wrapper("$(rm -rf /)", 2);
+        assert!(script.contains("'$(rm -rf /)'"));
+        assert!(!script.contains("$(rm -rf /)\""));
     }
 
     #[test]

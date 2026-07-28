@@ -684,6 +684,8 @@ message PmixLaunchPlan {
   uint32 task_offset = 4;
   repeated PmixLocalProc local_procs = 5;
   string tmpdir = 6;
+  uint32 job_uid = 7;
+  uint32 job_gid = 8;
 }
 
 // -- Agent --

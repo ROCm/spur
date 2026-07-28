@@ -219,7 +219,11 @@ node:
 .. code-block:: bash
 
    gcc -fPIC -Wall -O2 -shared -o spur_mpi_pmix.so pmix_server.c \
-     -Iinclude $(pkg-config --cflags pmix) $(pkg-config --libs pmix) -pthread
+     -Iinclude \
+     -I/usr/lib/x86_64-linux-gnu/pmix2/include \
+     -L/usr/lib/x86_64-linux-gnu/pmix2/lib \
+     -Wl,-rpath,/usr/lib/x86_64-linux-gnu/pmix2/lib \
+     -lpmix -pthread
    sudo install -D spur_mpi_pmix.so /usr/lib/spur/spur_mpi_pmix.so
 
 Runtime requirements

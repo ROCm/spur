@@ -180,14 +180,31 @@ static void spur_deregister_nspace(const char *namespace_) {
 #endif
 }
 
+static uid_t spur_job_uid(const spur_mpi_launch_plan_t *plan) {
+    return plan->job_uid != SPUR_MPI_JOB_CRED_UNSET ? (uid_t)plan->job_uid : getuid();
+}
+
+static gid_t spur_job_gid(const spur_mpi_launch_plan_t *plan) {
+    return plan->job_gid != SPUR_MPI_JOB_CRED_UNSET ? (gid_t)plan->job_gid : getgid();
+}
+
+static void spur_deregister_client(const pmix_proc_t *proc) {
+    PMIx_server_deregister_client(proc, NULL, NULL);
+}
+
 static pmix_status_t spur_register_clients(const spur_mpi_launch_plan_t *plan) {
-    uid_t uid = getuid();
-    gid_t gid = getgid();
+    uid_t uid = spur_job_uid(plan);
+    gid_t gid = spur_job_gid(plan);
     for (uint32_t i = 0; i < plan->num_local_procs; i++) {
         pmix_proc_t proc;
         PMIX_LOAD_PROCID(&proc, plan->namespace_, plan->local_procs[i].rank);
         pmix_status_t rc = PMIx_server_register_client(&proc, uid, gid, NULL, NULL, NULL);
         if (!pmix_status_ok(rc)) {
+            for (uint32_t j = 0; j < i; j++) {
+                pmix_proc_t prior;
+                PMIX_LOAD_PROCID(&prior, plan->namespace_, plan->local_procs[j].rank);
+                spur_deregister_client(&prior);
+            }
             return rc;
         }
     }

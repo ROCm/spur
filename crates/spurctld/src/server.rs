@@ -1610,11 +1610,15 @@ impl SlurmController for ControllerService {
             let step_mpi = mpi.clone();
             let pmix_plan = spur_core::mpi::maybe_local_pmix_plan(
                 step_mpi.as_str(),
-                job_id,
-                step_num_tasks,
-                node_tasks.task_offset,
-                node_tasks.tasks_on_node,
-                &pmix_tmpdir,
+                spur_core::mpi::PmixLocalDispatch {
+                    job_id,
+                    universe_size: step_num_tasks,
+                    task_offset: node_tasks.task_offset,
+                    local_count: node_tasks.tasks_on_node,
+                    tmpdir: pmix_tmpdir.clone(),
+                    job_uid: uid,
+                    job_gid: gid,
+                },
             )
             .map(spur_core::mpi::plan_to_proto);
             set.spawn(async move {

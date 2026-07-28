@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn release_target_dir() -> PathBuf {
     let base = std::env::var("CARGO_TARGET_DIR")
@@ -11,7 +11,13 @@ fn release_target_dir() -> PathBuf {
                 .join("../../target")
         });
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
-    base.join(profile)
+    let mut dir = base.join(profile);
+    if let (Ok(target), Ok(host)) = (std::env::var("TARGET"), std::env::var("HOST")) {
+        if target != host {
+            dir = dir.join(target);
+        }
+    }
+    dir
 }
 
 fn pkg_config_link_other(lib: &str) -> Vec<String> {
@@ -30,7 +36,7 @@ fn pkg_config_link_other(lib: &str) -> Vec<String> {
 }
 
 fn copy_plugin(
-    out_dir: &PathBuf,
+    out_dir: &Path,
     archive_name: &str,
     pmix_libs: &[String],
     pmix_link_paths: &[PathBuf],
@@ -41,13 +47,10 @@ fn copy_plugin(
     let target_dir = release_target_dir();
 
     let mut cmd = cc::Build::new().get_compiler().to_command();
-    cmd.arg("-shared")
-        .arg("-o")
-        .arg(&built)
-        .arg(format!(
-            "-Wl,--whole-archive,{},--no-whole-archive",
-            archive.display()
-        ));
+    cmd.arg("-shared").arg("-o").arg(&built).arg(format!(
+        "-Wl,--whole-archive,{},--no-whole-archive",
+        archive.display()
+    ));
     for link_path in pmix_link_paths {
         cmd.arg(format!("-L{}", link_path.display()));
     }
