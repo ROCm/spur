@@ -319,6 +319,7 @@ async fn main() -> anyhow::Result<()> {
         rpc_stats,
         sched_stats,
         accounting_pool,
+        config.cluster.control_plane_replicas,
     )
     .await?;
 

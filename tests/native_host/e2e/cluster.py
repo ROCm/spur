@@ -442,6 +442,54 @@ class SpurCluster:
     def scontrol(self, *args: str) -> str:
         return self.cli(["scontrol"] + list(args))
 
+    # --- Native k0s cluster (spur k8s) wrappers ---
+
+    def k8s_up(self, args: list[str] | None = None) -> str:
+        return self.cli(["spur", "k8s", "up"] + (args or []))
+
+    def k8s_down(self, reset: bool = True) -> str:
+        extra = ["--reset"] if reset else []
+        return self.cli(["spur", "k8s", "down"] + extra)
+
+    def k8s_status(self) -> str:
+        return self.cli(["spur", "k8s", "status"])
+
+    def k8s_control_planes(self) -> list[str]:
+        """Parse the control-plane node list from `spur k8s status`."""
+        for line in self.k8s_status().splitlines():
+            if line.startswith("control-plane:"):
+                names = line.split(":", 1)[1].strip()
+                return [n.strip() for n in names.split(",") if n.strip()]
+        return []
+
+    def k8s_active_controllers(self) -> list[str]:
+        """Node names whose `spur k8s status` row is role=controller/single and active."""
+        out = []
+        for line in self.k8s_status().splitlines():
+            fields = line.split()
+            if len(fields) >= 3 and fields[1] in ("controller", "single") and fields[2] == "active":
+                out.append(fields[0])
+        return out
+
+    def wait_k8s_phase(self, phase: str, timeout: int = 600) -> str:
+        """Poll `spur k8s status` until it reports the given phase."""
+        deadline = time.time() + timeout
+        last = ""
+        while time.time() < deadline:
+            last = self.k8s_status()
+            for line in last.splitlines():
+                if line.startswith("phase:") and line.split(":", 1)[1].strip() == phase:
+                    return last
+            time.sleep(5)
+        raise TimeoutError(f"k0s phase did not reach {phase} within {timeout}s:\n{last}")
+
+    def etcd_member_count(self, node_index: int = 0) -> int:
+        """Ground-truth etcd quorum size via `k0s etcd member-list` on a control plane."""
+        out = self.nodes[node_index].exec_allow_fail(
+            f"{self._sudo_prefix()}k0s etcd member-list 2>/dev/null"
+        )
+        return len(re.findall(r"https?://[^\"]+:2380", out))
+
     def sacct(self, args: list[str]) -> str:
         return self.cli(["sacct"] + args)
 

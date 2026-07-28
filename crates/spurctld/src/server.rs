@@ -40,6 +40,9 @@ pub struct ControllerService {
     client_addrs: BTreeMap<u64, String>,
     rpc_stats: Arc<RpcStatsCollector>,
     sched_stats: Arc<SchedStatsCollector>,
+    /// Default HA control-plane count (`[cluster] control_plane_replicas`) when `spur k8s up`
+    /// requests neither `--replicas` nor an explicit node set.
+    control_plane_replicas: u32,
 }
 
 struct LeaderProxy {
@@ -1797,29 +1800,63 @@ impl SlurmController for ControllerService {
             }
         }
         let req = request.into_inner();
+        let state = self.cluster.k0s_state();
+        let assigned = self
+            .cluster
+            .get_nodes()
+            .iter()
+            .any(|n| n.k0s_role.is_some());
+
+        // Resolve the HA control-plane set fail-closed BEFORE recording intent: an explicit node
+        // list wins, else `--replicas` (or the config default) picks the lowest-named nodes. Pin the
+        // bootstrap to the operator override / recorded CP so `.1` and the etcd seed are stable.
+        let candidates: Vec<String> = self
+            .cluster
+            .get_nodes()
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        let replicas = req
+            .control_plane_replicas
+            .filter(|r| *r > 0)
+            .unwrap_or(self.control_plane_replicas);
+        let pinned = req
+            .control_plane_node
+            .clone()
+            .or_else(|| state.control_plane_node.clone());
+        let cp_set = crate::cluster_k8s::resolve_control_plane_set(
+            candidates,
+            &req.control_plane_nodes,
+            pinned.as_deref(),
+            replicas,
+        )
+        .map_err(Status::invalid_argument)?;
+
         // Reject a control-plane change once roles are assigned: provisioning skips already-assigned
-        // nodes, so moving the control plane here would only rewrite the recorded CP and leave the
-        // old controller a Controller and the new node a Worker (inconsistent topology). Tear the
-        // cluster down (`spur k8s down --reset`) to re-elect a control plane.
-        if let Some(new_cp) = req.control_plane_node.as_deref() {
-            let state = self.cluster.k0s_state();
-            let assigned = self
-                .cluster
-                .get_nodes()
-                .iter()
-                .any(|n| n.k0s_role.is_some());
-            if assigned && state.control_plane_node.as_deref() != Some(new_cp) {
+        // nodes, so moving/growing the control plane here would leave an inconsistent topology (an old
+        // controller still Controller, a would-be CP a Worker). Tear the cluster down
+        // (`spur k8s down --reset`) to re-elect. A matching set (idempotent re-up) is allowed.
+        if assigned {
+            let mut current = state.controllers();
+            let mut want = cp_set.clone();
+            current.sort();
+            want.sort();
+            if current != want {
                 return Err(Status::failed_precondition(format!(
-                    "control-plane node is already assigned ({}); tear the cluster down \
-                     (spur k8s down --reset) before changing it to {new_cp}",
-                    state.control_plane_node.as_deref().unwrap_or("<none>"),
+                    "control plane is already assigned ({}); tear the cluster down \
+                     (spur k8s down --reset) before changing it to [{}]",
+                    state.controllers().join(", "),
+                    cp_set.join(", "),
                 )));
             }
         }
+
+        let bootstrap = cp_set.first().cloned();
         self.cluster
             .set_k0s_phase(
                 spur_core::k0s::K0sPhase::Provisioning,
-                req.control_plane_node.clone(),
+                bootstrap,
+                cp_set,
                 false,
             )
             .map_err(|e| Status::internal(format!("set k0s phase: {e}")))?;
@@ -1849,7 +1886,7 @@ impl SlurmController for ControllerService {
         }
         let req = request.into_inner();
         self.cluster
-            .set_k0s_phase(spur_core::k0s::K0sPhase::Down, None, req.reset)
+            .set_k0s_phase(spur_core::k0s::K0sPhase::Down, None, Vec::new(), req.reset)
             .map_err(|e| Status::internal(format!("set k0s phase: {e}")))?;
         Ok(Response::new(ClusterDownResponse {
             accepted: true,
@@ -1868,9 +1905,11 @@ impl SlurmController for ControllerService {
             return client.cluster_status(fwd).await;
         }
         let state = self.cluster.k0s_state();
+        let control_plane_nodes = state.controllers();
         Ok(Response::new(ClusterStatusResponse {
             phase: crate::cluster_k8s::phase_str(state.phase),
             control_plane_node: state.control_plane_node.unwrap_or_default(),
+            control_plane_nodes,
             nodes: crate::cluster_k8s::live_node_statuses(&self.cluster).await,
         }))
     }
@@ -1918,6 +1957,7 @@ pub async fn serve(
     rpc_stats: Arc<RpcStatsCollector>,
     sched_stats: Arc<SchedStatsCollector>,
     accounting_pool: Option<sqlx::PgPool>,
+    control_plane_replicas: u32,
 ) -> anyhow::Result<()> {
     let client_addrs: BTreeMap<u64, String> = raft_handle
         .peers
@@ -1941,6 +1981,7 @@ pub async fn serve(
         leader_proxy,
         rpc_stats: rpc_stats.clone(),
         sched_stats: sched_stats.clone(),
+        control_plane_replicas,
     };
 
     let stats_layer = RpcStatsLayer::new(rpc_stats, raft_handle);
@@ -2643,6 +2684,7 @@ mod tests {
             client_addrs,
             rpc_stats: Arc::new(RpcStatsCollector::new()),
             sched_stats: Arc::new(SchedStatsCollector::new("sched/backfill")),
+            control_plane_replicas: 1,
         }
     }
 
@@ -2755,6 +2797,7 @@ mod tests {
             client_addrs: BTreeMap::new(),
             rpc_stats: std::sync::Arc::new(RpcStatsCollector::new()),
             sched_stats: std::sync::Arc::new(SchedStatsCollector::new("backfill")),
+            control_plane_replicas: 1,
         }
     }
 

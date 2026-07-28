@@ -215,6 +215,8 @@ pub enum WalOperation {
         #[serde(default)]
         control_plane_node: Option<String>,
         #[serde(default)]
+        control_plane_nodes: Vec<String>,
+        #[serde(default)]
         reset_requested: bool,
     },
 }
@@ -709,6 +711,7 @@ mod deregistration_wal_tests {
         let op = WalOperation::K0sSetPhase {
             phase: K0sPhase::Ready,
             control_plane_node: Some("head-node".into()),
+            control_plane_nodes: vec!["head-node".into(), "cp-2".into(), "cp-3".into()],
             reset_requested: false,
         };
         let back: WalOperation =
@@ -717,10 +720,36 @@ mod deregistration_wal_tests {
             WalOperation::K0sSetPhase {
                 phase,
                 control_plane_node,
+                control_plane_nodes,
                 reset_requested,
             } => {
                 assert_eq!(phase, K0sPhase::Ready);
                 assert_eq!(control_plane_node.as_deref(), Some("head-node"));
+                assert_eq!(control_plane_nodes, vec!["head-node", "cp-2", "cp-3"]);
+                assert!(!reset_requested);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // Frozen pre-multi-CP K0sSetPhase entry (no control_plane_nodes field); must still deserialize
+    // or spurctld crashes on upgrade replay. Never regenerate.
+    #[test]
+    fn k0s_set_phase_pre_multi_cp_payload_still_deserializes() {
+        const K0S_SET_PHASE_PRE_MULTI_CP: &str = r#"{"K0sSetPhase":{"phase":"ready","control_plane_node":"head-node","reset_requested":false}}"#;
+        let op: WalOperation = serde_json::from_str(K0S_SET_PHASE_PRE_MULTI_CP).expect(
+            "pre-multi-CP K0sSetPhase must deserialize; a new field needs #[serde(default)]",
+        );
+        match op {
+            WalOperation::K0sSetPhase {
+                phase,
+                control_plane_node,
+                control_plane_nodes,
+                reset_requested,
+            } => {
+                assert_eq!(phase, K0sPhase::Ready);
+                assert_eq!(control_plane_node.as_deref(), Some("head-node"));
+                assert!(control_plane_nodes.is_empty());
                 assert!(!reset_requested);
             }
             _ => panic!("wrong variant"),

@@ -781,6 +781,11 @@ message ClusterUpRequest {
   // Override the control-plane node; empty = pick from [cluster] config / inventory.
   optional string control_plane_node = 1;
   reserved 2; // was install_arc — ARC is not installed by spur/k0s
+  // HA control-plane count (1, 3, or 5). 0/absent = the [cluster] config default. Ignored if
+  // control_plane_nodes is set.
+  optional uint32 control_plane_replicas = 3;
+  // Explicit control-plane node names (1, 3, or 5). First is the etcd bootstrap node.
+  repeated string control_plane_nodes = 4;
 }
 message ClusterUpResponse {
   bool accepted = 1;
@@ -803,6 +808,8 @@ message ClusterStatusResponse {
   string phase = 1;
   string control_plane_node = 2;
   repeated ClusterNodeStatus nodes = 3;
+  // All control-plane nodes (HA). Bootstrap node first; empty pre-multi-CP (see control_plane_node).
+  repeated string control_plane_nodes = 4;
 }
 
 message ClusterNodeStatus {

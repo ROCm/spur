@@ -35,6 +35,13 @@ pub enum K8sCommand {
         /// Control-plane node (default: picked from inventory / [cluster] config).
         #[arg(long)]
         control_plane_node: Option<String>,
+        /// HA control-plane count: 1, 3, or 5 (default: [cluster] config, else 1).
+        #[arg(long)]
+        replicas: Option<u32>,
+        /// Explicit control-plane nodes (repeatable; 1, 3, or 5). First is the etcd bootstrap.
+        /// Overrides --replicas.
+        #[arg(long = "control-plane-nodes", value_delimiter = ',')]
+        control_plane_nodes: Vec<String>,
     },
     /// Tear the k0s cluster down.
     Down {
@@ -74,7 +81,19 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let parsed = K8sArgs::try_parse_from(args)?;
     let controller = parsed.controller;
     match parsed.command {
-        K8sCommand::Up { control_plane_node } => cmd_up(&controller, control_plane_node).await,
+        K8sCommand::Up {
+            control_plane_node,
+            replicas,
+            control_plane_nodes,
+        } => {
+            cmd_up(
+                &controller,
+                control_plane_node,
+                replicas,
+                control_plane_nodes,
+            )
+            .await
+        }
         K8sCommand::Down { reset } => cmd_down(&controller, reset).await,
         K8sCommand::Status => cmd_status(&controller).await,
         K8sCommand::Kubeconfig { user } => cmd_kubeconfig(&controller, user).await,
@@ -104,10 +123,19 @@ async fn cmd_install_k0s(version: &str, path: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_up(controller: &str, control_plane_node: Option<String>) -> Result<()> {
+async fn cmd_up(
+    controller: &str,
+    control_plane_node: Option<String>,
+    replicas: Option<u32>,
+    control_plane_nodes: Vec<String>,
+) -> Result<()> {
     let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
     let resp = client
-        .cluster_up(ClusterUpRequest { control_plane_node })
+        .cluster_up(ClusterUpRequest {
+            control_plane_node,
+            control_plane_replicas: replicas,
+            control_plane_nodes,
+        })
         .await?
         .into_inner();
     if resp.accepted {
@@ -142,7 +170,9 @@ async fn cmd_status(controller: &str) -> Result<()> {
         .await?
         .into_inner();
     println!("phase: {}", resp.phase);
-    if !resp.control_plane_node.is_empty() {
+    if !resp.control_plane_nodes.is_empty() {
+        println!("control-plane: {}", resp.control_plane_nodes.join(", "));
+    } else if !resp.control_plane_node.is_empty() {
         println!("control-plane: {}", resp.control_plane_node);
     }
     for n in resp.nodes {
@@ -176,9 +206,34 @@ mod tests {
         let args =
             K8sArgs::try_parse_from(["k8s", "up", "--control-plane-node", "head-node"]).unwrap();
         match args.command {
-            K8sCommand::Up { control_plane_node } => {
+            K8sCommand::Up {
+                control_plane_node,
+                replicas,
+                control_plane_nodes,
+            } => {
                 assert_eq!(control_plane_node.as_deref(), Some("head-node"));
+                assert_eq!(replicas, None);
+                assert!(control_plane_nodes.is_empty());
             }
+            _ => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn parses_up_with_replicas_and_node_set() {
+        let args = K8sArgs::try_parse_from(["k8s", "up", "--replicas", "3"]).unwrap();
+        match args.command {
+            K8sCommand::Up { replicas, .. } => assert_eq!(replicas, Some(3)),
+            _ => panic!("wrong command"),
+        }
+        let args =
+            K8sArgs::try_parse_from(["k8s", "up", "--control-plane-nodes", "cp-1,cp-2,cp-3"])
+                .unwrap();
+        match args.command {
+            K8sCommand::Up {
+                control_plane_nodes,
+                ..
+            } => assert_eq!(control_plane_nodes, vec!["cp-1", "cp-2", "cp-3"]),
             _ => panic!("wrong command"),
         }
     }
