@@ -3,7 +3,10 @@
 
 """Multi-control-plane (HA) native k0s E2E tests (needs >= 3 nodes for etcd quorum)."""
 
+import pytest
 
+
+@pytest.mark.k0s
 class TestK8sMultiControlPlane:
     def test_three_control_planes_form_etcd_quorum(self, k8s_multicp_cluster):
         cluster = k8s_multicp_cluster

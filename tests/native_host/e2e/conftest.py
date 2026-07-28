@@ -23,6 +23,10 @@ def pytest_configure(config):
         "markers",
         "mpi: MPI end-to-end tests requiring spur_mpi_pmix.so, libpmix, and mpicc",
     )
+    config.addinivalue_line(
+        "markers",
+        "k0s: native spur-managed k0s cluster tests (rootful spurd + systemd + etcd; slow)",
+    )
 
 
 def _get_nodes_config() -> list[str]:
