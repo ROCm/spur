@@ -366,6 +366,12 @@ struct DrainRequest {
 /// past this bound is reclaimed.
 const LAUNCHING_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// Poll interval and attempt count for `wait_for_running_job`'s retry of a
+/// job that hasn't reached `running` yet. ~3s total, well above the launch
+/// latency skew observed between nodes of the same job under scheduler load.
+const JOB_LOOKUP_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const JOB_LOOKUP_RETRY_ATTEMPTS: u32 = 30;
+
 /// Reclaim allocations whose job is no longer tracked and is not mid-launch,
 /// using the running set as ground truth. Callers hold the `running` lock
 /// across building `running` and this call so the live set is a consistent
@@ -1481,27 +1487,8 @@ impl SlurmAgent for AgentService {
         };
         let step_id = req.step_id;
 
-        let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi) = {
-            let jobs = self.running.lock().await;
-            let tracked = jobs.get(&job_id).ok_or_else(|| {
-                Status::not_found(format!("job {} not running on this node", job_id))
-            })?;
-            let nodelist = if tracked.nodelist.is_empty() {
-                hostname::get()
-                    .map(|h| h.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| "localhost".into())
-            } else {
-                tracked.nodelist.clone()
-            };
-            (
-                tracked.gpu_devices.clone(),
-                tracked.partition.clone(),
-                tracked.cpus,
-                tracked.memory_mb,
-                nodelist,
-                tracked.mpi.clone(),
-            )
-        };
+        let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi) =
+            self.wait_for_running_job(job_id).await?;
 
         let agent_hostname = self.reporter.hostname.clone();
         let node_names: Vec<&str> = nodelist.split(',').filter(|s| !s.is_empty()).collect();
@@ -2255,6 +2242,54 @@ impl AgentService {
         });
     }
 
+    /// Look up a job's tracked fields, retrying briefly if it isn't in
+    /// `running` yet.
+    ///
+    /// spurctld marks a job Running (visible to `squeue`/`scontrol`) as soon
+    /// as it assigns nodes, before dispatching `LaunchJob` to any of them —
+    /// dispatch happens concurrently, out of band, and each agent only adds
+    /// the job to `running` after its own local launch pipeline (resource
+    /// allocation, GPU device injection, process/container spawn) finishes.
+    /// A step targeting this node (`srun` from within the batch script, or
+    /// any other RunCommand caller) can therefore arrive here before this
+    /// node's own dispatch has completed, even though the controller already
+    /// reports the job Running. Poll briefly rather than failing on the
+    /// first miss, since the job is expected to appear within one launch
+    /// pipeline's worth of time, not never.
+    async fn wait_for_running_job(
+        &self,
+        job_id: u32,
+    ) -> Result<(Vec<u32>, String, u32, u64, String, String), Status> {
+        for attempt in 0..JOB_LOOKUP_RETRY_ATTEMPTS {
+            let jobs = self.running.lock().await;
+            if let Some(tracked) = jobs.get(&job_id) {
+                let nodelist = if tracked.nodelist.is_empty() {
+                    hostname::get()
+                        .map(|h| h.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| "localhost".into())
+                } else {
+                    tracked.nodelist.clone()
+                };
+                return Ok((
+                    tracked.gpu_devices.clone(),
+                    tracked.partition.clone(),
+                    tracked.cpus,
+                    tracked.memory_mb,
+                    nodelist,
+                    tracked.mpi.clone(),
+                ));
+            }
+            drop(jobs);
+            if attempt + 1 < JOB_LOOKUP_RETRY_ATTEMPTS {
+                tokio::time::sleep(JOB_LOOKUP_RETRY_INTERVAL).await;
+            }
+        }
+        Err(Status::not_found(format!(
+            "job {} not running on this node",
+            job_id
+        )))
+    }
+
     /// Extract a `JobEntry` from a tracked running job for namespace entry.
     async fn job_entry(&self, job_id: u32) -> Result<crate::job_entry::JobEntry, Status> {
         let jobs = self.running.lock().await;
@@ -2902,7 +2937,10 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
-    #[tokio::test]
+    // A job that never registers must still fail, just not until the retry
+    // budget (wait_for_running_job) is exhausted. Paused time fast-forwards
+    // through that budget instead of the test actually taking ~3s.
+    #[tokio::test(start_paused = true)]
     async fn run_command_not_found_without_tracked_job() {
         let svc = AgentService::new(
             test_reporter(),
@@ -2921,6 +2959,53 @@ mod tests {
         });
         let err = svc.run_command(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
+        assert!(err.message().contains("not running on this node"));
+    }
+
+    // The startup race this guards against: spurctld marks a job Running
+    // (visible to squeue) before this node's own LaunchJob dispatch has
+    // finished, so a step can land here just ahead of `running` being
+    // populated. Paused time lets the retry loop's sleeps elapse instantly;
+    // the job is inserted while the first attempt's sleep is pending, so the
+    // next poll finds it instead of the call failing outright.
+    #[tokio::test(start_paused = true)]
+    async fn run_command_retries_until_job_registers() {
+        let svc = Arc::new(AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        ));
+        let job_id = 777;
+
+        let svc_call = svc.clone();
+        let call = tokio::spawn(async move {
+            let req = Request::new(RunCommandRequest {
+                command: vec!["echo".into(), "hi".into()],
+                uid: 0,
+                gid: 0,
+                work_dir: String::new(),
+                environment: HashMap::new(),
+                job_id,
+                ..Default::default()
+            });
+            svc_call.run_command(req).await
+        });
+
+        // Let the first (failing) lookup run and start its retry sleep before
+        // the job appears, so this exercises the retry path, not a lucky win
+        // on the first attempt.
+        tokio::task::yield_now().await;
+        svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
+        tokio::time::advance(JOB_LOOKUP_RETRY_INTERVAL).await;
+
+        let resp = call
+            .await
+            .expect("run_command task panicked")
+            .expect("run_command should succeed once the job registers")
+            .into_inner();
+        assert_eq!(resp.exit_code, 0);
+        assert_eq!(resp.stdout.trim(), "hi");
     }
 
     #[tokio::test]
