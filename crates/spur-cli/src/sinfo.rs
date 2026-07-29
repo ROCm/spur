@@ -332,7 +332,11 @@ fn effective_state_str(node: &NodeInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spur_proto::proto as pb;
+    use spur_proto::proto::slurm_controller_server::SlurmController;
     use spur_proto::proto::NodeState;
+    use std::sync::{Arc, Mutex};
+    use tonic::{Request, Response, Status};
 
     fn make_node(name: &str, state: NodeState, partition: &str) -> NodeInfo {
         NodeInfo {
@@ -434,6 +438,125 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("BOGUS"), "{err}");
+    }
+
+    /// Serves the two RPCs sinfo issues and records the `GetNodesRequest` it
+    /// saw, so a test can assert what actually went over the wire.
+    #[derive(Default)]
+    struct StubController {
+        nodes_req: Arc<Mutex<Option<pb::GetNodesRequest>>>,
+    }
+
+    /// Generates the impl so `async_trait` runs after expansion. Only the two
+    /// RPCs sinfo calls need behavior; the rest just have to exist.
+    macro_rules! stub_controller {
+        ($($name:ident($req:ty) -> $resp:ty;)*) => {
+            #[tonic::async_trait]
+            impl SlurmController for StubController {
+                async fn get_partitions(
+                    &self,
+                    _: Request<pb::GetPartitionsRequest>,
+                ) -> Result<Response<pb::GetPartitionsResponse>, Status> {
+                    Ok(Response::new(pb::GetPartitionsResponse {
+                        partitions: vec![make_partition("batch", true)],
+                    }))
+                }
+
+                async fn get_nodes(
+                    &self,
+                    request: Request<pb::GetNodesRequest>,
+                ) -> Result<Response<pb::GetNodesResponse>, Status> {
+                    *self.nodes_req.lock().unwrap() = Some(request.into_inner());
+                    Ok(Response::new(pb::GetNodesResponse {
+                        nodes: vec![make_node("n1", NodeState::NodeIdle, "batch")],
+                    }))
+                }
+
+                $(
+                    async fn $name(&self, _: Request<$req>) -> Result<Response<$resp>, Status> {
+                        Err(Status::unimplemented(stringify!($name)))
+                    }
+                )*
+            }
+        };
+    }
+
+    stub_controller! {
+        submit_job(pb::SubmitJobRequest) -> pb::SubmitJobResponse;
+        get_jobs(pb::GetJobsRequest) -> pb::GetJobsResponse;
+        get_job(pb::GetJobRequest) -> pb::JobInfo;
+        cancel_job(pb::CancelJobRequest) -> ();
+        complete_job(pb::CompleteJobRequest) -> ();
+        suspend_job(pb::SuspendJobRequest) -> ();
+        resume_job(pb::ResumeJobRequest) -> ();
+        update_job(pb::UpdateJobRequest) -> ();
+        get_node(pb::GetNodeRequest) -> pb::NodeInfo;
+        update_node(pb::UpdateNodeRequest) -> ();
+        drain_node(pb::DrainNodeRequest) -> pb::DrainNodeResponse;
+        deregister_node(pb::DeregisterNodeRequest) -> pb::DeregisterNodeResponse;
+        deregister_agent(pb::DeregisterAgentRequest) -> ();
+        get_job_steps(pb::GetJobStepsRequest) -> pb::GetJobStepsResponse;
+        create_job_step(pb::CreateJobStepRequest) -> pb::CreateJobStepResponse;
+        ping(()) -> pb::PingResponse;
+        get_job_metrics(()) -> pb::JobMetrics;
+        get_node_metrics(()) -> pb::NodeMetrics;
+        get_rpc_stats(()) -> pb::RpcStats;
+        reset_diag_stats(()) -> ();
+        get_sched_stats(()) -> pb::SchedStats;
+        register_agent(pb::RegisterAgentRequest) -> pb::RegisterAgentResponse;
+        heartbeat(pb::HeartbeatRequest) -> pb::HeartbeatResponse;
+        create_token(pb::CreateTokenRequest) -> pb::CreateTokenResponse;
+        list_tokens(pb::ListTokensRequest) -> pb::ListTokensResponse;
+        revoke_token(pb::RevokeTokenRequest) -> pb::RevokeTokenResponse;
+        report_job_status(pb::ReportJobStatusRequest) -> ();
+        create_reservation(pb::CreateReservationRequest) -> ();
+        update_reservation(pb::UpdateReservationRequest) -> ();
+        delete_reservation(pb::DeleteReservationRequest) -> ();
+        list_reservations(pb::ListReservationsRequest) -> pb::ListReservationsResponse;
+        exec_in_job(pb::ExecInJobRequest) -> pb::ExecInJobResponse;
+        run_step(pb::RunStepRequest) -> pb::RunStepResponse;
+        cluster_up(pb::ClusterUpRequest) -> pb::ClusterUpResponse;
+        cluster_down(pb::ClusterDownRequest) -> pb::ClusterDownResponse;
+        cluster_status(pb::ClusterStatusRequest) -> pb::ClusterStatusResponse;
+        cluster_kubeconfig(pb::ClusterKubeconfigRequest) -> pb::ClusterKubeconfigResponse;
+    }
+
+    #[tokio::test]
+    async fn stub_controller_rejects_rpcs_sinfo_does_not_use() {
+        let err = StubController::default()
+            .ping(Request::new(()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn state_filter_reaches_the_controller() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let stub = StubController::default();
+        let seen = stub.nodes_req.clone();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(spur_proto::controller_server(stub))
+                .serve_with_incoming(incoming),
+        );
+
+        main_with_args(vec![
+            "sinfo".into(),
+            "-t".into(),
+            "idle".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+        ])
+        .await
+        .expect("sinfo against the stub controller");
+
+        let req = seen.lock().unwrap().clone().expect("get_nodes was called");
+        assert_eq!(req.states, vec![NodeState::NodeIdle as i32]);
     }
 
     #[test]
