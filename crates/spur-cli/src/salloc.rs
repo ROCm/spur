@@ -28,9 +28,9 @@ pub struct SallocArgs {
     #[arg(short = 'N', long, default_value = "1")]
     pub nodes: u32,
 
-    /// Number of tasks
-    #[arg(short = 'n', long, default_value = "1")]
-    pub ntasks: u32,
+    /// Number of tasks (default: one per node)
+    #[arg(short = 'n', long)]
+    pub ntasks: Option<u32>,
 
     /// CPUs per task
     #[arg(short = 'c', long, default_value = "1")]
@@ -146,7 +146,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let reservation = args.reservation;
     let partition = args.partition;
     let account = args.account;
-    let ntasks = args.ntasks;
+    let ntasks = crate::sbatch::effective_ntasks(args.ntasks, None, nodes);
     let cpus_per_task = args.cpus_per_task;
 
     let channel = spur_client::connect_channel(&controller)
@@ -416,6 +416,26 @@ mod tests {
     }
 
     #[test]
+    fn ntasks_defaults_to_node_count() {
+        let args = SallocArgs::try_parse_from(["salloc", "-N", "4"]).expect("parse failed");
+        assert_eq!(args.ntasks, None);
+        assert_eq!(
+            crate::sbatch::effective_ntasks(args.ntasks, None, args.nodes),
+            4
+        );
+    }
+
+    #[test]
+    fn explicit_ntasks_overrides_node_default() {
+        let args =
+            SallocArgs::try_parse_from(["salloc", "-N", "4", "-n", "2"]).expect("parse failed");
+        assert_eq!(
+            crate::sbatch::effective_ntasks(args.ntasks, None, args.nodes),
+            2
+        );
+    }
+
+    #[test]
     fn parses_nodefile_short_and_long() {
         let short = SallocArgs::try_parse_from(["salloc", "-F", "nodes.txt"])
             .expect("parse short nodefile");
@@ -536,5 +556,29 @@ mod tests {
         let args = resolve_from(&["salloc"]);
         assert_eq!(args.nodes, 1, "nodes must stay at the CLI default");
         assert!(args.job_name.is_none(), "job_name must stay unset");
+    }
+
+    /// Drives `main_with_args` far enough to resolve the task count, then stops
+    /// at the controller dial. Guards the argument plumbing between parsing and
+    /// `connect_channel`, which the parse-only tests above never execute.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn main_with_args_resolves_request_then_fails_to_connect() {
+        let _env = EnvGuard::new();
+        let addr = crate::mock_controller::unreachable_addr().await;
+        let err = main_with_args(vec![
+            "salloc".into(),
+            "-N".into(),
+            "4".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+        ])
+        .await
+        .expect_err("connect to a closed port must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed to connect to spurctld"),
+            "expected a controller connect failure, got: {msg}"
+        );
     }
 }
