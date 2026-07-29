@@ -808,11 +808,15 @@ async fn dispatch_to_agent(
     let mpi = spec.mpi.clone().unwrap_or_default();
     let pmix_plan = spur_core::mpi::maybe_local_pmix_plan(
         &mpi,
-        params.job_id,
-        spec.num_tasks,
-        params.task_offset,
-        tasks_per_node,
-        params.pmix_tmpdir,
+        spur_core::mpi::PmixLocalDispatch {
+            job_id: params.job_id,
+            universe_size: spec.num_tasks,
+            task_offset: params.task_offset,
+            local_count: tasks_per_node,
+            tmpdir: params.pmix_tmpdir.to_string(),
+            job_uid: spec.uid,
+            job_gid: spec.gid,
+        },
     )
     .map(spur_core::mpi::plan_to_proto);
     let proto_spec = ProtoJobSpec {

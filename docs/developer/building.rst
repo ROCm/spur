@@ -29,7 +29,16 @@ succeed):
 .. code-block:: bash
 
    cargo build --release -p spur-mpi-pmix
-   sudo install -D target/release/libspur_mpi_pmix.so /usr/lib/spur/spur_mpi_pmix.so
+   sudo install -D target/release/spur_mpi_pmix.so /usr/lib/spur/spur_mpi_pmix.so
+
+Install the resulting ``spur_mpi_pmix.so`` on **every agent**, using the same
+glibc as the running ``spurd``. If ``pkg-config pmix`` is missing on agents but
+system PMIx headers exist, compile ``crates/spur-mpi-pmix/c/pmix_server.c`` on the
+node with ``gcc -fPIC -shared`` and the system PMIx ``-I`` / ``-L`` flags (see
+:doc:`/deployment/native-host`).
+
+``spurd`` launches multi-rank ``--mpi=pmix`` steps via ``mpirun -np N``; agents
+need ``mpirun`` on ``PATH`` (or ``OPAL_PREFIX`` pointing at an Open MPI install).
 
 Without libpmix, the crate still builds a stub plugin that fails at load time with
 an actionable error. Container images can include a functional plugin by building

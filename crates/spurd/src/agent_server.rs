@@ -656,6 +656,20 @@ async fn report_completion(
     );
 }
 
+fn warn_mpi_mpirun_skipped_affinity(job_id: u32, source: &HashMap<String, String>) {
+    use spur_core::task_launch::{mpi_mpirun_skips_cpu_bind, mpi_mpirun_skips_gpu_bind};
+    let cpu_bind = mpi_mpirun_skips_cpu_bind(source);
+    let gpu_bind = mpi_mpirun_skips_gpu_bind(source);
+    if cpu_bind || gpu_bind {
+        warn!(
+            job_id,
+            cpu_bind,
+            gpu_bind,
+            "multi-rank --mpi=pmix launches via mpirun --bind-to none; Spur CPU/GPU bind env is not applied to MPI ranks"
+        );
+    }
+}
+
 #[tonic::async_trait]
 impl SlurmAgent for AgentService {
     type StreamJobOutputStream = ReceiverStream<Result<StreamJobOutputChunk, Status>>;
@@ -903,6 +917,10 @@ impl SlurmAgent for AgentService {
                     &user_script_path,
                     std::fs::Permissions::from_mode(0o755),
                 );
+            }
+
+            if spec.mpi == MPI_PMIX {
+                warn_mpi_mpirun_skipped_affinity(job_id, &spec.environment);
             }
 
             // Build the wrapper that launches N tasks with GPU partitioning
@@ -1559,6 +1577,9 @@ impl SlurmAgent for AgentService {
             return Err(Status::invalid_argument(
                 "step mpi=pmix requires a PMIx launch plan",
             ));
+        }
+        if step_mpi && num_tasks > 1 {
+            warn_mpi_mpirun_skipped_affinity(job_id, &req.environment);
         }
 
         let (program, program_args, step_script_cleanup) = if num_tasks > 1 || req.label {

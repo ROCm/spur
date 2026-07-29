@@ -19,6 +19,8 @@ pub struct PmixLaunchPlan {
     pub task_offset: u32,
     pub local_procs: Vec<PmixLocalProc>,
     pub tmpdir: String,
+    pub job_uid: u32,
+    pub job_gid: u32,
 }
 
 impl PmixLaunchPlan {
@@ -33,6 +35,8 @@ impl PmixLaunchPlan {
         task_offset: u32,
         local_count: u32,
         tmpdir: impl Into<String>,
+        job_uid: u32,
+        job_gid: u32,
     ) -> Self {
         let local_procs = (0..local_count)
             .map(|local_rank| PmixLocalProc {
@@ -47,6 +51,8 @@ impl PmixLaunchPlan {
             task_offset,
             local_procs,
             tmpdir: tmpdir.into(),
+            job_uid,
+            job_gid,
         }
     }
 }
@@ -111,23 +117,30 @@ pub fn validate_pmix_plan(plan: &PmixLaunchPlan) -> Result<(), String> {
     Ok(())
 }
 
-pub fn maybe_local_pmix_plan(
-    mpi: &str,
-    job_id: u32,
-    universe_size: u32,
-    task_offset: u32,
-    local_count: u32,
-    tmpdir: impl Into<String>,
-) -> Option<PmixLaunchPlan> {
+/// Per-agent inputs for building a PMIx launch plan on the controller.
+#[derive(Debug, Clone)]
+pub struct PmixLocalDispatch {
+    pub job_id: u32,
+    pub universe_size: u32,
+    pub task_offset: u32,
+    pub local_count: u32,
+    pub tmpdir: String,
+    pub job_uid: u32,
+    pub job_gid: u32,
+}
+
+pub fn maybe_local_pmix_plan(mpi: &str, dispatch: PmixLocalDispatch) -> Option<PmixLaunchPlan> {
     if mpi != MPI_PMIX {
         return None;
     }
     Some(PmixLaunchPlan::local_tasks(
-        job_id,
-        universe_size,
-        task_offset,
-        local_count,
-        tmpdir,
+        dispatch.job_id,
+        dispatch.universe_size,
+        dispatch.task_offset,
+        dispatch.local_count,
+        dispatch.tmpdir,
+        dispatch.job_uid,
+        dispatch.job_gid,
     ))
 }
 
@@ -197,6 +210,8 @@ pub fn plan_to_proto(plan: PmixLaunchPlan) -> spur_proto::proto::PmixLaunchPlan 
             })
             .collect(),
         tmpdir: plan.tmpdir,
+        job_uid: plan.job_uid,
+        job_gid: plan.job_gid,
     }
 }
 
@@ -230,12 +245,17 @@ mod tests {
 
     #[test]
     fn local_tasks_plan() {
-        let plan = PmixLaunchPlan::local_tasks(42, 4, 0, 4, "/tmp/pmix");
+        let plan = PmixLaunchPlan::local_tasks(42, 4, 0, 4, "/tmp/pmix", 1000, 1000);
         assert_eq!(plan.namespace, "spur.42");
         assert_eq!(plan.universe_size, 4);
         assert_eq!(plan.local_procs.len(), 4);
         assert_eq!(plan.local_procs[0].rank, 0);
         assert_eq!(plan.local_procs[3].rank, 3);
+        assert_eq!(plan.job_uid, 1000);
+        assert_eq!(plan.job_gid, 1000);
+        let proto = plan_to_proto(plan);
+        assert_eq!(proto.job_uid, 1000);
+        assert_eq!(proto.job_gid, 1000);
     }
 
     #[test]
@@ -282,7 +302,7 @@ mod tests {
 
     #[test]
     fn validate_pmix_plan_rejects_empty_tmpdir() {
-        let mut plan = PmixLaunchPlan::local_tasks(1, 1, 0, 1, "/tmp/pmix");
+        let mut plan = PmixLaunchPlan::local_tasks(1, 1, 0, 1, "/tmp/pmix", 0, 0);
         plan.tmpdir.clear();
         assert!(validate_pmix_plan(&plan).is_err());
     }
@@ -305,6 +325,8 @@ mod tests {
                 },
             ],
             tmpdir: "/tmp/pmix".into(),
+            job_uid: 0,
+            job_gid: 0,
         };
         assert!(validate_pmix_plan(&plan).is_err());
     }
@@ -327,6 +349,8 @@ mod tests {
                 },
             ],
             tmpdir: "/tmp/pmix".into(),
+            job_uid: 0,
+            job_gid: 0,
         };
         assert!(validate_pmix_plan(&plan).is_err());
     }

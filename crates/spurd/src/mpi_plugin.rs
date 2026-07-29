@@ -16,6 +16,7 @@ use tracing::{debug, info, warn};
 
 const PMIX_ENV_KEYS: &[&str] = &[
     "PMIX_SERVER_URI",
+    "PMIX_SERVER_URI4",
     "PMIX_NAMESPACE",
     "PMIX_RANK",
     "PMIX_SIZE",
@@ -39,6 +40,8 @@ struct SpurMpiLaunchPlan {
     num_local_procs: c_uint,
     local_procs: [SpurMpiProc; 256],
     tmpdir: [c_char; 512],
+    job_uid: c_uint,
+    job_gid: c_uint,
 }
 
 type VersionFn = unsafe extern "C" fn() -> c_int;
@@ -446,6 +449,12 @@ impl MpiPluginHost {
                 debug!(job_id = plan.job_id, rank, key, "PMIx env key unavailable");
             }
         }
+        // Open MPI 4.x expects URI4/URI3; same aliases in pmix_server.c and task_launch.rs.
+        if let Some(uri) = out.get("PMIX_SERVER_URI").cloned() {
+            out.entry("PMIX_SERVER_URI4".into())
+                .or_insert_with(|| uri.clone());
+            out.entry("PMIX_SERVER_URI3".into()).or_insert(uri);
+        }
         validate_pmix_env(&out)?;
         Ok(out)
     }
@@ -473,6 +482,8 @@ fn plan_to_c(plan: &PmixLaunchPlan) -> Result<SpurMpiLaunchPlan, String> {
             local_rank: 0,
         }; 256],
         tmpdir: [0; 512],
+        job_uid: plan.job_uid,
+        job_gid: plan.job_gid,
     };
     write_c_str(&mut c_plan.namespace, &plan.namespace)?;
     write_c_str(&mut c_plan.tmpdir, &plan.tmpdir)?;
@@ -528,6 +539,8 @@ pub fn plan_from_proto(
             })
             .collect(),
         tmpdir: proto.tmpdir.clone(),
+        job_uid: proto.job_uid,
+        job_gid: proto.job_gid,
     };
     mpi::validate_pmix_plan(&plan)?;
     Ok(plan)
@@ -538,12 +551,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plan_credentials_survive_proto_roundtrip_and_plan_to_c() {
+        let plan = PmixLaunchPlan::local_tasks(7, 4, 0, 4, "/tmp/pmix", 1001, 1002);
+        let proto = mpi::plan_to_proto(plan);
+        let restored = plan_from_proto(&proto).unwrap();
+        assert_eq!(restored.job_uid, 1001);
+        assert_eq!(restored.job_gid, 1002);
+        let c = plan_to_c(&restored).unwrap();
+        assert_eq!(c.job_uid, 1001);
+        assert_eq!(c.job_gid, 1002);
+    }
+
+    #[test]
     fn missing_plugin_returns_actionable_error() {
         let host = MpiPluginHost::new(MpiConfig {
             plugin_dir: "/nonexistent/spur/plugins".into(),
             ..MpiConfig::default()
         });
-        let plan = PmixLaunchPlan::local_tasks(1, 1, 0, 1, "/tmp/pmix");
+        let plan = PmixLaunchPlan::local_tasks(1, 1, 0, 1, "/tmp/pmix", 0, 0);
         let err = host.start_pmix_server(&plan).unwrap_err();
         assert!(err.contains("MPI plugin not found"));
     }
@@ -575,6 +600,8 @@ mod tests {
                 })
                 .collect(),
             tmpdir: "/tmp/pmix".into(),
+            job_uid: 0,
+            job_gid: 0,
         };
         let err = host.start_pmix_server(&plan).unwrap_err();
         assert!(err.contains("max 256"));
@@ -600,6 +627,8 @@ mod tests {
                 local_rank: 0,
             }],
             tmpdir: "/tmp/pmix".into(),
+            job_uid: 0,
+            job_gid: 0,
         };
         let err = host.start_pmix_server(&plan).unwrap_err();
         assert!(err.contains("namespace mismatch"));
@@ -622,7 +651,7 @@ mod tests {
                 refs: 1,
             },
         );
-        let plan = PmixLaunchPlan::local_tasks(5, 1, 0, 1, "/tmp/pmix");
+        let plan = PmixLaunchPlan::local_tasks(5, 1, 0, 1, "/tmp/pmix", 0, 0);
         assert!(host.start_pmix_server(&plan).is_err());
         assert_eq!(
             host.active_namespaces.lock().unwrap().get(&5).unwrap().refs,
@@ -650,7 +679,7 @@ mod tests {
             plugin_dir: "/nonexistent/spur/plugins".into(),
             ..MpiConfig::default()
         }));
-        let plan = PmixLaunchPlan::local_tasks(9, 1, 0, 1, "/tmp/pmix");
+        let plan = PmixLaunchPlan::local_tasks(9, 1, 0, 1, "/tmp/pmix", 0, 0);
         assert!(PmixLaunchGuard::start(host.clone(), &plan).is_err());
         assert!(!host.has_active_pmix(plan.job_id));
     }
@@ -736,7 +765,7 @@ mod tests {
             pmix_tmpdir: "/tmp/spur-pmix-test".into(),
             ..MpiConfig::default()
         }));
-        let plan = PmixLaunchPlan::local_tasks(7777, 1, 0, 1, "/tmp/spur-pmix-test");
+        let plan = PmixLaunchPlan::local_tasks(7777, 1, 0, 1, "/tmp/spur-pmix-test", 0, 0);
         {
             let guard = PmixLaunchGuard::start(host.clone(), &plan).expect("plugin start");
             assert!(host.has_active_pmix(plan.job_id));

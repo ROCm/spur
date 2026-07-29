@@ -13,6 +13,9 @@ extern "C" {
 
 #define SPUR_MPI_PLUGIN_API_VERSION 1
 
+/* Use when the controller did not supply job credentials; plugin falls back to spurd. */
+#define SPUR_MPI_JOB_CRED_UNSET UINT32_MAX
+
 typedef struct spur_mpi_proc {
     uint32_t rank;
     uint32_t local_rank;
@@ -26,6 +29,8 @@ typedef struct spur_mpi_launch_plan {
     uint32_t num_local_procs;
     spur_mpi_proc_t local_procs[256];
     char tmpdir[512];
+    uint32_t job_uid;
+    uint32_t job_gid;
 } spur_mpi_launch_plan_t;
 
 int spur_mpi_pmix_version(void);
