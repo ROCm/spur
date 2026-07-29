@@ -267,7 +267,7 @@ pub enum PendingReason {
     JobHoldMaxRequeue,
 
     // Account/association-level limit parity (mirrors the QOS additions
-    // above, one layer up the hierarchy: `AccountLimits` on `Association`).
+    // above, one layer up the hierarchy: `AccountLimits` on an association).
     AssocMaxJobsLimit,
     AssocMaxSubmitJobLimit,
     AssocMaxCpuPerJobLimit,

@@ -4,7 +4,7 @@
 //! Account/association resource limit enforcement.
 //!
 //! Mirrors `qos::check_qos_limits` one layer up the hierarchy: limits here
-//! come from `AccountLimits` on a user's `Association` with an account,
+//! come from `AccountLimits` on a user's association with an account,
 //! rather than from a `Qos`. Unlike QOS, associations have no separate
 //! per-user TRES cap distinct from the per-job one — `max_tres_per_job`
 //! bounds a single job and `grp_tres` bounds the account's aggregate usage

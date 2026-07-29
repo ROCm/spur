@@ -136,17 +136,6 @@ pub struct AccountLimits {
     pub max_wall_minutes: Option<u32>,
 }
 
-/// A user-account association.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Association {
-    pub user: String,
-    pub account: String,
-    pub partition: Option<String>,
-    pub fairshare_weight: u32,
-    pub limits: AccountLimits,
-    pub is_default: bool,
-}
-
 /// Quality of Service definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Qos {

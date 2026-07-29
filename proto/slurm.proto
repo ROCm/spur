@@ -1066,14 +1066,18 @@ message ReportJobStatusRequest {
 // Account/User/QOS Management (sacctmgr)
 // ============================================================
 
+// Add or modify an account (proto3 presence: unset = leave unchanged on modify,
+// set = write; `add` sets every field). Empty/0 clears parent_account, grp_tres,
+// and max_running_jobs to NULL; description, organization, and fairshare_weight
+// store their literal value (0 is a real weight, not a clear).
 message CreateAccountRequest {
   string name = 1;
-  string description = 2;
-  string organization = 3;
-  string parent_account = 4;
-  double fairshare_weight = 5;
-  uint32 max_running_jobs = 6;
-  string grp_tres = 7;
+  optional string description = 2;
+  optional string organization = 3;
+  optional string parent_account = 4;
+  optional double fairshare_weight = 5;
+  optional uint32 max_running_jobs = 6;
+  optional string grp_tres = 7;
 }
 
 message DeleteAccountRequest {
@@ -1096,27 +1100,29 @@ message AccountInfo {
   string grp_tres = 7;
 }
 
+// Add or modify a user-account association (proto3 presence: unset = leave
+// unchanged on modify, set = write; `add` sets every field). The limit/QOS
+// fields below are nullable and clear to NULL when set empty/0; admin_level is
+// non-nullable, storing the literal sent (unset keeps it, 'none' on create).
 message AddUserRequest {
   string user = 1;
   string account = 2;
-  string admin_level = 3;
-  bool is_default = 4;
-  // Default QOS for this user's association with `account`. Like every
-  // other field here, this is a full resend on upsert, not a partial
-  // patch: empty clears an existing default (matches modify account/qos).
-  string default_qos = 5;
-  // Association-level resource limits for `user` within `account`. Same
-  // full-resend semantics as default_qos: 0/empty clears an existing
-  // limit rather than leaving it unchanged.
-  uint32 max_running_jobs = 6;
-  uint32 max_submit_jobs = 7;
-  string max_tres_per_job = 8;
-  string grp_tres = 9;
-  uint32 max_wall_minutes = 10;
-  // Comma-separated QOS names this association may use. Same full-resend
-  // semantics: empty clears an existing allow-list back to unrestricted.
-  // default_qos must be a member when both are set.
-  string allowed_qos = 11;
+  optional string admin_level = 3;
+  optional bool is_default = 4;
+  // Default QOS for this user's association with `account`. Unset preserves
+  // the stored default; explicit empty clears it.
+  optional string default_qos = 5;
+  // Association-level resource limits for `user` within `account`. Unset
+  // preserves the stored limit; an explicit 0/empty clears it (no limit).
+  optional uint32 max_running_jobs = 6;
+  optional uint32 max_submit_jobs = 7;
+  optional string max_tres_per_job = 8;
+  optional string grp_tres = 9;
+  optional uint32 max_wall_minutes = 10;
+  // Comma-separated QOS names this association may use. Unset preserves the
+  // stored allow-list; explicit empty clears it back to unrestricted.
+  // default_qos must be a member when both are set in the same request.
+  optional string allowed_qos = 11;
 }
 
 message RemoveUserRequest {
@@ -1142,19 +1148,23 @@ message UserInfo {
   string allowed_qos = 6;
 }
 
+// Add or modify a QOS (proto3 presence: unset = leave unchanged on modify, set =
+// write; `add` sets every field). Empty/0 clears the nullable limits
+// (max_*_per_user, *_wall_minutes, max_tres_*, grp_tres) to NULL; description,
+// preempt_mode, priority, and usage_factor store their literal value (0 is real).
 message CreateQosRequest {
   string name = 1;
-  string description = 2;
-  int32 priority = 3;
-  string preempt_mode = 4;
-  double usage_factor = 5;
-  uint32 max_jobs_per_user = 6;
-  uint32 max_wall_minutes = 7;
-  string max_tres_per_job = 8;
-  uint32 max_submit_jobs_per_user = 9;
-  string max_tres_per_user = 10;
-  string grp_tres = 11;
-  uint32 grp_wall_minutes = 12;
+  optional string description = 2;
+  optional int32 priority = 3;
+  optional string preempt_mode = 4;
+  optional double usage_factor = 5;
+  optional uint32 max_jobs_per_user = 6;
+  optional uint32 max_wall_minutes = 7;
+  optional string max_tres_per_job = 8;
+  optional uint32 max_submit_jobs_per_user = 9;
+  optional string max_tres_per_user = 10;
+  optional string grp_tres = 11;
+  optional uint32 grp_wall_minutes = 12;
 }
 
 message DeleteQosRequest {
