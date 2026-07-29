@@ -9,7 +9,8 @@ use crate::format_engine;
 
 /// View information about jobs in the scheduling queue.
 #[derive(Parser, Debug)]
-// -h is squeue's --noheader (Slurm convention), so disable clap's auto -h/--help.
+// -h is squeue's --noheader (Slurm convention), so disable clap's auto -h and
+// re-add --help below as long-only.
 #[command(
     name = "squeue",
     about = "View the job queue",
@@ -51,6 +52,10 @@ pub struct SqueueArgs {
     /// Don't print header
     #[arg(short = 'h', long)]
     pub noheader: bool,
+
+    /// Print help
+    #[arg(long, action = clap::ArgAction::Help)]
+    pub help: Option<bool>,
 
     /// Sort by field(s), comma-separated, each optionally prefixed with + (asc) or - (desc)
     #[arg(short = 'S', long, allow_hyphen_values = true)]
@@ -417,6 +422,19 @@ mod tests {
         // -S -i must parse as a descending sort spec, not a flag (allow_hyphen_values).
         let args = SqueueArgs::try_parse_from(["squeue", "-S", "-i"]).unwrap();
         assert_eq!(args.sort.as_deref(), Some("-i"));
+    }
+
+    #[test]
+    fn long_help_flag_is_preserved() {
+        // -h is reclaimed for --noheader, but --help must still print help.
+        let err = SqueueArgs::try_parse_from(["squeue", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn short_h_is_noheader_not_help() {
+        let args = SqueueArgs::try_parse_from(["squeue", "-h"]).unwrap();
+        assert!(args.noheader);
     }
 
     #[test]
