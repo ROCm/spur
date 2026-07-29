@@ -557,4 +557,28 @@ mod tests {
         assert_eq!(args.nodes, 1, "nodes must stay at the CLI default");
         assert!(args.job_name.is_none(), "job_name must stay unset");
     }
+
+    /// Drives `main_with_args` far enough to resolve the task count, then stops
+    /// at the controller dial. Guards the argument plumbing between parsing and
+    /// `connect_channel`, which the parse-only tests above never execute.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn main_with_args_resolves_request_then_fails_to_connect() {
+        let _env = EnvGuard::new();
+        let addr = crate::mock_controller::unreachable_addr().await;
+        let err = main_with_args(vec![
+            "salloc".into(),
+            "-N".into(),
+            "4".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+        ])
+        .await
+        .expect_err("connect to a closed port must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed to connect to spurctld"),
+            "expected a controller connect failure, got: {msg}"
+        );
+    }
 }

@@ -492,6 +492,7 @@ fn resolve_io_paths(args: &SrunArgs) -> ResolvedIoPaths {
     }
 }
 
+#[derive(Debug)]
 struct StepDispatchResult {
     exit_code: i32,
 }
@@ -1929,6 +1930,112 @@ mod tests {
         // An explicit CLI value still wins over both.
         let overridden = resolve_from(&["srun", "-p", "cli-part", "hostname"]);
         assert_eq!(overridden.partition.as_deref(), Some("cli-part"));
+    }
+
+    fn empty_io() -> ResolvedIoPaths {
+        ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        }
+    }
+
+    async fn dispatch_with(
+        client: &mut SlurmControllerClient<tonic::transport::Channel>,
+        cli: &[&str],
+    ) -> Result<StepDispatchResult> {
+        let args = SrunArgs::try_parse_from(cli).expect("parse failed");
+        let io = empty_io();
+        let params = StepDispatchParams {
+            args: &args,
+            work_dir: "/tmp",
+            io: &io,
+            mpi: spur_core::mpi::MPI_NONE,
+        };
+        dispatch_step(client, 1, &params).await
+    }
+
+    /// With no `-n`, the step must ask the controller for one task per node.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn dispatch_step_requests_one_task_per_node_by_default() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        let result = dispatch_with(&mut client, &["srun", "-N", "3", "hostname"])
+            .await
+            .expect("dispatch should succeed");
+
+        assert_eq!(capture.create_step_num_tasks(), 3);
+        assert_eq!(capture.run_step_calls(), 1);
+        assert_eq!(
+            capture.run_step_step_id(),
+            crate::mock_controller::MOCK_STEP_ID,
+            "RunStep must carry the step id returned by CreateJobStep"
+        );
+        assert_eq!(result.exit_code, crate::mock_controller::MOCK_EXIT_CODE);
+    }
+
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn dispatch_step_explicit_ntasks_overrides_node_default() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        dispatch_with(&mut client, &["srun", "-N", "3", "-n", "2", "hostname"])
+            .await
+            .expect("dispatch should succeed");
+
+        assert_eq!(capture.create_step_num_tasks(), 2);
+    }
+
+    /// The per-node default feeds cpu-bind validation, so a `map_cpu` list
+    /// shorter than the node count is rejected before the step is run.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn dispatch_step_rejects_map_cpu_bind_shorter_than_default_ntasks() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        let err = dispatch_with(
+            &mut client,
+            &["srun", "-N", "4", "--cpu-bind", "map_cpu:0,1", "hostname"],
+        )
+        .await
+        .expect_err("two CPUs cannot cover four tasks");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("map_cpu lists 2 CPU(s) but the step requires 4 task(s)"),
+            "expected a cpu-bind arity error, got: {msg}"
+        );
+        assert_eq!(capture.create_step_num_tasks(), 4);
+        assert_eq!(
+            capture.run_step_calls(),
+            0,
+            "dispatch must bail before running the step"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn dispatch_step_surfaces_create_job_step_failure() {
+        let _env = EnvGuard::new();
+        let addr = crate::mock_controller::unreachable_addr().await;
+        let mut client = crate::mock_controller::lazy_client(addr);
+
+        let err = dispatch_with(&mut client, &["srun", "-N", "2", "hostname"])
+            .await
+            .expect_err("no server is listening");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed to create job step"),
+            "expected a CreateJobStep failure, got: {msg}"
+        );
     }
 
     #[tokio::test]

@@ -8,6 +8,8 @@ mod format_engine;
 mod image;
 mod interactive;
 mod k8s;
+#[cfg(test)]
+mod mock_controller;
 mod net;
 mod node;
 mod nodelist;
