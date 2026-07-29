@@ -251,6 +251,11 @@ mod tests {
         assert_eq!(plan.local_procs.len(), 4);
         assert_eq!(plan.local_procs[0].rank, 0);
         assert_eq!(plan.local_procs[3].rank, 3);
+        assert_eq!(plan.job_uid, 1000);
+        assert_eq!(plan.job_gid, 1000);
+        let proto = plan_to_proto(plan);
+        assert_eq!(proto.job_uid, 1000);
+        assert_eq!(proto.job_gid, 1000);
     }
 
     #[test]

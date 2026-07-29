@@ -87,6 +87,30 @@ pub fn apply_gpu_bind_env(
     target.insert("GPU_DEVICE_ORDINAL".into(), visible);
 }
 
+/// True when env requests CPU bind that the single-`mpirun` PMIx wrapper does not apply.
+pub fn mpi_mpirun_skips_cpu_bind(source: &HashMap<String, String>) -> bool {
+    matches!(
+        source
+            .get("SPUR_CPU_BIND")
+            .or_else(|| source.get("SLURM_CPU_BIND")),
+        Some(bind) if !bind.is_empty() && !bind.eq_ignore_ascii_case("none")
+    )
+}
+
+/// True when env requests GPU bind that the single-`mpirun` PMIx wrapper does not apply.
+pub fn mpi_mpirun_skips_gpu_bind(source: &HashMap<String, String>) -> bool {
+    let Some(bind_str) = source
+        .get("SPUR_GPU_BIND")
+        .or_else(|| source.get("SLURM_GPU_BIND"))
+    else {
+        return false;
+    };
+    if bind_str.is_empty() || bind_str.eq_ignore_ascii_case("none") {
+        return false;
+    }
+    !matches!(bind_str.parse::<GpuBind>(), Ok(GpuBind::None))
+}
+
 /// Return the CPU bind string when step mode cannot enforce topology-based binds.
 pub fn unsupported_cpu_bind(source: &HashMap<String, String>) -> Option<String> {
     let bind_str = source
@@ -515,6 +539,19 @@ mod tests {
     fn mpi_wrapper_tag_output_when_labeled() {
         let script = build_multi_task_wrapper("/tmp/hello_mpi", 4, None, true);
         assert!(script.contains("--tag-output"));
+    }
+
+    #[test]
+    fn mpi_mpirun_skips_cpu_and_gpu_bind_detection() {
+        let mut env = HashMap::new();
+        assert!(!mpi_mpirun_skips_cpu_bind(&env));
+        assert!(!mpi_mpirun_skips_gpu_bind(&env));
+        env.insert("SPUR_CPU_BIND".into(), "rank".into());
+        assert!(mpi_mpirun_skips_cpu_bind(&env));
+        env.insert("SPUR_GPU_BIND".into(), "map_gpu:0,1".into());
+        assert!(mpi_mpirun_skips_gpu_bind(&env));
+        env.insert("SPUR_CPU_BIND".into(), "none".into());
+        assert!(!mpi_mpirun_skips_cpu_bind(&env));
     }
 
     #[test]

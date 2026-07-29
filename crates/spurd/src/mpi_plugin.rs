@@ -551,6 +551,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plan_credentials_survive_proto_roundtrip_and_plan_to_c() {
+        let plan = PmixLaunchPlan::local_tasks(7, 4, 0, 4, "/tmp/pmix", 1001, 1002);
+        let proto = mpi::plan_to_proto(plan);
+        let restored = plan_from_proto(&proto).unwrap();
+        assert_eq!(restored.job_uid, 1001);
+        assert_eq!(restored.job_gid, 1002);
+        let c = plan_to_c(&restored).unwrap();
+        assert_eq!(c.job_uid, 1001);
+        assert_eq!(c.job_gid, 1002);
+    }
+
+    #[test]
     fn missing_plugin_returns_actionable_error() {
         let host = MpiPluginHost::new(MpiConfig {
             plugin_dir: "/nonexistent/spur/plugins".into(),
