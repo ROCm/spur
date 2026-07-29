@@ -707,14 +707,7 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
 
     match entity.to_lowercase().as_str() {
         "account" | "accounts" => {
-            let fields = format_engine::resolve_format(
-                p.get("format").map(String::as_str),
-                ACCOUNT_DEFAULT_FORMAT,
-                ACCOUNT_ALL_FORMAT,
-                &account_field_spec,
-                &account_header,
-                "Account, Descr, Org, Parent, Share, GrpTRES, MaxJobs",
-            )?;
+            let fields = account_format_fields(p.get("format").map(String::as_str))?;
 
             let mut client = connect(addr).await?;
             let resp = client
@@ -878,6 +871,30 @@ fn account_field_spec(name: &str) -> Option<char> {
     }
 }
 
+/// Resolve `show account` output columns from an optional `format=` param. Shared by the handler
+/// and its tests so the default/all formats and the valid-field hint stay in one place.
+fn account_format_fields(
+    format_param: Option<&str>,
+) -> anyhow::Result<Vec<format_engine::FormatToken>> {
+    format_engine::resolve_format(
+        format_param,
+        ACCOUNT_DEFAULT_FORMAT,
+        ACCOUNT_ALL_FORMAT,
+        &account_field_spec,
+        &account_header,
+        "Account, Descr, Org, Parent, Share, GrpTRES, MaxJobs",
+    )
+}
+
+/// Render a numeric limit, blank when zero (Slurm shows "unlimited" as an empty cell).
+fn blank_if_zero(v: u32) -> String {
+    if v == 0 {
+        String::new()
+    } else {
+        v.to_string()
+    }
+}
+
 fn resolve_account_field(a: &AccountInfo, spec: char) -> String {
     match spec {
         'N' => a.name.clone(),
@@ -886,14 +903,8 @@ fn resolve_account_field(a: &AccountInfo, spec: char) -> String {
         'P' => a.parent_account.clone(),
         'S' => (a.fairshare_weight as u32).to_string(),
         'G' => a.grp_tres.clone(),
-        'J' => {
-            if a.max_running_jobs == 0 {
-                String::new()
-            } else {
-                a.max_running_jobs.to_string()
-            }
-        }
-        _ => String::new(),
+        'J' => blank_if_zero(a.max_running_jobs),
+        _ => "?".into(),
     }
 }
 
@@ -948,34 +959,10 @@ fn resolve_qos_field(q: &QosInfo, spec: char) -> String {
         'G' => q.grp_tres.clone(),
         'T' => q.max_tres_per_job.clone(),
         'V' => q.max_tres_per_user.clone(),
-        'J' => {
-            if q.max_jobs_per_user == 0 {
-                String::new()
-            } else {
-                q.max_jobs_per_user.to_string()
-            }
-        }
-        'S' => {
-            if q.max_submit_jobs_per_user == 0 {
-                String::new()
-            } else {
-                q.max_submit_jobs_per_user.to_string()
-            }
-        }
-        'W' => {
-            if q.max_wall_minutes == 0 {
-                String::new()
-            } else {
-                q.max_wall_minutes.to_string()
-            }
-        }
-        'w' => {
-            if q.grp_wall_minutes == 0 {
-                String::new()
-            } else {
-                q.grp_wall_minutes.to_string()
-            }
-        }
+        'J' => blank_if_zero(q.max_jobs_per_user),
+        'S' => blank_if_zero(q.max_submit_jobs_per_user),
+        'W' => blank_if_zero(q.max_wall_minutes),
+        'w' => blank_if_zero(q.grp_wall_minutes),
         _ => "?".into(),
     }
 }
@@ -1603,22 +1590,15 @@ mod tests {
         assert_eq!(resolve_account_field(&a, 'J'), "10");
     }
 
-    fn account_resolve_format(
-        fmt: Option<&str>,
-    ) -> anyhow::Result<Vec<format_engine::FormatToken>> {
-        format_engine::resolve_format(
-            fmt,
-            ACCOUNT_DEFAULT_FORMAT,
-            ACCOUNT_ALL_FORMAT,
-            &account_field_spec,
-            &account_header,
-            "Account, Descr, Org, Parent, Share, GrpTRES, MaxJobs",
-        )
+    #[test]
+    fn account_resolve_unknown_spec_is_visible_marker() {
+        // A header spec missing a resolver renders "?" (not a silently blank column).
+        assert_eq!(resolve_account_field(&stub_account(), 'Z'), "?");
     }
 
     #[test]
     fn account_resolve_format_all_expands_to_all_columns() {
-        let fields = account_resolve_format(Some("all")).unwrap();
+        let fields = account_format_fields(Some("all")).unwrap();
         let header = format_engine::format_header(&fields);
         assert!(header.contains("MaxJobs"), "all header: {header}");
         assert!(header.contains("GrpTRES"), "all header: {header}");
@@ -1626,12 +1606,12 @@ mod tests {
 
     #[test]
     fn account_resolve_format_unknown_field_errors() {
-        assert!(account_resolve_format(Some("bogus")).is_err());
+        assert!(account_format_fields(Some("bogus")).is_err());
     }
 
     #[test]
     fn account_resolve_format_none_uses_default() {
-        let fields = account_resolve_format(None).unwrap();
+        let fields = account_format_fields(None).unwrap();
         let header = format_engine::format_header(&fields);
         assert!(header.contains("Account"), "default header: {header}");
         assert!(
