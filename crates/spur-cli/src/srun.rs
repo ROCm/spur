@@ -1976,6 +1976,13 @@ mod tests {
             crate::sbatch::effective_ntasks(multi.ntasks, multi.ntasks_per_node, multi.nodes),
             16
         );
+
+        // Zero per-node is treated as unset, so the count falls back to nodes.
+        let zero = resolve_from(&["srun", "-N", "4", "--ntasks-per-node=0", "hostname"]);
+        assert_eq!(
+            crate::sbatch::effective_ntasks(zero.ntasks, zero.ntasks_per_node, zero.nodes),
+            4
+        );
     }
 
     #[test]
