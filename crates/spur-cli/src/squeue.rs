@@ -264,9 +264,15 @@ fn compare_field(
         't' | 'T' => state_sort_rank(a.state).cmp(&state_sort_rank(b.state)),
         'M' => run_time_secs(a).cmp(&run_time_secs(b)),
         'l' => time_limit_secs(a).cmp(&time_limit_secs(b)),
+        'L' => time_left_secs(a).cmp(&time_left_secs(b)),
         'S' => ts_secs(a.start_time.as_ref()).cmp(&ts_secs(b.start_time.as_ref())),
         'V' => ts_secs(a.submit_time.as_ref()).cmp(&ts_secs(b.submit_time.as_ref())),
         'e' => ts_secs(a.end_time.as_ref()).cmp(&ts_secs(b.end_time.as_ref())),
+        'P' => a.partition.cmp(&b.partition),
+        'u' => a.user.cmp(&b.user),
+        'j' | 'n' => a.name.cmp(&b.name),
+        'a' => a.account.cmp(&b.account),
+        'q' => a.qos.cmp(&b.qos),
         _ => resolve_job_field(a, spec).cmp(&resolve_job_field(b, spec)),
     }
 }
@@ -305,6 +311,15 @@ fn time_limit_secs(job: &spur_proto::proto::JobInfo) -> i64 {
 
 fn ts_secs(ts: Option<&prost_types::Timestamp>) -> i64 {
     ts.map(|t| t.seconds).unwrap_or(0)
+}
+
+// Unlimited time limit sorts last, matching `-S l`.
+fn time_left_secs(job: &spur_proto::proto::JobInfo) -> i64 {
+    let limit = time_limit_secs(job);
+    if limit == i64::MAX {
+        return i64::MAX;
+    }
+    limit.saturating_sub(run_time_secs(job))
 }
 
 fn state_code(state: i32) -> String {
@@ -584,5 +599,42 @@ mod tests {
         let mut jobs = vec![a, b];
         sort_jobs(&mut jobs, &parse_sort_arg("V").unwrap());
         assert_eq!(ids(&jobs), vec![2, 1]);
+    }
+
+    #[test]
+    fn sort_by_partition_orders_lexically() {
+        let mut jobs = vec![
+            job(1, "gamma", P::JobRunning, 0),
+            job(2, "alpha", P::JobRunning, 0),
+            job(3, "beta", P::JobRunning, 0),
+        ];
+        sort_jobs(&mut jobs, &parse_sort_arg("P").unwrap());
+        assert_eq!(ids(&jobs), vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn sort_by_time_left_puts_unlimited_last() {
+        let mut a = job(1, "default", P::JobRunning, 0);
+        a.time_limit = Some(prost_types::Duration {
+            seconds: 600,
+            nanos: 0,
+        });
+        a.run_time = Some(prost_types::Duration {
+            seconds: 60,
+            nanos: 0,
+        });
+        let b = job(2, "default", P::JobRunning, 0);
+        let mut c = job(3, "default", P::JobRunning, 0);
+        c.time_limit = Some(prost_types::Duration {
+            seconds: 600,
+            nanos: 0,
+        });
+        c.run_time = Some(prost_types::Duration {
+            seconds: 500,
+            nanos: 0,
+        });
+        let mut jobs = vec![a, b, c];
+        sort_jobs(&mut jobs, &parse_sort_arg("L").unwrap());
+        assert_eq!(ids(&jobs), vec![3, 1, 2]);
     }
 }
