@@ -686,9 +686,9 @@ class TestSacctmgrQosAuthorization:
 
 
 class TestSacctmgrModifyPartialPatch:
-    """SPUR-96: `sacctmgr modify` restates only the fields it names; every
-    unstated field keeps its stored value, and an explicitly empty field
-    clears it. Covers accounts and QOS (the user-QOS case is covered by
+    """`sacctmgr modify` restates only the fields it names; every unstated
+    field keeps its stored value, and an explicitly empty field clears it.
+    Covers accounts and QOS (the user-QOS case is covered by
     TestSacctmgrQosAuthorization)."""
 
     def _row(self, cluster, entity_show_args, needle):
@@ -713,8 +713,8 @@ class TestSacctmgrModifyPartialPatch:
             ]
         )
 
-        # Unrelated modify: only fairshare is restated. grptres/description
-        # must survive (the SPUR-96 regression).
+        # Unrelated modify: only fairshare is restated; grptres/description
+        # must survive.
         c.sacctmgr(["modify", "account", "name=patchacct", "set", "fairshare=7"])
         row = self._row(c, ["show", "account"], "patchacct")
         assert row is not None, "patchacct not found after modify"

@@ -703,10 +703,10 @@ pub struct AccountRecord {
     pub grp_tres: Option<String>,
 }
 
-/// Update the partition-less association's provided columns, inserting the row
-/// if none exists. Serialized per (user, account) by the caller's advisory lock
-/// so a concurrent first-time write can't double-insert: `partition_name` is
-/// nullable (NULL != NULL), so `ON CONFLICT` can't dedupe it here.
+/// Update the partition-less association's columns, inserting the row if none
+/// exists. `partition_name` is nullable (NULL != NULL), so `ON CONFLICT` can't
+/// dedupe; the caller's per-user advisory lock serializes concurrent `add_user`s
+/// so two can't double-insert. (`remove_user` takes no lock but only deletes.)
 async fn upsert_association(
     conn: &mut PgConnection,
     user: &str,
@@ -765,9 +765,9 @@ pub struct UserUpdate<'a> {
 }
 
 /// Add or modify a user-account association, writing only the fields set in `u`
-/// (partial patch: `modify` restates a subset, `add` sets all). The users row is
-/// ensured; limits/QOS live in a separate association row. `is_default = Some(true)`
-/// demotes the user's other accounts, so at most one is ever the default.
+/// (partial patch). `is_default`: `Some(true)` makes this the default (demoting the
+/// user's others), `Some(false)` clears it, `None` preserves it but still defaults a
+/// brand-new user's first account. Limits/QOS live in a separate association row.
 pub async fn add_user<'a>(
     pool: &PgPool,
     user: &'a str,
@@ -797,13 +797,17 @@ pub async fn add_user<'a>(
         .await?;
     }
 
-    // Partial-patch contract: COALESCE/CASE keep the stored admin_level and
-    // default_account when the request omits them ($3/$4 NULL). is_default = true
-    // makes this account the default, false clears it.
+    // Partial-patch: COALESCE/CASE keep stored admin_level/default_account when
+    // omitted ($3/$4 NULL); a brand-new user's first row still claims the default.
     sqlx::query(
         r#"
         INSERT INTO users (name, account, admin_level, default_account)
-        VALUES ($1, $2, COALESCE($3, 'none'), CASE WHEN $4::bool THEN $2 END)
+        VALUES ($1, $2, COALESCE($3, 'none'), CASE
+            WHEN $4::bool THEN $2
+            WHEN $4::bool IS NULL AND NOT EXISTS (
+                SELECT 1 FROM users WHERE name = $1 AND default_account IS NOT NULL
+            ) THEN $2
+        END)
         ON CONFLICT (name, account) DO UPDATE SET
             admin_level = COALESCE($3, users.admin_level),
             default_account = CASE
@@ -1492,9 +1496,8 @@ mod job_history_tests {
             .expect("user present");
         assert_eq!(got.default_qos.as_deref(), Some(qos_name.as_str()));
 
-        // A partial update that doesn't restate default_qos must preserve it
-        // (the core SPUR-96 guarantee), while still applying the field it did
-        // restate.
+        // An unrestated default_qos must be preserved while the restated field
+        // is still applied.
         add_user(
             &pool,
             &user,
@@ -1609,8 +1612,7 @@ mod job_history_tests {
             Some(account.as_str())
         );
 
-        // A partial update that doesn't restate is_default must preserve
-        // default_account (the reported bug cleared it via the ON CONFLICT gap).
+        // An unrestated is_default must leave default_account untouched.
         add_user(
             &pool,
             &user,
@@ -1629,8 +1631,7 @@ mod job_history_tests {
             "unrestated is_default must not touch default_account"
         );
 
-        // Restating is_default=false clears it — this is the change the old
-        // UPDATE dropped on the floor.
+        // Restating is_default=false clears default_account.
         add_user(
             &pool,
             &user,
@@ -1749,6 +1750,80 @@ mod job_history_tests {
             "A must be demoted when B becomes default"
         );
         assert_eq!(b_row.default_account.as_deref(), Some(acct_b.as_str()));
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        for a in [&acct_a, &acct_b] {
+            sqlx::query("DELETE FROM accounts WHERE name = $1")
+                .bind(a)
+                .execute(&pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn add_user_defaults_first_account_and_later_adds_dont_demote() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let user = format!("spur_defadd_user_{pid}");
+        let acct_a = format!("spur_defadd_a_{pid}");
+        let acct_b = format!("spur_defadd_b_{pid}");
+
+        sqlx::query("DELETE FROM associations WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        for a in [&acct_a, &acct_b] {
+            sqlx::query("DELETE FROM accounts WHERE name = $1")
+                .bind(a)
+                .execute(&pool)
+                .await?;
+            upsert_account(
+                &pool,
+                a,
+                AccountUpdate {
+                    description: Some("d"),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+
+        // A plain add (is_default = None) makes a user's first account the default.
+        add_user(&pool, &user, &acct_a, UserUpdate::default()).await?;
+        // A later plain add to another account must not demote that default.
+        add_user(&pool, &user, &acct_b, UserUpdate::default()).await?;
+
+        let users = list_users(&pool, None, Some(&user)).await?;
+        let a_row = users
+            .iter()
+            .find(|u| u.account == acct_a)
+            .expect("A row present");
+        let b_row = users
+            .iter()
+            .find(|u| u.account == acct_b)
+            .expect("B row present");
+        assert_eq!(
+            a_row.default_account.as_deref(),
+            Some(acct_a.as_str()),
+            "a user's first account must become the default"
+        );
+        assert_eq!(
+            b_row.default_account, None,
+            "a plain add must not steal the default from an existing account"
+        );
 
         sqlx::query("DELETE FROM associations WHERE user_name = $1")
             .bind(&user)
@@ -2401,8 +2476,8 @@ mod job_history_tests {
             .expect("account present");
         assert_eq!(got.grp_tres.as_deref(), Some("cpu=16,mem=32768,gres/gpu=8"));
 
-        // A partial update that doesn't restate grp_tres preserves it (the
-        // SPUR-96 fix) while applying the field it does restate.
+        // An unrestated grp_tres must be preserved while the restated field is
+        // still applied.
         upsert_account(
             &pool,
             &account,

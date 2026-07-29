@@ -388,11 +388,9 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     user: fields.name.clone(),
                     account: fields.account.clone(),
                     admin_level: Some(fields.admin.clone()),
-                    is_default: Some(
-                        p.get("defaultaccount")
-                            .map(|da| da == &fields.account)
-                            .unwrap_or(true),
-                    ),
+                    // Like `modify`, send None when defaultaccount= is absent so a
+                    // plain add can't silently demote a default the user already has.
+                    is_default: p.get("defaultaccount").map(|da| da == &fields.account),
                     default_qos: Some(fields.default_qos.clone()),
                     allowed_qos: Some(fields.allowed_qos.clone()),
                     max_running_jobs: Some(fields.max_running_jobs),
@@ -1164,7 +1162,7 @@ mod tests {
     #[test]
     fn reject_unknown_keys_accepts_every_parsed_account_field() {
         // Every key the add/modify account handlers read must be allowlisted,
-        // otherwise reject_unknown_keys bounces it (the grpwall regression class).
+        // otherwise reject_unknown_keys would bounce a valid field.
         let parsed_fields = [
             "name",
             "account",
@@ -1336,9 +1334,8 @@ mod tests {
 
     #[test]
     fn build_modify_account_request_omits_unrestated_fields() {
-        // The core of SPUR-96: `modify account name=X set fairshare=2` must
-        // send only fairshare; every other field is None so the server leaves
-        // it untouched.
+        // `modify account name=X set fairshare=2` must send only fairshare;
+        // every other field is None so the server leaves it untouched.
         let p = parse_params(&["name=physics".into(), "set".into(), "fairshare=2".into()]);
         let req = build_modify_account_request(&p).unwrap();
         assert_eq!(req.name, "physics");
@@ -1440,7 +1437,7 @@ mod tests {
     #[test]
     fn build_modify_user_request_omits_unrestated_limits_and_qos() {
         // `modify user ... set maxjobs=5` must not touch the QOS allow-list or
-        // the other limits — the association-limit half of SPUR-96.
+        // the other limits.
         let p = parse_params(&[
             "name=alice".into(),
             "account=physics".into(),
