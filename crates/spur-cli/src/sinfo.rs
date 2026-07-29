@@ -11,7 +11,11 @@ use crate::format_engine;
 
 /// View information about nodes and partitions.
 #[derive(Parser, Debug)]
-#[command(name = "sinfo", about = "View cluster information")]
+#[command(
+    name = "sinfo",
+    about = "View cluster information",
+    disable_help_flag = true
+)]
 pub struct SinfoArgs {
     /// Show only this partition
     #[arg(short = 'p', long)]
@@ -48,6 +52,10 @@ pub struct SinfoArgs {
         default_value = "http://localhost:6817"
     )]
     pub controller: String,
+
+    /// Print help
+    #[arg(long, action = clap::ArgAction::Help)]
+    pub help: Option<bool>,
 }
 
 pub async fn main() -> Result<()> {
@@ -353,16 +361,8 @@ mod tests {
 
     // --- state filter plumbing tests ---
 
-    /// `-h` is `--noheader` here, so the auto-generated help flag has to be
-    /// dropped before clap will build the command outside of `main`.
     fn parse_sinfo_args(argv: &[&str]) -> SinfoArgs {
-        use clap::{CommandFactory, FromArgMatches};
-
-        let matches = SinfoArgs::command()
-            .disable_help_flag(true)
-            .try_get_matches_from(argv)
-            .unwrap();
-        SinfoArgs::from_arg_matches(&matches).unwrap()
+        SinfoArgs::try_parse_from(argv).unwrap()
     }
 
     #[test]
@@ -420,6 +420,20 @@ mod tests {
         let req = build_get_nodes_request(&args).unwrap();
         assert_eq!(req.partition, "batch");
         assert_eq!(req.nodelist, "n[1-2]");
+    }
+
+    #[test]
+    fn short_h_is_noheader_not_help() {
+        assert!(parse_sinfo_args(&["sinfo", "-h"]).noheader);
+    }
+
+    #[tokio::test]
+    async fn invalid_state_fails_before_connecting() {
+        // Errors while building the request, so no server/network is needed here.
+        let err = main_with_args(vec!["sinfo".into(), "-t".into(), "BOGUS".into()])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("BOGUS"), "{err}");
     }
 
     #[test]
