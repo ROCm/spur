@@ -277,7 +277,6 @@ fn build_salloc_job_spec(args: &SallocArgs, nodelist: Option<String>) -> Result<
         .transpose()?
         .unwrap_or(0);
 
-    // sleep infinity holds the allocation until the interactive shell exits.
     Ok(JobSpec {
         name: args
             .job_name
@@ -515,6 +514,16 @@ mod tests {
 
         env.set("SPUR_QOS", "from-spur");
         assert_eq!(resolve_from(&["salloc"]).qos.as_deref(), Some("from-spur"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn env_only_qos_reaches_job_spec() {
+        let env = EnvGuard::new();
+        env.set("SALLOC_QOS", "burst");
+        let args = resolve_from(&["salloc"]);
+        let spec = build_salloc_job_spec(&args, None).expect("build spec");
+        assert_eq!(spec.qos, "burst");
     }
 
     #[test]
