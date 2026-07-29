@@ -912,7 +912,7 @@ fn first_node(nodelist: &str) -> String {
     nodelist
         .split(',')
         .next()
-        .unwrap_or(nodelist)
+        .unwrap_or_default()
         .trim()
         .to_string()
 }
@@ -922,7 +922,7 @@ async fn try_stream_output(
     nodelist: &str,
     job_id: u32,
 ) -> bool {
-    let first_node = nodelist.split(',').next().unwrap_or(nodelist).trim();
+    let first_node = nodelist.split(',').next().unwrap_or_default().trim();
     if first_node.is_empty() {
         return false;
     }

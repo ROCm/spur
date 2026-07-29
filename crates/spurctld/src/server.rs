@@ -1225,6 +1225,15 @@ impl SlurmController for ControllerService {
         let target_node =
             select_step_node(&job.allocated_nodes, &req.node).map_err(Status::invalid_argument)?;
 
+        // Resolve the target agent address BEFORE creating the step: an unregistered node returns a
+        // retryable Unavailable and the client retries the whole call, so resolving first keeps a
+        // failed attempt from leaking a step per retry.
+        let node = self.cluster.get_node(target_node).ok_or_else(|| {
+            Status::unavailable(format!("node {target_node} is not currently registered"))
+        })?;
+        let host = node.address.as_deref().unwrap_or(&node.name);
+        let node_addr = format!("{}:{}", host, node.port);
+
         let existing_steps = self.cluster.get_steps(job_id);
         let step_id = existing_steps
             .iter()
@@ -1249,12 +1258,6 @@ impl SlurmController for ControllerService {
         self.cluster
             .create_step(step)
             .map_err(|e| Status::internal(format!("failed to create job step: {e}")))?;
-
-        let node = self.cluster.get_node(target_node).ok_or_else(|| {
-            Status::unavailable(format!("node {target_node} is not currently registered"))
-        })?;
-        let host = node.address.as_deref().unwrap_or(&node.name);
-        let node_addr = format!("{}:{}", host, node.port);
 
         Ok(Response::new(CreateJobStepResponse { step_id, node_addr }))
     }
@@ -2453,6 +2456,127 @@ mod tests {
 
         let status = submit_rpc_status(SubmitError::internal("raft propose failed"));
         assert_eq!(status.code(), Code::Internal);
+    }
+
+    fn step_test_config() -> spur_core::config::SlurmConfig {
+        spur_core::config::SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n\
+             [controller]\nfirst_job_id = 1\n\
+             [[partitions]]\nname = \"default\"\ndefault = true\nnodes = \"ALL\"\n",
+        )
+        .unwrap()
+    }
+
+    async fn test_service(dir: &tempfile::TempDir) -> ControllerService {
+        use crate::cluster::ClusterManager;
+        let cluster =
+            std::sync::Arc::new(ClusterManager::new(step_test_config(), dir.path()).unwrap());
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cluster.clone())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .unwrap();
+        cluster.set_raft(handle.raft.clone());
+        let raft = std::sync::Arc::new(handle);
+        ControllerService {
+            cluster,
+            raft: raft.clone(),
+            leader_proxy: LeaderProxy::new(raft, BTreeMap::new()),
+            client_addrs: BTreeMap::new(),
+            rpc_stats: std::sync::Arc::new(RpcStatsCollector::new()),
+            sched_stats: std::sync::Arc::new(SchedStatsCollector::new("backfill")),
+        }
+    }
+
+    // A step must NOT be created when the target node is allocated but unregistered: address
+    // resolution runs first and returns a retryable Unavailable, so the client's retries can't
+    // each leak a step.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_job_step_unregistered_target_creates_no_step() {
+        use spur_core::resource::{ResourceAllocations, ResourceSet};
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        svc.cluster
+            .register_node(
+                "n1".into(),
+                ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                std::collections::HashMap::new(),
+            )
+            .unwrap();
+        for _ in 0..200 {
+            if svc.cluster.get_node("n1").is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let mut spec = spur_core::job::JobSpec {
+            name: "leak".into(),
+            user: "u".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        spec.srun_job = true;
+        let job_id = svc.cluster.submit_job(spec).unwrap();
+        // Allocate to a real node plus a ghost node that is never registered.
+        let res = ResourceAllocations::with_scalar(2, 4000);
+        let per_node: std::collections::HashMap<_, _> = [
+            ("n1".to_string(), res.clone()),
+            ("ghost".to_string(), res.clone()),
+        ]
+        .into_iter()
+        .collect();
+        svc.cluster
+            .start_job(job_id, vec!["n1".into(), "ghost".into()], res, per_node)
+            .unwrap();
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).map(|j| j.state) == Some(JobState::Running) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let steps_before = svc.cluster.get_steps(job_id).len();
+        // Simulate the client's retry loop: each attempt returns retryable Unavailable and must
+        // leave the step count unchanged (the pre-fix bug created one step per attempt).
+        for _ in 0..5 {
+            let err = svc
+                .create_job_step(Request::new(CreateJobStepRequest {
+                    job_id,
+                    command: vec!["hostname".into()],
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    overlap: true,
+                    pty: true,
+                    winsize: None,
+                    node: "ghost".into(),
+                }))
+                .await
+                .expect_err("unregistered target must fail");
+            assert_eq!(err.code(), Code::Unavailable);
+        }
+        assert_eq!(
+            svc.cluster.get_steps(job_id).len(),
+            steps_before,
+            "no step should be created when the target node is unregistered"
+        );
     }
 
     #[test]
