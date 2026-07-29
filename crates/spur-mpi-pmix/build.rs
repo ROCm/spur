@@ -3,21 +3,17 @@
 
 use std::path::{Path, PathBuf};
 
-fn release_target_dir() -> PathBuf {
-    let base = std::env::var("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
-                .join("../../target")
-        });
-    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
-    let mut dir = base.join(profile);
-    if let (Ok(target), Ok(host)) = (std::env::var("TARGET"), std::env::var("HOST")) {
-        if target != host {
-            dir = dir.join(target);
+/// Profile output dir derived from `OUT_DIR` so it honors `--target-dir`
+/// (e.g. `cargo llvm-cov`) instead of a guessed path that need not exist.
+fn profile_target_dir(out_dir: &Path) -> Option<PathBuf> {
+    let mut dir = out_dir;
+    while let Some(parent) = dir.parent() {
+        if parent.file_name().is_some_and(|n| n == "build") {
+            return parent.parent().map(Path::to_path_buf);
         }
+        dir = parent;
     }
-    dir
+    None
 }
 
 fn pkg_config_link_other(lib: &str) -> Vec<String> {
@@ -44,7 +40,6 @@ fn copy_plugin(
 ) {
     let archive = out_dir.join(format!("lib{archive_name}.a"));
     let built = out_dir.join("libspur_mpi_pmix.so");
-    let target_dir = release_target_dir();
 
     let mut cmd = cc::Build::new().get_compiler().to_command();
     cmd.arg("-shared").arg("-o").arg(&built).arg(format!(
@@ -65,10 +60,20 @@ fn copy_plugin(
         panic!("failed to link {built:?}");
     }
 
-    let release_lib = target_dir.join("libspur_mpi_pmix.so");
-    let plugin_name = target_dir.join("spur_mpi_pmix.so");
-    std::fs::copy(&built, &release_lib).expect("copy libspur_mpi_pmix.so to target dir");
-    std::fs::copy(&built, &plugin_name).expect("copy spur_mpi_pmix.so to target dir");
+    // Release-only, best-effort: place the plugin next to the release binaries
+    // for packaging/e2e without dropping uninstrumented .so where llvm-cov scans.
+    if std::env::var("PROFILE").as_deref() != Ok("release") {
+        return;
+    }
+    let Some(target_dir) = profile_target_dir(out_dir) else {
+        println!("cargo:warning=could not locate profile dir from OUT_DIR {out_dir:?}; plugin not staged");
+        return;
+    };
+    for name in ["libspur_mpi_pmix.so", "spur_mpi_pmix.so"] {
+        if let Err(e) = std::fs::copy(&built, target_dir.join(name)) {
+            println!("cargo:warning=failed to stage {name} into {target_dir:?}: {e}");
+        }
+    }
 }
 
 fn main() {
