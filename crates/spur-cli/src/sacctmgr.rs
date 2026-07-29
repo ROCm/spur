@@ -730,6 +730,8 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
 
     match entity.to_lowercase().as_str() {
         "account" | "accounts" => {
+            let fields = account_format_fields(p.get("format").map(String::as_str))?;
+
             let mut client = connect(addr).await?;
             let resp = client
                 .list_accounts(ListAccountsRequest {})
@@ -738,34 +740,13 @@ async fn show(entity: &str, params: &[String], addr: &str) -> Result<()> {
 
             let accounts = resp.into_inner().accounts;
 
-            println!(
-                "{:<20} {:<30} {:<15} {:<10} {:<10} {:<10}",
-                "Account", "Descr", "Org", "Parent", "Share", "GrpTRES"
-            );
-            println!("{}", "-".repeat(100));
+            format_engine::print_header(&fields);
 
-            if accounts.is_empty() {
+            for a in &accounts {
                 println!(
-                    "{:<20} {:<30} {:<15} {:<10} {:<10} {:<10}",
-                    "(no accounts configured)", "", "", "", "", ""
+                    "{}",
+                    format_engine::format_row(&fields, &|spec| resolve_account_field(a, spec))
                 );
-            } else {
-                for a in &accounts {
-                    let parent = if a.parent_account.is_empty() {
-                        ""
-                    } else {
-                        &a.parent_account
-                    };
-                    println!(
-                        "{:<20} {:<30} {:<15} {:<10} {:<10} {:<10}",
-                        a.name,
-                        a.description,
-                        a.organization,
-                        parent,
-                        a.fairshare_weight as u32,
-                        a.grp_tres,
-                    );
-                }
             }
             Ok(())
         }
@@ -883,6 +864,73 @@ fn filter_qos_by_name(qos_list: &mut Vec<QosInfo>, filter: &str) {
     qos_list.retain(|q| names.iter().any(|n| n.eq_ignore_ascii_case(&q.name)));
 }
 
+const ACCOUNT_DEFAULT_FORMAT: &str = "%-20N %-30D %-15O %-10P %-10S %-10G";
+
+const ACCOUNT_ALL_FORMAT: &str = "%-20N %-30D %-15O %-10P %-10S %-10G %-10J";
+
+fn account_header(spec: char) -> &'static str {
+    match spec {
+        'N' => "Account",
+        'D' => "Descr",
+        'O' => "Org",
+        'P' => "Parent",
+        'S' => "Share",
+        'G' => "GrpTRES",
+        'J' => "MaxJobs",
+        _ => "?",
+    }
+}
+
+fn account_field_spec(name: &str) -> Option<char> {
+    match name.to_lowercase().as_str() {
+        "account" | "name" => Some('N'),
+        "description" | "descr" => Some('D'),
+        "organization" | "org" => Some('O'),
+        "parent" | "parentaccount" => Some('P'),
+        "share" | "fairshare" | "fairshareweight" => Some('S'),
+        "grptres" => Some('G'),
+        "maxjobs" | "maxrunningjobs" => Some('J'),
+        _ => None,
+    }
+}
+
+/// Resolve `show account` output columns from an optional `format=` param. Shared by the handler
+/// and its tests so the default/all formats and the valid-field hint stay in one place.
+fn account_format_fields(
+    format_param: Option<&str>,
+) -> anyhow::Result<Vec<format_engine::FormatToken>> {
+    format_engine::resolve_format(
+        format_param,
+        ACCOUNT_DEFAULT_FORMAT,
+        ACCOUNT_ALL_FORMAT,
+        &account_field_spec,
+        &account_header,
+        "Account, Descr, Org, Parent, Share, GrpTRES, MaxJobs",
+    )
+}
+
+/// Render a numeric limit, blank when zero (Slurm shows "unlimited" as an empty cell).
+fn blank_if_zero(v: u32) -> String {
+    if v == 0 {
+        String::new()
+    } else {
+        v.to_string()
+    }
+}
+
+fn resolve_account_field(a: &AccountInfo, spec: char) -> String {
+    match spec {
+        'N' => a.name.clone(),
+        'D' => a.description.clone(),
+        'O' => a.organization.clone(),
+        'P' => a.parent_account.clone(),
+        'S' => (a.fairshare_weight as u32).to_string(),
+        'G' => a.grp_tres.clone(),
+        'J' => blank_if_zero(a.max_running_jobs),
+        _ => "?".into(),
+    }
+}
+
 const QOS_DEFAULT_FORMAT: &str = "%-15N %-8p %-10P %-12U %-10J %-10S %-10W %-10w %-20T %-20V %-20G";
 
 const QOS_ALL_FORMAT: &str =
@@ -934,34 +982,10 @@ fn resolve_qos_field(q: &QosInfo, spec: char) -> String {
         'G' => q.grp_tres.clone(),
         'T' => q.max_tres_per_job.clone(),
         'V' => q.max_tres_per_user.clone(),
-        'J' => {
-            if q.max_jobs_per_user == 0 {
-                String::new()
-            } else {
-                q.max_jobs_per_user.to_string()
-            }
-        }
-        'S' => {
-            if q.max_submit_jobs_per_user == 0 {
-                String::new()
-            } else {
-                q.max_submit_jobs_per_user.to_string()
-            }
-        }
-        'W' => {
-            if q.max_wall_minutes == 0 {
-                String::new()
-            } else {
-                q.max_wall_minutes.to_string()
-            }
-        }
-        'w' => {
-            if q.grp_wall_minutes == 0 {
-                String::new()
-            } else {
-                q.grp_wall_minutes.to_string()
-            }
-        }
+        'J' => blank_if_zero(q.max_jobs_per_user),
+        'S' => blank_if_zero(q.max_submit_jobs_per_user),
+        'W' => blank_if_zero(q.max_wall_minutes),
+        'w' => blank_if_zero(q.grp_wall_minutes),
         _ => "?".into(),
     }
 }
@@ -1647,5 +1671,143 @@ mod tests {
 
         assert!(account.is_empty());
         assert_eq!(user, "testuser");
+    }
+
+    fn stub_account() -> AccountInfo {
+        AccountInfo {
+            name: "physics".into(),
+            description: "Physics dept".into(),
+            organization: "sciences".into(),
+            parent_account: "root".into(),
+            fairshare_weight: 5.0,
+            max_running_jobs: 10,
+            grp_tres: "node=4,cpu=256".into(),
+        }
+    }
+
+    #[test]
+    fn account_named_format_selects_and_orders_fields() {
+        let fields = format_engine::parse_named_format(
+            "Account,GrpTRES",
+            &account_field_spec,
+            &account_header,
+        );
+        let specs: Vec<char> = fields
+            .iter()
+            .filter_map(|t| match t {
+                format_engine::FormatToken::Field(f) => Some(f.spec),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(specs, vec!['N', 'G']);
+
+        let a = stub_account();
+        let row = format_engine::format_row(&fields, &|spec| resolve_account_field(&a, spec));
+        assert!(row.contains("physics"), "Account missing: {row}");
+        assert!(row.contains("node=4,cpu=256"), "GrpTRES missing: {row}");
+        assert!(
+            !row.contains("Physics dept"),
+            "Descr should be absent: {row}"
+        );
+    }
+
+    #[test]
+    fn account_format_reorders_columns() {
+        let fields = format_engine::parse_named_format(
+            "GrpTRES,Account",
+            &account_field_spec,
+            &account_header,
+        );
+        let header = format_engine::format_header(&fields);
+        let grp = header.find("GrpTRES").expect("GrpTRES header");
+        let acct = header.find("Account").expect("Account header");
+        assert!(grp < acct, "GrpTRES should precede Account: {header}");
+    }
+
+    #[test]
+    fn account_default_format_matches_legacy_columns() {
+        let fields = format_engine::parse_format(ACCOUNT_DEFAULT_FORMAT, &account_header);
+        let header = format_engine::format_header(&fields);
+        for col in ["Account", "Descr", "Org", "Parent", "Share", "GrpTRES"] {
+            assert!(
+                header.contains(col),
+                "default header missing {col}: {header}"
+            );
+        }
+    }
+
+    #[test]
+    fn account_all_format_includes_maxjobs() {
+        let fields = format_engine::parse_format(ACCOUNT_ALL_FORMAT, &account_header);
+        let header = format_engine::format_header(&fields);
+        assert!(header.contains("MaxJobs"), "all header: {header}");
+    }
+
+    #[test]
+    fn account_field_spec_aliases_are_case_insensitive() {
+        assert_eq!(account_field_spec("account"), account_field_spec("Name"));
+        assert_eq!(
+            account_field_spec("org"),
+            account_field_spec("Organization")
+        );
+        assert_eq!(
+            account_field_spec("parent"),
+            account_field_spec("ParentAccount")
+        );
+        assert_eq!(account_field_spec("share"), account_field_spec("FairShare"));
+    }
+
+    #[test]
+    fn account_field_spec_rejects_unknown_names() {
+        assert_eq!(account_field_spec("bogus"), None);
+        assert_eq!(account_field_spec(""), None);
+    }
+
+    #[test]
+    fn account_resolve_zero_maxjobs_is_blank() {
+        let a = AccountInfo {
+            max_running_jobs: 0,
+            ..stub_account()
+        };
+        assert_eq!(resolve_account_field(&a, 'J'), "");
+    }
+
+    #[test]
+    fn account_resolve_nonzero_maxjobs_renders_value() {
+        let a = AccountInfo {
+            max_running_jobs: 10,
+            ..stub_account()
+        };
+        assert_eq!(resolve_account_field(&a, 'J'), "10");
+    }
+
+    #[test]
+    fn account_resolve_unknown_spec_is_visible_marker() {
+        // A header spec missing a resolver renders "?" (not a silently blank column).
+        assert_eq!(resolve_account_field(&stub_account(), 'Z'), "?");
+    }
+
+    #[test]
+    fn account_resolve_format_all_expands_to_all_columns() {
+        let fields = account_format_fields(Some("all")).unwrap();
+        let header = format_engine::format_header(&fields);
+        assert!(header.contains("MaxJobs"), "all header: {header}");
+        assert!(header.contains("GrpTRES"), "all header: {header}");
+    }
+
+    #[test]
+    fn account_resolve_format_unknown_field_errors() {
+        assert!(account_format_fields(Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn account_resolve_format_none_uses_default() {
+        let fields = account_format_fields(None).unwrap();
+        let header = format_engine::format_header(&fields);
+        assert!(header.contains("Account"), "default header: {header}");
+        assert!(
+            !header.contains("MaxJobs"),
+            "default should omit MaxJobs: {header}"
+        );
     }
 }
