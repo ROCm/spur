@@ -43,6 +43,10 @@ pub struct SrunArgs {
     #[arg(short = 'n', long)]
     pub ntasks: Option<u32>,
 
+    /// Tasks per node
+    #[arg(long, overrides_with = "ntasks_per_node")]
+    pub ntasks_per_node: Option<u32>,
+
     /// CPUs per task
     #[arg(short = 'c', long, default_value = "1")]
     pub cpus_per_task: u32,
@@ -559,7 +563,8 @@ fn build_srun_job_spec(
         uid: nix::unistd::getuid().as_raw(),
         gid: nix::unistd::getgid().as_raw(),
         num_nodes: args.nodes,
-        num_tasks: crate::sbatch::effective_ntasks(args.ntasks, None, args.nodes),
+        num_tasks: crate::sbatch::effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
+        tasks_per_node: args.ntasks_per_node.unwrap_or(0),
         cpus_per_task: args.cpus_per_task,
         memory_per_node_mb: memory_mb,
         gres,
@@ -708,7 +713,7 @@ async fn dispatch_step(
     let work_dir = params.work_dir;
     let io = params.io;
     let step_mpi = params.mpi;
-    let ntasks = crate::sbatch::effective_ntasks(args.ntasks, None, args.nodes);
+    let ntasks = crate::sbatch::effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes);
     let step_id = client
         .create_job_step(CreateJobStepRequest {
             job_id,
@@ -1515,6 +1520,49 @@ mod tests {
         assert!(spec.script.contains("hostname"));
     }
 
+    /// Launchers like PRTE's `plm:slurm` always pass `--ntasks-per-node`, so
+    /// srun must accept both spellings rather than rejecting the command line.
+    #[test]
+    fn parses_ntasks_per_node() {
+        let eq = SrunArgs::try_parse_from(["srun", "--ntasks-per-node=1", "hostname"])
+            .expect("parse --ntasks-per-node=N");
+        assert_eq!(eq.ntasks_per_node, Some(1));
+
+        let spaced = SrunArgs::try_parse_from(["srun", "--ntasks-per-node", "8", "hostname"])
+            .expect("parse --ntasks-per-node N");
+        assert_eq!(spaced.ntasks_per_node, Some(8));
+
+        let absent = SrunArgs::try_parse_from(["srun", "hostname"]).expect("parse");
+        assert!(absent.ntasks_per_node.is_none());
+    }
+
+    #[test]
+    fn build_srun_job_spec_sets_tasks_per_node() {
+        let args = SrunArgs::try_parse_from(["srun", "--ntasks-per-node=4", "hostname"])
+            .expect("parse failed");
+        let io = ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        };
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
+        assert_eq!(spec.tasks_per_node, 4);
+    }
+
+    #[test]
+    fn build_srun_job_spec_tasks_per_node_defaults_zero() {
+        let args = SrunArgs::try_parse_from(["srun", "hostname"]).expect("parse failed");
+        let io = ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        };
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
+        assert_eq!(spec.tasks_per_node, 0);
+    }
+
     #[test]
     fn build_srun_job_spec_ntasks_defaults_to_node_count() {
         let args = SrunArgs::try_parse_from(["srun", "-N", "4", "hostname"]).expect("parse");
@@ -1907,6 +1955,66 @@ mod tests {
             .expect("parse failed");
         let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
         assert!(resolve_srun_env(&matches, &mut args).is_err());
+    }
+
+    /// `--ntasks-per-node` sizes the job when `-n` is absent:
+    /// `srun --ntasks-per-node=1 -N 4` launches one task per node.
+    #[test]
+    #[serial(env_injection)]
+    fn ntasks_per_node_scales_task_count() {
+        let _env = EnvGuard::new();
+        let args = resolve_from(&["srun", "-N", "4", "--ntasks-per-node=1", "hostname"]);
+        assert_eq!(args.ntasks, None);
+        assert_eq!(args.ntasks_per_node, Some(1));
+        assert_eq!(
+            crate::sbatch::effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
+            4
+        );
+
+        let multi = resolve_from(&["srun", "-N", "2", "--ntasks-per-node=8", "hostname"]);
+        assert_eq!(
+            crate::sbatch::effective_ntasks(multi.ntasks, multi.ntasks_per_node, multi.nodes),
+            16
+        );
+
+        // Zero per-node is treated as unset, so the count falls back to nodes.
+        let zero = resolve_from(&["srun", "-N", "4", "--ntasks-per-node=0", "hostname"]);
+        assert_eq!(
+            crate::sbatch::effective_ntasks(zero.ntasks, zero.ntasks_per_node, zero.nodes),
+            4
+        );
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn explicit_ntasks_overrides_ntasks_per_node() {
+        let env = EnvGuard::new();
+        let cli = resolve_from(&[
+            "srun",
+            "-N",
+            "4",
+            "--ntasks-per-node=8",
+            "-n",
+            "3",
+            "hostname",
+        ]);
+        assert_eq!(
+            crate::sbatch::effective_ntasks(cli.ntasks, cli.ntasks_per_node, cli.nodes),
+            3
+        );
+
+        // An inherited allocation task count is a direct request, so it wins
+        // over the per-node derivation.
+        env.set("SLURM_NTASKS", "5");
+        let inherited = resolve_from(&["srun", "-N", "4", "--ntasks-per-node=8", "hostname"]);
+        assert_eq!(
+            crate::sbatch::effective_ntasks(
+                inherited.ntasks,
+                inherited.ntasks_per_node,
+                inherited.nodes
+            ),
+            5
+        );
     }
 
     /// Allocation context is exported under the `*_JOB_*` names
