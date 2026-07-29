@@ -38,6 +38,10 @@ pub enum WalOperation {
         /// Computed on the leader so every replica applies the same instant.
         #[serde(default)]
         begin_time: Option<chrono::DateTime<chrono::Utc>>,
+        /// Slurm's `state_desc`, travelling with `pending_reason` so both fields
+        /// land together on every replica.
+        #[serde(default)]
+        pending_reason_desc: Option<String>,
     },
     JobStart {
         job_id: JobId,
@@ -212,6 +216,7 @@ impl WalOperation {
             pending_reason: None,
             pending_priority: None,
             begin_time: None,
+            pending_reason_desc: None,
         }
     }
 
@@ -228,6 +233,26 @@ impl WalOperation {
             pending_reason: Some(reason),
             pending_priority: Some(0),
             begin_time: None,
+            pending_reason_desc: None,
+        }
+    }
+
+    /// As [`Self::job_state_change_held_pending`], with a `state_desc` that says
+    /// more about the hold than its reason code can.
+    pub fn job_state_change_held_pending_desc(
+        job_id: JobId,
+        old_state: JobState,
+        reason: PendingReason,
+        desc: impl Into<String>,
+    ) -> Self {
+        Self::JobStateChange {
+            job_id,
+            old_state,
+            new_state: JobState::Pending,
+            pending_reason: Some(reason),
+            pending_priority: Some(0),
+            begin_time: None,
+            pending_reason_desc: Some(desc.into()),
         }
     }
 
@@ -246,6 +271,7 @@ impl WalOperation {
             pending_reason: Some(reason),
             pending_priority: None,
             begin_time: Some(begin_time),
+            pending_reason_desc: None,
         }
     }
 
@@ -288,6 +314,7 @@ mod job_state_change_wal_tests {
                 pending_reason,
                 pending_priority,
                 begin_time,
+                pending_reason_desc,
             } => {
                 assert_eq!(job_id, 1);
                 assert_eq!(old_state, JobState::Preempted);
@@ -295,6 +322,67 @@ mod job_state_change_wal_tests {
                 assert_eq!(pending_reason, Some(PendingReason::JobHoldMaxRequeue));
                 assert_eq!(pending_priority, Some(0));
                 assert_eq!(begin_time, None, "a max-requeue hold has no begin_time");
+                assert_eq!(pending_reason_desc, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn a_held_pending_hold_carries_its_description_to_every_replica() {
+        // The reason and its description must travel in one entry: a follower
+        // that applied only the reason would report a bare JobHeldUser and lose
+        // why the job is parked.
+        let op = WalOperation::job_state_change_held_pending_desc(
+            9,
+            JobState::Failed,
+            PendingReason::Held,
+            "launch failed requeued held",
+        );
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobStateChange {
+                new_state,
+                pending_reason,
+                pending_priority,
+                pending_reason_desc,
+                ..
+            } => {
+                assert_eq!(new_state, JobState::Pending);
+                assert_eq!(pending_reason, Some(PendingReason::Held));
+                assert_eq!(pending_priority, Some(0));
+                assert_eq!(
+                    pending_reason_desc.as_deref(),
+                    Some("launch failed requeued held")
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn a_state_change_written_before_the_description_field_still_replays() {
+        // Pre-upgrade WAL entries have no pending_reason_desc key at all.
+        let op =
+            WalOperation::job_state_change_held_pending(3, JobState::Running, PendingReason::Held);
+        let mut value = serde_json::to_value(&op).unwrap();
+        value["JobStateChange"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pending_reason_desc")
+            .expect("the field must be written, so removing it models an old entry");
+
+        let back: WalOperation =
+            serde_json::from_value(value).expect("old entries must still replay");
+        match back {
+            WalOperation::JobStateChange {
+                pending_reason,
+                pending_reason_desc,
+                ..
+            } => {
+                assert_eq!(pending_reason, Some(PendingReason::Held));
+                assert_eq!(pending_reason_desc, None);
             }
             _ => panic!("wrong variant"),
         }

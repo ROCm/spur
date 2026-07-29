@@ -39,6 +39,27 @@ use crate::limits_cache::QosCache;
 use crate::raft::{ClientResponse, JobFinalized, SpurRaft, StateMachineApply};
 use crate::sched_stats::SchedStatsCollector;
 
+/// Description shown for a job parked after a launch failure it would carry to
+/// the next node. Byte-exact with the `state_desc` Slurm sets in the same case,
+/// so operator runbooks and log greps written against Slurm keep working.
+pub const LAUNCH_FAILURE_HELD_DESC: &str = "launch failed requeued held";
+
+/// Seconds to defer a job by after its `requeue_count`-th launch failure.
+///
+/// Doubles per attempt from the same base the preemption requeue uses (two
+/// scheduler cycles plus slack), capped by `max_launch_backoff_secs`. The shift
+/// is clamped because `max_batch_requeue` is operator-supplied and a large one
+/// would otherwise overflow it; the cap makes the clamped value indistinguishable
+/// from the exact one anyway. Config validation rejects a cap above the ceiling,
+/// but an unvalidated config must degrade rather than push the computed instant
+/// out of chrono's range and panic the controller.
+fn launch_backoff_secs(interval_secs: u32, cap: u64, requeue_count: u32) -> u64 {
+    let base = (interval_secs as u64 * 2 + 3).max(5);
+    base.saturating_mul(1u64 << requeue_count.min(16))
+        .min(cap)
+        .min(spur_core::config::MAX_LAUNCH_BACKOFF_SECS)
+}
+
 /// Result of recording a per-node completion report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeCompleteResult {
@@ -614,7 +635,7 @@ impl ClusterManager {
             // Record the reason before the terminal transition so any
             // observer (history, audit log, late `squeue` poll) sees DeadLine
             // instead of whatever update_pending_reasons last wrote.
-            job.pending_reason = PendingReason::DeadLine;
+            job.set_pending_reason(PendingReason::DeadLine);
         }
 
         let resp = self.propose(WalOperation::JobComplete {
@@ -1122,7 +1143,7 @@ impl ClusterManager {
     /// Requeue a job if spec.requeue is set and attempt limit not exceeded.
     fn maybe_requeue(&self, job_id: JobId) -> anyhow::Result<()> {
         let max = self.config.controller.max_batch_requeue;
-        let (should_requeue, old_state) = {
+        let (old_state, backoff) = {
             let jobs = self.jobs.read();
             let Some(job) = jobs.get(&job_id) else {
                 return Ok(());
@@ -1140,19 +1161,32 @@ impl ClusterManager {
             if !job.spec.requeue {
                 return Ok(());
             }
-            (true, job.state)
+            // The eviction tagged the cause, so a launch failure gets the same
+            // backoff the all-nodes-failed path gets. Without it a job with one
+            // broken node in its allocation burns its whole requeue budget in
+            // seconds. Node health and timeout requeues keep today's immediate
+            // retry: the blocking condition is already gone by then.
+            let launch_failed = job.pending_reason == PendingReason::JobLaunchFailure;
+            (
+                job.state,
+                launch_failed.then(|| self.launch_backoff_until(job)),
+            )
         };
-        if !should_requeue {
-            return Ok(());
-        }
 
-        self.propose(WalOperation::job_state_change(
-            job_id,
-            old_state,
-            JobState::Pending,
-        ))?;
+        // Computed before the proposal so every replica applies one verbatim
+        // instant rather than reading its own clock.
+        let op = match backoff {
+            Some(hold) => WalOperation::job_state_change_backoff_pending(
+                job_id,
+                old_state,
+                PendingReason::JobLaunchFailure,
+                hold,
+            ),
+            None => WalOperation::job_state_change(job_id, old_state, JobState::Pending),
+        };
+        self.propose(op)?;
 
-        info!(job_id, from = %old_state, "job requeued");
+        info!(job_id, from = %old_state, hold_until = ?backoff, "job requeued");
         Ok(())
     }
 
@@ -1162,6 +1196,19 @@ impl ClusterManager {
     /// (e.g., container image not found) so it can be retried after the
     /// user fixes the issue. (Issue #91)
     pub fn requeue_job(&self, job_id: JobId) -> anyhow::Result<()> {
+        self.requeue_after_launch_failure(job_id, false)
+    }
+
+    /// Requeue after a dispatch failure, optionally parking the job for an
+    /// operator instead of retrying it.
+    ///
+    /// `hold` is for failures the job carries with it, so a retry would fail the
+    /// same way on the next node and drain that one too. Such a job skips the
+    /// backoff and the requeue cap (neither means anything to a job that will
+    /// not retry on its own) and waits at priority 0 for `scontrol release`.
+    /// This is Slurm's prolog behavior, and the hold is what bounds the drain to
+    /// one node per failure.
+    pub fn requeue_after_launch_failure(&self, job_id: JobId, hold: bool) -> anyhow::Result<()> {
         let (old_state, begin_time) = {
             let jobs = self.jobs.read();
             let Some(job) = jobs.get(&job_id) else {
@@ -1170,20 +1217,20 @@ impl ClusterManager {
             if job.state.is_terminal() {
                 return Ok(());
             }
+            if !hold && job.requeue_count >= self.config.controller.max_batch_requeue {
+                drop(jobs);
+                return self.hold_job_at_max_requeue(job_id);
+            }
             // A job that never reached Running has nothing to requeue: Pending ->
             // Failed is not a legal transition and Pending -> Pending applies as a
             // NoOp, so both proposals below would be discarded and the hold lost.
             // Callers that fail before dispatch fall to the next scheduler tick.
             if job.state == JobState::Pending {
-                warn!(
+                debug!(
                     job_id,
                     "requeue requested for a job that never started; no backoff hold applied"
                 );
                 return Ok(());
-            }
-            if job.requeue_count >= self.config.controller.max_batch_requeue {
-                drop(jobs);
-                return self.hold_job_at_max_requeue(job_id);
             }
             (job.state, self.launch_backoff_until(job))
         };
@@ -1195,6 +1242,17 @@ impl ClusterManager {
             exit_code: -1,
             state: JobState::Failed,
         })?;
+
+        if hold {
+            self.propose(WalOperation::job_state_change_held_pending_desc(
+                job_id,
+                JobState::Failed,
+                PendingReason::Held,
+                LAUNCH_FAILURE_HELD_DESC,
+            ))?;
+            info!(job_id, from = %old_state, "job requeued and held after launch failure");
+            return Ok(());
+        }
 
         // Failed → Pending resets allocation fields and makes the job
         // schedulable again, but only once the backoff hold lapses: without it
@@ -1213,21 +1271,15 @@ impl ClusterManager {
 
     /// Instant until which a job requeued after a launch failure is held.
     ///
-    /// Doubles per attempt from the same base the preemption requeue uses (two
-    /// scheduler cycles plus slack), capped by `max_launch_backoff_secs`. A user
-    /// `--begin` further out always wins, so the hold never shortens a
+    /// A user `--begin` further out always wins, so the hold never shortens a
     /// user-supplied constraint. Computed on the leader so every replica applies
     /// one verbatim instant rather than reading its own clock.
     fn launch_backoff_until(&self, job: &Job) -> DateTime<Utc> {
-        let base = (self.config.scheduler.interval_secs as u64 * 2 + 3).max(5);
-        let cap = self.config.controller.max_launch_backoff_secs;
-        // Config validation rejects a cap above the ceiling; clamping again here
-        // keeps an unvalidated config from overflowing the instant below, which
-        // would panic the controller rather than degrade.
-        let hold_secs = base
-            .saturating_mul(1u64 << job.requeue_count.min(16))
-            .min(cap)
-            .min(spur_core::config::MAX_LAUNCH_BACKOFF_SECS);
+        let hold_secs = launch_backoff_secs(
+            self.config.scheduler.interval_secs,
+            self.config.controller.max_launch_backoff_secs,
+            job.requeue_count,
+        );
         let hold = Utc::now() + chrono::Duration::seconds(hold_secs as i64);
         job.spec.begin_time.map_or(hold, |user| user.max(hold))
     }
@@ -2288,7 +2340,7 @@ impl ClusterManager {
             }
             if let Some(job) = jobs.get_mut(id) {
                 job.bb_stage_state = BbStageState::Staging;
-                job.pending_reason = PendingReason::BurstBufferStageIn;
+                job.set_pending_reason(PendingReason::BurstBufferStageIn);
                 remaining = remaining.saturating_sub(req);
                 started.push(*id);
             }
@@ -2337,7 +2389,7 @@ impl ClusterManager {
             if job.state == JobState::Pending && job.bb_stage_state == BbStageState::Staging {
                 job.bb_stage_state = BbStageState::Ready;
                 if job.pending_reason == PendingReason::BurstBufferStageIn {
-                    job.pending_reason = PendingReason::None;
+                    job.set_pending_reason(PendingReason::None);
                 }
                 self.scheduler_notify.notify_one();
                 return true;
@@ -2402,7 +2454,7 @@ impl ClusterManager {
                         && j.pending_reason != PendingReason::DeadLine
                         && !j.reason_explains_begin_hold(Utc::now())
                     {
-                        j.pending_reason = PendingReason::Dependency;
+                        j.set_pending_reason(PendingReason::Dependency);
                     }
                 }
             }
@@ -2460,7 +2512,7 @@ impl ClusterManager {
                     && j.pending_reason != PendingReason::DeadLine
                     && !j.reason_explains_begin_hold(now)
                 {
-                    j.pending_reason = reason;
+                    j.set_pending_reason(reason);
                 }
             }
         }
@@ -2737,7 +2789,7 @@ impl ClusterManager {
                 continue;
             }
             job.priority = 0;
-            job.pending_reason = PendingReason::ReservationDeleted;
+            job.set_pending_reason(PendingReason::ReservationDeleted);
         }
     }
 
@@ -2751,7 +2803,7 @@ impl ClusterManager {
             }
             job.spec.reservation = None;
             if job.pending_reason == PendingReason::ReservationDeleted {
-                job.pending_reason = PendingReason::None;
+                job.set_pending_reason(PendingReason::None);
             }
         }
     }
@@ -2843,7 +2895,7 @@ impl ClusterManager {
             }
 
             if let Some(reason) = reservation_fence_reason(job, cluster_state) {
-                job_entry.pending_reason = reason;
+                job_entry.set_pending_reason(reason);
                 continue;
             }
 
@@ -2869,7 +2921,7 @@ impl ClusterManager {
                             || !node.can_satisfy_request(&required))
                 })
             {
-                job_entry.pending_reason = PendingReason::ReqNodeNotAvail;
+                job_entry.set_pending_reason(PendingReason::ReqNodeNotAvail);
                 continue;
             }
 
@@ -2881,7 +2933,7 @@ impl ClusterManager {
                     .filter(|n| placement.in_partition(n))
                     .count();
 
-                job_entry.pending_reason = if needed > partition_size {
+                job_entry.set_pending_reason(if needed > partition_size {
                     PendingReason::PartitionNodeLimit
                 } else if job.spec.constraint.is_some() && eligible.is_empty() {
                     PendingReason::BadConstraints
@@ -2891,7 +2943,7 @@ impl ClusterManager {
                     PendingReason::ReqNodeNotAvail
                 } else {
                     PendingReason::Resources
-                };
+                });
                 continue;
             }
 
@@ -2899,12 +2951,13 @@ impl ClusterManager {
             // `Allocated` cluster out of NodeDown; a nodelist pin to down nodes
             // is ReqNodeNotAvail (Slurm parity).
             if eligible.iter().all(|n| !n.state.is_up()) {
-                job_entry.pending_reason =
+                job_entry.set_pending_reason(
                     if job.spec.nodelist.as_deref().is_some_and(|s| !s.is_empty()) {
                         PendingReason::ReqNodeNotAvail
                     } else {
                         PendingReason::NodeDown
-                    };
+                    },
+                );
                 continue;
             }
 
@@ -2923,11 +2976,11 @@ impl ClusterManager {
                 })
                 .count();
 
-            job_entry.pending_reason = if free_now < needed {
+            job_entry.set_pending_reason(if free_now < needed {
                 PendingReason::Resources
             } else {
                 PendingReason::Priority
-            };
+            });
         }
     }
 
@@ -3139,7 +3192,7 @@ impl ClusterManager {
         job.allocated_nodes.clear();
         job.allocated_resources = None;
         job.per_node_alloc.clear();
-        job.pending_reason = PendingReason::None;
+        job.set_pending_reason(PendingReason::None);
         // Stale after requeue (points at nodes the job left); next dispatch resets it.
         job.actual_stdout_path = None;
         job.actual_stderr_path = None;
@@ -3183,7 +3236,7 @@ impl ClusterManager {
         }
         job.exit_code = Some(-1);
         job.end_time = Some(timestamp);
-        job.pending_reason = reason;
+        job.set_pending_reason(reason);
         let already_deallocated: Vec<String> = job.node_completions.keys().cloned().collect();
         job.node_completions.clear();
 
@@ -3288,6 +3341,7 @@ impl ClusterManager {
                 pending_reason,
                 pending_priority,
                 begin_time,
+                pending_reason_desc,
                 ..
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
@@ -3307,7 +3361,11 @@ impl ClusterManager {
                         } else {
                             Self::clear_run_state_for_requeue(job);
                         }
-                        job.pending_reason = pending_reason.clone().unwrap_or(PendingReason::None);
+                        let reason = pending_reason.clone().unwrap_or(PendingReason::None);
+                        match pending_reason_desc {
+                            Some(desc) => job.set_pending_reason_desc(reason, desc.clone()),
+                            None => job.set_pending_reason(reason),
+                        }
                         if let Some(priority) = pending_priority {
                             job.priority = *priority;
                         }
@@ -3353,7 +3411,7 @@ impl ClusterManager {
                     }
                     Self::reset_job_for_preempt_requeue(job);
                     job.spec.begin_time = Some(*begin_time);
-                    job.pending_reason = PendingReason::BeginTime;
+                    job.set_pending_reason(PendingReason::BeginTime);
                 }
                 if let Some(ref total) = allocated_resources {
                     let node_count = freed_nodes.len().max(1) as u32;
@@ -3442,7 +3500,7 @@ impl ClusterManager {
                     job.allocated_nodes = node_names.clone();
                     job.allocated_resources = Some(resources.clone());
                     job.per_node_alloc = per_node_alloc.clone();
-                    job.pending_reason = PendingReason::None;
+                    job.set_pending_reason(PendingReason::None);
                     job.srun_step_dispatch = *srun_step_dispatch;
                     job.run_attempt = *run_attempt;
                 }
@@ -3549,7 +3607,7 @@ impl ClusterManager {
                                 // steps, accumulated live by JobStepComplete; a
                                 // job with no srun steps keeps 0 (Slurm parity),
                                 // not the batch exit. Left as-is here.
-                                job.pending_reason = if oom {
+                                job.set_pending_reason(if oom {
                                     PendingReason::OutOfMemory
                                 } else if final_signal != 0 {
                                     PendingReason::RaisedSignal
@@ -3557,7 +3615,7 @@ impl ClusterManager {
                                     PendingReason::NonZeroExitCode
                                 } else {
                                     PendingReason::None
-                                };
+                                });
                                 job.end_time = Some(timestamp);
                                 job.node_completions.clear();
                                 Some((final_state, final_exit))
@@ -3733,7 +3791,7 @@ impl ClusterManager {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.priority = *new_priority;
                     if let Some(reason) = pending_reason {
-                        job.pending_reason = reason.clone();
+                        job.set_pending_reason(reason.clone());
                     }
                     if *reset_requeue_count {
                         job.requeue_count = 0;
@@ -6651,6 +6709,31 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_job_at_the_requeue_cap_is_held_not_ignored() {
+        // The cap has to be checked before the never-started bail-out. A job
+        // that exhausts its budget while Pending would otherwise be dropped on
+        // the floor and re-dispatched at full priority every scheduler tick.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let max = cm.config.controller.max_batch_requeue;
+
+        let job_id = submit_and_wait(&cm, basic_spec("pending-at-cap"));
+        cm.jobs.write().get_mut(&job_id).unwrap().requeue_count = max;
+
+        cm.requeue_job(job_id).unwrap();
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.pending_reason, PendingReason::JobHoldMaxRequeue);
+        assert_eq!(job.priority, 0, "a held job must not outrank live work");
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "the hold must take the job out of scheduling"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn draining_a_node_for_a_launch_failure_still_lets_the_job_requeue() {
         // The agent drains the node on a spool fault. That drain must not
         // finalize the job: it still has to reach Pending so the scheduler can
@@ -6711,18 +6794,46 @@ mod tests {
         assert_eq!(job.requeue_count, 0, "a terminal job is never retried");
     }
 
+    #[test]
+    fn the_backoff_doubles_each_attempt_up_to_the_cap() {
+        // The schedule itself, checked as arithmetic. With the default
+        // interval_secs = 1 the base is 5s, so the five attempts allowed by
+        // max_batch_requeue = 5 wait 5, 10, 20, 40 and 80 seconds: 155s in
+        // total instead of burning the budget in ~5s.
+        let uncapped = spur_core::config::MAX_LAUNCH_BACKOFF_SECS;
+        for (attempt, expected) in [5u64, 10, 20, 40, 80].into_iter().enumerate() {
+            assert_eq!(
+                launch_backoff_secs(1, uncapped, attempt as u32),
+                expected,
+                "attempt {attempt}"
+            );
+        }
+
+        // A cap clamps the doubling without stopping it from reaching the cap.
+        assert_eq!(launch_backoff_secs(1, 12, 0), 5);
+        assert_eq!(launch_backoff_secs(1, 12, 1), 10);
+        assert_eq!(launch_backoff_secs(1, 12, 2), 12);
+
+        // A slow scheduler waits at least two of its own cycles plus slack, and
+        // a zero interval still gets the 5s floor rather than no backoff at all.
+        assert_eq!(launch_backoff_secs(10, uncapped, 0), 23);
+        assert_eq!(launch_backoff_secs(0, uncapped, 0), 5);
+
+        // An operator-supplied max_batch_requeue large enough to overflow the
+        // shift must saturate at the cap, not panic the controller.
+        assert_eq!(launch_backoff_secs(1, 300, u32::MAX), 300);
+        assert_eq!(launch_backoff_secs(1, uncapped, u32::MAX), uncapped);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn launch_failure_backoff_doubles_each_attempt() {
-        // With the default interval_secs = 1 the base hold is 5s, so the five
-        // attempts allowed by max_batch_requeue = 5 wait 5, 10, 20, 40 and 80
-        // seconds: 155s in total instead of burning the budget in ~5s.
+    async fn launch_failure_backoff_defers_every_attempt_until_the_budget_runs_out() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = submit_and_wait(&cm, basic_spec("backoff-schedule"));
 
-        for (attempt, expected_secs) in [5i64, 10, 20, 40, 80].into_iter().enumerate() {
+        for attempt in 0..cm.config.controller.max_batch_requeue {
             let resources = scalar_alloc(2, 4000);
             cm.start_job(
                 job_id,
@@ -6733,16 +6844,18 @@ mod tests {
             .unwrap();
             settle(&cm, job_id, JobState::Running);
 
-            let before = Utc::now();
             cm.requeue_job(job_id).unwrap();
             settle(&cm, job_id, JobState::Pending);
 
             let job = cm.get_job(job_id).unwrap();
-            assert_eq!(job.requeue_count, attempt as u32 + 1);
-            let held_for = (job.spec.begin_time.unwrap() - before).num_seconds();
+            assert_eq!(job.requeue_count, attempt + 1);
             assert!(
-                (expected_secs..=expected_secs + 2).contains(&held_for),
-                "attempt {attempt} held {held_for}s, expected ~{expected_secs}s"
+                job.spec.begin_time.is_some_and(|begin| begin > Utc::now()),
+                "attempt {attempt} must defer the retry"
+            );
+            assert!(
+                !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+                "attempt {attempt} must not leave the job immediately eligible"
             );
 
             lapse_hold(&cm, job_id);
@@ -6764,43 +6877,6 @@ mod tests {
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::JobHoldMaxRequeue
         );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn launch_failure_backoff_is_capped() {
-        let dir = TempDir::new().unwrap();
-        let mut config = test_config();
-        config.controller.max_launch_backoff_secs = 12;
-        let cm = test_cluster_with_config(&dir, config).await;
-        register_node(&cm, "worker1", 8, 16000);
-
-        let job_id = submit_and_wait(&cm, basic_spec("capped-backoff"));
-
-        // Uncapped the third hold would be 20s; the cap clamps it to 12s.
-        for expected_secs in [5i64, 10, 12] {
-            let resources = scalar_alloc(2, 4000);
-            cm.start_job(
-                job_id,
-                vec!["worker1".into()],
-                resources.clone(),
-                per_node_for(&["worker1"], resources),
-            )
-            .unwrap();
-            settle(&cm, job_id, JobState::Running);
-
-            let before = Utc::now();
-            cm.requeue_job(job_id).unwrap();
-            settle(&cm, job_id, JobState::Pending);
-
-            let held_for =
-                (cm.get_job(job_id).unwrap().spec.begin_time.unwrap() - before).num_seconds();
-            assert!(
-                (expected_secs..=expected_secs + 2).contains(&held_for),
-                "held {held_for}s, expected ~{expected_secs}s"
-            );
-
-            lapse_hold(&cm, job_id);
-        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9168,6 +9244,82 @@ mod tests {
             PendingReason::JobHoldMaxRequeue,
             "one timeout after chronic preemption must not exhaust the failure budget"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_partial_dispatch_failure_backs_off_like_a_total_one() {
+        // Both launch-failure paths must throttle. Without this, a 2-node job
+        // with one broken node evicts, requeues immediately, lands on the same
+        // node and burns its whole requeue budget in seconds.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+
+        let mut spec = basic_spec("partial-backoff");
+        spec.num_nodes = 2;
+        spec.requeue = true;
+        let job_id = submit_and_wait(&cm, spec);
+
+        let alloc = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["n1".into(), "n2".into()],
+            scalar_alloc(4, 8000),
+            per_node_for(&["n1", "n2"], alloc),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        cm.evict_job(job_id).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+        assert!(
+            job.spec.begin_time.is_some_and(|begin| begin > Utc::now()),
+            "a launch-failure requeue must carry a future hold"
+        );
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "the hold must keep the job out of the very next dispatch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_failure_requeue_still_retries_immediately() {
+        // The backoff is scoped to launch failures. A job evicted because its
+        // node died has nothing to back off from: the node is already out of the
+        // candidate set, so delaying the retry only wastes capacity.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+
+        let mut spec = basic_spec("nodedown-requeue");
+        spec.requeue = true;
+        let job_id = submit_and_wait(&cm, spec);
+
+        let alloc = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["n1".into()],
+            alloc.clone(),
+            per_node_for(&["n1"], alloc),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        if let Some(node) = cm.nodes.write().get_mut("n1") {
+            node.last_heartbeat = Some(Utc::now() - chrono::Duration::seconds(200));
+        }
+        cm.check_node_health(90);
+        settle(&cm, job_id, JobState::Pending);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::None);
+        assert!(job.spec.begin_time.is_none(), "no hold on a node failure");
+        assert!(cm.pending_jobs().iter().any(|j| j.job_id == job_id));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

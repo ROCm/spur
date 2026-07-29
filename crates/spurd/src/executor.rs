@@ -22,8 +22,8 @@ use spur_spank::{SpankContext, SpankHandle, SpankHost};
 /// simply cannot run here.
 pub enum LaunchError {
     PrologFailed(anyhow::Error),
-    /// The node itself cannot host work: spurd's own spool filesystem is full or
-    /// read-only, so every subsequent job will fail identically.
+    /// The node itself cannot host work: an I/O failure in spurd's own spool
+    /// tree, so every subsequent job will fail identically.
     NodeFault(anyhow::Error),
     Other(anyhow::Error),
 }
@@ -42,14 +42,20 @@ impl std::fmt::Display for LaunchError {
 }
 
 impl LaunchError {
-    /// Reason to drain this node, or `None` when the failure is not the node's
-    /// fault. Derived from `Display` so the reason and the decision cannot
-    /// disagree, and so callers never re-prefix a message that already carries
-    /// its own prefix.
+    /// Reason for the agent to drain itself, or `None` when the controller owns
+    /// the decision. Derived from `Display` so the reason and the decision
+    /// cannot disagree, and so callers never re-prefix a message that already
+    /// carries its own prefix.
+    ///
+    /// Only `NodeFault` qualifies: it is gated on a root-owned path with no user
+    /// input, so retrying elsewhere converges and no further node drains. A
+    /// prolog failure also drains, but the controller does it, because only the
+    /// controller can pair the drain with the hold that stops the job walking
+    /// the cluster.
     pub fn drain_reason(&self) -> Option<String> {
         match self {
-            Self::PrologFailed(_) | Self::NodeFault(_) => Some(self.to_string()),
-            Self::Other(_) => None,
+            Self::NodeFault(_) => Some(self.to_string()),
+            Self::PrologFailed(_) | Self::Other(_) => None,
         }
     }
 }
@@ -60,19 +66,26 @@ impl From<anyhow::Error> for LaunchError {
     }
 }
 
-/// True when the error chain bottoms out in a filesystem that cannot accept the
-/// write at all, as opposed to a path or permission problem specific to one job.
+/// True when the error chain carries a real OS-level I/O failure that the node
+/// itself is responsible for.
 ///
-/// `EDQUOT` is deliberately absent: a quota is a property of a user on a shared
-/// filesystem, not of the node, and no quota applies to the root-owned spool tree.
-fn is_disk_exhausted(err: &anyhow::Error) -> bool {
+/// Structured as an exclusion list, mirroring Slurm's "all others drain the
+/// node" default: the spool tree is root-owned and not user-writable, and every
+/// path under it is built by spurd from the job id alone, so a submission cannot
+/// steer the errno. `EIO`, `EACCES`, `ENOTDIR` and `EPERM` there mean the node
+/// is broken just as surely as `ENOSPC` does.
+///
+/// Requiring a real `raw_os_error` keeps a plain `anyhow!("...")` out.
+/// `EDQUOT` stays excluded: a quota is a property of a user on a shared
+/// filesystem, not of the node.
+fn is_node_fault_io_error(err: &anyhow::Error) -> bool {
     err.chain()
         .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
-        .any(is_exhaustion_errno)
+        .any(is_node_fault_errno)
 }
 
-fn is_exhaustion_errno(err: &std::io::Error) -> bool {
-    matches!(err.raw_os_error(), Some(libc::ENOSPC) | Some(libc::EROFS))
+fn is_node_fault_errno(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(errno) if errno != libc::EDQUOT)
 }
 
 /// True when `dir` lives in the spool tree spurd owns, as opposed to the
@@ -84,13 +97,15 @@ fn is_node_owned_spool(dir: &Path) -> bool {
     dir.starts_with(SPOOL_ROOT)
 }
 
-/// Classify a failed write to a job's spool directory.
+/// Classify a failed write to a job's spool directory. An I/O failure under the
+/// node's own spool root condemns the node; anything else is just this job's
+/// problem.
 ///
 /// Only spool writes may reach this. Writes to the job's `work_dir` must not use
 /// it: that path is user-controlled and frequently a shared mount, where one user
 /// filling their quota would otherwise drain every node in turn.
 fn classify_spool_error(dir: &Path, err: anyhow::Error) -> LaunchError {
-    if is_node_owned_spool(dir) && is_disk_exhausted(&err) {
+    if is_node_owned_spool(dir) && is_node_fault_io_error(&err) {
         LaunchError::NodeFault(err)
     } else {
         LaunchError::Other(err)
@@ -1168,11 +1183,11 @@ fn create_job_spool_dir(job_id: JobId, uid: u32, gid: u32) -> Result<PathBuf, La
 ///
 /// Reports the owned root's failure when there is one, in preference to the temp
 /// fallback's: that is the root an operator configured and the only one whose
-/// exhaustion condemns the node, so naming the fallback instead would send them
+/// failure condemns the node, so naming the fallback instead would send them
 /// to inspect the wrong filesystem.
 ///
 /// Keeps the `io::Error` as a source rather than formatting it into the message,
-/// because exhaustion is detected by walking the chain and a flattened errno
+/// because the node fault is detected by walking the chain and a flattened errno
 /// would silently downgrade a node fault to a job failure, leaving a node
 /// accepting work it cannot run.
 fn spool_dir_error(mut failures: Vec<(PathBuf, std::io::Error)>) -> LaunchError {
@@ -1657,40 +1672,57 @@ mod tests {
             std::io::Error::from_raw_os_error(libc::ENOSPC)
         );
         assert!(
-            !is_disk_exhausted(&flattened),
+            !is_node_fault_io_error(&flattened),
             "an errno in the message text must not be mistaken for a real source"
         );
     }
 
     #[test]
-    fn only_the_fallback_being_full_does_not_drain() {
-        // The owned root failed for its own reason and only the world-writable
-        // fallback is full. The node's own spool is not exhausted, so this is a
-        // job failure, not grounds for taking the node out of service.
-        let err = spool_dir_error(vec![
-            (
-                owned_spool(),
-                std::io::Error::from_raw_os_error(libc::EACCES),
-            ),
-            (
-                fallback_spool(),
-                std::io::Error::from_raw_os_error(libc::ENOSPC),
-            ),
-        ]);
+    fn a_failure_confined_to_the_fallback_root_does_not_drain() {
+        // Only the world-writable fallback failed. The node's own spool is
+        // fine, so this is a job failure, not grounds for taking the node out
+        // of service. This is the path check doing the work, not the errno.
+        let err = spool_dir_error(vec![(
+            fallback_spool(),
+            std::io::Error::from_raw_os_error(libc::ENOSPC),
+        )]);
         assert!(matches!(err, LaunchError::Other(_)));
         assert!(err.drain_reason().is_none());
     }
 
     #[test]
-    fn non_exhaustion_spool_root_failures_do_not_drain() {
-        // A permissions problem is not the filesystem being full, so it must
-        // not take the node offline.
+    fn an_error_with_no_io_source_never_drains() {
+        // Everything under the owned root drains except EDQUOT, so the errno
+        // check is what keeps a plain anyhow error out. Without it a container
+        // or config problem would start condemning nodes.
+        let err =
+            classify_spool_error(&owned_spool(), anyhow::anyhow!("spool root not configured"));
+        assert!(matches!(err, LaunchError::Other(_)));
+        assert!(err.drain_reason().is_none());
+    }
+
+    #[test]
+    fn a_permission_failure_on_the_owned_spool_root_is_a_node_fault() {
+        // The spool tree is root-owned and every path under it is built by
+        // spurd from the job id, so a submission cannot steer the errno. EACCES
+        // there means the node is misconfigured or its filesystem is broken,
+        // and leaving it eligible just feeds it more jobs to fail.
         let err = spool_dir_error(vec![(
             owned_spool(),
             std::io::Error::from_raw_os_error(libc::EACCES),
         )]);
-        assert!(matches!(err, LaunchError::Other(_)));
-        assert!(err.drain_reason().is_none());
+        assert!(matches!(err, LaunchError::NodeFault(_)));
+        assert!(err.drain_reason().is_some());
+    }
+
+    #[test]
+    fn a_hardware_io_error_on_the_owned_spool_root_is_a_node_fault() {
+        let err = classify_spool_error(
+            &owned_spool(),
+            anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EIO))
+                .context("write job script"),
+        );
+        assert!(matches!(err, LaunchError::NodeFault(_)));
     }
 
     #[test]
@@ -1752,7 +1784,7 @@ mod tests {
     }
 
     #[test]
-    fn non_disk_spool_failure_does_not_drain() {
+    fn a_spool_failure_with_no_errno_does_not_drain() {
         let err =
             classify_spool_error(&owned_spool(), anyhow::anyhow!("container image not found"));
         assert!(matches!(err, LaunchError::Other(_)));
@@ -1760,12 +1792,17 @@ mod tests {
     }
 
     #[test]
-    fn prolog_drain_reason_is_not_double_prefixed() {
+    fn the_agent_does_not_self_drain_on_a_prolog_failure() {
+        // The drain still happens, but the controller issues it, so it can pair
+        // it with the hold. An agent-side drain would retry the job elsewhere
+        // and walk a job-caused failure across the cluster.
         let err = LaunchError::PrologFailed(anyhow::anyhow!("exit status 1"));
+        assert!(err.drain_reason().is_none());
         assert_eq!(
-            err.drain_reason().unwrap(),
+            err.to_string(),
             "prolog failed: exit status 1",
-            "reason must come from Display, not a second hand-written prefix"
+            "this text reaches the controller as the launch error and becomes \
+             the drain reason there, so it must not be double-prefixed"
         );
     }
 

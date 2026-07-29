@@ -310,10 +310,24 @@ pub struct ControllerConfig {
     /// `[controller] max_launch_backoff_secs` (default: 300).
     #[serde(default = "default_max_launch_backoff_secs")]
     pub max_launch_backoff_secs: u64,
+
+    /// Hold a job at priority 0 when its prolog fails, instead of requeueing it
+    /// for another attempt. On by default: a prolog receives the job's own
+    /// context, so the same failure recurs on every node, and retrying would
+    /// drain one node per attempt. Turning it off restores the retry, bounded by
+    /// `max_batch_requeue`. Configured in TOML as
+    /// `[controller] hold_on_prolog_fail` (default: true). Slurm's equivalent is
+    /// the inverse `SchedulerParameters=nohold_on_prolog_fail`.
+    #[serde(default = "default_hold_on_prolog_fail")]
+    pub hold_on_prolog_fail: bool,
 }
 
 fn default_max_batch_requeue() -> u32 {
     5
+}
+
+fn default_hold_on_prolog_fail() -> bool {
+    true
 }
 
 fn default_max_launch_backoff_secs() -> u64 {
@@ -359,6 +373,7 @@ impl Default for ControllerConfig {
             heartbeat_timeout_secs: None,
             max_batch_requeue: default_max_batch_requeue(),
             max_launch_backoff_secs: default_max_launch_backoff_secs(),
+            hold_on_prolog_fail: default_hold_on_prolog_fail(),
         }
     }
 }
@@ -1764,6 +1779,19 @@ deny_accounts = ["student"]
         assert_eq!(config.heartbeat_timeout_secs, None);
         assert_eq!(config.max_batch_requeue, 5);
         assert_eq!(config.max_launch_backoff_secs, 300);
+        assert!(config.hold_on_prolog_fail);
+    }
+
+    #[test]
+    fn controller_config_parses_hold_on_prolog_fail() {
+        let toml = r#"
+cluster_name = "test"
+
+[controller]
+hold_on_prolog_fail = false
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert!(!config.controller.hold_on_prolog_fail);
     }
 
     #[test]

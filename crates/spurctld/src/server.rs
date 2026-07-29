@@ -2232,7 +2232,7 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         partition: job.spec.partition.clone().unwrap_or_default(),
         account: job.spec.account.clone().unwrap_or_default(),
         state: job.state.to_proto_i32(),
-        state_reason: job.pending_reason.display().to_string(),
+        state_reason: job.state_reason_display().to_string(),
         submit_time: Some(datetime_to_proto(job.submit_time)),
         start_time: job.start_time.map(datetime_to_proto),
         end_time: job.end_time.map(datetime_to_proto),

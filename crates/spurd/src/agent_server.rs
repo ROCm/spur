@@ -1062,31 +1062,17 @@ impl SlurmAgent for AgentService {
                 memory_mb: spec.memory_per_node_mb,
             };
             if let Err(e) = spur_core::hooks::run_hook(prolog, &ctx).await {
-                let err_msg = format!("prolog failed: {e}");
+                // No completion report and no self-drain: the controller owns
+                // both decisions here, because only it can pair the drain with
+                // the hold that stops the job walking the cluster.
+                let err_msg = format!("prolog failed: {e:#}");
                 error!(job_id, error = %err_msg, "prolog hook failed before launch");
-                let controller = self.reporter.controller_addr.clone();
-                let node_name = self.reporter.hostname.clone();
-                let drain_reason = err_msg.clone();
-                tokio::spawn(async move {
-                    let drain = DrainRequest {
-                        reason: drain_reason.clone(),
-                    };
-                    report_completion(
-                        &controller,
-                        job_id,
-                        -1,
-                        0,
-                        run_attempt,
-                        &node_name,
-                        Some(&drain),
-                    )
-                    .await;
-                });
                 return Ok(Response::new(LaunchJobResponse {
                     success: false,
                     error: err_msg,
                     stdout_path: String::new(),
                     stderr_path: String::new(),
+                    failure_kind: LaunchFailureKind::LaunchFailureProlog as i32,
                 }));
             }
         }
@@ -1225,6 +1211,7 @@ impl SlurmAgent for AgentService {
                         error: "reservation reclaimed during launch".into(),
                         stdout_path: String::new(),
                         stderr_path: String::new(),
+                        failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
                     }));
                 }
 
@@ -1274,11 +1261,18 @@ impl SlurmAgent for AgentService {
                     error: String::new(),
                     stdout_path,
                     stderr_path,
+                    failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
                 }))
             }
             Err(e) => {
                 // reservation_guard releases the allocation and PMI on this return.
                 let drain_reason = e.drain_reason();
+                let failure_kind = match e {
+                    executor::LaunchError::PrologFailed(_) => {
+                        LaunchFailureKind::LaunchFailureProlog
+                    }
+                    _ => LaunchFailureKind::LaunchFailureUnspecified,
+                };
                 let err_msg = e.to_string();
                 error!(job_id, error = %err_msg, "failed to launch job");
 
@@ -1295,6 +1289,7 @@ impl SlurmAgent for AgentService {
                     error: err_msg,
                     stdout_path: String::new(),
                     stderr_path: String::new(),
+                    failure_kind: failure_kind as i32,
                 }))
             }
         }
@@ -2812,6 +2807,109 @@ mod tests {
             String::new(),
             String::new(),
         ))
+    }
+
+    /// An executable script at a temp path that exits with `code`.
+    fn failing_hook_script(code: i32) -> tempfile::TempPath {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "#!/bin/bash\nexit {code}").unwrap();
+        let path = f.into_temp_path();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn a_failed_prolog_is_reported_to_the_controller_as_a_prolog_failure() {
+        // The controller drains and holds on this kind, so the launch must come
+        // back classified rather than as an opaque rejection the controller can
+        // only string-match. The agent itself neither drains nor reports a
+        // completion: pairing the drain with the hold is the controller's job.
+        let prolog = failing_hook_script(1);
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig {
+                prolog: Some(prolog.to_str().unwrap().to_string()),
+                ..Default::default()
+            },
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let resp = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 7,
+                spec: Some(JobSpec {
+                    name: "prolog-fail".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("a prolog failure is a launch outcome, not a transport error")
+            .into_inner();
+
+        assert!(!resp.success);
+        assert_eq!(
+            resp.failure_kind,
+            LaunchFailureKind::LaunchFailureProlog as i32
+        );
+        assert!(
+            resp.error.contains("prolog_slurmd script exited with"),
+            "the operator needs the script's own failure, got {:?}",
+            resp.error
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prolog_that_cannot_even_start_reports_the_underlying_errno() {
+        // Issue 520: `{e}` renders only the outermost context, reducing this to
+        // "prolog_slurmd script failed to execute: ..." and dropping the errno
+        // that says whether the script is missing, unreadable or not executable.
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig {
+                prolog: Some("/nonexistent/prolog.sh".into()),
+                ..Default::default()
+            },
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let resp = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 8,
+                spec: Some(JobSpec {
+                    name: "prolog-missing".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!resp.success);
+        assert_eq!(
+            resp.failure_kind,
+            LaunchFailureKind::LaunchFailureProlog as i32
+        );
+        assert!(
+            resp.error.contains("No such file or directory"),
+            "the cause chain must survive into the reported error, got {:?}",
+            resp.error
+        );
     }
 
     #[tokio::test]
