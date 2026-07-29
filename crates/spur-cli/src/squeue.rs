@@ -9,7 +9,12 @@ use crate::format_engine;
 
 /// View information about jobs in the scheduling queue.
 #[derive(Parser, Debug)]
-#[command(name = "squeue", about = "View the job queue")]
+// -h is squeue's --noheader (Slurm convention), so disable clap's auto -h/--help.
+#[command(
+    name = "squeue",
+    about = "View the job queue",
+    disable_help_flag = true
+)]
 pub struct SqueueArgs {
     /// Show only jobs for this user
     #[arg(short = 'u', long)]
@@ -84,6 +89,13 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         None => default_squeue_states(),
     };
 
+    // Parse the sort spec before any network I/O so an invalid -S surfaces its own error
+    // rather than a downstream connect failure.
+    let sort_keys = match args.sort.as_deref() {
+        Some(s) => parse_sort_arg(s)?,
+        None => default_sort_keys(),
+    };
+
     // Parse job ID filter
     let job_ids = args
         .jobs
@@ -114,13 +126,6 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .context("failed to get jobs")?;
 
     let mut jobs = response.into_inner().jobs;
-
-    // Slurm sorts client-side; its default job sort is "P,t,-p". The trailing
-    // jobid tiebreak is ours, so equal-priority jobs order deterministically.
-    let sort_keys = match args.sort.as_deref() {
-        Some(s) => parse_sort_arg(s)?,
-        None => default_sort_keys(),
-    };
     sort_jobs(&mut jobs, &sort_keys);
 
     // Print header
@@ -221,10 +226,10 @@ fn parse_sort_arg(s: &str) -> Result<Vec<SortKey>> {
             None => (false, token.strip_prefix('+').unwrap_or(token)),
         };
         let mut chars = rest.chars();
-        let spec = chars
-            .next()
-            .filter(|_| chars.next().is_none())
-            .ok_or_else(|| anyhow::anyhow!("Invalid sort specification: {token}"))?;
+        let spec = match (chars.next(), chars.next()) {
+            (Some(c), None) => c,
+            _ => anyhow::bail!("Invalid sort specification: {token}"),
+        };
         if format_engine::squeue_header(spec) == "?" {
             anyhow::bail!("Invalid sort specification: {token}");
         }
@@ -277,25 +282,10 @@ fn compare_field(
     }
 }
 
-/// Rank a proto state by Slurm's base job-state order (SUSPENDED sits right
-/// after RUNNING, before the terminal states) so `-S t` matches Slurm.
 fn state_sort_rank(state: i32) -> u8 {
-    use spur_proto::proto::JobState as S;
-    match S::try_from(state) {
-        Ok(S::JobPending) => 0,
-        Ok(S::JobRunning) => 1,
-        Ok(S::JobSuspended) => 2,
-        Ok(S::JobCompleting) => 3,
-        Ok(S::JobCompleted) => 4,
-        Ok(S::JobCancelled) => 5,
-        Ok(S::JobFailed) => 6,
-        Ok(S::JobTimeout) => 7,
-        Ok(S::JobNodeFail) => 8,
-        Ok(S::JobPreempted) => 9,
-        Ok(S::JobDeadline) => 10,
-        Ok(S::JobOutOfMemory) => 11,
-        Err(_) => u8::MAX,
-    }
+    spur_core::job::JobState::from_proto_i32(state)
+        .map(|s| s.sort_rank())
+        .unwrap_or(u8::MAX)
 }
 
 fn run_time_secs(job: &spur_proto::proto::JobInfo) -> i64 {
@@ -313,7 +303,7 @@ fn ts_secs(ts: Option<&prost_types::Timestamp>) -> i64 {
     ts.map(|t| t.seconds).unwrap_or(0)
 }
 
-// Unlimited time limit sorts last, matching `-S l`.
+/// Unlimited time limit sorts last, matching `-S L`.
 fn time_left_secs(job: &spur_proto::proto::JobInfo) -> i64 {
     let limit = time_limit_secs(job);
     if limit == i64::MAX {
@@ -421,6 +411,13 @@ fn format_timestamp(ts: Option<&prost_types::Timestamp>) -> String {
 mod tests {
     use super::*;
     use spur_proto::proto::JobState as P;
+
+    #[test]
+    fn sort_flag_accepts_hyphen_prefixed_value() {
+        // -S -i must parse as a descending sort spec, not a flag (allow_hyphen_values).
+        let args = SqueueArgs::try_parse_from(["squeue", "-S", "-i"]).unwrap();
+        assert_eq!(args.sort.as_deref(), Some("-i"));
+    }
 
     #[test]
     fn default_squeue_states_includes_completing() {

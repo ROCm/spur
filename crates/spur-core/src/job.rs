@@ -71,6 +71,25 @@ impl JobState {
         }
     }
 
+    /// Rank for `squeue -S t` in Slurm's base state order (SUSPENDED after RUNNING),
+    /// which is not the enum's declaration order — hence an explicit match.
+    pub fn sort_rank(&self) -> u8 {
+        match self {
+            Self::Pending => 0,
+            Self::Running => 1,
+            Self::Suspended => 2,
+            Self::Completing => 3,
+            Self::Completed => 4,
+            Self::Cancelled => 5,
+            Self::Failed => 6,
+            Self::Timeout => 7,
+            Self::NodeFail => 8,
+            Self::Preempted => 9,
+            Self::Deadline => 10,
+            Self::OutOfMemory => 11,
+        }
+    }
+
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -1892,5 +1911,19 @@ mod tests {
     fn resolved_stdin_none_when_unset() {
         let job = Job::new(1, JobSpec::default());
         assert_eq!(job.resolved_stdin(), None);
+    }
+
+    #[test]
+    fn sort_rank_follows_slurm_state_order_not_enum_order() {
+        // SUSPENDED ranks right after RUNNING and before COMPLETING, unlike the
+        // enum's declaration order (Completing before Suspended).
+        assert!(JobState::Running.sort_rank() < JobState::Suspended.sort_rank());
+        assert!(JobState::Suspended.sort_rank() < JobState::Completing.sort_rank());
+        assert_eq!(JobState::Pending.sort_rank(), 0);
+        // Ranks are unique across all states.
+        let mut ranks: Vec<u8> = JobState::ALL.iter().map(|s| s.sort_rank()).collect();
+        ranks.sort_unstable();
+        ranks.dedup();
+        assert_eq!(ranks.len(), JobState::ALL.len());
     }
 }
