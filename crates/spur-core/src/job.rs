@@ -309,6 +309,13 @@ impl PendingReason {
         )
     }
 
+    /// True when this reason is set alongside a `begin_time` hold to explain it.
+    /// Any other reason on a held job is unrelated to the hold, so recomputing
+    /// it loses nothing.
+    pub fn explains_begin_hold(&self) -> bool {
+        matches!(self, Self::BeginTime | Self::JobLaunchFailure)
+    }
+
     pub fn display(&self) -> &'static str {
         match self {
             Self::None => "None",
@@ -1023,6 +1030,23 @@ pub enum TransitionOutcome {
 }
 
 impl Job {
+    /// True while a future `begin_time` defers this job's start, whether it came
+    /// from `--begin`, a preemption requeue, or a launch-failure backoff.
+    pub fn is_begin_held(&self, now: DateTime<Utc>) -> bool {
+        self.spec.begin_time.is_some_and(|begin| now < begin)
+    }
+
+    /// True when this job's `pending_reason` exists to explain an active
+    /// `begin_time` hold, so passes that recompute reasons must leave it alone:
+    /// a generic wait reason would overwrite it before anyone could read it.
+    ///
+    /// Narrower than [`Job::is_begin_held`] on purpose. A `--begin` job still
+    /// needs its real blocking reason (bad partition, unmet dependency) surfaced
+    /// during the wait, and only the hold-explaining reasons are worth keeping.
+    pub fn reason_explains_begin_hold(&self, now: DateTime<Utc>) -> bool {
+        self.is_begin_held(now) && self.pending_reason.explains_begin_hold()
+    }
+
     /// Attempt a state transition, enforcing the state machine.
     pub fn transition(&mut self, to: JobState) -> Result<(), JobTransitionError> {
         let valid = match (self.state, to) {
@@ -1807,6 +1831,26 @@ mod tests {
         );
         assert_eq!(PendingReason::OutOfMemory.display(), "OutOfMemory");
         assert_eq!(PendingReason::BootFail.display(), "BootFailure");
+    }
+
+    #[test]
+    fn is_begin_held_tracks_the_hold_window_regardless_of_reason() {
+        let now = Utc::now();
+        let mut job = make_job();
+
+        assert!(!job.is_begin_held(now), "no begin_time means not held");
+
+        job.spec.begin_time = Some(now + chrono::Duration::seconds(30));
+        assert!(job.is_begin_held(now));
+
+        // The predicate is keyed on the hold window alone: a launch-failure
+        // backoff must be recognised as held even though its reason is not
+        // BeginTime, otherwise the reason gets overwritten while it waits.
+        job.pending_reason = PendingReason::JobLaunchFailure;
+        assert!(job.is_begin_held(now));
+
+        job.spec.begin_time = Some(now - chrono::Duration::seconds(1));
+        assert!(!job.is_begin_held(now), "a lapsed hold no longer defers");
     }
 
     #[test]

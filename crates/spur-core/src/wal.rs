@@ -34,6 +34,10 @@ pub enum WalOperation {
         /// When set with `new_state == Pending`, sets priority in the same apply step (e.g. hold at 0).
         #[serde(default)]
         pending_priority: Option<u32>,
+        /// When set with `new_state == Pending`, holds the job until this instant.
+        /// Computed on the leader so every replica applies the same instant.
+        #[serde(default)]
+        begin_time: Option<chrono::DateTime<chrono::Utc>>,
     },
     JobStart {
         job_id: JobId,
@@ -207,6 +211,7 @@ impl WalOperation {
             new_state,
             pending_reason: None,
             pending_priority: None,
+            begin_time: None,
         }
     }
 
@@ -222,6 +227,25 @@ impl WalOperation {
             new_state: JobState::Pending,
             pending_reason: Some(reason),
             pending_priority: Some(0),
+            begin_time: None,
+        }
+    }
+
+    /// Requeue to Pending with a backoff hold and a reason, applied in one step
+    /// so the job is never briefly eligible with no hold.
+    pub fn job_state_change_backoff_pending(
+        job_id: JobId,
+        old_state: JobState,
+        reason: PendingReason,
+        begin_time: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        Self::JobStateChange {
+            job_id,
+            old_state,
+            new_state: JobState::Pending,
+            pending_reason: Some(reason),
+            pending_priority: None,
+            begin_time: Some(begin_time),
         }
     }
 
@@ -263,12 +287,14 @@ mod job_state_change_wal_tests {
                 new_state,
                 pending_reason,
                 pending_priority,
+                begin_time,
             } => {
                 assert_eq!(job_id, 1);
                 assert_eq!(old_state, JobState::Preempted);
                 assert_eq!(new_state, JobState::Pending);
                 assert_eq!(pending_reason, Some(PendingReason::JobHoldMaxRequeue));
                 assert_eq!(pending_priority, Some(0));
+                assert_eq!(begin_time, None, "a max-requeue hold has no begin_time");
             }
             _ => panic!("wrong variant"),
         }
@@ -283,10 +309,63 @@ mod job_state_change_wal_tests {
             WalOperation::JobStateChange {
                 pending_reason,
                 pending_priority,
+                begin_time,
                 ..
             } => {
                 assert_eq!(pending_reason, None);
                 assert_eq!(pending_priority, None);
+                assert_eq!(begin_time, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn job_state_change_backoff_pending_round_trips() {
+        let hold = chrono::Utc::now() + chrono::Duration::seconds(40);
+        let op = WalOperation::job_state_change_backoff_pending(
+            7,
+            JobState::Failed,
+            PendingReason::JobLaunchFailure,
+            hold,
+        );
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobStateChange {
+                new_state,
+                pending_reason,
+                pending_priority,
+                begin_time,
+                ..
+            } => {
+                assert_eq!(new_state, JobState::Pending);
+                assert_eq!(pending_reason, Some(PendingReason::JobLaunchFailure));
+                assert_eq!(
+                    pending_priority, None,
+                    "a backoff defers the job, it must not zero its priority"
+                );
+                assert_eq!(
+                    begin_time,
+                    Some(hold),
+                    "the leader-computed instant must survive the WAL verbatim"
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn pre_upgrade_job_state_change_without_begin_time_deserializes() {
+        // A WAL written before the backoff field existed must still replay.
+        let json = r#"{"JobStateChange":{"job_id":3,"old_state":"FAILED","new_state":"PENDING"}}"#;
+        let back: WalOperation = serde_json::from_str(json).unwrap();
+        match back {
+            WalOperation::JobStateChange {
+                job_id, begin_time, ..
+            } => {
+                assert_eq!(job_id, 3);
+                assert_eq!(begin_time, None);
             }
             _ => panic!("wrong variant"),
         }

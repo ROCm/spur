@@ -458,7 +458,7 @@ impl Drop for LaunchReservationGuard {
     }
 }
 
-fn completion_report_retryable(status: &tonic::Status) -> bool {
+fn controller_rpc_retryable(status: &tonic::Status) -> bool {
     use tonic::Code;
     matches!(
         status.code(),
@@ -468,19 +468,19 @@ fn completion_report_retryable(status: &tonic::Status) -> bool {
 
 #[cfg(test)]
 mod completion_report_tests {
-    use super::completion_report_retryable;
+    use super::controller_rpc_retryable;
     use tonic::Status;
 
     #[test]
     fn permanent_errors_are_not_retryable() {
-        assert!(!completion_report_retryable(&Status::invalid_argument("x")));
-        assert!(!completion_report_retryable(&Status::not_found("x")));
+        assert!(!controller_rpc_retryable(&Status::invalid_argument("x")));
+        assert!(!controller_rpc_retryable(&Status::not_found("x")));
     }
 
     #[test]
     fn transient_errors_are_retryable() {
-        assert!(completion_report_retryable(&Status::unavailable("x")));
-        assert!(completion_report_retryable(&Status::internal("x")));
+        assert!(controller_rpc_retryable(&Status::unavailable("x")));
+        assert!(controller_rpc_retryable(&Status::internal("x")));
     }
 }
 
@@ -618,7 +618,7 @@ async fn report_completion(
                         return;
                     }
                     Err(e) => {
-                        if !completion_report_retryable(&e) {
+                        if !controller_rpc_retryable(&e) {
                             error!(
                                 job_id,
                                 attempt,
@@ -668,6 +668,76 @@ fn warn_mpi_mpirun_skipped_affinity(job_id: u32, source: &HashMap<String, String
             "multi-rank --mpi=pmix launches via mpirun --bind-to none; Spur CPU/GPU bind env is not applied to MPI ranks"
         );
     }
+}
+
+/// Drain this node without reporting a job completion.
+///
+/// A launch failure is not a completion: the job never ran, and the controller's
+/// dispatch path already owns its fate (requeue when every dispatch failed,
+/// eviction to NodeFail on a partial failure). Reporting an exit code here would
+/// race that path and could finalize a still-retryable job to Failed, which no
+/// requeue path recovers.
+async fn request_node_drain(controller_addr: &str, node_name: &str, reason: &str, job_id: u32) {
+    for attempt in 1..=3 {
+        match spur_client::connect_channel(controller_addr).await {
+            Ok(channel) => {
+                let mut client = spur_proto::controller_client(channel);
+                let req = DrainNodeRequest {
+                    name: node_name.to_string(),
+                    reason: reason.to_string(),
+                };
+                match client.drain_node(req).await {
+                    Ok(resp) => {
+                        warn!(
+                            job_id,
+                            node = %node_name,
+                            state = %resp.into_inner().actual_state,
+                            reason,
+                            "requested node drain after launch failure"
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        if !controller_rpc_retryable(&e) {
+                            error!(
+                                job_id,
+                                node = %node_name,
+                                attempt,
+                                code = ?e.code(),
+                                error = %e,
+                                "DrainNode failed with non-retryable error"
+                            );
+                            return;
+                        }
+                        warn!(
+                            job_id,
+                            node = %node_name,
+                            attempt,
+                            error = %e,
+                            "DrainNode RPC failed"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    job_id,
+                    node = %node_name,
+                    attempt,
+                    error = %e,
+                    "failed to connect to controller for drain request"
+                );
+            }
+        }
+        if attempt < 3 {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        }
+    }
+    error!(
+        job_id,
+        node = %node_name,
+        "gave up requesting node drain after 3 attempts"
+    );
 }
 
 #[tonic::async_trait]
@@ -1208,28 +1278,15 @@ impl SlurmAgent for AgentService {
             }
             Err(e) => {
                 // reservation_guard releases the allocation and PMI on this return.
-                let is_prolog_failure = matches!(e, executor::LaunchError::PrologFailed(_));
+                let drain_reason = e.drain_reason();
                 let err_msg = e.to_string();
                 error!(job_id, error = %err_msg, "failed to launch job");
 
-                if is_prolog_failure {
+                if let Some(drain_reason) = drain_reason {
                     let controller = self.reporter.controller_addr.clone();
                     let node_name = self.reporter.hostname.clone();
-                    let drain_reason = format!("prolog failed: {}", err_msg);
                     tokio::spawn(async move {
-                        let drain = DrainRequest {
-                            reason: drain_reason.clone(),
-                        };
-                        report_completion(
-                            &controller,
-                            job_id,
-                            -1,
-                            0,
-                            run_attempt,
-                            &node_name,
-                            Some(&drain),
-                        )
-                        .await;
+                        request_node_drain(&controller, &node_name, &drain_reason, job_id).await;
                     });
                 }
 
