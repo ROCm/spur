@@ -159,6 +159,17 @@ class TestSacctmgrShowAccount:
         assert "Descr" not in header, f"Descr should be absent: {header!r}"
         assert "Org" not in header, f"Org should be absent: {header!r}"
 
+    def test_empty_account_list_is_header_only(self, accounting_cluster):
+        """No accounts prints the header only, not a placeholder or blank row."""
+        c = accounting_cluster
+        out = c.sacctmgr(["show", "account"])
+        rows = [line for line in out.splitlines() if line.strip()]
+        assert rows, f"expected a header line: {out!r}"
+        for column in ("Account", "Descr", "Org"):
+            assert column in rows[0], f"missing column {column!r}: {rows[0]!r}"
+        assert "no accounts configured" not in out
+        assert rows[1:] == [], f"expected no data rows: {rows[1:]!r}"
+
 
 class TestQosLimitReasons:
     def test_wall_cap_sets_qos_pending_reason(self, accounting_cluster):
