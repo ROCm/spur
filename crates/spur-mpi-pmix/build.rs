@@ -66,6 +66,7 @@ fn copy_plugin(
         return;
     }
     let Some(target_dir) = profile_target_dir(out_dir) else {
+        println!("cargo:warning=could not locate profile dir from OUT_DIR {out_dir:?}; plugin not staged");
         return;
     };
     for name in ["libspur_mpi_pmix.so", "spur_mpi_pmix.so"] {
