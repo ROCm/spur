@@ -341,16 +341,17 @@ impl AgentService {
                     } else {
                         None
                     };
-                    report_completion(
-                        &controller_addr,
+                    // Spawn so a controller mid-failover/restart can't stall the
+                    // monitor loop; delivery retries in the background until acked.
+                    tokio::spawn(report_completion(
+                        controller_addr.clone(),
                         c.job_id,
                         c.exit_code,
                         c.signal,
                         c.run_attempt,
-                        &local_hostname,
-                        drain.as_ref(),
-                    )
-                    .await;
+                        local_hostname.clone(),
+                        drain,
+                    ));
                 }
             }
         });
@@ -460,27 +461,136 @@ impl Drop for LaunchReservationGuard {
 
 fn completion_report_retryable(status: &tonic::Status) -> bool {
     use tonic::Code;
+    // NotFound: a just-restarted controller may not have replayed this job's log
+    // entry yet; jobs are never purged, so retrying resolves once replay finishes.
     matches!(
         status.code(),
-        Code::Unavailable | Code::Internal | Code::DeadlineExceeded | Code::Unknown
+        Code::Unavailable
+            | Code::Internal
+            | Code::DeadlineExceeded
+            | Code::Unknown
+            | Code::NotFound
     )
 }
 
 #[cfg(test)]
 mod completion_report_tests {
-    use super::completion_report_retryable;
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use tonic::Status;
 
     #[test]
     fn permanent_errors_are_not_retryable() {
         assert!(!completion_report_retryable(&Status::invalid_argument("x")));
-        assert!(!completion_report_retryable(&Status::not_found("x")));
     }
 
     #[test]
     fn transient_errors_are_retryable() {
         assert!(completion_report_retryable(&Status::unavailable("x")));
         assert!(completion_report_retryable(&Status::internal("x")));
+    }
+
+    #[test]
+    fn not_found_is_retryable_for_cold_start_replay() {
+        assert!(completion_report_retryable(&Status::not_found(
+            "job 7 not found"
+        )));
+    }
+
+    #[test]
+    fn classify_maps_result_to_delivery() {
+        assert_eq!(classify_report_result(&Ok(())), CompletionDelivery::Acked);
+        assert_eq!(
+            classify_report_result(&Err(Status::unavailable("x"))),
+            CompletionDelivery::Transient
+        );
+        assert_eq!(
+            classify_report_result(&Err(Status::invalid_argument("x"))),
+            CompletionDelivery::Permanent
+        );
+    }
+
+    #[test]
+    fn backoff_doubles_then_caps() {
+        let max = std::time::Duration::from_secs(30);
+        let d = std::time::Duration::from_secs(1);
+        let d = next_backoff(d, max);
+        assert_eq!(d, std::time::Duration::from_secs(2));
+        let d = next_backoff(d, max);
+        assert_eq!(d, std::time::Duration::from_secs(4));
+        assert_eq!(
+            next_backoff(std::time::Duration::from_secs(20), max),
+            max,
+            "must saturate at the cap"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_failures_retry_until_acked() {
+        let calls = AtomicU32::new(0);
+        let attempts = drive_completion_report(
+            |_| {
+                let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                async move {
+                    if n < 4 {
+                        Err(Status::unavailable("controller mid-failover"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            COMPLETION_RETRY_INITIAL,
+            COMPLETION_RETRY_MAX,
+        )
+        .await;
+        assert_eq!(attempts, 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanent_failure_stops_immediately() {
+        let calls = AtomicU32::new(0);
+        let attempts = drive_completion_report(
+            |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move { Err(Status::invalid_argument("node not allocated")) }
+            },
+            COMPLETION_RETRY_INITIAL,
+            COMPLETION_RETRY_MAX,
+        )
+        .await;
+        assert_eq!(attempts, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn success_on_first_attempt_makes_one_call() {
+        let attempts = drive_completion_report(
+            |_| async move { Ok(()) },
+            COMPLETION_RETRY_INITIAL,
+            COMPLETION_RETRY_MAX,
+        )
+        .await;
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn request_carries_drain_fields_when_draining() {
+        let drain = DrainRequest {
+            reason: "prolog failed: boom".into(),
+        };
+        let req = build_completion_request(7, -1, 0, 3, "node1".into(), Some(&drain));
+        assert!(req.drain_node);
+        assert_eq!(req.drain_reason, "prolog failed: boom");
+        assert_eq!(req.job_id, 7);
+        assert_eq!(req.reporting_node, "node1");
+        assert_eq!(req.run_attempt, 3);
+    }
+
+    #[test]
+    fn request_omits_drain_when_not_draining() {
+        let req = build_completion_request(7, 0, 0, 1, "node1".into(), None);
+        assert!(!req.drain_node);
+        assert!(req.drain_reason.is_empty());
     }
 }
 
@@ -575,85 +685,122 @@ fn inject_script_args(script: &str, args: &[String]) -> Result<String, Status> {
     Ok(format!("{set_line}\n{script}"))
 }
 
-async fn report_completion(
-    controller_addr: &str,
+/// Initial and capped retry backoff for redelivering a completion report.
+const COMPLETION_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(1);
+const COMPLETION_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Outcome of one `ReportJobStatus` attempt, driving the redelivery loop.
+#[derive(Debug, PartialEq, Eq)]
+enum CompletionDelivery {
+    Acked,
+    Permanent,
+    Transient,
+}
+
+fn classify_report_result(result: &Result<(), tonic::Status>) -> CompletionDelivery {
+    match result {
+        Ok(()) => CompletionDelivery::Acked,
+        Err(s) if completion_report_retryable(s) => CompletionDelivery::Transient,
+        Err(_) => CompletionDelivery::Permanent,
+    }
+}
+
+fn next_backoff(current: std::time::Duration, max: std::time::Duration) -> std::time::Duration {
+    current.saturating_mul(2).min(max)
+}
+
+/// Redeliver a completion until acked or a permanent error; a transient failure
+/// retries with capped exponential backoff. Returns the attempt count.
+async fn drive_completion_report<F, Fut>(
+    mut attempt: F,
+    initial: std::time::Duration,
+    max: std::time::Duration,
+) -> u32
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<(), tonic::Status>>,
+{
+    let mut delay = initial;
+    let mut n = 0;
+    loop {
+        n += 1;
+        match classify_report_result(&attempt(n).await) {
+            CompletionDelivery::Acked | CompletionDelivery::Permanent => return n,
+            CompletionDelivery::Transient => {
+                tokio::time::sleep(delay).await;
+                delay = next_backoff(delay, max);
+            }
+        }
+    }
+}
+
+/// Build the completion RPC. `state` is advisory (derived from `exit_code` to
+/// satisfy the validator); the controller rederives the true outcome from `signal`.
+fn build_completion_request(
     job_id: u32,
     exit_code: i32,
     signal: i32,
     run_attempt: u32,
-    reporting_node: &str,
+    reporting_node: String,
     drain: Option<&DrainRequest>,
-) {
-    // Wire `state` is derived from `exit_code` alone (advisory): a signaled job
-    // reports Completed/0 because the controller's validator requires
-    // state<->exit_code agreement. The controller rederives the true Failed /
-    // RaisedSignal outcome from the reported `signal`.
-    let state = spur_core::job::JobState::completion_state_for_exit_code(exit_code).to_proto_i32();
-
-    // Retry up to 3 times with 1-second backoff — a single transient failure
-    // must not permanently lose a job completion.
-    for attempt in 1..=3 {
-        match spur_client::connect_channel(controller_addr).await {
-            Ok(channel) => {
-                let mut client = spur_proto::controller_client(channel);
-                let req = ReportJobStatusRequest {
-                    job_id,
-                    state,
-                    exit_code,
-                    signal,
-                    message: format!("exit_code={}", exit_code),
-                    drain_node: drain.is_some(),
-                    drain_reason: drain.as_ref().map(|d| d.reason.clone()).unwrap_or_default(),
-                    reporting_node: reporting_node.to_string(),
-                    run_attempt,
-                };
-                match client.report_job_status(req).await {
-                    Ok(_) => {
-                        info!(
-                            job_id,
-                            exit_code,
-                            controller = %controller_addr,
-                            "reported completion to controller"
-                        );
-                        return;
-                    }
-                    Err(e) => {
-                        if !completion_report_retryable(&e) {
-                            error!(
-                                job_id,
-                                attempt,
-                                code = ?e.code(),
-                                error = %e,
-                                "ReportJobStatus failed with non-retryable error"
-                            );
-                            return;
-                        }
-                        warn!(
-                            job_id,
-                            attempt,
-                            error = %e,
-                            "ReportJobStatus RPC failed"
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    job_id,
-                    attempt,
-                    error = %e,
-                    "failed to connect to controller for completion report"
-                );
-            }
-        }
-        if attempt < 3 {
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        }
-    }
-    error!(
+) -> ReportJobStatusRequest {
+    ReportJobStatusRequest {
         job_id,
-        exit_code, "gave up reporting completion after 3 attempts"
-    );
+        state: spur_core::job::JobState::completion_state_for_exit_code(exit_code).to_proto_i32(),
+        exit_code,
+        signal,
+        message: format!("exit_code={}", exit_code),
+        drain_node: drain.is_some(),
+        drain_reason: drain.map(|d| d.reason.clone()).unwrap_or_default(),
+        reporting_node,
+        run_attempt,
+    }
+}
+
+async fn report_completion(
+    controller_addr: String,
+    job_id: u32,
+    exit_code: i32,
+    signal: i32,
+    run_attempt: u32,
+    reporting_node: String,
+    drain: Option<DrainRequest>,
+) {
+    let attempt = |n: u32| {
+        let controller_addr = controller_addr.clone();
+        let req = build_completion_request(
+            job_id,
+            exit_code,
+            signal,
+            run_attempt,
+            reporting_node.clone(),
+            drain.as_ref(),
+        );
+        async move {
+            let result = match spur_client::connect_channel(&controller_addr).await {
+                Ok(channel) => spur_proto::controller_client(channel)
+                    .report_job_status(req)
+                    .await
+                    .map(|_| ()),
+                Err(e) => Err(tonic::Status::unavailable(e.to_string())),
+            };
+            match &result {
+                Ok(()) => info!(job_id, exit_code, "reported completion to controller"),
+                Err(e) if completion_report_retryable(e) => {
+                    warn!(job_id, attempt = n, error = %e, "ReportJobStatus failed; will retry")
+                }
+                Err(e) => error!(
+                    job_id,
+                    code = ?e.code(),
+                    error = %e,
+                    "ReportJobStatus failed with non-retryable error"
+                ),
+            }
+            result
+        }
+    };
+
+    drive_completion_report(attempt, COMPLETION_RETRY_INITIAL, COMPLETION_RETRY_MAX).await;
 }
 
 fn warn_mpi_mpirun_skipped_affinity(job_id: u32, source: &HashMap<String, String>) {
@@ -1216,21 +1363,17 @@ impl SlurmAgent for AgentService {
                     let controller = self.reporter.controller_addr.clone();
                     let node_name = self.reporter.hostname.clone();
                     let drain_reason = format!("prolog failed: {}", err_msg);
-                    tokio::spawn(async move {
-                        let drain = DrainRequest {
-                            reason: drain_reason.clone(),
-                        };
-                        report_completion(
-                            &controller,
-                            job_id,
-                            -1,
-                            0,
-                            run_attempt,
-                            &node_name,
-                            Some(&drain),
-                        )
-                        .await;
-                    });
+                    tokio::spawn(report_completion(
+                        controller,
+                        job_id,
+                        -1,
+                        0,
+                        run_attempt,
+                        node_name,
+                        Some(DrainRequest {
+                            reason: drain_reason,
+                        }),
+                    ));
                 }
 
                 Ok(Response::new(LaunchJobResponse {
