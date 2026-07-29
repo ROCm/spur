@@ -134,13 +134,8 @@ pub(crate) fn provision_assignments(
     }
     nodes.sort_by(|a, b| a.name.cmp(&b.name)); // deterministic
 
-    // Bootstrap control-plane (etcd seed, holder of `.1`). Derive from an ALREADY-ASSIGNED
-    // Controller/Single node FIRST: the persisted role assignment is the durable source of truth.
-    // The CP-choice persist below is a separate raft write that lands *after* the assignment loop, so
-    // a crash between the first `assign(CP, .1)` and that persist would otherwise let a restart (with
-    // `state.control_plane_node` still None) pick a different, lexically-earlier node and hand it the
-    // same `.1`. Fall back to the recorded choice -> config override -> lexically-first when nothing
-    // is assigned yet. `.1` follows the bootstrap so a 1->3 CP set keeps its existing address.
+    // Bootstrap control-plane (etcd seed, holder of `.1`). Recorded bootstrap outranks a scanned
+    // `Controller` (secondary CPs also carry that role); `.1` follows it so a 1->3 set stays stable.
     let bootstrap = nodes
         .iter()
         .find(|n| matches!(n.k0s_role, Some(K0sRole::Single)))

@@ -483,12 +483,20 @@ class SpurCluster:
             time.sleep(5)
         raise TimeoutError(f"k0s phase did not reach {phase} within {timeout}s:\n{last}")
 
-    def etcd_member_count(self, node_index: int = 0) -> int:
-        """Ground-truth etcd quorum size via `k0s etcd member-list` on a control plane."""
-        out = self.nodes[node_index].exec_allow_fail(
-            f"{self._sudo_prefix()}k0s etcd member-list 2>/dev/null"
-        )
-        return len(re.findall(r"https?://[^\"]+:2380", out))
+    def etcd_member_count(self) -> int:
+        """Ground-truth etcd quorum size via `k0s etcd member-list`. Runs on a control-plane node
+        (etcd only exists there; node 0 may be a worker since CPs are chosen by lexical order)."""
+        cps = set(self.k8s_control_planes())
+        for i, name in enumerate(self.node_names):
+            if name not in cps:
+                continue
+            out = self.nodes[i].exec_allow_fail(
+                f"{self._sudo_prefix()}k0s etcd member-list 2>/dev/null"
+            )
+            members = re.findall(r"https?://[^\"]+:2380", out)
+            if members:
+                return len(members)
+        return 0
 
     def sacct(self, args: list[str]) -> str:
         return self.cli(["sacct"] + args)
