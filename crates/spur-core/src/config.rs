@@ -303,11 +303,41 @@ pub struct ControllerConfig {
     /// with `JobHoldMaxRequeue`. Configured in TOML as `[controller] max_batch_requeue` (default: 5).
     #[serde(default = "default_max_batch_requeue")]
     pub max_batch_requeue: u32,
+
+    /// Upper bound on the hold placed between automatic requeues after a launch
+    /// failure. The hold doubles per attempt, so this caps how long a job with a
+    /// large `max_batch_requeue` can wait between retries. Configured in TOML as
+    /// `[controller] max_launch_backoff_secs` (default: 300).
+    #[serde(default = "default_max_launch_backoff_secs")]
+    pub max_launch_backoff_secs: u64,
+
+    /// Hold a job at priority 0 when its prolog fails, instead of requeueing it
+    /// for another attempt. On by default: a prolog receives the job's own
+    /// context, so the same failure recurs on every node, and retrying would
+    /// drain one node per attempt. Turning it off restores the retry, bounded by
+    /// `max_batch_requeue`. Configured in TOML as
+    /// `[controller] hold_on_prolog_fail` (default: true). Slurm's equivalent is
+    /// the inverse `SchedulerParameters=nohold_on_prolog_fail`.
+    #[serde(default = "default_hold_on_prolog_fail")]
+    pub hold_on_prolog_fail: bool,
 }
 
 fn default_max_batch_requeue() -> u32 {
     5
 }
+
+fn default_hold_on_prolog_fail() -> bool {
+    true
+}
+
+fn default_max_launch_backoff_secs() -> u64 {
+    300
+}
+
+/// Upper bound for `max_launch_backoff_secs`. A per-attempt retry hold beyond a
+/// day is not a retry policy, and larger values push the computed hold instant
+/// out of chrono's representable range.
+pub const MAX_LAUNCH_BACKOFF_SECS: u64 = 86_400;
 
 fn default_listen_addr() -> String {
     "[::]:6817".into()
@@ -342,6 +372,8 @@ impl Default for ControllerConfig {
             raft_listen_addr: "[::]:6821".into(),
             heartbeat_timeout_secs: None,
             max_batch_requeue: default_max_batch_requeue(),
+            max_launch_backoff_secs: default_max_launch_backoff_secs(),
+            hold_on_prolog_fail: default_hold_on_prolog_fail(),
         }
     }
 }
@@ -1083,6 +1115,20 @@ impl SlurmConfig {
                 value: "0 (must be at least 1)".into(),
             });
         }
+        // Zero would clamp every launch-failure hold to zero, restoring the tight
+        // re-dispatch loop the backoff exists to prevent. The upper bound keeps
+        // the hold instant representable.
+        if self.controller.max_launch_backoff_secs == 0
+            || self.controller.max_launch_backoff_secs > MAX_LAUNCH_BACKOFF_SECS
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.max_launch_backoff_secs".into(),
+                value: format!(
+                    "{} (must be between 1 and {})",
+                    self.controller.max_launch_backoff_secs, MAX_LAUNCH_BACKOFF_SECS
+                ),
+            });
+        }
         if self.cluster.enabled {
             if self.cluster.distro != "k0s" {
                 return Err(ConfigError::InvalidValue {
@@ -1732,6 +1778,20 @@ deny_accounts = ["student"]
         let config = ControllerConfig::default();
         assert_eq!(config.heartbeat_timeout_secs, None);
         assert_eq!(config.max_batch_requeue, 5);
+        assert_eq!(config.max_launch_backoff_secs, 300);
+        assert!(config.hold_on_prolog_fail);
+    }
+
+    #[test]
+    fn controller_config_parses_hold_on_prolog_fail() {
+        let toml = r#"
+cluster_name = "test"
+
+[controller]
+hold_on_prolog_fail = false
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert!(!config.controller.hold_on_prolog_fail);
     }
 
     #[test]
@@ -1757,6 +1817,71 @@ max_batch_requeue = 0
         let err = SlurmConfig::load_from_str(toml).unwrap_err();
         assert!(
             err.to_string().contains("max_batch_requeue"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn controller_config_parses_max_launch_backoff_secs() {
+        let toml = r#"
+cluster_name = "test"
+
+[controller]
+max_launch_backoff_secs = 90
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.controller.max_launch_backoff_secs, 90);
+    }
+
+    #[test]
+    fn controller_config_rejects_out_of_range_max_launch_backoff_secs() {
+        // Past this bound the computed hold instant overflows and panics the
+        // controller, so it must be refused at load rather than at first use.
+        let toml = format!(
+            r#"
+cluster_name = "test"
+
+[controller]
+max_launch_backoff_secs = {}
+"#,
+            MAX_LAUNCH_BACKOFF_SECS + 1
+        );
+        let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("max_launch_backoff_secs"),
+            "unexpected error: {err}"
+        );
+
+        let ok = format!(
+            r#"
+cluster_name = "test"
+
+[controller]
+max_launch_backoff_secs = {MAX_LAUNCH_BACKOFF_SECS}
+"#
+        );
+        assert_eq!(
+            SlurmConfig::load_from_str(&ok)
+                .unwrap()
+                .controller
+                .max_launch_backoff_secs,
+            MAX_LAUNCH_BACKOFF_SECS,
+            "the bound itself must be accepted"
+        );
+    }
+
+    #[test]
+    fn controller_config_rejects_zero_max_launch_backoff_secs() {
+        // Zero would clamp every hold to zero and restore the retry storm.
+        let toml = r#"
+cluster_name = "test"
+
+[controller]
+max_launch_backoff_secs = 0
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("max_launch_backoff_secs"),
             "unexpected error: {err}"
         );
     }

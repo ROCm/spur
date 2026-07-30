@@ -767,11 +767,36 @@ struct LaunchOutcome {
     stderr_path: String,
 }
 
+/// A failed dispatch, keeping the agent's classification of the failure so the
+/// controller can choose a response rather than string-matching the message.
+enum DispatchError {
+    /// The node ran the job's prolog and it failed. The prolog sees the job's
+    /// own context, so the same failure recurs everywhere: Slurm drains the node
+    /// and holds the job instead of retrying it onto the next one.
+    PrologFailed(String),
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for DispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PrologFailed(reason) => write!(f, "agent rejected job: {reason}"),
+            Self::Other(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl<E: Into<anyhow::Error>> From<E> for DispatchError {
+    fn from(e: E) -> Self {
+        Self::Other(e.into())
+    }
+}
+
 /// Send a LaunchJob RPC to a node agent.
 async fn dispatch_to_agent(
     agent_addr: &str,
     params: &AgentDispatchParams<'_>,
-) -> anyhow::Result<LaunchOutcome> {
+) -> Result<LaunchOutcome, DispatchError> {
     let mut client = SlurmAgentClient::connect(agent_addr.to_string())
         .await?
         .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
@@ -919,14 +944,23 @@ async fn dispatch_to_agent(
         .await?;
 
     let inner = response.into_inner();
-    if inner.success {
-        info!(
-            job_id = params.job_id,
-            "job dispatched to agent successfully"
+    if !inner.success {
+        // An agent predating the classification sends UNSPECIFIED, which falls
+        // through to the generic requeue this has always done.
+        return Err(
+            if inner.failure_kind
+                == spur_proto::proto::LaunchFailureKind::LaunchFailureProlog as i32
+            {
+                DispatchError::PrologFailed(inner.error)
+            } else {
+                DispatchError::Other(anyhow::anyhow!("agent rejected job: {}", inner.error))
+            },
         );
-    } else {
-        anyhow::bail!("agent rejected job: {}", inner.error);
     }
+    info!(
+        job_id = params.job_id,
+        "job dispatched to agent successfully"
+    );
 
     Ok(LaunchOutcome {
         stdout_path: inner.stdout_path,
@@ -1105,6 +1139,7 @@ async fn dispatch_job_to_nodes(
     let mut successes = 0u32;
     let mut failures = 0u32;
     let mut succeeded_nodes: Vec<String> = Vec::new();
+    let mut prolog_failed: Vec<(String, String)> = Vec::new();
     let total = dispatch_nodes.len() as u32;
 
     // Batch stdout/stderr live on the primary node (task_offset == 0). Capture
@@ -1171,6 +1206,9 @@ async fn dispatch_job_to_nodes(
             Ok((node_name, _, Err(e))) => {
                 error!(job_id, node = %node_name, error = %e, "dispatch to agent failed");
                 failures += 1;
+                if let DispatchError::PrologFailed(reason) = e {
+                    prolog_failed.push((node_name, reason));
+                }
             }
             Err(e) => {
                 error!(job_id, error = %e, "dispatch task panicked");
@@ -1188,6 +1226,18 @@ async fn dispatch_job_to_nodes(
         }
     }
 
+    // Drain before deciding the job's fate, so the failing node is already out
+    // of the candidate set if the job does go back to Pending. The drain is
+    // issued here rather than by the agent because only the controller can pair
+    // it with the hold that stops the job walking the cluster.
+    let hold = !prolog_failed.is_empty() && cluster.config.controller.hold_on_prolog_fail;
+    for (node_name, reason) in &prolog_failed {
+        warn!(job_id, node = %node_name, reason = %reason, "draining node after prolog failure");
+        if let Err(e) = cluster.drain_node(node_name, Some(reason.clone())) {
+            error!(job_id, node = %node_name, error = %e, "failed to drain node after prolog failure");
+        }
+    }
+
     // If ALL dispatches failed, requeue the job back to Pending
     // so the scheduler can retry (e.g., container image may be
     // imported later, or a transient agent error may resolve) rather
@@ -1197,8 +1247,20 @@ async fn dispatch_job_to_nodes(
             job_id,
             failures, "all dispatches failed — requeueing job to Pending"
         );
-        if let Err(e) = cluster.requeue_job(job_id) {
+        if let Err(e) = finish_failed_dispatch(&cluster, job_id, &spec, hold) {
             error!(job_id, error = %e, "failed to requeue job after dispatch failure");
+        }
+    } else if hold {
+        // Same ordering rationale as the eviction branch below: stop what did
+        // launch before the job can be touched again. Eviction itself is wrong
+        // here, since it routes through maybe_requeue and would drop the hold.
+        warn!(
+            job_id,
+            successes, failures, "prolog failed on part of the allocation — holding job"
+        );
+        cancel_job_on_nodes(&cluster, job_id, &succeeded_nodes, 9).await;
+        if let Err(e) = finish_failed_dispatch(&cluster, job_id, &spec, true) {
+            error!(job_id, error = %e, "failed to hold job after prolog failure");
         }
     } else if failures > 0 {
         // A node that never got the dispatch will never report completion, so evict
@@ -1220,6 +1282,24 @@ async fn dispatch_job_to_nodes(
             error!(job_id, error = %e, "failed to evict job after partial dispatch failure");
         }
     }
+}
+
+/// Settle a job whose dispatch failed: requeue it, or hold it when the failure
+/// would follow it to the next node.
+///
+/// Interactive jobs are cancelled instead of held, matching both Slurm ("only
+/// batch jobs can be requeued, interactive jobs will be cancelled") and the
+/// PrologSlurmctld arm above. Holding one would strand the waiting `srun`.
+fn finish_failed_dispatch(
+    cluster: &ClusterManager,
+    job_id: spur_core::job::JobId,
+    spec: &spur_core::job::JobSpec,
+    hold: bool,
+) -> anyhow::Result<()> {
+    if hold && spec.interactive {
+        return cluster.cancel_job(job_id, &spec.user);
+    }
+    cluster.requeue_after_launch_failure(job_id, hold)
 }
 
 /// Watchdog: gracefully terminate running jobs that exceed their time limit.
@@ -2018,11 +2098,13 @@ mod tests {
         use tonic::transport::server::TcpIncoming;
         use tonic::transport::Server;
 
-        /// Minimal SlurmAgent: always accepts launch_job and counts cancel_job
-        /// calls, so tests can assert the controller actually tried to stop
-        /// the job on nodes that did launch it.
+        /// Minimal SlurmAgent: counts cancel_job calls, so tests can assert the
+        /// controller actually tried to stop the job on nodes that did launch
+        /// it. `reject_launch_as` makes launch_job fail with a given
+        /// classification instead of succeeding.
         struct MockAgent {
             cancel_calls: Arc<AtomicU32>,
+            reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
         }
 
         #[tonic::async_trait]
@@ -2037,6 +2119,15 @@ mod tests {
                 request: tonic::Request<spur_proto::proto::LaunchJobRequest>,
             ) -> Result<tonic::Response<spur_proto::proto::LaunchJobResponse>, tonic::Status>
             {
+                if let Some(kind) = self.reject_launch_as {
+                    return Ok(tonic::Response::new(spur_proto::proto::LaunchJobResponse {
+                        success: false,
+                        error: "prolog failed: prolog_slurmd script exited with exit status: 1"
+                            .into(),
+                        failure_kind: kind as i32,
+                        ..Default::default()
+                    }));
+                }
                 // Echo a path keyed by task_offset so tests can assert the
                 // controller keeps the primary node's (task_offset == 0) path.
                 let req = request.into_inner();
@@ -2046,6 +2137,7 @@ mod tests {
                     error: String::new(),
                     stdout_path: path.clone(),
                     stderr_path: path,
+                    ..Default::default()
                 }))
             }
 
@@ -2172,11 +2264,18 @@ mod tests {
         /// Spawn a real MockAgent gRPC server on an OS-assigned localhost
         /// port. Returns the bound address and the shared cancel-call counter.
         async fn spawn_mock_agent() -> (std::net::SocketAddr, Arc<AtomicU32>) {
+            spawn_mock_agent_rejecting(None).await
+        }
+
+        async fn spawn_mock_agent_rejecting(
+            reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
+        ) -> (std::net::SocketAddr, Arc<AtomicU32>) {
             let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
             let addr = incoming.local_addr().unwrap();
             let cancel_calls = Arc::new(AtomicU32::new(0));
             let agent = MockAgent {
                 cancel_calls: cancel_calls.clone(),
+                reject_launch_as,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -2249,7 +2348,14 @@ mod tests {
         }
 
         async fn test_cluster(dir: &TempDir) -> Arc<ClusterManager> {
-            let cm = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+            test_cluster_with_config(dir, test_config()).await
+        }
+
+        async fn test_cluster_with_config(
+            dir: &TempDir,
+            config: SlurmConfig,
+        ) -> Arc<ClusterManager> {
+            let cm = Arc::new(ClusterManager::new(config, dir.path()).unwrap());
             let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
                 .await
                 .unwrap();
@@ -2761,6 +2867,249 @@ mod tests {
                 "a partial dispatch failure must not record an output path"
             );
             assert!(job.actual_stderr_path.is_none());
+        }
+
+        // ── prolog failure: drain the node, hold the job ──
+
+        /// Start `spec` on `nodes` and run the real dispatch against them.
+        async fn dispatch_started_job(
+            cm: &Arc<ClusterManager>,
+            job_id: spur_core::job::JobId,
+            nodes: &[&str],
+        ) {
+            let nodes: Vec<String> = nodes.iter().map(|n| n.to_string()).collect();
+            let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
+                .iter()
+                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+            let run_attempt = cm
+                .start_job(
+                    job_id,
+                    nodes.clone(),
+                    ResourceAllocations::with_scalar(nodes.len() as u32, 0),
+                    per_node_allocs.clone(),
+                )
+                .unwrap();
+            settle(cm, job_id, spur_core::job::JobState::Running);
+
+            let spec = cm.get_job(job_id).unwrap().spec;
+            let nodelist = nodes.join(",");
+            dispatch_job_to_nodes(
+                cm.clone(),
+                job_id,
+                nodes,
+                spec,
+                Vec::new(),
+                per_node_allocs,
+                nodelist,
+                1,
+                run_attempt,
+            )
+            .await;
+        }
+
+        fn batch_spec(name: &str, num_nodes: u32) -> JobSpec {
+            JobSpec {
+                name: name.into(),
+                user: "testuser".into(),
+                num_nodes,
+                num_tasks: num_nodes,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_prolog_failure_drains_the_node_and_parks_the_job() {
+            use spur_core::job::{JobState, PendingReason};
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (addr, _) = spawn_mock_agent_rejecting(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureProlog,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("prolog-fail", 1));
+            dispatch_started_job(&cm, job_id, &["n1"]).await;
+            settle(&cm, job_id, JobState::Pending);
+
+            let node = cm.get_node("n1").unwrap();
+            assert!(
+                node.state.is_admin_hold(),
+                "the node that ran the failing prolog must stop taking work"
+            );
+            assert!(
+                node.state_reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("prolog")),
+                "operators need the prolog's own failure, got {:?}",
+                node.state_reason
+            );
+
+            // The hold is what bounds the drain to one node: without it the job
+            // retries onto the next node and drains that one too.
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.pending_reason, PendingReason::Held);
+            assert_eq!(job.priority, 0);
+            assert_eq!(
+                job.state_reason_display(),
+                crate::cluster::LAUNCH_FAILURE_HELD_DESC
+            );
+            assert!(
+                !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+                "a held job must not be scheduled anywhere"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn an_operator_can_release_a_job_held_for_a_prolog_failure() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (addr, _) = spawn_mock_agent_rejecting(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureProlog,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("prolog-release", 1));
+            dispatch_started_job(&cm, job_id, &["n1"]).await;
+            settle(&cm, job_id, JobState::Pending);
+
+            cm.release_job(job_id).unwrap();
+            wait_for("job released", || {
+                cm.get_job(job_id).is_some_and(|j| j.priority > 0)
+            });
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(
+                job.pending_reason_desc, None,
+                "the release must clear the description with the reason"
+            );
+            assert!(cm.pending_jobs().iter().any(|j| j.job_id == job_id));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn hold_on_prolog_fail_off_retries_the_job_instead() {
+            use spur_core::job::{JobState, PendingReason};
+
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.controller.hold_on_prolog_fail = false;
+            let cm = test_cluster_with_config(&dir, config).await;
+
+            let (addr, _) = spawn_mock_agent_rejecting(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureProlog,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("prolog-retry", 1));
+            dispatch_started_job(&cm, job_id, &["n1"]).await;
+            settle(&cm, job_id, JobState::Pending);
+
+            // Slurm's nohold_on_prolog_fail: retry, bounded by max_batch_requeue
+            // rather than by a hold. The node still drains.
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+            assert_ne!(job.priority, 0);
+            assert!(job.spec.begin_time.is_some_and(|b| b > Utc::now()));
+            assert!(cm.get_node("n1").unwrap().state.is_admin_hold());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn an_interactive_job_is_cancelled_rather_than_held() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (addr, _) = spawn_mock_agent_rejecting(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureProlog,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            // Holding an interactive job would leave its srun waiting forever
+            // with nothing to wait for. Slurm cancels these too.
+            let mut spec = batch_spec("prolog-interactive", 1);
+            spec.interactive = true;
+            let job_id = submit_and_wait(&cm, spec);
+            dispatch_started_job(&cm, job_id, &["n1"]).await;
+            settle(&cm, job_id, JobState::Cancelled);
+
+            assert!(
+                cm.get_node("n1").unwrap().state.is_admin_hold(),
+                "the node is broken regardless of what happens to the job"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn an_unclassified_rejection_keeps_the_plain_requeue_path() {
+            use spur_core::job::{JobState, PendingReason};
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            // What an agent predating the classification sends.
+            let (addr, _) = spawn_mock_agent_rejecting(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureUnspecified,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("unclassified", 1));
+            dispatch_started_job(&cm, job_id, &["n1"]).await;
+            settle(&cm, job_id, JobState::Pending);
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+            assert_ne!(job.priority, 0, "no hold without a classification");
+            assert!(
+                !cm.get_node("n1").unwrap().state.is_admin_hold(),
+                "an unclassified rejection is not grounds to drain"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn only_the_node_whose_prolog_failed_drains() {
+            use spur_core::job::{JobState, PendingReason};
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (good_addr, cancel_calls) = spawn_mock_agent().await;
+            let (bad_addr, _) = spawn_mock_agent_rejecting(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureProlog,
+            ))
+            .await;
+            register_node_at(&cm, "n1", good_addr);
+            register_node_at(&cm, "n2", bad_addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("prolog-partial", 2));
+            dispatch_started_job(&cm, job_id, &["n1", "n2"]).await;
+            settle(&cm, job_id, JobState::Pending);
+
+            assert!(!cm.get_node("n1").unwrap().state.is_admin_hold());
+            assert!(cm.get_node("n2").unwrap().state.is_admin_hold());
+
+            // The partial branch must hold like the total one; evicting would
+            // route through maybe_requeue and drop the hold.
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.pending_reason, PendingReason::Held);
+            assert_eq!(job.priority, 0);
+
+            assert_eq!(
+                cancel_calls.load(Ordering::SeqCst),
+                1,
+                "n1 launched the job, so it must be stopped before the job settles"
+            );
         }
     }
 

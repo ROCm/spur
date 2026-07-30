@@ -309,6 +309,13 @@ impl PendingReason {
         )
     }
 
+    /// True when this reason is set alongside a `begin_time` hold to explain it.
+    /// Any other reason on a held job is unrelated to the hold, so recomputing
+    /// it loses nothing.
+    pub fn explains_begin_hold(&self) -> bool {
+        matches!(self, Self::BeginTime | Self::JobLaunchFailure)
+    }
+
     pub fn display(&self) -> &'static str {
         match self {
             Self::None => "None",
@@ -652,6 +659,13 @@ pub struct Job {
     pub spec: JobSpec,
     pub state: JobState,
     pub pending_reason: PendingReason,
+    /// Slurm's `state_desc`: overrides `pending_reason` in user-facing output
+    /// when set, letting a hold say more than its reason code can. Written only
+    /// through [`Job::set_pending_reason`] and
+    /// [`Job::set_pending_reason_desc`], so it cannot outlive the reason it
+    /// explains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_reason_desc: Option<String>,
     pub priority: u32,
 
     pub submit_time: DateTime<Utc>,
@@ -749,6 +763,7 @@ impl Job {
             spec,
             state,
             pending_reason,
+            pending_reason_desc: None,
             priority,
             submit_time: Utc::now(),
             start_time: None,
@@ -1023,6 +1038,46 @@ pub enum TransitionOutcome {
 }
 
 impl Job {
+    /// True while a future `begin_time` defers this job's start, whether it came
+    /// from `--begin`, a preemption requeue, or a launch-failure backoff.
+    pub fn is_begin_held(&self, now: DateTime<Utc>) -> bool {
+        self.spec.begin_time.is_some_and(|begin| now < begin)
+    }
+
+    /// True when this job's `pending_reason` exists to explain an active
+    /// `begin_time` hold, so passes that recompute reasons must leave it alone:
+    /// a generic wait reason would overwrite it before anyone could read it.
+    ///
+    /// Narrower than [`Job::is_begin_held`] on purpose. A `--begin` job still
+    /// needs its real blocking reason (bad partition, unmet dependency) surfaced
+    /// during the wait, and only the hold-explaining reasons are worth keeping.
+    pub fn reason_explains_begin_hold(&self, now: DateTime<Utc>) -> bool {
+        self.is_begin_held(now) && self.pending_reason.explains_begin_hold()
+    }
+
+    /// Set the scheduling reason, dropping any description the previous reason
+    /// carried. Every write to `pending_reason` goes through here or
+    /// [`Job::set_pending_reason_desc`]: a description left behind by an
+    /// earlier reason would mask the new one everywhere it is displayed.
+    pub fn set_pending_reason(&mut self, reason: PendingReason) {
+        self.pending_reason = reason;
+        self.pending_reason_desc = None;
+    }
+
+    /// Set the reason together with a Slurm-style `state_desc` override.
+    pub fn set_pending_reason_desc(&mut self, reason: PendingReason, desc: impl Into<String>) {
+        self.pending_reason = reason;
+        self.pending_reason_desc = Some(desc.into());
+    }
+
+    /// The reason as users see it. Mirrors Slurm, where a `state_desc` wins
+    /// over the reason code in both `squeue` and `scontrol show job`.
+    pub fn state_reason_display(&self) -> &str {
+        self.pending_reason_desc
+            .as_deref()
+            .unwrap_or_else(|| self.pending_reason.display())
+    }
+
     /// Attempt a state transition, enforcing the state machine.
     pub fn transition(&mut self, to: JobState) -> Result<(), JobTransitionError> {
         let valid = match (self.state, to) {
@@ -1807,6 +1862,76 @@ mod tests {
         );
         assert_eq!(PendingReason::OutOfMemory.display(), "OutOfMemory");
         assert_eq!(PendingReason::BootFail.display(), "BootFailure");
+    }
+
+    #[test]
+    fn a_description_overrides_the_reason_code_in_user_facing_output() {
+        // Mirrors Slurm, where squeue and scontrol print state_desc when it is
+        // set and fall back to the state_reason code when it is not.
+        let mut job = make_job();
+        job.set_pending_reason(PendingReason::Held);
+        assert_eq!(job.state_reason_display(), "JobHeldUser");
+
+        job.set_pending_reason_desc(PendingReason::Held, "launch failed requeued held");
+        assert_eq!(job.state_reason_display(), "launch failed requeued held");
+        assert_eq!(
+            job.pending_reason,
+            PendingReason::Held,
+            "the description explains the code, it does not replace it"
+        );
+    }
+
+    #[test]
+    fn a_new_reason_never_inherits_the_previous_description() {
+        // The whole point of routing writes through the setters: a description
+        // left behind by an earlier hold would masquerade as the current reason
+        // everywhere the job is displayed.
+        let mut job = make_job();
+        job.set_pending_reason_desc(PendingReason::Held, "launch failed requeued held");
+
+        job.set_pending_reason(PendingReason::JobHoldMaxRequeue);
+
+        assert_eq!(job.pending_reason_desc, None);
+        assert_eq!(job.state_reason_display(), "JobHoldMaxRequeue");
+    }
+
+    #[test]
+    fn a_job_snapshot_without_a_description_still_deserializes() {
+        // Pre-upgrade snapshots carry no pending_reason_desc; they must load
+        // with the field absent rather than failing the whole replay.
+        let mut job = make_job();
+        job.set_pending_reason(PendingReason::Held);
+
+        let mut value = serde_json::to_value(&job).expect("serialize job");
+        assert!(
+            value.get("pending_reason_desc").is_none(),
+            "an absent description must not be written out"
+        );
+        value.as_object_mut().unwrap().remove("pending_reason_desc");
+
+        let back: Job = serde_json::from_value(value).expect("deserialize job");
+        assert_eq!(back.pending_reason_desc, None);
+        assert_eq!(back.state_reason_display(), "JobHeldUser");
+    }
+
+    #[test]
+    fn is_begin_held_tracks_the_hold_window_regardless_of_reason() {
+        let now = Utc::now();
+        let mut job = make_job();
+
+        assert!(!job.is_begin_held(now), "no begin_time means not held");
+
+        job.spec.begin_time = Some(now + chrono::Duration::seconds(30));
+        assert!(job.is_begin_held(now));
+
+        // The predicate is keyed on the hold window alone: a launch-failure
+        // backoff must be recognised as held even though its reason is not
+        // BeginTime, otherwise the reason gets overwritten while it waits.
+        job.pending_reason = PendingReason::JobLaunchFailure;
+        assert!(job.is_begin_held(now));
+
+        job.spec.begin_time = Some(now - chrono::Duration::seconds(1));
+        assert!(!job.is_begin_held(now), "a lapsed hold no longer defers");
     }
 
     #[test]

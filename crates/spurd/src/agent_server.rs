@@ -458,7 +458,7 @@ impl Drop for LaunchReservationGuard {
     }
 }
 
-fn completion_report_retryable(status: &tonic::Status) -> bool {
+fn controller_rpc_retryable(status: &tonic::Status) -> bool {
     use tonic::Code;
     matches!(
         status.code(),
@@ -466,21 +466,154 @@ fn completion_report_retryable(status: &tonic::Status) -> bool {
     )
 }
 
+const CONTROLLER_RPC_ATTEMPTS: u32 = 3;
+const CONTROLLER_RPC_RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A single failed attempt at a controller RPC.
+enum ControllerRpcError {
+    Connect(tonic::transport::Error),
+    Rpc(tonic::Status),
+}
+
+impl ControllerRpcError {
+    /// A transport failure is always worth another attempt: it says nothing
+    /// about the request, only that no controller answered. A server response
+    /// is worth one only when its code says so.
+    fn retryable(&self) -> bool {
+        match self {
+            Self::Connect(_) => true,
+            Self::Rpc(status) => controller_rpc_retryable(status),
+        }
+    }
+}
+
+impl std::fmt::Display for ControllerRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connect(e) => write!(f, "connect: {e}"),
+            Self::Rpc(status) => write!(f, "{status}"),
+        }
+    }
+}
+
+/// Run `attempt` until it succeeds, fails in a way no retry can fix, or spends
+/// the attempt budget, returning the last failure. A single transient failure
+/// must not lose a job completion or leave a broken node accepting work.
+async fn retry_controller_rpc<T, F, Fut>(mut attempt: F) -> Result<T, ControllerRpcError>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<T, ControllerRpcError>>,
+{
+    let mut n = 1;
+    loop {
+        match attempt(n).await {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                if !e.retryable() || n == CONTROLLER_RPC_ATTEMPTS {
+                    return Err(e);
+                }
+                n += 1;
+                tokio::time::sleep(CONTROLLER_RPC_RETRY_GAP).await;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
-mod completion_report_tests {
-    use super::completion_report_retryable;
+mod controller_rpc_tests {
+    use super::{
+        controller_rpc_retryable, retry_controller_rpc, ControllerRpcError,
+        CONTROLLER_RPC_ATTEMPTS, CONTROLLER_RPC_RETRY_GAP,
+    };
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
     use tonic::Status;
 
     #[test]
     fn permanent_errors_are_not_retryable() {
-        assert!(!completion_report_retryable(&Status::invalid_argument("x")));
-        assert!(!completion_report_retryable(&Status::not_found("x")));
+        assert!(!controller_rpc_retryable(&Status::invalid_argument("x")));
+        assert!(!controller_rpc_retryable(&Status::not_found("x")));
     }
 
     #[test]
     fn transient_errors_are_retryable() {
-        assert!(completion_report_retryable(&Status::unavailable("x")));
-        assert!(completion_report_retryable(&Status::internal("x")));
+        assert!(controller_rpc_retryable(&Status::unavailable("x")));
+        assert!(controller_rpc_retryable(&Status::internal("x")));
+    }
+
+    /// Drive the retry loop with one scripted outcome per attempt, reporting how
+    /// many attempts it actually made.
+    async fn run_script(script: Vec<Result<(), Status>>) -> (Result<(), ControllerRpcError>, u32) {
+        let calls = AtomicU32::new(0);
+        let result = retry_controller_rpc(|_| {
+            let outcome = script[calls.fetch_add(1, Ordering::SeqCst) as usize].clone();
+            async move { outcome.map_err(ControllerRpcError::Rpc) }
+        })
+        .await;
+        (result, calls.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn success_returns_on_the_first_attempt() {
+        let start = tokio::time::Instant::now();
+        let (result, calls) = run_script(vec![
+            Ok(()),
+            Err(Status::unavailable("must not be reached")),
+            Err(Status::unavailable("must not be reached")),
+        ])
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls, 1);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    /// A rejection no retry can fix must not spend the budget: the caller runs in
+    /// a spawned task, and sleeping through attempts delays the drain that stops
+    /// the node taking more work. The trailing successes make a regression here
+    /// surface as a wrong result rather than a short script.
+    #[tokio::test(start_paused = true)]
+    async fn non_retryable_error_gives_up_without_retrying() {
+        let start = tokio::time::Instant::now();
+        let (result, calls) = run_script(vec![
+            Err(Status::invalid_argument("unknown node")),
+            Ok(()),
+            Ok(()),
+        ])
+        .await;
+
+        assert!(matches!(result, Err(ControllerRpcError::Rpc(_))));
+        assert_eq!(calls, 1);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retryable_errors_are_retried_until_one_succeeds() {
+        let start = tokio::time::Instant::now();
+        let (result, calls) = run_script(vec![
+            Err(Status::unavailable("controller restarting")),
+            Err(Status::internal("leader election in progress")),
+            Ok(()),
+        ])
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls, CONTROLLER_RPC_ATTEMPTS);
+        assert_eq!(start.elapsed(), 2 * CONTROLLER_RPC_RETRY_GAP);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retryable_errors_give_up_once_the_budget_is_spent() {
+        let start = tokio::time::Instant::now();
+        let script = vec![Err(Status::unavailable("no route")); CONTROLLER_RPC_ATTEMPTS as usize];
+        let (result, calls) = run_script(script).await;
+
+        assert!(matches!(result, Err(ControllerRpcError::Rpc(_))));
+        assert_eq!(calls, CONTROLLER_RPC_ATTEMPTS);
+        assert_eq!(
+            start.elapsed(),
+            (CONTROLLER_RPC_ATTEMPTS - 1) * CONTROLLER_RPC_RETRY_GAP
+        );
     }
 }
 
@@ -590,70 +723,65 @@ async fn report_completion(
     // RaisedSignal outcome from the reported `signal`.
     let state = spur_core::job::JobState::completion_state_for_exit_code(exit_code).to_proto_i32();
 
-    // Retry up to 3 times with 1-second backoff — a single transient failure
-    // must not permanently lose a job completion.
-    for attempt in 1..=3 {
-        match spur_client::connect_channel(controller_addr).await {
-            Ok(channel) => {
-                let mut client = spur_proto::controller_client(channel);
-                let req = ReportJobStatusRequest {
-                    job_id,
-                    state,
-                    exit_code,
-                    signal,
-                    message: format!("exit_code={}", exit_code),
-                    drain_node: drain.is_some(),
-                    drain_reason: drain.as_ref().map(|d| d.reason.clone()).unwrap_or_default(),
-                    reporting_node: reporting_node.to_string(),
-                    run_attempt,
-                };
-                match client.report_job_status(req).await {
-                    Ok(_) => {
-                        info!(
-                            job_id,
-                            exit_code,
-                            controller = %controller_addr,
-                            "reported completion to controller"
-                        );
-                        return;
-                    }
-                    Err(e) => {
-                        if !completion_report_retryable(&e) {
-                            error!(
-                                job_id,
-                                attempt,
-                                code = ?e.code(),
-                                error = %e,
-                                "ReportJobStatus failed with non-retryable error"
-                            );
-                            return;
-                        }
-                        warn!(
-                            job_id,
-                            attempt,
-                            error = %e,
-                            "ReportJobStatus RPC failed"
-                        );
-                    }
-                }
-            }
-            Err(e) => {
+    let result = retry_controller_rpc(move |attempt| async move {
+        let channel = spur_client::connect_channel(controller_addr)
+            .await
+            .map_err(|e| {
                 warn!(
                     job_id,
                     attempt,
                     error = %e,
                     "failed to connect to controller for completion report"
                 );
-            }
-        }
-        if attempt < 3 {
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        }
+                ControllerRpcError::Connect(e)
+            })?;
+        let req = ReportJobStatusRequest {
+            job_id,
+            state,
+            exit_code,
+            signal,
+            message: format!("exit_code={}", exit_code),
+            drain_node: drain.is_some(),
+            drain_reason: drain.as_ref().map(|d| d.reason.clone()).unwrap_or_default(),
+            reporting_node: reporting_node.to_string(),
+            run_attempt,
+        };
+        spur_proto::controller_client(channel)
+            .report_job_status(req)
+            .await
+            .map_err(|e| {
+                warn!(
+                    job_id,
+                    attempt,
+                    error = %e,
+                    "ReportJobStatus RPC failed"
+                );
+                ControllerRpcError::Rpc(e)
+            })
+    })
+    .await;
+
+    match result {
+        Ok(_) => info!(
+            job_id,
+            exit_code,
+            controller = %controller_addr,
+            "reported completion to controller"
+        ),
+        Err(e) if e.retryable() => error!(
+            job_id,
+            exit_code,
+            attempts = CONTROLLER_RPC_ATTEMPTS,
+            error = %e,
+            "gave up reporting completion to controller"
+        ),
+        Err(e) => error!(
+            job_id,
+            exit_code,
+            error = %e,
+            "ReportJobStatus failed with non-retryable error"
+        ),
     }
-    error!(
-        job_id,
-        exit_code, "gave up reporting completion after 3 attempts"
-    );
 }
 
 fn warn_mpi_mpirun_skipped_affinity(job_id: u32, source: &HashMap<String, String>) {
@@ -667,6 +795,67 @@ fn warn_mpi_mpirun_skipped_affinity(job_id: u32, source: &HashMap<String, String
             gpu_bind,
             "multi-rank --mpi=pmix launches via mpirun --bind-to none; Spur CPU/GPU bind env is not applied to MPI ranks"
         );
+    }
+}
+
+/// Drain this node without reporting a job completion. The controller's dispatch
+/// path already owns the job's fate, so reporting an exit code here would race it
+/// and could finalize a still-retryable job to Failed, which no requeue recovers.
+async fn request_node_drain(controller_addr: &str, node_name: &str, reason: &str, job_id: u32) {
+    let result = retry_controller_rpc(move |attempt| async move {
+        let channel = spur_client::connect_channel(controller_addr)
+            .await
+            .map_err(|e| {
+                warn!(
+                    job_id,
+                    node = %node_name,
+                    attempt,
+                    error = %e,
+                    "failed to connect to controller for drain request"
+                );
+                ControllerRpcError::Connect(e)
+            })?;
+        let req = DrainNodeRequest {
+            name: node_name.to_string(),
+            reason: reason.to_string(),
+        };
+        spur_proto::controller_client(channel)
+            .drain_node(req)
+            .await
+            .map_err(|e| {
+                warn!(
+                    job_id,
+                    node = %node_name,
+                    attempt,
+                    error = %e,
+                    "DrainNode RPC failed"
+                );
+                ControllerRpcError::Rpc(e)
+            })
+    })
+    .await;
+
+    match result {
+        Ok(resp) => warn!(
+            job_id,
+            node = %node_name,
+            state = %resp.into_inner().actual_state,
+            reason = %reason,
+            "requested node drain after launch failure"
+        ),
+        Err(e) if e.retryable() => error!(
+            job_id,
+            node = %node_name,
+            attempts = CONTROLLER_RPC_ATTEMPTS,
+            error = %e,
+            "gave up requesting node drain"
+        ),
+        Err(e) => error!(
+            job_id,
+            node = %node_name,
+            error = %e,
+            "DrainNode failed with non-retryable error"
+        ),
     }
 }
 
@@ -992,31 +1181,17 @@ impl SlurmAgent for AgentService {
                 memory_mb: spec.memory_per_node_mb,
             };
             if let Err(e) = spur_core::hooks::run_hook(prolog, &ctx).await {
-                let err_msg = format!("prolog failed: {e}");
+                // No completion report and no self-drain: the controller owns
+                // both decisions here, because only it can pair the drain with
+                // the hold that stops the job walking the cluster.
+                let err_msg = format!("prolog failed: {e:#}");
                 error!(job_id, error = %err_msg, "prolog hook failed before launch");
-                let controller = self.reporter.controller_addr.clone();
-                let node_name = self.reporter.hostname.clone();
-                let drain_reason = err_msg.clone();
-                tokio::spawn(async move {
-                    let drain = DrainRequest {
-                        reason: drain_reason.clone(),
-                    };
-                    report_completion(
-                        &controller,
-                        job_id,
-                        -1,
-                        0,
-                        run_attempt,
-                        &node_name,
-                        Some(&drain),
-                    )
-                    .await;
-                });
                 return Ok(Response::new(LaunchJobResponse {
                     success: false,
                     error: err_msg,
                     stdout_path: String::new(),
                     stderr_path: String::new(),
+                    failure_kind: LaunchFailureKind::LaunchFailureProlog as i32,
                 }));
             }
         }
@@ -1155,6 +1330,7 @@ impl SlurmAgent for AgentService {
                         error: "reservation reclaimed during launch".into(),
                         stdout_path: String::new(),
                         stderr_path: String::new(),
+                        failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
                     }));
                 }
 
@@ -1204,32 +1380,26 @@ impl SlurmAgent for AgentService {
                     error: String::new(),
                     stdout_path,
                     stderr_path,
+                    failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
                 }))
             }
             Err(e) => {
                 // reservation_guard releases the allocation and PMI on this return.
-                let is_prolog_failure = matches!(e, executor::LaunchError::PrologFailed(_));
+                let drain_reason = e.drain_reason();
+                let failure_kind = match e {
+                    executor::LaunchError::PrologFailed(_) => {
+                        LaunchFailureKind::LaunchFailureProlog
+                    }
+                    _ => LaunchFailureKind::LaunchFailureUnspecified,
+                };
                 let err_msg = e.to_string();
                 error!(job_id, error = %err_msg, "failed to launch job");
 
-                if is_prolog_failure {
+                if let Some(drain_reason) = drain_reason {
                     let controller = self.reporter.controller_addr.clone();
                     let node_name = self.reporter.hostname.clone();
-                    let drain_reason = format!("prolog failed: {}", err_msg);
                     tokio::spawn(async move {
-                        let drain = DrainRequest {
-                            reason: drain_reason.clone(),
-                        };
-                        report_completion(
-                            &controller,
-                            job_id,
-                            -1,
-                            0,
-                            run_attempt,
-                            &node_name,
-                            Some(&drain),
-                        )
-                        .await;
+                        request_node_drain(&controller, &node_name, &drain_reason, job_id).await;
                     });
                 }
 
@@ -1238,6 +1408,7 @@ impl SlurmAgent for AgentService {
                     error: err_msg,
                     stdout_path: String::new(),
                     stderr_path: String::new(),
+                    failure_kind: failure_kind as i32,
                 }))
             }
         }
@@ -2755,6 +2926,109 @@ mod tests {
             String::new(),
             String::new(),
         ))
+    }
+
+    /// An executable script at a temp path that exits with `code`.
+    fn failing_hook_script(code: i32) -> tempfile::TempPath {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "#!/bin/bash\nexit {code}").unwrap();
+        let path = f.into_temp_path();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn a_failed_prolog_is_reported_to_the_controller_as_a_prolog_failure() {
+        // The controller drains and holds on this kind, so the launch must come
+        // back classified rather than as an opaque rejection the controller can
+        // only string-match. The agent itself neither drains nor reports a
+        // completion: pairing the drain with the hold is the controller's job.
+        let prolog = failing_hook_script(1);
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig {
+                prolog: Some(prolog.to_str().unwrap().to_string()),
+                ..Default::default()
+            },
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let resp = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 7,
+                spec: Some(JobSpec {
+                    name: "prolog-fail".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("a prolog failure is a launch outcome, not a transport error")
+            .into_inner();
+
+        assert!(!resp.success);
+        assert_eq!(
+            resp.failure_kind,
+            LaunchFailureKind::LaunchFailureProlog as i32
+        );
+        assert!(
+            resp.error.contains("prolog_slurmd script exited with"),
+            "the operator needs the script's own failure, got {:?}",
+            resp.error
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prolog_that_cannot_even_start_reports_the_underlying_errno() {
+        // Issue 520: `{e}` renders only the outermost context, reducing this to
+        // "prolog_slurmd script failed to execute: ..." and dropping the errno
+        // that says whether the script is missing, unreadable or not executable.
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig {
+                prolog: Some("/nonexistent/prolog.sh".into()),
+                ..Default::default()
+            },
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let resp = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 8,
+                spec: Some(JobSpec {
+                    name: "prolog-missing".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!resp.success);
+        assert_eq!(
+            resp.failure_kind,
+            LaunchFailureKind::LaunchFailureProlog as i32
+        );
+        assert!(
+            resp.error.contains("No such file or directory"),
+            "the cause chain must survive into the reported error, got {:?}",
+            resp.error
+        );
     }
 
     #[tokio::test]

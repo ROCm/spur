@@ -707,11 +707,23 @@ message LaunchJobRequest {
   PmixLaunchPlan pmix_plan = 10;
 }
 
+// Why a launch was rejected, when the controller's response depends on it.
+// Only kinds with a live emission path are listed; an agent that predates a
+// kind sends UNSPECIFIED and the controller falls back to its generic handling.
+enum LaunchFailureKind {
+  LAUNCH_FAILURE_UNSPECIFIED = 0;
+  // The node ran the job's prolog and it failed. The controller drains the node
+  // and holds the job rather than retrying, since a prolog sees the job's own
+  // context and so fails the same way everywhere.
+  LAUNCH_FAILURE_PROLOG = 1;
+}
+
 message LaunchJobResponse {
   bool success = 1;
   string error = 2;
   string stdout_path = 3;  // absolute resolved output path on the launching node
   string stderr_path = 4;
+  LaunchFailureKind failure_kind = 5;
 }
 
 message AgentCancelJobRequest {

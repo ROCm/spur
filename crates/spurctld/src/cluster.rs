@@ -39,6 +39,25 @@ use crate::limits_cache::QosCache;
 use crate::raft::{ClientResponse, JobFinalized, SpurRaft, StateMachineApply};
 use crate::sched_stats::SchedStatsCollector;
 
+/// Description shown for a job parked after a launch failure it would carry to
+/// the next node. Byte-exact with the `state_desc` Slurm sets in the same case,
+/// so operator runbooks and log greps written against Slurm keep working.
+pub const LAUNCH_FAILURE_HELD_DESC: &str = "launch failed requeued held";
+
+/// Seconds to defer a job by after its `requeue_count`-th launch failure,
+/// doubling per attempt from the same base the preemption requeue uses.
+///
+/// The shift is clamped and the result double-capped because `max_batch_requeue`
+/// and the cap are both operator-supplied: an unvalidated config must degrade
+/// rather than push the computed instant out of chrono's range and panic the
+/// controller.
+fn launch_backoff_secs(interval_secs: u32, cap: u64, requeue_count: u32) -> u64 {
+    let base = (interval_secs as u64 * 2 + 3).max(5);
+    base.saturating_mul(1u64 << requeue_count.min(16))
+        .min(cap)
+        .min(spur_core::config::MAX_LAUNCH_BACKOFF_SECS)
+}
+
 /// Result of recording a per-node completion report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeCompleteResult {
@@ -614,7 +633,7 @@ impl ClusterManager {
             // Record the reason before the terminal transition so any
             // observer (history, audit log, late `squeue` poll) sees DeadLine
             // instead of whatever update_pending_reasons last wrote.
-            job.pending_reason = PendingReason::DeadLine;
+            job.set_pending_reason(PendingReason::DeadLine);
         }
 
         let resp = self.propose(WalOperation::JobComplete {
@@ -1122,7 +1141,7 @@ impl ClusterManager {
     /// Requeue a job if spec.requeue is set and attempt limit not exceeded.
     fn maybe_requeue(&self, job_id: JobId) -> anyhow::Result<()> {
         let max = self.config.controller.max_batch_requeue;
-        let (should_requeue, old_state) = {
+        let (old_state, backoff) = {
             let jobs = self.jobs.read();
             let Some(job) = jobs.get(&job_id) else {
                 return Ok(());
@@ -1140,19 +1159,32 @@ impl ClusterManager {
             if !job.spec.requeue {
                 return Ok(());
             }
-            (true, job.state)
+            // The eviction tagged the cause, so a launch failure gets the same
+            // backoff the all-nodes-failed path gets. Without it a job with one
+            // broken node in its allocation burns its whole requeue budget in
+            // seconds. Node health and timeout requeues keep today's immediate
+            // retry: the blocking condition is already gone by then.
+            let launch_failed = job.pending_reason == PendingReason::JobLaunchFailure;
+            (
+                job.state,
+                launch_failed.then(|| self.launch_backoff_until(job)),
+            )
         };
-        if !should_requeue {
-            return Ok(());
-        }
 
-        self.propose(WalOperation::job_state_change(
-            job_id,
-            old_state,
-            JobState::Pending,
-        ))?;
+        // Computed before the proposal so every replica applies one verbatim
+        // instant rather than reading its own clock.
+        let op = match backoff {
+            Some(hold) => WalOperation::job_state_change_backoff_pending(
+                job_id,
+                old_state,
+                PendingReason::JobLaunchFailure,
+                hold,
+            ),
+            None => WalOperation::job_state_change(job_id, old_state, JobState::Pending),
+        };
+        self.propose(op)?;
 
-        info!(job_id, from = %old_state, "job requeued");
+        info!(job_id, from = %old_state, hold_until = ?backoff, "job requeued");
         Ok(())
     }
 
@@ -1162,7 +1194,18 @@ impl ClusterManager {
     /// (e.g., container image not found) so it can be retried after the
     /// user fixes the issue. (Issue #91)
     pub fn requeue_job(&self, job_id: JobId) -> anyhow::Result<()> {
-        let old_state = {
+        self.requeue_after_launch_failure(job_id, false)
+    }
+
+    /// Requeue after a dispatch failure, optionally parking the job for an
+    /// operator instead of retrying it.
+    ///
+    /// `hold` is for failures the job carries with it, which would fail the same
+    /// way on the next node and drain that one too. Such a job skips the backoff
+    /// and the requeue cap, neither of which means anything to a job that will
+    /// not retry on its own.
+    pub fn requeue_after_launch_failure(&self, job_id: JobId, hold: bool) -> anyhow::Result<()> {
+        let (old_state, begin_time) = {
             let jobs = self.jobs.read();
             let Some(job) = jobs.get(&job_id) else {
                 return Ok(());
@@ -1170,11 +1213,22 @@ impl ClusterManager {
             if job.state.is_terminal() {
                 return Ok(());
             }
-            if job.requeue_count >= self.config.controller.max_batch_requeue {
+            if !hold && job.requeue_count >= self.config.controller.max_batch_requeue {
                 drop(jobs);
                 return self.hold_job_at_max_requeue(job_id);
             }
-            job.state
+            // A job that never reached Running has nothing to requeue: Pending ->
+            // Failed is not a legal transition and Pending -> Pending applies as a
+            // NoOp, so both proposals below would be discarded and the hold lost.
+            // Callers that fail before dispatch fall to the next scheduler tick.
+            if job.state == JobState::Pending {
+                debug!(
+                    job_id,
+                    "requeue requested for a job that never started; no backoff hold applied"
+                );
+                return Ok(());
+            }
+            (job.state, self.launch_backoff_until(job))
         };
 
         // transition to Failed via JobComplete so node resources,
@@ -1185,16 +1239,44 @@ impl ClusterManager {
             state: JobState::Failed,
         })?;
 
-        // Failed → Pending resets allocation fields and makes
-        // the job schedulable again.
-        self.propose(WalOperation::job_state_change(
+        if hold {
+            self.propose(WalOperation::job_state_change_held_pending_desc(
+                job_id,
+                JobState::Failed,
+                PendingReason::Held,
+                LAUNCH_FAILURE_HELD_DESC,
+            ))?;
+            info!(job_id, from = %old_state, "job requeued and held after launch failure");
+            return Ok(());
+        }
+
+        // Failed → Pending resets allocation fields and makes the job
+        // schedulable again, but only once the backoff hold lapses: without it
+        // the next scheduler tick re-dispatches to the same node, which for a
+        // node-local fault burns the whole requeue budget in seconds.
+        self.propose(WalOperation::job_state_change_backoff_pending(
             job_id,
             JobState::Failed,
-            JobState::Pending,
+            PendingReason::JobLaunchFailure,
+            begin_time,
         ))?;
 
-        info!(job_id, from = %old_state, "job requeued after dispatch failure");
+        info!(job_id, from = %old_state, hold_until = %begin_time, "job requeued after dispatch failure");
         Ok(())
+    }
+
+    /// Instant until which a job requeued after a launch failure is held. A user
+    /// `--begin` further out always wins, so the hold never shortens a
+    /// user-supplied constraint. Computed on the leader so every replica applies
+    /// one verbatim instant rather than reading its own clock.
+    fn launch_backoff_until(&self, job: &Job) -> DateTime<Utc> {
+        let hold_secs = launch_backoff_secs(
+            self.config.scheduler.interval_secs,
+            self.config.controller.max_launch_backoff_secs,
+            job.requeue_count,
+        );
+        let hold = Utc::now() + chrono::Duration::seconds(hold_secs as i64);
+        job.spec.begin_time.map_or(hold, |user| user.max(hold))
     }
 
     /// Evict a running job to NodeFail: frees allocations and feeds the
@@ -1793,11 +1875,17 @@ impl ClusterManager {
         reason: Option<String>,
     ) -> anyhow::Result<(NodeState, u32)> {
         let (old_state, running_count) = {
+            // Lock order is jobs before nodes, matching apply_operation. Taking
+            // nodes first deadlocks against a raft apply that already holds jobs
+            // and is waiting on nodes: parking_lot queues writers ahead of new
+            // readers, so neither side can make progress and the controller
+            // wedges. The agent calls this on a launch failure at the same
+            // instant the requeue is being applied for that job.
+            let jobs = self.jobs.read();
             let nodes = self.nodes.read();
             let node = nodes
                 .get(name)
                 .ok_or_else(|| anyhow::anyhow!("node '{}' not found", name))?;
-            let jobs = self.jobs.read();
             let count = jobs
                 .values()
                 .filter(|j| {
@@ -2247,7 +2335,7 @@ impl ClusterManager {
             }
             if let Some(job) = jobs.get_mut(id) {
                 job.bb_stage_state = BbStageState::Staging;
-                job.pending_reason = PendingReason::BurstBufferStageIn;
+                job.set_pending_reason(PendingReason::BurstBufferStageIn);
                 remaining = remaining.saturating_sub(req);
                 started.push(*id);
             }
@@ -2296,7 +2384,7 @@ impl ClusterManager {
             if job.state == JobState::Pending && job.bb_stage_state == BbStageState::Staging {
                 job.bb_stage_state = BbStageState::Ready;
                 if job.pending_reason == PendingReason::BurstBufferStageIn {
-                    job.pending_reason = PendingReason::None;
+                    job.set_pending_reason(PendingReason::None);
                 }
                 self.scheduler_notify.notify_one();
                 return true;
@@ -2354,13 +2442,14 @@ impl ClusterManager {
             let mut jobs = self.jobs.write();
             for id in &to_wait {
                 if let Some(j) = jobs.get_mut(id) {
-                    // Don't clobber Held or DeadLine — matches
-                    // update_pending_reasons().
+                    // Don't clobber Held, DeadLine or a begin-hold reason —
+                    // matches update_pending_reasons().
                     if j.state == JobState::Pending
                         && !j.pending_reason.is_scheduling_hold()
                         && j.pending_reason != PendingReason::DeadLine
+                        && !j.reason_explains_begin_hold(Utc::now())
                     {
-                        j.pending_reason = PendingReason::Dependency;
+                        j.set_pending_reason(PendingReason::Dependency);
                     }
                 }
             }
@@ -2413,14 +2502,12 @@ impl ClusterManager {
             if let Some(j) = jobs.get_mut(&id) {
                 // Re-check under the write lock: the read snapshot was released,
                 // so the job may have started or been held/deadlined since.
-                let begin_held = j.pending_reason == PendingReason::BeginTime
-                    && j.spec.begin_time.is_some_and(|b| now < b);
                 if j.state == JobState::Pending
                     && !j.pending_reason.is_scheduling_hold()
                     && j.pending_reason != PendingReason::DeadLine
-                    && !begin_held
+                    && !j.reason_explains_begin_hold(now)
                 {
-                    j.pending_reason = reason;
+                    j.set_pending_reason(reason);
                 }
             }
         }
@@ -2697,7 +2784,7 @@ impl ClusterManager {
                 continue;
             }
             job.priority = 0;
-            job.pending_reason = PendingReason::ReservationDeleted;
+            job.set_pending_reason(PendingReason::ReservationDeleted);
         }
     }
 
@@ -2711,7 +2798,7 @@ impl ClusterManager {
             }
             job.spec.reservation = None;
             if job.pending_reason == PendingReason::ReservationDeleted {
-                job.pending_reason = PendingReason::None;
+                job.set_pending_reason(PendingReason::None);
             }
         }
     }
@@ -2795,16 +2882,15 @@ impl ClusterManager {
             if job_entry.pending_reason == PendingReason::DeadLine {
                 continue;
             }
-            // Keep an active BeginTime hold (e.g. requeue-by-preemption) until
-            // it lapses, then fall through to the real wait reason.
-            if job_entry.pending_reason == PendingReason::BeginTime
-                && job_entry.spec.begin_time.is_some_and(|b| Utc::now() < b)
-            {
+            // Keep a reason that explains an active begin_time hold (preemption
+            // requeue, launch-failure backoff) until it lapses, then fall through
+            // to the real wait reason.
+            if job_entry.reason_explains_begin_hold(Utc::now()) {
                 continue;
             }
 
             if let Some(reason) = reservation_fence_reason(job, cluster_state) {
-                job_entry.pending_reason = reason;
+                job_entry.set_pending_reason(reason);
                 continue;
             }
 
@@ -2830,7 +2916,7 @@ impl ClusterManager {
                             || !node.can_satisfy_request(&required))
                 })
             {
-                job_entry.pending_reason = PendingReason::ReqNodeNotAvail;
+                job_entry.set_pending_reason(PendingReason::ReqNodeNotAvail);
                 continue;
             }
 
@@ -2842,7 +2928,7 @@ impl ClusterManager {
                     .filter(|n| placement.in_partition(n))
                     .count();
 
-                job_entry.pending_reason = if needed > partition_size {
+                job_entry.set_pending_reason(if needed > partition_size {
                     PendingReason::PartitionNodeLimit
                 } else if job.spec.constraint.is_some() && eligible.is_empty() {
                     PendingReason::BadConstraints
@@ -2852,7 +2938,7 @@ impl ClusterManager {
                     PendingReason::ReqNodeNotAvail
                 } else {
                     PendingReason::Resources
-                };
+                });
                 continue;
             }
 
@@ -2860,12 +2946,13 @@ impl ClusterManager {
             // `Allocated` cluster out of NodeDown; a nodelist pin to down nodes
             // is ReqNodeNotAvail (Slurm parity).
             if eligible.iter().all(|n| !n.state.is_up()) {
-                job_entry.pending_reason =
+                job_entry.set_pending_reason(
                     if job.spec.nodelist.as_deref().is_some_and(|s| !s.is_empty()) {
                         PendingReason::ReqNodeNotAvail
                     } else {
                         PendingReason::NodeDown
-                    };
+                    },
+                );
                 continue;
             }
 
@@ -2884,11 +2971,11 @@ impl ClusterManager {
                 })
                 .count();
 
-            job_entry.pending_reason = if free_now < needed {
+            job_entry.set_pending_reason(if free_now < needed {
                 PendingReason::Resources
             } else {
                 PendingReason::Priority
-            };
+            });
         }
     }
 
@@ -3100,7 +3187,7 @@ impl ClusterManager {
         job.allocated_nodes.clear();
         job.allocated_resources = None;
         job.per_node_alloc.clear();
-        job.pending_reason = PendingReason::None;
+        job.set_pending_reason(PendingReason::None);
         // Stale after requeue (points at nodes the job left); next dispatch resets it.
         job.actual_stdout_path = None;
         job.actual_stderr_path = None;
@@ -3144,7 +3231,7 @@ impl ClusterManager {
         }
         job.exit_code = Some(-1);
         job.end_time = Some(timestamp);
-        job.pending_reason = reason;
+        job.set_pending_reason(reason);
         let already_deallocated: Vec<String> = job.node_completions.keys().cloned().collect();
         job.node_completions.clear();
 
@@ -3248,6 +3335,8 @@ impl ClusterManager {
                 new_state,
                 pending_reason,
                 pending_priority,
+                begin_time,
+                pending_reason_desc,
                 ..
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
@@ -3267,9 +3356,16 @@ impl ClusterManager {
                         } else {
                             Self::clear_run_state_for_requeue(job);
                         }
-                        job.pending_reason = pending_reason.clone().unwrap_or(PendingReason::None);
+                        let reason = pending_reason.clone().unwrap_or(PendingReason::None);
+                        match pending_reason_desc {
+                            Some(desc) => job.set_pending_reason_desc(reason, desc.clone()),
+                            None => job.set_pending_reason(reason),
+                        }
                         if let Some(priority) = pending_priority {
                             job.priority = *priority;
+                        }
+                        if let Some(hold) = begin_time {
+                            job.spec.begin_time = Some(*hold);
                         }
                     }
                 }
@@ -3310,7 +3406,7 @@ impl ClusterManager {
                     }
                     Self::reset_job_for_preempt_requeue(job);
                     job.spec.begin_time = Some(*begin_time);
-                    job.pending_reason = PendingReason::BeginTime;
+                    job.set_pending_reason(PendingReason::BeginTime);
                 }
                 if let Some(ref total) = allocated_resources {
                     let node_count = freed_nodes.len().max(1) as u32;
@@ -3399,7 +3495,7 @@ impl ClusterManager {
                     job.allocated_nodes = node_names.clone();
                     job.allocated_resources = Some(resources.clone());
                     job.per_node_alloc = per_node_alloc.clone();
-                    job.pending_reason = PendingReason::None;
+                    job.set_pending_reason(PendingReason::None);
                     job.srun_step_dispatch = *srun_step_dispatch;
                     job.run_attempt = *run_attempt;
                 }
@@ -3506,7 +3602,7 @@ impl ClusterManager {
                                 // steps, accumulated live by JobStepComplete; a
                                 // job with no srun steps keeps 0 (Slurm parity),
                                 // not the batch exit. Left as-is here.
-                                job.pending_reason = if oom {
+                                job.set_pending_reason(if oom {
                                     PendingReason::OutOfMemory
                                 } else if final_signal != 0 {
                                     PendingReason::RaisedSignal
@@ -3514,7 +3610,7 @@ impl ClusterManager {
                                     PendingReason::NonZeroExitCode
                                 } else {
                                     PendingReason::None
-                                };
+                                });
                                 job.end_time = Some(timestamp);
                                 job.node_completions.clear();
                                 Some((final_state, final_exit))
@@ -3690,7 +3786,7 @@ impl ClusterManager {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.priority = *new_priority;
                     if let Some(reason) = pending_reason {
-                        job.pending_reason = reason.clone();
+                        job.set_pending_reason(reason.clone());
                     }
                     if *reset_requeue_count {
                         job.requeue_count = 0;
@@ -5071,13 +5167,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("j")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
 
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Running);
@@ -5123,13 +5217,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("j")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(4, 8000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
@@ -5165,13 +5257,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("s")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let t0 = chrono::Utc::now();
         cm.apply_operation(&WalOperation::JobSuspend { job_id: 1, at: t0 });
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Suspended);
@@ -5331,13 +5421,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("acc")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let t0 = chrono::Utc::now();
         // Cycle 1: 10s suspended.
         cm.apply_operation(&WalOperation::JobSuspend { job_id: 1, at: t0 });
@@ -5370,13 +5458,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("cancel-susp")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         // Suspended 30s ago, then cancelled now (JobComplete stamps Utc::now()).
         let since = chrono::Utc::now() - chrono::Duration::seconds(30);
         cm.apply_operation(&WalOperation::JobSuspend {
@@ -5612,13 +5698,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("single-completing")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
@@ -5655,13 +5739,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("oom")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
@@ -5699,13 +5781,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("multi-completing")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
@@ -5767,13 +5847,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("steps")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["n1".into()],
@@ -5830,13 +5908,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("batch-only")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
 
         cm.apply_operation(&WalOperation::JobStepComplete {
             job_id: 1,
@@ -5860,13 +5936,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("finalize-response")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
@@ -5912,13 +5986,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("job-complete-response")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
@@ -5953,13 +6025,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("double-complete")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
@@ -6012,13 +6082,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("penultimate")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
@@ -6051,13 +6119,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("signal-job")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["n1".into()],
@@ -6095,13 +6161,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("rpc-signal-job")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["n1".into()],
@@ -6132,13 +6196,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("exit-job")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["n1".into()],
@@ -6171,13 +6233,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("stale-job")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         // Re-dispatched run: current epoch is 2.
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
@@ -6212,13 +6272,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("cancel-while-cg")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
@@ -6281,13 +6339,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("nc-after-cancel")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
@@ -6585,6 +6641,433 @@ mod tests {
         settle(&cm, job_id, JobState::Running);
     }
 
+    // ── requeue-after-launch-failure backoff ─────────────────────
+
+    /// Let an active hold lapse, exactly as the wall clock would, so the next
+    /// dispatch attempt can proceed without sleeping in the test.
+    fn lapse_hold(cm: &ClusterManager, job_id: JobId) {
+        let mut jobs = cm.jobs.write();
+        let job = jobs.get_mut(&job_id).unwrap();
+        job.spec.begin_time = Some(Utc::now() - chrono::Duration::seconds(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launch_failure_requeue_holds_job_and_reports_reason() {
+        // The dispatch-failure requeue must defer the job and say why. Without
+        // the hold the scheduler re-dispatches on the very next tick, and for a
+        // node-local fault that means the same broken node again.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "launch-fail", "worker1");
+        assert_eq!(cm.node_metrics().alloc_cpus, 2);
+
+        cm.requeue_job(job_id).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert!(job.allocated_nodes.is_empty());
+        assert_eq!(cm.node_metrics().alloc_cpus, 0, "nodes must be freed");
+        assert_eq!(job.requeue_count, 1);
+        assert_eq!(
+            job.pending_reason,
+            PendingReason::JobLaunchFailure,
+            "squeue must show why the job is waiting"
+        );
+        assert!(
+            job.spec.begin_time.is_some_and(|begin| begin > Utc::now()),
+            "requeue must carry a future hold"
+        );
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "held job must not be eligible for immediate re-dispatch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeueing_a_job_that_never_started_is_a_no_op() {
+        // Pending -> Failed is illegal and Pending -> Pending applies as a NoOp,
+        // so the two proposals would be silently discarded. Bailing out keeps the
+        // caller from logging a hold that was never applied.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = submit_and_wait(&cm, basic_spec("never-started"));
+        cm.requeue_job(job_id).unwrap();
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.requeue_count, 0, "no attempt was consumed");
+        assert!(job.spec.begin_time.is_none(), "no hold was applied");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_job_at_the_requeue_cap_is_held_not_ignored() {
+        // The cap has to be checked before the never-started bail-out. A job
+        // that exhausts its budget while Pending would otherwise be dropped on
+        // the floor and re-dispatched at full priority every scheduler tick.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let max = cm.config.controller.max_batch_requeue;
+
+        let job_id = submit_and_wait(&cm, basic_spec("pending-at-cap"));
+        cm.jobs.write().get_mut(&job_id).unwrap().requeue_count = max;
+
+        cm.requeue_job(job_id).unwrap();
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.pending_reason, PendingReason::JobHoldMaxRequeue);
+        assert_eq!(job.priority, 0, "a held job must not outrank live work");
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "the hold must take the job out of scheduling"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn draining_a_node_for_a_launch_failure_still_lets_the_job_requeue() {
+        // The agent drains the node on a spool fault. That drain must not
+        // finalize the job: it still has to reach Pending so the scheduler can
+        // retry it somewhere healthy.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        register_node(&cm, "worker2", 8, 16000);
+
+        let job_id = run_job_on(&cm, "spool-fault", "worker1");
+
+        let (state, _) = cm
+            .drain_node("worker1", Some("launch failed: ENOSPC".into()))
+            .unwrap();
+        assert_eq!(state, NodeState::Draining, "the job still holds the node");
+
+        cm.requeue_job(job_id).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::JobLaunchFailure
+        );
+        let node = cm.get_node("worker1").unwrap();
+        assert!(
+            node.state.is_admin_hold(),
+            "the broken node must stay excluded from scheduling"
+        );
+        assert_eq!(
+            node.state_reason.as_deref(),
+            Some("launch failed: ENOSPC"),
+            "operators need the fault text"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_completion_report_for_a_launch_failure_strands_the_job() {
+        // Why the agent drains instead of reporting a completion: a completion
+        // finalizes the job, and requeue_job refuses terminal jobs, so the
+        // launch failure would never be retried anywhere.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "stranded", "worker1");
+        cm.node_complete(job_id, "worker1", -1, 0, 0).unwrap();
+        wait_for("job reaches a terminal state", || {
+            cm.get_job(job_id).is_some_and(|j| j.state.is_terminal())
+        });
+
+        cm.requeue_job(job_id).unwrap();
+
+        let job = cm.get_job(job_id).unwrap();
+        assert!(
+            job.state.is_terminal(),
+            "the completion report won the race"
+        );
+        assert_eq!(job.requeue_count, 0, "a terminal job is never retried");
+    }
+
+    #[test]
+    fn the_backoff_doubles_each_attempt_up_to_the_cap() {
+        // The schedule itself, checked as arithmetic. With the default
+        // interval_secs = 1 the base is 5s, so the five attempts allowed by
+        // max_batch_requeue = 5 wait 5, 10, 20, 40 and 80 seconds: 155s in
+        // total instead of burning the budget in ~5s.
+        let uncapped = spur_core::config::MAX_LAUNCH_BACKOFF_SECS;
+        for (attempt, expected) in [5u64, 10, 20, 40, 80].into_iter().enumerate() {
+            assert_eq!(
+                launch_backoff_secs(1, uncapped, attempt as u32),
+                expected,
+                "attempt {attempt}"
+            );
+        }
+
+        // A cap clamps the doubling without stopping it from reaching the cap.
+        assert_eq!(launch_backoff_secs(1, 12, 0), 5);
+        assert_eq!(launch_backoff_secs(1, 12, 1), 10);
+        assert_eq!(launch_backoff_secs(1, 12, 2), 12);
+
+        // A slow scheduler waits at least two of its own cycles plus slack, and
+        // a zero interval still gets the 5s floor rather than no backoff at all.
+        assert_eq!(launch_backoff_secs(10, uncapped, 0), 23);
+        assert_eq!(launch_backoff_secs(0, uncapped, 0), 5);
+
+        // An operator-supplied max_batch_requeue large enough to overflow the
+        // shift must saturate at the cap, not panic the controller.
+        assert_eq!(launch_backoff_secs(1, 300, u32::MAX), 300);
+        assert_eq!(launch_backoff_secs(1, uncapped, u32::MAX), uncapped);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launch_failure_backoff_defers_every_attempt_until_the_budget_runs_out() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = submit_and_wait(&cm, basic_spec("backoff-schedule"));
+
+        for attempt in 0..cm.config.controller.max_batch_requeue {
+            let resources = scalar_alloc(2, 4000);
+            cm.start_job(
+                job_id,
+                vec!["worker1".into()],
+                resources.clone(),
+                per_node_for(&["worker1"], resources),
+            )
+            .unwrap();
+            settle(&cm, job_id, JobState::Running);
+
+            cm.requeue_job(job_id).unwrap();
+            settle(&cm, job_id, JobState::Pending);
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.requeue_count, attempt + 1);
+            assert!(
+                job.spec.begin_time.is_some_and(|begin| begin > Utc::now()),
+                "attempt {attempt} must defer the retry"
+            );
+            assert!(
+                !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+                "attempt {attempt} must not leave the job immediately eligible"
+            );
+
+            lapse_hold(&cm, job_id);
+        }
+
+        // Budget exhausted: the next failure holds the job for an operator.
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            resources.clone(),
+            per_node_for(&["worker1"], resources),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+        cm.requeue_job(job_id).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::JobHoldMaxRequeue
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launch_failure_requeue_preserves_later_user_begin() {
+        // The backoff must never shorten a user's --begin constraint.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let user_begin = Utc::now() + chrono::Duration::hours(1);
+        let mut spec = basic_spec("user-begin-launch-fail");
+        spec.begin_time = Some(user_begin);
+        let job_id = submit_and_wait(&cm, spec);
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            resources.clone(),
+            per_node_for(&["worker1"], resources),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        cm.requeue_job(job_id).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+
+        assert_eq!(
+            cm.get_job(job_id).unwrap().spec.begin_time,
+            Some(user_begin),
+            "user --begin beyond the hold must be preserved"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launch_failure_reason_survives_both_pending_reason_passes() {
+        // JobLaunchFailure must outlive every pass that recomputes
+        // pending_reason. The predicate lives in four places; miss one and the
+        // reason is clobbered back to Resources before an operator sees it.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "reason-survives", "worker1");
+        cm.requeue_job(job_id).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+
+        // Both guard sites in tag_blocked_pending_reasons.
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::JobLaunchFailure,
+            "tag_blocked_pending_reasons must not clobber an active hold"
+        );
+
+        // The guard site in update_pending_reasons. An empty cluster_state would
+        // otherwise force Resources/NodeDown.
+        let empty_state = spur_sched::traits::ClusterState {
+            nodes: &[],
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        let snapshot = cm.get_job(job_id).unwrap();
+        cm.update_pending_reasons(&[&snapshot], &empty_state);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::JobLaunchFailure,
+            "update_pending_reasons must not clobber an active hold"
+        );
+
+        // The guard site in cancel_unsatisfiable_dependency_jobs.
+        cm.cancel_unsatisfiable_dependency_jobs();
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::JobLaunchFailure,
+            "the dependency pass must not clobber an active hold"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_user_begin_job_still_reports_what_blocks_it() {
+        // A --begin job carries no reason explaining its own hold, so the wait
+        // reason passes must still tag it. Skipping every held job would leave
+        // squeue showing None for as long as the user asked to wait.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let mut spec = basic_spec("begin-blocked");
+        spec.begin_time = Some(Utc::now() + chrono::Duration::hours(1));
+        let job_id = submit_and_wait(&cm, spec);
+        assert!(cm.get_job(job_id).unwrap().is_begin_held(Utc::now()));
+
+        let empty_state = spur_sched::traits::ClusterState {
+            nodes: &[],
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        let snapshot = cm.get_job(job_id).unwrap();
+        cm.update_pending_reasons(&[&snapshot], &empty_state);
+
+        let reason = cm.get_job(job_id).unwrap().pending_reason;
+        assert_ne!(
+            reason,
+            PendingReason::None,
+            "a held --begin job must still say what blocks it"
+        );
+        assert!(
+            !reason.explains_begin_hold(),
+            "the hold is not the blocker here, the empty cluster is"
+        );
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "tagging a reason must not make a held job eligible"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launch_failure_hold_expires_and_job_reschedules() {
+        // The hold defers the job, it must not strand it.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "hold-lapses", "worker1");
+        cm.requeue_job(job_id).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+        lapse_hold(&cm, job_id);
+
+        assert!(
+            cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "job must be eligible again once the hold lapses"
+        );
+
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            resources.clone(),
+            per_node_for(&["worker1"], resources),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replayed_backoff_requeue_does_not_double_count_or_drift() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("backoff-replay")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: -1,
+            state: JobState::Failed,
+        });
+
+        let hold = Utc::now() + chrono::Duration::seconds(40);
+        let requeue = WalOperation::job_state_change_backoff_pending(
+            1,
+            JobState::Failed,
+            PendingReason::JobLaunchFailure,
+            hold,
+        );
+        cm.apply_operation(&requeue);
+
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.requeue_count, 1);
+        assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+        assert_eq!(job.spec.begin_time, Some(hold));
+
+        // Replay the identical entry: the job is already Pending, so this is a
+        // NoOp. Followers and WAL recovery must not compound the hold.
+        cm.apply_operation(&requeue);
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(
+            job.requeue_count, 1,
+            "replayed requeue must not double-count"
+        );
+        assert_eq!(
+            job.spec.begin_time,
+            Some(hold),
+            "replayed hold instant must not drift"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn preempt_job_cancel_terminates_and_frees_nodes() {
         let dir = TempDir::new().unwrap();
@@ -6650,22 +7133,18 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("replay")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
 
         // Re-applying the same running transition is a NoOp, not an error.
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Running);
 
         let alloc = scalar_alloc(2, 4000);
@@ -6706,35 +7185,29 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("requeue-replay")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
             exit_code: -1,
             state: JobState::Preempted,
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Preempted,
-            new_state: JobState::Pending,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Preempted,
+            JobState::Pending,
+        ));
         assert_eq!(cm.get_job(1).unwrap().requeue_count, 1);
 
         // Replay the same requeue transition (job already Pending): NoOp.
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Preempted,
-            new_state: JobState::Pending,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Preempted,
+            JobState::Pending,
+        ));
         assert_eq!(
             cm.get_job(1).unwrap().requeue_count,
             1,
@@ -6756,13 +7229,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("preempt-replay")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
@@ -8480,33 +8951,27 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         let job_id = submit_and_wait(&cm, basic_spec("preempt-me"));
-        cm.apply_operation(&WalOperation::JobStateChange {
+        cm.apply_operation(&WalOperation::job_state_change(
             job_id,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+            JobState::Pending,
+            JobState::Running,
+        ));
         cm.apply_operation(&WalOperation::JobComplete {
             job_id,
             exit_code: -1,
             state: JobState::Preempted,
         });
         for _ in 0..5 {
-            cm.apply_operation(&WalOperation::JobStateChange {
+            cm.apply_operation(&WalOperation::job_state_change(
                 job_id,
-                old_state: JobState::Preempted,
-                new_state: JobState::Pending,
-                pending_reason: None,
-                pending_priority: None,
-            });
-            cm.apply_operation(&WalOperation::JobStateChange {
+                JobState::Preempted,
+                JobState::Pending,
+            ));
+            cm.apply_operation(&WalOperation::job_state_change(
                 job_id,
-                old_state: JobState::Pending,
-                new_state: JobState::Running,
-                pending_reason: None,
-                pending_priority: None,
-            });
+                JobState::Pending,
+                JobState::Running,
+            ));
             cm.apply_operation(&WalOperation::JobComplete {
                 job_id,
                 exit_code: -1,
@@ -8777,6 +9242,82 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_partial_dispatch_failure_backs_off_like_a_total_one() {
+        // Both launch-failure paths must throttle. Without this, a 2-node job
+        // with one broken node evicts, requeues immediately, lands on the same
+        // node and burns its whole requeue budget in seconds.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+
+        let mut spec = basic_spec("partial-backoff");
+        spec.num_nodes = 2;
+        spec.requeue = true;
+        let job_id = submit_and_wait(&cm, spec);
+
+        let alloc = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["n1".into(), "n2".into()],
+            scalar_alloc(4, 8000),
+            per_node_for(&["n1", "n2"], alloc),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        cm.evict_job(job_id).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+        assert!(
+            job.spec.begin_time.is_some_and(|begin| begin > Utc::now()),
+            "a launch-failure requeue must carry a future hold"
+        );
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "the hold must keep the job out of the very next dispatch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_failure_requeue_still_retries_immediately() {
+        // The backoff is scoped to launch failures. A job evicted because its
+        // node died has nothing to back off from: the node is already out of the
+        // candidate set, so delaying the retry only wastes capacity.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+
+        let mut spec = basic_spec("nodedown-requeue");
+        spec.requeue = true;
+        let job_id = submit_and_wait(&cm, spec);
+
+        let alloc = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["n1".into()],
+            alloc.clone(),
+            per_node_for(&["n1"], alloc),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        if let Some(node) = cm.nodes.write().get_mut("n1") {
+            node.last_heartbeat = Some(Utc::now() - chrono::Duration::seconds(200));
+        }
+        cm.check_node_health(90);
+        settle(&cm, job_id, JobState::Pending);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::None);
+        assert!(job.spec.begin_time.is_none(), "no hold on a node failure");
+        assert!(cm.pending_jobs().iter().any(|j| j.job_id == job_id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn maybe_requeue_holds_at_max_for_timeout() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -8814,33 +9355,27 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         let job_id = submit_and_wait(&cm, basic_spec("release-me"));
-        cm.apply_operation(&WalOperation::JobStateChange {
+        cm.apply_operation(&WalOperation::job_state_change(
             job_id,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+            JobState::Pending,
+            JobState::Running,
+        ));
         cm.apply_operation(&WalOperation::JobComplete {
             job_id,
             exit_code: -1,
             state: JobState::Preempted,
         });
         for _ in 0..5 {
-            cm.apply_operation(&WalOperation::JobStateChange {
+            cm.apply_operation(&WalOperation::job_state_change(
                 job_id,
-                old_state: JobState::Preempted,
-                new_state: JobState::Pending,
-                pending_reason: None,
-                pending_priority: None,
-            });
-            cm.apply_operation(&WalOperation::JobStateChange {
+                JobState::Preempted,
+                JobState::Pending,
+            ));
+            cm.apply_operation(&WalOperation::job_state_change(
                 job_id,
-                old_state: JobState::Pending,
-                new_state: JobState::Running,
-                pending_reason: None,
-                pending_priority: None,
-            });
+                JobState::Pending,
+                JobState::Running,
+            ));
             cm.apply_operation(&WalOperation::JobComplete {
                 job_id,
                 exit_code: -1,
@@ -8870,13 +9405,11 @@ mod tests {
         let cm = test_cluster(&dir).await;
         let job_id = submit_and_wait(&cm, basic_spec("cancel-preempted"));
 
-        cm.apply_operation(&WalOperation::JobStateChange {
+        cm.apply_operation(&WalOperation::job_state_change(
             job_id,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+            JobState::Pending,
+            JobState::Running,
+        ));
         cm.apply_operation(&WalOperation::JobComplete {
             job_id,
             exit_code: -1,
@@ -9978,13 +10511,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("parent")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
 
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:1".into()];
@@ -10773,13 +11304,11 @@ mod tests {
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Timeout);
 
         // Requeue: Timeout → Pending should reset allocation fields
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: id,
-            old_state: JobState::Timeout,
-            new_state: JobState::Pending,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            id,
+            JobState::Timeout,
+            JobState::Pending,
+        ));
 
         let job = cm.get_job(id).unwrap();
         assert_eq!(job.state, JobState::Pending);
@@ -11806,13 +12335,11 @@ mod tests {
         // Jobs may only reach Completed/Failed/etc. via Running; cancel is the
         // only legal direct transition out of Pending.
         if state != JobState::Cancelled {
-            cm.apply_operation(&WalOperation::JobStateChange {
-                job_id: id,
-                old_state: JobState::Pending,
-                new_state: JobState::Running,
-                pending_reason: None,
-                pending_priority: None,
-            });
+            cm.apply_operation(&WalOperation::job_state_change(
+                id,
+                JobState::Pending,
+                JobState::Running,
+            ));
         }
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: id,
@@ -11866,13 +12393,11 @@ mod tests {
             spec: Box::new(child),
         });
         // Child is already Running by the time the cancel pass fires.
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 2,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            2,
+            JobState::Pending,
+            JobState::Running,
+        ));
 
         let cancelled = cm.cancel_unsatisfiable_dependency_jobs();
         assert!(cancelled.is_empty(), "running job must not be cancelled");
@@ -11889,13 +12414,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("parent")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
 
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:1".into()];
@@ -12609,13 +13132,11 @@ mod tests {
     // ---- Node deregistration tests ----
 
     fn start_job_on(cm: &ClusterManager, id: JobId, node: &str) {
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: id,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            id,
+            JobState::Pending,
+            JobState::Running,
+        ));
         cm.apply_operation(&WalOperation::JobStart {
             job_id: id,
             nodes: vec![node.into()],
@@ -12627,13 +13148,11 @@ mod tests {
     }
 
     fn start_srun_job_on(cm: &ClusterManager, id: JobId, node: &str) {
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: id,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            id,
+            JobState::Pending,
+            JobState::Running,
+        ));
         cm.apply_operation(&WalOperation::JobStart {
             job_id: id,
             nodes: vec![node.into()],
