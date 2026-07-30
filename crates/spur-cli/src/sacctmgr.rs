@@ -534,18 +534,26 @@ async fn delete(entity: &str, params: &[String], addr: &str) -> Result<()> {
             let account = p.get("account").cloned().unwrap_or_default();
 
             let mut client = connect(addr).await?;
-            client
+            let acct_display = if account.is_empty() { "all" } else { &account };
+            match client
                 .remove_user(RemoveUserRequest {
                     user: name.clone(),
                     account: account.clone(),
                 })
                 .await
-                .context("RemoveUser RPC failed")?;
-
-            let acct_display = if account.is_empty() { "all" } else { &account };
-            println!(" Deleting user {} from account {}", name, acct_display);
-            println!(" Done.");
-            Ok(())
+            {
+                Ok(_) => {
+                    println!(" Deleting user {} from account {}", name, acct_display);
+                    println!(" Done.");
+                    Ok(())
+                }
+                // Slurm prints "Nothing deleted" and exits 0 when the delete is a no-op.
+                Err(status) if status.code() == tonic::Code::NotFound => {
+                    println!(" Nothing deleted.");
+                    Ok(())
+                }
+                Err(status) => Err(anyhow::Error::new(status).context("RemoveUser RPC failed")),
+            }
         }
         "qos" => {
             let name = p
