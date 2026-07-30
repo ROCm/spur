@@ -1053,6 +1053,7 @@ struct AllocationRegisterParams {
     partition: String,
     uid: u32,
     gid: u32,
+    user: String,
     mpi: String,
     allocated_nodelist: String,
     allocated: spur_core::resource::ResourceAllocations,
@@ -1087,6 +1088,7 @@ async fn register_allocation_to_agent(
             allocated: Some(crate::server::allocations_to_proto(&params.allocated)),
             mpi: params.mpi.clone(),
             work_dir: params.work_dir.clone(),
+            user: params.user.clone(),
         })
         .await?;
 
@@ -1147,6 +1149,7 @@ async fn register_allocation_on_nodes(
             partition: spec.partition.clone().unwrap_or_default(),
             uid: spec.uid,
             gid: spec.gid,
+            user: spec.user.clone(),
             mpi: spec.mpi.clone().unwrap_or_default(),
             allocated_nodelist: allocated_nodelist.clone(),
             allocated,

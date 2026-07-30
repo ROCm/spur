@@ -963,6 +963,7 @@ address = "http://peer-a:6817"
         let req = spur_proto::proto::ExecInJobRequest {
             job_id: 42,
             command: vec!["ls".into(), "-la".into()],
+            user: "alice".into(),
         };
         assert_eq!(req.job_id, 42);
         assert_eq!(req.command.len(), 2);
@@ -988,6 +989,7 @@ address = "http://peer-a:6817"
                     }),
                     argv: vec!["/bin/bash".into()],
                     env: HashMap::new(),
+                    user: "alice".into(),
                 },
             )),
         };

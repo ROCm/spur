@@ -95,6 +95,7 @@ async fn stream_output_only(
         .stream_job_output(StreamJobOutputRequest {
             job_id,
             stream: stream_name.to_string(),
+            user: crate::interactive::current_user(),
         })
         .await
         .context("failed to start output stream")?

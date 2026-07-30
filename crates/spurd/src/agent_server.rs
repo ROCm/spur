@@ -43,6 +43,9 @@ struct TrackedJob {
     work_dir: String,
     uid: u32,
     gid: u32,
+    /// Owning username, used to gate exec/attach requests that arrive straight
+    /// at the agent without passing through the controller.
+    user: String,
     partition: String,
     gpu_devices: Vec<u32>,
     cpus: u32,
@@ -1364,6 +1367,7 @@ impl SlurmAgent for AgentService {
                         work_dir: launch_cfg.work_dir,
                         uid: launch_cfg.uid,
                         gid: launch_cfg.gid,
+                        user: launch_cfg.user,
                         partition: launch_cfg.partition,
                         gpu_devices: launch_cfg.gpu_devices,
                         cpus: launch_cfg.cpus,
@@ -1476,6 +1480,9 @@ impl SlurmAgent for AgentService {
         request: Request<ExecInJobRequest>,
     ) -> Result<Response<ExecInJobResponse>, Status> {
         let req = request.into_inner();
+
+        self.check_job_access(req.job_id, &req.user, "exec into")
+            .await?;
 
         let entry = self.job_entry(req.job_id).await?;
 
@@ -1614,6 +1621,7 @@ impl SlurmAgent for AgentService {
                 work_dir: req.work_dir.clone(),
                 uid: req.uid,
                 gid: req.gid,
+                user: req.user,
                 partition: req.partition,
                 gpu_devices: controller_gpu_ids,
                 cpus,
@@ -1923,6 +1931,9 @@ impl SlurmAgent for AgentService {
         let req = request.into_inner();
         let job_id = req.job_id;
 
+        self.check_job_access(job_id, &req.user, "read output of")
+            .await?;
+
         // No retry on a miss, same as run_command: a Running job has been
         // confirmed on every node (confirm_dispatch_on_nodes). Callers here
         // (srun --attach, sattach) hit the agent directly with no controller
@@ -2030,6 +2041,9 @@ impl SlurmAgent for AgentService {
                 ));
             }
         };
+
+        self.check_job_access(init.job_id, &init.user, "attach to")
+            .await?;
 
         let entry = self.job_entry(init.job_id).await?;
 
@@ -2443,6 +2457,20 @@ impl AgentService {
         });
     }
 
+    /// Reject `user` unless they own job `job_id`.
+    ///
+    /// Enforced here as well as on the controller because `sattach` and the
+    /// output stream dial the agent's port directly.
+    async fn check_job_access(&self, job_id: u32, user: &str, action: &str) -> Result<(), Status> {
+        let jobs = self.running.lock().await;
+        let tracked = jobs
+            .get(&job_id)
+            .ok_or_else(|| Status::not_found(format!("job {} not running on this node", job_id)))?;
+
+        spur_core::auth::check_job_owner(user, &tracked.user, action)
+            .map_err(|e| Status::permission_denied(e.to_string()))
+    }
+
     /// Extract a `JobEntry` from a tracked running job for namespace entry.
     ///
     /// Backs `exec_in_job` and `interactive_session` (attach), both reachable
@@ -2781,9 +2809,11 @@ impl TrackedJob {
     fn dummy(_pid: u32) -> Self {
         // Spawn in its own process group, matching how real managed jobs are
         // launched, so group-targeted signals (kill_signal) land correctly.
+        // kill_on_drop keeps the long sleep from outliving the test that owns it.
         let child = tokio::process::Command::new("sleep")
             .arg("3600")
             .process_group(0)
+            .kill_on_drop(true)
             .spawn()
             .expect("failed to spawn dummy process");
         Self {
@@ -2801,6 +2831,7 @@ impl TrackedJob {
             work_dir: "/tmp".into(),
             uid: 0,
             gid: 0,
+            user: "testuser".into(),
             partition: String::new(),
             gpu_devices: Vec::new(),
             cpus: 1,
@@ -3067,6 +3098,7 @@ mod tests {
         let req = Request::new(ExecInJobRequest {
             job_id: 42,
             command: vec!["echo".into(), "hello".into()],
+            user: "testuser".into(),
         });
 
         let result = svc.exec_in_job(req).await;
@@ -3085,10 +3117,83 @@ mod tests {
         let req = Request::new(ExecInJobRequest {
             job_id: 999,
             command: vec!["echo".into()],
+            user: "testuser".into(),
         });
 
         let err = svc.exec_in_job(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn exec_in_job_rejects_non_owner() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        svc.insert_test_job(43, TrackedJob::dummy(std::process::id()))
+            .await;
+
+        let err = svc
+            .exec_in_job(Request::new(ExecInJobRequest {
+                job_id: 43,
+                command: vec!["whoami".into()],
+                user: "intruder".into(),
+            }))
+            .await
+            .expect_err("a non-owner must not exec inside another user's job");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn stream_job_output_rejects_non_owner() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        svc.insert_test_job(44, TrackedJob::dummy(std::process::id()))
+            .await;
+
+        let err = svc
+            .stream_job_output(Request::new(StreamJobOutputRequest {
+                job_id: 44,
+                stream: "stdout".into(),
+                user: "intruder".into(),
+            }))
+            .await
+            .expect_err("a non-owner must not read another user's job output");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn exec_in_job_allows_owner() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        svc.insert_test_job(45, TrackedJob::dummy(std::process::id()))
+            .await;
+
+        // The owner clears the gate; the exec itself may still fail in a test
+        // sandbox, so only the absence of PermissionDenied is asserted.
+        let code = svc
+            .exec_in_job(Request::new(ExecInJobRequest {
+                job_id: 45,
+                command: vec!["echo".into(), "hello".into()],
+                user: "testuser".into(),
+            }))
+            .await
+            .err()
+            .map(|e| e.code());
+
+        assert_ne!(code, Some(tonic::Code::PermissionDenied));
     }
 
     // --- srun step dispatch via RunCommand ---
@@ -4247,6 +4352,7 @@ mod tests {
             work_dir: "/tmp".into(),
             uid: 0,
             gid: 0,
+            user: "testuser".into(),
             partition: String::new(),
             gpu_devices: Vec::new(),
             cpus: 1,
@@ -4279,8 +4385,8 @@ mod tests {
         // No monitor: this test asserts the grace timer's epoch guard directly,
         // so nothing should reap the job out from under it.
 
-        // SIGTERM-trapping process so epoch 1 survives its cancel; built inline
-        // (not via dummy(), which would leak its own sleep child).
+        // SIGTERM-trapping process so epoch 1 survives its cancel; dummy()'s
+        // plain sleep would die on the first SIGTERM.
         fn spawn_trap(run_attempt: u32) -> (TrackedJob, i32) {
             let child = tokio::process::Command::new("/bin/sh")
                 .args(["-c", "trap '' TERM; while true; do sleep 1; done"])
@@ -4306,6 +4412,7 @@ mod tests {
                 work_dir: "/tmp".into(),
                 uid: 0,
                 gid: 0,
+                user: "testuser".into(),
                 partition: String::new(),
                 gpu_devices: Vec::new(),
                 cpus: 1,
