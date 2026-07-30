@@ -3008,6 +3008,38 @@ mod tests {
         assert_eq!(resp.stdout.trim(), "hi");
     }
 
+    // wait_for_running_job falls back to this node's own hostname only when
+    // the tracked job's nodelist is empty (the case every other run_command
+    // test hits via TrackedJob::dummy). A multi-node job's nodelist is set
+    // by the controller at dispatch time, so it's normally non-empty —
+    // exercise that path explicitly.
+    #[tokio::test]
+    async fn run_command_uses_tracked_job_nodelist_when_set() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 778;
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.nodelist = "node-a,node-b".into();
+        svc.insert_test_job(job_id, tracked).await;
+
+        let req = Request::new(RunCommandRequest {
+            command: vec!["/bin/sh".into(), "-c".into(), "echo $SPUR_NODELIST".into()],
+            uid: 0,
+            gid: 0,
+            work_dir: String::new(),
+            environment: HashMap::new(),
+            job_id,
+            ..Default::default()
+        });
+        let resp = svc.run_command(req).await.unwrap().into_inner();
+        assert_eq!(resp.exit_code, 0);
+        assert_eq!(resp.stdout.trim(), "node-a,node-b");
+    }
+
     #[tokio::test]
     async fn run_command_uses_provided_work_dir() {
         // The bug repro: the user's workflow is `salloc; srun hostname`.
