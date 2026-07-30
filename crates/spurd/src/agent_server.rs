@@ -466,9 +466,67 @@ fn controller_rpc_retryable(status: &tonic::Status) -> bool {
     )
 }
 
+const CONTROLLER_RPC_ATTEMPTS: u32 = 3;
+const CONTROLLER_RPC_RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A single failed attempt at a controller RPC.
+enum ControllerRpcError {
+    Connect(tonic::transport::Error),
+    Rpc(tonic::Status),
+}
+
+impl ControllerRpcError {
+    /// A transport failure is always worth another attempt: it says nothing
+    /// about the request, only that no controller answered. A server response
+    /// is worth one only when its code says so.
+    fn retryable(&self) -> bool {
+        match self {
+            Self::Connect(_) => true,
+            Self::Rpc(status) => controller_rpc_retryable(status),
+        }
+    }
+}
+
+impl std::fmt::Display for ControllerRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connect(e) => write!(f, "connect: {e}"),
+            Self::Rpc(status) => write!(f, "{status}"),
+        }
+    }
+}
+
+/// Run `attempt` until it succeeds, fails in a way no retry can fix, or spends
+/// the attempt budget, returning the last failure. A single transient failure
+/// must not lose a job completion or leave a broken node accepting work.
+async fn retry_controller_rpc<T, F, Fut>(mut attempt: F) -> Result<T, ControllerRpcError>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<T, ControllerRpcError>>,
+{
+    let mut n = 1;
+    loop {
+        match attempt(n).await {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                if !e.retryable() || n == CONTROLLER_RPC_ATTEMPTS {
+                    return Err(e);
+                }
+                n += 1;
+                tokio::time::sleep(CONTROLLER_RPC_RETRY_GAP).await;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
-mod completion_report_tests {
-    use super::controller_rpc_retryable;
+mod controller_rpc_tests {
+    use super::{
+        controller_rpc_retryable, retry_controller_rpc, ControllerRpcError,
+        CONTROLLER_RPC_ATTEMPTS, CONTROLLER_RPC_RETRY_GAP,
+    };
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
     use tonic::Status;
 
     #[test]
@@ -481,6 +539,81 @@ mod completion_report_tests {
     fn transient_errors_are_retryable() {
         assert!(controller_rpc_retryable(&Status::unavailable("x")));
         assert!(controller_rpc_retryable(&Status::internal("x")));
+    }
+
+    /// Drive the retry loop with one scripted outcome per attempt, reporting how
+    /// many attempts it actually made.
+    async fn run_script(script: Vec<Result<(), Status>>) -> (Result<(), ControllerRpcError>, u32) {
+        let calls = AtomicU32::new(0);
+        let result = retry_controller_rpc(|_| {
+            let outcome = script[calls.fetch_add(1, Ordering::SeqCst) as usize].clone();
+            async move { outcome.map_err(ControllerRpcError::Rpc) }
+        })
+        .await;
+        (result, calls.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn success_returns_on_the_first_attempt() {
+        let start = tokio::time::Instant::now();
+        let (result, calls) = run_script(vec![
+            Ok(()),
+            Err(Status::unavailable("must not be reached")),
+            Err(Status::unavailable("must not be reached")),
+        ])
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls, 1);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    /// A rejection no retry can fix must not spend the budget: the caller runs in
+    /// a spawned task, and sleeping through attempts delays the drain that stops
+    /// the node taking more work. The trailing successes make a regression here
+    /// surface as a wrong result rather than a short script.
+    #[tokio::test(start_paused = true)]
+    async fn non_retryable_error_gives_up_without_retrying() {
+        let start = tokio::time::Instant::now();
+        let (result, calls) = run_script(vec![
+            Err(Status::invalid_argument("unknown node")),
+            Ok(()),
+            Ok(()),
+        ])
+        .await;
+
+        assert!(matches!(result, Err(ControllerRpcError::Rpc(_))));
+        assert_eq!(calls, 1);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retryable_errors_are_retried_until_one_succeeds() {
+        let start = tokio::time::Instant::now();
+        let (result, calls) = run_script(vec![
+            Err(Status::unavailable("controller restarting")),
+            Err(Status::internal("leader election in progress")),
+            Ok(()),
+        ])
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls, CONTROLLER_RPC_ATTEMPTS);
+        assert_eq!(start.elapsed(), 2 * CONTROLLER_RPC_RETRY_GAP);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retryable_errors_give_up_once_the_budget_is_spent() {
+        let start = tokio::time::Instant::now();
+        let script = vec![Err(Status::unavailable("no route")); CONTROLLER_RPC_ATTEMPTS as usize];
+        let (result, calls) = run_script(script).await;
+
+        assert!(matches!(result, Err(ControllerRpcError::Rpc(_))));
+        assert_eq!(calls, CONTROLLER_RPC_ATTEMPTS);
+        assert_eq!(
+            start.elapsed(),
+            (CONTROLLER_RPC_ATTEMPTS - 1) * CONTROLLER_RPC_RETRY_GAP
+        );
     }
 }
 
@@ -590,70 +723,65 @@ async fn report_completion(
     // RaisedSignal outcome from the reported `signal`.
     let state = spur_core::job::JobState::completion_state_for_exit_code(exit_code).to_proto_i32();
 
-    // Retry up to 3 times with 1-second backoff — a single transient failure
-    // must not permanently lose a job completion.
-    for attempt in 1..=3 {
-        match spur_client::connect_channel(controller_addr).await {
-            Ok(channel) => {
-                let mut client = spur_proto::controller_client(channel);
-                let req = ReportJobStatusRequest {
-                    job_id,
-                    state,
-                    exit_code,
-                    signal,
-                    message: format!("exit_code={}", exit_code),
-                    drain_node: drain.is_some(),
-                    drain_reason: drain.as_ref().map(|d| d.reason.clone()).unwrap_or_default(),
-                    reporting_node: reporting_node.to_string(),
-                    run_attempt,
-                };
-                match client.report_job_status(req).await {
-                    Ok(_) => {
-                        info!(
-                            job_id,
-                            exit_code,
-                            controller = %controller_addr,
-                            "reported completion to controller"
-                        );
-                        return;
-                    }
-                    Err(e) => {
-                        if !controller_rpc_retryable(&e) {
-                            error!(
-                                job_id,
-                                attempt,
-                                code = ?e.code(),
-                                error = %e,
-                                "ReportJobStatus failed with non-retryable error"
-                            );
-                            return;
-                        }
-                        warn!(
-                            job_id,
-                            attempt,
-                            error = %e,
-                            "ReportJobStatus RPC failed"
-                        );
-                    }
-                }
-            }
-            Err(e) => {
+    let result = retry_controller_rpc(move |attempt| async move {
+        let channel = spur_client::connect_channel(controller_addr)
+            .await
+            .map_err(|e| {
                 warn!(
                     job_id,
                     attempt,
                     error = %e,
                     "failed to connect to controller for completion report"
                 );
-            }
-        }
-        if attempt < 3 {
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        }
+                ControllerRpcError::Connect(e)
+            })?;
+        let req = ReportJobStatusRequest {
+            job_id,
+            state,
+            exit_code,
+            signal,
+            message: format!("exit_code={}", exit_code),
+            drain_node: drain.is_some(),
+            drain_reason: drain.as_ref().map(|d| d.reason.clone()).unwrap_or_default(),
+            reporting_node: reporting_node.to_string(),
+            run_attempt,
+        };
+        spur_proto::controller_client(channel)
+            .report_job_status(req)
+            .await
+            .map_err(|e| {
+                warn!(
+                    job_id,
+                    attempt,
+                    error = %e,
+                    "ReportJobStatus RPC failed"
+                );
+                ControllerRpcError::Rpc(e)
+            })
+    })
+    .await;
+
+    match result {
+        Ok(_) => info!(
+            job_id,
+            exit_code,
+            controller = %controller_addr,
+            "reported completion to controller"
+        ),
+        Err(e) if e.retryable() => error!(
+            job_id,
+            exit_code,
+            attempts = CONTROLLER_RPC_ATTEMPTS,
+            error = %e,
+            "gave up reporting completion to controller"
+        ),
+        Err(e) => error!(
+            job_id,
+            exit_code,
+            error = %e,
+            "ReportJobStatus failed with non-retryable error"
+        ),
     }
-    error!(
-        job_id,
-        exit_code, "gave up reporting completion after 3 attempts"
-    );
 }
 
 fn warn_mpi_mpirun_skipped_affinity(job_id: u32, source: &HashMap<String, String>) {
@@ -678,48 +806,10 @@ fn warn_mpi_mpirun_skipped_affinity(job_id: u32, source: &HashMap<String, String
 /// race that path and could finalize a still-retryable job to Failed, which no
 /// requeue path recovers.
 async fn request_node_drain(controller_addr: &str, node_name: &str, reason: &str, job_id: u32) {
-    for attempt in 1..=3 {
-        match spur_client::connect_channel(controller_addr).await {
-            Ok(channel) => {
-                let mut client = spur_proto::controller_client(channel);
-                let req = DrainNodeRequest {
-                    name: node_name.to_string(),
-                    reason: reason.to_string(),
-                };
-                match client.drain_node(req).await {
-                    Ok(resp) => {
-                        warn!(
-                            job_id,
-                            node = %node_name,
-                            state = %resp.into_inner().actual_state,
-                            reason,
-                            "requested node drain after launch failure"
-                        );
-                        return;
-                    }
-                    Err(e) => {
-                        if !controller_rpc_retryable(&e) {
-                            error!(
-                                job_id,
-                                node = %node_name,
-                                attempt,
-                                code = ?e.code(),
-                                error = %e,
-                                "DrainNode failed with non-retryable error"
-                            );
-                            return;
-                        }
-                        warn!(
-                            job_id,
-                            node = %node_name,
-                            attempt,
-                            error = %e,
-                            "DrainNode RPC failed"
-                        );
-                    }
-                }
-            }
-            Err(e) => {
+    let result = retry_controller_rpc(move |attempt| async move {
+        let channel = spur_client::connect_channel(controller_addr)
+            .await
+            .map_err(|e| {
                 warn!(
                     job_id,
                     node = %node_name,
@@ -727,17 +817,50 @@ async fn request_node_drain(controller_addr: &str, node_name: &str, reason: &str
                     error = %e,
                     "failed to connect to controller for drain request"
                 );
-            }
-        }
-        if attempt < 3 {
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        }
+                ControllerRpcError::Connect(e)
+            })?;
+        let req = DrainNodeRequest {
+            name: node_name.to_string(),
+            reason: reason.to_string(),
+        };
+        spur_proto::controller_client(channel)
+            .drain_node(req)
+            .await
+            .map_err(|e| {
+                warn!(
+                    job_id,
+                    node = %node_name,
+                    attempt,
+                    error = %e,
+                    "DrainNode RPC failed"
+                );
+                ControllerRpcError::Rpc(e)
+            })
+    })
+    .await;
+
+    match result {
+        Ok(resp) => warn!(
+            job_id,
+            node = %node_name,
+            state = %resp.into_inner().actual_state,
+            reason = %reason,
+            "requested node drain after launch failure"
+        ),
+        Err(e) if e.retryable() => error!(
+            job_id,
+            node = %node_name,
+            attempts = CONTROLLER_RPC_ATTEMPTS,
+            error = %e,
+            "gave up requesting node drain"
+        ),
+        Err(e) => error!(
+            job_id,
+            node = %node_name,
+            error = %e,
+            "DrainNode failed with non-retryable error"
+        ),
     }
-    error!(
-        job_id,
-        node = %node_name,
-        "gave up requesting node drain after 3 attempts"
-    );
 }
 
 #[tonic::async_trait]
