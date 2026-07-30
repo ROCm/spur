@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 use spur_proto::proto::UpdateNodeRequest;
@@ -29,28 +29,28 @@ pub struct NodeArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum NodeCommand {
-    /// Set or remove labels on a node.
+    /// Set or remove labels on one or more nodes.
     ///
     /// Labels are key=value pairs used for partition routing.
     /// Append a trailing dash to remove a label (e.g., "pool-").
     Label {
-        /// Node name
+        /// Node names: comma-separated list and/or hostlist range (e.g. "n1,n2", "n[1-4]")
         node: String,
         /// Labels to set (key=value) or remove (key-)
         #[arg(required = true)]
         labels: Vec<String>,
     },
-    /// Drain a node: stop scheduling new jobs while existing jobs finish.
+    /// Drain one or more nodes: stop scheduling new jobs while existing jobs finish.
     Drain {
-        /// Node name
+        /// Node names: comma-separated list and/or hostlist range (e.g. "n1,n2", "n[1-4]")
         node: String,
         /// Reason for draining
         #[arg(long)]
         reason: Option<String>,
     },
-    /// Remove a node from the cluster entirely.
+    /// Remove one or more nodes from the cluster entirely.
     Remove {
-        /// Node name
+        /// Node names: comma-separated list and/or hostlist range (e.g. "n1,n2", "n[1-4]")
         node: String,
         /// Force removal even if jobs are running (jobs will be failed with NODE_FAIL)
         #[arg(long)]
@@ -102,50 +102,57 @@ fn parse_label_args(label_args: &[String]) -> Result<(HashMap<String, String>, V
     Ok((set_labels, remove_labels))
 }
 
-async fn cmd_label(controller: &str, node: String, label_args: Vec<String>) -> Result<()> {
+async fn cmd_label(controller: &str, node_pattern: String, label_args: Vec<String>) -> Result<()> {
     let mut client = spur_proto::controller_client(spur_client::connect_channel(controller).await?);
     let (set_labels, remove_labels) = parse_label_args(&label_args)?;
+    let nodes = expand_node_pattern(&node_pattern)?;
 
-    client
-        .update_node(UpdateNodeRequest {
-            name: node.clone(),
-            state: None,
-            reason: None,
-            labels: set_labels.clone(),
-            remove_labels: remove_labels.clone(),
-        })
-        .await?;
+    for node in &nodes {
+        client
+            .update_node(UpdateNodeRequest {
+                name: node.to_string(),
+                state: None,
+                reason: None,
+                labels: set_labels.clone(),
+                remove_labels: remove_labels.clone(),
+            })
+            .await?;
 
-    for (k, v) in &set_labels {
-        println!("  {node}: {k}={v}");
-    }
-    for k in &remove_labels {
-        println!("  {node}: {k} removed");
+        for (k, v) in &set_labels {
+            println!("  {node}: {k}={v}");
+        }
+        for k in &remove_labels {
+            println!("  {node}: {k} removed");
+        }
     }
 
     Ok(())
 }
 
-async fn cmd_drain(controller: &str, node: String, reason: Option<String>) -> Result<()> {
+async fn cmd_drain(controller: &str, node_pattern: String, reason: Option<String>) -> Result<()> {
     let mut client = spur_proto::controller_client(spur_client::connect_channel(controller).await?);
-    let resp = client
-        .drain_node(spur_proto::proto::DrainNodeRequest {
-            name: node.clone(),
-            reason: reason.clone().unwrap_or_default(),
-        })
-        .await?
-        .into_inner();
+    let nodes = expand_node_pattern(&node_pattern)?;
 
-    if resp.running_jobs > 0 {
-        println!(
-            "Node {node} set to draining ({} running job{} will finish first)",
-            resp.running_jobs,
-            if resp.running_jobs == 1 { "" } else { "s" }
-        );
-    } else {
-        println!("Node {node} set to drain");
+    for node in &nodes {
+        let resp = client
+            .drain_node(spur_proto::proto::DrainNodeRequest {
+                name: node.to_string(),
+                reason: reason.clone().unwrap_or_default(),
+            })
+            .await?
+            .into_inner();
+
+        if resp.running_jobs > 0 {
+            println!(
+                "Node {node} set to draining ({} running job{} will finish first)",
+                resp.running_jobs,
+                if resp.running_jobs == 1 { "" } else { "s" }
+            );
+        } else {
+            println!("Node {node} set to drain");
+        }
     }
-    if let Some(r) = reason {
+    if let Some(r) = &reason {
         println!("  reason: {r}");
     }
     Ok(())
@@ -153,37 +160,45 @@ async fn cmd_drain(controller: &str, node: String, reason: Option<String>) -> Re
 
 async fn cmd_remove(
     controller: &str,
-    node: String,
+    node_pattern: String,
     force: bool,
     reason: Option<String>,
 ) -> Result<()> {
     let mut client = spur_proto::controller_client(spur_client::connect_channel(controller).await?);
-    let resp = client
-        .deregister_node(spur_proto::proto::DeregisterNodeRequest {
-            name: node.clone(),
-            force,
-            reason: reason.clone().unwrap_or_default(),
-        })
-        .await?
-        .into_inner();
+    let nodes = expand_node_pattern(&node_pattern)?;
 
-    if resp.evicted_jobs_count > 0 {
-        println!(
-            "Node {node} removed from cluster ({} job{} evicted)",
-            resp.evicted_jobs_count,
-            if resp.evicted_jobs_count == 1 {
-                ""
-            } else {
-                "s"
-            }
-        );
-    } else {
-        println!("Node {node} removed from cluster");
+    for node in &nodes {
+        let resp = client
+            .deregister_node(spur_proto::proto::DeregisterNodeRequest {
+                name: node.to_string(),
+                force,
+                reason: reason.clone().unwrap_or_default(),
+            })
+            .await?
+            .into_inner();
+
+        if resp.evicted_jobs_count > 0 {
+            println!(
+                "Node {node} removed from cluster ({} job{} evicted)",
+                resp.evicted_jobs_count,
+                if resp.evicted_jobs_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+        } else {
+            println!("Node {node} removed from cluster");
+        }
     }
-    if let Some(r) = reason {
+    if let Some(r) = &reason {
         println!("  reason: {r}");
     }
     Ok(())
+}
+
+fn expand_node_pattern(pattern: &str) -> Result<Vec<String>> {
+    spur_core::hostlist::expand(pattern).context("invalid node name pattern")
 }
 
 #[cfg(test)]
