@@ -49,7 +49,7 @@ Some changes compile and pass tests but break a running cluster on upgrade or br
 
 - **Persisted state (Raft/WAL log, snapshots)** — `WalOperation` and every type it reaches (`JobSpec`, `JobStep`, `Reservation`, `NodeState`, resource/alloc types, `AdmissionToken`, k0s state) serialize to JSON in the Raft log; `PersistedSnapshot` likewise. A new field without `#[serde(default)]` or `Option`, or a renamed/removed field or enum variant, makes a new controller crash replaying old entries.
 - **gRPC proto (`proto/slurm.proto`)** — renumbering, removing, or retyping a field breaks FFI, REST, and cross-version wire compat. Only append fields with new tags; never reuse or renumber tags.
-- **Config (`/etc/spur/spur.conf`, `config.rs`)** — removing/renaming a field or changing its type breaks deployed configs. New fields need `#[serde(default)]`.
+- **Config (`/etc/spur/spur.conf`, `config.rs`)** — removing/renaming a field or changing its type breaks deployed configs.
 - **User-facing CLI/REST** — removing a flag, subcommand, or response field, or changing its meaning, breaks Slurm-compatible scripts.
 
 Validate your changes before submitting:
