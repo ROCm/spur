@@ -1652,6 +1652,11 @@ impl SlurmAgent for AgentService {
         };
         let step_id = req.step_id;
 
+        // No retry on a miss here: the controller only lets a step reach this
+        // node once the job is visibly Running, and Running is only reached
+        // once every assigned node — this one included — has already
+        // confirmed its LaunchJob (see confirm_dispatch_on_nodes). A miss
+        // therefore means a genuinely wrong job/node pairing, not a race.
         let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
@@ -1910,6 +1915,19 @@ impl SlurmAgent for AgentService {
         let req = request.into_inner();
         let job_id = req.job_id;
 
+        // No retry on a miss here, for the same reason as run_command: a job
+        // only becomes visibly Running once every assigned node has
+        // confirmed its LaunchJob (confirm_dispatch_on_nodes), so a caller
+        // that waited for Running before reaching this node has already
+        // missed the window where this could race. Unlike run_command (which
+        // the controller only forwards to a node once it has independently
+        // checked job.state == Running), this RPC has no controller-side
+        // proxy — callers (srun --attach, sattach) call it directly against
+        // the agent after checking job.state themselves. That's still safe
+        // against this race (there is no other, earlier source of "the job
+        // is running" for a caller to have used instead), just worth noting
+        // as a difference from the other lookups in this file.
+        //
         // Look up the output file path from the tracked job
         let file_path = {
             let jobs = self.running.lock().await;
@@ -2427,6 +2445,15 @@ impl AgentService {
     }
 
     /// Extract a `JobEntry` from a tracked running job for namespace entry.
+    ///
+    /// Backs both `exec_in_job` and `interactive_session` (attach). Both are
+    /// only reachable once the controller's own `job.state == Running` check
+    /// passes (`exec_in_job` and `create_job_step` in spurctld/server.rs), and
+    /// that state is only reached once every assigned node — this one
+    /// included — has confirmed its LaunchJob (confirm_dispatch_on_nodes). No
+    /// retry needed here for the same reason run_command's lookup doesn't
+    /// need one: by the time a caller can reach this node at all, the miss
+    /// window is already behind it.
     async fn job_entry(&self, job_id: u32) -> Result<crate::job_entry::JobEntry, Status> {
         let jobs = self.running.lock().await;
         let tracked = jobs

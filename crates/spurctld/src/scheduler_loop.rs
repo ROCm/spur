@@ -282,11 +282,11 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             // fallback) must have every assigned node confirm its LaunchJob
             // *before* start_job flips the job to Running — otherwise squeue
             // reports Running while a node may still be mid-launch (the race
-            // PR #544 papers over with a retry window on the agent side). The
-            // pure interactive srun_step_dispatch case has nothing left to
-            // dispatch here: register_allocation_on_nodes above already
-            // confirmed the allocation, and the actual step launch is a later
-            // RunCommand, not this LaunchJob RPC.
+            // an earlier mitigation only papered over with a retry window on
+            // the agent side). The pure interactive srun_step_dispatch case
+            // has nothing left to dispatch here: register_allocation_on_nodes
+            // above already confirmed the allocation, and the actual step
+            // launch is a later RunCommand, not this LaunchJob RPC.
             let dispatch_spec = if !spec.srun_job {
                 Some(spec.clone())
             } else if !srun_step_dispatch {
@@ -1158,16 +1158,29 @@ enum DispatchConfirmOutcome {
 /// RPC to resolve before returning anything the caller can use to flip the
 /// job to Running.
 ///
-/// This is the structural fix for the srun-step startup race (see PR #544,
-/// which only widens the agent-side retry window): the old flow called
-/// `start_job` (Running, visible to squeue/scontrol) and then fired this
-/// dispatch in the background via `tokio::spawn`, so a step could target a
-/// node before that node's own `LaunchJob` had actually finished. Now the
-/// scheduler loop awaits this function *before* calling `start_job`, mirroring
-/// the pattern `register_allocation_on_nodes` already uses for standalone
-/// srun/salloc allocations — except this confirms the heavier `LaunchJob` RPC
-/// (which actually spawns the job's process), not the lightweight
-/// `RegisterJobAllocation` used there.
+/// This is the structural fix for the srun-step startup race: an earlier
+/// mitigation only widened an agent-side retry window on one lookup. The old
+/// flow called `start_job` (Running, visible to squeue/scontrol) and then
+/// fired this dispatch in the background via `tokio::spawn`, so a step could
+/// target a node before that node's own `LaunchJob` had actually finished.
+/// Now the scheduler loop awaits this function *before* calling `start_job`,
+/// mirroring the pattern `register_allocation_on_nodes` already uses for
+/// standalone srun/salloc allocations — except this confirms the heavier
+/// `LaunchJob` RPC (which actually spawns the job's process), not the
+/// lightweight `RegisterJobAllocation` used there.
+///
+/// This closes the race for every consumer that gates on `job.state ==
+/// Running` before targeting a node, not just the step-dispatch path
+/// (`run_step`/`run_command`) it was written for: `exec_in_job` and
+/// `create_job_step` (spurctld/server.rs) both check `job.state == Running`
+/// before forwarding to an agent, and back `exec_in_job`/`interactive_session`
+/// (spurd/agent_server.rs's `job_entry`) and `stream_job_output`'s attach
+/// path respectively. Since Running is the single, sole signal all of these
+/// checks (and the CLI's own client-side checks, for the RPCs that have no
+/// controller-side proxy) rely on, and it is now unreachable before every
+/// node's registration completes, none of run_command/job_entry/
+/// stream_job_output's node-side lookups need a retry of their own — see the
+/// comments at each of those lookups.
 ///
 /// Failure handling necessarily differs from the old post-Running
 /// `dispatch_job_to_nodes` this replaces, because the job is still Pending
