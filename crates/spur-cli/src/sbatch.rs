@@ -1337,7 +1337,11 @@ echo "hello world"
     }
 
     #[test]
+    #[serial(env_injection)]
     fn test_nodefile_directive_is_parsed() {
+        // Guarded because SBATCH_NODELIST clears a directive nodefile, so a
+        // stray or concurrently-set var would empty the field under test.
+        let _env = EnvGuard::new();
         let args = parse_merged(&["--nodefile=nodes.txt"], &["sbatch"]);
         assert_eq!(args.nodefile.as_deref(), Some("nodes.txt"));
         assert!(args.nodelist.is_none());
