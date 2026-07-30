@@ -3196,6 +3196,59 @@ mod tests {
         assert_ne!(code, Some(tonic::Code::PermissionDenied));
     }
 
+    /// `interactive_session` (the `sattach` and `srun --pty` path) gates on
+    /// `check_job_access`, but its handler consumes a gRPC stream that cannot be
+    /// built in-process, so the gate is exercised directly here.
+    #[tokio::test]
+    async fn check_job_access_gates_attach_by_owner() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        svc.insert_test_job(46, TrackedJob::dummy(std::process::id()))
+            .await;
+
+        svc.check_job_access(46, "testuser", "attach to")
+            .await
+            .expect("the owner must be allowed to attach");
+        svc.check_job_access(46, "root", "attach to")
+            .await
+            .expect("root is an admin override");
+
+        let err = svc
+            .check_job_access(46, "intruder", "attach to")
+            .await
+            .expect_err("a non-owner must not attach to another user's job");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        let missing = svc
+            .check_job_access(999, "testuser", "attach to")
+            .await
+            .expect_err("an untracked job must report not-found");
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+    }
+
+    /// An allocation registered by a controller predating the identity field
+    /// leaves the owner blank; the real owner must not be locked out of it.
+    #[tokio::test]
+    async fn check_job_access_allows_attach_when_owner_unrecorded() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let mut job = TrackedJob::dummy(std::process::id());
+        job.user = String::new();
+        svc.insert_test_job(47, job).await;
+
+        svc.check_job_access(47, "alice", "attach to")
+            .await
+            .expect("an unattributed job stays reachable by its owner");
+    }
+
     // --- srun step dispatch via RunCommand ---
     //
     // Regression: srun's run_as_step previously called

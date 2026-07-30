@@ -3156,6 +3156,28 @@ mod tests {
         assert_eq!(err.code(), Code::PermissionDenied);
     }
 
+    /// A REST submission omitting `user` records no owner. Such a job must stay
+    /// reachable rather than becoming root-only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_in_job_allows_caller_when_owner_unrecorded() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "").await;
+
+        // The ownership gate must pass; dispatch to the fake agent still fails.
+        let code = svc
+            .exec_in_job(Request::new(ExecInJobRequest {
+                job_id,
+                command: vec!["whoami".into()],
+                user: "alice".into(),
+            }))
+            .await
+            .err()
+            .map(|e| e.code());
+
+        assert_ne!(code, Some(Code::PermissionDenied));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_job_step_denies_non_owner() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -3208,28 +3230,6 @@ mod tests {
             .expect("the owner must be allowed to attach");
 
         assert_eq!(resp.into_inner().node_addr, "127.0.0.1:6818");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn exec_in_job_allows_caller_when_owner_unrecorded() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
-        let job_id = running_job_owned_by(&svc, "").await;
-
-        let err = svc
-            .exec_in_job(Request::new(ExecInJobRequest {
-                job_id,
-                command: vec!["whoami".into()],
-                user: "anybody".into(),
-            }))
-            .await
-            .expect_err("job is running but no agent is listening");
-
-        assert_ne!(
-            err.code(),
-            Code::PermissionDenied,
-            "empty owner must not trigger auth denial"
-        );
     }
 
     async fn assign_ha_control_plane(svc: &ControllerService) {

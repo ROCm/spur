@@ -92,8 +92,15 @@ impl Identity {
 /// before the identity field existed send nothing; root is an admin override.
 /// Callers that reach this from a self-reported client field get only as much
 /// assurance as that field carries.
+///
+/// An empty `owner` is also accepted: a job whose submitter was never recorded
+/// (REST submission without `user`, or an allocation registered by a controller
+/// predating the field) is unattributable, so it cannot be matched against any
+/// caller. Denying it would lock the real owner out of their own job instead of
+/// stopping an intruder. Note this reasoning does not extend to a non-empty
+/// placeholder owner, which matches nobody and so restricts the job to root.
 pub fn check_job_owner(user: &str, owner: &str, action: &str) -> Result<(), AuthError> {
-    if user.is_empty() || user == "root" || user == owner {
+    if user.is_empty() || owner.is_empty() || user == "root" || user == owner {
         return Ok(());
     }
     Err(AuthError::NotJobOwner {
@@ -245,6 +252,29 @@ mod tests {
             err.to_string(),
             "user bob cannot exec job owned by alice",
             "message names the requester, action, and owner"
+        );
+    }
+
+    /// A job with no recorded submitter must stay reachable by its real owner.
+    /// Reachable via REST submission without `user`, and via an allocation
+    /// registered by a controller predating the identity field.
+    #[test]
+    fn test_check_job_owner_allows_any_user_when_owner_unrecorded() {
+        assert!(check_job_owner("alice", "", "exec").is_ok());
+        assert!(check_job_owner("bob", "", "attach to").is_ok());
+        assert!(check_job_owner("", "", "exec").is_ok());
+    }
+
+    /// A non-empty placeholder owner matches no caller, so it restricts the job
+    /// to root. Asserted so that introducing such a placeholder cannot silently
+    /// lock users out of their own jobs.
+    #[test]
+    fn test_check_job_owner_placeholder_owner_restricts_to_root() {
+        assert!(check_job_owner("root", "k8s", "exec").is_ok());
+        assert!(
+            check_job_owner("alice", "k8s", "exec").is_err(),
+            "a placeholder owner denies every named user; record the real \
+             submitter or leave the owner empty instead"
         );
     }
 
