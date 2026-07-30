@@ -43,15 +43,9 @@ impl std::fmt::Display for LaunchError {
 
 impl LaunchError {
     /// Reason for the agent to drain itself, or `None` when the controller owns
-    /// the decision. Derived from `Display` so the reason and the decision
-    /// cannot disagree, and so callers never re-prefix a message that already
-    /// carries its own prefix.
-    ///
-    /// Only `NodeFault` qualifies: it is gated on a root-owned path with no user
-    /// input, so retrying elsewhere converges and no further node drains. A
-    /// prolog failure also drains, but the controller does it, because only the
-    /// controller can pair the drain with the hold that stops the job walking
-    /// the cluster.
+    /// the decision. A prolog failure drains too, but the controller does it,
+    /// because only the controller can pair the drain with the hold that stops
+    /// the job walking the cluster.
     pub fn drain_reason(&self) -> Option<String> {
         match self {
             Self::NodeFault(_) => Some(self.to_string()),
@@ -69,15 +63,11 @@ impl From<anyhow::Error> for LaunchError {
 /// True when the error chain carries a real OS-level I/O failure that the node
 /// itself is responsible for.
 ///
-/// Structured as an exclusion list, mirroring Slurm's "all others drain the
-/// node" default: the spool tree is root-owned and not user-writable, and every
-/// path under it is built by spurd from the job id alone, so a submission cannot
-/// steer the errno. `EIO`, `EACCES`, `ENOTDIR` and `EPERM` there mean the node
-/// is broken just as surely as `ENOSPC` does.
-///
-/// Requiring a real `raw_os_error` keeps a plain `anyhow!("...")` out.
-/// `EDQUOT` stays excluded: a quota is a property of a user on a shared
-/// filesystem, not of the node.
+/// An exclusion list, mirroring Slurm's "all others drain the node" default: the
+/// spool tree is root-owned and every path under it is built from the job id
+/// alone, so a submission cannot steer the errno. Requiring a real
+/// `raw_os_error` keeps a plain `anyhow!("...")` out, and `EDQUOT` stays
+/// excluded as a property of a user on a shared filesystem, not of the node.
 fn is_node_fault_io_error(err: &anyhow::Error) -> bool {
     err.chain()
         .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
@@ -1179,17 +1169,13 @@ fn create_job_spool_dir(job_id: JobId, uid: u32, gid: u32) -> Result<PathBuf, La
 }
 
 /// Build the error for a spool dir that could not be created under any candidate
-/// root.
+/// root. Prefers the owned root's failure over the temp fallback's, since that
+/// is the one an operator configured and the only one whose failure condemns the
+/// node.
 ///
-/// Reports the owned root's failure when there is one, in preference to the temp
-/// fallback's: that is the root an operator configured and the only one whose
-/// failure condemns the node, so naming the fallback instead would send them
-/// to inspect the wrong filesystem.
-///
-/// Keeps the `io::Error` as a source rather than formatting it into the message,
-/// because the node fault is detected by walking the chain and a flattened errno
-/// would silently downgrade a node fault to a job failure, leaving a node
-/// accepting work it cannot run.
+/// The `io::Error` must stay a source rather than be formatted into the message:
+/// [`is_node_fault_io_error`] detects the fault by walking the chain, so a
+/// flattened errno would silently downgrade a node fault to a job failure.
 fn spool_dir_error(mut failures: Vec<(PathBuf, std::io::Error)>) -> LaunchError {
     if failures.is_empty() {
         return LaunchError::Other(anyhow::anyhow!("no spool root candidates configured"));

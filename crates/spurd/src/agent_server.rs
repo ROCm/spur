@@ -798,13 +798,9 @@ fn warn_mpi_mpirun_skipped_affinity(job_id: u32, source: &HashMap<String, String
     }
 }
 
-/// Drain this node without reporting a job completion.
-///
-/// A launch failure is not a completion: the job never ran, and the controller's
-/// dispatch path already owns its fate (requeue when every dispatch failed,
-/// eviction to NodeFail on a partial failure). Reporting an exit code here would
-/// race that path and could finalize a still-retryable job to Failed, which no
-/// requeue path recovers.
+/// Drain this node without reporting a job completion. The controller's dispatch
+/// path already owns the job's fate, so reporting an exit code here would race it
+/// and could finalize a still-retryable job to Failed, which no requeue recovers.
 async fn request_node_drain(controller_addr: &str, node_name: &str, reason: &str, job_id: u32) {
     let result = retry_controller_rpc(move |attempt| async move {
         let channel = spur_client::connect_channel(controller_addr)

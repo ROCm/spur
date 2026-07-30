@@ -44,15 +44,13 @@ use crate::sched_stats::SchedStatsCollector;
 /// so operator runbooks and log greps written against Slurm keep working.
 pub const LAUNCH_FAILURE_HELD_DESC: &str = "launch failed requeued held";
 
-/// Seconds to defer a job by after its `requeue_count`-th launch failure.
+/// Seconds to defer a job by after its `requeue_count`-th launch failure,
+/// doubling per attempt from the same base the preemption requeue uses.
 ///
-/// Doubles per attempt from the same base the preemption requeue uses (two
-/// scheduler cycles plus slack), capped by `max_launch_backoff_secs`. The shift
-/// is clamped because `max_batch_requeue` is operator-supplied and a large one
-/// would otherwise overflow it; the cap makes the clamped value indistinguishable
-/// from the exact one anyway. Config validation rejects a cap above the ceiling,
-/// but an unvalidated config must degrade rather than push the computed instant
-/// out of chrono's range and panic the controller.
+/// The shift is clamped and the result double-capped because `max_batch_requeue`
+/// and the cap are both operator-supplied: an unvalidated config must degrade
+/// rather than push the computed instant out of chrono's range and panic the
+/// controller.
 fn launch_backoff_secs(interval_secs: u32, cap: u64, requeue_count: u32) -> u64 {
     let base = (interval_secs as u64 * 2 + 3).max(5);
     base.saturating_mul(1u64 << requeue_count.min(16))
@@ -1202,12 +1200,10 @@ impl ClusterManager {
     /// Requeue after a dispatch failure, optionally parking the job for an
     /// operator instead of retrying it.
     ///
-    /// `hold` is for failures the job carries with it, so a retry would fail the
-    /// same way on the next node and drain that one too. Such a job skips the
-    /// backoff and the requeue cap (neither means anything to a job that will
-    /// not retry on its own) and waits at priority 0 for `scontrol release`.
-    /// This is Slurm's prolog behavior, and the hold is what bounds the drain to
-    /// one node per failure.
+    /// `hold` is for failures the job carries with it, which would fail the same
+    /// way on the next node and drain that one too. Such a job skips the backoff
+    /// and the requeue cap, neither of which means anything to a job that will
+    /// not retry on its own.
     pub fn requeue_after_launch_failure(&self, job_id: JobId, hold: bool) -> anyhow::Result<()> {
         let (old_state, begin_time) = {
             let jobs = self.jobs.read();
@@ -1269,9 +1265,8 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Instant until which a job requeued after a launch failure is held.
-    ///
-    /// A user `--begin` further out always wins, so the hold never shortens a
+    /// Instant until which a job requeued after a launch failure is held. A user
+    /// `--begin` further out always wins, so the hold never shortens a
     /// user-supplied constraint. Computed on the leader so every replica applies
     /// one verbatim instant rather than reading its own clock.
     fn launch_backoff_until(&self, job: &Job) -> DateTime<Utc> {
