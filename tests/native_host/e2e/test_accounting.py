@@ -723,6 +723,43 @@ class TestSacctmgrQosAuthorization:
         c.scancel(str(job_id))
 
 
+class TestSacctmgrDeleteUser:
+    """`sacctmgr delete user` deletes the real association rows and reports
+    `Done.` only when something changed, `Nothing deleted.` (exit 0) on a no-op."""
+
+    def test_delete_user_removes_association_and_reports_truthfully(self, accounting_cluster):
+        c = accounting_cluster
+        user = c.nodes[0].user
+
+        c.sacctmgr(["add", "account", "name=delone"])
+        c.sacctmgr(["add", "account", "name=deltwo"])
+        c.sacctmgr(["add", "user", f"name={user}", "account=delone"])
+        c.sacctmgr(["add", "user", f"name={user}", "account=deltwo"])
+
+        out = c.sacctmgr(["delete", "user", f"name={user}", "account=delone"])
+        assert "Done." in out, f"a real delete must report Done., got {out!r}"
+
+        shown = c.sacctmgr(["show", "user"])
+        rows = [line for line in shown.splitlines() if user in line]
+        assert any("deltwo" in line for line in rows), f"deltwo association must survive, got {rows!r}"
+        assert not any("delone" in line for line in rows), f"delone association must be gone, got {rows!r}"
+
+        # No account= targets every account; the surviving deltwo row goes too.
+        out = c.sacctmgr(["delete", "user", f"name={user}"])
+        assert "Done." in out, f"all-account delete must report Done., got {out!r}"
+        shown = c.sacctmgr(["show", "user"])
+        assert not any(user in line and ("delone" in line or "deltwo" in line)
+                       for line in shown.splitlines()), "every association for the user must be gone"
+
+    def test_delete_nonexistent_user_is_a_clean_no_op(self, accounting_cluster):
+        # Regression guard: the CLI once printed Done. while nothing was
+        # deleted. A no-op must say so and still exit 0 (sacctmgr() raises otherwise).
+        c = accounting_cluster
+        out = c.sacctmgr(["delete", "user", "name=spur_ghost_user"])
+        assert "Nothing deleted." in out, f"a no-op delete must say so, got {out!r}"
+        assert "Done." not in out, f"a no-op must not falsely report Done., got {out!r}"
+
+
 class TestSacctmgrModifyPartialPatch:
     """`sacctmgr modify` restates only the fields it names; every unstated
     field keeps its stored value, and an explicitly empty field clears it.
