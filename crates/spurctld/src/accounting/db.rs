@@ -2345,14 +2345,42 @@ mod job_history_tests {
             .execute(&pool)
             .await?;
 
-        upsert_account(&pool, &account_one, "d", "o", None, 1, None).await?;
-        upsert_account(&pool, &account_two, "d", "o", None, 1, None).await?;
-        add_user(&pool, &user, &account_one, "none", true, "").await?;
-        add_user(&pool, &user, &account_two, "none", false, "").await?;
+        let acct_update = || AccountUpdate {
+            description: Some("d"),
+            organization: Some("o"),
+            fairshare: Some(1),
+            ..Default::default()
+        };
+        upsert_account(&pool, &account_one, acct_update()).await?;
+        upsert_account(&pool, &account_two, acct_update()).await?;
+        add_user(
+            &pool,
+            &user,
+            &account_one,
+            UserUpdate {
+                admin_level: Some("none"),
+                is_default: Some(true),
+                max_running_jobs: Some(Some(1)),
+                ..Default::default()
+            },
+        )
+        .await?;
+        add_user(
+            &pool,
+            &user,
+            &account_two,
+            UserUpdate {
+                admin_level: Some("none"),
+                is_default: Some(false),
+                max_running_jobs: Some(Some(1)),
+                ..Default::default()
+            },
+        )
+        .await?;
 
         let deleted = remove_user(&pool, &user, &account_one).await?;
         assert_eq!(deleted, 2);
-        let remaining = list_users(&pool, None).await?;
+        let remaining = list_users(&pool, None, None).await?;
         assert!(!remaining
             .iter()
             .any(|record| record.name == user && record.account == account_one));
@@ -2362,7 +2390,7 @@ mod job_history_tests {
 
         let deleted = remove_user(&pool, &user, "").await?;
         assert_eq!(deleted, 2);
-        let remaining = list_users(&pool, None).await?;
+        let remaining = list_users(&pool, None, None).await?;
         assert!(!remaining.iter().any(|record| record.name == user));
         let association_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM associations WHERE user_name = $1")
