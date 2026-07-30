@@ -86,6 +86,11 @@ pub enum WalOperation {
         /// When set, applied on all replicas so pending reason survives replay.
         #[serde(default)]
         pending_reason: Option<PendingReason>,
+        /// Overrides the reason's default display text, same as
+        /// `JobStateChange`'s `pending_reason_desc`. `#[serde(default)]` so
+        /// older WAL/snapshot entries without this field replay as `None`.
+        #[serde(default)]
+        pending_reason_desc: Option<String>,
         /// When true, clears automatic requeue counter (admin release after max requeue).
         #[serde(default)]
         reset_requeue_count: bool,
@@ -454,6 +459,74 @@ mod job_state_change_wal_tests {
             } => {
                 assert_eq!(job_id, 3);
                 assert_eq!(begin_time, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod job_priority_change_wal_tests {
+    use super::*;
+
+    #[test]
+    fn job_priority_change_carries_a_description_alongside_its_reason() {
+        // Mirrors JobStateChange's pending_reason_desc: a hold applied while a
+        // job is still Pending (e.g. hold_job_for_launch_failure) has nowhere
+        // else to carry a custom description, since there is no state
+        // transition for it to ride along with.
+        let op = WalOperation::JobPriorityChange {
+            job_id: 4,
+            old_priority: 500,
+            new_priority: 0,
+            pending_reason: Some(PendingReason::Held),
+            pending_reason_desc: Some("launch failed requeued held".into()),
+            reset_requeue_count: false,
+            clear_reservation: false,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobPriorityChange {
+                job_id,
+                new_priority,
+                pending_reason,
+                pending_reason_desc,
+                ..
+            } => {
+                assert_eq!(job_id, 4);
+                assert_eq!(new_priority, 0);
+                assert_eq!(pending_reason, Some(PendingReason::Held));
+                assert_eq!(
+                    pending_reason_desc.as_deref(),
+                    Some("launch failed requeued held")
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn pre_upgrade_job_priority_change_without_description_deserializes() {
+        // A WAL written before pending_reason_desc existed on this variant
+        // must still replay (e.g. hold_job / release_job entries from before
+        // this fix).
+        let json = r#"{"JobPriorityChange":{"job_id":4,"old_priority":500,"new_priority":0,"pending_reason":"Held"}}"#;
+        let back: WalOperation = serde_json::from_str(json).unwrap();
+        match back {
+            WalOperation::JobPriorityChange {
+                job_id,
+                pending_reason,
+                pending_reason_desc,
+                reset_requeue_count,
+                clear_reservation,
+                ..
+            } => {
+                assert_eq!(job_id, 4);
+                assert_eq!(pending_reason, Some(PendingReason::Held));
+                assert_eq!(pending_reason_desc, None);
+                assert!(!reset_requeue_count);
+                assert!(!clear_reservation);
             }
             _ => panic!("wrong variant"),
         }
