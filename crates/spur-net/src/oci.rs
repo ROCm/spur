@@ -15,6 +15,7 @@
 //! 5. Extract layers in order to build rootfs
 //! 6. Pack rootfs into squashfs via mksquashfs
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
@@ -22,7 +23,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use flate2::read::GzDecoder;
 use reqwest::header::{ACCEPT, AUTHORIZATION};
 use serde::Deserialize;
-use tracing::{debug, info, warn, Level};
+use tracing::{debug, info, warn};
 
 /// A parsed container image reference.
 #[derive(Debug, Clone)]
@@ -155,11 +156,10 @@ pub async fn pull_image(image: &str, output_dir: &Path) -> anyhow::Result<PathBu
     let rootfs_dir = tmp_dir.join("rootfs");
     std::fs::create_dir_all(&rootfs_dir)?;
 
-    let cache_dir = layer_cache_dir(
-        output_dir,
-        std::env::var_os("SPUR_IMAGE_CACHE").map(PathBuf::from),
-    );
-    let result = pull_and_extract(&image_ref, &rootfs_dir, &cache_dir).await;
+    let cache_override = std::env::var_os("SPUR_IMAGE_CACHE");
+    let cache = LayerCache::open(&layer_cache_dir(output_dir, cache_override.as_deref()));
+
+    let result = pull_and_extract(&image_ref, &rootfs_dir, &cache).await;
     if let Err(e) = &result {
         let _ = std::fs::remove_dir_all(&tmp_dir);
         return Err(anyhow::anyhow!("{}", e));
@@ -216,7 +216,7 @@ pub async fn pull_image(image: &str, output_dir: &Path) -> anyhow::Result<PathBu
 async fn pull_and_extract(
     image_ref: &ImageRef,
     rootfs_dir: &Path,
-    cache_dir: &Path,
+    cache: &LayerCache,
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::builder().user_agent("spur/0.1").build()?;
 
@@ -285,26 +285,6 @@ async fn pull_and_extract(
 
     info!(layers = manifest.layers.len(), "downloading layers");
 
-    let cache_enabled = match std::fs::create_dir_all(cache_dir) {
-        Ok(()) => true,
-        Err(error) => {
-            if tracing::enabled!(Level::WARN) {
-                warn!(
-                    path = %cache_dir.display(),
-                    %error,
-                    "failed to create image layer cache; continuing without cache"
-                );
-            } else {
-                eprintln!(
-                    "Warning: failed to create image layer cache at {}; continuing without cache: {}",
-                    cache_dir.display(),
-                    error
-                );
-            }
-            false
-        }
-    };
-
     // Download layers in parallel, then extract sequentially (order matters)
     let mut layer_data: Vec<(usize, bytes::Bytes)> = Vec::new();
 
@@ -313,20 +293,16 @@ async fn pull_and_extract(
     for (i, layer) in manifest.layers.iter().enumerate() {
         let digest = layer.digest.clone();
         let size = layer.size;
-        let cache_path = cache_enabled.then(|| cache_dir.join(digest.replace(':', "_")));
 
-        // Check layer cache
-        if let Some(cache_path) = &cache_path {
-            if let Ok(cached) = std::fs::read(cache_path) {
-                info!(
-                    layer = i + 1,
-                    total = manifest.layers.len(),
-                    digest = %digest,
-                    "layer cached, skipping download"
-                );
-                layer_data.push((i, bytes::Bytes::from(cached)));
-                continue;
-            }
+        if let Some(cached) = cache.read_layer(&digest) {
+            info!(
+                layer = i + 1,
+                total = manifest.layers.len(),
+                digest = %digest,
+                "layer cached, skipping download"
+            );
+            layer_data.push((i, bytes::Bytes::from(cached)));
+            continue;
         }
 
         let blob_url = format!(
@@ -335,6 +311,7 @@ async fn pull_and_extract(
         );
         let client = client.clone();
         let token = token.clone();
+        let cache = cache.clone();
 
         let handle = tokio::spawn(async move {
             info!(
@@ -356,23 +333,7 @@ async fn pull_and_extract(
 
             let data = resp.bytes().await.context("failed to read layer body")?;
 
-            if let Some(cache_path) = cache_path {
-                if let Err(error) = std::fs::write(&cache_path, &data) {
-                    if tracing::enabled!(Level::WARN) {
-                        warn!(
-                            path = %cache_path.display(),
-                            %error,
-                            "failed to cache image layer"
-                        );
-                    } else {
-                        eprintln!(
-                            "Warning: failed to cache image layer at {}: {}",
-                            cache_path.display(),
-                            error
-                        );
-                    }
-                }
-            }
+            cache.write_layer(&digest, &data);
 
             Ok::<(usize, bytes::Bytes), anyhow::Error>((i, data))
         });
@@ -400,8 +361,66 @@ async fn pull_and_extract(
     Ok(())
 }
 
-fn layer_cache_dir(output_dir: &Path, override_dir: Option<PathBuf>) -> PathBuf {
-    override_dir.unwrap_or_else(|| output_dir.join(".layers"))
+/// Resolve the layer cache directory for an image output directory.
+///
+/// The cache lives beside the images it belongs to so that it follows the
+/// non-root fallback from `/var/spool/spur/images` to `~/.spur/images`. An
+/// empty override is treated as unset, matching `SPUR_IMAGE_DIR` handling.
+fn layer_cache_dir(output_dir: &Path, override_dir: Option<&OsStr>) -> PathBuf {
+    match override_dir.filter(|dir| !dir.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => output_dir.join(".layers"),
+    }
+}
+
+/// Content-addressed store for downloaded image layers.
+///
+/// Caching is best effort: an unusable cache directory only costs a re-download,
+/// so failures downgrade the cache to a no-op instead of failing the pull.
+#[derive(Clone)]
+struct LayerCache {
+    dir: Option<PathBuf>,
+}
+
+impl LayerCache {
+    fn open(dir: &Path) -> Self {
+        if let Err(error) = std::fs::create_dir_all(dir) {
+            warn!(
+                path = %dir.display(),
+                %error,
+                "failed to create image layer cache; layers will not be cached"
+            );
+            return Self { dir: None };
+        }
+
+        Self {
+            dir: Some(dir.to_path_buf()),
+        }
+    }
+
+    fn layer_path(&self, digest: &str) -> Option<PathBuf> {
+        self.dir
+            .as_ref()
+            .map(|dir| dir.join(digest.replace(':', "_")))
+    }
+
+    fn read_layer(&self, digest: &str) -> Option<Vec<u8>> {
+        std::fs::read(self.layer_path(digest)?).ok()
+    }
+
+    fn write_layer(&self, digest: &str, data: &[u8]) {
+        let Some(path) = self.layer_path(digest) else {
+            return;
+        };
+
+        if let Err(error) = std::fs::write(&path, data) {
+            warn!(
+                path = %path.display(),
+                %error,
+                "failed to cache image layer"
+            );
+        }
+    }
 }
 
 /// Registry credentials loaded from file or environment.
@@ -899,11 +918,68 @@ mod tests {
     #[test]
     fn layer_cache_honors_environment_override() {
         let output_dir = Path::new("/home/alice/.spur/images");
-        let override_dir = PathBuf::from("/mnt/shared/spur-layers");
+        let override_dir = Path::new("/mnt/shared/spur-layers");
 
         assert_eq!(
-            layer_cache_dir(output_dir, Some(override_dir.clone())),
+            layer_cache_dir(output_dir, Some(override_dir.as_os_str())),
             override_dir
         );
+    }
+
+    #[test]
+    fn layer_cache_ignores_empty_environment_override() {
+        let output_dir = Path::new("/home/alice/.spur/images");
+
+        assert_eq!(
+            layer_cache_dir(output_dir, Some(OsStr::new(""))),
+            output_dir.join(".layers")
+        );
+    }
+
+    #[test]
+    fn layer_cache_round_trips_layers() {
+        let output_dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = layer_cache_dir(output_dir.path(), None);
+        let cache = LayerCache::open(&cache_dir);
+
+        assert!(cache_dir.is_dir());
+        assert_eq!(cache.read_layer("sha256:abc"), None);
+
+        cache.write_layer("sha256:abc", b"layer bytes");
+
+        assert_eq!(
+            cache.read_layer("sha256:abc").as_deref(),
+            Some(&b"layer bytes"[..])
+        );
+        assert!(cache_dir.join("sha256_abc").is_file());
+    }
+
+    #[test]
+    fn layer_cache_disabled_when_directory_cannot_be_created() {
+        let output_dir = tempfile::tempdir().expect("tempdir");
+        // A regular file cannot become a parent directory, so this fails for
+        // every user including root.
+        let blocked = output_dir.path().join("not-a-directory");
+        std::fs::write(&blocked, b"").expect("write blocker");
+
+        let cache = LayerCache::open(&blocked.join(".layers"));
+
+        assert_eq!(cache.layer_path("sha256:abc"), None);
+        cache.write_layer("sha256:abc", b"layer bytes");
+        assert_eq!(cache.read_layer("sha256:abc"), None);
+    }
+
+    #[test]
+    fn layer_cache_write_failure_leaves_pull_usable() {
+        let output_dir = tempfile::tempdir().expect("tempdir");
+        let cache = LayerCache::open(&layer_cache_dir(output_dir.path(), None));
+
+        // Occupying the entry path with a directory makes the layer write fail.
+        let entry = cache.layer_path("sha256:abc").expect("cache enabled");
+        std::fs::create_dir(&entry).expect("occupy entry path");
+
+        cache.write_layer("sha256:abc", b"layer bytes");
+
+        assert_eq!(cache.read_layer("sha256:abc"), None);
     }
 }
