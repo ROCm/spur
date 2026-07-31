@@ -2215,7 +2215,19 @@ impl ClusterManager {
             });
         }
 
-        candidates.retain(|candidate| candidate.scheduling_eligible);
+        // A begin-deferred job reaches none of the blocker checks above, which
+        // all pass ineligible candidates straight through, so this is the only
+        // place its wait can be named. Structural blockers already claimed the
+        // jobs they explain, keeping their precedence over the hold.
+        candidates.retain(|candidate| {
+            if candidate.scheduling_eligible {
+                return true;
+            }
+            if candidate.job.is_begin_held(now) {
+                record_blocked(&mut blocked, candidate, PendingReason::BeginTime);
+            }
+            false
+        });
 
         PendingJobClassification {
             jobs: candidates
@@ -7806,6 +7818,95 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_sets_begin_time_reason_for_a_deferred_job() {
+        // A --begin deferral used to report None, the same string shown for a job
+        // the scheduler simply had not reached yet, leaving no way to tell them
+        // apart from squeue or scontrol.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        let mut spec = basic_spec("deferred");
+        spec.begin_time = Some(Utc::now() + chrono::Duration::hours(1));
+        let job_id = submit_and_wait(&cm, spec);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::BeginTime
+        );
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "a deferred job must stay out of scheduling"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn begin_time_reason_gives_way_once_the_hold_lapses() {
+        // A sticky BeginTime would keep claiming the job waits on a start time
+        // that has already passed.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        let mut spec = basic_spec("begin-lapse");
+        spec.begin_time = Some(Utc::now() + chrono::Duration::hours(1));
+        let job_id = submit_and_wait(&cm, spec);
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::BeginTime
+        );
+
+        {
+            let mut jobs = cm.jobs.write();
+            jobs.get_mut(&job_id).unwrap().spec.begin_time =
+                Some(Utc::now() - chrono::Duration::seconds(1));
+        }
+
+        assert!(
+            cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "an elapsed hold must return the job to scheduling"
+        );
+
+        // An empty cluster forces a real wait reason, which must win.
+        let empty_state = spur_sched::traits::ClusterState {
+            nodes: &[],
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        let snapshot = cm.get_job(job_id).unwrap();
+        cm.update_pending_reasons(&[&snapshot], &empty_state);
+        assert_ne!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::BeginTime,
+            "the real wait reason must replace a lapsed hold"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_structural_blocker_outranks_a_begin_time_hold() {
+        // Both apply. The partition explains why the job cannot run at all,
+        // which is more useful than naming a start time it will never reach.
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].state = "DOWN".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("down-and-deferred");
+        spec.partition = Some("default".into());
+        spec.begin_time = Some(Utc::now() + chrono::Duration::hours(1));
+        let job_id = submit_and_wait(&cm, spec);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::PartitionInactive
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn multi_partition_job_reaches_scheduling_when_one_partition_is_eligible() {
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
@@ -10031,6 +10132,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn future_begin_jobs_do_not_receive_consumable_block_reasons() {
+        // A consumable shortage is transient and may well be gone by the time a
+        // deferred job's start time arrives, so the hold is the honest reason to
+        // report and the shortage must not be recorded in its place.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 8, 16000);
@@ -10047,6 +10151,8 @@ mod tests {
         bb_spec.burst_buffer = Some("capacity=500".into());
         let bb_id = submit_and_wait(&cm, bb_spec);
 
+        // Seed an unrelated reason so the pass has something to overwrite: the
+        // hold has to be recorded even when the job already carries a reason.
         {
             let mut jobs = cm.jobs.write();
             jobs.get_mut(&license_id).unwrap().pending_reason = PendingReason::Priority;
@@ -10063,11 +10169,13 @@ mod tests {
         assert!(!pending.contains(&bb_id));
         assert_eq!(
             cm.get_job(license_id).unwrap().pending_reason,
-            PendingReason::Priority
+            PendingReason::BeginTime,
+            "a missing license must not displace the deferral as the reason"
         );
         assert_eq!(
             cm.get_job(bb_id).unwrap().pending_reason,
-            PendingReason::Priority
+            PendingReason::BeginTime,
+            "a burst-buffer shortfall must not displace the deferral as the reason"
         );
     }
 
