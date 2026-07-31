@@ -346,14 +346,21 @@ async fn process_assignment(
     // has nothing left to dispatch here: register_allocation_on_nodes
     // above already confirmed the allocation, and the actual step
     // launch is a later RunCommand, not this LaunchJob RPC.
-    let dispatch_spec = if !spec.srun_job {
-        Some(spec.clone())
+    //
+    // `task_fanout` distinguishes the two dispatched cases for the agent:
+    // true only for the srun-as-batch-script fallback, where the dispatched
+    // "script" is the literal command srun was asked to run tasks_per_node
+    // times on this node (real srun semantics). False for a genuine sbatch
+    // batch script, which runs exactly once per node regardless of
+    // tasks_per_node, matching Slurm.
+    let (dispatch_spec, task_fanout) = if !spec.srun_job {
+        (Some(spec.clone()), false)
     } else if !srun_step_dispatch {
         let mut batch_spec = spec.clone();
         batch_spec.srun_job = false;
-        Some(batch_spec)
+        (Some(batch_spec), true)
     } else {
-        None
+        (None, false)
     };
 
     if let Some(dspec) = dispatch_spec {
@@ -374,6 +381,7 @@ async fn process_assignment(
             allocated_nodelist.clone(),
             tasks_per_node,
             prospective_run_attempt,
+            task_fanout,
         )
         .await
         {
@@ -792,6 +800,11 @@ struct AgentDispatchParams<'a> {
     allocated_nodelist: &'a str,
     run_attempt: u32,
     pmix_tmpdir: &'a str,
+    /// See `LaunchJobRequest.task_fanout` in slurm.proto: true only for a
+    /// standalone `srun` request routed through this batch dispatch path
+    /// (e.g. a Kubernetes-inclusive allocation), where the dispatched
+    /// "script" is the literal command `srun` was asked to fan out.
+    task_fanout: bool,
 }
 
 /// Resolved output paths reported by an agent after a successful launch.
@@ -973,6 +986,7 @@ async fn dispatch_to_agent(
             array_task_id: spec.array_task_id.unwrap_or(0),
             run_attempt: params.run_attempt,
             pmix_plan,
+            task_fanout: params.task_fanout,
         })
         .await?;
 
@@ -1222,6 +1236,7 @@ async fn confirm_dispatch_on_nodes(
     allocated_nodelist: String,
     tasks_per_node: u32,
     run_attempt: u32,
+    task_fanout: bool,
 ) -> DispatchConfirmOutcome {
     let mut successes = 0u32;
     let mut failures = 0u32;
@@ -1274,6 +1289,7 @@ async fn confirm_dispatch_on_nodes(
                     allocated_nodelist: &allocated_nodelist,
                     run_attempt,
                     pmix_tmpdir: &pmix_tmpdir,
+                    task_fanout,
                 },
             )
             .await;
@@ -2159,6 +2175,9 @@ mod tests {
             cancel_calls: Arc<AtomicU32>,
             reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
             launch_delay: Duration,
+            /// Records each `LaunchJobRequest.task_fanout` this agent receives,
+            /// so tests can assert on it without a real spurd behind the RPC.
+            fanout_calls: Option<Arc<std::sync::Mutex<Vec<bool>>>>,
         }
 
         #[tonic::async_trait]
@@ -2188,6 +2207,9 @@ mod tests {
                 // Echo a path keyed by task_offset so tests can assert the
                 // controller keeps the primary node's (task_offset == 0) path.
                 let req = request.into_inner();
+                if let Some(sink) = &self.fanout_calls {
+                    sink.lock().unwrap().push(req.task_fanout);
+                }
                 let path = format!("/spool/off{}/spur.out", req.task_offset);
                 Ok(tonic::Response::new(spur_proto::proto::LaunchJobResponse {
                     success: true,
@@ -2344,13 +2366,34 @@ mod tests {
             reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
             launch_delay: Duration,
         ) -> (std::net::SocketAddr, Arc<AtomicU32>) {
+            let (addr, cancel_calls, _) =
+                spawn_mock_agent_capturing_fanout(reject_launch_as, launch_delay, false).await;
+            (addr, cancel_calls)
+        }
+
+        /// Like [`spawn_mock_agent`], but also records every
+        /// `LaunchJobRequest.task_fanout` this agent receives when `capture` is
+        /// true, so a test can assert on it — `spawn_mock_agent`/`_rejecting`/
+        /// `_with_delay` don't need this, so they pass `capture: false` and
+        /// discard the (empty) sink.
+        async fn spawn_mock_agent_capturing_fanout(
+            reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
+            launch_delay: Duration,
+            capture: bool,
+        ) -> (
+            std::net::SocketAddr,
+            Arc<AtomicU32>,
+            Arc<std::sync::Mutex<Vec<bool>>>,
+        ) {
             let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
             let addr = incoming.local_addr().unwrap();
             let cancel_calls = Arc::new(AtomicU32::new(0));
+            let fanout_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
             let agent = MockAgent {
                 cancel_calls: cancel_calls.clone(),
                 reject_launch_as,
                 launch_delay,
+                fanout_calls: capture.then(|| fanout_calls.clone()),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -2360,7 +2403,7 @@ mod tests {
                     .serve_with_incoming(incoming)
                     .await;
             });
-            (addr, cancel_calls)
+            (addr, cancel_calls, fanout_calls)
         }
 
         /// Reserve a localhost port with nothing listening on it, so a
@@ -2541,6 +2584,7 @@ mod tests {
                 "n1,n2".into(),
                 1,
                 1,
+                false,
             )
             .await;
 
@@ -2717,6 +2761,7 @@ mod tests {
                 "n1,n2".into(),
                 1,
                 1,
+                false,
             )
             .await;
 
@@ -2775,6 +2820,7 @@ mod tests {
                 "n1,n2".into(),
                 1,
                 1,
+                false,
             )
             .await;
 
@@ -2829,6 +2875,7 @@ mod tests {
                 "n1,n2".into(),
                 1,
                 1,
+                false,
             )
             .await;
 
@@ -2872,6 +2919,7 @@ mod tests {
                 nodelist,
                 1,
                 1,
+                false,
             )
             .await
         }
@@ -3184,6 +3232,7 @@ mod tests {
                 nodelist,
                 1,
                 1,
+                false,
             )
             .await;
             let elapsed = start.elapsed();
@@ -3381,6 +3430,59 @@ mod tests {
             assert!(
                 !job.srun_step_dispatch,
                 "the batch-script fallback launches like sbatch, not a native srun step"
+            );
+        }
+
+        // task_fanout: the agent-facing signal distinguishing a genuine sbatch
+        // batch script (runs once per node, regardless of tasks_per_node or
+        // mpi) from a standalone srun request routed through this same batch
+        // dispatch path (the dispatched "script" is the literal command srun
+        // was asked to run tasks_per_node times — real srun semantics).
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_dispatches_a_plain_batch_job_with_task_fanout_false() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, _, fanout_calls) =
+                spawn_mock_agent_capturing_fanout(None, Duration::ZERO, true).await;
+            register_node_at(&cm, "n1", addr);
+
+            let mut spec = batch_spec("plain-batch-fanout", 1);
+            spec.tasks_per_node = Some(4);
+            let job_id = submit_and_wait(&cm, spec);
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+
+            assert!(started, "a clean single-node batch dispatch must start");
+            assert_eq!(
+                *fanout_calls.lock().unwrap(),
+                vec![false],
+                "a genuine sbatch job must dispatch with task_fanout=false"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_dispatches_srun_batch_fallback_with_task_fanout_true() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, _, fanout_calls) =
+                spawn_mock_agent_capturing_fanout(None, Duration::ZERO, true).await;
+            register_k8s_node_at(&cm, "k1", addr);
+
+            let mut spec = batch_spec("srun-fanout-with-script", 1);
+            spec.srun_job = true;
+            spec.tasks_per_node = Some(4);
+            spec.script = Some("#!/bin/bash\necho hi\n".into());
+            let job_id = submit_and_wait(&cm, spec);
+            let started = process_assignment(cm.clone(), assignment(job_id, &["k1"])).await;
+
+            assert!(
+                started,
+                "an srun batch fallback with a script confirms and starts like a plain batch job"
+            );
+            assert_eq!(
+                *fanout_calls.lock().unwrap(),
+                vec![true],
+                "the srun-as-batch-fallback path must dispatch with task_fanout=true"
             );
         }
 

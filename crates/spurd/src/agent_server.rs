@@ -1091,12 +1091,19 @@ impl SlurmAgent for AgentService {
             (script, crate::container::RootfsMode::Extracted)
         };
 
-        // Multi-task per-node: wrap the user script so it forks N processes,
-        // each with a distinct LOCAL_RANK. The wrapper backgrounds N copies and
-        // waits for all to finish, so TrackedJob only tracks a single PID (the
-        // wrapper shell). GPU devices are partitioned across tasks via
-        // ROCR_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES overrides in each fork.
-        let launch_script = if tasks_per_node > 1 {
+        // Under Slurm semantics a batch script runs exactly once per node,
+        // regardless of --ntasks-per-node or --mpi: task multiplicity is only
+        // advertised via environment variables (SPUR_TASKS_PER_NODE,
+        // LOCAL_WORLD_SIZE, NPROC_PER_NODE, ...) and any fan-out — including
+        // multi-rank MPI — is the script's own responsibility, typically via
+        // an internal `srun` call. The one exception is `task_fanout`: this
+        // dispatch is itself the fan-out mechanism for a standalone `srun`
+        // request routed through the batch dispatch path (e.g. an allocation
+        // spanning Kubernetes-backed nodes, which bypass the native-host
+        // per-task step path), where the dispatched "script" is the literal
+        // command `srun` was asked to run `tasks_per_node` times on this node
+        // — real srun semantics, not a batch script.
+        let launch_script = if tasks_per_node > 1 && req.task_fanout {
             // Write the user script to disk first so the wrapper can reference it
             let user_script_path = format!("{}/.spur_user_{}.sh", work_dir, job_id);
             std::fs::write(&user_script_path, &launch_script)
@@ -3366,6 +3373,240 @@ mod tests {
         let expected = format!("{}/spur-77.out", work_dir_str);
         assert_eq!(inner.stdout_path, expected);
         assert_eq!(inner.stderr_path, expected);
+    }
+
+    /// Poll `path` until its content stabilizes (unchanged across two
+    /// consecutive checks) or `timeout_ms` elapses, then return it. Used to
+    /// wait out a script's execution(s) without depending on job-completion
+    /// reporting to a controller (which these unit tests don't run).
+    async fn wait_for_stable_file(path: &std::path::Path, timeout_ms: u64) -> String {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
+        let mut last = String::new();
+        loop {
+            let current = std::fs::read_to_string(path).unwrap_or_default();
+            if current == last && !current.is_empty() {
+                return current;
+            }
+            last = current;
+            if tokio::time::Instant::now() >= deadline {
+                return last;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    // A file that's still being actively rewritten never satisfies the
+    // "two consecutive identical reads" stability check above; the helper
+    // must give up after `timeout_ms` and return the last-seen value rather
+    // than hang forever (relevant if a launched script never converges or
+    // never completes). Exercises `wait_for_stable_file`'s timeout branch,
+    // which the tests above never reach since their scripts finish quickly.
+    #[tokio::test]
+    async fn wait_for_stable_file_gives_up_after_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("churn.txt");
+        let writer_path = path.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_writer = stop.clone();
+        let writer = tokio::spawn(async move {
+            let mut n: u64 = 0;
+            while !stop_writer.load(std::sync::atomic::Ordering::Relaxed) {
+                std::fs::write(&writer_path, format!("v{n}")).unwrap();
+                n += 1;
+                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+            }
+        });
+
+        let result = wait_for_stable_file(&path, 200).await;
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = writer.await;
+
+        assert!(
+            result.starts_with('v'),
+            "expected a churned placeholder value, got {result:?}"
+        );
+    }
+
+    // A plain (mpi=none) batch script must execute exactly once per node
+    // regardless of --ntasks-per-node, matching Slurm semantics (task
+    // multiplicity is only advertised via environment variables; further
+    // fan-out is the script's own responsibility, typically via `srun`).
+    // Without this, `launch_job` wraps every batch script in
+    // `build_multi_task_wrapper` whenever tasks_per_node > 1, forking that
+    // many concurrent copies of the ENTIRE script — corrupting any script
+    // with more than a single trivial command. Reproduces that failure mode
+    // directly: an unconditional counter step plus an `mkdir` step that
+    // collides when run more than once concurrently.
+    #[tokio::test]
+    async fn sbatch_script_runs_exactly_once_regardless_of_ntasks_per_node() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let work_dir = tempfile::tempdir().unwrap();
+        let work_dir_str = work_dir.path().to_string_lossy().to_string();
+        let counter_path = work_dir.path().join("run_count.txt");
+        let collide_dir = work_dir.path().join("only_once_dir");
+
+        let script = format!(
+            "#!/bin/bash\necho ran >> \"{counter}\"\nmkdir \"{collide}\" 2>/dev/null || true\n",
+            counter = counter_path.display(),
+            collide = collide_dir.display(),
+        );
+
+        let req = Request::new(LaunchJobRequest {
+            job_id: 5350,
+            spec: Some(JobSpec {
+                script,
+                num_tasks: 4,
+                num_nodes: 1,
+                tasks_per_node: 4,
+                cpus_per_task: 1,
+                work_dir: work_dir_str,
+                ..Default::default()
+            }),
+            allocated: Some(ResourceAllocations {
+                cpus: 4,
+                memory_mb: 0,
+                devices: std::collections::HashMap::new(),
+            }),
+            // Default (false): a genuine sbatch batch script, not an
+            // explicit srun task fan-out.
+            ..Default::default()
+        });
+
+        let resp = svc.launch_job(req).await.expect("launch should succeed");
+        assert!(resp.into_inner().success, "launch should succeed");
+
+        let content = wait_for_stable_file(&counter_path, 2_000).await;
+        let runs = content.lines().filter(|l| *l == "ran").count();
+        assert_eq!(
+            runs, 1,
+            "batch script must run exactly once regardless of tasks_per_node=4, got {runs} run(s): {content:?}"
+        );
+    }
+
+    // Counterpart to the test above: a standalone `srun` request routed
+    // through the batch dispatch path (Kubernetes-inclusive allocations;
+    // see `dispatch_job_to_nodes` in scheduler_loop.rs) sets
+    // `task_fanout: true` because there the dispatched "script" is the
+    // literal command srun was asked to run `tasks_per_node` times — real
+    // srun semantics that must not regress into running only once.
+    #[tokio::test]
+    async fn task_fanout_dispatch_still_replicates_per_ntasks_per_node() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let work_dir = tempfile::tempdir().unwrap();
+        let work_dir_str = work_dir.path().to_string_lossy().to_string();
+        let counter_path = work_dir.path().join("run_count.txt");
+
+        let script = format!(
+            "#!/bin/bash\necho ran >> \"{counter}\"\n",
+            counter = counter_path.display(),
+        );
+
+        let req = Request::new(LaunchJobRequest {
+            job_id: 5351,
+            spec: Some(JobSpec {
+                script,
+                num_tasks: 4,
+                num_nodes: 1,
+                tasks_per_node: 4,
+                cpus_per_task: 1,
+                work_dir: work_dir_str,
+                ..Default::default()
+            }),
+            allocated: Some(ResourceAllocations {
+                cpus: 4,
+                memory_mb: 0,
+                devices: std::collections::HashMap::new(),
+            }),
+            task_fanout: true,
+            ..Default::default()
+        });
+
+        let resp = svc.launch_job(req).await.expect("launch should succeed");
+        assert!(resp.into_inner().success, "launch should succeed");
+
+        let content = wait_for_stable_file(&counter_path, 2_000).await;
+        let runs = content.lines().filter(|l| *l == "ran").count();
+        assert_eq!(
+            runs, 4,
+            "task_fanout dispatch must still run tasks_per_node=4 copies, got {runs} run(s): {content:?}"
+        );
+    }
+
+    // A documented `--mpi=pmix` batch job is no longer a special case: with
+    // `task_fanout` false (a genuine sbatch job, not a routed srun request)
+    // it must run its script exactly once per node like any other batch
+    // script, the same as mpi=none. Multi-rank MPI is the script's own job
+    // via an internal `srun` call, not the launcher replicating the whole
+    // script.
+    //
+    // A real end-to-end run isn't possible here: `launch_job` unconditionally
+    // requires a PMIx launch plan (and the plugin/mpirun behind it, neither
+    // installed in this environment) whenever `spec.mpi == "pmix"`, so this
+    // launch always errors before the script would actually execute. The
+    // wrapper-selection decision under test runs earlier in `launch_job` than
+    // that PMIx requirement, though, and its outcome is directly observable:
+    // the multi-task wrapper path writes an intermediate `.spur_user_<id>.sh`
+    // copy of the script to disk before building the wrapper, so its absence
+    // proves the fan-out branch was skipped.
+    #[tokio::test]
+    async fn sbatch_mpi_pmix_without_task_fanout_does_not_fan_out() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let work_dir = tempfile::tempdir().unwrap();
+        let work_dir_str = work_dir.path().to_string_lossy().to_string();
+
+        let req = Request::new(LaunchJobRequest {
+            job_id: 5352,
+            spec: Some(JobSpec {
+                script: "#!/bin/bash\ntrue\n".into(),
+                num_tasks: 4,
+                num_nodes: 1,
+                tasks_per_node: 4,
+                cpus_per_task: 1,
+                mpi: MPI_PMIX.into(),
+                work_dir: work_dir_str.clone(),
+                ..Default::default()
+            }),
+            allocated: Some(ResourceAllocations {
+                cpus: 4,
+                memory_mb: 0,
+                devices: std::collections::HashMap::new(),
+            }),
+            // Default (false): a genuine sbatch job, not a routed srun
+            // request — no pmix_plan is supplied either, so if this reached
+            // the multi-task wrapper it would need one regardless.
+            ..Default::default()
+        });
+
+        let result = svc.launch_job(req).await;
+        assert!(
+            result.is_err(),
+            "a missing PMIx launch plan must still fail the launch"
+        );
+
+        let wrapper_input_path = format!("{work_dir_str}/.spur_user_5352.sh");
+        assert!(
+            !std::path::Path::new(&wrapper_input_path).exists(),
+            "mpi=pmix without task_fanout must not take the multi-task-wrapper branch"
+        );
     }
 
     // The monitor loop's reconcile step must reclaim an
