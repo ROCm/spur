@@ -11116,6 +11116,87 @@ mod tests {
         assert!(cm.hold_job_for_launch_failure(id).is_err());
     }
 
+    // backoff_pending_job_after_dispatch_failure is confirm_dispatch_on_nodes's
+    // Pending-safe equivalent of requeue_after_launch_failure's backoff: both
+    // are no-ops rather than errors for a job that's already moved on by the
+    // time the caller gets around to backing it off (e.g. a concurrent
+    // cancel, or a stale/unknown job_id) — the caller only has a job_id and
+    // no reason to assume it's still exactly as it left it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backoff_pending_job_after_dispatch_failure_is_a_noop_for_a_missing_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        assert!(cm.backoff_pending_job_after_dispatch_failure(999).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backoff_pending_job_after_dispatch_failure_is_a_noop_once_the_job_left_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("backoff-already-cancelled"));
+        cm.cancel_job(id, "testuser").unwrap();
+        settle(&cm, id, JobState::Cancelled);
+
+        assert!(cm.backoff_pending_job_after_dispatch_failure(id).is_ok());
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backoff_pending_job_after_dispatch_failure_applies_backoff_and_bumps_requeue_count() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("backoff-applies"));
+
+        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        wait_for("backoff applied", || {
+            cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+        assert!(job.spec.begin_time.is_some_and(|t| t > Utc::now()));
+    }
+
+    // The apply-level checks mirror the public method's, guarding against a
+    // narrower race: the job matched (existed, was Pending) when the public
+    // method read it, but no longer does by the time this specific WAL entry
+    // is actually applied (a state change committed in between). Exercised
+    // directly against apply_operation, bypassing the public method's own
+    // up-front checks, so this is testing the apply arm's defense
+    // independently of whether the caller's own check could have caught it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_dispatch_backoff_apply_is_a_noop_for_a_missing_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&WalOperation::JobDispatchBackoff {
+            job_id: 999,
+            begin_time: Utc::now(),
+        });
+        assert!(cm.get_job(999).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_dispatch_backoff_apply_is_a_noop_once_the_job_left_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("backoff-apply-already-cancelled"));
+        cm.cancel_job(id, "testuser").unwrap();
+        settle(&cm, id, JobState::Cancelled);
+        let requeue_count_before = cm.get_job(id).unwrap().requeue_count;
+
+        cm.apply_operation(&WalOperation::JobDispatchBackoff {
+            job_id: id,
+            begin_time: Utc::now(),
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(job.requeue_count, requeue_count_before);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn update_job_priority() {
         let dir = TempDir::new().unwrap();
