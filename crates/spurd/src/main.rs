@@ -185,13 +185,17 @@ async fn main() -> anyhow::Result<()> {
         .clone()
         .or_else(|| std::env::var("SPUR_COMM_ADDRESS").ok());
     let node_address = if let Some(ref addr) = explicit_addr {
-        match spur_net::normalize_comm_address(addr) {
+        let addr_input = addr.clone();
+        match tokio::task::spawn_blocking(move || spur_net::normalize_comm_address(&addr_input))
+            .await
+            .map_err(|e| anyhow::anyhow!("comm address normalization task failed: {e}"))?
+        {
             Ok(normalized) => {
                 if spur_net::comm_addr_is_unusable(&normalized) {
                     warn!(
                         comm_addr = %normalized,
                         input = %addr,
-                        "explicit comm address resolves to loopback; inter-node jobs may fail"
+                        "explicit comm address is not routable; inter-node jobs may fail"
                     );
                 } else if normalized != *addr {
                     info!(
@@ -224,8 +228,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     } else {
+        let detect_hostname = hostname.clone();
         let wg_interface = std::env::var("SPUR_WG_INTERFACE").unwrap_or_else(|_| "spur0".into());
-        spur_net::detect_node_address(&hostname, listen_port, &wg_interface)
+        tokio::task::spawn_blocking(move || {
+            spur_net::detect_node_address(&detect_hostname, listen_port, &wg_interface)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("node address detection task failed: {e}"))?
     };
     info!(
         ip = %node_address.ip,

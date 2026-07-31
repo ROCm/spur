@@ -93,14 +93,14 @@ fn node_comm_http_url(node: &spur_core::node::Node, node_name: &str) -> Result<S
     let host = node
         .comm_addr()
         .ok_or_else(|| Status::unavailable(format!("node {node_name} has no comm address")))?;
-    Ok(format!("http://{host}:{}", node.port))
+    Ok(spur_net::format_comm_http_url(host, node.port))
 }
 
 fn node_comm_socket(node: &spur_core::node::Node, node_name: &str) -> Result<String, Status> {
     let host = node
         .comm_addr()
         .ok_or_else(|| Status::unavailable(format!("node {node_name} has no comm address")))?;
-    Ok(format!("{host}:{}", node.port))
+    Ok(spur_net::format_comm_socket(host, node.port))
 }
 
 /// Forwarding decision for read RPCs, split out so it's unit-testable.
@@ -1054,8 +1054,12 @@ impl SlurmController for ControllerService {
         let resources = req.resources.map(proto_to_resource_set).unwrap_or_default();
 
         let reject_loopback = self.cluster.config.network.reject_loopback_comm_addr;
-        let agent_addr =
-            resolve_registration_comm_addr(&req.address, &remote_addr, reject_loopback)?;
+        let advertised = req.address.clone();
+        let agent_addr = tokio::task::spawn_blocking(move || {
+            resolve_registration_comm_addr(&advertised, &remote_addr, reject_loopback)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("comm address resolution task failed: {e}")))??;
 
         let agent_port = if req.port > 0 { req.port as u16 } else { 6818 };
 

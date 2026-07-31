@@ -582,7 +582,8 @@ pub struct NetworkConfig {
     /// Agent gRPC listen port (default: 6818).
     #[serde(default = "default_agent_port")]
     pub agent_port: u16,
-    /// Reject agent registrations whose comm address resolves to loopback.
+    /// Reject agent registrations whose comm address is not routable (loopback,
+    /// unspecified, or link-local).
     #[serde(default)]
     pub reject_loopback_comm_addr: bool,
 }

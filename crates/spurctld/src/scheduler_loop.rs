@@ -29,16 +29,12 @@ const CANCEL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn node_comm_socket(node: &Node) -> Option<String> {
     let host = node.comm_addr()?;
-    Some(format!("{host}:{}", node.port))
+    Some(spur_net::format_comm_socket(host, node.port))
 }
 
 fn node_comm_http_url(node: &Node) -> Option<String> {
     let host = node.comm_addr()?;
-    Some(format!("http://{host}:{}", node.port))
-}
-
-fn node_comm_endpoint(node: &Node) -> Option<(String, u16)> {
-    Some((node.comm_addr()?.to_string(), node.port))
+    Some(spur_net::format_comm_http_url(host, node.port))
 }
 
 /// Spawn the time-limit enforcement watchdog and power manager alongside the scheduler loop.
@@ -1110,9 +1106,9 @@ async fn register_allocation_on_nodes(
     let mut set = tokio::task::JoinSet::new();
     for node_name in &dispatch_nodes {
         let node_info = cluster.get_node(node_name);
-        let (addr, port) = match node_info {
-            Some(ref n) => match node_comm_endpoint(n) {
-                Some(ep) => ep,
+        let agent_addr = match node_info {
+            Some(ref n) => match node_comm_http_url(n) {
+                Some(url) => url,
                 None => {
                     warn!(
                         job_id,
@@ -1134,7 +1130,6 @@ async fn register_allocation_on_nodes(
             }
         };
 
-        let agent_addr = format!("http://{}:{}", addr, port);
         let result_node = node_name.clone();
         let allocated = per_node_allocs.get(node_name).cloned().unwrap_or_default();
         let params = AllocationRegisterParams {
@@ -1283,9 +1278,9 @@ async fn confirm_dispatch_on_nodes(
     let mut set = tokio::task::JoinSet::new();
     for (node_idx, node_name) in dispatch_nodes.iter().enumerate() {
         let node_info = cluster.get_node(node_name);
-        let (addr, port) = match node_info {
-            Some(ref n) => match node_comm_endpoint(n) {
-                Some(ep) => ep,
+        let agent_addr = match node_info {
+            Some(ref n) => match node_comm_http_url(n) {
+                Some(url) => url,
                 None => {
                     warn!(
                         job_id,
@@ -1307,7 +1302,6 @@ async fn confirm_dispatch_on_nodes(
             }
         };
 
-        let agent_addr = format!("http://{}:{}", addr, port);
         let spec = spec.clone();
         let peer_addrs = peer_addrs.clone();
         let task_offset = node_idx as u32 * tasks_per_node;
@@ -1831,9 +1825,9 @@ pub async fn send_suspend_to_agents(
 ) {
     for node_name in &job.allocated_nodes {
         let node_info = cluster.get_node(node_name);
-        let (addr, port) = match node_info {
-            Some(ref n) => match node_comm_endpoint(n) {
-                Some(ep) => ep,
+        let agent_addr = match node_info {
+            Some(ref n) => match node_comm_http_url(n) {
+                Some(url) => url,
                 None => {
                     warn!(job_id = job.job_id, node = %node_name,
                         "no comm address — cannot suspend/resume job on node");
@@ -1846,7 +1840,6 @@ pub async fn send_suspend_to_agents(
                 continue;
             }
         };
-        let agent_addr = format!("http://{}:{}", addr, port);
         let job_id = job.job_id;
         tokio::spawn(async move {
             match SlurmAgentClient::connect(agent_addr.clone())

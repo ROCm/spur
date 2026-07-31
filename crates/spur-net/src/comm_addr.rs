@@ -44,6 +44,9 @@ pub fn comm_addr_is_unusable(input: &str) -> bool {
 }
 
 /// Resolve `input` to a canonical comm address string (IP literal preferred).
+///
+/// Hostname inputs perform blocking DNS via [`ToSocketAddrs`]. Call from async
+/// contexts through [`tokio::task::spawn_blocking`].
 pub fn normalize_comm_address(input: &str) -> Result<String, CommAddressError> {
     let input = input.trim();
     if input.is_empty() {
@@ -74,7 +77,8 @@ pub fn normalize_comm_address(input: &str) -> Result<String, CommAddressError> {
     Ok(addrs[0].to_string())
 }
 
-/// Normalize and optionally reject loopback comm addresses.
+/// Normalize and optionally reject non-routable comm addresses (loopback,
+/// unspecified, or link-local).
 pub fn validate_comm_address(
     input: &str,
     reject_loopback: bool,
@@ -88,6 +92,25 @@ pub fn validate_comm_address(
         }
     }
     Ok(normalized)
+}
+
+/// Host portion for `host:port` strings; bracket IPv6 literals.
+pub fn comm_host_for_socket(host: &str) -> String {
+    if host.parse::<IpAddr>().is_ok_and(|ip| ip.is_ipv6()) {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
+/// Format a comm address and port for TCP/gRPC socket connection strings.
+pub fn format_comm_socket(host: &str, port: u16) -> String {
+    format!("{}:{port}", comm_host_for_socket(host))
+}
+
+/// Format a comm address and port for HTTP agent RPC URLs.
+pub fn format_comm_http_url(host: &str, port: u16) -> String {
+    format!("http://{}:{port}", comm_host_for_socket(host))
 }
 
 #[cfg(test)]
@@ -143,5 +166,15 @@ mod tests {
             normalize_comm_address(""),
             Err(CommAddressError::Empty)
         ));
+    }
+
+    #[test]
+    fn format_comm_socket_brackets_ipv6() {
+        assert_eq!(format_comm_socket("::1", 6818), "[::1]:6818");
+        assert_eq!(
+            format_comm_http_url("2001:db8::1", 6818),
+            "http://[2001:db8::1]:6818"
+        );
+        assert_eq!(format_comm_socket("10.0.0.1", 6818), "10.0.0.1:6818");
     }
 }
