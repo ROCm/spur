@@ -254,6 +254,41 @@ async fn process_assignment(
         return false;
     }
 
+    // Run PrologSlurmctld before any node is touched. In Slurm it gates node
+    // access: a failure must abort admission before allocations are registered,
+    // the node prolog (prolog_slurmd) runs, or anything launches. The job is
+    // still Pending here, so a failure just requeues it (batch) or cancels it
+    // (interactive) — nothing on any node to tear down.
+    if let Some(ref prolog_ctld) = cluster.config.hooks.prolog_slurmctld {
+        let ctx = spur_core::hooks::HookContext {
+            job_id: assignment.job_id,
+            work_dir: job.spec.work_dir.clone(),
+            uid: job.spec.uid,
+            gid: job.spec.gid,
+            partition: job.spec.partition.clone().unwrap_or_default(),
+            nodelist: assignment.nodes.join(","),
+            script_context: "prolog_slurmctld".into(),
+            gpu_devices: Vec::new(),
+            cpus: job.spec.cpus_per_task,
+            memory_mb: job.spec.memory_per_node_mb.unwrap_or(0),
+        };
+        if let Err(e) = spur_core::hooks::run_hook(prolog_ctld, &ctx).await {
+            error!(
+                job_id = assignment.job_id,
+                error = %e,
+                "PrologSlurmctld failed"
+            );
+            if job.spec.interactive {
+                if let Err(ce) = cluster.cancel_job(assignment.job_id, &job.spec.user) {
+                    error!(job_id = assignment.job_id, error = %ce, "failed to cancel job after PrologSlurmctld failure");
+                }
+            } else if let Err(re) = cluster.requeue_job(assignment.job_id) {
+                error!(job_id = assignment.job_id, error = %re, "failed to requeue job after PrologSlurmctld failure");
+            }
+            return false;
+        }
+    }
+
     if spec.srun_job && srun_step_dispatch {
         match register_allocation_on_nodes(
             cluster.clone(),
@@ -379,45 +414,6 @@ async fn process_assignment(
             "failed to start job"
         );
         return false;
-    }
-
-    // Run PrologSlurmctld if configured
-    if let Some(ref prolog_ctld) = cluster.config.hooks.prolog_slurmctld {
-        let ctx = spur_core::hooks::HookContext {
-            job_id: assignment.job_id,
-            work_dir: job.spec.work_dir.clone(),
-            uid: job.spec.uid,
-            gid: job.spec.gid,
-            partition: job.spec.partition.clone().unwrap_or_default(),
-            nodelist: assignment.nodes.join(","),
-            script_context: "prolog_slurmctld".into(),
-            gpu_devices: Vec::new(),
-            cpus: job.spec.cpus_per_task,
-            memory_mb: job.spec.memory_per_node_mb.unwrap_or(0),
-        };
-        if let Err(e) = spur_core::hooks::run_hook(prolog_ctld, &ctx).await {
-            error!(
-                job_id = assignment.job_id,
-                error = %e,
-                "PrologSlurmctld failed"
-            );
-            // The job is now Running with real work already dispatched
-            // above (a LaunchJob confirmed on every node, or — for the
-            // pure interactive case — an allocation registered on
-            // every node). Unlike the old post-Running-spawn ordering,
-            // that has already happened by the time we get here, so
-            // it must always be torn down on this path now, regardless
-            // of interactive vs. batch.
-            cancel_job_on_nodes(&cluster, job_id, &dispatch_nodes, 0).await;
-            if job.spec.interactive {
-                if let Err(ce) = cluster.cancel_job(assignment.job_id, &job.spec.user) {
-                    error!(job_id = assignment.job_id, error = %ce, "failed to cancel job after PrologSlurmctld failure");
-                }
-            } else if let Err(re) = cluster.requeue_job(assignment.job_id) {
-                error!(job_id = assignment.job_id, error = %re, "failed to requeue job after PrologSlurmctld failure");
-            }
-            return false;
-        }
     }
 
     true
@@ -3553,9 +3549,13 @@ mod tests {
             // Slurm cancels an interactive job here rather than holding it —
             // holding would strand its waiting srun with nothing to wait for.
             settle(&cm, job_id, JobState::Cancelled);
-            wait_for("the already-launched node is torn down", || {
-                cancel_calls.load(Ordering::SeqCst) >= 1
-            });
+            // PrologSlurmctld runs before dispatch, so no node was ever
+            // launched — there is nothing to tear down.
+            assert_eq!(
+                cancel_calls.load(Ordering::SeqCst),
+                0,
+                "no node should have been launched when PrologSlurmctld fails pre-dispatch"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3578,13 +3578,14 @@ mod tests {
                 "a job whose PrologSlurmctld fails must not count as started"
             );
             // Unlike the interactive case, a batch job is requeued (it has no
-            // waiting srun to strand) — it leaves Running, not straight to a
-            // held Pending, since requeue_after_launch_failure's backoff path
-            // routes a Running job through Failed first.
+            // waiting srun to strand). PrologSlurmctld runs before dispatch, so
+            // the job never left Pending and no node was launched.
             settle(&cm, job_id, JobState::Pending);
-            wait_for("the already-launched node is torn down", || {
-                cancel_calls.load(Ordering::SeqCst) >= 1
-            });
+            assert_eq!(
+                cancel_calls.load(Ordering::SeqCst),
+                0,
+                "no node should have been launched when PrologSlurmctld fails pre-dispatch"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3592,10 +3593,9 @@ mod tests {
             use spur_core::job::JobState;
 
             // A deliberate delay so the concurrent cancel below has a real,
-            // generous window to land after start_job (Running) but before
-            // this returns — the same synthetic-delay idiom
-            // spawn_mock_agent_with_delay uses to make a concurrency test
-            // deterministic instead of racy.
+            // generous window to land while the (pre-dispatch) PrologSlurmctld
+            // script is still running — the same synthetic-delay idiom used to
+            // make a concurrency test deterministic instead of racy.
             let script = make_script("sleep 0.2\nexit 1");
             let dir = TempDir::new().unwrap();
             let cm =
@@ -3614,11 +3614,9 @@ mod tests {
 
             // Simulate a concurrent scancel landing while the (delayed)
             // PrologSlurmctld script is still running: by the time
-            // process_assignment's own interactive-job cancel_job call
-            // fires, the job is already terminal, so that call fails and
-            // must just be logged — not panic or otherwise corrupt the
-            // outcome.
-            settle(&cm, job_id, JobState::Running);
+            // process_assignment's own interactive-job cancel_job call fires,
+            // the job is already terminal, so that call fails and must just be
+            // logged — not panic or otherwise corrupt the outcome.
             cm.cancel_job(job_id, "testuser").unwrap();
 
             let started = handle.await.unwrap();
