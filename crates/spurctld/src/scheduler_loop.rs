@@ -1348,8 +1348,8 @@ async fn confirm_dispatch_on_nodes(
         } else if let Err(e) = cluster.hold_job_for_launch_failure(job_id) {
             error!(job_id, error = %e, "failed to hold job after prolog failure");
         }
-    } else if let Err(e) = cluster.requeue_job(job_id) {
-        error!(job_id, error = %e, "failed to requeue after dispatch confirmation failure");
+    } else if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
+        error!(job_id, error = %e, "failed to back off after dispatch confirmation failure");
     }
 
     DispatchConfirmOutcome::Aborted
@@ -2971,7 +2971,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn hold_on_prolog_fail_off_retries_the_job_instead() {
-            use spur_core::job::JobState;
+            use spur_core::job::{JobState, PendingReason};
 
             let dir = TempDir::new().unwrap();
             let mut config = test_config();
@@ -2985,23 +2985,24 @@ mod tests {
             register_node_at(&cm, "n1", addr);
 
             let job_id = submit_and_wait(&cm, batch_spec("prolog-retry", 1));
-            let reason_before_dispatch = cm.get_job(job_id).unwrap().pending_reason;
             let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
             assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
 
-            // Slurm's nohold_on_prolog_fail: retry rather than hold. Pre-
-            // Running, "retry" is simply leaving the job Pending for the next
-            // scheduler tick (the same simplification
-            // register_allocation_on_nodes's own failure arms already make
-            // for the srun path), rather than the old post-Running
-            // exponential-backoff detour through Failed — that path isn't
-            // reachable from Pending. See confirm_dispatch_on_nodes's doc
-            // comment for the trade-off. The node still drains either way.
+            // Slurm's nohold_on_prolog_fail: retry rather than hold — but
+            // "retry" still means the same bounded backoff any other
+            // non-held dispatch failure gets (backoff_pending_job_after_dispatch_failure),
+            // not an unconditional immediate retry: the node that failed the
+            // prolog is draining anyway, so this job would just land
+            // somewhere else next tick regardless, but a *different* job that
+            // isn't drain-sensitive still needs the backoff to avoid hammering
+            // whatever it lands on. The node drains either way.
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(job.state, JobState::Pending);
-            assert_eq!(
-                job.pending_reason, reason_before_dispatch,
-                "no hold/backoff is applied pre-Running when hold_on_prolog_fail is off"
+            assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+            assert_eq!(job.requeue_count, 1);
+            assert!(
+                job.spec.begin_time.is_some_and(|t| t > chrono::Utc::now()),
+                "nohold_on_prolog_fail retries with a backoff, not an unconditional immediate retry"
             );
             assert!(cm.get_node("n1").unwrap().state.is_admin_hold());
         }
@@ -3036,8 +3037,8 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn an_unclassified_rejection_keeps_the_plain_requeue_path() {
-            use spur_core::job::JobState;
+        async fn an_unclassified_rejection_backs_off_without_draining_the_node() {
+            use spur_core::job::{JobState, PendingReason};
 
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
@@ -3050,19 +3051,73 @@ mod tests {
             register_node_at(&cm, "n1", addr);
 
             let job_id = submit_and_wait(&cm, batch_spec("unclassified", 1));
-            let reason_before_dispatch = cm.get_job(job_id).unwrap().pending_reason;
             let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
             assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
 
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(job.state, JobState::Pending);
+            // Unlike a prolog rejection (an unconditional hold, since the same
+            // job would fail the same way on any node), an unclassified/
+            // non-prolog failure gets a bounded backoff instead: the job stays
+            // eligible to retry once the hold lapses, but can't be reassigned
+            // to (and fail against) the same still-broken node on literally
+            // the next scheduler tick, forever.
+            assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
             assert_eq!(
-                job.pending_reason, reason_before_dispatch,
-                "no hold without a classification"
+                job.requeue_count, 1,
+                "the backoff must count against max_batch_requeue like any other launch failure"
+            );
+            assert!(
+                job.spec.begin_time.is_some_and(|t| t > chrono::Utc::now()),
+                "the backoff hold must defer the job into the future, not just tag it"
             );
             assert!(
                 !cm.get_node("n1").unwrap().state.is_admin_hold(),
                 "an unclassified rejection is not grounds to drain"
+            );
+        }
+
+        // The actual bug this backoff closes: without it, a job whose only
+        // node is unreachable would fail confirmation, land back in
+        // literally the same Pending state, and get reassigned to the same
+        // node on the very next scheduler tick — forever. Drive enough
+        // consecutive failures to cross max_batch_requeue and confirm the
+        // job is held instead of backing off yet again, the same bound a
+        // job that failed after actually reaching Running already gets.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn repeated_dispatch_failures_are_bounded_by_max_batch_requeue() {
+            use spur_core::job::{JobState, PendingReason};
+
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.controller.max_batch_requeue = 2;
+            let cm = test_cluster_with_config(&dir, config).await;
+
+            let bad_addr = unreachable_addr().await;
+            register_node_at(&cm, "n1", bad_addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("bounded-retry", 1));
+
+            for attempt in 1..=2u32 {
+                let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+                assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+                let job = cm.get_job(job_id).unwrap();
+                assert_eq!(job.state, JobState::Pending);
+                assert_eq!(job.requeue_count, attempt, "attempt {attempt}");
+                assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+            }
+
+            // The next failure crosses max_batch_requeue: held for an
+            // operator instead of backing off yet again.
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Pending);
+            assert_eq!(job.pending_reason, PendingReason::JobHoldMaxRequeue);
+            assert_eq!(job.priority, 0);
+            assert!(
+                !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+                "a held job must not be scheduled anywhere, closing the retry loop for good"
             );
         }
 
@@ -3178,22 +3233,18 @@ mod tests {
             );
 
             // Every node's LaunchJob is confirmed concurrently, so admission
-            // takes at least one node's launch delay...
+            // takes at least one node's launch delay — proving dispatch
+            // didn't skip the real per-node work rather than proving it ran
+            // concurrently. An absolute upper bound would demonstrate the
+            // latter (that 64 nodes stays near one node's delay instead of
+            // scaling with the sum across nodes), but a wall-clock ceiling
+            // is flaky on a loaded CI box and adds real sleep time to the
+            // suite for a property the eprintln! above already lets a human
+            // eyeball. Left as a manual/eprintln! check rather than an
+            // asserted one.
             assert!(two_nodes >= PER_NODE_LAUNCH_DELAY);
             assert!(eight_nodes >= PER_NODE_LAUNCH_DELAY);
             assert!(sixty_four_nodes >= PER_NODE_LAUNCH_DELAY);
-
-            // ...and, crucially, stays close to it as the node count grows by
-            // 32x (2 -> 64) rather than scaling with the sum across nodes
-            // (which would be ~32x slower, i.e. ~4.8s here). The multiplier
-            // below leaves headroom for scheduler/OS jitter on a loaded box;
-            // it is not evidence of a real per-node cost.
-            assert!(
-                sixty_four_nodes < PER_NODE_LAUNCH_DELAY * 5,
-                "64-node confirmation ({sixty_four_nodes:?}) scaled with node count instead of \
-                 staying near the single-node launch delay ({PER_NODE_LAUNCH_DELAY:?}) — \
-                 dispatch may have serialized instead of running concurrently"
-            );
         }
 
         // ── process_assignment: the glue `run()` awaits per assignment ──

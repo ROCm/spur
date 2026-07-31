@@ -1265,6 +1265,46 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Back off a job whose batch dispatch confirmation failed for a
+    /// non-prolog reason (e.g. a node's agent was briefly unreachable, or had
+    /// no resolved address) before the job ever left Pending.
+    ///
+    /// `requeue_after_launch_failure` can't be reused here: its backoff and
+    /// `requeue_count` bookkeeping only apply on a real `Running`-or-later ->
+    /// `Pending` transition, and this job never left Pending to begin with —
+    /// its early `job.state == JobState::Pending` branch deliberately no-ops
+    /// rather than let a same-state `JobStateChange` silently apply nothing.
+    /// Without an equivalent here, a job whose only assigned node is flaky
+    /// would fail confirmation, land back in the same unmodified Pending
+    /// state, and get reassigned to the same node on literally the next
+    /// scheduler tick — forever, with no backoff and no `max_batch_requeue`
+    /// bound, since that counter is never touched.
+    pub(crate) fn backoff_pending_job_after_dispatch_failure(
+        &self,
+        job_id: JobId,
+    ) -> anyhow::Result<()> {
+        let begin_time = {
+            let jobs = self.jobs.read();
+            let Some(job) = jobs.get(&job_id) else {
+                return Ok(());
+            };
+            if job.state != JobState::Pending {
+                // Moved on already (e.g. cancelled concurrently) between the
+                // failed confirmation and this call — nothing to back off.
+                return Ok(());
+            }
+            if job.requeue_count >= self.config.controller.max_batch_requeue {
+                drop(jobs);
+                return self.hold_job_at_max_requeue(job_id);
+            }
+            self.launch_backoff_until(job)
+        };
+
+        self.propose(WalOperation::JobDispatchBackoff { job_id, begin_time })?;
+        info!(job_id, hold_until = %begin_time, "job's batch dispatch failed before it started; backing off");
+        Ok(())
+    }
+
     /// Instant until which a job requeued after a launch failure is held. A user
     /// `--begin` further out always wins, so the hold never shortens a
     /// user-supplied constraint. Computed on the leader so every replica applies
@@ -3417,6 +3457,21 @@ impl ClusterManager {
                         }
                     }
                 }
+            }
+            WalOperation::JobDispatchBackoff { job_id, begin_time } => {
+                // The job's own state never changes here (Pending in, Pending
+                // out), so there's no transition to gate on like
+                // JobStateChange does. If it's since left Pending (e.g. a
+                // concurrent cancel), this is a NoOp instead.
+                let Some(job) = jobs.get_mut(job_id) else {
+                    return ClientResponse::default();
+                };
+                if job.state != JobState::Pending {
+                    return ClientResponse::default();
+                }
+                Self::reset_job_for_requeue(job);
+                job.spec.begin_time = Some(*begin_time);
+                job.set_pending_reason(PendingReason::JobLaunchFailure);
             }
             WalOperation::JobPreemptRequeue { job_id, begin_time } => {
                 // Only a running job is preempted; on replay the job is already

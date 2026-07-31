@@ -92,6 +92,8 @@ async fn cleanup_completed_job_mpi(
 
 pub struct AgentService {
     pub reporter: Arc<NodeReporter>,
+    /// In-memory only: starts empty on every spurd start/restart, regardless
+    /// of whether the controller still reports a job Running from before.
     running: Arc<Mutex<HashMap<u32, TrackedJob>>>,
     allocation: Arc<Mutex<NodeAllocation>>,
     spank: Arc<Option<SpankHost>>,
@@ -1652,11 +1654,17 @@ impl SlurmAgent for AgentService {
         };
         let step_id = req.step_id;
 
-        // No retry on a miss here: the controller only lets a step reach this
-        // node once the job is visibly Running, and Running is only reached
-        // once every assigned node — this one included — has already
-        // confirmed its LaunchJob (see confirm_dispatch_on_nodes). A miss
-        // therefore means a genuinely wrong job/node pairing, not a race.
+        // No retry on a miss here for the launch race this PR fixes: the
+        // controller only lets a step reach this node once the job is
+        // visibly Running, and Running is only reached once every assigned
+        // node — this one included — has already confirmed its LaunchJob
+        // (see confirm_dispatch_on_nodes). That guarantee is specific to
+        // this launch window, though — it does not cover this agent
+        // restarting while the job is still Running: `running` starts empty
+        // on every restart (see its field doc), so a step landing here
+        // between restart and this node's jobs re-registering would still
+        // miss with no retry. That's a separate, out-of-scope gap, not one
+        // this lookup claims to handle.
         let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
@@ -1915,18 +1923,21 @@ impl SlurmAgent for AgentService {
         let req = request.into_inner();
         let job_id = req.job_id;
 
-        // No retry on a miss here, for the same reason as run_command: a job
-        // only becomes visibly Running once every assigned node has
-        // confirmed its LaunchJob (confirm_dispatch_on_nodes), so a caller
-        // that waited for Running before reaching this node has already
-        // missed the window where this could race. Unlike run_command (which
-        // the controller only forwards to a node once it has independently
-        // checked job.state == Running), this RPC has no controller-side
-        // proxy — callers (srun --attach, sattach) call it directly against
-        // the agent after checking job.state themselves. That's still safe
-        // against this race (there is no other, earlier source of "the job
-        // is running" for a caller to have used instead), just worth noting
-        // as a difference from the other lookups in this file.
+        // No retry on a miss here for the launch race this PR fixes, for the
+        // same reason as run_command: a job only becomes visibly Running
+        // once every assigned node has confirmed its LaunchJob
+        // (confirm_dispatch_on_nodes), so a caller that waited for Running
+        // before reaching this node has already missed the window where
+        // that specific race could happen. As with run_command's lookup,
+        // this doesn't cover this agent restarting while the job is still
+        // Running (`running` starts empty on restart, independent of what
+        // the controller still reports) — that's a separate, out-of-scope
+        // gap. Unlike run_command (which the controller only forwards to a
+        // node once it has independently checked job.state == Running),
+        // this RPC also has no controller-side proxy of its own — callers
+        // (srun --attach, sattach) call it directly against the agent after
+        // checking job.state themselves, so it inherits whatever guarantee
+        // (or lack of one, in the restart case) that client-side check had.
         //
         // Look up the output file path from the tracked job
         let file_path = {
@@ -2451,9 +2462,13 @@ impl AgentService {
     /// passes (`exec_in_job` and `create_job_step` in spurctld/server.rs), and
     /// that state is only reached once every assigned node — this one
     /// included — has confirmed its LaunchJob (confirm_dispatch_on_nodes). No
-    /// retry needed here for the same reason run_command's lookup doesn't
-    /// need one: by the time a caller can reach this node at all, the miss
-    /// window is already behind it.
+    /// retry needed here for the launch race this PR fixes, for the same
+    /// reason run_command's lookup doesn't need one: by the time a caller
+    /// can reach this node at all, that specific miss window is already
+    /// behind it. This doesn't cover this agent restarting while the job is
+    /// still Running, though — `running` starts empty on restart regardless
+    /// of what the controller still reports — which is a separate,
+    /// out-of-scope gap.
     async fn job_entry(&self, job_id: u32) -> Result<crate::job_entry::JobEntry, Status> {
         let jobs = self.running.lock().await;
         let tracked = jobs

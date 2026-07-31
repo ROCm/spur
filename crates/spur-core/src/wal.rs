@@ -98,6 +98,17 @@ pub enum WalOperation {
         #[serde(default)]
         clear_reservation: bool,
     },
+    /// Back off a job that failed to dispatch before ever leaving Pending
+    /// (e.g. a node's agent was unreachable during batch dispatch
+    /// confirmation). `JobStateChange`'s backoff constructors don't apply
+    /// here: their bookkeeping (`requeue_count`, the hold) is gated on a
+    /// real `old_state != new_state` transition, and this job's state
+    /// isn't changing — it was Pending and stays Pending. Applying is a
+    /// NoOp if the job has since left Pending (e.g. cancelled concurrently).
+    JobDispatchBackoff {
+        job_id: JobId,
+        begin_time: chrono::DateTime<chrono::Utc>,
+    },
     /// Preempt a running job and requeue it in one atomic step: free its node
     /// allocation, end the prior run for accounting (as PREEMPTED), return it to
     /// Pending, and hold it ineligible until `begin_time` so the scheduler can't
@@ -443,6 +454,24 @@ mod job_state_change_wal_tests {
                     Some(hold),
                     "the leader-computed instant must survive the WAL verbatim"
                 );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn job_dispatch_backoff_round_trips() {
+        let hold = chrono::Utc::now() + chrono::Duration::seconds(20);
+        let op = WalOperation::JobDispatchBackoff {
+            job_id: 8,
+            begin_time: hold,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobDispatchBackoff { job_id, begin_time } => {
+                assert_eq!(job_id, 8);
+                assert_eq!(begin_time, hold);
             }
             _ => panic!("wrong variant"),
         }
