@@ -2988,14 +2988,8 @@ mod tests {
             let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
             assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
 
-            // Slurm's nohold_on_prolog_fail: retry rather than hold — but
-            // "retry" still means the same bounded backoff any other
-            // non-held dispatch failure gets (backoff_pending_job_after_dispatch_failure),
-            // not an unconditional immediate retry: the node that failed the
-            // prolog is draining anyway, so this job would just land
-            // somewhere else next tick regardless, but a *different* job that
-            // isn't drain-sensitive still needs the backoff to avoid hammering
-            // whatever it lands on. The node drains either way.
+            // nohold_on_prolog_fail: retry rather than hold, but "retry" is the
+            // same bounded backoff as any dispatch failure, not an immediate one.
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(job.state, JobState::Pending);
             assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
@@ -3056,12 +3050,9 @@ mod tests {
 
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(job.state, JobState::Pending);
-            // Unlike a prolog rejection (an unconditional hold, since the same
-            // job would fail the same way on any node), an unclassified/
-            // non-prolog failure gets a bounded backoff instead: the job stays
-            // eligible to retry once the hold lapses, but can't be reassigned
-            // to (and fail against) the same still-broken node on literally
-            // the next scheduler tick, forever.
+            // A non-prolog failure gets a bounded backoff rather than a drain:
+            // eligible again once the hold lapses, but not reassigned to the
+            // same broken node next tick.
             assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
             assert_eq!(
                 job.requeue_count, 1,
@@ -3077,13 +3068,8 @@ mod tests {
             );
         }
 
-        // The actual bug this backoff closes: without it, a job whose only
-        // node is unreachable would fail confirmation, land back in
-        // literally the same Pending state, and get reassigned to the same
-        // node on the very next scheduler tick — forever. Drive enough
-        // consecutive failures to cross max_batch_requeue and confirm the
-        // job is held instead of backing off yet again, the same bound a
-        // job that failed after actually reaching Running already gets.
+        // Repeated failures against an unreachable node must cross
+        // max_batch_requeue and hold the job, not back off forever.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn repeated_dispatch_failures_are_bounded_by_max_batch_requeue() {
             use spur_core::job::{JobState, PendingReason};
@@ -3232,16 +3218,9 @@ mod tests {
                  (synthetic per-node launch delay: {PER_NODE_LAUNCH_DELAY:?})"
             );
 
-            // Every node's LaunchJob is confirmed concurrently, so admission
-            // takes at least one node's launch delay — proving dispatch
-            // didn't skip the real per-node work rather than proving it ran
-            // concurrently. An absolute upper bound would demonstrate the
-            // latter (that 64 nodes stays near one node's delay instead of
-            // scaling with the sum across nodes), but a wall-clock ceiling
-            // is flaky on a loaded CI box and adds real sleep time to the
-            // suite for a property the eprintln! above already lets a human
-            // eyeball. Left as a manual/eprintln! check rather than an
-            // asserted one.
+            // Lower bound only: proves per-node work wasn't skipped. Concurrency
+            // (64 nodes near one node's delay) is left to the eprintln! above — a
+            // wall-clock ceiling is flaky under CI load.
             assert!(two_nodes >= PER_NODE_LAUNCH_DELAY);
             assert!(eight_nodes >= PER_NODE_LAUNCH_DELAY);
             assert!(sixty_four_nodes >= PER_NODE_LAUNCH_DELAY);

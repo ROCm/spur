@@ -1654,17 +1654,10 @@ impl SlurmAgent for AgentService {
         };
         let step_id = req.step_id;
 
-        // No retry on a miss here for the launch race this PR fixes: the
-        // controller only lets a step reach this node once the job is
-        // visibly Running, and Running is only reached once every assigned
-        // node — this one included — has already confirmed its LaunchJob
-        // (see confirm_dispatch_on_nodes). That guarantee is specific to
-        // this launch window, though — it does not cover this agent
-        // restarting while the job is still Running: `running` starts empty
-        // on every restart (see its field doc), so a step landing here
-        // between restart and this node's jobs re-registering would still
-        // miss with no retry. That's a separate, out-of-scope gap, not one
-        // this lookup claims to handle.
+        // No retry on a miss: a step only reaches a Running job, i.e. one every
+        // node already confirmed via LaunchJob (confirm_dispatch_on_nodes) — so a
+        // miss is a wrong job/node pairing, not a launch race. The one uncovered
+        // case is a spurd restart mid-job, which starts `running` empty.
         let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
@@ -1923,23 +1916,11 @@ impl SlurmAgent for AgentService {
         let req = request.into_inner();
         let job_id = req.job_id;
 
-        // No retry on a miss here for the launch race this PR fixes, for the
-        // same reason as run_command: a job only becomes visibly Running
-        // once every assigned node has confirmed its LaunchJob
-        // (confirm_dispatch_on_nodes), so a caller that waited for Running
-        // before reaching this node has already missed the window where
-        // that specific race could happen. As with run_command's lookup,
-        // this doesn't cover this agent restarting while the job is still
-        // Running (`running` starts empty on restart, independent of what
-        // the controller still reports) — that's a separate, out-of-scope
-        // gap. Unlike run_command (which the controller only forwards to a
-        // node once it has independently checked job.state == Running),
-        // this RPC also has no controller-side proxy of its own — callers
-        // (srun --attach, sattach) call it directly against the agent after
-        // checking job.state themselves, so it inherits whatever guarantee
-        // (or lack of one, in the restart case) that client-side check had.
-        //
-        // Look up the output file path from the tracked job
+        // No retry on a miss, same as run_command: a Running job has been
+        // confirmed on every node (confirm_dispatch_on_nodes). Callers here
+        // (srun --attach, sattach) hit the agent directly with no controller
+        // proxy, so they inherit their own job.state check. Restart mid-job
+        // (empty `running`) is the one uncovered case.
         let file_path = {
             let jobs = self.running.lock().await;
             match jobs.get(&job_id) {
@@ -2457,18 +2438,10 @@ impl AgentService {
 
     /// Extract a `JobEntry` from a tracked running job for namespace entry.
     ///
-    /// Backs both `exec_in_job` and `interactive_session` (attach). Both are
-    /// only reachable once the controller's own `job.state == Running` check
-    /// passes (`exec_in_job` and `create_job_step` in spurctld/server.rs), and
-    /// that state is only reached once every assigned node — this one
-    /// included — has confirmed its LaunchJob (confirm_dispatch_on_nodes). No
-    /// retry needed here for the launch race this PR fixes, for the same
-    /// reason run_command's lookup doesn't need one: by the time a caller
-    /// can reach this node at all, that specific miss window is already
-    /// behind it. This doesn't cover this agent restarting while the job is
-    /// still Running, though — `running` starts empty on restart regardless
-    /// of what the controller still reports — which is a separate,
-    /// out-of-scope gap.
+    /// Backs `exec_in_job` and `interactive_session` (attach), both reachable
+    /// only after the controller's `job.state == Running` check — i.e. every
+    /// node has confirmed LaunchJob (confirm_dispatch_on_nodes) — so no retry
+    /// on a miss. Restart mid-job (empty `running`) is the one uncovered case.
     async fn job_entry(&self, job_id: u32) -> Result<crate::job_entry::JobEntry, Status> {
         let jobs = self.running.lock().await;
         let tracked = jobs

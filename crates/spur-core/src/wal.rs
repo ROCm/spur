@@ -98,13 +98,9 @@ pub enum WalOperation {
         #[serde(default)]
         clear_reservation: bool,
     },
-    /// Back off a job that failed to dispatch before ever leaving Pending
-    /// (e.g. a node's agent was unreachable during batch dispatch
-    /// confirmation). `JobStateChange`'s backoff constructors don't apply
-    /// here: their bookkeeping (`requeue_count`, the hold) is gated on a
-    /// real `old_state != new_state` transition, and this job's state
-    /// isn't changing — it was Pending and stays Pending. Applying is a
-    /// NoOp if the job has since left Pending (e.g. cancelled concurrently).
+    /// Back off a job that failed dispatch before ever leaving Pending, where
+    /// `JobStateChange`'s transition-gated backoff can't apply. NoOp on replay
+    /// if the job has since left Pending.
     JobDispatchBackoff {
         job_id: JobId,
         begin_time: chrono::DateTime<chrono::Utc>,

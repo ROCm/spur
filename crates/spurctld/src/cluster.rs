@@ -1265,20 +1265,11 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Back off a job whose batch dispatch confirmation failed for a
-    /// non-prolog reason (e.g. a node's agent was briefly unreachable, or had
-    /// no resolved address) before the job ever left Pending.
-    ///
-    /// `requeue_after_launch_failure` can't be reused here: its backoff and
-    /// `requeue_count` bookkeeping only apply on a real `Running`-or-later ->
-    /// `Pending` transition, and this job never left Pending to begin with —
-    /// its early `job.state == JobState::Pending` branch deliberately no-ops
-    /// rather than let a same-state `JobStateChange` silently apply nothing.
-    /// Without an equivalent here, a job whose only assigned node is flaky
-    /// would fail confirmation, land back in the same unmodified Pending
-    /// state, and get reassigned to the same node on literally the next
-    /// scheduler tick — forever, with no backoff and no `max_batch_requeue`
-    /// bound, since that counter is never touched.
+    /// Back off a job whose batch dispatch confirmation failed for a non-prolog
+    /// reason (agent briefly unreachable, no resolved address) before it left
+    /// Pending. `requeue_after_launch_failure` can't be reused: its `requeue_count`
+    /// bookkeeping is gated on a real transition out of Running, so without this a
+    /// flaky node's job would be reassigned to it every tick, forever unbounded.
     pub(crate) fn backoff_pending_job_after_dispatch_failure(
         &self,
         job_id: JobId,
@@ -3459,10 +3450,8 @@ impl ClusterManager {
                 }
             }
             WalOperation::JobDispatchBackoff { job_id, begin_time } => {
-                // The job's own state never changes here (Pending in, Pending
-                // out), so there's no transition to gate on like
-                // JobStateChange does. If it's since left Pending (e.g. a
-                // concurrent cancel), this is a NoOp instead.
+                // NoOp if the job left Pending since the leader proposed this
+                // (e.g. a concurrent cancel).
                 let Some(job) = jobs.get_mut(job_id) else {
                     return ClientResponse::default();
                 };
