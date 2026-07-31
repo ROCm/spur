@@ -2845,6 +2845,72 @@ mod tests {
         );
     }
 
+    // exec_in_job and create_job_step are what keep job_entry (backing
+    // exec_in_job and interactive_session/attach) and the step-dispatch path
+    // from ever reaching a node before its LaunchJob is confirmed: both
+    // reject here, before any node is even resolved, for a job that hasn't
+    // reached Running. Pin that both gates actually exist and fire, since
+    // confirm_dispatch_on_nodes closing the race for those RPCs depends on
+    // this check never being bypassed or accidentally dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_in_job_rejects_when_job_not_running() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let spec = spur_core::job::JobSpec {
+            name: "pending-exec".into(),
+            user: "u".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        let job_id = svc.cluster.submit_job(spec).unwrap();
+
+        let err = svc
+            .exec_in_job(Request::new(ExecInJobRequest {
+                job_id,
+                command: vec!["hostname".into()],
+            }))
+            .await
+            .expect_err("a still-Pending job must not be exec'd into");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_job_step_rejects_when_job_not_running() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let mut spec = spur_core::job::JobSpec {
+            name: "pending-step".into(),
+            user: "u".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        spec.srun_job = true;
+        let job_id = svc.cluster.submit_job(spec).unwrap();
+
+        let err = svc
+            .create_job_step(Request::new(CreateJobStepRequest {
+                job_id,
+                command: vec!["hostname".into()],
+                num_tasks: 1,
+                cpus_per_task: 1,
+                overlap: true,
+                pty: true,
+                winsize: None,
+                node: String::new(),
+            }))
+            .await
+            .expect_err("a still-Pending job must not accept a new step");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
     #[test]
     fn select_step_node_empty_request_uses_first_allocated() {
         let allocated = vec!["node001".to_string(), "node002".to_string()];

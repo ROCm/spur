@@ -194,185 +194,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 
         let mut jobs_started_cycle = 0u64;
         for assignment in assignments {
-            let job = match cluster.get_job(assignment.job_id) {
-                Some(j) => j,
-                None => continue,
-            };
-
-            let resources =
-                compute_job_allocation(&job, &assignment.nodes, &assignment.per_node_alloc);
-
-            let job_id = assignment.job_id;
-            let spec = job.spec.clone();
-            let all_nodes = assignment.nodes.clone();
-            let per_node_allocs = assignment.per_node_alloc.clone();
-            let dispatch_nodes = all_nodes.clone();
-            let allocated_nodelist = all_nodes.join(",");
-
-            let srun_step_dispatch = spec.srun_job
-                && dispatch_nodes.iter().all(|name| {
-                    cluster
-                        .get_node(name)
-                        .is_some_and(|n| n.source == NodeSource::NativeHost)
-                });
-
-            if spec.srun_job
-                && !srun_step_dispatch
-                && spec.script.as_deref().unwrap_or("").is_empty()
-            {
-                warn!(
-                    job_id,
-                    "srun batch fallback requires a script in the job spec"
-                );
-                if let Err(e) = cluster.requeue_job(job_id) {
-                    error!(job_id, error = %e, "failed to requeue srun job without script");
-                }
-                continue;
-            }
-
-            if spec.srun_job && srun_step_dispatch {
-                match register_allocation_on_nodes(
-                    cluster.clone(),
-                    job_id,
-                    dispatch_nodes.clone(),
-                    &spec,
-                    per_node_allocs.clone(),
-                    allocated_nodelist.clone(),
-                )
-                .await
-                {
-                    AllocationRegisterOutcome::AllFailed => {
-                        if let Err(e) = cluster.requeue_job(job_id) {
-                            error!(job_id, error = %e, "failed to requeue after registration failure");
-                        }
-                        continue;
-                    }
-                    AllocationRegisterOutcome::PartialFailed { succeeded_nodes } => {
-                        cancel_job_on_nodes(&cluster, job_id, &succeeded_nodes, 9).await;
-                        if let Err(e) = cluster.requeue_job(job_id) {
-                            error!(job_id, error = %e, "failed to requeue after partial registration");
-                        }
-                        continue;
-                    }
-                    AllocationRegisterOutcome::AllSucceeded => {}
-                }
-            }
-
-            // Transition job to Running
-            let start_result = if srun_step_dispatch {
-                cluster.start_job_impl(
-                    job_id,
-                    assignment.nodes.clone(),
-                    resources,
-                    assignment.per_node_alloc.clone(),
-                    true,
-                )
-            } else {
-                cluster.start_job(
-                    job_id,
-                    assignment.nodes.clone(),
-                    resources,
-                    assignment.per_node_alloc.clone(),
-                )
-            };
-            let run_attempt = match start_result {
-                Ok(attempt) => attempt,
-                Err(e) => {
-                    if spec.srun_job && srun_step_dispatch {
-                        cancel_job_on_nodes(&cluster, job_id, &dispatch_nodes, 0).await;
-                    }
-                    debug!(
-                        job_id = assignment.job_id,
-                        error = %e,
-                        "failed to start job"
-                    );
-                    continue;
-                }
-            };
-
-            // Run PrologSlurmctld if configured
-            if let Some(ref prolog_ctld) = cluster.config.hooks.prolog_slurmctld {
-                let ctx = spur_core::hooks::HookContext {
-                    job_id: assignment.job_id,
-                    work_dir: job.spec.work_dir.clone(),
-                    uid: job.spec.uid,
-                    gid: job.spec.gid,
-                    partition: job.spec.partition.clone().unwrap_or_default(),
-                    nodelist: assignment.nodes.join(","),
-                    script_context: "prolog_slurmctld".into(),
-                    gpu_devices: Vec::new(),
-                    cpus: job.spec.cpus_per_task,
-                    memory_mb: job.spec.memory_per_node_mb.unwrap_or(0),
-                };
-                if let Err(e) = spur_core::hooks::run_hook(prolog_ctld, &ctx).await {
-                    error!(
-                        job_id = assignment.job_id,
-                        error = %e,
-                        "PrologSlurmctld failed"
-                    );
-                    if spec.srun_job && srun_step_dispatch && !job.spec.interactive {
-                        cancel_job_on_nodes(&cluster, job_id, &dispatch_nodes, 0).await;
-                    }
-                    if job.spec.interactive {
-                        if let Err(ce) = cluster.cancel_job(assignment.job_id, &job.spec.user) {
-                            error!(job_id = assignment.job_id, error = %ce, "failed to cancel job after PrologSlurmctld failure");
-                        }
-                    } else {
-                        if let Err(re) = cluster.requeue_job(assignment.job_id) {
-                            error!(job_id = assignment.job_id, error = %re, "failed to requeue job after PrologSlurmctld failure");
-                        }
-                    }
-                    continue;
-                }
-            }
-
-            jobs_started_cycle += 1;
-
-            // Build peer_nodes list with addresses for cross-node communication
-            let peer_addrs: Vec<String> = all_nodes
-                .iter()
-                .filter_map(|name| {
-                    cluster
-                        .get_node(name)
-                        .and_then(|n| n.address.as_ref().map(|a| format!("{}:{}", a, n.port)))
-                })
-                .collect();
-
-            let tasks_per_node = if let Some(tpn) = spec.tasks_per_node {
-                tpn
-            } else {
-                (spec.num_tasks / spec.num_nodes.max(1)).max(1)
-            };
-
-            let cluster_ref = cluster.clone();
-            if spec.srun_job {
-                if !srun_step_dispatch {
-                    let mut batch_spec = spec;
-                    batch_spec.srun_job = false;
-                    tokio::spawn(dispatch_job_to_nodes(
-                        cluster_ref,
-                        job_id,
-                        dispatch_nodes,
-                        batch_spec,
-                        peer_addrs,
-                        per_node_allocs,
-                        allocated_nodelist,
-                        tasks_per_node,
-                        run_attempt,
-                    ));
-                }
-            } else {
-                tokio::spawn(dispatch_job_to_nodes(
-                    cluster_ref,
-                    job_id,
-                    dispatch_nodes,
-                    spec,
-                    peer_addrs,
-                    per_node_allocs,
-                    allocated_nodelist,
-                    tasks_per_node,
-                    run_attempt,
-                ));
+            if process_assignment(cluster.clone(), assignment).await {
+                jobs_started_cycle += 1;
             }
         }
 
@@ -384,6 +207,216 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             hit_depth_limit,
         );
     }
+}
+
+/// Process one scheduler assignment: dispatch/confirm on its nodes, start the
+/// job, and run `PrologSlurmctld`. Returns whether the job actually started
+/// (fed into the caller's `jobs_started_cycle` count).
+///
+/// Extracted from `run`'s assignment loop so this — including the
+/// `confirm_dispatch_on_nodes`/`start_job` ordering the srun-step startup fix
+/// depends on — is directly testable without driving the whole scheduler
+/// loop (which needs a live Raft cluster, a real `interval`/`scheduler_notify`
+/// wake, and the three watchdog tasks `run` also spawns).
+async fn process_assignment(
+    cluster: Arc<ClusterManager>,
+    assignment: spur_sched::traits::Assignment,
+) -> bool {
+    let job = match cluster.get_job(assignment.job_id) {
+        Some(j) => j,
+        None => return false,
+    };
+
+    let resources = compute_job_allocation(&job, &assignment.nodes, &assignment.per_node_alloc);
+
+    let job_id = assignment.job_id;
+    let spec = job.spec.clone();
+    let all_nodes = assignment.nodes.clone();
+    let per_node_allocs = assignment.per_node_alloc.clone();
+    let dispatch_nodes = all_nodes.clone();
+    let allocated_nodelist = all_nodes.join(",");
+
+    let srun_step_dispatch = spec.srun_job
+        && dispatch_nodes.iter().all(|name| {
+            cluster
+                .get_node(name)
+                .is_some_and(|n| n.source == NodeSource::NativeHost)
+        });
+
+    if spec.srun_job && !srun_step_dispatch && spec.script.as_deref().unwrap_or("").is_empty() {
+        warn!(
+            job_id,
+            "srun batch fallback requires a script in the job spec"
+        );
+        if let Err(e) = cluster.requeue_job(job_id) {
+            error!(job_id, error = %e, "failed to requeue srun job without script");
+        }
+        return false;
+    }
+
+    // Run PrologSlurmctld before any node is touched. In Slurm it gates node
+    // access: a failure must abort admission before allocations are registered,
+    // the node prolog (prolog_slurmd) runs, or anything launches. The job is
+    // still Pending here, so a failure just requeues it (batch) or cancels it
+    // (interactive) — nothing on any node to tear down.
+    if let Some(ref prolog_ctld) = cluster.config.hooks.prolog_slurmctld {
+        let ctx = spur_core::hooks::HookContext {
+            job_id: assignment.job_id,
+            work_dir: job.spec.work_dir.clone(),
+            uid: job.spec.uid,
+            gid: job.spec.gid,
+            partition: job.spec.partition.clone().unwrap_or_default(),
+            nodelist: assignment.nodes.join(","),
+            script_context: "prolog_slurmctld".into(),
+            gpu_devices: Vec::new(),
+            cpus: job.spec.cpus_per_task,
+            memory_mb: job.spec.memory_per_node_mb.unwrap_or(0),
+        };
+        if let Err(e) = spur_core::hooks::run_hook(prolog_ctld, &ctx).await {
+            error!(
+                job_id = assignment.job_id,
+                error = %e,
+                "PrologSlurmctld failed"
+            );
+            if job.spec.interactive {
+                if let Err(ce) = cluster.cancel_job(assignment.job_id, &job.spec.user) {
+                    error!(job_id = assignment.job_id, error = %ce, "failed to cancel job after PrologSlurmctld failure");
+                }
+            } else if let Err(re) = cluster.requeue_job(assignment.job_id) {
+                error!(job_id = assignment.job_id, error = %re, "failed to requeue job after PrologSlurmctld failure");
+            }
+            return false;
+        }
+    }
+
+    if spec.srun_job && srun_step_dispatch {
+        match register_allocation_on_nodes(
+            cluster.clone(),
+            job_id,
+            dispatch_nodes.clone(),
+            &spec,
+            per_node_allocs.clone(),
+            allocated_nodelist.clone(),
+        )
+        .await
+        {
+            AllocationRegisterOutcome::AllFailed => {
+                if let Err(e) = cluster.requeue_job(job_id) {
+                    error!(job_id, error = %e, "failed to requeue after registration failure");
+                }
+                return false;
+            }
+            AllocationRegisterOutcome::PartialFailed { succeeded_nodes } => {
+                cancel_job_on_nodes(&cluster, job_id, &succeeded_nodes, 9).await;
+                if let Err(e) = cluster.requeue_job(job_id) {
+                    error!(job_id, error = %e, "failed to requeue after partial registration");
+                }
+                return false;
+            }
+            AllocationRegisterOutcome::AllSucceeded => {}
+        }
+    }
+
+    // Build peer_nodes list with addresses for cross-node communication
+    // and the effective per-node task count. Both are needed by the
+    // LaunchJob dispatch below, which — unlike the old fire-and-forget
+    // spawn — now runs (and is awaited) *before* the job is allowed to
+    // become visibly Running.
+    let peer_addrs: Vec<String> = all_nodes
+        .iter()
+        .filter_map(|name| {
+            cluster
+                .get_node(name)
+                .and_then(|n| n.address.as_ref().map(|a| format!("{}:{}", a, n.port)))
+        })
+        .collect();
+
+    let tasks_per_node = if let Some(tpn) = spec.tasks_per_node {
+        tpn
+    } else {
+        (spec.num_tasks / spec.num_nodes.max(1)).max(1)
+    };
+
+    // Batch dispatch (plain sbatch jobs, and the srun-as-batch-script
+    // fallback) must have every assigned node confirm its LaunchJob
+    // *before* start_job flips the job to Running — otherwise squeue
+    // reports Running while a node may still be mid-launch (the race
+    // an earlier mitigation only papered over with a retry window on
+    // the agent side). The pure interactive srun_step_dispatch case
+    // has nothing left to dispatch here: register_allocation_on_nodes
+    // above already confirmed the allocation, and the actual step
+    // launch is a later RunCommand, not this LaunchJob RPC.
+    let dispatch_spec = if !spec.srun_job {
+        Some(spec.clone())
+    } else if !srun_step_dispatch {
+        let mut batch_spec = spec.clone();
+        batch_spec.srun_job = false;
+        Some(batch_spec)
+    } else {
+        None
+    };
+
+    if let Some(dspec) = dispatch_spec {
+        // The run epoch start_job_impl is about to persist for this
+        // dispatch. Safe to read ahead of that call: this iteration is
+        // the only place that can advance a Pending job's run_attempt,
+        // and nothing here yields back to another iteration for the
+        // same job in between.
+        let prospective_run_attempt = job.run_attempt.saturating_add(1);
+
+        match confirm_dispatch_on_nodes(
+            cluster.clone(),
+            job_id,
+            dispatch_nodes.clone(),
+            dspec,
+            peer_addrs.clone(),
+            per_node_allocs.clone(),
+            allocated_nodelist.clone(),
+            tasks_per_node,
+            prospective_run_attempt,
+        )
+        .await
+        {
+            DispatchConfirmOutcome::Aborted => return false,
+            DispatchConfirmOutcome::Confirmed => {}
+        }
+    }
+
+    // Transition job to Running. Reached only once every assigned node
+    // has confirmed (LaunchJob for batch dispatch above, or
+    // RegisterJobAllocation for the pure interactive case above that).
+    let start_result = if srun_step_dispatch {
+        cluster.start_job_impl(
+            job_id,
+            assignment.nodes.clone(),
+            resources,
+            assignment.per_node_alloc.clone(),
+            true,
+        )
+    } else {
+        cluster.start_job(
+            job_id,
+            assignment.nodes.clone(),
+            resources,
+            assignment.per_node_alloc.clone(),
+        )
+    };
+    if let Err(e) = start_result {
+        // Confirmation above already registered the allocation or
+        // launched real processes on dispatch_nodes; stop them so a
+        // start_job failure here (e.g. the job was cancelled out from
+        // under us between assignment and this point) doesn't leave
+        // orphans.
+        cancel_job_on_nodes(&cluster, job_id, &dispatch_nodes, 0).await;
+        debug!(
+            job_id = assignment.job_id,
+            error = %e,
+            "failed to start job"
+        );
+        return false;
+    }
+
+    true
 }
 
 /// Compute the resource set to record against the cluster for an assignment.
@@ -1120,12 +1153,66 @@ pub async fn release_srun_allocation_on_agents(
     send_cancel_to_agents(cluster, job, 0).await;
 }
 
-/// Dispatch a job to every assigned node and act on the aggregate result:
-/// requeue to Pending if every node rejected the launch, or evict the job to
-/// NodeFail if only some nodes accepted it (a node that never launched the
-/// job will never report completion, so the job would otherwise hang).
+/// Outcome of [`confirm_dispatch_on_nodes`]: either every assigned node
+/// confirmed its LaunchJob (the job may now become visibly Running), or
+/// admission was aborted and the job — which never left Pending — has
+/// already been settled (requeued, held, or cancelled as appropriate).
+enum DispatchConfirmOutcome {
+    Confirmed,
+    Aborted,
+}
+
+/// Dispatch a batch job to every assigned node and *wait* for every LaunchJob
+/// RPC to resolve before returning anything the caller can use to flip the
+/// job to Running.
+///
+/// This is the structural fix for the srun-step startup race: an earlier
+/// mitigation only widened an agent-side retry window on one lookup. The old
+/// flow called `start_job` (Running, visible to squeue/scontrol) and then
+/// fired this dispatch in the background via `tokio::spawn`, so a step could
+/// target a node before that node's own `LaunchJob` had actually finished.
+/// Now the scheduler loop awaits this function *before* calling `start_job`,
+/// mirroring the pattern `register_allocation_on_nodes` already uses for
+/// standalone srun/salloc allocations — except this confirms the heavier
+/// `LaunchJob` RPC (which actually spawns the job's process), not the
+/// lightweight `RegisterJobAllocation` used there.
+///
+/// This closes the race for every consumer that gates on `job.state ==
+/// Running` before targeting a node, not just the step-dispatch path
+/// (`run_step`/`run_command`) it was written for: `exec_in_job` and
+/// `create_job_step` (spurctld/server.rs) both check `job.state == Running`
+/// before forwarding to an agent, and back `exec_in_job`/`interactive_session`
+/// (spurd/agent_server.rs's `job_entry`) and `stream_job_output`'s attach
+/// path respectively. Since Running is the single, sole signal all of these
+/// checks (and the CLI's own client-side checks, for the RPCs that have no
+/// controller-side proxy) rely on, and it is now unreachable before every
+/// node's registration completes, none of run_command/job_entry/
+/// stream_job_output's node-side lookups need a retry of their own — see the
+/// comments at each of those lookups.
+///
+/// Failure handling necessarily differs from the old post-Running
+/// `dispatch_job_to_nodes` this replaces, because the job is still Pending
+/// here — there is no Running/Failed/NodeFail detour to route a partial
+/// failure through:
+///   - A node whose own prolog rejected the job is drained, exactly as before
+///     (this is a per-node action, independent of the job's state).
+///   - If `hold_on_prolog_fail` is set (the default) and applies, the job is
+///     parked the same way `scontrol hold` parks a Pending job
+///     (`ClusterManager::hold_job_for_launch_failure`), since holding via the
+///     old Running→Failed→Held path isn't reachable from Pending. Interactive
+///     jobs are cancelled instead, same as before.
+///   - Otherwise (no prolog failure, or holding is disabled) the job is
+///     simply left Pending for the next scheduler tick — the same
+///     simplification `register_allocation_on_nodes`'s own failure arms above
+///     already make for the srun path. This intentionally does not reproduce
+///     `requeue_after_launch_failure`'s exponential backoff / requeue-count
+///     bookkeeping for a *non*-prolog failure, since that path requires an
+///     actual Failed transition the job never has here; a persistently
+///     failing node still gets drained on repeated prolog failures, but a
+///     transient (non-prolog) failure can retry immediately rather than
+///     backing off. See the fix's write-up for why this trade-off was made.
 #[allow(clippy::too_many_arguments)]
-async fn dispatch_job_to_nodes(
+async fn confirm_dispatch_on_nodes(
     cluster: Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
     dispatch_nodes: Vec<String>,
@@ -1135,7 +1222,7 @@ async fn dispatch_job_to_nodes(
     allocated_nodelist: String,
     tasks_per_node: u32,
     run_attempt: u32,
-) {
+) -> DispatchConfirmOutcome {
     let mut successes = 0u32;
     let mut failures = 0u32;
     let mut succeeded_nodes: Vec<String> = Vec::new();
@@ -1157,7 +1244,7 @@ async fn dispatch_job_to_nodes(
                 warn!(
                     job_id,
                     node = %node_name,
-                    "no agent address for node, skipping dispatch"
+                    "no agent address for node, skipping dispatch confirmation"
                 );
                 failures += 1;
                 continue;
@@ -1204,33 +1291,42 @@ async fn dispatch_job_to_nodes(
                 }
             }
             Ok((node_name, _, Err(e))) => {
-                error!(job_id, node = %node_name, error = %e, "dispatch to agent failed");
+                error!(job_id, node = %node_name, error = %e, "dispatch confirmation failed");
                 failures += 1;
                 if let DispatchError::PrologFailed(reason) = e {
                     prolog_failed.push((node_name, reason));
                 }
             }
             Err(e) => {
-                error!(job_id, error = %e, "dispatch task panicked");
+                error!(job_id, error = %e, "dispatch confirmation task panicked");
                 failures += 1;
             }
         }
     }
 
-    // Only surface the primary's paths on a clean launch; a partial/total
-    // failure requeues or evicts the job, leaving it to fall back to the
-    // computed path on the next attempt.
     if failures == 0 {
         if let Some(outcome) = primary_outcome {
             cluster.set_job_output_paths(job_id, outcome.stdout_path, outcome.stderr_path);
         }
+        return DispatchConfirmOutcome::Confirmed;
     }
 
+    warn!(
+        job_id,
+        successes, failures, total,
+        "one or more nodes failed to confirm dispatch — aborting admission instead of partially running"
+    );
+
+    // Stop whatever DID launch before the job settles anywhere: a node that
+    // never confirmed will never report completion, and letting it keep
+    // running while the job as a whole is aborted back to Pending would
+    // orphan it.
+    cancel_job_on_nodes(&cluster, job_id, &succeeded_nodes, 9).await;
+
     // Drain before deciding the job's fate, so the failing node is already out
-    // of the candidate set if the job does go back to Pending. The drain is
-    // issued here rather than by the agent because only the controller can pair
-    // it with the hold that stops the job walking the cluster.
-    let hold = !prolog_failed.is_empty() && cluster.config.controller.hold_on_prolog_fail;
+    // of the candidate set on the next scheduling attempt. The drain is issued
+    // here rather than by the agent because only the controller can pair it
+    // with the hold that stops the job walking the cluster.
     for (node_name, reason) in &prolog_failed {
         warn!(job_id, node = %node_name, reason = %reason, "draining node after prolog failure");
         if let Err(e) = cluster.drain_node(node_name, Some(reason.clone())) {
@@ -1238,68 +1334,21 @@ async fn dispatch_job_to_nodes(
         }
     }
 
-    // If ALL dispatches failed, requeue the job back to Pending
-    // so the scheduler can retry (e.g., container image may be
-    // imported later, or a transient agent error may resolve) rather
-    // than failing it outright and denying the user a chance to fix it.
-    if successes == 0 && total > 0 {
-        error!(
-            job_id,
-            failures, "all dispatches failed — requeueing job to Pending"
-        );
-        if let Err(e) = finish_failed_dispatch(&cluster, job_id, &spec, hold) {
-            error!(job_id, error = %e, "failed to requeue job after dispatch failure");
-        }
-    } else if hold {
-        // Same ordering rationale as the eviction branch below: stop what did
-        // launch before the job can be touched again. Eviction itself is wrong
-        // here, since it routes through maybe_requeue and would drop the hold.
-        warn!(
-            job_id,
-            successes, failures, "prolog failed on part of the allocation — holding job"
-        );
-        cancel_job_on_nodes(&cluster, job_id, &succeeded_nodes, 9).await;
-        if let Err(e) = finish_failed_dispatch(&cluster, job_id, &spec, true) {
+    if !prolog_failed.is_empty() && cluster.config.controller.hold_on_prolog_fail {
+        if spec.interactive {
+            // Holding an interactive job would strand its waiting srun forever
+            // with nothing to wait for; Slurm cancels these too.
+            if let Err(e) = cluster.cancel_job(job_id, &spec.user) {
+                error!(job_id, error = %e, "failed to cancel interactive job after prolog failure");
+            }
+        } else if let Err(e) = cluster.hold_job_for_launch_failure(job_id) {
             error!(job_id, error = %e, "failed to hold job after prolog failure");
         }
-    } else if failures > 0 {
-        // A node that never got the dispatch will never report completion, so evict
-        // the whole job to NodeFail (same as a node dying mid-run) instead of hanging.
-        warn!(
-            job_id,
-            successes, failures, "partial dispatch failure — evicting job to NodeFail"
-        );
-        // Cancel the job on nodes that DID launch it *before* evicting, and wait
-        // for those cancels to be delivered. Eviction can synchronously requeue
-        // the job to Pending (when `spec.requeue` is set), making it eligible for
-        // immediate re-dispatch on the next scheduler cycle; because CancelJob is
-        // keyed only by job_id, a cancel still in flight would otherwise be able
-        // to terminate a freshly re-dispatched attempt on the same node. Ordering
-        // the awaited cancel ahead of the requeue closes that race — the launched
-        // processes are stopped before the job can be relaunched anywhere.
-        cancel_job_on_nodes(&cluster, job_id, &succeeded_nodes, 9).await;
-        if let Err(e) = cluster.evict_job(job_id) {
-            error!(job_id, error = %e, "failed to evict job after partial dispatch failure");
-        }
+    } else if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
+        error!(job_id, error = %e, "failed to back off after dispatch confirmation failure");
     }
-}
 
-/// Settle a job whose dispatch failed: requeue it, or hold it when the failure
-/// would follow it to the next node.
-///
-/// Interactive jobs are cancelled instead of held, matching both Slurm ("only
-/// batch jobs can be requeued, interactive jobs will be cancelled") and the
-/// PrologSlurmctld arm above. Holding one would strand the waiting `srun`.
-fn finish_failed_dispatch(
-    cluster: &ClusterManager,
-    job_id: spur_core::job::JobId,
-    spec: &spur_core::job::JobSpec,
-    hold: bool,
-) -> anyhow::Result<()> {
-    if hold && spec.interactive {
-        return cluster.cancel_job(job_id, &spec.user);
-    }
-    cluster.requeue_after_launch_failure(job_id, hold)
+    DispatchConfirmOutcome::Aborted
 }
 
 /// Watchdog: gracefully terminate running jobs that exceed their time limit.
@@ -2101,10 +2150,15 @@ mod tests {
         /// Minimal SlurmAgent: counts cancel_job calls, so tests can assert the
         /// controller actually tried to stop the job on nodes that did launch
         /// it. `reject_launch_as` makes launch_job fail with a given
-        /// classification instead of succeeding.
+        /// classification instead of succeeding. `launch_delay` sleeps inside
+        /// `launch_job` before responding, standing in for the node-side work
+        /// (resource allocation, GPU device-injection planning, process
+        /// spawn) a real agent does — used to measure confirmation latency
+        /// under a synthetic per-node launch cost rather than estimating it.
         struct MockAgent {
             cancel_calls: Arc<AtomicU32>,
             reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
+            launch_delay: Duration,
         }
 
         #[tonic::async_trait]
@@ -2119,6 +2173,9 @@ mod tests {
                 request: tonic::Request<spur_proto::proto::LaunchJobRequest>,
             ) -> Result<tonic::Response<spur_proto::proto::LaunchJobResponse>, tonic::Status>
             {
+                if !self.launch_delay.is_zero() {
+                    tokio::time::sleep(self.launch_delay).await;
+                }
                 if let Some(kind) = self.reject_launch_as {
                     return Ok(tonic::Response::new(spur_proto::proto::LaunchJobResponse {
                         success: false,
@@ -2270,12 +2327,30 @@ mod tests {
         async fn spawn_mock_agent_rejecting(
             reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
         ) -> (std::net::SocketAddr, Arc<AtomicU32>) {
+            spawn_mock_agent_full(reject_launch_as, Duration::ZERO).await
+        }
+
+        /// Like [`spawn_mock_agent`], but `launch_job` sleeps `delay` before
+        /// accepting — a synthetic stand-in for a real agent's launch pipeline,
+        /// so latency tests measure a real (if synthetic) number instead of
+        /// guessing one.
+        async fn spawn_mock_agent_with_delay(
+            delay: Duration,
+        ) -> (std::net::SocketAddr, Arc<AtomicU32>) {
+            spawn_mock_agent_full(None, delay).await
+        }
+
+        async fn spawn_mock_agent_full(
+            reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
+            launch_delay: Duration,
+        ) -> (std::net::SocketAddr, Arc<AtomicU32>) {
             let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
             let addr = incoming.local_addr().unwrap();
             let cancel_calls = Arc::new(AtomicU32::new(0));
             let agent = MockAgent {
                 cancel_calls: cancel_calls.clone(),
                 reject_launch_as,
+                launch_delay,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -2421,7 +2496,8 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn partial_dispatch_evicts_job_and_cancels_the_node_that_launched() {
+        async fn partial_dispatch_confirmation_aborts_admission_and_cancels_the_node_that_launched()
+        {
             use spur_core::job::JobState;
 
             let dir = TempDir::new().unwrap();
@@ -2432,7 +2508,7 @@ mod tests {
             register_node_at(&cm, "n1", good_addr);
             register_node_at(&cm, "n2", bad_addr);
 
-            let mut spec = JobSpec {
+            let spec = JobSpec {
                 name: "partial-dispatch".into(),
                 user: "testuser".into(),
                 num_nodes: 2,
@@ -2442,104 +2518,20 @@ mod tests {
                 ..Default::default()
             };
             let job_id = submit_and_wait(&cm, spec.clone());
-            spec = cm.get_job(job_id).unwrap().spec;
+            let spec = cm.get_job(job_id).unwrap().spec;
 
             let nodes = vec!["n1".to_string(), "n2".to_string()];
             let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
                 .iter()
                 .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
                 .collect();
-            let run_attempt = cm
-                .start_job(
-                    job_id,
-                    nodes.clone(),
-                    ResourceAllocations::with_scalar(2, 0),
-                    per_node_allocs.clone(),
-                )
-                .unwrap();
-            settle(&cm, job_id, JobState::Running);
 
-            // This calls the exact same function `run()` spawns per assignment:
-            // real network dispatch to both nodes, real JoinSet success/failure
-            // counting, and the real branch that decides to evict on a partial
-            // failure — n1 (real agent) accepts, n2 (nothing listening) fails.
-            dispatch_job_to_nodes(
-                cm.clone(),
-                job_id,
-                nodes,
-                spec,
-                Vec::new(),
-                per_node_allocs,
-                "n1,n2".into(),
-                1,
-                run_attempt,
-            )
-            .await;
-
-            settle(&cm, job_id, JobState::NodeFail);
-            assert_eq!(
-                cm.get_job(job_id).unwrap().pending_reason,
-                spur_core::job::PendingReason::JobLaunchFailure
-            );
-
-            // n1 actually launched the job, so the controller must tell its
-            // agent to stop it instead of leaving an orphaned process behind.
-            // The cancel is awaited inside dispatch_job_to_nodes, so it has
-            // already been delivered by the time that call returned.
-            assert_eq!(
-                cancel_calls.load(Ordering::SeqCst),
-                1,
-                "n1 must have been cancelled before dispatch_job_to_nodes returned"
-            );
-        }
-
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn partial_dispatch_with_requeue_still_cancels_the_node_that_launched() {
-            use spur_core::job::JobState;
-
-            let dir = TempDir::new().unwrap();
-            let cm = test_cluster(&dir).await;
-
-            let (good_addr, cancel_calls) = spawn_mock_agent().await;
-            let bad_addr = unreachable_addr().await;
-            register_node_at(&cm, "n1", good_addr);
-            register_node_at(&cm, "n2", bad_addr);
-
-            let mut spec = JobSpec {
-                name: "partial-dispatch-requeue".into(),
-                user: "testuser".into(),
-                num_nodes: 2,
-                num_tasks: 2,
-                cpus_per_task: 1,
-                work_dir: "/tmp".into(),
-                requeue: true,
-                ..Default::default()
-            };
-            let job_id = submit_and_wait(&cm, spec.clone());
-            spec = cm.get_job(job_id).unwrap().spec;
-
-            let nodes = vec!["n1".to_string(), "n2".to_string()];
-            let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
-                .iter()
-                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
-                .collect();
-            cm.start_job(
-                job_id,
-                nodes.clone(),
-                ResourceAllocations::with_scalar(2, 0),
-                per_node_allocs.clone(),
-            )
-            .unwrap();
-            settle(&cm, job_id, JobState::Running);
-
-            // Same as the non-requeue case, but `spec.requeue` is set: eviction's
-            // requeue side effect resets the job to Pending and clears
-            // `allocated_nodes`. The cancel RPC must be delivered to n1 *before*
-            // that requeue makes the job eligible for re-dispatch, otherwise a
-            // job_id-keyed cancel still in flight could kill a fresh attempt.
-            // dispatch_job_to_nodes awaits the cancel before evicting, so by the
-            // time it returns both the cancel is delivered and the job is Pending.
-            dispatch_job_to_nodes(
+            // This calls the exact same function `run()` now awaits per
+            // assignment *before* start_job: real network dispatch to both
+            // nodes, real JoinSet success/failure counting, and the real
+            // branch that aborts admission on a partial failure — n1 (real
+            // agent) accepts, n2 (nothing listening) fails.
+            let outcome = confirm_dispatch_on_nodes(
                 cm.clone(),
                 job_id,
                 nodes,
@@ -2552,18 +2544,25 @@ mod tests {
             )
             .await;
 
-            // Cancel-before-requeue: the cancel is already delivered, and the
-            // requeue side effect has put the job back to Pending with its
-            // allocation cleared — no polling needed, both are guaranteed by the
-            // await ordering inside dispatch_job_to_nodes.
-            assert_eq!(
-                cancel_calls.load(Ordering::SeqCst),
-                1,
-                "n1 must have been cancelled before the requeue re-enabled dispatch"
-            );
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+
+            // The job must never have been visible as Running — admission
+            // failed before that transition, not after it (unlike the old
+            // dispatch_job_to_nodes, which evicted an already-Running job to
+            // NodeFail on the same partial failure).
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(job.state, JobState::Pending);
             assert!(job.allocated_nodes.is_empty());
+
+            // n1 actually launched the job, so the controller must tell its
+            // agent to stop it instead of leaving an orphaned process behind.
+            // The cancel is awaited inside confirm_dispatch_on_nodes, so it
+            // has already been delivered by the time that call returned.
+            assert_eq!(
+                cancel_calls.load(Ordering::SeqCst),
+                1,
+                "n1 must have been cancelled before confirm_dispatch_on_nodes returned"
+            );
         }
 
         // Force-finish must cancel the job on the unreported node before freeing
@@ -2677,11 +2676,11 @@ mod tests {
         }
 
         // Mock agents echo an offset-keyed path; the stored path must be the
-        // primary's (task_offset == 0) regardless of which response arrives first.
+        // primary's (task_offset == 0) regardless of which response arrives
+        // first. Confirmed *before* start_job now, so the job is still
+        // Pending when the path lands.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn clean_dispatch_stores_primary_node_output_path() {
-            use spur_core::job::JobState;
-
+        async fn clean_dispatch_confirmation_stores_primary_node_output_path() {
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
 
@@ -2707,17 +2706,8 @@ mod tests {
                 .iter()
                 .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
                 .collect();
-            let run_attempt = cm
-                .start_job(
-                    job_id,
-                    nodes.clone(),
-                    ResourceAllocations::with_scalar(2, 0),
-                    per_node_allocs.clone(),
-                )
-                .unwrap();
-            settle(&cm, job_id, JobState::Running);
 
-            dispatch_job_to_nodes(
+            let outcome = confirm_dispatch_on_nodes(
                 cm.clone(),
                 job_id,
                 nodes,
@@ -2726,9 +2716,11 @@ mod tests {
                 per_node_allocs,
                 "n1,n2".into(),
                 1,
-                run_attempt,
+                1,
             )
             .await;
+
+            assert!(matches!(outcome, DispatchConfirmOutcome::Confirmed));
 
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(
@@ -2742,13 +2734,10 @@ mod tests {
             );
         }
 
-        // If the primary node fails to launch, the dispatch requeues/evicts the
-        // job and no output path is recorded, so queries fall back to the
-        // computed path.
+        // If the primary node fails to launch, admission is aborted and no
+        // output path is recorded, so queries fall back to the computed path.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn failed_primary_leaves_output_path_unset() {
-            use spur_core::job::JobState;
-
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
 
@@ -2775,17 +2764,8 @@ mod tests {
                 .iter()
                 .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
                 .collect();
-            let run_attempt = cm
-                .start_job(
-                    job_id,
-                    nodes.clone(),
-                    ResourceAllocations::with_scalar(2, 0),
-                    per_node_allocs.clone(),
-                )
-                .unwrap();
-            settle(&cm, job_id, JobState::Running);
 
-            dispatch_job_to_nodes(
+            let outcome = confirm_dispatch_on_nodes(
                 cm.clone(),
                 job_id,
                 nodes,
@@ -2794,24 +2774,24 @@ mod tests {
                 per_node_allocs,
                 "n1,n2".into(),
                 1,
-                run_attempt,
+                1,
             )
             .await;
+
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
 
             let job = cm.get_job(job_id).unwrap();
             assert!(
                 job.actual_stdout_path.is_none(),
-                "a failed dispatch must not record an output path"
+                "a failed dispatch confirmation must not record an output path"
             );
             assert!(job.actual_stderr_path.is_none());
         }
 
-        // A secondary-node failure (primary succeeds) still evicts/requeues the
-        // job, so the `failures == 0` gate must skip storing the primary's path.
+        // A secondary-node failure (primary succeeds) still aborts admission,
+        // so the `failures == 0` gate must skip storing the primary's path.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn secondary_failure_leaves_output_path_unset() {
-            use spur_core::job::JobState;
-
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
 
@@ -2838,17 +2818,8 @@ mod tests {
                 .iter()
                 .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
                 .collect();
-            let run_attempt = cm
-                .start_job(
-                    job_id,
-                    nodes.clone(),
-                    ResourceAllocations::with_scalar(2, 0),
-                    per_node_allocs.clone(),
-                )
-                .unwrap();
-            settle(&cm, job_id, JobState::Running);
 
-            dispatch_job_to_nodes(
+            let outcome = confirm_dispatch_on_nodes(
                 cm.clone(),
                 job_id,
                 nodes,
@@ -2857,9 +2828,11 @@ mod tests {
                 per_node_allocs,
                 "n1,n2".into(),
                 1,
-                run_attempt,
+                1,
             )
             .await;
+
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
 
             let job = cm.get_job(job_id).unwrap();
             assert!(
@@ -2870,31 +2843,26 @@ mod tests {
         }
 
         // ── prolog failure: drain the node, hold the job ──
+        //
+        // All of these confirm dispatch on a still-Pending job (never
+        // started), matching what `run()` now does: the job is never visible
+        // as Running before these outcomes are decided.
 
-        /// Start `spec` on `nodes` and run the real dispatch against them.
-        async fn dispatch_started_job(
+        /// Submit `spec` (via the caller) and run the real dispatch
+        /// confirmation against `nodes` on the still-Pending job.
+        async fn confirm_dispatch_pending_job(
             cm: &Arc<ClusterManager>,
             job_id: spur_core::job::JobId,
             nodes: &[&str],
-        ) {
+        ) -> DispatchConfirmOutcome {
             let nodes: Vec<String> = nodes.iter().map(|n| n.to_string()).collect();
             let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
                 .iter()
                 .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
                 .collect();
-            let run_attempt = cm
-                .start_job(
-                    job_id,
-                    nodes.clone(),
-                    ResourceAllocations::with_scalar(nodes.len() as u32, 0),
-                    per_node_allocs.clone(),
-                )
-                .unwrap();
-            settle(cm, job_id, spur_core::job::JobState::Running);
-
             let spec = cm.get_job(job_id).unwrap().spec;
             let nodelist = nodes.join(",");
-            dispatch_job_to_nodes(
+            confirm_dispatch_on_nodes(
                 cm.clone(),
                 job_id,
                 nodes,
@@ -2903,9 +2871,9 @@ mod tests {
                 per_node_allocs,
                 nodelist,
                 1,
-                run_attempt,
+                1,
             )
-            .await;
+            .await
         }
 
         fn batch_spec(name: &str, num_nodes: u32) -> JobSpec {
@@ -2934,8 +2902,8 @@ mod tests {
             register_node_at(&cm, "n1", addr);
 
             let job_id = submit_and_wait(&cm, batch_spec("prolog-fail", 1));
-            dispatch_started_job(&cm, job_id, &["n1"]).await;
-            settle(&cm, job_id, JobState::Pending);
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
 
             let node = cm.get_node("n1").unwrap();
             assert!(
@@ -2950,9 +2918,14 @@ mod tests {
                 node.state_reason
             );
 
-            // The hold is what bounds the drain to one node: without it the job
-            // retries onto the next node and drains that one too.
+            // The hold is what bounds the drain to one node: without it the
+            // job retries onto the next node and drains that one too. The job
+            // never reached Running, so this hold is applied directly on the
+            // still-Pending job (`hold_job_for_launch_failure`) rather than
+            // via the old Running->Failed->Held detour — same end state
+            // (Pending, priority 0, Held, identical description).
             let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Pending);
             assert_eq!(job.pending_reason, PendingReason::Held);
             assert_eq!(job.priority, 0);
             assert_eq!(
@@ -2967,8 +2940,6 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn an_operator_can_release_a_job_held_for_a_prolog_failure() {
-            use spur_core::job::JobState;
-
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
 
@@ -2979,8 +2950,7 @@ mod tests {
             register_node_at(&cm, "n1", addr);
 
             let job_id = submit_and_wait(&cm, batch_spec("prolog-release", 1));
-            dispatch_started_job(&cm, job_id, &["n1"]).await;
-            settle(&cm, job_id, JobState::Pending);
+            confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
 
             cm.release_job(job_id).unwrap();
             wait_for("job released", || {
@@ -3011,15 +2981,19 @@ mod tests {
             register_node_at(&cm, "n1", addr);
 
             let job_id = submit_and_wait(&cm, batch_spec("prolog-retry", 1));
-            dispatch_started_job(&cm, job_id, &["n1"]).await;
-            settle(&cm, job_id, JobState::Pending);
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
 
-            // Slurm's nohold_on_prolog_fail: retry, bounded by max_batch_requeue
-            // rather than by a hold. The node still drains.
+            // nohold_on_prolog_fail: retry rather than hold, but "retry" is the
+            // same bounded backoff as any dispatch failure, not an immediate one.
             let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Pending);
             assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
-            assert_ne!(job.priority, 0);
-            assert!(job.spec.begin_time.is_some_and(|b| b > Utc::now()));
+            assert_eq!(job.requeue_count, 1);
+            assert!(
+                job.spec.begin_time.is_some_and(|t| t > chrono::Utc::now()),
+                "nohold_on_prolog_fail retries with a backoff, not an unconditional immediate retry"
+            );
             assert!(cm.get_node("n1").unwrap().state.is_admin_hold());
         }
 
@@ -3041,7 +3015,9 @@ mod tests {
             let mut spec = batch_spec("prolog-interactive", 1);
             spec.interactive = true;
             let job_id = submit_and_wait(&cm, spec);
-            dispatch_started_job(&cm, job_id, &["n1"]).await;
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+
             settle(&cm, job_id, JobState::Cancelled);
 
             assert!(
@@ -3051,7 +3027,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn an_unclassified_rejection_keeps_the_plain_requeue_path() {
+        async fn an_unclassified_rejection_backs_off_without_draining_the_node() {
             use spur_core::job::{JobState, PendingReason};
 
             let dir = TempDir::new().unwrap();
@@ -3065,15 +3041,65 @@ mod tests {
             register_node_at(&cm, "n1", addr);
 
             let job_id = submit_and_wait(&cm, batch_spec("unclassified", 1));
-            dispatch_started_job(&cm, job_id, &["n1"]).await;
-            settle(&cm, job_id, JobState::Pending);
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
 
             let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Pending);
+            // A non-prolog failure gets a bounded backoff rather than a drain:
+            // eligible again once the hold lapses, but not reassigned to the
+            // same broken node next tick.
             assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
-            assert_ne!(job.priority, 0, "no hold without a classification");
+            assert_eq!(
+                job.requeue_count, 1,
+                "the backoff must count against max_batch_requeue like any other launch failure"
+            );
+            assert!(
+                job.spec.begin_time.is_some_and(|t| t > chrono::Utc::now()),
+                "the backoff hold must defer the job into the future, not just tag it"
+            );
             assert!(
                 !cm.get_node("n1").unwrap().state.is_admin_hold(),
                 "an unclassified rejection is not grounds to drain"
+            );
+        }
+
+        // Repeated failures against an unreachable node must cross
+        // max_batch_requeue and hold the job, not back off forever.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn repeated_dispatch_failures_are_bounded_by_max_batch_requeue() {
+            use spur_core::job::{JobState, PendingReason};
+
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.controller.max_batch_requeue = 2;
+            let cm = test_cluster_with_config(&dir, config).await;
+
+            let bad_addr = unreachable_addr().await;
+            register_node_at(&cm, "n1", bad_addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("bounded-retry", 1));
+
+            for attempt in 1..=2u32 {
+                let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+                assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+                let job = cm.get_job(job_id).unwrap();
+                assert_eq!(job.state, JobState::Pending);
+                assert_eq!(job.requeue_count, attempt, "attempt {attempt}");
+                assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+            }
+
+            // The next failure crosses max_batch_requeue: held for an
+            // operator instead of backing off yet again.
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Pending);
+            assert_eq!(job.pending_reason, PendingReason::JobHoldMaxRequeue);
+            assert_eq!(job.priority, 0);
+            assert!(
+                !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+                "a held job must not be scheduled anywhere, closing the retry loop for good"
             );
         }
 
@@ -3093,15 +3119,17 @@ mod tests {
             register_node_at(&cm, "n2", bad_addr);
 
             let job_id = submit_and_wait(&cm, batch_spec("prolog-partial", 2));
-            dispatch_started_job(&cm, job_id, &["n1", "n2"]).await;
-            settle(&cm, job_id, JobState::Pending);
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1", "n2"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
 
             assert!(!cm.get_node("n1").unwrap().state.is_admin_hold());
             assert!(cm.get_node("n2").unwrap().state.is_admin_hold());
 
-            // The partial branch must hold like the total one; evicting would
-            // route through maybe_requeue and drop the hold.
+            // The partial branch must hold like the total one, and — unlike
+            // the pre-fix behavior — the job must never have been visible as
+            // Running in between.
             let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Pending);
             assert_eq!(job.pending_reason, PendingReason::Held);
             assert_eq!(job.priority, 0);
 
@@ -3109,6 +3137,533 @@ mod tests {
                 cancel_calls.load(Ordering::SeqCst),
                 1,
                 "n1 launched the job, so it must be stopped before the job settles"
+            );
+        }
+
+        // ── measured admission latency ──
+        //
+        // Answers "how much slower does job start get?" with a real number
+        // instead of an estimate: every node's LaunchJob is confirmed
+        // concurrently via JoinSet, so the added latency this fix introduces
+        // should track the *slowest* node's own launch time, not the sum
+        // across all assigned nodes.
+
+        /// Confirm dispatch across `count` freshly-registered nodes, each of
+        /// whose mock agent sleeps `delay` before accepting the launch, and
+        /// return how long the whole confirmation actually took.
+        async fn measure_confirm_latency(
+            cm: &Arc<ClusterManager>,
+            count: usize,
+            delay: Duration,
+        ) -> Duration {
+            let mut nodes = Vec::with_capacity(count);
+            for i in 0..count {
+                let name = format!("latency-n{i}");
+                let (addr, _) = spawn_mock_agent_with_delay(delay).await;
+                register_node_at(cm, &name, addr);
+                nodes.push(name);
+            }
+
+            let spec = batch_spec(&format!("latency-{count}"), count as u32);
+            let job_id = submit_and_wait(cm, spec);
+            let spec = cm.get_job(job_id).unwrap().spec;
+            let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
+                .iter()
+                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+            let nodelist = nodes.join(",");
+
+            let start = std::time::Instant::now();
+            let outcome = confirm_dispatch_on_nodes(
+                cm.clone(),
+                job_id,
+                nodes,
+                spec,
+                Vec::new(),
+                per_node_allocs,
+                nodelist,
+                1,
+                1,
+            )
+            .await;
+            let elapsed = start.elapsed();
+
+            assert!(matches!(outcome, DispatchConfirmOutcome::Confirmed));
+            elapsed
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+        async fn confirm_dispatch_latency_tracks_the_slowest_node_not_the_node_count() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            // A generous, deliberately-visible stand-in for a real agent's
+            // launch pipeline (resource allocation, GPU device-injection
+            // planning, process spawn) — real hardware is faster than this,
+            // but the point is the shape of the curve (flat vs. linear in
+            // node count), not the absolute number.
+            const PER_NODE_LAUNCH_DELAY: Duration = Duration::from_millis(150);
+
+            let two_nodes = measure_confirm_latency(&cm, 2, PER_NODE_LAUNCH_DELAY).await;
+            let eight_nodes = measure_confirm_latency(&cm, 8, PER_NODE_LAUNCH_DELAY).await;
+            let sixty_four_nodes = measure_confirm_latency(&cm, 64, PER_NODE_LAUNCH_DELAY).await;
+
+            eprintln!(
+                "confirm_dispatch_on_nodes latency — 2 nodes: {two_nodes:?}, \
+                 8 nodes: {eight_nodes:?}, 64 nodes: {sixty_four_nodes:?} \
+                 (synthetic per-node launch delay: {PER_NODE_LAUNCH_DELAY:?})"
+            );
+
+            // Lower bound only: proves per-node work wasn't skipped. Concurrency
+            // (64 nodes near one node's delay) is left to the eprintln! above — a
+            // wall-clock ceiling is flaky under CI load.
+            assert!(two_nodes >= PER_NODE_LAUNCH_DELAY);
+            assert!(eight_nodes >= PER_NODE_LAUNCH_DELAY);
+            assert!(sixty_four_nodes >= PER_NODE_LAUNCH_DELAY);
+        }
+
+        // ── process_assignment: the glue `run()` awaits per assignment ──
+        //
+        // confirm_dispatch_pending_job above calls confirm_dispatch_on_nodes
+        // directly, standing in for what `run()` used to fire off in the
+        // background. These tests instead go through process_assignment
+        // itself — the peer_addrs/tasks_per_node build, the dispatch_spec
+        // decision (plain batch vs. srun-as-batch-fallback vs. pure
+        // interactive), and start_job — the same call `run()` makes once per
+        // assignment every cycle.
+
+        fn register_k8s_node_at(cm: &ClusterManager, name: &str, addr: std::net::SocketAddr) {
+            cm.register_node(
+                name.into(),
+                ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                addr.ip().to_string(),
+                addr.port(),
+                String::new(),
+                String::new(),
+                NodeSource::Kubernetes {
+                    namespace: "spur-test".into(),
+                },
+                HashMap::new(),
+            )
+            .unwrap();
+            let n = name.to_string();
+            wait_for(&format!("node '{n}' registered"), || {
+                cm.get_node(&n).is_some()
+            });
+        }
+
+        fn assignment(
+            job_id: spur_core::job::JobId,
+            nodes: &[&str],
+        ) -> spur_sched::traits::Assignment {
+            let per_node_alloc: HashMap<String, ResourceAllocations> = nodes
+                .iter()
+                .map(|n| (n.to_string(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+            spur_sched::traits::Assignment {
+                job_id,
+                nodes: nodes.iter().map(|n| n.to_string()).collect(),
+                per_node_alloc,
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_starts_a_plain_batch_job() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, _) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr);
+
+            // An explicit --ntasks-per-node so this also covers the "user
+            // supplied one" branch of the effective-tasks-per-node
+            // computation, not just its num_tasks/num_nodes fallback.
+            let mut spec = batch_spec("plain-batch", 1);
+            spec.tasks_per_node = Some(2);
+            let job_id = submit_and_wait(&cm, spec);
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+
+            assert!(started, "a clean single-node batch dispatch must start");
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Running);
+            assert_eq!(job.allocated_nodes, vec!["n1".to_string()]);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_returns_false_for_a_job_that_no_longer_exists() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            // No submit_job call: this job_id was never assigned, standing in
+            // for an assignment computed against a snapshot that's since gone
+            // stale (e.g. the job was deleted/expired between scheduling and
+            // this call).
+            let started = process_assignment(cm.clone(), assignment(999, &["n1"])).await;
+
+            assert!(!started);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_aborts_a_plain_batch_job_when_confirmation_fails() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let bad_addr = unreachable_addr().await;
+            register_node_at(&cm, "n1", bad_addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("plain-batch-unreachable", 1));
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+
+            assert!(
+                !started,
+                "a plain batch job must not start if its only node can't be reached"
+            );
+            assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_requeues_srun_batch_fallback_without_a_script() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            // Kubernetes-sourced, so srun_step_dispatch is false and this
+            // takes the srun-as-batch-script-fallback branch, which requires
+            // a script.
+            let (addr, _) = spawn_mock_agent().await;
+            register_k8s_node_at(&cm, "k1", addr);
+
+            let mut spec = batch_spec("srun-no-script", 1);
+            spec.srun_job = true;
+            assert!(spec.script.is_none());
+            let job_id = submit_and_wait(&cm, spec);
+
+            let started = process_assignment(cm.clone(), assignment(job_id, &["k1"])).await;
+
+            assert!(
+                !started,
+                "an srun batch fallback with no script must not start"
+            );
+            // requeue_job on a job that never left Pending is a no-op by
+            // design (nothing to unwind), so the meaningful assertion is
+            // that it never started, not a visible state change here.
+            assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_dispatches_srun_batch_fallback_with_a_script() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, _) = spawn_mock_agent().await;
+            register_k8s_node_at(&cm, "k1", addr);
+
+            let mut spec = batch_spec("srun-with-script", 1);
+            spec.srun_job = true;
+            spec.script = Some("#!/bin/bash\necho hi\n".into());
+            let job_id = submit_and_wait(&cm, spec);
+
+            let started = process_assignment(cm.clone(), assignment(job_id, &["k1"])).await;
+
+            assert!(
+                started,
+                "an srun batch fallback with a script confirms and starts like a plain batch job"
+            );
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Running);
+            assert!(
+                !job.srun_step_dispatch,
+                "the batch-script fallback launches like sbatch, not a native srun step"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_completes_pure_interactive_srun_without_a_launch_job_dispatch()
+        {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            // NativeHost, so srun_step_dispatch is true: register_allocation_on_nodes
+            // (not this test's mock agent's launch_job) is what has to succeed.
+            let (addr, _) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr);
+
+            let mut spec = batch_spec("pure-interactive", 1);
+            spec.srun_job = true;
+            spec.interactive = true;
+            let job_id = submit_and_wait(&cm, spec);
+
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+
+            assert!(
+                started,
+                "a native srun allocation on its own node must start"
+            );
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Running);
+            assert!(
+                job.srun_step_dispatch,
+                "the pure interactive path must record itself as step-dispatch, \
+                 not the batch-script fallback"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_requeues_when_all_srun_allocation_registrations_fail() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let bad_addr = unreachable_addr().await;
+            register_node_at(&cm, "n1", bad_addr);
+
+            let mut spec = batch_spec("srun-alloc-all-fail", 1);
+            spec.srun_job = true;
+            let job_id = submit_and_wait(&cm, spec);
+
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+
+            assert!(!started);
+            assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_cancels_the_launched_node_on_partial_srun_allocation_failure() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (good_addr, cancel_calls) = spawn_mock_agent().await;
+            let bad_addr = unreachable_addr().await;
+            register_node_at(&cm, "n1", good_addr);
+            register_node_at(&cm, "n2", bad_addr);
+
+            let mut spec = batch_spec("srun-alloc-partial-fail", 2);
+            spec.srun_job = true;
+            let job_id = submit_and_wait(&cm, spec);
+
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1", "n2"])).await;
+
+            assert!(!started);
+            assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
+            wait_for("n1 registration rolled back with a cancel", || {
+                cancel_calls.load(Ordering::SeqCst) >= 1
+            });
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_cancels_dispatched_nodes_when_start_job_fails_after_confirmation(
+        ) {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr1, cancel1) = spawn_mock_agent().await;
+            let (addr2, cancel2) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr1);
+            register_node_at(&cm, "n2", addr2);
+
+            let job_id = submit_and_wait(&cm, batch_spec("start-job-inconsistent", 2));
+
+            // A malformed assignment: confirm_dispatch_on_nodes tolerates a
+            // missing per_node_alloc entry (falls back to a default
+            // allocation), but start_job validates every assigned node has
+            // one and rejects the whole call otherwise. This is what a
+            // scheduler/assignment bug producing inconsistent data — or the
+            // job being touched by another path between assignment and this
+            // call — looks like from here: both nodes already launched real
+            // work by the time start_job is rejected, so both must be torn
+            // back down rather than left running under a job stuck Pending.
+            let mut bad_assignment = assignment(job_id, &["n1", "n2"]);
+            bad_assignment.per_node_alloc.remove("n2");
+
+            let started = process_assignment(cm.clone(), bad_assignment).await;
+
+            assert!(
+                !started,
+                "start_job's own validation must still block on inconsistent per-node data"
+            );
+            assert_eq!(
+                cm.get_job(job_id).unwrap().state,
+                JobState::Pending,
+                "a start_job failure must not leave the job Running with no confirmed nodes"
+            );
+            wait_for(
+                "n1 cancelled after start_job rejected the assignment",
+                || cancel1.load(Ordering::SeqCst) >= 1,
+            );
+            wait_for(
+                "n2 cancelled after start_job rejected the assignment",
+                || cancel2.load(Ordering::SeqCst) >= 1,
+            );
+        }
+
+        fn make_script(body: &str) -> tempfile::TempPath {
+            use std::io::Write;
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            writeln!(f, "#!/bin/bash\n{}", body).unwrap();
+            let path = f.into_temp_path();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path
+        }
+
+        fn test_config_with_prolog_slurmctld(script: &std::path::Path) -> SlurmConfig {
+            let mut config = test_config();
+            config.hooks.prolog_slurmctld = Some(script.to_string_lossy().into_owned());
+            config
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_cancels_interactive_job_when_prolog_slurmctld_fails() {
+            use spur_core::job::JobState;
+
+            let script = make_script("exit 1");
+            let dir = TempDir::new().unwrap();
+            let cm =
+                test_cluster_with_config(&dir, test_config_with_prolog_slurmctld(&script)).await;
+            let (addr, cancel_calls) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr);
+
+            let mut spec = batch_spec("prolog-slurmctld-interactive", 1);
+            spec.interactive = true;
+            let job_id = submit_and_wait(&cm, spec);
+
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+
+            assert!(
+                !started,
+                "a job whose PrologSlurmctld fails must not count as started"
+            );
+            // Slurm cancels an interactive job here rather than holding it —
+            // holding would strand its waiting srun with nothing to wait for.
+            settle(&cm, job_id, JobState::Cancelled);
+            // PrologSlurmctld runs before dispatch, so no node was ever
+            // launched — there is nothing to tear down.
+            assert_eq!(
+                cancel_calls.load(Ordering::SeqCst),
+                0,
+                "no node should have been launched when PrologSlurmctld fails pre-dispatch"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_requeues_batch_job_when_prolog_slurmctld_fails() {
+            use spur_core::job::JobState;
+
+            let script = make_script("exit 1");
+            let dir = TempDir::new().unwrap();
+            let cm =
+                test_cluster_with_config(&dir, test_config_with_prolog_slurmctld(&script)).await;
+            let (addr, cancel_calls) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("prolog-slurmctld-batch", 1));
+
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+
+            assert!(
+                !started,
+                "a job whose PrologSlurmctld fails must not count as started"
+            );
+            // Unlike the interactive case, a batch job is requeued (it has no
+            // waiting srun to strand). PrologSlurmctld runs before dispatch, so
+            // the job never left Pending and no node was launched.
+            settle(&cm, job_id, JobState::Pending);
+            assert_eq!(
+                cancel_calls.load(Ordering::SeqCst),
+                0,
+                "no node should have been launched when PrologSlurmctld fails pre-dispatch"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_survives_a_cancel_that_races_prolog_slurmctld_failure() {
+            use spur_core::job::JobState;
+
+            // A deliberate delay so the concurrent cancel below has a real,
+            // generous window to land while the (pre-dispatch) PrologSlurmctld
+            // script is still running — the same synthetic-delay idiom used to
+            // make a concurrency test deterministic instead of racy.
+            let script = make_script("sleep 0.2\nexit 1");
+            let dir = TempDir::new().unwrap();
+            let cm =
+                test_cluster_with_config(&dir, test_config_with_prolog_slurmctld(&script)).await;
+            let (addr, _) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr);
+
+            let mut spec = batch_spec("prolog-slurmctld-double-cancel", 1);
+            spec.interactive = true;
+            let job_id = submit_and_wait(&cm, spec);
+
+            let cm_task = cm.clone();
+            let handle = tokio::spawn(async move {
+                process_assignment(cm_task, assignment(job_id, &["n1"])).await
+            });
+
+            // Simulate a concurrent scancel landing while the (delayed)
+            // PrologSlurmctld script is still running: by the time
+            // process_assignment's own interactive-job cancel_job call fires,
+            // the job is already terminal, so that call fails and must just be
+            // logged — not panic or otherwise corrupt the outcome.
+            cm.cancel_job(job_id, "testuser").unwrap();
+
+            let started = handle.await.unwrap();
+
+            assert!(!started);
+            assert_eq!(
+                cm.get_job(job_id).unwrap().state,
+                JobState::Cancelled,
+                "the job must stay exactly as the earlier, real cancel left it"
+            );
+        }
+
+        // confirm_dispatch_on_nodes's own interactive-prolog-failure cleanup
+        // calls cancel_job — which can itself fail if the job was already
+        // cancelled by something else (e.g. a concurrent scancel) while the
+        // prolog check was in flight. That must not panic or otherwise
+        // corrupt the outcome; it's just logged.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn confirm_dispatch_on_nodes_survives_a_cancel_that_races_prolog_failure() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (addr, _) = spawn_mock_agent_rejecting(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureProlog,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let mut spec = batch_spec("prolog-interactive-double-cancel", 1);
+            spec.interactive = true;
+            let job_id = submit_and_wait(&cm, spec);
+
+            // Simulate a concurrent scancel landing before the prolog
+            // rejection is processed: the job is already terminal by the
+            // time confirm_dispatch_on_nodes tries to cancel it itself.
+            cm.cancel_job(job_id, "testuser").unwrap();
+            settle(&cm, job_id, JobState::Cancelled);
+
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert_eq!(
+                cm.get_job(job_id).unwrap().state,
+                JobState::Cancelled,
+                "the job must stay exactly as the earlier, real cancel left it"
             );
         }
     }

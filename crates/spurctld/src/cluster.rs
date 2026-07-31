@@ -1265,6 +1265,37 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Back off a job whose batch dispatch confirmation failed for a non-prolog
+    /// reason (agent briefly unreachable, no resolved address) before it left
+    /// Pending. `requeue_after_launch_failure` can't be reused: its `requeue_count`
+    /// bookkeeping is gated on a real transition out of Running, so without this a
+    /// flaky node's job would be reassigned to it every tick, forever unbounded.
+    pub(crate) fn backoff_pending_job_after_dispatch_failure(
+        &self,
+        job_id: JobId,
+    ) -> anyhow::Result<()> {
+        let begin_time = {
+            let jobs = self.jobs.read();
+            let Some(job) = jobs.get(&job_id) else {
+                return Ok(());
+            };
+            if job.state != JobState::Pending {
+                // Moved on already (e.g. cancelled concurrently) between the
+                // failed confirmation and this call — nothing to back off.
+                return Ok(());
+            }
+            if job.requeue_count >= self.config.controller.max_batch_requeue {
+                drop(jobs);
+                return self.hold_job_at_max_requeue(job_id);
+            }
+            self.launch_backoff_until(job)
+        };
+
+        self.propose(WalOperation::JobDispatchBackoff { job_id, begin_time })?;
+        info!(job_id, hold_until = %begin_time, "job's batch dispatch failed before it started; backing off");
+        Ok(())
+    }
+
     /// Instant until which a job requeued after a launch failure is held. A user
     /// `--begin` further out always wins, so the hold never shortens a
     /// user-supplied constraint. Computed on the leader so every replica applies
@@ -1282,12 +1313,21 @@ impl ClusterManager {
     /// Evict a running job to NodeFail: frees allocations and feeds the
     /// existing auto-requeue path in `notify_job_finished`, same as the
     /// health-check path (`evict_jobs_on_node`) that runs when an entire
-    /// node goes Down, but scoped to a single job. Used when only some of a
-    /// job's assigned nodes could be dispatched to, since a node that never
-    /// launched the job will never report completion. Unlike the
-    /// health-check path, this does not by itself cancel the job on nodes
-    /// that *did* launch it — the caller (`scheduler_loop`) is responsible
-    /// for sending the cancel RPC once eviction succeeds.
+    /// node goes Down, but scoped to a single job. Unlike the health-check
+    /// path, this does not by itself cancel the job on nodes that *did*
+    /// launch it — a caller evicting a job with launched-but-unconfirmed
+    /// nodes is responsible for sending the cancel RPC once eviction
+    /// succeeds.
+    ///
+    /// No longer called from `scheduler_loop`: batch dispatch is now
+    /// confirmed on every assigned node *before* a job is allowed to become
+    /// Running (see `confirm_dispatch_on_nodes`), so a job can no longer
+    /// reach Running with only some of its nodes actually launched — this
+    /// function's original trigger. Kept as a public primitive, with its
+    /// back-off/requeue contract still exercised directly by this module's
+    /// tests, for any other caller that needs to evict an already-Running
+    /// job (e.g. a future admin-initiated NodeFail).
+    #[allow(dead_code)]
     pub fn evict_job(&self, job_id: JobId) -> anyhow::Result<()> {
         {
             let jobs = self.jobs.read();
@@ -1492,10 +1532,46 @@ impl ClusterManager {
             old_priority,
             new_priority: 0,
             pending_reason: Some(PendingReason::Held),
+            pending_reason_desc: None,
             reset_requeue_count: false,
             clear_reservation: false,
         })?;
         info!(job_id, "job held");
+        Ok(())
+    }
+
+    /// Hold a *Pending* job whose batch dispatch failed to confirm on a node
+    /// (prolog rejection with `hold_on_prolog_fail` set). Same end state as
+    /// [`Self::hold_job`] (priority 0, `PendingReason::Held`), but carries the
+    /// launch-failure description so it reads the same as the pre-fix path
+    /// that reached this via a Running→Failed→Held detour: the job here never
+    /// actually left Pending, so that detour isn't available.
+    pub(crate) fn hold_job_for_launch_failure(&self, job_id: JobId) -> anyhow::Result<()> {
+        let old_priority = {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            if job.state != JobState::Pending {
+                anyhow::bail!(
+                    "can only hold pending jobs (job {} is {:?})",
+                    job_id,
+                    job.state
+                );
+            }
+            job.priority
+        };
+
+        self.propose(WalOperation::JobPriorityChange {
+            job_id,
+            old_priority,
+            new_priority: 0,
+            pending_reason: Some(PendingReason::Held),
+            pending_reason_desc: Some(LAUNCH_FAILURE_HELD_DESC.to_string()),
+            reset_requeue_count: false,
+            clear_reservation: false,
+        })?;
+        info!(job_id, "job held after launch failure");
         Ok(())
     }
 
@@ -1554,6 +1630,7 @@ impl ClusterManager {
                 old_priority,
                 new_priority: 0,
                 pending_reason: Some(PendingReason::JobHoldMaxRequeue),
+                pending_reason_desc: None,
                 reset_requeue_count: false,
                 clear_reservation: false,
             })?;
@@ -1584,6 +1661,7 @@ impl ClusterManager {
             old_priority,
             new_priority: 1000,
             pending_reason: Some(PendingReason::Priority),
+            pending_reason_desc: None,
             reset_requeue_count: reset_requeue,
             clear_reservation,
         })?;
@@ -1656,6 +1734,7 @@ impl ClusterManager {
                 old_priority: old,
                 new_priority: p,
                 pending_reason: None,
+                pending_reason_desc: None,
                 reset_requeue_count: false,
                 clear_reservation: false,
             })?;
@@ -3370,6 +3449,19 @@ impl ClusterManager {
                     }
                 }
             }
+            WalOperation::JobDispatchBackoff { job_id, begin_time } => {
+                // NoOp if the job left Pending since the leader proposed this
+                // (e.g. a concurrent cancel).
+                let Some(job) = jobs.get_mut(job_id) else {
+                    return ClientResponse::default();
+                };
+                if job.state != JobState::Pending {
+                    return ClientResponse::default();
+                }
+                Self::reset_job_for_requeue(job);
+                job.spec.begin_time = Some(*begin_time);
+                job.set_pending_reason(PendingReason::JobLaunchFailure);
+            }
             WalOperation::JobPreemptRequeue { job_id, begin_time } => {
                 // Only a running job is preempted; on replay the job is already
                 // Pending, so this is a NoOp (no re-dealloc, no double requeue).
@@ -3779,6 +3871,7 @@ impl ClusterManager {
                 job_id,
                 new_priority,
                 pending_reason,
+                pending_reason_desc,
                 reset_requeue_count,
                 clear_reservation,
                 ..
@@ -3786,7 +3879,10 @@ impl ClusterManager {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.priority = *new_priority;
                     if let Some(reason) = pending_reason {
-                        job.set_pending_reason(reason.clone());
+                        match pending_reason_desc {
+                            Some(desc) => job.set_pending_reason_desc(reason.clone(), desc.clone()),
+                            None => job.set_pending_reason(reason.clone()),
+                        }
                     }
                     if *reset_requeue_count {
                         job.requeue_count = 0;
@@ -5586,6 +5682,7 @@ mod tests {
             old_priority: 1000,
             new_priority: 5000,
             pending_reason: None,
+            pending_reason_desc: None,
             reset_requeue_count: false,
             clear_reservation: false,
         });
@@ -10949,6 +11046,144 @@ mod tests {
         let job = cm.get_job(id).unwrap();
         assert_eq!(job.priority, 1000);
         assert_eq!(job.pending_reason, PendingReason::Priority);
+    }
+
+    // hold_job_for_launch_failure is confirm_dispatch_on_nodes's Pending-
+    // compatible equivalent of the old Running->Failed->Held detour: same end
+    // state as a plain hold_job (Pending, priority 0, PendingReason::Held),
+    // plus the launch-failure description, and it must refuse a job that
+    // already started (unlike a fresh Pending job, that would silently do the
+    // wrong thing by holding it mid-run).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hold_job_for_launch_failure_holds_a_pending_job_with_its_description() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("prolog-hold"));
+
+        cm.hold_job_for_launch_failure(id).unwrap();
+        wait_for("hold applied", || {
+            cm.get_job(id).is_some_and(|j| j.priority == 0)
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.priority, 0);
+        assert_eq!(job.pending_reason, PendingReason::Held);
+        assert_eq!(
+            job.state_reason_display(),
+            LAUNCH_FAILURE_HELD_DESC,
+            "must carry the same description the old post-Running hold used"
+        );
+
+        // Releasing it behaves exactly like releasing a plain hold_job.
+        cm.release_job(id).unwrap();
+        wait_for("release applied", || {
+            cm.get_job(id).is_some_and(|j| j.priority > 0)
+        });
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(
+            job.pending_reason_desc, None,
+            "the release must clear the description with the reason"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hold_job_for_launch_failure_refuses_a_job_that_already_started() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("already-running"));
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            scalar_alloc(1, 1000),
+            per_node_for(&["n1"], scalar_alloc(1, 1000)),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+
+        assert!(cm.hold_job_for_launch_failure(id).is_err());
+    }
+
+    // backoff_pending_job_after_dispatch_failure is confirm_dispatch_on_nodes's
+    // Pending-safe equivalent of requeue_after_launch_failure's backoff: both
+    // are no-ops rather than errors for a job that's already moved on by the
+    // time the caller gets around to backing it off (e.g. a concurrent
+    // cancel, or a stale/unknown job_id) — the caller only has a job_id and
+    // no reason to assume it's still exactly as it left it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backoff_pending_job_after_dispatch_failure_is_a_noop_for_a_missing_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        assert!(cm.backoff_pending_job_after_dispatch_failure(999).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backoff_pending_job_after_dispatch_failure_is_a_noop_once_the_job_left_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("backoff-already-cancelled"));
+        cm.cancel_job(id, "testuser").unwrap();
+        settle(&cm, id, JobState::Cancelled);
+
+        assert!(cm.backoff_pending_job_after_dispatch_failure(id).is_ok());
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backoff_pending_job_after_dispatch_failure_applies_backoff_and_bumps_requeue_count() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("backoff-applies"));
+
+        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        wait_for("backoff applied", || {
+            cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+        assert!(job.spec.begin_time.is_some_and(|t| t > Utc::now()));
+    }
+
+    // The apply-level checks mirror the public method's, guarding against a
+    // narrower race: the job matched (existed, was Pending) when the public
+    // method read it, but no longer does by the time this specific WAL entry
+    // is actually applied (a state change committed in between). Exercised
+    // directly against apply_operation, bypassing the public method's own
+    // up-front checks, so this is testing the apply arm's defense
+    // independently of whether the caller's own check could have caught it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_dispatch_backoff_apply_is_a_noop_for_a_missing_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&WalOperation::JobDispatchBackoff {
+            job_id: 999,
+            begin_time: Utc::now(),
+        });
+        assert!(cm.get_job(999).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_dispatch_backoff_apply_is_a_noop_once_the_job_left_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("backoff-apply-already-cancelled"));
+        cm.cancel_job(id, "testuser").unwrap();
+        settle(&cm, id, JobState::Cancelled);
+        let requeue_count_before = cm.get_job(id).unwrap().requeue_count;
+
+        cm.apply_operation(&WalOperation::JobDispatchBackoff {
+            job_id: id,
+            begin_time: Utc::now(),
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(job.requeue_count, requeue_count_before);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
