@@ -1539,6 +1539,14 @@ impl ClusterManager {
     /// job (e.g. a future admin-initiated NodeFail).
     #[allow(dead_code)]
     pub fn evict_job(&self, job_id: JobId) -> anyhow::Result<()> {
+        self.evict_job_with_detail(job_id, None)
+    }
+
+    pub fn evict_job_with_detail(
+        &self,
+        job_id: JobId,
+        detail: Option<String>,
+    ) -> anyhow::Result<()> {
         {
             let jobs = self.jobs.read();
             let job = jobs
@@ -1548,7 +1556,7 @@ impl ClusterManager {
                 return Ok(());
             }
         }
-        let resp = self.propose(WalOperation::JobEvict { job_id })?;
+        let resp = self.propose(WalOperation::JobEvict { job_id, detail })?;
         self.run_all_finalized_side_effects(&resp);
         Ok(())
     }
@@ -1598,8 +1606,14 @@ impl ClusterManager {
                             port,
                             wg_pubkey,
                             version,
+                            source: source.clone(),
                         })?;
                         info!(node = %name, "node comm address or metadata updated");
+                    }
+                    if existing.source != source {
+                        if let Some(node) = self.nodes.write().get_mut(&name) {
+                            node.source = source;
+                        }
                     }
                 }
             }
@@ -1612,6 +1626,7 @@ impl ClusterManager {
                     port,
                     wg_pubkey,
                     version,
+                    source: source.clone(),
                 })?;
                 self.sync_node_labels(&name, labels)?;
                 if let Some(node) = self.nodes.write().get_mut(&name) {
@@ -1629,6 +1644,7 @@ impl ClusterManager {
                     wg_pubkey,
                     version,
                     labels,
+                    source: source.clone(),
                 })?;
                 if let Some(node) = self.nodes.write().get_mut(&name) {
                     node.source = source;
@@ -3864,6 +3880,15 @@ impl ClusterManager {
         job.actual_stderr_path = None;
     }
 
+    pub fn set_job_launch_failure_detail(
+        &self,
+        job_id: JobId,
+        detail: String,
+    ) -> anyhow::Result<()> {
+        self.propose(WalOperation::JobLaunchFailureDetail { job_id, detail })?;
+        Ok(())
+    }
+
     /// Requeue after a dispatch failure or Timeout/NodeFail: counts against
     /// `max_batch_requeue`.
     fn reset_job_for_requeue(job: &mut Job) {
@@ -4155,7 +4180,10 @@ impl ClusterManager {
                     }
                 }
             }
-            WalOperation::JobEvict { job_id } => {
+            WalOperation::JobEvict { job_id, detail } => {
+                if let Some(job) = jobs.get_mut(job_id) {
+                    job.launch_failure_detail = detail.clone();
+                }
                 if let Some(fin) = Self::evict_job_locked(
                     *job_id,
                     &mut jobs,
@@ -4164,6 +4192,11 @@ impl ClusterManager {
                     PendingReason::JobLaunchFailure,
                 ) {
                     response.jobs_finalized.push(fin);
+                }
+            }
+            WalOperation::JobLaunchFailureDetail { job_id, detail } => {
+                if let Some(job) = jobs.get_mut(job_id) {
+                    job.launch_failure_detail = Some(detail.clone());
                 }
             }
             WalOperation::JobStart {
@@ -4182,6 +4215,7 @@ impl ClusterManager {
                     job.set_pending_reason(PendingReason::None);
                     job.srun_step_dispatch = *srun_step_dispatch;
                     job.run_attempt = *run_attempt;
+                    job.launch_failure_detail = None;
                 }
                 let node_count = node_names.len().max(1) as u32;
                 for name in node_names {
@@ -4496,6 +4530,7 @@ impl ClusterManager {
                 wg_pubkey,
                 version,
                 labels,
+                source,
             } => {
                 let mut node = Node::new(name.clone(), resources.clone());
                 node.hostname = if hostname.is_empty() {
@@ -4515,6 +4550,7 @@ impl ClusterManager {
                 if !version.is_empty() {
                     node.version = Some(version.clone());
                 }
+                node.source = spur_core::node::resolve_wal_node_source(source, version, labels);
                 node.last_heartbeat = Some(Utc::now());
                 node.state = node
                     .state
@@ -4551,6 +4587,7 @@ impl ClusterManager {
                 port,
                 wg_pubkey,
                 version,
+                source,
             } => {
                 if let Some(node) = nodes.get_mut(name) {
                     node.total_resources = resources.clone();
@@ -4567,6 +4604,8 @@ impl ClusterManager {
                     if !version.is_empty() {
                         node.version = Some(version.clone());
                     }
+                    node.source =
+                        spur_core::node::resolve_wal_node_source(source, version, &node.labels);
                     node.last_heartbeat = Some(Utc::now());
                 }
             }
@@ -6941,6 +6980,7 @@ mod tests {
             wg_pubkey: String::new(),
             version: "1.0".into(),
             labels: HashMap::new(),
+            source: NodeSource::default(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -15186,6 +15226,7 @@ mod tests {
             wg_pubkey: String::new(),
             version: String::new(),
             labels: HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
         });
 
         assert_eq!(
@@ -15224,6 +15265,7 @@ mod tests {
             wg_pubkey: String::new(),
             version: String::new(),
             labels: HashMap::new(),
+            source: NodeSource::default(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -15270,6 +15312,7 @@ mod tests {
             wg_pubkey: String::new(),
             version: String::new(),
             labels: HashMap::from([("gpu".into(), "mi300x".into())]),
+            source: NodeSource::default(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -15316,6 +15359,7 @@ mod tests {
             wg_pubkey: String::new(),
             version: String::new(),
             labels: HashMap::from([("gpu".into(), "mi250".into())]),
+            source: NodeSource::default(),
         });
 
         let node = cm.get_node("cpu-node").unwrap();

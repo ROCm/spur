@@ -21,14 +21,13 @@ use spur_sched::cons_tres::{AllocError, AllocationResult, NodeAllocation};
 use spur_spank::{SpankContext, SpankHandle, SpankHook, SpankHost};
 
 use spur_core::config::{HooksConfig, MpiConfig};
-use spur_core::mpi::{resolve_step_mpi, MPI_NONE, MPI_PMIX};
+use spur_core::mpi::{resolve_step_mpi, PmixLaunchPlan, MPI_NONE, MPI_PMIX};
 use spur_core::spur_env::SpurEnv;
-use spur_core::task_launch::build_multi_task_wrapper;
+use spur_core::task_launch::{build_multi_task_pmix_wrapper, build_multi_task_wrapper};
 use spur_devices::DeviceRegistry;
 
 use crate::executor;
 use crate::mpi_plugin::{self, MpiPluginHost, PmixLaunchGuard};
-use crate::pmi::PmiServer;
 use crate::reporter::NodeReporter;
 
 pub(crate) struct TrackedJob {
@@ -74,18 +73,7 @@ struct CompletedJob {
     mpi: String,
 }
 
-/// Per-node registry of running PMI servers, keyed by job id.
-type PmiServers = Arc<Mutex<HashMap<u32, Arc<PmiServer>>>>;
-
-async fn cleanup_completed_job_mpi(
-    job_id: u32,
-    mpi: &str,
-    pmi_servers: &PmiServers,
-    mpi_host: &MpiPluginHost,
-) {
-    if let Some(pmi) = pmi_servers.lock().await.remove(&job_id) {
-        pmi.cleanup();
-    }
+async fn cleanup_completed_job_mpi(job_id: u32, mpi: &str, mpi_host: &MpiPluginHost) {
     if mpi == MPI_PMIX {
         if let Err(e) = mpi_host.release_pmix_server(job_id) {
             warn!(job_id, error = %e, "PMIx batch ref release failed");
@@ -101,6 +89,43 @@ pub(crate) fn new_running_jobs() -> RunningJobs {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+type PmixLaunchSetup = (
+    PmixLaunchGuard,
+    PmixLaunchPlan,
+    Option<Vec<HashMap<String, String>>>,
+);
+
+fn start_pmix_launch(
+    mpi_host: Arc<MpiPluginHost>,
+    proto_plan: &spur_proto::proto::PmixLaunchPlan,
+    pmix_prepared: bool,
+    task_offset: u32,
+    tasks_on_node: u32,
+) -> Result<PmixLaunchSetup, Status> {
+    let plan = mpi_plugin::plan_from_proto(proto_plan).map_err(Status::failed_precondition)?;
+    let guard = if pmix_prepared {
+        PmixLaunchGuard::join_prepared(mpi_host.clone(), &plan)
+    } else {
+        PmixLaunchGuard::start(mpi_host.clone(), &plan)
+    }
+    .map_err(Status::failed_precondition)?;
+    // Per-rank direct fork under Spur's embedded PMIx server (Slurm parity).
+    let per_local_rank_env = if tasks_on_node > 1 {
+        Some(
+            mpi_plugin::pmix_setup_fork_env_for_node_tasks(
+                &mpi_host,
+                &plan,
+                task_offset,
+                tasks_on_node,
+            )
+            .map_err(Status::failed_precondition)?,
+        )
+    } else {
+        None
+    };
+    Ok((guard, plan, per_local_rank_env))
+}
+
 pub struct AgentService {
     pub reporter: Arc<NodeReporter>,
     /// In-memory only: starts empty on every spurd start/restart, regardless
@@ -108,7 +133,6 @@ pub struct AgentService {
     running: RunningJobs,
     allocation: Arc<Mutex<NodeAllocation>>,
     spank: Arc<Option<SpankHost>>,
-    pmi_servers: PmiServers,
     mpi_host: Arc<MpiPluginHost>,
     hooks: Arc<HooksConfig>,
     memlock: spur_core::config::MemlockLimit,
@@ -207,7 +231,6 @@ impl AgentService {
             running,
             allocation: Arc::new(Mutex::new(allocation)),
             spank: Arc::new(spank),
-            pmi_servers: Arc::new(Mutex::new(HashMap::new())),
             mpi_host: Arc::new(MpiPluginHost::new(mpi)),
             hooks: Arc::new(hooks),
             memlock,
@@ -227,7 +250,6 @@ impl AgentService {
         let allocation = self.allocation.clone();
         let spank = self.spank.clone();
         let mpi_host = self.mpi_host.clone();
-        let pmi_servers = self.pmi_servers.clone();
         let hooks = self.hooks.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
@@ -283,7 +305,7 @@ impl AgentService {
                         crate::executor::cleanup_cgroup(cgroup);
                     }
                     allocation.lock().await.release_job(c.job_id);
-                    cleanup_completed_job_mpi(c.job_id, &c.mpi, &pmi_servers, &mpi_host).await;
+                    cleanup_completed_job_mpi(c.job_id, &c.mpi, &mpi_host).await;
                 }
 
                 // Self-heal backstop: reclaim allocations with no tracked,
@@ -402,12 +424,9 @@ fn reconcile_orphaned_allocations(
 
 /// Releases a launch reservation if the handler exits between reserve and
 /// commit, including on future cancellation which no error path can catch.
-/// Also tears down a PMI server started for the launch (via `adopt_pmi`), since
-/// that too would leak on a cancelled launch. Disarmed once the job is
-/// committed to the running set.
+/// Disarmed once the job is committed to the running set.
 struct LaunchReservationGuard {
     allocation: Arc<Mutex<NodeAllocation>>,
-    pmi_servers: Option<PmiServers>,
     job_id: u32,
     armed: bool,
 }
@@ -416,16 +435,9 @@ impl LaunchReservationGuard {
     fn new(allocation: Arc<Mutex<NodeAllocation>>, job_id: u32) -> Self {
         Self {
             allocation,
-            pmi_servers: None,
             job_id,
             armed: true,
         }
-    }
-
-    /// Take ownership of the job's PMI server so it is torn down alongside the
-    /// reservation if the launch aborts.
-    fn adopt_pmi(&mut self, pmi_servers: PmiServers) {
-        self.pmi_servers = Some(pmi_servers);
     }
 
     fn disarm(&mut self) {
@@ -439,8 +451,6 @@ impl Drop for LaunchReservationGuard {
             return;
         }
         let job_id = self.job_id;
-        // Drop can't await; try_lock succeeds inline on this uncontended path,
-        // else release off-thread so the reservation is never left stranded.
         if let Ok(mut alloc) = self.allocation.try_lock() {
             alloc.release_job(job_id);
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -448,28 +458,6 @@ impl Drop for LaunchReservationGuard {
             handle.spawn(async move {
                 allocation.lock().await.release_job(job_id);
             });
-        }
-        // No runtime (shutdown) and lock held: reconcile reclaims via the TTL.
-
-        if let Some(pmi_servers) = self.pmi_servers.take() {
-            let locked_inline = match pmi_servers.try_lock() {
-                Ok(mut map) => {
-                    if let Some(pmi) = map.remove(&job_id) {
-                        pmi.cleanup();
-                    }
-                    true
-                }
-                Err(_) => false,
-            };
-            if !locked_inline {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move {
-                        if let Some(pmi) = pmi_servers.lock().await.remove(&job_id) {
-                            pmi.cleanup();
-                        }
-                    });
-                }
-            }
         }
     }
 }
@@ -974,7 +962,7 @@ impl SlurmAgent for AgentService {
         // Spur-only vars
         senv.set("SPUR_NODE_RANK", node_rank);
         if tasks_per_node == 1 {
-            SpurEnv::apply_task_rank(&mut senv, task_offset, 0, 1, spec.mpi == MPI_PMIX);
+            SpurEnv::apply_task_rank(&mut senv, task_offset, 0, 1);
         } else {
             senv.set("SPUR_TASK_OFFSET", task_offset);
             senv.set("LOCAL_RANK", "0");
@@ -1105,6 +1093,25 @@ impl SlurmAgent for AgentService {
             (script, crate::container::RootfsMode::Extracted)
         };
 
+        let mut pmix_guard = None;
+        let mut pmix_plan: Option<PmixLaunchPlan> = None;
+        let mut pmix_per_local_rank_env: Option<Vec<HashMap<String, String>>> = None;
+        if spec.mpi == MPI_PMIX {
+            let proto = req.pmix_plan.as_ref().ok_or_else(|| {
+                Status::failed_precondition("missing PMIx launch plan for --mpi=pmix job")
+            })?;
+            let (guard, plan, per_local_rank_env) = start_pmix_launch(
+                self.mpi_host.clone(),
+                proto,
+                req.pmix_prepared,
+                task_offset,
+                tasks_per_node,
+            )?;
+            pmix_guard = Some(guard);
+            pmix_plan = Some(plan);
+            pmix_per_local_rank_env = per_local_rank_env;
+        }
+
         // Under Slurm semantics a batch script runs exactly once per node,
         // regardless of --ntasks-per-node or --mpi: task multiplicity is only
         // advertised via environment variables (SPUR_TASKS_PER_NODE,
@@ -1133,15 +1140,18 @@ impl SlurmAgent for AgentService {
 
             if spec.mpi == MPI_PMIX {
                 warn_mpi_mpirun_skipped_affinity(job_id, &spec.environment);
+                build_multi_task_pmix_wrapper(
+                    &user_script_path,
+                    tasks_per_node,
+                    pmix_per_local_rank_env.as_ref().ok_or_else(|| {
+                        Status::internal("missing PMIx per-rank env for multi-task launch")
+                    })?,
+                    None,
+                )
+                .map_err(Status::failed_precondition)?
+            } else {
+                build_multi_task_wrapper(&user_script_path, tasks_per_node, None)
             }
-
-            // Build the wrapper that launches N tasks with GPU partitioning
-            build_multi_task_wrapper(
-                &user_script_path,
-                tasks_per_node,
-                None,
-                spec.mpi == MPI_PMIX,
-            )
         } else {
             launch_script
         };
@@ -1153,21 +1163,6 @@ impl SlurmAgent for AgentService {
         // Release the reservation on any exit before commit, including a
         // cancelled launch future; disarmed once committed to `running`.
         let mut reservation_guard = LaunchReservationGuard::new(self.allocation.clone(), job_id);
-
-        // PMI-1 server: if MPI mode is "pmi1" and multiple tasks, start a
-        // Unix socket KVS server so MPI ranks can bootstrap via PMI. Started
-        // under the guard so an aborted launch tears it down with the reservation.
-        if spec.mpi == "pmi1" && tasks_per_node > 1 {
-            let socket_path = format!("/tmp/spur-pmi-{}.sock", job_id);
-            let pmi = Arc::new(PmiServer::new(&socket_path, spec.num_tasks));
-            let pmi_run = pmi.clone();
-            tokio::spawn(async move {
-                pmi_run.run().await;
-            });
-            env.insert("PMI_PORT".into(), socket_path);
-            self.pmi_servers.lock().await.insert(job_id, pmi);
-            reservation_guard.adopt_pmi(self.pmi_servers.clone());
-        }
 
         let injection = {
             let reg = self.device_registry.lock().await;
@@ -1219,28 +1214,12 @@ impl SlurmAgent for AgentService {
             }
         }
 
-        let mut pmix_guard = None;
-        if spec.mpi == MPI_PMIX {
-            let plan = req
-                .pmix_plan
+        if spec.mpi == MPI_PMIX && pmix_per_local_rank_env.is_none() {
+            let plan = pmix_plan
                 .as_ref()
-                .ok_or_else(|| {
-                    Status::failed_precondition("missing PMIx launch plan for --mpi=pmix job")
-                })
-                .and_then(|proto| {
-                    mpi_plugin::plan_from_proto(proto).map_err(Status::failed_precondition)
-                })?;
-            pmix_guard = Some(
-                PmixLaunchGuard::start(self.mpi_host.clone(), &plan)
-                    .map_err(Status::failed_precondition)?,
-            );
-            // Single-node Mode 1: one PMIX_SERVER_URI in the parent env; the multi-task
-            // wrapper overrides PMIX_RANK per fork via SPUR_PROCID.
-            let pmix_env = self
-                .mpi_host
-                .pmix_env_for_rank(&plan, task_offset)
+                .ok_or_else(|| Status::internal("missing PMIx plan for launch"))?;
+            mpi_plugin::apply_pmix_setup_fork_env(&self.mpi_host, plan, task_offset, &mut env)
                 .map_err(Status::failed_precondition)?;
-            env.extend(pmix_env);
         }
 
         if let Some(ref mut cfg) = container_config {
@@ -1325,7 +1304,6 @@ impl SlurmAgent for AgentService {
                         job_id,
                         "reservation reclaimed during launch; aborting to avoid running unbacked"
                     );
-                    self.cleanup_pmi_server(job_id).await;
                     if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
                         warn!(job_id, error = %e, "PMIx stop failed after reclaimed reservation");
                     }
@@ -1438,6 +1416,41 @@ impl SlurmAgent for AgentService {
         }
     }
 
+    async fn prepare_pmix(
+        &self,
+        request: Request<PreparePmixRequest>,
+    ) -> Result<Response<PreparePmixResponse>, Status> {
+        let req = request.into_inner();
+        let plan = req
+            .pmix_plan
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("missing PMIx launch plan"))
+            .and_then(|proto| {
+                mpi_plugin::plan_from_proto(proto).map_err(Status::invalid_argument)
+            })?;
+        match self.mpi_host.prepare_pmix_server(&plan, req.run_attempt) {
+            Ok(()) => Ok(Response::new(PreparePmixResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(err) => Ok(Response::new(PreparePmixResponse {
+                success: false,
+                error: err,
+            })),
+        }
+    }
+
+    async fn release_pmix(
+        &self,
+        request: Request<ReleasePmixRequest>,
+    ) -> Result<Response<ReleasePmixResponse>, Status> {
+        let job_id = request.into_inner().job_id;
+        if let Err(err) = self.mpi_host.release_prepared_pmix(job_id) {
+            warn!(job_id, error = %err, "PMIx prepare release failed");
+        }
+        Ok(Response::new(ReleasePmixResponse {}))
+    }
+
     async fn cancel_job(
         &self,
         request: Request<AgentCancelJobRequest>,
@@ -1460,6 +1473,10 @@ impl SlurmAgent for AgentService {
             self.allocation.lock().await.release_job(job_id);
         }
         drop(jobs);
+
+        if let Err(err) = self.mpi_host.release_prepared_pmix(job_id) {
+            warn!(job_id, error = %err, "PMIx prepare release on cancel failed");
+        }
 
         Ok(Response::new(()))
     }
@@ -1781,8 +1798,25 @@ impl SlurmAgent for AgentService {
                 "step mpi=pmix requires a PMIx launch plan",
             ));
         }
-        if step_mpi && num_tasks > 1 {
-            warn_mpi_mpirun_skipped_affinity(job_id, &req.environment);
+
+        let mut pmix_step_guard = None;
+        let mut pmix_plan: Option<PmixLaunchPlan> = None;
+        let mut pmix_per_local_rank_env: Option<Vec<HashMap<String, String>>> = None;
+        if step_mpi {
+            let proto = req
+                .pmix_plan
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("missing PMIx launch plan"))?;
+            let (guard, plan, per_local_rank_env) = start_pmix_launch(
+                self.mpi_host.clone(),
+                proto,
+                req.pmix_prepared,
+                req.task_offset,
+                num_tasks,
+            )?;
+            pmix_step_guard = Some(guard);
+            pmix_plan = Some(plan);
+            pmix_per_local_rank_env = per_local_rank_env;
         }
 
         let (program, program_args, step_script_cleanup) = if num_tasks > 1 || req.label {
@@ -1804,12 +1838,23 @@ impl SlurmAgent for AgentService {
 
             let wrapper_path = step_dir.join(format!("wrapper_{node_id}.sh"));
             let wrapper = if num_tasks > 1 {
-                build_multi_task_wrapper(
-                    user_script_path.to_string_lossy().as_ref(),
-                    num_tasks,
-                    Some(&req.environment),
-                    step_mpi,
-                )
+                if step_mpi {
+                    build_multi_task_pmix_wrapper(
+                        user_script_path.to_string_lossy().as_ref(),
+                        num_tasks,
+                        pmix_per_local_rank_env.as_ref().ok_or_else(|| {
+                            Status::internal("missing PMIx per-rank env for multi-task step")
+                        })?,
+                        Some(&req.environment),
+                    )
+                    .map_err(Status::failed_precondition)?
+                } else {
+                    build_multi_task_wrapper(
+                        user_script_path.to_string_lossy().as_ref(),
+                        num_tasks,
+                        Some(&req.environment),
+                    )
+                }
             } else {
                 spur_core::task_launch::build_labeled_single_task_wrapper(
                     user_script_path.to_string_lossy().as_ref(),
@@ -1823,13 +1868,13 @@ impl SlurmAgent for AgentService {
 
             if num_tasks > 1 {
                 senv.set("SPUR_TASK_OFFSET", req.task_offset);
-            } else {
-                SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0, 1, step_mpi);
+            } else if !req.label {
+                SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0, 1);
             }
             let wrapper_path_string = wrapper_path.to_string_lossy().into_owned();
             ("bash".to_string(), vec![wrapper_path_string], Some(guard))
         } else {
-            SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0, 1, step_mpi);
+            SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0, 1);
             let (program, args) = spur_core::task_launch::wrap_command_with_cpu_bind(
                 &req.command[0],
                 &req.command[1..],
@@ -1859,23 +1904,14 @@ impl SlurmAgent for AgentService {
         }
 
         let mut env = senv.into_map();
-        let mut _pmix_step_guard = None;
-        if step_mpi {
-            let proto_plan = req
-                .pmix_plan
+        if step_mpi && pmix_per_local_rank_env.is_none() {
+            let plan = pmix_plan
                 .as_ref()
-                .ok_or_else(|| Status::invalid_argument("missing PMIx launch plan"))?;
-            let plan = mpi_plugin::plan_from_proto(proto_plan).map_err(Status::invalid_argument)?;
-            _pmix_step_guard = Some(
-                PmixLaunchGuard::start(self.mpi_host.clone(), &plan)
-                    .map_err(Status::failed_precondition)?,
-            );
-            let pmix_env = self
-                .mpi_host
-                .pmix_env_for_rank(&plan, req.task_offset)
+                .ok_or_else(|| Status::internal("missing PMIx plan for step"))?;
+            mpi_plugin::apply_pmix_setup_fork_env(&self.mpi_host, plan, req.task_offset, &mut env)
                 .map_err(Status::failed_precondition)?;
-            env.extend(pmix_env);
         }
+        let _pmix_step_guard = pmix_step_guard;
 
         let mut cmd = tokio::process::Command::new(&program);
         cmd.args(&program_args).current_dir(&work_dir);
@@ -2263,14 +2299,6 @@ impl AgentService {
             if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
                 warn!(job_id, error = %e, "PMIx stop failed on job drop");
             }
-        }
-    }
-
-    /// Tear down the PMI server started for a job that aborts before it enters
-    /// the running set — the monitor loop's completion cleanup never runs for it.
-    async fn cleanup_pmi_server(&self, job_id: u32) {
-        if let Some(pmi) = self.pmi_servers.lock().await.remove(&job_id) {
-            pmi.cleanup();
         }
     }
 
@@ -4214,59 +4242,6 @@ mod tests {
     // A launch that aborts before entering `running` must tear down its PMI
     // server, since the monitor loop's completion cleanup never runs for it.
     #[tokio::test]
-    async fn cleanup_pmi_server_removes_entry_and_socket() {
-        let svc = AgentService::new(
-            test_reporter_with_gpus(&[0]),
-            HooksConfig::default(),
-            Arc::new(Mutex::new(DeviceRegistry::new())),
-            spur_core::config::MemlockLimit::Unlimited,
-        );
-
-        let socket_path = format!("/tmp/spur-pmi-test-{}.sock", std::process::id());
-        let pmi = Arc::new(crate::pmi::PmiServer::new(&socket_path, 2));
-        std::fs::write(&socket_path, b"").expect("create fake socket");
-        svc.pmi_servers.lock().await.insert(42, pmi);
-
-        svc.cleanup_pmi_server(42).await;
-
-        assert!(
-            !svc.pmi_servers.lock().await.contains_key(&42),
-            "pmi server entry must be removed"
-        );
-        assert!(
-            !std::path::Path::new(&socket_path).exists(),
-            "pmi socket file must be removed"
-        );
-    }
-
-    // Monitor completion must tear down PMI servers for pmi1 multi-task jobs.
-    #[tokio::test]
-    async fn completion_cleanup_removes_pmi_server() {
-        let svc = AgentService::new(
-            test_reporter_with_gpus(&[0]),
-            HooksConfig::default(),
-            Arc::new(Mutex::new(DeviceRegistry::new())),
-            spur_core::config::MemlockLimit::Unlimited,
-        );
-
-        let socket_path = format!("/tmp/spur-pmi-complete-{}.sock", std::process::id());
-        let pmi = Arc::new(crate::pmi::PmiServer::new(&socket_path, 2));
-        std::fs::write(&socket_path, b"").expect("create fake socket");
-        svc.pmi_servers.lock().await.insert(42, pmi);
-
-        cleanup_completed_job_mpi(42, "pmi1", &svc.pmi_servers, &svc.mpi_host).await;
-
-        assert!(
-            !svc.pmi_servers.lock().await.contains_key(&42),
-            "completion cleanup must remove the PMI entry"
-        );
-        assert!(
-            !std::path::Path::new(&socket_path).exists(),
-            "completion cleanup must remove the PMI socket"
-        );
-    }
-
-    #[tokio::test]
     async fn completion_cleanup_releases_batch_pmix_ref_without_force_stop() {
         use crate::mpi_plugin::ActiveNamespace;
 
@@ -4285,48 +4260,11 @@ mod tests {
             },
         );
 
-        cleanup_completed_job_mpi(99, MPI_PMIX, &svc.pmi_servers, &svc.mpi_host).await;
+        cleanup_completed_job_mpi(99, MPI_PMIX, &svc.mpi_host).await;
 
         assert!(
             svc.mpi_host.has_active_pmix(99),
             "batch completion must release one ref, not force-stop an active step namespace"
-        );
-    }
-
-    // An armed guard that adopted a PMI server must tear it down on drop (the
-    // future-cancellation path); a disarmed guard must leave it for the monitor.
-    #[tokio::test]
-    async fn reservation_guard_tears_down_adopted_pmi_on_drop() {
-        let svc = AgentService::new(
-            test_reporter_with_gpus(&[0]),
-            HooksConfig::default(),
-            Arc::new(Mutex::new(DeviceRegistry::new())),
-            spur_core::config::MemlockLimit::Unlimited,
-        );
-
-        let socket_path = format!("/tmp/spur-pmi-guard-{}.sock", std::process::id());
-        std::fs::write(&socket_path, b"").expect("create fake socket");
-        svc.pmi_servers
-            .lock()
-            .await
-            .insert(88, Arc::new(crate::pmi::PmiServer::new(&socket_path, 2)));
-
-        {
-            let mut guard = LaunchReservationGuard::new(svc.allocation.clone(), 88);
-            guard.adopt_pmi(svc.pmi_servers.clone());
-            drop(guard);
-        }
-        // Drop's off-thread fallback (if try_lock lost) resolves synchronously
-        // here since the map is uncontended, but yield once to be safe.
-        tokio::task::yield_now().await;
-
-        assert!(
-            !svc.pmi_servers.lock().await.contains_key(&88),
-            "armed guard must remove the adopted PMI entry on drop"
-        );
-        assert!(
-            !std::path::Path::new(&socket_path).exists(),
-            "armed guard must remove the PMI socket on drop"
         );
     }
 

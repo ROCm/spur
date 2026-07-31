@@ -463,6 +463,22 @@ impl SlurmAgent for VirtualAgent {
         }
     }
 
+    async fn prepare_pmix(
+        &self,
+        _request: Request<PreparePmixRequest>,
+    ) -> Result<Response<PreparePmixResponse>, Status> {
+        Err(Status::unimplemented(
+            "PMIx prepare is not supported on the K8s virtual agent",
+        ))
+    }
+
+    async fn release_pmix(
+        &self,
+        _request: Request<ReleasePmixRequest>,
+    ) -> Result<Response<ReleasePmixResponse>, Status> {
+        Ok(Response::new(ReleasePmixResponse {}))
+    }
+
     async fn cancel_job(
         &self,
         request: Request<AgentCancelJobRequest>,

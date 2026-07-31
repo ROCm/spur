@@ -78,6 +78,7 @@ fn copy_plugin(
 
 fn main() {
     println!("cargo:rerun-if-changed=c/pmix_server.c");
+    println!("cargo:rerun-if-changed=c/modex_exchange.c");
     println!("cargo:rerun-if-changed=c/stub_server.c");
     println!("cargo:rerun-if-changed=include/spur_mpi_plugin.h");
 
@@ -93,6 +94,7 @@ fn main() {
         for include in &pmix.include_paths {
             build.include(include);
         }
+        build.file("c/modex_exchange.c");
         build.file("c/pmix_server.c");
         build.compile("spur_mpi_pmix_server");
         copy_plugin(

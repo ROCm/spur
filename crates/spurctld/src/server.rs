@@ -12,6 +12,7 @@ use tonic::{Code, Request, Response, Status};
 use tracing::{info, warn};
 
 use spur_core::job::NodeCompleteError;
+use spur_core::mpi::MPI_PMIX;
 use spur_core::reservation::Reservation;
 use spur_core::task_launch::build_step_task_plan;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
@@ -19,6 +20,7 @@ use spur_proto::proto::slurm_controller_server::SlurmController;
 use spur_proto::proto::*;
 
 use crate::cluster::{ClusterManager, PartitionError, ReservationError};
+use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
 use crate::rpc_middleware::RpcStatsLayer;
 use crate::rpc_stats::RpcStatsCollector;
@@ -1135,6 +1137,7 @@ impl SlurmController for ControllerService {
 
         let node_token_response = self.validate_admission(&req.join_token, &req.hostname)?;
 
+        let source = spur_core::node::node_source_from_registration(&req.version, &req.labels);
         self.cluster
             .register_node(
                 // NodeName and NodeHostname are the same until agents can supply both.
@@ -1145,7 +1148,7 @@ impl SlurmController for ControllerService {
                 agent_port,
                 req.wg_pubkey,
                 req.version,
-                spur_core::node::NodeSource::NativeHost,
+                source,
                 req.labels,
             )
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -2036,6 +2039,9 @@ impl SlurmController for ControllerService {
         spur_core::mpi::validate_pmix_step_agents(mpi.as_str(), plan.len())
             .map_err(Status::invalid_argument)?;
         let pmix_tmpdir = self.cluster.config().mpi.pmix_tmpdir.clone();
+        let modex_connect_timeout_secs = self.cluster.config().mpi.modex_connect_timeout_secs;
+        let modex_fence_timeout_secs = self.cluster.config().mpi.modex_fence_timeout_secs;
+        let modex_verify_timeout_secs = self.cluster.config().mpi.modex_verify_timeout_secs;
 
         struct NodeDispatch {
             node_name: String,
@@ -2077,29 +2083,114 @@ impl SlurmController for ControllerService {
             });
         }
 
+        if !dispatch_errors.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "srun step dispatch setup failed: {}",
+                dispatch_errors.join("; ")
+            )));
+        }
+
+        let pmix_peers = if mpi == MPI_PMIX {
+            Some(
+                spur_core::mpi::PmixStepPeers::from_participants(
+                    dispatches
+                        .iter()
+                        .map(|dispatch| dispatch.node_tasks.node_index)
+                        .collect(),
+                    |idx| {
+                        let name = job.allocated_nodes.get(idx as usize)?;
+                        self.cluster
+                            .get_node(name)
+                            .and_then(|n| n.comm_addr().map(str::to_string))
+                    },
+                )
+                .map_err(Status::failed_precondition)?,
+            )
+        } else {
+            None
+        };
+        let needs_pmix_prepare = pmix_peers.as_ref().is_some_and(|peers| peers.num_nodes > 1);
+        let run_attempt = job.run_attempt;
+
+        let dispatch_pmix_plans: Vec<Option<spur_proto::proto::PmixLaunchPlan>> =
+            if let Some(peers) = pmix_peers.as_ref() {
+                dispatches
+                    .iter()
+                    .map(|node_dispatch| {
+                        let local = spur_core::mpi::pmix_local_dispatch_for_step(
+                            peers,
+                            node_dispatch.node_tasks.node_index,
+                            job_id,
+                            step_num_tasks,
+                            node_dispatch.node_tasks.task_offset,
+                            node_dispatch.node_tasks.tasks_on_node,
+                            pmix_tmpdir.clone(),
+                            uid,
+                            gid,
+                            modex_connect_timeout_secs,
+                            modex_fence_timeout_secs,
+                            modex_verify_timeout_secs,
+                        )
+                        .map_err(Status::failed_precondition)?;
+                        spur_core::mpi::build_validated_pmix_plan_proto(mpi.as_str(), local)
+                            .map_err(Status::failed_precondition)?
+                            .ok_or_else(|| {
+                                Status::failed_precondition("job is not configured for PMIx")
+                            })
+                            .map(Some)
+                    })
+                    .collect::<Result<Vec<_>, Status>>()?
+            } else {
+                vec![None; dispatches.len()]
+            };
+
+        if needs_pmix_prepare {
+            if let Some(detail) = pmix_dispatch::multi_node_pmix_unsupported(
+                dispatches.iter().filter_map(|dispatch| {
+                    self.cluster
+                        .get_node(&dispatch.node_name)
+                        .map(|node| node.source.clone())
+                }),
+            ) {
+                return Err(Status::failed_precondition(detail));
+            }
+
+            let prepare_nodes: Vec<PmixPrepareNode> = dispatches
+                .iter()
+                .zip(&dispatch_pmix_plans)
+                .map(|(node_dispatch, pmix_plan)| {
+                    Ok(PmixPrepareNode {
+                        node_name: node_dispatch.node_name.clone(),
+                        agent_addr: node_dispatch.agent_addr.clone(),
+                        pmix_plan: pmix_plan.clone().ok_or_else(|| {
+                            Status::failed_precondition("job is not configured for PMIx")
+                        })?,
+                    })
+                })
+                .collect::<Result<Vec<_>, Status>>()?;
+            if prepare_nodes.len() != dispatches.len() {
+                return Err(Status::failed_precondition(
+                    "multi-node PMIx step missing launch plan for one or more nodes",
+                ));
+            }
+            if let Err(detail) =
+                pmix_dispatch::prepare_pmix_on_nodes(job_id, run_attempt, prepare_nodes).await
+            {
+                return Err(Status::failed_precondition(format!(
+                    "PMIx prepare failed: {detail}"
+                )));
+            }
+        }
+
         let mut set = tokio::task::JoinSet::new();
-        for dispatch in dispatches {
-            let node_name = dispatch.node_name;
-            let agent_addr = dispatch.agent_addr;
-            let node_tasks = dispatch.node_tasks;
+        for (dispatch, pmix_plan) in dispatches.iter().zip(dispatch_pmix_plans) {
+            let node_name = dispatch.node_name.clone();
+            let agent_addr = dispatch.agent_addr.clone();
+            let node_tasks = dispatch.node_tasks.clone();
             let command = command.clone();
             let work_dir = work_dir.clone();
             let environment = environment.clone();
-            let pmix_tmpdir = pmix_tmpdir.clone();
             let step_mpi = mpi.clone();
-            let pmix_plan = spur_core::mpi::maybe_local_pmix_plan(
-                step_mpi.as_str(),
-                spur_core::mpi::PmixLocalDispatch {
-                    job_id,
-                    universe_size: step_num_tasks,
-                    task_offset: node_tasks.task_offset,
-                    local_count: node_tasks.tasks_on_node,
-                    tmpdir: pmix_tmpdir.clone(),
-                    job_uid: uid,
-                    job_gid: gid,
-                },
-            )
-            .map(spur_core::mpi::plan_to_proto);
             set.spawn(async move {
                 let mut agent = SlurmAgentClient::connect(agent_addr.clone())
                     .await
@@ -2123,7 +2214,8 @@ impl SlurmController for ControllerService {
                         step_num_tasks,
                         label,
                         pmix_plan,
-                        mpi: step_mpi,
+                        mpi: step_mpi.clone(),
+                        pmix_prepared: needs_pmix_prepare,
                     })
                     .await
                     .map_err(|e| {
@@ -2167,6 +2259,12 @@ impl SlurmController for ControllerService {
                 "srun step dispatch errors:\n{}\n",
                 dispatch_errors.join("\n")
             ));
+        }
+
+        if needs_pmix_prepare {
+            for dispatch in &dispatches {
+                pmix_dispatch::release_pmix_on_agent(&dispatch.agent_addr, job_id).await;
+            }
         }
 
         if let Err(e) = self.cluster.record_step_complete(job_id, step_id, max_exit) {
@@ -2720,7 +2818,7 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         partition: job.spec.partition.clone().unwrap_or_default(),
         account: job.spec.account.clone().unwrap_or_default(),
         state: job.state.to_proto_i32(),
-        state_reason: job.state_reason_display().to_string(),
+        state_reason: job.state_reason(),
         submit_time: Some(datetime_to_proto(job.submit_time)),
         start_time: job.start_time.map(datetime_to_proto),
         end_time: job.end_time.map(datetime_to_proto),

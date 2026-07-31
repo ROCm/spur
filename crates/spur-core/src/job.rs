@@ -777,6 +777,10 @@ pub struct Job {
     pub actual_stdout_path: Option<String>,
     #[serde(default)]
     pub actual_stderr_path: Option<String>,
+
+    /// Set when a job is evicted during PMIx bootstrap or partial dispatch.
+    #[serde(default)]
+    pub launch_failure_detail: Option<String>,
 }
 
 impl Job {
@@ -825,7 +829,23 @@ impl Job {
             srun_step_dispatch: false,
             actual_stdout_path: None,
             actual_stderr_path: None,
+            launch_failure_detail: None,
         }
+    }
+
+    /// Slurm-style state reason, including PMIx bootstrap detail when present.
+    pub fn state_reason(&self) -> String {
+        if self.state == JobState::Pending {
+            if let Some(ref detail) = self.launch_failure_detail {
+                return format!("LaunchFailure ({detail})");
+            }
+        }
+        if self.pending_reason == PendingReason::JobLaunchFailure {
+            if let Some(ref detail) = self.launch_failure_detail {
+                return format!("{} ({detail})", self.pending_reason.display());
+            }
+        }
+        self.pending_reason.display().to_string()
     }
 
     /// Derive a job's `ExitCode` and state from per-node completions, matching
@@ -2083,6 +2103,17 @@ mod tests {
             job.pending_reason,
             PendingReason::Held,
             "the description explains the code, it does not replace it"
+        );
+    }
+
+    #[test]
+    fn state_reason_shows_launch_failure_detail_while_pending() {
+        let mut job = make_job();
+        job.state = JobState::Pending;
+        job.launch_failure_detail = Some("PMIx prepare failed: n1: connect failed".into());
+        assert_eq!(
+            job.state_reason(),
+            "LaunchFailure (PMIx prepare failed: n1: connect failed)"
         );
     }
 

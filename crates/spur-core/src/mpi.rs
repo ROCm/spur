@@ -21,6 +21,12 @@ pub struct PmixLaunchPlan {
     pub tmpdir: String,
     pub job_uid: u32,
     pub job_gid: u32,
+    pub num_nodes: u32,
+    pub node_index: u32,
+    pub peer_hosts: Vec<String>,
+    pub modex_connect_timeout_secs: u32,
+    pub modex_fence_timeout_secs: u32,
+    pub modex_verify_timeout_secs: u32,
 }
 
 impl PmixLaunchPlan {
@@ -29,6 +35,7 @@ impl PmixLaunchPlan {
     }
 
     /// Build a plan for all tasks running locally on one agent.
+    #[allow(clippy::too_many_arguments)]
     pub fn local_tasks(
         job_id: u32,
         universe_size: u32,
@@ -37,6 +44,9 @@ impl PmixLaunchPlan {
         tmpdir: impl Into<String>,
         job_uid: u32,
         job_gid: u32,
+        num_nodes: u32,
+        node_index: u32,
+        peer_hosts: Vec<String>,
     ) -> Self {
         let local_procs = (0..local_count)
             .map(|local_rank| PmixLocalProc {
@@ -53,7 +63,25 @@ impl PmixLaunchPlan {
             tmpdir: tmpdir.into(),
             job_uid,
             job_gid,
+            num_nodes: num_nodes.max(1),
+            node_index,
+            peer_hosts,
+            modex_connect_timeout_secs: 0,
+            modex_fence_timeout_secs: 0,
+            modex_verify_timeout_secs: 0,
         }
+    }
+
+    pub fn with_modex_timeouts(
+        mut self,
+        connect_secs: u32,
+        fence_secs: u32,
+        verify_secs: u32,
+    ) -> Self {
+        self.modex_connect_timeout_secs = connect_secs;
+        self.modex_fence_timeout_secs = fence_secs;
+        self.modex_verify_timeout_secs = verify_secs;
+        self
     }
 }
 
@@ -65,6 +93,10 @@ pub const MPI_PMIX: &str = "pmix";
 pub const PMIX_NAMESPACE_MAX: usize = 255;
 /// Max bytes for PMIx tmpdir strings passed to the C plugin (NUL excluded).
 pub const PMIX_TMPDIR_MAX: usize = 511;
+/// Max peer host entries passed to the C plugin.
+pub const PMIX_MAX_PEER_HOSTS: usize = 64;
+/// Max bytes for peer host strings passed to the C plugin (NUL excluded).
+pub const PMIX_PEER_HOST_MAX: usize = 255;
 
 /// Validate a PMIx launch plan before calling the agent plugin.
 pub fn validate_pmix_plan(plan: &PmixLaunchPlan) -> Result<(), String> {
@@ -114,6 +146,53 @@ pub fn validate_pmix_plan(plan: &PmixLaunchPlan) -> Result<(), String> {
             plan.task_offset, local_count, plan.universe_size
         ));
     }
+    if plan.num_nodes == 0 {
+        return Err("PMIx num_nodes must be > 0".into());
+    }
+    if plan.node_index >= plan.num_nodes {
+        return Err(format!(
+            "PMIx node_index {} >= num_nodes {}",
+            plan.node_index, plan.num_nodes
+        ));
+    }
+    if plan.num_nodes > 1 {
+        if !plan.universe_size.is_multiple_of(plan.num_nodes) {
+            return Err(format!(
+                "PMIx multi-node jobs require uniform tasks per node \
+                 (universe_size {0} not divisible by num_nodes {1})",
+                plan.universe_size, plan.num_nodes
+            ));
+        }
+        let expected_local = plan.universe_size / plan.num_nodes;
+        if local_count != expected_local {
+            return Err(format!(
+                "PMIx local_count {local_count} != universe_size / num_nodes ({expected_local})"
+            ));
+        }
+        if plan.peer_hosts.len() != plan.num_nodes as usize {
+            return Err(format!(
+                "PMIx peer_hosts length {} != num_nodes {}",
+                plan.peer_hosts.len(),
+                plan.num_nodes
+            ));
+        }
+        if plan.peer_hosts.len() > PMIX_MAX_PEER_HOSTS {
+            return Err(format!(
+                "PMIx peer_hosts exceeds max {}",
+                PMIX_MAX_PEER_HOSTS
+            ));
+        }
+        for (idx, host) in plan.peer_hosts.iter().enumerate() {
+            if host.is_empty() {
+                return Err(format!("PMIx peer_hosts[{idx}] is empty"));
+            }
+            if host.len() > PMIX_PEER_HOST_MAX {
+                return Err(format!(
+                    "PMIx peer_hosts[{idx}] exceeds {PMIX_PEER_HOST_MAX} bytes"
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -127,21 +206,130 @@ pub struct PmixLocalDispatch {
     pub tmpdir: String,
     pub job_uid: u32,
     pub job_gid: u32,
+    pub num_nodes: u32,
+    pub node_index: u32,
+    pub peer_hosts: Vec<String>,
+    pub modex_connect_timeout_secs: u32,
+    pub modex_fence_timeout_secs: u32,
+    pub modex_verify_timeout_secs: u32,
 }
 
 pub fn maybe_local_pmix_plan(mpi: &str, dispatch: PmixLocalDispatch) -> Option<PmixLaunchPlan> {
     if mpi != MPI_PMIX {
         return None;
     }
-    Some(PmixLaunchPlan::local_tasks(
-        dispatch.job_id,
-        dispatch.universe_size,
-        dispatch.task_offset,
-        dispatch.local_count,
-        dispatch.tmpdir,
-        dispatch.job_uid,
-        dispatch.job_gid,
-    ))
+    Some(
+        PmixLaunchPlan::local_tasks(
+            dispatch.job_id,
+            dispatch.universe_size,
+            dispatch.task_offset,
+            dispatch.local_count,
+            dispatch.tmpdir,
+            dispatch.job_uid,
+            dispatch.job_gid,
+            dispatch.num_nodes,
+            dispatch.node_index,
+            dispatch.peer_hosts,
+        )
+        .with_modex_timeouts(
+            dispatch.modex_connect_timeout_secs,
+            dispatch.modex_fence_timeout_secs,
+            dispatch.modex_verify_timeout_secs,
+        ),
+    )
+}
+
+/// Build and validate a PMIx launch plan for controller dispatch (batch, prepare, srun).
+/// Returns `Ok(None)` when `mpi` is not `pmix`.
+pub fn build_validated_pmix_plan_proto(
+    mpi: &str,
+    dispatch: PmixLocalDispatch,
+) -> Result<Option<spur_proto::proto::PmixLaunchPlan>, String> {
+    let Some(plan) = maybe_local_pmix_plan(mpi, dispatch) else {
+        return Ok(None);
+    };
+    validate_pmix_plan(&plan)?;
+    Ok(Some(plan_to_proto(plan)))
+}
+
+/// Modex peer set for a PMIx step that may use fewer nodes than the job allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmixStepPeers {
+    pub num_nodes: u32,
+    pub peer_hosts: Vec<String>,
+    modex_index: std::collections::HashMap<u32, u32>,
+}
+
+impl PmixStepPeers {
+    pub fn modex_node_index(&self, allocation_node_index: u32) -> Option<u32> {
+        self.modex_index.get(&allocation_node_index).copied()
+    }
+
+    pub fn from_participants(
+        mut participant_indices: Vec<u32>,
+        host_for_index: impl Fn(u32) -> Option<String>,
+    ) -> Result<Self, String> {
+        participant_indices.sort_unstable();
+        participant_indices.dedup();
+        let mut peer_hosts = Vec::with_capacity(participant_indices.len());
+        let mut modex_index = std::collections::HashMap::new();
+        for (modex_idx, alloc_idx) in participant_indices.iter().enumerate() {
+            let host = host_for_index(*alloc_idx).ok_or_else(|| {
+                format!("missing agent address for allocation node index {alloc_idx}")
+            })?;
+            peer_hosts.push(host);
+            modex_index.insert(*alloc_idx, modex_idx as u32);
+        }
+        Ok(Self {
+            num_nodes: peer_hosts.len() as u32,
+            peer_hosts,
+            modex_index,
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn pmix_local_dispatch_for_step(
+    peers: &PmixStepPeers,
+    allocation_node_index: u32,
+    job_id: u32,
+    universe_size: u32,
+    task_offset: u32,
+    local_count: u32,
+    tmpdir: impl Into<String>,
+    job_uid: u32,
+    job_gid: u32,
+    modex_connect_timeout_secs: u32,
+    modex_fence_timeout_secs: u32,
+    modex_verify_timeout_secs: u32,
+) -> Result<PmixLocalDispatch, String> {
+    let node_index = peers
+        .modex_node_index(allocation_node_index)
+        .ok_or_else(|| {
+            format!("allocation node index {allocation_node_index} is not in this step")
+        })?;
+    Ok(PmixLocalDispatch {
+        job_id,
+        universe_size,
+        task_offset,
+        local_count,
+        tmpdir: tmpdir.into(),
+        job_uid,
+        job_gid,
+        num_nodes: peers.num_nodes,
+        node_index,
+        peer_hosts: peers.peer_hosts.clone(),
+        modex_connect_timeout_secs,
+        modex_fence_timeout_secs,
+        modex_verify_timeout_secs,
+    })
+}
+
+/// TCP port used for cross-agent PMIx modex exchange.
+pub fn modex_port_for_job(job_id: u32) -> u16 {
+    const BASE: u32 = 16819;
+    const SPAN: u32 = 8000;
+    (BASE + (job_id % SPAN)) as u16
 }
 
 /// Parse `--mpi` / `#SBATCH --mpi`. Returns `None` for `list`.
@@ -173,28 +361,6 @@ pub fn resolve_step_mpi<'a>(step_mpi: &'a str, job_mpi: &'a str) -> &'a str {
     }
 }
 
-/// Reject PMIx for allocations that span more than one node (Mode 1 scope).
-pub fn validate_single_node_pmix(mpi: &str, num_nodes: u32) -> Result<(), String> {
-    if mpi == MPI_PMIX && num_nodes > 1 {
-        return Err(
-            "--mpi=pmix is only supported for single-node jobs; multi-node PMIx is not yet available"
-                .into(),
-        );
-    }
-    Ok(())
-}
-
-/// Reject PMIx steps that fan out to more than one agent.
-pub fn validate_pmix_step_agents(mpi: &str, agent_count: usize) -> Result<(), String> {
-    if mpi == MPI_PMIX && agent_count > 1 {
-        return Err(
-            "--mpi=pmix steps must run on a single node; multi-node PMIx is not yet available"
-                .into(),
-        );
-    }
-    Ok(())
-}
-
 pub fn plan_to_proto(plan: PmixLaunchPlan) -> spur_proto::proto::PmixLaunchPlan {
     spur_proto::proto::PmixLaunchPlan {
         job_id: plan.job_id,
@@ -212,6 +378,12 @@ pub fn plan_to_proto(plan: PmixLaunchPlan) -> spur_proto::proto::PmixLaunchPlan 
         tmpdir: plan.tmpdir,
         job_uid: plan.job_uid,
         job_gid: plan.job_gid,
+        num_nodes: plan.num_nodes,
+        node_index: plan.node_index,
+        peer_hosts: plan.peer_hosts,
+        modex_connect_timeout_secs: plan.modex_connect_timeout_secs,
+        modex_fence_timeout_secs: plan.modex_fence_timeout_secs,
+        modex_verify_timeout_secs: plan.modex_verify_timeout_secs,
     }
 }
 
@@ -245,7 +417,18 @@ mod tests {
 
     #[test]
     fn local_tasks_plan() {
-        let plan = PmixLaunchPlan::local_tasks(42, 4, 0, 4, "/tmp/pmix", 1000, 1000);
+        let plan = PmixLaunchPlan::local_tasks(
+            42,
+            4,
+            0,
+            4,
+            "/tmp/pmix",
+            1000,
+            1000,
+            1,
+            0,
+            vec!["10.0.0.1".into()],
+        );
         assert_eq!(plan.namespace, "spur.42");
         assert_eq!(plan.universe_size, 4);
         assert_eq!(plan.local_procs.len(), 4);
@@ -279,17 +462,124 @@ mod tests {
     }
 
     #[test]
-    fn validate_single_node_pmix_rejects_multi_node() {
-        validate_single_node_pmix("none", 4).unwrap();
-        validate_single_node_pmix("pmix", 1).unwrap();
-        assert!(validate_single_node_pmix("pmix", 2).is_err());
+    fn build_validated_pmix_plan_proto_rejects_invalid_multi_node() {
+        let dispatch = PmixLocalDispatch {
+            job_id: 1,
+            universe_size: 5,
+            task_offset: 0,
+            local_count: 2,
+            tmpdir: "/tmp/pmix".into(),
+            job_uid: 0,
+            job_gid: 0,
+            num_nodes: 2,
+            node_index: 0,
+            peer_hosts: vec!["10.0.0.1".into(), "10.0.0.2".into()],
+            modex_connect_timeout_secs: 0,
+            modex_fence_timeout_secs: 0,
+            modex_verify_timeout_secs: 0,
+        };
+        let err = build_validated_pmix_plan_proto(MPI_PMIX, dispatch).unwrap_err();
+        assert!(err.contains("uniform tasks per node"), "{err}");
     }
 
     #[test]
-    fn validate_pmix_step_agents_rejects_multi_agent() {
-        validate_pmix_step_agents("none", 2).unwrap();
-        validate_pmix_step_agents("pmix", 1).unwrap();
-        assert!(validate_pmix_step_agents("pmix", 2).is_err());
+    fn build_validated_pmix_plan_proto_none_for_non_pmix() {
+        let dispatch = PmixLocalDispatch {
+            job_id: 1,
+            universe_size: 4,
+            task_offset: 0,
+            local_count: 4,
+            tmpdir: "/tmp/pmix".into(),
+            job_uid: 0,
+            job_gid: 0,
+            num_nodes: 1,
+            node_index: 0,
+            peer_hosts: vec![],
+            modex_connect_timeout_secs: 0,
+            modex_fence_timeout_secs: 0,
+            modex_verify_timeout_secs: 0,
+        };
+        assert!(build_validated_pmix_plan_proto(MPI_NONE, dispatch)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn validate_multi_node_pmix_plan_rejects_non_uniform_tasks() {
+        let plan = PmixLaunchPlan::local_tasks(
+            1,
+            5,
+            0,
+            2,
+            "/tmp/pmix",
+            0,
+            0,
+            2,
+            0,
+            vec!["10.0.0.1".into(), "10.0.0.2".into()],
+        );
+        let err = validate_pmix_plan(&plan).unwrap_err();
+        assert!(err.contains("uniform tasks per node"), "{err}");
+    }
+
+    #[test]
+    fn validate_multi_node_pmix_plan_rejects_local_count_mismatch() {
+        let plan = PmixLaunchPlan::local_tasks(
+            1,
+            4,
+            0,
+            3,
+            "/tmp/pmix",
+            0,
+            0,
+            2,
+            0,
+            vec!["10.0.0.1".into(), "10.0.0.2".into()],
+        );
+        let err = validate_pmix_plan(&plan).unwrap_err();
+        assert!(err.contains("local_count"), "{err}");
+    }
+
+    #[test]
+    fn validate_multi_node_pmix_plan_accepts_peer_hosts() {
+        let plan = PmixLaunchPlan::local_tasks(
+            1,
+            4,
+            2,
+            2,
+            "/tmp/pmix",
+            0,
+            0,
+            2,
+            1,
+            vec!["10.0.0.1".into(), "10.0.0.2".into()],
+        );
+        validate_pmix_plan(&plan).unwrap();
+    }
+
+    #[test]
+    fn validate_multi_node_pmix_plan_rejects_peer_mismatch() {
+        let plan = PmixLaunchPlan::local_tasks(
+            1,
+            4,
+            0,
+            2,
+            "/tmp/pmix",
+            0,
+            0,
+            2,
+            0,
+            vec!["10.0.0.1".into()],
+        );
+        assert!(validate_pmix_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn mpi_list_lines_include_supported_modes() {
+        let lines = mpi_list_lines("/usr/lib/spur");
+        assert!(lines.iter().any(|l| l == "none"));
+        assert!(lines.iter().any(|l| l == "pmix"));
+        assert!(lines.iter().any(|l| l.contains("plugin_dir=")));
     }
 
     #[test]
@@ -302,7 +592,7 @@ mod tests {
 
     #[test]
     fn validate_pmix_plan_rejects_empty_tmpdir() {
-        let mut plan = PmixLaunchPlan::local_tasks(1, 1, 0, 1, "/tmp/pmix", 0, 0);
+        let mut plan = PmixLaunchPlan::local_tasks(1, 1, 0, 1, "/tmp/pmix", 0, 0, 1, 0, vec![]);
         plan.tmpdir.clear();
         assert!(validate_pmix_plan(&plan).is_err());
     }
@@ -327,6 +617,12 @@ mod tests {
             tmpdir: "/tmp/pmix".into(),
             job_uid: 0,
             job_gid: 0,
+            num_nodes: 1,
+            node_index: 0,
+            peer_hosts: vec![],
+            modex_connect_timeout_secs: 0,
+            modex_fence_timeout_secs: 0,
+            modex_verify_timeout_secs: 0,
         };
         assert!(validate_pmix_plan(&plan).is_err());
     }
@@ -351,7 +647,41 @@ mod tests {
             tmpdir: "/tmp/pmix".into(),
             job_uid: 0,
             job_gid: 0,
+            num_nodes: 1,
+            node_index: 0,
+            peer_hosts: vec![],
+            modex_connect_timeout_secs: 0,
+            modex_fence_timeout_secs: 0,
+            modex_verify_timeout_secs: 0,
         };
         assert!(validate_pmix_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn modex_port_for_job_is_stable() {
+        assert_eq!(modex_port_for_job(42), 16861);
+        assert_eq!(modex_port_for_job(8042), 16819 + (8042 % 8000));
+    }
+
+    #[test]
+    fn pmix_step_peers_dense_modex_index_for_subset() {
+        let peers =
+            PmixStepPeers::from_participants(vec![0, 2], |idx| Some(format!("10.0.0.{}", idx + 1)))
+                .unwrap();
+        assert_eq!(peers.num_nodes, 2);
+        assert_eq!(
+            peers.peer_hosts,
+            vec![String::from("10.0.0.1"), String::from("10.0.0.3")]
+        );
+        assert_eq!(peers.modex_node_index(0), Some(0));
+        assert_eq!(peers.modex_node_index(2), Some(1));
+        assert_eq!(peers.modex_node_index(1), None);
+
+        let dispatch =
+            pmix_local_dispatch_for_step(&peers, 2, 9, 2, 1, 1, "/tmp/pmix", 0, 0, 0, 0, 0)
+                .unwrap();
+        assert_eq!(dispatch.num_nodes, 2);
+        assert_eq!(dispatch.node_index, 1);
+        assert_eq!(dispatch.peer_hosts, peers.peer_hosts);
     }
 }

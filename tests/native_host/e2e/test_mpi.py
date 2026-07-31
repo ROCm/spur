@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Single-node MPI E2E tests."""
+"""MPI E2E tests (single-node and multi-node)."""
 
 import re
 
@@ -115,3 +115,94 @@ class TestMpiSingleNode:
                 ranks.add(int(match.group(1)))
                 assert int(match.group(2)) == 4
         assert ranks == {0, 1, 2, 3}, f"expected ranks 0-3, got {ranks}:\n{content}"
+
+
+@pytest.mark.mpi
+class TestMpiMultiNode:
+    def test_hello_mpi_two_nodes_one_rank_each(self, mpi_multi_node_cluster):
+        cluster = mpi_multi_node_cluster
+        hello_mpi = cluster.compile_mpi_fixture("hello_mpi.c")
+        code, out = cluster.srun_with_exit(["--mpi=pmix", "-N", "2", "-n", "2", hello_mpi])
+        assert code == 0, f"srun failed (exit {code}):\n{out}"
+
+        ranks = set()
+        for line in out.splitlines():
+            match = re.match(r"rank=(\d+) size=(\d+)", line.strip())
+            if match:
+                ranks.add(int(match.group(1)))
+                assert int(match.group(2)) == 2
+        assert ranks == {0, 1}, f"expected ranks 0-1, got {ranks}:\n{out}"
+
+    def test_hello_mpi_two_nodes_multi_rank(self, mpi_multi_node_cluster):
+        cluster = mpi_multi_node_cluster
+        hello_mpi = cluster.compile_mpi_fixture("hello_mpi.c")
+        code, out = cluster.srun_with_exit(["--mpi=pmix", "-N", "2", "-n", "4", hello_mpi])
+        assert code == 0, f"srun failed (exit {code}):\n{out}"
+
+        ranks = set()
+        for line in out.splitlines():
+            match = re.match(r"rank=(\d+) size=(\d+)", line.strip())
+            if match:
+                ranks.add(int(match.group(1)))
+                assert int(match.group(2)) == 4
+        assert ranks == {0, 1, 2, 3}, f"expected ranks 0-3, got {ranks}:\n{out}"
+
+    def test_standalone_srun_pmix(self, mpi_multi_node_cluster):
+        cluster = mpi_multi_node_cluster
+        hello_mpi = cluster.compile_mpi_fixture("hello_mpi.c")
+        code, out = cluster.srun_with_exit(["--mpi=pmix", "-N", "2", "-n", "2", hello_mpi])
+        assert code == 0, f"srun failed (exit {code}):\n{out}"
+        assert "rank=" in out
+
+    def test_batch_script_srun_pmix(self, mpi_multi_node_cluster):
+        cluster = mpi_multi_node_cluster
+        hello_mpi = cluster.compile_mpi_fixture("hello_mpi.c")
+        out_path = f"{cluster.remote_dir}/mpi-batch-multi.out"
+        script = cluster.write_file(
+            "mpi-batch-multi.sh",
+            "#!/bin/bash\n#SBATCH --mpi=pmix\n#SBATCH -N2\n" f"srun --mpi=pmix {hello_mpi}\n",
+        )
+        sb = cluster.sbatch(["-n4", "-o", out_path, script])
+        job_id = parse_job_id(sb)
+        assert job_id is not None, f"sbatch failed: {sb}"
+
+        wait_job(cluster, job_id, timeout=180)
+        content = cluster.read_output_on_any_node(out_path)
+
+        ranks = set()
+        for line in content.splitlines():
+            match = re.match(r"rank=(\d+) size=(\d+)", line.strip())
+            if match:
+                ranks.add(int(match.group(1)))
+                assert int(match.group(2)) == 4
+        assert ranks == {0, 1, 2, 3}, f"expected ranks 0-3, got {ranks}:\n{content}"
+
+    def test_mpi_none_unchanged(self, mpi_multi_node_cluster):
+        cluster = mpi_multi_node_cluster
+        hello_mpi = cluster.compile_mpi_fixture("hello_mpi.c")
+        code, _out = cluster.srun_with_exit(["-N", "2", "-n", "2", hello_mpi])
+        assert code != 0, "MPI_Init should fail without --mpi=pmix"
+
+    def test_sbatch_srun_step_pmix(self, mpi_multi_node_cluster):
+        cluster = mpi_multi_node_cluster
+        hello_mpi = cluster.compile_mpi_fixture("hello_mpi.c")
+        hold_script = cluster.write_file("mpi-hold-multi.sh", "#!/bin/bash\nsleep 120\n")
+        sb = cluster.sbatch(["-J", "mpi-hold-multi", "-N2", "-n4", "-t", "5", hold_script])
+        job_id = parse_job_id(sb)
+        assert job_id is not None, f"sbatch failed: {sb}"
+
+        wait_job_state(cluster, job_id, "R", timeout=90)
+        try:
+            code, out = cluster.srun_in_allocation(
+                job_id, ["--mpi=pmix", "-N2", "-n4", hello_mpi]
+            )
+            assert code == 0, f"srun step failed (exit {code}):\n{out}"
+            ranks = set()
+            for line in out.splitlines():
+                match = re.match(r"rank=(\d+) size=(\d+)", line.strip())
+                if match:
+                    ranks.add(int(match.group(1)))
+                    assert int(match.group(2)) == 4
+            assert ranks == {0, 1, 2, 3}, f"expected ranks 0-3, got {ranks}:\n{out}"
+        finally:
+            cluster.scancel(str(job_id))

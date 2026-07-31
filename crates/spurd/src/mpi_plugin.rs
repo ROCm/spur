@@ -14,6 +14,7 @@ use spur_core::config::MpiConfig;
 use spur_core::mpi::{self, PmixLaunchPlan};
 use tracing::{debug, info, warn};
 
+/// Keys required in per-rank PMIx setup_fork env.
 const PMIX_ENV_KEYS: &[&str] = &[
     "PMIX_SERVER_URI",
     "PMIX_SERVER_URI4",
@@ -42,25 +43,31 @@ struct SpurMpiLaunchPlan {
     tmpdir: [c_char; 512],
     job_uid: c_uint,
     job_gid: c_uint,
+    num_nodes: c_uint,
+    node_index: c_uint,
+    num_peer_hosts: c_uint,
+    peer_hosts: [[c_char; 256]; 64],
+    modex_connect_timeout_sec: c_uint,
+    modex_fence_timeout_sec: c_uint,
+    modex_verify_timeout_sec: c_uint,
 }
 
 type VersionFn = unsafe extern "C" fn() -> c_int;
 type RuntimeVersionFn = unsafe extern "C" fn(*mut c_char, usize) -> c_int;
 type ServerStartFn = unsafe extern "C" fn(*const SpurMpiLaunchPlan, *mut c_char, usize) -> c_int;
 type ServerStopFn = unsafe extern "C" fn(*const c_char, *mut c_char, usize) -> c_int;
-type EnvFn = unsafe extern "C" fn(
-    *const SpurMpiLaunchPlan,
-    c_uint,
-    *const c_char,
-    *mut c_char,
-    usize,
-) -> c_int;
+type VerifyPeersFn = unsafe extern "C" fn(*const SpurMpiLaunchPlan, *mut c_char, usize) -> c_int;
+type SetupForkEnvFn =
+    unsafe extern "C" fn(*const SpurMpiLaunchPlan, c_uint, *mut *mut *mut c_char) -> c_int;
+type SetupForkEnvFreeFn = unsafe extern "C" fn(*mut *mut c_char);
 
 struct PluginApi {
     _library: Library,
     server_start: ServerStartFn,
     server_stop: ServerStopFn,
-    env: EnvFn,
+    verify_peers: VerifyPeersFn,
+    setup_fork_env: SetupForkEnvFn,
+    setup_fork_env_free: SetupForkEnvFreeFn,
 }
 
 pub(crate) struct ActiveNamespace {
@@ -85,10 +92,15 @@ impl Drop for NamespaceReservation<'_> {
     }
 }
 
+struct PreparedPmix {
+    run_attempt: u32,
+}
+
 pub struct MpiPluginHost {
     config: MpiConfig,
     plugin: Mutex<Option<PluginApi>>,
     pub(crate) active_namespaces: Mutex<HashMap<u32, ActiveNamespace>>,
+    prepared: Mutex<HashMap<u32, PreparedPmix>>,
 }
 
 /// Rolls back a PMIx namespace reference when launch fails before the job is committed.
@@ -101,6 +113,15 @@ pub struct PmixLaunchGuard {
 impl PmixLaunchGuard {
     pub fn start(host: Arc<MpiPluginHost>, plan: &PmixLaunchPlan) -> Result<Self, String> {
         host.start_pmix_server(plan)?;
+        Ok(Self {
+            host,
+            job_id: plan.job_id,
+            rollback: true,
+        })
+    }
+
+    pub fn join_prepared(host: Arc<MpiPluginHost>, plan: &PmixLaunchPlan) -> Result<Self, String> {
+        host.join_prepared_pmix(plan)?;
         Ok(Self {
             host,
             job_id: plan.job_id,
@@ -130,6 +151,19 @@ impl MpiPluginHost {
             config,
             plugin: Mutex::new(None),
             active_namespaces: Mutex::new(HashMap::new()),
+            prepared: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn apply_modex_timeouts(&self, plan: &mut PmixLaunchPlan) {
+        if plan.modex_connect_timeout_secs == 0 {
+            plan.modex_connect_timeout_secs = self.config.modex_connect_timeout_secs;
+        }
+        if plan.modex_fence_timeout_secs == 0 {
+            plan.modex_fence_timeout_secs = self.config.modex_fence_timeout_secs;
+        }
+        if plan.modex_verify_timeout_secs == 0 {
+            plan.modex_verify_timeout_secs = self.config.modex_verify_timeout_secs;
         }
     }
 
@@ -180,13 +214,21 @@ impl MpiPluginHost {
         let server_stop: Symbol<ServerStopFn> =
             unsafe { library.get(b"spur_mpi_pmix_server_stop") }
                 .map_err(|e| format!("MPI plugin missing spur_mpi_pmix_server_stop: {e}"))?;
-        let env: Symbol<EnvFn> = unsafe { library.get(b"spur_mpi_pmix_env") }
-            .map_err(|e| format!("MPI plugin missing spur_mpi_pmix_env: {e}"))?;
+        let verify_peers: Symbol<VerifyPeersFn> =
+            unsafe { library.get(b"spur_mpi_pmix_verify_peers") }
+                .map_err(|e| format!("MPI plugin missing spur_mpi_pmix_verify_peers: {e}"))?;
+        let setup_fork_env: Symbol<SetupForkEnvFn> =
+            unsafe { library.get(b"spur_mpi_pmix_setup_fork_env") }
+                .map_err(|e| format!("MPI plugin missing spur_mpi_pmix_setup_fork_env: {e}"))?;
+        let setup_fork_env_free: Symbol<SetupForkEnvFreeFn> = unsafe {
+            library.get(b"spur_mpi_pmix_setup_fork_env_free")
+        }
+        .map_err(|e| format!("MPI plugin missing spur_mpi_pmix_setup_fork_env_free: {e}"))?;
 
         let api_version = unsafe { version() };
-        if api_version != 1 {
+        if api_version != 3 {
             return Err(format!(
-                "unsupported MPI plugin API version {api_version} (expected 1)"
+                "unsupported MPI plugin API version {api_version} (expected 3)"
             ));
         }
 
@@ -212,13 +254,17 @@ impl MpiPluginHost {
 
         let server_start_fn = *server_start;
         let server_stop_fn = *server_stop;
-        let env_fn = *env;
+        let verify_peers_fn = *verify_peers;
+        let setup_fork_env_fn = *setup_fork_env;
+        let setup_fork_env_free_fn = *setup_fork_env_free;
 
         *guard = Some(PluginApi {
             _library: library,
             server_start: server_start_fn,
             server_stop: server_stop_fn,
-            env: env_fn,
+            verify_peers: verify_peers_fn,
+            setup_fork_env: setup_fork_env_fn,
+            setup_fork_env_free: setup_fork_env_free_fn,
         });
         Ok(())
     }
@@ -235,6 +281,25 @@ impl MpiPluginHost {
                 .as_ref()
                 .ok_or_else(|| "MPI plugin not loaded".to_string())?;
             unsafe { (api.server_start)(&c_plan, errbuf.as_mut_ptr(), errbuf.len()) }
+        };
+        if rc != 0 {
+            return Err(c_str_to_string(&errbuf));
+        }
+        Ok(())
+    }
+
+    fn call_verify_peers(&self, plan: &PmixLaunchPlan) -> Result<(), String> {
+        let c_plan = plan_to_c(plan)?;
+        let mut errbuf = vec![0i8; 512];
+        let rc = {
+            let guard = self
+                .plugin
+                .lock()
+                .map_err(|_| "plugin lock poisoned".to_string())?;
+            let api = guard
+                .as_ref()
+                .ok_or_else(|| "MPI plugin not loaded".to_string())?;
+            unsafe { (api.verify_peers)(&c_plan, errbuf.as_mut_ptr(), errbuf.len()) }
         };
         if rc != 0 {
             return Err(c_str_to_string(&errbuf));
@@ -283,7 +348,9 @@ impl MpiPluginHost {
     /// needed. Returns `Ok(true)` on first registration, `Ok(false)` when joining an active
     /// namespace (refcount incremented). Always calls into the plugin so C can validate the plan.
     pub fn start_pmix_server(&self, plan: &PmixLaunchPlan) -> Result<bool, String> {
-        mpi::validate_pmix_plan(plan)?;
+        let mut plan = plan.clone();
+        self.apply_modex_timeouts(&mut plan);
+        mpi::validate_pmix_plan(&plan)?;
 
         let joined = {
             let mut namespaces = self
@@ -323,7 +390,7 @@ impl MpiPluginHost {
 
         let start_result = (|| {
             self.load_plugin()?;
-            self.call_server_start(plan)
+            self.call_server_start(&plan)
         })();
 
         if let Err(err) = start_result {
@@ -359,6 +426,139 @@ impl MpiPluginHost {
             );
         }
         Ok(!joined)
+    }
+
+    /// Start PMIx server and verify peers before rank exec (multi-node prepare phase).
+    pub fn prepare_pmix_server(
+        &self,
+        plan: &PmixLaunchPlan,
+        run_attempt: u32,
+    ) -> Result<(), String> {
+        let existing_attempt = self
+            .prepared
+            .lock()
+            .map_err(|_| "prepared lock poisoned".to_string())?
+            .get(&plan.job_id)
+            .map(|entry| entry.run_attempt);
+        if existing_attempt == Some(run_attempt) {
+            if plan.num_nodes > 1 {
+                let mut plan = plan.clone();
+                self.apply_modex_timeouts(&mut plan);
+                mpi::validate_pmix_plan(&plan)?;
+                self.load_plugin()?;
+                self.call_verify_peers(&plan)?;
+            }
+            return Ok(());
+        }
+        if existing_attempt.is_some() {
+            self.release_prepared_pmix(plan.job_id)?;
+        }
+
+        let mut plan = plan.clone();
+        self.apply_modex_timeouts(&mut plan);
+        mpi::validate_pmix_plan(&plan)?;
+        self.load_plugin()?;
+        self.call_server_start(&plan)?;
+        if plan.num_nodes > 1 {
+            if let Err(err) = self.call_verify_peers(&plan) {
+                if let Err(stop_err) = self.call_server_stop(plan.job_id, &plan.namespace) {
+                    warn!(
+                        job_id = plan.job_id,
+                        namespace = %plan.namespace,
+                        error = %stop_err,
+                        "PMIx server stop failed during prepare verify rollback"
+                    );
+                }
+                return Err(err);
+            }
+        }
+        {
+            let mut namespaces = self
+                .active_namespaces
+                .lock()
+                .map_err(|_| "namespace lock poisoned".to_string())?;
+            namespaces.insert(
+                plan.job_id,
+                ActiveNamespace {
+                    namespace: plan.namespace.clone(),
+                    refs: 0,
+                },
+            );
+        }
+        self.prepared
+            .lock()
+            .map_err(|_| "prepared lock poisoned".to_string())?
+            .insert(plan.job_id, PreparedPmix { run_attempt });
+        Ok(())
+    }
+
+    /// Join a prepared PMIx server at launch time (controller two-phase dispatch).
+    pub fn join_prepared_pmix(&self, plan: &PmixLaunchPlan) -> Result<(), String> {
+        {
+            let guard = self
+                .prepared
+                .lock()
+                .map_err(|_| "prepared lock poisoned".to_string())?;
+            if !guard.contains_key(&plan.job_id) {
+                return Err(format!(
+                    "job {} PMIx was not prepared on this agent",
+                    plan.job_id
+                ));
+            }
+        }
+        mpi::validate_pmix_plan(plan)?;
+        self.load_plugin()?;
+        {
+            let mut namespaces = self
+                .active_namespaces
+                .lock()
+                .map_err(|_| "namespace lock poisoned".to_string())?;
+            let entry = namespaces.get_mut(&plan.job_id).ok_or_else(|| {
+                format!(
+                    "job {} PMIx namespace not active after prepare",
+                    plan.job_id
+                )
+            })?;
+            if entry.namespace != plan.namespace {
+                return Err(format!(
+                    "PMIx namespace mismatch for job {} (prepared {}, join {})",
+                    plan.job_id, entry.namespace, plan.namespace
+                ));
+            }
+            entry.refs = entry.refs.saturating_add(1);
+        }
+        self.prepared
+            .lock()
+            .map_err(|_| "prepared lock poisoned".to_string())?
+            .remove(&plan.job_id);
+        debug!(
+            job_id = plan.job_id,
+            namespace = %plan.namespace,
+            "PMIx prepared namespace joined for launch"
+        );
+        Ok(())
+    }
+
+    /// Tear down a prepared-but-not-launched PMIx server.
+    pub fn release_prepared_pmix(&self, job_id: u32) -> Result<(), String> {
+        let was_prepared = self
+            .prepared
+            .lock()
+            .map_err(|_| "prepared lock poisoned".to_string())?
+            .remove(&job_id);
+        let active = self
+            .active_namespaces
+            .lock()
+            .map_err(|_| "namespace lock poisoned".to_string())?
+            .contains_key(&job_id);
+        if active {
+            return self.release_pmix_server(job_id);
+        }
+        if was_prepared.is_none() {
+            return Ok(());
+        }
+        let namespace = PmixLaunchPlan::namespace_for_job(job_id);
+        self.call_server_stop(job_id, &namespace)
     }
 
     /// Release one reference to a PMIx namespace; stops the C server when the last ref drops.
@@ -412,7 +612,8 @@ impl MpiPluginHost {
         Ok(())
     }
 
-    pub fn pmix_env_for_rank(
+    /// Bulk `PMIx_server_setup_fork` env for one rank (Slurm `mpi_p_slurmstepd_task` input).
+    pub fn pmix_setup_fork_env(
         &self,
         plan: &PmixLaunchPlan,
         rank: u32,
@@ -420,44 +621,119 @@ impl MpiPluginHost {
         mpi::validate_pmix_plan(plan)?;
         self.load_plugin()?;
         let c_plan = plan_to_c(plan)?;
-        let mut out = HashMap::new();
-        let guard = self
-            .plugin
-            .lock()
-            .map_err(|_| "plugin lock poisoned".to_string())?;
-        let api = guard
-            .as_ref()
-            .ok_or_else(|| "MPI plugin not loaded".to_string())?;
-        for key in PMIX_ENV_KEYS {
-            let c_key = CString::new(*key).map_err(|_| format!("invalid env key {key}"))?;
-            let mut valbuf = vec![0i8; 4096];
-            let rc = unsafe {
-                (api.env)(
-                    &c_plan,
-                    rank,
-                    c_key.as_ptr(),
-                    valbuf.as_mut_ptr(),
-                    valbuf.len(),
-                )
-            };
-            if rc == 0 {
-                let value = c_str_to_string(&valbuf);
-                if !value.is_empty() {
-                    out.insert(key.to_string(), value);
-                }
-            } else {
-                debug!(job_id = plan.job_id, rank, key, "PMIx env key unavailable");
-            }
+        let mut env_ptr: *mut *mut c_char = std::ptr::null_mut();
+        let rc = {
+            let guard = self
+                .plugin
+                .lock()
+                .map_err(|_| "plugin lock poisoned".to_string())?;
+            let api = guard
+                .as_ref()
+                .ok_or_else(|| "MPI plugin not loaded".to_string())?;
+            unsafe { (api.setup_fork_env)(&c_plan, rank, &mut env_ptr) }
+        };
+        if rc != 0 {
+            return Err(format!(
+                "PMIx_server_setup_fork failed for job {} rank {rank}",
+                plan.job_id
+            ));
         }
-        // Open MPI 4.x expects URI4/URI3; same aliases in pmix_server.c and task_launch.rs.
-        if let Some(uri) = out.get("PMIX_SERVER_URI").cloned() {
-            out.entry("PMIX_SERVER_URI4".into())
-                .or_insert_with(|| uri.clone());
-            out.entry("PMIX_SERVER_URI3".into()).or_insert(uri);
+        let mut out = parse_setup_fork_env(env_ptr);
+        {
+            let guard = self
+                .plugin
+                .lock()
+                .map_err(|_| "plugin lock poisoned".to_string())?;
+            let api = guard
+                .as_ref()
+                .ok_or_else(|| "MPI plugin not loaded".to_string())?;
+            unsafe { (api.setup_fork_env_free)(env_ptr) };
         }
-        validate_pmix_env(&out)?;
+        normalize_pmix_fork_env(&mut out, plan, rank);
         Ok(out)
     }
+}
+
+fn normalize_pmix_fork_env(env: &mut HashMap<String, String>, plan: &PmixLaunchPlan, rank: u32) {
+    apply_pmix_uri_aliases(env);
+
+    let size = plan.universe_size.to_string();
+    env.insert("PMIX_SIZE".into(), size.clone());
+    env.insert("PMIX_JOB_SIZE".into(), size);
+
+    env.entry("PMIX_NAMESPACE".into())
+        .or_insert_with(|| plan.namespace.clone());
+    env.insert("PMIX_RANK".into(), rank.to_string());
+    env.entry("PMIX_SERVER_TMPDIR".into())
+        .or_insert_with(|| plan.tmpdir.clone());
+}
+
+/// Slurm `mpi_p_slurmstepd_task` equivalent: merge per-rank setup_fork env into task env.
+pub fn apply_pmix_setup_fork_env(
+    host: &MpiPluginHost,
+    plan: &PmixLaunchPlan,
+    rank: u32,
+    env: &mut HashMap<String, String>,
+) -> Result<(), String> {
+    let fork_env = host.pmix_setup_fork_env(plan, rank)?;
+    validate_pmix_env(&fork_env)?;
+    env.extend(fork_env);
+    Ok(())
+}
+
+/// Per-local-rank setup_fork env for a multi-task node launch.
+pub fn pmix_setup_fork_env_for_node_tasks(
+    host: &MpiPluginHost,
+    plan: &PmixLaunchPlan,
+    task_offset: u32,
+    tasks_on_node: u32,
+) -> Result<Vec<HashMap<String, String>>, String> {
+    let mut out = Vec::with_capacity(tasks_on_node as usize);
+    for local_rank in 0..tasks_on_node {
+        let rank = task_offset + local_rank;
+        let rank_env = host.pmix_setup_fork_env(plan, rank)?;
+        validate_pmix_env(&rank_env)?;
+        out.push(rank_env);
+    }
+    Ok(out)
+}
+
+fn apply_pmix_uri_aliases(env: &mut HashMap<String, String>) {
+    let uri = env
+        .get("PMIX_SERVER_URI")
+        .or_else(|| env.get("PMIX_SERVER_URI4"))
+        .or_else(|| env.get("PMIX_SERVER_URI41"))
+        .or_else(|| env.get("PMIX_SERVER_URI3"))
+        .or_else(|| env.get("PMIX_SERVER_URI2"))
+        .cloned();
+    let Some(uri) = uri else {
+        return;
+    };
+    env.entry("PMIX_SERVER_URI".into())
+        .or_insert_with(|| uri.clone());
+    env.entry("PMIX_SERVER_URI4".into())
+        .or_insert_with(|| uri.clone());
+    env.entry("PMIX_SERVER_URI3".into()).or_insert(uri);
+}
+
+fn parse_setup_fork_env(env: *mut *mut c_char) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    if env.is_null() {
+        return out;
+    }
+    let mut cur = env;
+    unsafe {
+        while !(*cur).is_null() {
+            let entry = CStr::from_ptr(*cur).to_string_lossy();
+            if let Some((key, value)) = entry.split_once('=') {
+                if !key.is_empty() {
+                    out.insert(key.to_string(), value.to_string());
+                }
+            }
+            cur = cur.add(1);
+        }
+    }
+    out
 }
 
 fn validate_pmix_env(env: &HashMap<String, String>) -> Result<(), String> {
@@ -484,9 +760,22 @@ fn plan_to_c(plan: &PmixLaunchPlan) -> Result<SpurMpiLaunchPlan, String> {
         tmpdir: [0; 512],
         job_uid: plan.job_uid,
         job_gid: plan.job_gid,
+        num_nodes: plan.num_nodes,
+        node_index: plan.node_index,
+        num_peer_hosts: plan.peer_hosts.len() as c_uint,
+        peer_hosts: [[0; 256]; 64],
+        modex_connect_timeout_sec: plan.modex_connect_timeout_secs,
+        modex_fence_timeout_sec: plan.modex_fence_timeout_secs,
+        modex_verify_timeout_sec: plan.modex_verify_timeout_secs,
     };
     write_c_str(&mut c_plan.namespace, &plan.namespace)?;
     write_c_str(&mut c_plan.tmpdir, &plan.tmpdir)?;
+    for (idx, host) in plan.peer_hosts.iter().enumerate() {
+        if idx >= 64 {
+            return Err("peer_hosts exceeds plugin max (64)".into());
+        }
+        write_c_str(&mut c_plan.peer_hosts[idx], host)?;
+    }
     for (idx, proc) in plan.local_procs.iter().enumerate() {
         c_plan.local_procs[idx] = SpurMpiProc {
             rank: proc.rank,
@@ -541,6 +830,12 @@ pub fn plan_from_proto(
         tmpdir: proto.tmpdir.clone(),
         job_uid: proto.job_uid,
         job_gid: proto.job_gid,
+        num_nodes: proto.num_nodes.max(1),
+        node_index: proto.node_index,
+        peer_hosts: proto.peer_hosts.clone(),
+        modex_connect_timeout_secs: proto.modex_connect_timeout_secs,
+        modex_fence_timeout_secs: proto.modex_fence_timeout_secs,
+        modex_verify_timeout_secs: proto.modex_verify_timeout_secs,
     };
     mpi::validate_pmix_plan(&plan)?;
     Ok(plan)
@@ -552,7 +847,7 @@ mod tests {
 
     #[test]
     fn plan_credentials_survive_proto_roundtrip_and_plan_to_c() {
-        let plan = PmixLaunchPlan::local_tasks(7, 4, 0, 4, "/tmp/pmix", 1001, 1002);
+        let plan = PmixLaunchPlan::local_tasks(7, 4, 0, 4, "/tmp/pmix", 1001, 1002, 1, 0, vec![]);
         let proto = mpi::plan_to_proto(plan);
         let restored = plan_from_proto(&proto).unwrap();
         assert_eq!(restored.job_uid, 1001);
@@ -568,7 +863,7 @@ mod tests {
             plugin_dir: "/nonexistent/spur/plugins".into(),
             ..MpiConfig::default()
         });
-        let plan = PmixLaunchPlan::local_tasks(1, 1, 0, 1, "/tmp/pmix", 0, 0);
+        let plan = PmixLaunchPlan::local_tasks(1, 1, 0, 1, "/tmp/pmix", 0, 0, 1, 0, vec![]);
         let err = host.start_pmix_server(&plan).unwrap_err();
         assert!(err.contains("MPI plugin not found"));
     }
@@ -602,6 +897,12 @@ mod tests {
             tmpdir: "/tmp/pmix".into(),
             job_uid: 0,
             job_gid: 0,
+            num_nodes: 1,
+            node_index: 0,
+            peer_hosts: vec![],
+            modex_connect_timeout_secs: 0,
+            modex_fence_timeout_secs: 0,
+            modex_verify_timeout_secs: 0,
         };
         let err = host.start_pmix_server(&plan).unwrap_err();
         assert!(err.contains("max 256"));
@@ -629,6 +930,12 @@ mod tests {
             tmpdir: "/tmp/pmix".into(),
             job_uid: 0,
             job_gid: 0,
+            num_nodes: 1,
+            node_index: 0,
+            peer_hosts: vec![],
+            modex_connect_timeout_secs: 0,
+            modex_fence_timeout_secs: 0,
+            modex_verify_timeout_secs: 0,
         };
         let err = host.start_pmix_server(&plan).unwrap_err();
         assert!(err.contains("namespace mismatch"));
@@ -651,7 +958,7 @@ mod tests {
                 refs: 1,
             },
         );
-        let plan = PmixLaunchPlan::local_tasks(5, 1, 0, 1, "/tmp/pmix", 0, 0);
+        let plan = PmixLaunchPlan::local_tasks(5, 1, 0, 1, "/tmp/pmix", 0, 0, 1, 0, vec![]);
         assert!(host.start_pmix_server(&plan).is_err());
         assert_eq!(
             host.active_namespaces.lock().unwrap().get(&5).unwrap().refs,
@@ -674,12 +981,45 @@ mod tests {
     }
 
     #[test]
+    fn apply_pmix_uri_aliases_fills_missing_uri_from_uri4() {
+        let mut env = HashMap::from([("PMIX_SERVER_URI4".into(), "pmix://host:1234".into())]);
+        apply_pmix_uri_aliases(&mut env);
+        assert_eq!(
+            env.get("PMIX_SERVER_URI").map(String::as_str),
+            Some("pmix://host:1234")
+        );
+        assert_eq!(
+            env.get("PMIX_SERVER_URI3").map(String::as_str),
+            Some("pmix://host:1234")
+        );
+    }
+
+    #[test]
+    fn parse_setup_fork_env_splits_key_value_pairs() {
+        let entries = [
+            CString::new("PMIX_RANK=2").unwrap(),
+            CString::new("PMIX_SERVER_URI=pmix://x").unwrap(),
+        ];
+        let mut ptrs: Vec<*mut c_char> = entries
+            .iter()
+            .map(|s| s.as_ptr() as *mut c_char)
+            .chain(std::iter::once(std::ptr::null_mut()))
+            .collect();
+        let env = parse_setup_fork_env(ptrs.as_mut_ptr());
+        assert_eq!(env.get("PMIX_RANK").map(String::as_str), Some("2"));
+        assert_eq!(
+            env.get("PMIX_SERVER_URI").map(String::as_str),
+            Some("pmix://x")
+        );
+    }
+
+    #[test]
     fn pmix_launch_guard_start_failure_leaves_no_active_namespace() {
         let host = Arc::new(MpiPluginHost::new(MpiConfig {
             plugin_dir: "/nonexistent/spur/plugins".into(),
             ..MpiConfig::default()
         }));
-        let plan = PmixLaunchPlan::local_tasks(9, 1, 0, 1, "/tmp/pmix", 0, 0);
+        let plan = PmixLaunchPlan::local_tasks(9, 1, 0, 1, "/tmp/pmix", 0, 0, 1, 0, vec![]);
         assert!(PmixLaunchGuard::start(host.clone(), &plan).is_err());
         assert!(!host.has_active_pmix(plan.job_id));
     }
@@ -751,6 +1091,103 @@ mod tests {
     }
 
     #[test]
+    fn join_prepared_fails_when_not_prepared() {
+        let host = MpiPluginHost::new(MpiConfig::default());
+        let plan = PmixLaunchPlan::local_tasks(42, 2, 0, 2, "/tmp/pmix", 0, 0, 2, 0, vec![]);
+        let err = host.join_prepared_pmix(&plan).unwrap_err();
+        assert!(err.contains("was not prepared"));
+    }
+
+    #[test]
+    fn release_prepared_is_noop_when_not_prepared() {
+        let host = MpiPluginHost::new(MpiConfig::default());
+        host.release_prepared_pmix(99).unwrap();
+    }
+
+    #[test]
+    fn release_prepared_clears_prepared_entry() {
+        let host = MpiPluginHost::new(MpiConfig {
+            plugin_dir: "/nonexistent/spur/plugins".into(),
+            ..MpiConfig::default()
+        });
+        host.prepared
+            .lock()
+            .unwrap()
+            .insert(77, PreparedPmix { run_attempt: 1 });
+        host.release_prepared_pmix(77).unwrap();
+        assert!(host.prepared.lock().unwrap().get(&77).is_none());
+    }
+
+    #[test]
+    fn prepare_same_run_attempt_is_idempotent() {
+        let host = MpiPluginHost::new(MpiConfig::default());
+        host.prepared
+            .lock()
+            .unwrap()
+            .insert(88, PreparedPmix { run_attempt: 2 });
+        let plan = PmixLaunchPlan::local_tasks(88, 2, 0, 2, "/tmp/pmix", 0, 0, 1, 0, vec![]);
+        host.prepare_pmix_server(&plan, 2).unwrap();
+    }
+
+    #[test]
+    fn prepare_stale_run_attempt_releases_prior_prepare() {
+        let host = MpiPluginHost::new(MpiConfig {
+            plugin_dir: "/nonexistent/spur/plugins".into(),
+            ..MpiConfig::default()
+        });
+        host.prepared
+            .lock()
+            .unwrap()
+            .insert(89, PreparedPmix { run_attempt: 1 });
+        let plan = PmixLaunchPlan::local_tasks(
+            89,
+            2,
+            0,
+            2,
+            "/tmp/pmix",
+            0,
+            0,
+            2,
+            0,
+            vec!["10.0.0.1".into(), "10.0.0.2".into()],
+        );
+        assert!(host.prepare_pmix_server(&plan, 2).is_err());
+        assert!(host.prepared.lock().unwrap().get(&89).is_none());
+    }
+
+    #[test]
+    fn pmix_launch_guard_join_prepared_fails_when_not_prepared() {
+        let host = Arc::new(MpiPluginHost::new(MpiConfig::default()));
+        let plan = PmixLaunchPlan::local_tasks(90, 2, 0, 2, "/tmp/pmix", 0, 0, 2, 0, vec![]);
+        assert!(PmixLaunchGuard::join_prepared(host, &plan).is_err());
+    }
+
+    #[test]
+    fn plan_modex_timeouts_survive_proto_roundtrip() {
+        let plan = PmixLaunchPlan::local_tasks(
+            91,
+            4,
+            0,
+            2,
+            "/tmp/pmix",
+            0,
+            0,
+            2,
+            0,
+            vec!["10.0.0.1".into(), "10.0.0.2".into()],
+        )
+        .with_modex_timeouts(7, 90, 15);
+        let proto = mpi::plan_to_proto(plan);
+        assert_eq!(proto.modex_connect_timeout_secs, 7);
+        assert_eq!(proto.modex_fence_timeout_secs, 90);
+        assert_eq!(proto.modex_verify_timeout_secs, 15);
+        let restored = plan_from_proto(&proto).unwrap();
+        assert_eq!(restored.modex_connect_timeout_secs, 7);
+        assert_eq!(restored.modex_fence_timeout_secs, 90);
+        assert_eq!(restored.modex_verify_timeout_secs, 15);
+    }
+
+    #[test]
     #[ignore = "requires SPUR_TEST_MPI_PLUGIN pointing at a built spur_mpi_pmix.so"]
     fn pmix_launch_guard_drop_rolls_back_after_successful_start() {
         let plugin_path = std::env::var("SPUR_TEST_MPI_PLUGIN")
@@ -765,7 +1202,8 @@ mod tests {
             pmix_tmpdir: "/tmp/spur-pmix-test".into(),
             ..MpiConfig::default()
         }));
-        let plan = PmixLaunchPlan::local_tasks(7777, 1, 0, 1, "/tmp/spur-pmix-test", 0, 0);
+        let plan =
+            PmixLaunchPlan::local_tasks(7777, 1, 0, 1, "/tmp/spur-pmix-test", 0, 0, 1, 0, vec![]);
         {
             let guard = PmixLaunchGuard::start(host.clone(), &plan).expect("plugin start");
             assert!(host.has_active_pmix(plan.job_id));

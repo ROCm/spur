@@ -223,6 +223,44 @@ pub enum NodeSource {
     Kubernetes { namespace: String },
 }
 
+/// `RegisterAgentRequest.version` sent by the spur-k8s operator.
+pub const K8S_OPERATOR_VERSION: &str = "spur-k8s-operator";
+
+/// Node label carrying the operator's Kubernetes namespace.
+pub const K8S_NAMESPACE_LABEL: &str = "spur.amd.com/k8s-namespace";
+
+/// Derive node source from agent registration metadata.
+pub fn node_source_from_registration(
+    version: &str,
+    labels: &HashMap<String, String>,
+) -> NodeSource {
+    if version == K8S_OPERATOR_VERSION {
+        NodeSource::Kubernetes {
+            namespace: labels
+                .get(K8S_NAMESPACE_LABEL)
+                .cloned()
+                .filter(|ns| !ns.is_empty())
+                .unwrap_or_else(|| "default".to_string()),
+        }
+    } else {
+        NodeSource::NativeHost
+    }
+}
+
+/// Apply WAL-stored source on replay; re-derive from registration metadata when the
+/// persisted value is the default (pre-source WAL entries and native agents).
+pub fn resolve_wal_node_source(
+    source: &NodeSource,
+    version: &str,
+    labels: &HashMap<String, String>,
+) -> NodeSource {
+    if matches!(source, NodeSource::NativeHost) {
+        node_source_from_registration(version, labels)
+    } else {
+        source.clone()
+    }
+}
+
 /// A compute node in the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {

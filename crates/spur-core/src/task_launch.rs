@@ -306,25 +306,22 @@ fn bash_single_quote(value: &str) -> String {
 }
 
 /// Bash prefix shared by PMIx/Open MPI launch wrappers.
-///
-/// Open MPI 4.x expects `PMIX_SERVER_URI4`/`URI3`; the same aliases exist in
-/// `spurd::mpi_plugin` and `crates/spur-mpi-pmix/c/pmix_server.c`.
 fn mpi_launch_preamble() -> &'static str {
     concat!(
+        "if [ -f \"${HOME}/spur/mpi/env.sh\" ]; then . \"${HOME}/spur/mpi/env.sh\"; fi\n",
         "if [ -z \"${SPUR_MPIRUN:-}\" ]; then\n",
         "  if command -v mpirun >/dev/null 2>&1; then SPUR_MPIRUN=$(command -v mpirun)\n",
         "  elif [ -n \"${OPAL_PREFIX:-}\" ] && [ -x \"${OPAL_PREFIX}/bin/mpirun\" ]; then SPUR_MPIRUN=\"${OPAL_PREFIX}/bin/mpirun\"\n",
+        "  elif [ -n \"${OPAL_PREFIX:-}\" ] && [ -x \"${OPAL_PREFIX}/bin/mpirun.openmpi\" ]; then SPUR_MPIRUN=\"${OPAL_PREFIX}/bin/mpirun.openmpi\"\n",
         "  else SPUR_MPIRUN=mpirun; fi\n",
         "fi\n",
         "export PMIX_SERVER_URI4=${PMIX_SERVER_URI4:-$PMIX_SERVER_URI}\n",
         "export PMIX_SERVER_URI3=${PMIX_SERVER_URI3:-$PMIX_SERVER_URI}\n",
-        "while IFS= read -r _v; do unset \"$_v\"; done < <(env | sed -n 's/^\\(SLURM_[^=]*\\)=.*/\\1/p')\n",
     )
 }
 
-/// Launch multi-rank MPI jobs via a single `mpirun` instead of forking independent
-/// processes. Open MPI 4.x direct-launched tasks otherwise spawn per-process PMIx
-/// servers and never form a shared `MPI_COMM_WORLD`.
+/// Legacy mpirun wrapper kept for unit tests; Spur PMIx jobs use direct per-rank
+/// launch (Slurm ``mpi_p_slurmstepd_task`` parity) via [`build_multi_task_pmix_wrapper`].
 pub fn build_mpi_mpirun_wrapper(user_script_path: &str, tasks_on_node: u32) -> String {
     let quoted = bash_single_quote(user_script_path);
     format!(
@@ -344,10 +341,103 @@ pub fn build_mpi_mpirun_wrapper(user_script_path: &str, tasks_on_node: u32) -> S
     )
 }
 
+/// Bash prefix shared by PMIx direct-launch wrappers (multi-node per-rank fork).
+///
+/// Open MPI 4.x expects `PMIX_SERVER_URI4`/`URI3`; the same aliases exist in
+/// `spurd::mpi_plugin` and `crates/spur-mpi-pmix/c/pmix_server.c`.
+fn mpi_direct_task_preamble(indent: &str) -> String {
+    format!(
+        concat!(
+            "{indent}if [ -f \"${{HOME}}/spur/mpi/env.sh\" ]; then . \"${{HOME}}/spur/mpi/env.sh\"; fi\n",
+            "{indent}export PMIX_SERVER_URI4=${{PMIX_SERVER_URI4:-$PMIX_SERVER_URI}}\n",
+            "{indent}export PMIX_SERVER_URI3=${{PMIX_SERVER_URI3:-$PMIX_SERVER_URI}}\n",
+        ),
+        indent = indent
+    )
+}
+
+fn bash_export_block(env: &HashMap<String, String>, indent: &str) -> String {
+    let mut keys: Vec<_> = env.keys().collect();
+    keys.sort();
+    keys.into_iter()
+        .map(|key| format!("{indent}export {key}={}\n", bash_single_quote(&env[key])))
+        .collect()
+}
+
+/// Fork one process per local rank, injecting per-rank `PMIx_server_setup_fork` env
+/// (Slurm `mpi_p_slurmstepd_task` parity).
+pub fn build_multi_task_pmix_wrapper(
+    user_script_path: &str,
+    tasks_on_node: u32,
+    per_local_rank_env: &[HashMap<String, String>],
+    environment: Option<&HashMap<String, String>>,
+) -> Result<String, String> {
+    if per_local_rank_env.len() != tasks_on_node as usize {
+        return Err(format!(
+            "PMIx per-rank env count {} != tasks_on_node {tasks_on_node}",
+            per_local_rank_env.len()
+        ));
+    }
+
+    let quoted = bash_single_quote(user_script_path);
+    let bind = environment.map(parse_cpu_bind).unwrap_or(CpuBind::None);
+    let map_cpus: Vec<&str> = match &bind {
+        CpuBind::Map(list) => list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect(),
+        CpuBind::Mask(mask) => mask
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    };
+    let taskset_prefix = cpu_bind_bash_prefix(&bind, &map_cpus);
+    let mut wrapper = String::from("#!/bin/bash\n");
+    wrapper.push_str(&format!(
+        "_TASKS_ON_NODE={tasks_on_node}\nSPUR_TASK_OFFSET=${{SPUR_TASK_OFFSET:-0}}\n"
+    ));
+    wrapper.push_str("for LOCAL_RANK in $(seq 0 $((_TASKS_ON_NODE - 1))); do\n");
+    wrapper.push_str("  export LOCAL_RANK\n");
+    wrapper.push_str(SpurEnv::per_task_bash_exports());
+    wrapper.push_str("  case $LOCAL_RANK in\n");
+    for (local_rank, rank_env) in per_local_rank_env.iter().enumerate() {
+        wrapper.push_str(&format!("  {local_rank})\n"));
+        wrapper.push_str(&mpi_direct_task_preamble("    "));
+        wrapper.push_str(&bash_export_block(rank_env, "    "));
+        wrapper.push_str("    ;;\n");
+    }
+    wrapper.push_str("  esac\n");
+
+    wrapper.push_str("  if [ -n \"$SPUR_JOB_GPUS\" ]; then\n");
+    wrapper.push_str("    IFS=',' read -ra _ALL_GPUS <<< \"$SPUR_JOB_GPUS\"\n");
+    wrapper.push_str("    _GPUS_PER_TASK=$(( ${#_ALL_GPUS[@]} / _TASKS_ON_NODE ))\n");
+    wrapper.push_str("    if [ $_GPUS_PER_TASK -gt 0 ]; then\n");
+    wrapper.push_str("      _START=$((LOCAL_RANK * _GPUS_PER_TASK))\n");
+    wrapper.push_str(
+        "      _TASK_GPUS=$(echo \"${_ALL_GPUS[@]:$_START:$_GPUS_PER_TASK}\" | tr ' ' ',')\n",
+    );
+    wrapper.push_str("      export ROCR_VISIBLE_DEVICES=$_TASK_GPUS\n");
+    wrapper.push_str("      export CUDA_VISIBLE_DEVICES=$_TASK_GPUS\n");
+    wrapper.push_str("      export GPU_DEVICE_ORDINAL=$_TASK_GPUS\n");
+    wrapper.push_str("    fi\n");
+    wrapper.push_str("  fi\n");
+
+    wrapper.push_str("  if [ \"$SPUR_LABEL\" = \"1\" ]; then\n");
+    wrapper.push_str(&format!(
+        "    {taskset_prefix}bash {quoted} 2>&1 | sed \"s/^/[$SPUR_PROCID] /\" &\n"
+    ));
+    wrapper.push_str("  else\n");
+    wrapper.push_str(&format!("    {taskset_prefix}bash {quoted} &\n"));
+    wrapper.push_str("  fi\n");
+    wrapper.push_str("done\nwait\n");
+    Ok(wrapper)
+}
+
 /// Build a bash wrapper that forks `tasks_on_node` copies of `user_script_path`,
 /// assigning distinct `LOCAL_RANK` / `SLURM_PROCID` values in each fork.
-///
-/// When `mpi_bootstrap` is true, uses [`build_mpi_mpirun_wrapper`] instead.
 ///
 /// Output labeling is controlled at runtime via the `SPUR_LABEL=1` environment
 /// variable (matching batch `launch_job` and srun `-l`).
@@ -355,11 +445,7 @@ pub fn build_multi_task_wrapper(
     user_script_path: &str,
     tasks_on_node: u32,
     environment: Option<&HashMap<String, String>>,
-    mpi_bootstrap: bool,
 ) -> String {
-    if mpi_bootstrap {
-        return build_mpi_mpirun_wrapper(user_script_path, tasks_on_node);
-    }
     let escaped = user_script_path.replace('"', "\\\"");
     let bind = environment.map(parse_cpu_bind).unwrap_or(CpuBind::None);
     let map_cpus: Vec<&str> = match &bind {
@@ -493,7 +579,7 @@ mod tests {
 
     #[test]
     fn multi_task_wrapper_exports_procid() {
-        let script = build_multi_task_wrapper("/tmp/work.sh", 2, None, false);
+        let script = build_multi_task_wrapper("/tmp/work.sh", 2, None);
         assert!(script.contains("SPUR_PROCID"));
         assert!(script.contains("SLURM_PROCID"));
         assert!(script.contains("_TASKS_ON_NODE=2"));
@@ -504,7 +590,7 @@ mod tests {
     fn multi_task_wrapper_applies_map_cpu_bind() {
         let mut env = HashMap::new();
         env.insert("SPUR_CPU_BIND".into(), "map_cpu:0,4".into());
-        let script = build_multi_task_wrapper("/tmp/work.sh", 2, Some(&env), false);
+        let script = build_multi_task_wrapper("/tmp/work.sh", 2, Some(&env));
         assert!(script.contains("_CPU_MAP=(0 4)"));
         assert!(script.contains("_CPU_IDX\" -ge"));
         assert!(script.contains("taskset -c ${_CPU_MAP[$_CPU_IDX]}"));
@@ -512,46 +598,53 @@ mod tests {
 
     #[test]
     fn multi_task_wrapper_honors_spur_label_env() {
-        let script = build_multi_task_wrapper("/tmp/work.sh", 1, None, false);
+        let script = build_multi_task_wrapper("/tmp/work.sh", 1, None);
         assert!(script.contains("SPUR_LABEL"));
         assert!(script.contains("sed \"s/^/[$SPUR_PROCID] /\""));
     }
 
     #[test]
-    fn mpi_wrapper_uses_mpirun_not_fork() {
-        let script = build_multi_task_wrapper("/tmp/hello_mpi", 4, None, true);
+    fn mpi_mpirun_wrapper_uses_single_mpirun() {
+        let script = build_mpi_mpirun_wrapper("/tmp/hello_mpi", 4);
         assert!(script.contains("\"$SPUR_MPIRUN\" -np \"$_TASKS_ON_NODE\""));
         assert!(script.contains("_TASKS_ON_NODE=4"));
         assert!(script.contains("PMIX_SERVER_URI4"));
-        assert!(script.contains("unset \"$_v\""));
         assert!(script.contains("'/tmp/hello_mpi'"));
         assert!(!script.contains("for LOCAL_RANK in"));
     }
 
     #[test]
-    fn mpi_wrapper_single_quotes_user_script() {
+    fn mpi_mpirun_wrapper_single_quotes_user_script() {
         let script = build_mpi_mpirun_wrapper("$(rm -rf /)", 2);
         assert!(script.contains("'$(rm -rf /)'"));
         assert!(!script.contains("$(rm -rf /)\""));
     }
 
     #[test]
-    fn mpi_wrapper_tag_output_when_labeled() {
-        let script = build_multi_task_wrapper("/tmp/hello_mpi", 4, None, true);
-        assert!(script.contains("--tag-output"));
+    fn pmix_direct_wrapper_single_quotes_user_script() {
+        let mut rank0 = HashMap::new();
+        rank0.insert("PMIX_RANK".into(), "0".into());
+        let script = build_multi_task_pmix_wrapper("$(rm -rf /)", 1, &[rank0], None).unwrap();
+        assert!(script.contains("'$(rm -rf /)'"));
+        assert!(!script.contains("$(rm -rf /)\""));
     }
 
     #[test]
-    fn mpi_mpirun_skips_cpu_and_gpu_bind_detection() {
-        let mut env = HashMap::new();
-        assert!(!mpi_mpirun_skips_cpu_bind(&env));
-        assert!(!mpi_mpirun_skips_gpu_bind(&env));
-        env.insert("SPUR_CPU_BIND".into(), "rank".into());
-        assert!(mpi_mpirun_skips_cpu_bind(&env));
-        env.insert("SPUR_GPU_BIND".into(), "map_gpu:0,1".into());
-        assert!(mpi_mpirun_skips_gpu_bind(&env));
-        env.insert("SPUR_CPU_BIND".into(), "none".into());
-        assert!(!mpi_mpirun_skips_cpu_bind(&env));
+    fn pmix_direct_wrapper_exports_per_rank_env() {
+        let mut rank0 = HashMap::new();
+        rank0.insert("PMIX_RANK".into(), "0".into());
+        rank0.insert("PMIX_SIZE".into(), "4".into());
+        let mut rank1 = HashMap::new();
+        rank1.insert("PMIX_RANK".into(), "1".into());
+        rank1.insert("PMIX_SIZE".into(), "4".into());
+        let script =
+            build_multi_task_pmix_wrapper("/tmp/hello_mpi", 2, &[rank0, rank1], None).unwrap();
+        assert!(script.contains("case $LOCAL_RANK in"));
+        assert!(script.contains("0)\n"));
+        assert!(script.contains("export PMIX_RANK='0'"));
+        assert!(script.contains("export PMIX_RANK='1'"));
+        assert!(script.contains("for LOCAL_RANK in"));
+        assert!(!script.contains("mpirun"));
     }
 
     #[test]

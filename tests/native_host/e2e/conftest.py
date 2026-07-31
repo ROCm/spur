@@ -318,6 +318,40 @@ def label_cluster(ssh_nodes, remote_bin_dir):
 
 
 @pytest.fixture
+def mpi_multi_node_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
+    """Multi-node MPI tests with spur_mpi_pmix.so deployed."""
+    if len(ssh_nodes) < 2:
+        pytest.skip(
+            f"Multi-node MPI tests require at least 2 nodes in SPUR_TEST_NODES "
+            f"(got {len(ssh_nodes)})"
+        )
+    try:
+        ensure_bins(
+            ssh_nodes,
+            _get_binaries_dir(),
+            remote_bin_dir,
+            with_mpi_plugin=True,
+        )
+    except FileNotFoundError as exc:
+        pytest.skip(str(exc))
+
+    plugin_dir = str(Path(remote_bin_dir).parent / "lib" / "spur")
+    mpi_cfg = {
+        "mpi": {
+            "plugin_dir": plugin_dir,
+            "pmix_tmpdir": "/tmp/spur-pmix",
+        }
+    }
+    overrides = cluster_config_overrides or {}
+    merged = deep_merge(dict(overrides), mpi_cfg) if isinstance(overrides, dict) else mpi_cfg
+
+    c = _deploy_cluster(ssh_nodes, remote_bin_dir, config_overrides=merged)
+    c.mpi_preflight(2)
+    yield c
+    c.teardown()
+
+
+@pytest.fixture
 def mpi_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     """Single-node MPI tests with spur_mpi_pmix.so deployed."""
     if len(ssh_nodes) < 1:

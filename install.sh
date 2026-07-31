@@ -164,6 +164,13 @@ EXTRACTED=$(find "${TMPDIR}" -maxdepth 1 -type d -name 'spur-*' | head -1)
 cp -f "${EXTRACTED}"/bin/* "${INSTALL_DIR}/"
 chmod +x "${INSTALL_DIR}/spur" "${INSTALL_DIR}/spurctld" "${INSTALL_DIR}/spurd"
 
+PLUGIN_DIR="${INSTALL_DIR%/bin}/lib/spur"
+if [ -f "${EXTRACTED}/lib/spur/spur_mpi_pmix.so" ]; then
+    mkdir -p "${PLUGIN_DIR}"
+    cp -f "${EXTRACTED}/lib/spur/spur_mpi_pmix.so" "${PLUGIN_DIR}/"
+    log "Installed MPI plugin to ${PLUGIN_DIR}/spur_mpi_pmix.so"
+fi
+
 # --- Verify ---
 if ! "${INSTALL_DIR}/spur" --version >/dev/null 2>&1; then
     # Binary exists but --version may not be implemented yet

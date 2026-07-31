@@ -387,6 +387,10 @@ service SlurmController {
 
 service SlurmAgent {
   rpc LaunchJob(LaunchJobRequest) returns (LaunchJobResponse);
+  // Start PMIx server and verify multi-node peers before rank exec (multi-node pmix only).
+  rpc PreparePmix(PreparePmixRequest) returns (PreparePmixResponse);
+  // Tear down a prepared-but-not-launched PMIx server (prepare rollback).
+  rpc ReleasePmix(ReleasePmixRequest) returns (ReleasePmixResponse);
   rpc CancelJob(AgentCancelJobRequest) returns (google.protobuf.Empty);
   rpc SuspendJob(AgentSuspendJobRequest) returns (google.protobuf.Empty);
   rpc GetNodeResources(google.protobuf.Empty) returns (NodeResourcesResponse);
@@ -696,6 +700,13 @@ message PmixLaunchPlan {
   string tmpdir = 6;
   uint32 job_uid = 7;
   uint32 job_gid = 8;
+  uint32 num_nodes = 9;
+  uint32 node_index = 10;
+  repeated string peer_hosts = 11;
+  // 0 = agent falls back to [mpi] config defaults.
+  uint32 modex_connect_timeout_secs = 12;
+  uint32 modex_fence_timeout_secs = 13;
+  uint32 modex_verify_timeout_secs = 14;
 }
 
 // -- Agent --
@@ -725,6 +736,8 @@ message LaunchJobRequest {
   // advertised via environment variables, and any fan-out is the script's
   // own responsibility, typically via an internal `srun` call.
   bool task_fanout = 11;
+  // When true, PMIx was prepared via PreparePmix; LaunchJob must not re-init the server.
+  bool pmix_prepared = 12;
 }
 
 // Why a launch was rejected, when the controller's response depends on it.
@@ -737,6 +750,23 @@ enum LaunchFailureKind {
   // context and so fails the same way everywhere.
   LAUNCH_FAILURE_PROLOG = 1;
 }
+
+message PreparePmixRequest {
+  uint32 job_id = 1;
+  PmixLaunchPlan pmix_plan = 2;
+  uint32 run_attempt = 3;
+}
+
+message PreparePmixResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message ReleasePmixRequest {
+  uint32 job_id = 1;
+}
+
+message ReleasePmixResponse {}
 
 message LaunchJobResponse {
   bool success = 1;
@@ -947,6 +977,8 @@ message RunCommandRequest {
   bool label = 11;             // Prefix output with [rank] inside wrapper
   PmixLaunchPlan pmix_plan = 12;
   string mpi = 13;             // Resolved step MPI type: "none" or "pmix"
+  // When true, PMIx was prepared via PreparePmix on the controller before RunCommand.
+  bool pmix_prepared = 14;
 }
 
 // Register a srun-only allocation on an agent without starting a batch process.

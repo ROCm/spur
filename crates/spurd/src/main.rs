@@ -8,7 +8,6 @@ mod executor;
 pub(crate) mod job_entry;
 mod landlock;
 mod mpi_plugin;
-pub mod pmi;
 pub(crate) mod privdrop;
 pub(crate) mod pty;
 mod reporter;
