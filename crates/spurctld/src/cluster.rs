@@ -991,6 +991,16 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Record that a running job has exhausted its time limit, before the
+    /// caller sends SIGTERM. Durably marking the run first is what lets the
+    /// completion path report `Timeout` instead of reading the terminating
+    /// signal as an ordinary failure — a job that exits promptly on SIGTERM
+    /// reports back long before the grace period is up.
+    pub fn signal_time_limit(&self, job_id: JobId, at: DateTime<Utc>) -> anyhow::Result<()> {
+        self.propose(WalOperation::JobTimeLimitSignaled { job_id, at })?;
+        Ok(())
+    }
+
     /// Preempt a running job per its partition's PreemptMode. Does the
     /// controller-side state change; the caller dispatches the signal named by
     /// the returned `PreemptOutcome`. `Off` is rejected.
@@ -3187,6 +3197,7 @@ impl ClusterManager {
         job.allocated_nodes.clear();
         job.allocated_resources = None;
         job.per_node_alloc.clear();
+        job.time_limit_signaled_at = None;
         job.set_pending_reason(PendingReason::None);
         // Stale after requeue (points at nodes the job left); next dispatch resets it.
         job.actual_stdout_path = None;
@@ -3589,11 +3600,8 @@ impl ClusterManager {
                         let (derived_state, final_exit, raw_signal) =
                             Job::derived_completion(&job.node_completions, &primary);
                         let final_signal = raw_signal & !spur_core::job::OOM_SIGNAL_FLAG;
-                        let final_state = if oom {
-                            JobState::OutOfMemory
-                        } else {
-                            derived_state
-                        };
+                        let (final_state, final_reason) =
+                            job.completion_verdict(derived_state, final_exit, final_signal, oom);
                         match job.transition(final_state) {
                             Ok(()) => {
                                 job.exit_code = Some(final_exit);
@@ -3602,15 +3610,7 @@ impl ClusterManager {
                                 // steps, accumulated live by JobStepComplete; a
                                 // job with no srun steps keeps 0 (Slurm parity),
                                 // not the batch exit. Left as-is here.
-                                job.set_pending_reason(if oom {
-                                    PendingReason::OutOfMemory
-                                } else if final_signal != 0 {
-                                    PendingReason::RaisedSignal
-                                } else if final_exit != 0 {
-                                    PendingReason::NonZeroExitCode
-                                } else {
-                                    PendingReason::None
-                                });
+                                job.set_pending_reason(final_reason);
                                 job.end_time = Some(timestamp);
                                 job.node_completions.clear();
                                 Some((final_state, final_exit))
@@ -3642,6 +3642,15 @@ impl ClusterManager {
                         }],
                         ..Default::default()
                     };
+                }
+            }
+            WalOperation::JobTimeLimitSignaled { job_id, at } => {
+                if let Some(job) = jobs.get_mut(job_id) {
+                    // A run that already ended keeps the verdict it finalized
+                    // with: the watchdog raced the job's own exit and lost.
+                    if job.state.is_active() && job.time_limit_signaled_at.is_none() {
+                        job.time_limit_signaled_at = Some(*at);
+                    }
                 }
             }
             WalOperation::JobComplete {
@@ -3678,6 +3687,11 @@ impl ClusterManager {
                     }
                     job.exit_code = Some(*exit_code);
                     job.end_time = Some(timestamp);
+                    // Derived from the replicated entry, so every replica reports
+                    // the same reason for a job the watchdog had to force-kill.
+                    if *state == JobState::Timeout {
+                        job.set_pending_reason(PendingReason::TimeLimit);
+                    }
                     // Suspended -> terminal: fold the final suspended interval in
                     // and clear suspended_at so it never lingers on a terminal job.
                     if let Some(since) = job.suspended_at.take() {
@@ -6140,6 +6154,103 @@ mod tests {
         assert_eq!(job.exit_signal, 9);
         assert_eq!(job.derived_exit_code, 0);
         assert_eq!(job.pending_reason, PendingReason::RaisedSignal);
+    }
+
+    // A job that exits promptly on the watchdog's SIGTERM used to report FAILED:
+    // its completion reached the controller well before the grace period was up,
+    // and nothing durable recorded why it had been signalled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_complete_after_a_time_limit_signal_reports_timeout() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "time-limit-job", "worker1");
+        cm.signal_time_limit(job_id, Utc::now()).unwrap();
+        wait_for("time limit expiry recorded", || {
+            cm.get_job(job_id)
+                .is_some_and(|j| j.time_limit_signaled_at.is_some())
+        });
+
+        // What spurd reports for a script that dies on SIGTERM.
+        cm.node_complete(job_id, "worker1", 0, 15, 0).unwrap();
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Timeout);
+        assert_eq!(job.pending_reason, PendingReason::TimeLimit);
+        // The terminating signal is still reported, so ExitCode stays 0:15.
+        assert_eq!(job.exit_code, Some(0));
+        assert_eq!(job.exit_signal, 15);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_time_limit_signal_after_the_run_ended_is_a_noop() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        // The watchdog can lose the race: the job finished on its own just as
+        // the deadline passed, so its verdict is already final.
+        let job_id = run_job_on(&cm, "raced-job", "worker1");
+        cm.node_complete(job_id, "worker1", 0, 0, 0).unwrap();
+        settle(&cm, job_id, JobState::Completed);
+
+        cm.signal_time_limit(job_id, Utc::now()).unwrap();
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Completed);
+        assert_eq!(job.pending_reason, PendingReason::None);
+        assert!(job.time_limit_signaled_at.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_kill_after_the_grace_period_reports_the_time_limit_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        // A job that outlives the grace period is finalized by the watchdog
+        // itself rather than by an agent report.
+        let job_id = run_job_on(&cm, "grace-expired", "worker1");
+        cm.signal_time_limit(job_id, Utc::now()).unwrap();
+        cm.complete_job(job_id, -1, JobState::Timeout).unwrap();
+        settle(&cm, job_id, JobState::Timeout);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::TimeLimit);
+        assert_eq!(job.exit_code, Some(-1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeue_after_a_time_limit_kill_clears_the_marker() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let mut spec = basic_spec("requeue-after-timeout");
+        spec.requeue = true;
+        let job_id = submit_and_wait(&cm, spec);
+        let alloc = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            alloc.clone(),
+            per_node_for(&["worker1"], alloc),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        cm.signal_time_limit(job_id, Utc::now()).unwrap();
+        cm.node_complete(job_id, "worker1", 0, 15, 0).unwrap();
+
+        // Attributing the kill to the time limit is what routes a well-behaved
+        // job into the requeue path at all.
+        settle(&cm, job_id, JobState::Pending);
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.requeue_count, 1);
+        // A marker left behind would make the next run report TIMEOUT the
+        // moment it ended, whatever its outcome.
+        assert!(job.time_limit_signaled_at.is_none());
     }
 
     // Reproduces the two steps report_job_status performs (validate the wire

@@ -1305,19 +1305,21 @@ fn finish_failed_dispatch(
 /// Watchdog: gracefully terminate running jobs that exceed their time limit.
 ///
 /// Two-phase shutdown:
-///   1. **Warning phase**: When `start_time + time_limit < now`, send SIGTERM
-///      (signal 15) to all agents and record the job as "warned".
-///   2. **Kill phase**: 30 seconds after warning, if the job is still running,
-///      mark it as Timeout and send SIGKILL (signal 9).
+///   1. **Warning phase**: When `start_time + time_limit < now`, durably mark
+///      the run as timed out and send SIGTERM (signal 15) to all agents.
+///   2. **Kill phase**: 30 seconds after the warning, if the job is still
+///      running, mark it as Timeout and send SIGKILL (signal 9).
+///
+/// Both phases key off the job's replicated `time_limit_signaled_at`, so the
+/// grace period is measured from one agreed instant even across a leadership
+/// change, and a job that exits during the grace period still finalizes as
+/// `Timeout` rather than as a plain signal death.
 ///
 /// Runs every 10 seconds.
 async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     const GRACE_PERIOD_SECS: i64 = 30;
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
-    let mut warned_jobs: HashSet<spur_core::job::JobId> = HashSet::new();
-    let mut warn_times: std::collections::HashMap<spur_core::job::JobId, chrono::DateTime<Utc>> =
-        std::collections::HashMap::new();
 
     loop {
         interval.tick().await;
@@ -1374,34 +1376,7 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
                 continue;
             }
 
-            if warned_jobs.contains(&job.job_id) {
-                // Already warned — check if grace period has elapsed
-                let warn_time = warn_times
-                    .get(&job.job_id)
-                    .copied()
-                    .unwrap_or(now - chrono::Duration::seconds(GRACE_PERIOD_SECS + 1));
-                if (now - warn_time).num_seconds() < GRACE_PERIOD_SECS {
-                    continue; // Still in grace period
-                }
-
-                // Grace period expired — force kill
-                info!(
-                    job_id = job.job_id,
-                    "grace period expired — force-killing job"
-                );
-
-                if let Err(e) =
-                    cluster.complete_job(job.job_id, -1, spur_core::job::JobState::Timeout)
-                {
-                    warn!(job_id = job.job_id, error = %e, "failed to mark job as timed out");
-                    continue;
-                }
-
-                send_cancel_to_agents(&cluster, job, 9).await; // SIGKILL
-                warned_jobs.remove(&job.job_id);
-                warn_times.remove(&job.job_id);
-            } else {
-                // First time past deadline — send SIGTERM (graceful warning)
+            let Some(signaled_at) = job.time_limit_signaled_at else {
                 info!(
                     job_id = job.job_id,
                     elapsed_secs = (now - start_time).num_seconds(),
@@ -1410,17 +1385,34 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
                     "time limit exceeded — sending SIGTERM, grace period starts"
                 );
 
-                send_cancel_to_agents(&cluster, job, 15).await; // SIGTERM
-                warned_jobs.insert(job.job_id);
-                warn_times.insert(job.job_id, now);
-            }
-        }
+                // Record before signalling: if the job exits on the SIGTERM, its
+                // completion must find the run already marked as timed out.
+                if let Err(e) = cluster.signal_time_limit(job.job_id, now) {
+                    warn!(job_id = job.job_id, error = %e, "failed to record time limit expiry");
+                    continue;
+                }
 
-        // Clean up warned_jobs for jobs that are no longer running
-        // (e.g., they exited cleanly during grace period)
-        let running_ids: HashSet<_> = running.iter().map(|j| j.job_id).collect();
-        warned_jobs.retain(|id| running_ids.contains(id));
-        warn_times.retain(|id, _| running_ids.contains(id));
+                send_cancel_to_agents(&cluster, job, 15).await; // SIGTERM
+                continue;
+            };
+
+            if (now - signaled_at).num_seconds() < GRACE_PERIOD_SECS {
+                continue;
+            }
+
+            info!(
+                job_id = job.job_id,
+                "grace period expired — force-killing job"
+            );
+
+            if let Err(e) = cluster.complete_job(job.job_id, -1, spur_core::job::JobState::Timeout)
+            {
+                warn!(job_id = job.job_id, error = %e, "failed to mark job as timed out");
+                continue;
+            }
+
+            send_cancel_to_agents(&cluster, job, 9).await; // SIGKILL
+        }
     }
 }
 

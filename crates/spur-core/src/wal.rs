@@ -68,6 +68,15 @@ pub enum WalOperation {
         exit_code: i32,
         signal: i32,
     },
+    /// The time-limit watchdog signalled a running job for exhausting its wall
+    /// clock. Durable so the grace period survives a leadership change and so
+    /// every replica finalizes the run as `Timeout` rather than reading the
+    /// terminating signal as an ordinary failure. `at` is stamped on the leader
+    /// so replicas share one instant instead of consulting their own clocks.
+    JobTimeLimitSignaled {
+        job_id: JobId,
+        at: chrono::DateTime<chrono::Utc>,
+    },
     /// An srun job step finished. Records the step's exit code durably so the
     /// job's DerivedExitCode (running max over steps) survives restart/replay.
     JobStepComplete {

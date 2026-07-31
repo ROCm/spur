@@ -245,6 +245,9 @@ pub enum PendingReason {
     ReqNodeNotAvail,
     BeginTime,
     DeadLine,
+    /// Slurm's `FAIL_TIMEOUT`: the run ended because it exhausted its wall-clock
+    /// time limit. Sibling of `DeadLine`, which fires before the job ever starts.
+    TimeLimit,
     Licenses,
     NonZeroExitCode,
     RaisedSignal,
@@ -331,6 +334,7 @@ impl PendingReason {
             Self::ReqNodeNotAvail => "ReqNodeNotAvail",
             Self::BeginTime => "BeginTime",
             Self::DeadLine => "DeadLine",
+            Self::TimeLimit => "TimeLimit",
             Self::Licenses => "Licenses",
             Self::NonZeroExitCode => "NonZeroExitCode",
             Self::RaisedSignal => "RaisedSignal",
@@ -718,6 +722,15 @@ pub struct Job {
     #[serde(default)]
     pub srun_step_dispatch: bool,
 
+    /// Wall-clock instant the controller signalled this run for exceeding its
+    /// time limit, cleared on requeue. Replicated rather than kept in the
+    /// watchdog's memory for two reasons: the completion path runs inside the
+    /// Raft apply and must reach the same verdict on every replica, and a
+    /// leadership change mid-grace-period would otherwise restart the grace
+    /// period from scratch.
+    #[serde(default)]
+    pub time_limit_signaled_at: Option<DateTime<Utc>>,
+
     /// Wall-clock instant the job entered Suspended (None unless currently suspended).
     #[serde(default)]
     pub suspended_at: Option<DateTime<Utc>>,
@@ -780,6 +793,7 @@ impl Job {
             het_job_id: None,
             het_group: None,
             node_completions: HashMap::new(),
+            time_limit_signaled_at: None,
             suspended_at: None,
             suspended_secs: 0,
             bb_stage_state: BbStageState::None,
@@ -827,6 +841,39 @@ impl Job {
             }
             None => (JobState::Completed, 0, 0),
         }
+    }
+
+    /// Reconcile the per-node completion verdict with what the controller
+    /// already knows about the run, yielding its final `(state, reason)`.
+    ///
+    /// A run signalled for exceeding its time limit reports `Timeout` however
+    /// the process itself ended: the exit signal records how it was stopped,
+    /// not why. An OOM kill outranks even that, being direct kernel evidence of
+    /// a distinct failure the user has to act on.
+    pub fn completion_verdict(
+        &self,
+        derived_state: JobState,
+        exit_code: i32,
+        signal: i32,
+        oom: bool,
+    ) -> (JobState, PendingReason) {
+        let state = if oom {
+            JobState::OutOfMemory
+        } else if self.time_limit_signaled_at.is_some() {
+            JobState::Timeout
+        } else {
+            derived_state
+        };
+
+        let reason = match state {
+            JobState::OutOfMemory => PendingReason::OutOfMemory,
+            JobState::Timeout => PendingReason::TimeLimit,
+            _ if signal != 0 => PendingReason::RaisedSignal,
+            _ if exit_code != 0 => PendingReason::NonZeroExitCode,
+            _ => PendingReason::None,
+        };
+
+        (state, reason)
     }
 
     pub fn all_nodes_completed(&self) -> bool {
@@ -1096,6 +1143,10 @@ impl Job {
             (JobState::Completing, JobState::Completed) => true,
             (JobState::Completing, JobState::Failed) => true,
             (JobState::Completing, JobState::Cancelled) => true,
+            // A job signalled for exceeding its time limit routes through
+            // Completing like any other, so the final verdict lands from there
+            // (Slurm's JOB_TIMEOUT | JOB_COMPLETING).
+            (JobState::Completing, JobState::Timeout) => true,
             (JobState::Completing, JobState::NodeFail) => true,
             (JobState::Completing, JobState::OutOfMemory) => true,
             (JobState::Suspended, JobState::Running) => true,
@@ -1519,6 +1570,68 @@ mod tests {
         assert_eq!(signal, 11);
     }
 
+    /// A job whose run the watchdog signalled for exhausting its time limit.
+    fn timed_out_job() -> Job {
+        let mut job = make_job();
+        job.time_limit_signaled_at = Some(Utc::now());
+        job
+    }
+
+    #[test]
+    fn completion_verdict_reports_timeout_for_a_job_killed_by_its_time_limit() {
+        // The regression: SIGTERM from the watchdog looks exactly like any other
+        // signal death to derived_completion, which reports Failed.
+        let (state, reason) = timed_out_job().completion_verdict(JobState::Failed, 0, 15, false);
+        assert_eq!(state, JobState::Timeout);
+        assert_eq!(reason, PendingReason::TimeLimit);
+    }
+
+    #[test]
+    fn completion_verdict_reports_timeout_when_the_job_exits_cleanly_on_sigterm() {
+        // A script that traps SIGTERM, checkpoints, and exits 0 still ran out of
+        // time; the run's outcome is not the handler's exit status.
+        let (state, reason) = timed_out_job().completion_verdict(JobState::Completed, 0, 0, false);
+        assert_eq!(state, JobState::Timeout);
+        assert_eq!(reason, PendingReason::TimeLimit);
+    }
+
+    #[test]
+    fn completion_verdict_leaves_an_unsignalled_death_alone() {
+        // Nothing to do with the time limit: a job killed by an external SIGKILL
+        // must keep reporting Failed / RaisedSignal.
+        let (state, reason) = make_job().completion_verdict(JobState::Failed, 0, 9, false);
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(reason, PendingReason::RaisedSignal);
+
+        let (state, reason) = make_job().completion_verdict(JobState::Failed, 42, 0, false);
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(reason, PendingReason::NonZeroExitCode);
+
+        let (state, reason) = make_job().completion_verdict(JobState::Completed, 0, 0, false);
+        assert_eq!(state, JobState::Completed);
+        assert_eq!(reason, PendingReason::None);
+    }
+
+    #[test]
+    fn completion_verdict_lets_an_oom_kill_outrank_the_time_limit() {
+        // Kernel evidence of a specific failure the user must act on beats the
+        // controller's own reason for signalling the job.
+        let (state, reason) = timed_out_job().completion_verdict(JobState::Failed, 0, 9, true);
+        assert_eq!(state, JobState::OutOfMemory);
+        assert_eq!(reason, PendingReason::OutOfMemory);
+    }
+
+    #[test]
+    fn a_timed_out_job_finalizes_from_completing() {
+        // The completion path routes every job through Completing, so without
+        // this transition a timed-out job could not reach its verdict.
+        let mut job = make_job();
+        job.transition(JobState::Running).unwrap();
+        job.transition(JobState::Completing).unwrap();
+        job.transition(JobState::Timeout).unwrap();
+        assert_eq!(job.state, JobState::Timeout);
+    }
+
     #[test]
     fn completion_state_for_exit_code_maps_expected_states() {
         assert_eq!(
@@ -1810,6 +1923,7 @@ mod tests {
         (PendingReason::BurstBufferResources, "BurstBufferResources"),
         (PendingReason::BurstBufferStageIn, "BurstBufferStageIn"),
         (PendingReason::JobHoldMaxRequeue, "JobHoldMaxRequeue"),
+        (PendingReason::TimeLimit, "TimeLimit"),
         (PendingReason::AssocMaxJobsLimit, "AssocMaxJobsLimit"),
         (
             PendingReason::AssocMaxSubmitJobLimit,
