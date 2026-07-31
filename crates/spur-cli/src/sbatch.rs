@@ -625,51 +625,15 @@ fn convert_pbs_resource(spec: &str) -> Option<String> {
     None
 }
 
-/// Parse a datetime argument. Supports:
-///   - ISO 8601: "2026-03-22T10:00:00Z"
-///   - "now" → current time
-///   - "now+Nhours", "now+Nminutes" → offset from now
+/// Parse a `--begin` / `--deadline` value using Slurm's time grammar.
+///
+/// A specification without a timezone is read in this host's local zone, as
+/// Slurm does; see [`spur_core::time_spec`] for the accepted forms.
 fn parse_datetime_arg(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
-    let s = s.trim();
-    if s.eq_ignore_ascii_case("now") {
-        return Ok(chrono::Utc::now());
-    }
-    if let Some(rest) = s.strip_prefix("now+").or_else(|| s.strip_prefix("now +")) {
-        let rest = rest.trim();
-        // Try "Nhours", "Nminutes", "Nseconds", "Ndays"
-        if let Some(n) = rest
-            .strip_suffix("hours")
-            .or_else(|| rest.strip_suffix("hour"))
-        {
-            let n: i64 = n.trim().parse().context("invalid offset")?;
-            return Ok(chrono::Utc::now() + chrono::Duration::hours(n));
-        }
-        if let Some(n) = rest
-            .strip_suffix("minutes")
-            .or_else(|| rest.strip_suffix("minute"))
-        {
-            let n: i64 = n.trim().parse().context("invalid offset")?;
-            return Ok(chrono::Utc::now() + chrono::Duration::minutes(n));
-        }
-        if let Some(n) = rest
-            .strip_suffix("seconds")
-            .or_else(|| rest.strip_suffix("second"))
-        {
-            let n: i64 = n.trim().parse().context("invalid offset")?;
-            return Ok(chrono::Utc::now() + chrono::Duration::seconds(n));
-        }
-        if let Some(n) = rest
-            .strip_suffix("days")
-            .or_else(|| rest.strip_suffix("day"))
-        {
-            let n: i64 = n.trim().parse().context("invalid offset")?;
-            return Ok(chrono::Utc::now() + chrono::Duration::days(n));
-        }
-        bail!("unsupported time offset format: {}", rest);
-    }
-    // Try ISO 8601 parse
-    s.parse::<chrono::DateTime<chrono::Utc>>()
-        .context("invalid datetime format (expected ISO 8601 or 'now+Nhours')")
+    Ok(spur_core::time_spec::parse_time_spec(
+        s,
+        &chrono::Local::now(),
+    )?)
 }
 
 /// Parse memory string (e.g., "4G", "4096M", "4096") into MB.
