@@ -27,6 +27,82 @@ use crate::sched_stats::SchedStatsCollector;
 const FORWARDED_HEADER: &str = "x-spur-forwarded";
 const LEADER_HEADER: &str = "x-spur-leader";
 
+/// Resolve the comm address for an agent registration.
+///
+/// Tries the advertised address first, then the gRPC peer IP (Slurm-style
+/// dynamic registration fallback). Loopback or link-local results are deferred
+/// when a routable candidate is also available.
+fn resolve_registration_comm_addr(
+    advertised: &str,
+    remote_addr: &str,
+    reject_loopback: bool,
+) -> Result<String, Status> {
+    let mut candidates = Vec::new();
+    if !advertised.is_empty() {
+        candidates.push(advertised);
+    }
+    if !remote_addr.is_empty() && remote_addr != advertised {
+        candidates.push(remote_addr);
+    }
+
+    if candidates.is_empty() {
+        return Err(Status::invalid_argument(
+            "no comm address available for registration",
+        ));
+    }
+
+    let mut last_err = None;
+    let mut unusable_result = None;
+    for candidate in candidates {
+        match spur_net::validate_comm_address(candidate, reject_loopback) {
+            Ok(addr) if spur_net::comm_addr_is_unusable(&addr) => {
+                if unusable_result.is_none() {
+                    unusable_result = Some((candidate.to_string(), addr));
+                }
+            }
+            Ok(addr) => {
+                if candidate != addr {
+                    info!(
+                        candidate = %candidate,
+                        comm_addr = %addr,
+                        "normalized comm address for registration"
+                    );
+                }
+                return Ok(addr);
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+
+    if let Some((candidate, addr)) = unusable_result {
+        warn!(
+            comm_addr = %addr,
+            candidate = %candidate,
+            "node registered with loopback or link-local comm address"
+        );
+        return Ok(addr);
+    }
+
+    Err(Status::invalid_argument(format!(
+        "invalid comm address: {}",
+        last_err.unwrap()
+    )))
+}
+
+fn node_comm_http_url(node: &spur_core::node::Node, node_name: &str) -> Result<String, Status> {
+    let host = node
+        .comm_addr()
+        .ok_or_else(|| Status::unavailable(format!("node {node_name} has no comm address")))?;
+    Ok(format!("http://{host}:{}", node.port))
+}
+
+fn node_comm_socket(node: &spur_core::node::Node, node_name: &str) -> Result<String, Status> {
+    let host = node
+        .comm_addr()
+        .ok_or_else(|| Status::unavailable(format!("node {node_name} has no comm address")))?;
+    Ok(format!("{host}:{}", node.port))
+}
+
 /// Forwarding decision for read RPCs, split out so it's unit-testable.
 fn read_forwarding_policy(is_leader: bool, is_forwarded: bool) -> bool {
     !is_leader && !is_forwarded
@@ -977,17 +1053,9 @@ impl SlurmController for ControllerService {
         let req = request.into_inner();
         let resources = req.resources.map(proto_to_resource_set).unwrap_or_default();
 
-        let agent_addr = if !req.address.is_empty() {
-            req.address.clone()
-        } else {
-            let is_loopback =
-                remote_addr.is_empty() || remote_addr == "127.0.0.1" || remote_addr == "::1";
-            if is_loopback {
-                "127.0.0.1".to_string()
-            } else {
-                remote_addr
-            }
-        };
+        let reject_loopback = self.cluster.config.network.reject_loopback_comm_addr;
+        let agent_addr =
+            resolve_registration_comm_addr(&req.address, &remote_addr, reject_loopback)?;
 
         let agent_port = if req.port > 0 { req.port as u16 } else { 6818 };
 
@@ -995,6 +1063,8 @@ impl SlurmController for ControllerService {
 
         self.cluster
             .register_node(
+                // NodeName and NodeHostname are the same until agents can supply both.
+                req.hostname.clone(),
                 req.hostname.clone(),
                 resources,
                 agent_addr,
@@ -1322,8 +1392,7 @@ impl SlurmController for ControllerService {
         let node = self.cluster.get_node(target_node).ok_or_else(|| {
             Status::unavailable(format!("node {target_node} is not currently registered"))
         })?;
-        let host = node.address.as_deref().unwrap_or(&node.name);
-        let node_addr = format!("{}:{}", host, node.port);
+        let node_addr = node_comm_socket(&node, target_node)?;
 
         let existing_steps = self.cluster.get_steps(job_id);
         let step_id = existing_steps
@@ -1545,11 +1614,7 @@ impl SlurmController for ControllerService {
             .cluster
             .get_node(&node_name)
             .ok_or_else(|| Status::not_found(format!("node {} not found", node_name)))?;
-        let addr = node
-            .address
-            .as_ref()
-            .ok_or_else(|| Status::internal(format!("node {} has no agent address", node_name)))?;
-        let agent_addr = format!("http://{}:{}", addr, node.port);
+        let agent_addr = node_comm_http_url(&node, &node_name)?;
 
         let mut agent = SlurmAgentClient::connect(agent_addr.clone())
             .await
@@ -1660,13 +1725,16 @@ impl SlurmController for ControllerService {
                 dispatch_errors.push(format!("node {node_name} not found"));
                 continue;
             };
-            let Some(addr) = node.address.as_ref() else {
-                dispatch_errors.push(format!("node {node_name} has no agent address"));
-                continue;
+            let agent_addr = match node_comm_http_url(&node, &node_name) {
+                Ok(url) => url,
+                Err(e) => {
+                    dispatch_errors.push(format!("node {node_name}: {e}"));
+                    continue;
+                }
             };
             dispatches.push(NodeDispatch {
                 node_name,
-                agent_addr: format!("http://{}:{}", addr, node.port),
+                agent_addr,
                 node_tasks,
             });
         }
@@ -2608,6 +2676,35 @@ mod tests {
     use tonic::Code;
 
     #[test]
+    fn resolve_registration_comm_addr_normalizes_explicit_ip() {
+        assert_eq!(
+            resolve_registration_comm_addr("10.0.0.2", "", false).unwrap(),
+            "10.0.0.2"
+        );
+    }
+
+    #[test]
+    fn resolve_registration_comm_addr_falls_back_to_peer_ip() {
+        assert_eq!(
+            resolve_registration_comm_addr("", "10.0.0.9", false).unwrap(),
+            "10.0.0.9"
+        );
+    }
+
+    #[test]
+    fn resolve_registration_comm_addr_prefers_peer_over_loopback_advertised() {
+        assert_eq!(
+            resolve_registration_comm_addr("127.0.0.1", "10.245.159.30", false).unwrap(),
+            "10.245.159.30"
+        );
+    }
+
+    #[test]
+    fn resolve_registration_comm_addr_rejects_loopback_when_configured() {
+        assert!(resolve_registration_comm_addr("127.0.0.1", "", true).is_err());
+    }
+
+    #[test]
     fn resolve_user_namespace_sa_fails_closed_on_cold_cache() {
         // A not-yet-loaded cache resolves fail-open, so the scoped-kubeconfig path
         // must reject rather than mint an unscoped (cluster-wide) token.
@@ -2809,6 +2906,7 @@ mod tests {
 
         svc.cluster
             .register_node(
+                "n1".into(),
                 "n1".into(),
                 ResourceSet {
                     cpus: 8,

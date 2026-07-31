@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use tracing::{debug, error, info, warn};
 
-use spur_core::node::NodeSource;
+use spur_core::node::{Node, NodeSource};
 use spur_core::partition::requested_partition_names;
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
@@ -26,6 +26,20 @@ use crate::raft::RaftHandle;
 /// awaits delivery. Best-effort cleanup must not stall eviction on an
 /// unreachable agent.
 const CANCEL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn node_comm_socket(node: &Node) -> Option<String> {
+    let host = node.comm_addr()?;
+    Some(format!("{host}:{}", node.port))
+}
+
+fn node_comm_http_url(node: &Node) -> Option<String> {
+    let host = node.comm_addr()?;
+    Some(format!("http://{host}:{}", node.port))
+}
+
+fn node_comm_endpoint(node: &Node) -> Option<(String, u16)> {
+    Some((node.comm_addr()?.to_string(), node.port))
+}
 
 /// Spawn the time-limit enforcement watchdog and power manager alongside the scheduler loop.
 pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
@@ -325,9 +339,14 @@ async fn process_assignment(
     let peer_addrs: Vec<String> = all_nodes
         .iter()
         .filter_map(|name| {
-            cluster
-                .get_node(name)
-                .and_then(|n| n.address.as_ref().map(|a| format!("{}:{}", a, n.port)))
+            let n = cluster.get_node(name)?;
+            if n.comm_addr().is_none() {
+                warn!(
+                    node = %name,
+                    "no comm address for peer list; node omitted from multi-node peers"
+                );
+            }
+            node_comm_socket(&n)
         })
         .collect();
 
@@ -1092,7 +1111,18 @@ async fn register_allocation_on_nodes(
     for node_name in &dispatch_nodes {
         let node_info = cluster.get_node(node_name);
         let (addr, port) = match node_info {
-            Some(ref n) if n.address.is_some() => (n.address.clone().unwrap(), n.port),
+            Some(ref n) => match node_comm_endpoint(n) {
+                Some(ep) => ep,
+                None => {
+                    warn!(
+                        job_id,
+                        node = %node_name,
+                        "no comm address for node, skipping allocation registration"
+                    );
+                    failures += 1;
+                    continue;
+                }
+            },
             _ => {
                 warn!(
                     job_id,
@@ -1254,7 +1284,18 @@ async fn confirm_dispatch_on_nodes(
     for (node_idx, node_name) in dispatch_nodes.iter().enumerate() {
         let node_info = cluster.get_node(node_name);
         let (addr, port) = match node_info {
-            Some(ref n) if n.address.is_some() => (n.address.clone().unwrap(), n.port),
+            Some(ref n) => match node_comm_endpoint(n) {
+                Some(ep) => ep,
+                None => {
+                    warn!(
+                        job_id,
+                        node = %node_name,
+                        "no comm address for node, skipping dispatch confirmation"
+                    );
+                    failures += 1;
+                    continue;
+                }
+            },
             _ => {
                 warn!(
                     job_id,
@@ -1710,8 +1751,16 @@ fn cancel_agent_addrs(
     let mut addrs = Vec::with_capacity(node_names.len());
     for node_name in node_names {
         match cluster.get_node(node_name) {
-            Some(ref n) if n.address.is_some() => {
-                addrs.push(format!("http://{}:{}", n.address.clone().unwrap(), n.port));
+            Some(ref n) => {
+                if let Some(url) = node_comm_http_url(n) {
+                    addrs.push(url);
+                } else {
+                    warn!(
+                        job_id,
+                        node = %node_name,
+                        "no comm address — cannot cancel job on node"
+                    );
+                }
             }
             _ => {
                 warn!(
@@ -1783,7 +1832,14 @@ pub async fn send_suspend_to_agents(
     for node_name in &job.allocated_nodes {
         let node_info = cluster.get_node(node_name);
         let (addr, port) = match node_info {
-            Some(ref n) if n.address.is_some() => (n.address.clone().unwrap(), n.port),
+            Some(ref n) => match node_comm_endpoint(n) {
+                Some(ep) => ep,
+                None => {
+                    warn!(job_id = job.job_id, node = %node_name,
+                        "no comm address — cannot suspend/resume job on node");
+                    continue;
+                }
+            },
             _ => {
                 warn!(job_id = job.job_id, node = %node_name,
                     "no agent address — cannot suspend/resume job on node");
@@ -2503,6 +2559,7 @@ mod tests {
         fn register_node_at(cm: &ClusterManager, name: &str, addr: std::net::SocketAddr) {
             cm.register_node(
                 name.into(),
+                name.into(),
                 ResourceSet {
                     cpus: 4,
                     memory_mb: 8000,
@@ -2520,6 +2577,34 @@ mod tests {
             wait_for(&format!("node '{n}' registered"), || {
                 cm.get_node(&n).is_some()
             });
+        }
+
+        fn register_node_without_comm_addr(cm: &ClusterManager, name: &str) {
+            use crate::raft::StateMachineApply;
+            use spur_core::wal::WalOperation;
+
+            cm.apply_operation(&WalOperation::NodeRegister {
+                name: name.into(),
+                hostname: name.into(),
+                resources: ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                address: String::new(),
+                port: 6818,
+                wg_pubkey: String::new(),
+                version: String::new(),
+                labels: HashMap::new(),
+            });
+            let n = name.to_string();
+            wait_for(
+                &format!("node '{n}' registered without comm address"),
+                || {
+                    cm.get_node(&n)
+                        .is_some_and(|node| node.comm_addr().is_none())
+                },
+            );
         }
 
         fn submit_and_wait(cm: &ClusterManager, spec: JobSpec) -> spur_core::job::JobId {
@@ -2937,6 +3022,18 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn dispatch_aborts_when_node_has_no_comm_address() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            register_node_without_comm_addr(&cm, "n1");
+
+            let job_id = submit_and_wait(&cm, batch_spec("no-comm-addr", 1));
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn a_prolog_failure_drains_the_node_and_parks_the_job() {
             use spur_core::job::{JobState, PendingReason};
 
@@ -3283,6 +3380,7 @@ mod tests {
 
         fn register_k8s_node_at(cm: &ClusterManager, name: &str, addr: std::net::SocketAddr) {
             cm.register_node(
+                name.into(),
                 name.into(),
                 ResourceSet {
                     cpus: 4,

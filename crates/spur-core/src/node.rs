@@ -226,7 +226,11 @@ pub enum NodeSource {
 /// A compute node in the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
+    /// Cluster node name (NodeName): used by `-w`, partitions, and display.
     pub name: String,
+    /// OS hostname reported at agent registration (NodeHostname).
+    #[serde(default)]
+    pub hostname: String,
     pub state: NodeState,
     pub state_reason: Option<String>,
     /// When true, the current state was set by an operator (admin API, drain,
@@ -261,7 +265,7 @@ pub struct Node {
     pub agent_start_time: Option<DateTime<Utc>>,
     pub last_heartbeat: Option<DateTime<Utc>>,
 
-    /// Agent address for gRPC communication.
+    /// Routable comm address for agent gRPC and inter-node TCP (NodeAddr).
     pub address: Option<String>,
     /// Agent gRPC listen port.
     pub port: u16,
@@ -297,6 +301,7 @@ impl Node {
     pub fn new(name: String, resources: ResourceSet) -> Self {
         Self {
             name,
+            hostname: String::new(),
             state: NodeState::Unknown,
             state_reason: None,
             admin_locked: false,
@@ -343,6 +348,25 @@ impl Node {
     /// Whether this node can accept new work.
     pub fn is_schedulable(&self) -> bool {
         self.state.is_available()
+    }
+
+    /// Routable comm address (NodeAddr), when registered.
+    pub fn comm_addr(&self) -> Option<&str> {
+        self.address.as_deref()
+    }
+
+    /// Host used to reach this agent; prefers comm address over node name.
+    pub fn agent_host(&self) -> &str {
+        self.comm_addr().unwrap_or(&self.name)
+    }
+
+    /// OS hostname reported at registration; falls back to node name.
+    pub fn node_hostname(&self) -> &str {
+        if self.hostname.is_empty() {
+            &self.name
+        } else {
+            &self.hostname
+        }
     }
 
     /// Update state based on allocation level.
@@ -603,5 +627,23 @@ mod tests {
     fn node_state_from_short_or_name_rejects_unknown() {
         assert_eq!(NodeState::from_short_or_name("bogus"), None);
         assert_eq!(NodeState::from_short_or_name(""), None);
+    }
+
+    #[test]
+    fn agent_host_prefers_comm_addr() {
+        let mut node = Node::new("node1".into(), ResourceSet::default());
+        assert_eq!(node.agent_host(), "node1");
+        node.address = Some("10.0.0.5".into());
+        assert_eq!(node.agent_host(), "10.0.0.5");
+    }
+
+    #[test]
+    fn node_hostname_falls_back_to_name() {
+        let node = Node::new("node1".into(), ResourceSet::default());
+        assert_eq!(node.node_hostname(), "node1");
+
+        let mut node = Node::new("node1".into(), ResourceSet::default());
+        node.hostname = "host1.example.com".into();
+        assert_eq!(node.node_hostname(), "host1.example.com");
     }
 }

@@ -87,9 +87,9 @@ struct Args {
     #[arg(short = 'N', long)]
     hostname: Option<String>,
 
-    /// Advertised IP address for the controller to reach this agent.
+    /// Advertised comm address (IP or routable hostname) for inter-node reachability.
     /// If not set, auto-detected from WireGuard interface or hostname resolution.
-    #[arg(long, env = "SPUR_NODE_ADDRESS")]
+    #[arg(long, alias = "comm-address", env = "SPUR_NODE_ADDRESS")]
     address: Option<String>,
 
     /// Node labels for partition routing (key=value pairs).
@@ -179,14 +179,49 @@ async fn main() -> anyhow::Result<()> {
         spur_update::SPUR_BINARIES,
     );
 
-    // Detect node address (explicit --address > WireGuard > hostname)
-    let node_address = if let Some(ref addr) = args.address {
-        info!(ip = %addr, "using explicit node address");
-        spur_net::address::NodeAddress {
-            ip: addr.clone(),
-            hostname: hostname.clone(),
-            port: listen_port,
-            source: spur_net::address::AddressSource::Static,
+    // Detect node address (explicit --address/--comm-address > WireGuard > hostname)
+    let explicit_addr = args
+        .address
+        .clone()
+        .or_else(|| std::env::var("SPUR_COMM_ADDRESS").ok());
+    let node_address = if let Some(ref addr) = explicit_addr {
+        match spur_net::normalize_comm_address(addr) {
+            Ok(normalized) => {
+                if spur_net::comm_addr_is_unusable(&normalized) {
+                    warn!(
+                        comm_addr = %normalized,
+                        input = %addr,
+                        "explicit comm address resolves to loopback; inter-node jobs may fail"
+                    );
+                } else if normalized != *addr {
+                    info!(
+                        input = %addr,
+                        comm_addr = %normalized,
+                        "normalized explicit comm address"
+                    );
+                } else {
+                    info!(comm_addr = %normalized, "using explicit comm address");
+                }
+                spur_net::address::NodeAddress {
+                    ip: normalized,
+                    hostname: hostname.clone(),
+                    port: listen_port,
+                    source: spur_net::address::AddressSource::Static,
+                }
+            }
+            Err(e) => {
+                warn!(
+                    input = %addr,
+                    error = %e,
+                    "failed to normalize comm address; using raw value"
+                );
+                spur_net::address::NodeAddress {
+                    ip: addr.clone(),
+                    hostname: hostname.clone(),
+                    port: listen_port,
+                    source: spur_net::address::AddressSource::Static,
+                }
+            }
         }
     } else {
         let wg_interface = std::env::var("SPUR_WG_INTERFACE").unwrap_or_else(|_| "spur0".into());

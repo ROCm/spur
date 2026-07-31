@@ -45,6 +45,7 @@ Create ``/etc/spur/spur.conf``. The repository includes ``examples/spur.conf``. 
    wg_enabled = true
    wg_interface = "spur0"
    agent_port = 6818
+   # reject_loopback_comm_addr = true   # optional: refuse agent registrations whose comm address is loopback or link-local
 
    [[partitions]]
    name = "gpu"
@@ -57,6 +58,7 @@ Create ``/etc/spur/spur.conf``. The repository includes ``examples/spur.conf``. 
    cpus = 128
    memory_mb = 512000
    gres = ["gpu:mi300x:8"]
+   # address = "10.44.0.2"   # optional default comm address before the agent registers
 
 Start the controller:
 
@@ -127,7 +129,12 @@ Start the agent:
    spurd -D \
        --controller http://10.44.0.1:6817 \
        --hostname gpu-node-1 \
+       --address 10.44.0.2 \
        --listen [::]:6818
+
+``--address`` and ``--comm-address`` are equivalent. You can also set
+``SPUR_NODE_ADDRESS`` or ``SPUR_COMM_ADDRESS``. Pass a routable IP or FQDN,
+not the short hostname alone when ``/etc/hosts`` maps it to loopback.
 
 The agent auto-detects CPUs, memory, and GPUs, then registers with the controller over the mesh.
 
