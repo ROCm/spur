@@ -705,6 +705,16 @@ message LaunchJobRequest {
   // the controller can drop stale-run reports. 0 = unset (legacy), check off.
   uint32 run_attempt = 9;
   PmixLaunchPlan pmix_plan = 10;
+  // True when this dispatch is itself a per-task fan-out mechanism (a
+  // standalone `srun` request routed through the batch dispatch path, e.g.
+  // an allocation spanning Kubernetes-backed nodes) and `spec.script` is the
+  // literal command that should run `tasks_per_node` times on this node.
+  // False (default) for a genuine `sbatch` batch script: it runs exactly
+  // once per node regardless of tasks_per_node or mpi, matching Slurm
+  // semantics — task multiplicity (including multi-rank MPI) is only
+  // advertised via environment variables, and any fan-out is the script's
+  // own responsibility, typically via an internal `srun` call.
+  bool task_fanout = 11;
 }
 
 // Why a launch was rejected, when the controller's response depends on it.
