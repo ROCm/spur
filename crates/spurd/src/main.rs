@@ -191,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("comm address normalization task failed: {e}"))?
         {
             Ok(normalized) => {
-                if spur_net::comm_addr_is_unusable(&normalized) {
+                if spur_net::normalized_comm_addr_is_unusable(&normalized) {
                     warn!(
                         comm_addr = %normalized,
                         input = %addr,

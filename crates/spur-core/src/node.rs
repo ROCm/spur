@@ -355,20 +355,6 @@ impl Node {
         self.address.as_deref()
     }
 
-    /// Host used to reach this agent; prefers comm address over node name.
-    pub fn agent_host(&self) -> &str {
-        self.comm_addr().unwrap_or(&self.name)
-    }
-
-    /// OS hostname reported at registration; falls back to node name.
-    pub fn node_hostname(&self) -> &str {
-        if self.hostname.is_empty() {
-            &self.name
-        } else {
-            &self.hostname
-        }
-    }
-
     /// Update state based on allocation level.
     pub fn update_state_from_alloc(&mut self) {
         if self.state.is_admin_hold() {
@@ -627,23 +613,5 @@ mod tests {
     fn node_state_from_short_or_name_rejects_unknown() {
         assert_eq!(NodeState::from_short_or_name("bogus"), None);
         assert_eq!(NodeState::from_short_or_name(""), None);
-    }
-
-    #[test]
-    fn agent_host_prefers_comm_addr() {
-        let mut node = Node::new("node1".into(), ResourceSet::default());
-        assert_eq!(node.agent_host(), "node1");
-        node.address = Some("10.0.0.5".into());
-        assert_eq!(node.agent_host(), "10.0.0.5");
-    }
-
-    #[test]
-    fn node_hostname_falls_back_to_name() {
-        let node = Node::new("node1".into(), ResourceSet::default());
-        assert_eq!(node.node_hostname(), "node1");
-
-        let mut node = Node::new("node1".into(), ResourceSet::default());
-        node.hostname = "host1.example.com".into();
-        assert_eq!(node.node_hostname(), "host1.example.com");
     }
 }

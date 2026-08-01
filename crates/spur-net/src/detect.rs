@@ -74,7 +74,7 @@ fn get_wg_address(interface: &str) -> Option<String> {
 fn resolve_hostname(hostname: &str) -> String {
     match crate::comm_addr::normalize_comm_address(hostname) {
         Ok(addr) => {
-            if crate::comm_addr::comm_addr_is_unusable(&addr) {
+            if crate::comm_addr::normalized_comm_addr_is_unusable(&addr) {
                 warn!(
                     hostname,
                     comm_addr = %addr,

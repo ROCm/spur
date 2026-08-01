@@ -332,19 +332,29 @@ async fn process_assignment(
     // LaunchJob dispatch below, which — unlike the old fire-and-forget
     // spawn — now runs (and is awaited) *before* the job is allowed to
     // become visibly Running.
-    let peer_addrs: Vec<String> = all_nodes
-        .iter()
-        .filter_map(|name| {
-            let n = cluster.get_node(name)?;
-            if n.comm_addr().is_none() {
+    let peer_addrs: Vec<String> = {
+        let mut addrs = Vec::with_capacity(all_nodes.len());
+        for name in &all_nodes {
+            let Some(n) = cluster.get_node(name) else {
                 warn!(
+                    job_id,
                     node = %name,
-                    "no comm address for peer list; node omitted from multi-node peers"
+                    "node missing while building peer list"
                 );
-            }
-            node_comm_socket(&n)
-        })
-        .collect();
+                return false;
+            };
+            let Some(addr) = node_comm_socket(&n) else {
+                warn!(
+                    job_id,
+                    node = %name,
+                    "no comm address for peer list"
+                );
+                return false;
+            };
+            addrs.push(addr);
+        }
+        addrs
+    };
 
     let tasks_per_node = if let Some(tpn) = spec.tasks_per_node {
         tpn

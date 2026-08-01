@@ -18,21 +18,19 @@ pub enum CommAddressError {
     Unusable(String, String),
 }
 
-/// True when `addr` is loopback or an unspecified address.
-pub fn is_loopback_ip(addr: IpAddr) -> bool {
-    match addr {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
-        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
-    }
-}
-
 /// True when `addr` is unsuitable for inter-node reachability (loopback,
 /// unspecified, or link-local).
-pub fn is_unusable_comm_ip(addr: IpAddr) -> bool {
+fn is_unusable_comm_ip(addr: IpAddr) -> bool {
     match addr {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified() || v4.is_link_local(),
         IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified() || v6.is_unicast_link_local(),
     }
+}
+
+/// Whether an already-normalized comm address is unsuitable for inter-node
+/// reachability (loopback, unspecified, or link-local).
+pub fn normalized_comm_addr_is_unusable(normalized: &str) -> bool {
+    normalized.parse::<IpAddr>().is_ok_and(is_unusable_comm_ip)
 }
 
 /// Whether a comm-address string resolves to an address unsuitable for
@@ -166,6 +164,12 @@ mod tests {
             normalize_comm_address(""),
             Err(CommAddressError::Empty)
         ));
+    }
+
+    #[test]
+    fn normalized_comm_addr_is_unusable_detects_loopback() {
+        assert!(normalized_comm_addr_is_unusable("127.0.0.1"));
+        assert!(!normalized_comm_addr_is_unusable("10.0.0.1"));
     }
 
     #[test]

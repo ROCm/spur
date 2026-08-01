@@ -10,9 +10,8 @@ pub mod wireguard;
 
 pub use address::{AddressPool, AddressSource, NodeAddress};
 pub use comm_addr::{
-    comm_addr_is_unusable, comm_host_for_socket, format_comm_http_url, format_comm_socket,
-    is_loopback_ip, is_unusable_comm_ip, normalize_comm_address, validate_comm_address,
-    CommAddressError,
+    comm_addr_is_unusable, format_comm_http_url, format_comm_socket, normalize_comm_address,
+    normalized_comm_addr_is_unusable, validate_comm_address, CommAddressError,
 };
 pub use detect::detect_node_address;
 pub use mesh::{MeshMembership, MeshNode};

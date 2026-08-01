@@ -13394,6 +13394,43 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_config_address_fills_when_agent_address_empty() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.nodes = vec![spur_core::config::NodeConfig {
+            names: "worker1".into(),
+            selector: HashMap::new(),
+            cpus: 0,
+            memory_mb: 0,
+            gres: Vec::new(),
+            features: Vec::new(),
+            address: Some("10.0.0.99".into()),
+            weight: 1,
+        }];
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "worker1".into(),
+            hostname: "worker1".into(),
+            resources: ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            address: String::new(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+        });
+
+        assert_eq!(
+            cm.get_node("worker1").unwrap().address,
+            Some("10.0.0.99".into())
+        );
+    }
+
     #[test]
     fn label_update_applies_nodeconfig_features() {
         let dir = TempDir::new().unwrap();

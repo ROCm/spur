@@ -55,7 +55,7 @@ fn resolve_registration_comm_addr(
     let mut unusable_result = None;
     for candidate in candidates {
         match spur_net::validate_comm_address(candidate, reject_loopback) {
-            Ok(addr) if spur_net::comm_addr_is_unusable(&addr) => {
+            Ok(addr) if spur_net::normalized_comm_addr_is_unusable(&addr) => {
                 if unusable_result.is_none() {
                     unusable_result = Some((candidate.to_string(), addr));
                 }
@@ -83,10 +83,10 @@ fn resolve_registration_comm_addr(
         return Ok(addr);
     }
 
-    Err(Status::invalid_argument(format!(
-        "invalid comm address: {}",
-        last_err.unwrap()
-    )))
+    Err(Status::invalid_argument(match last_err {
+        Some(e) => format!("invalid comm address: {e}"),
+        None => "no comm address candidate resolved".into(),
+    }))
 }
 
 fn node_comm_http_url(node: &spur_core::node::Node, node_name: &str) -> Result<String, Status> {
@@ -2706,6 +2706,26 @@ mod tests {
     #[test]
     fn resolve_registration_comm_addr_rejects_loopback_when_configured() {
         assert!(resolve_registration_comm_addr("127.0.0.1", "", true).is_err());
+    }
+
+    #[test]
+    fn resolve_registration_comm_addr_prefers_peer_when_rejecting_loopback() {
+        assert_eq!(
+            resolve_registration_comm_addr("127.0.0.1", "10.245.159.30", true).unwrap(),
+            "10.245.159.30"
+        );
+    }
+
+    #[test]
+    fn node_comm_http_url_brackets_ipv6() {
+        let mut node =
+            spur_core::node::Node::new("n1".into(), spur_core::resource::ResourceSet::default());
+        node.address = Some("2001:db8::1".into());
+        node.port = 6818;
+        assert_eq!(
+            node_comm_http_url(&node, "n1").unwrap(),
+            "http://[2001:db8::1]:6818"
+        );
     }
 
     #[test]
