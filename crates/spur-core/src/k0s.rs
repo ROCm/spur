@@ -116,8 +116,7 @@ mod cluster_state_tests {
         assert_eq!(st.phase, K0sPhase::Ready);
         assert!(st.control_plane_nodes.is_empty());
         assert_eq!(st.controllers(), vec!["head-node"]);
-        assert!(st.is_controller("head-node"));
-        assert!(!st.is_controller("worker-1"));
+        assert_eq!(st.bootstrap().as_deref(), Some("head-node"));
     }
 
     #[test]
@@ -129,8 +128,18 @@ mod cluster_state_tests {
             reset_requested: false,
         };
         assert_eq!(st.controllers(), vec!["cp-1", "cp-2", "cp-3"]);
-        assert!(st.is_controller("cp-2"));
-        assert!(st.is_controller("cp-1"));
+        assert_eq!(st.bootstrap().as_deref(), Some("cp-1"));
+    }
+
+    #[test]
+    fn bootstrap_falls_back_to_first_of_set_when_singular_absent() {
+        let st = K0sClusterState {
+            phase: K0sPhase::Ready,
+            control_plane_node: None,
+            control_plane_nodes: vec!["cp-1".into(), "cp-2".into(), "cp-3".into()],
+            reset_requested: false,
+        };
+        assert_eq!(st.bootstrap().as_deref(), Some("cp-1"));
     }
 
     #[test]
@@ -238,9 +247,11 @@ impl K0sClusterState {
         self.control_plane_node.iter().cloned().collect()
     }
 
-    /// True if `node` is a control-plane node (bootstrap or secondary).
-    pub fn is_controller(&self, node: &str) -> bool {
-        self.control_plane_node.as_deref() == Some(node)
-            || self.control_plane_nodes.iter().any(|n| n == node)
+    /// The bootstrap control-plane (etcd seed): the recorded singular node, else the first of the
+    /// set for HA state where the singular field was never written.
+    pub fn bootstrap(&self) -> Option<String> {
+        self.control_plane_node
+            .clone()
+            .or_else(|| self.control_plane_nodes.first().cloned())
     }
 }

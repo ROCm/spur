@@ -11087,6 +11087,57 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_derives_bootstrap_from_set_when_singular_absent() {
+        use spur_core::k0s::{K0sPhase, K0sRole};
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        for name in ["cp-a", "cp-b", "cp-c"] {
+            register_node(&cm, name, 4, 8000);
+        }
+        wait_for("all registered", || {
+            ["cp-a", "cp-b", "cp-c"]
+                .iter()
+                .all(|n| cm.get_node(n).is_some())
+        });
+        // HA set recorded bootstrap-first (cp-b) with the singular field unset. The first-of-set must
+        // hold `.1` — cp-b, NOT the sorted-first cp-a, so this fails if bootstrap ignores the set.
+        cm.set_k0s_phase(
+            K0sPhase::Provisioning,
+            None,
+            vec!["cp-b".into(), "cp-a".into(), "cp-c".into()],
+            false,
+        )
+        .unwrap();
+        wait_for("cp set recorded", || {
+            cm.k0s_state().controllers().len() == 3
+        });
+
+        let net = crate::cluster_k8s::ClusterNetworking {
+            mesh_cidr: "10.44.0.0/16".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
+            cni: "kuberouter".into(),
+            control_plane_node: None,
+        };
+        crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
+        wait_for("all assigned", || {
+            ["cp-a", "cp-b", "cp-c"]
+                .iter()
+                .all(|n| cm.get_node(n).and_then(|x| x.k0s_role).is_some())
+        });
+
+        for cp in ["cp-a", "cp-b", "cp-c"] {
+            assert_eq!(cm.get_node(cp).unwrap().k0s_role, Some(K0sRole::Controller));
+        }
+        assert_eq!(
+            cm.get_node("cp-b").unwrap().k0s_mesh_ip.as_deref(),
+            Some("10.44.0.1"),
+            "bootstrap (first of recorded set) holds .1"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restore_from_snapshot_rejects_corrupt_data() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;

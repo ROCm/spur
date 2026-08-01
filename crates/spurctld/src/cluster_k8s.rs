@@ -135,16 +135,13 @@ pub(crate) fn provision_assignments(
     nodes.sort_by(|a, b| a.name.cmp(&b.name)); // deterministic
 
     // Bootstrap control-plane (etcd seed, holder of `.1`). Recorded bootstrap outranks a scanned
-    // `Controller` (secondary CPs also carry that role); `.1` follows it so a 1->3 set stays stable.
-    let bootstrap = nodes
-        .iter()
-        .find(|n| matches!(n.k0s_role, Some(K0sRole::Single)))
-        .map(|n| n.name.clone())
-        .or_else(|| state.control_plane_node.clone())
+    // role (secondary CPs also carry `Controller`) so `.1` stays put across a 1->3 grow.
+    let bootstrap = state
+        .bootstrap()
         .or_else(|| {
             nodes
                 .iter()
-                .find(|n| matches!(n.k0s_role, Some(K0sRole::Controller)))
+                .find(|n| matches!(n.k0s_role, Some(K0sRole::Single | K0sRole::Controller)))
                 .map(|n| n.name.clone())
         })
         .or_else(|| net.control_plane_node.clone())
@@ -219,12 +216,8 @@ pub(crate) fn provision_assignments(
     Ok(())
 }
 
-/// Resolve the control-plane node set for `spur k8s up`, fail-closed. Given a sorted list of
-/// candidate node names, an optional explicit CP list, an optional pinned bootstrap node, and a
-/// replica count, returns the CP set with the bootstrap node first. Rules:
-/// - an explicit `nodes` list wins (its count must be 1/3/5 and every name must exist);
-/// - otherwise pick the lowest `replicas` candidates (validated 1/3/5), pinned bootstrap first;
-/// - never request more control planes than there are nodes.
+/// Resolve the control-plane set for `spur k8s up`, fail-closed, bootstrap node first: an explicit
+/// `nodes` list wins, else the lowest `replicas` candidates. Count must be 1/3/5 and fit the nodes.
 pub(crate) fn resolve_control_plane_set(
     mut candidates: Vec<String>,
     explicit: &[String],
@@ -574,7 +567,7 @@ async fn converge_provisioning(
         join_tokens.clear();
         return;
     }
-    let bootstrap = cluster.k0s_state().control_plane_node;
+    let bootstrap = cluster.k0s_state().bootstrap();
     let mut all_active = true;
     let mut bootstrap_active = false;
     // Bootstrap control-plane first: it seeds etcd (tokenless) and its k0s API must answer before any
@@ -603,9 +596,8 @@ async fn converge_provisioning(
     if !bootstrap_active {
         return;
     }
-    // Secondary control planes: join the bootstrap's etcd quorum with a `controller` token, then
-    // workers with a `worker` token. Both mint from a healthy control-plane agent; minting errors
-    // until that API is reachable — treated as "retry next tick".
+    // Secondary CPs join the etcd quorum with a `controller` token, then workers with a `worker`
+    // token; both mint from a healthy CP agent, and a minting error just retries next tick.
     for node in &assigned {
         let role = node.k0s_role.expect("assigned above");
         let is_bootstrap = role == K0sRole::Single || bootstrap.as_deref() == Some(&node.name);

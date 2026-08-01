@@ -1801,21 +1801,14 @@ impl SlurmController for ControllerService {
         }
         let req = request.into_inner();
         let state = self.cluster.k0s_state();
-        let assigned = self
-            .cluster
-            .get_nodes()
-            .iter()
-            .any(|n| n.k0s_role.is_some());
+        let nodes = self.cluster.get_nodes();
+        let assigned = nodes.iter().any(|n| n.k0s_role.is_some());
 
         // Resolve the HA control-plane set fail-closed BEFORE recording intent: an explicit node
-        // list wins, else `--replicas` (or the config default) picks the lowest-named nodes. Pin the
-        // bootstrap to the operator override / recorded CP so `.1` and the etcd seed are stable.
-        let candidates: Vec<String> = self
-            .cluster
-            .get_nodes()
-            .into_iter()
-            .map(|n| n.name)
-            .collect();
+        // list wins, else `--replicas` (or the config default) picks the lowest-named nodes.
+        let candidates: Vec<String> = nodes.into_iter().map(|n| n.name).collect();
+        let explicit_override =
+            !req.control_plane_nodes.is_empty() || req.control_plane_replicas.is_some();
         let replicas = req
             .control_plane_replicas
             .filter(|r| *r > 0)
@@ -1824,18 +1817,22 @@ impl SlurmController for ControllerService {
             .control_plane_node
             .clone()
             .or_else(|| state.control_plane_node.clone());
-        let cp_set = crate::cluster_k8s::resolve_control_plane_set(
-            candidates,
-            &req.control_plane_nodes,
-            pinned.as_deref(),
-            replicas,
-        )
-        .map_err(Status::invalid_argument)?;
+        // A bare re-up of an assigned cluster targets the recorded set, so it stays idempotent
+        // regardless of the config default; an explicit list/replica count is resolved and enforced.
+        let cp_set = if assigned && !explicit_override {
+            state.controllers()
+        } else {
+            crate::cluster_k8s::resolve_control_plane_set(
+                candidates,
+                &req.control_plane_nodes,
+                pinned.as_deref(),
+                replicas,
+            )
+            .map_err(Status::invalid_argument)?
+        };
 
-        // Reject a control-plane change once roles are assigned: provisioning skips already-assigned
-        // nodes, so moving/growing the control plane here would leave an inconsistent topology (an old
-        // controller still Controller, a would-be CP a Worker). Tear the cluster down
-        // (`spur k8s down --reset`) to re-elect. A matching set (idempotent re-up) is allowed.
+        // A control-plane change after roles are assigned would leave an inconsistent topology
+        // (provisioning skips assigned nodes); require `spur k8s down --reset` to re-elect.
         if assigned {
             let mut current = state.controllers();
             let mut want = cp_set.clone();
@@ -2951,6 +2948,78 @@ mod tests {
             }))
             .await
             .expect_err("a still-Pending job must not accept a new step");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    async fn assign_ha_control_plane(svc: &ControllerService) {
+        use spur_core::k0s::{K0sPhase, K0sRole};
+        use spur_core::node::NodeSource;
+        for (i, name) in ["cp-a", "cp-b", "cp-c"].iter().enumerate() {
+            svc.cluster
+                .register_node(
+                    (*name).into(),
+                    spur_core::resource::ResourceSet {
+                        cpus: 4,
+                        memory_mb: 8000,
+                        ..Default::default()
+                    },
+                    "127.0.0.1".into(),
+                    6818 + i as u16,
+                    String::new(),
+                    String::new(),
+                    NodeSource::NativeHost,
+                    std::collections::HashMap::new(),
+                )
+                .unwrap();
+            svc.cluster
+                .assign_node_k0s(
+                    name,
+                    K0sRole::Controller,
+                    &format!("10.44.0.{}", i + 1),
+                    "10.42.0.0/24",
+                )
+                .unwrap();
+        }
+        svc.cluster
+            .set_k0s_phase(
+                K0sPhase::Ready,
+                Some("cp-a".into()),
+                vec!["cp-a".into(), "cp-b".into(), "cp-c".into()],
+                false,
+            )
+            .unwrap();
+    }
+
+    // A bare `spur k8s up` (no flags) on an assigned 3-CP cluster is idempotent: it must target the
+    // recorded set, not re-resolve against the replicas=1 config default and spuriously reject.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_bare_reup_on_ha_cluster_is_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        assign_ha_control_plane(&svc).await;
+
+        let resp = svc
+            .cluster_up(Request::new(ClusterUpRequest::default()))
+            .await
+            .expect("bare re-up of an assigned HA cluster must be accepted")
+            .into_inner();
+        assert!(resp.accepted);
+    }
+
+    // An explicit replica count that doesn't match the assigned set is still rejected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_mismatched_replicas_on_ha_cluster_is_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        assign_ha_control_plane(&svc).await;
+
+        let err = svc
+            .cluster_up(Request::new(ClusterUpRequest {
+                control_plane_replicas: Some(1),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("shrinking an assigned 3-CP cluster must be rejected");
         assert_eq!(err.code(), Code::FailedPrecondition);
     }
 

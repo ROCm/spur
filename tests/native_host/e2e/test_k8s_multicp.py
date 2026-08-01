@@ -12,7 +12,7 @@ class TestK8sMultiControlPlane:
         cluster = k8s_multicp_cluster
 
         out = cluster.k8s_up(["--replicas", "3"])
-        assert "requested" in out or "up" in out.lower(), out
+        assert "provisioning requested" in out, out
 
         cluster.wait_k8s_phase("ready", timeout=600)
 
