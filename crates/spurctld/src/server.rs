@@ -320,6 +320,12 @@ fn resolve_user_namespace_sa(
     ))
 }
 
+/// Whether `caller` may perform k0s cluster-admin ops: empty/root always, else accounting `Admin`.
+/// Fails closed when accounting is off (cache reports no admins), leaving only root/internal.
+fn is_k0s_admin(cache: &crate::association_cache::AssociationCache, caller: &str) -> bool {
+    caller.is_empty() || caller == "root" || cache.is_admin(caller)
+}
+
 #[tonic::async_trait]
 impl SlurmController for ControllerService {
     async fn submit_job(
@@ -1872,6 +1878,11 @@ impl SlurmController for ControllerService {
             }
         }
         let req = request.into_inner();
+        if !is_k0s_admin(self.cluster.association_cache(), &req.caller) {
+            return Err(Status::permission_denied(
+                "k0s cluster up requires cluster admin",
+            ));
+        }
         let state = self.cluster.k0s_state();
         let nodes = self.cluster.get_nodes();
         let assigned = nodes.iter().any(|n| n.k0s_role.is_some());
@@ -1954,6 +1965,11 @@ impl SlurmController for ControllerService {
             }
         }
         let req = request.into_inner();
+        if !is_k0s_admin(self.cluster.association_cache(), &req.caller) {
+            return Err(Status::permission_denied(
+                "k0s cluster down requires cluster admin",
+            ));
+        }
         self.cluster
             .set_k0s_phase(spur_core::k0s::K0sPhase::Down, None, Vec::new(), req.reset)
             .map_err(|e| Status::internal(format!("set k0s phase: {e}")))?;
@@ -1994,7 +2010,14 @@ impl SlurmController for ControllerService {
             return client.cluster_kubeconfig(fwd).await;
         }
         let req = request.into_inner();
-        if req.user.is_empty() {
+        let is_admin = is_k0s_admin(self.cluster.association_cache(), &req.caller);
+
+        if req.admin {
+            if !is_admin {
+                return Err(Status::permission_denied(
+                    "the cluster-admin kubeconfig requires cluster admin",
+                ));
+            }
             // Cluster-admin kubeconfig (`k0s kubeconfig admin` on the control-plane agent).
             return match crate::cluster_k8s::fetch_admin_kubeconfig(&self.cluster).await {
                 Ok(kubeconfig) => Ok(Response::new(ClusterKubeconfigResponse { kubeconfig })),
@@ -2003,17 +2026,35 @@ impl SlurmController for ControllerService {
                 ))),
             };
         }
-        // Scoped kubeconfig: resolve the user's account -> its namespace + per-user ServiceAccount,
+
+        // A non-admin caller may only mint their own scope; an admin may target any user. An empty
+        // target means "the caller's own namespace" (an empty caller is internal/root).
+        let target = if req.user.is_empty() {
+            req.caller.clone()
+        } else {
+            req.user.clone()
+        };
+        if !is_admin && target != req.caller {
+            return Err(Status::permission_denied(format!(
+                "user '{}' may only request their own kubeconfig",
+                req.caller
+            )));
+        }
+        if target.is_empty() {
+            return Err(Status::invalid_argument(
+                "no target user for the scoped kubeconfig; pass --user or set a caller identity",
+            ));
+        }
+
+        // Scoped kubeconfig: resolve the target's account -> its namespace + per-user ServiceAccount,
         // then have the control-plane agent mint a bound token there.
-        let (namespace, sa) =
-            resolve_user_namespace_sa(self.cluster.association_cache(), &req.user)?;
-        match crate::cluster_k8s::fetch_user_kubeconfig(&self.cluster, &req.user, &namespace, &sa)
+        let (namespace, sa) = resolve_user_namespace_sa(self.cluster.association_cache(), &target)?;
+        match crate::cluster_k8s::fetch_user_kubeconfig(&self.cluster, &target, &namespace, &sa)
             .await
         {
             Ok(kubeconfig) => Ok(Response::new(ClusterKubeconfigResponse { kubeconfig })),
             Err(e) => Err(Status::unavailable(format!(
-                "could not mint a scoped kubeconfig for user '{}': {e}",
-                req.user
+                "could not mint a scoped kubeconfig for user '{target}': {e}"
             ))),
         }
     }
@@ -2755,6 +2796,31 @@ mod tests {
     }
 
     #[test]
+    fn is_k0s_admin_root_and_empty_always_admin_even_cold_cache() {
+        let cache = crate::association_cache::AssociationCache::new();
+        assert!(is_k0s_admin(&cache, ""));
+        assert!(is_k0s_admin(&cache, "root"));
+    }
+
+    #[test]
+    fn is_k0s_admin_named_user_denied_when_accounting_off() {
+        // Cold cache = accounting disabled/not loaded: only root/internal are admin.
+        let cache = crate::association_cache::AssociationCache::new();
+        assert!(!is_k0s_admin(&cache, "alice"));
+    }
+
+    #[test]
+    fn is_k0s_admin_honors_accounting_admin_level() {
+        let cache = crate::association_cache::AssociationCache::new();
+        cache.insert_admin_level("carol", "Admin");
+        cache.insert_admin_level("dave", "Operator");
+        assert!(is_k0s_admin(&cache, "carol"));
+        // Operator is not full admin; a plain member isn't either.
+        assert!(!is_k0s_admin(&cache, "dave"));
+        assert!(!is_k0s_admin(&cache, "erin"));
+    }
+
+    #[test]
     fn read_forwards_only_when_follower_and_not_already_forwarded() {
         // Leader serves reads locally; never forwards.
         assert!(!read_forwarding_policy(true, false));
@@ -3144,6 +3210,146 @@ mod tests {
             .await
             .expect_err("shrinking an assigned 3-CP cluster must be rejected");
         assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_denied_for_non_admin_caller() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .association_cache()
+            .insert_association("alice", "physics");
+        let err = svc
+            .cluster_up(Request::new(ClusterUpRequest {
+                caller: "alice".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a non-admin caller must not bring the cluster up");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_down_denied_for_non_admin_caller() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .association_cache()
+            .insert_association("alice", "physics");
+        let err = svc
+            .cluster_down(Request::new(ClusterDownRequest {
+                caller: "alice".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a non-admin caller must not tear the cluster down");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_allowed_for_admin_level_caller() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .register_node(
+                "cp-a".into(),
+                "cp-a".into(),
+                spur_core::resource::ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                std::collections::HashMap::new(),
+            )
+            .unwrap();
+        svc.cluster
+            .association_cache()
+            .insert_admin_level("carol", "Admin");
+        let resp = svc
+            .cluster_up(Request::new(ClusterUpRequest {
+                caller: "carol".into(),
+                control_plane_replicas: Some(1),
+                ..Default::default()
+            }))
+            .await
+            .expect("an Admin-level caller may bring the cluster up")
+            .into_inner();
+        assert!(resp.accepted);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_kubeconfig_admin_flag_denied_for_non_admin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .association_cache()
+            .insert_association("alice", "physics");
+        let err = svc
+            .cluster_kubeconfig(Request::new(ClusterKubeconfigRequest {
+                caller: "alice".into(),
+                admin: true,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a non-admin must not get the cluster-admin kubeconfig");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_kubeconfig_other_user_denied_for_non_admin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .association_cache()
+            .insert_default_account("alice", "physics");
+        let err = svc
+            .cluster_kubeconfig(Request::new(ClusterKubeconfigRequest {
+                caller: "alice".into(),
+                user: "bob".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a non-admin must not mint another user's kubeconfig");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_kubeconfig_bare_self_scope_clears_authz_for_non_admin() {
+        // A non-admin bare request (own scope) must pass authz and reach target resolution; the
+        // absent control-plane agent then yields Unavailable — never PermissionDenied/InvalidArgument.
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .association_cache()
+            .insert_default_account("alice", "physics");
+        let err = svc
+            .cluster_kubeconfig(Request::new(ClusterKubeconfigRequest {
+                caller: "alice".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("no control-plane agent is running in this test");
+        assert_eq!(err.code(), Code::Unavailable);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_denied_for_named_caller_when_accounting_off() {
+        // Cold cache = accounting disabled: a named caller is not admin, so up fails closed.
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let err = svc
+            .cluster_up(Request::new(ClusterUpRequest {
+                caller: "alice".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a named caller must be denied when accounting is off");
+        assert_eq!(err.code(), Code::PermissionDenied);
     }
 
     #[test]

@@ -51,12 +51,15 @@ pub enum K8sCommand {
     },
     /// Show cluster phase + per-node component status.
     Status,
-    /// Print a kubeconfig to stdout. Default: the cluster-admin kubeconfig. With `--user`, a
-    /// namespace-scoped kubeconfig (a ServiceAccount token in that user's account namespace).
+    /// Print a kubeconfig to stdout. Default: your own scope. `--admin`: cluster-admin (admins only).
+    /// `--user X`: another user's scope (admins only).
     Kubeconfig {
-        /// Mint a scoped kubeconfig for this SPUR user instead of the admin one.
+        /// Mint a scoped kubeconfig for this SPUR user instead of your own (requires cluster admin).
         #[arg(long)]
         user: Option<String>,
+        /// Fetch the cluster-admin kubeconfig instead of a scoped one (requires cluster admin).
+        #[arg(long, conflicts_with = "user")]
+        admin: bool,
     },
     /// Download + install the k0s binary on THIS node (local; no controller needed).
     /// Run as root for the default /usr/local/bin path.
@@ -96,13 +99,17 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         }
         K8sCommand::Down { reset } => cmd_down(&controller, reset).await,
         K8sCommand::Status => cmd_status(&controller).await,
-        K8sCommand::Kubeconfig { user } => cmd_kubeconfig(&controller, user).await,
+        K8sCommand::Kubeconfig { user, admin } => cmd_kubeconfig(&controller, user, admin).await,
         K8sCommand::InstallK0s {
             version,
             path,
             force,
         } => cmd_install_k0s(&version, &path, force).await,
     }
+}
+
+fn effective_user() -> String {
+    whoami::username().unwrap_or_else(|_| "unknown".into())
 }
 
 async fn cmd_install_k0s(version: &str, path: &str, force: bool) -> Result<()> {
@@ -135,6 +142,7 @@ async fn cmd_up(
             control_plane_node,
             control_plane_replicas: replicas,
             control_plane_nodes,
+            caller: effective_user(),
         })
         .await?
         .into_inner();
@@ -152,7 +160,10 @@ async fn cmd_up(
 async fn cmd_down(controller: &str, reset: bool) -> Result<()> {
     let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
     let resp = client
-        .cluster_down(ClusterDownRequest { reset })
+        .cluster_down(ClusterDownRequest {
+            reset,
+            caller: effective_user(),
+        })
         .await?
         .into_inner();
     if resp.accepted {
@@ -184,11 +195,13 @@ async fn cmd_status(controller: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_kubeconfig(controller: &str, user: Option<String>) -> Result<()> {
+async fn cmd_kubeconfig(controller: &str, user: Option<String>, admin: bool) -> Result<()> {
     let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
     let resp = client
         .cluster_kubeconfig(ClusterKubeconfigRequest {
             user: user.unwrap_or_default(),
+            caller: effective_user(),
+            admin,
         })
         .await?
         .into_inner();
@@ -250,5 +263,37 @@ mod tests {
     fn controller_defaults_and_env() {
         let args = K8sArgs::try_parse_from(["k8s", "status"]).unwrap();
         assert_eq!(args.controller, "http://localhost:6817");
+    }
+
+    #[test]
+    fn kubeconfig_bare_is_self_scoped() {
+        let args = K8sArgs::try_parse_from(["k8s", "kubeconfig"]).unwrap();
+        match args.command {
+            K8sCommand::Kubeconfig { user, admin } => {
+                assert_eq!(user, None);
+                assert!(!admin);
+            }
+            _ => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn kubeconfig_admin_flag_parses() {
+        let args = K8sArgs::try_parse_from(["k8s", "kubeconfig", "--admin"]).unwrap();
+        match args.command {
+            K8sCommand::Kubeconfig { admin, .. } => assert!(admin),
+            _ => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn kubeconfig_admin_and_user_conflict() {
+        let err =
+            K8sArgs::try_parse_from(["k8s", "kubeconfig", "--admin", "--user", "bob"]).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "--admin and --user must be mutually exclusive"
+        );
     }
 }

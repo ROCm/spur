@@ -445,11 +445,12 @@ class SpurCluster:
     # --- Native k0s cluster (spur k8s) wrappers ---
 
     def k8s_up(self, args: list[str] | None = None) -> str:
-        return self.cli(["spur", "k8s", "up"] + (args or []))
+        # k0s up/down are admin-gated; run as root so they pass without accounting.
+        return self.cli_as_user("root", ["spur", "k8s", "up"] + (args or []))
 
     def k8s_down(self, reset: bool = True) -> str:
         extra = ["--reset"] if reset else []
-        return self.cli(["spur", "k8s", "down"] + extra)
+        return self.cli_as_user("root", ["spur", "k8s", "down"] + extra)
 
     def k8s_status(self) -> str:
         return self.cli(["spur", "k8s", "status"])

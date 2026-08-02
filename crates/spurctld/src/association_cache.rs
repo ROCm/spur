@@ -17,6 +17,7 @@ struct Snapshot {
     memberships: HashSet<(String, String)>,
     limits: HashMap<(String, String), AccountLimits>,
     allowed_qos: HashMap<(String, String), HashSet<String>>,
+    admin_level: HashMap<String, String>,
     loaded: bool,
 }
 
@@ -50,6 +51,7 @@ impl AssociationCache {
                 memberships: HashSet::new(),
                 limits: HashMap::new(),
                 allowed_qos: HashMap::new(),
+                admin_level: HashMap::new(),
                 loaded: false,
             }),
         }
@@ -58,6 +60,17 @@ impl AssociationCache {
     /// True after a successful load from the accounting database.
     pub fn is_loaded(&self) -> bool {
         self.snapshot.read().loaded
+    }
+
+    /// Whether `user` holds the `Admin` accounting admin-level. Fails closed: an unloaded cache
+    /// (accounting off or not yet fetched) reports no admins.
+    pub fn is_admin(&self, user: &str) -> bool {
+        let snapshot = self.snapshot.read();
+        snapshot.loaded
+            && snapshot
+                .admin_level
+                .get(user)
+                .is_some_and(|lvl| lvl.eq_ignore_ascii_case("admin"))
     }
 
     pub fn account_membership(&self, user: &str, account: &str) -> AccountMembership {
@@ -158,6 +171,7 @@ impl AssociationCache {
             .unwrap_or_default()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn replace(
         &self,
         default_qos: HashMap<(String, String), String>,
@@ -165,6 +179,7 @@ impl AssociationCache {
         memberships: HashSet<(String, String)>,
         limits: HashMap<(String, String), AccountLimits>,
         allowed_qos: HashMap<(String, String), HashSet<String>>,
+        admin_level: HashMap<String, String>,
     ) {
         *self.snapshot.write() = Snapshot {
             default_qos,
@@ -172,6 +187,7 @@ impl AssociationCache {
             memberships,
             limits,
             allowed_qos,
+            admin_level,
             loaded: true,
         };
     }
@@ -182,6 +198,13 @@ impl AssociationCache {
         let mut snap = self.snapshot.write();
         snap.memberships
             .insert((user.to_owned(), account.to_owned()));
+        snap.loaded = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_admin_level(&self, user: &str, level: &str) {
+        let mut snap = self.snapshot.write();
+        snap.admin_level.insert(user.to_owned(), level.to_owned());
         snap.loaded = true;
     }
 
@@ -243,16 +266,17 @@ impl AssociationCache {
             )
             .await
             {
-                Ok(Ok((qos, accounts, memberships, limits, allowed_qos))) => {
+                Ok(Ok((qos, accounts, memberships, limits, allowed_qos, admin_level))) => {
                     info!(
                         default_qos = qos.len(),
                         default_account = accounts.len(),
                         memberships = memberships.len(),
                         limits = limits.len(),
                         allowed_qos = allowed_qos.len(),
+                        admin_level = admin_level.len(),
                         "association cache initialized"
                     );
-                    cache.replace(qos, accounts, memberships, limits, allowed_qos);
+                    cache.replace(qos, accounts, memberships, limits, allowed_qos, admin_level);
                 }
                 Ok(Err(e)) => {
                     warn!(error = %e, "initial association fetch failed, will retry in background");
@@ -271,8 +295,8 @@ impl AssociationCache {
                 )
                 .await
                 {
-                    Ok(Ok((qos, accounts, memberships, limits, allowed_qos))) => {
-                        cache.replace(qos, accounts, memberships, limits, allowed_qos)
+                    Ok(Ok((qos, accounts, memberships, limits, allowed_qos, admin_level))) => {
+                        cache.replace(qos, accounts, memberships, limits, allowed_qos, admin_level)
                     }
                     Ok(Err(e)) => {
                         warn!(error = %e, "association refresh failed, retaining stale data")
@@ -295,6 +319,22 @@ mod tests {
             cache.resolve("alice", Some("research")),
             (Some("research".into()), None, HashSet::new())
         );
+    }
+
+    #[test]
+    fn is_admin_false_on_cold_cache() {
+        let cache = AssociationCache::new();
+        assert!(!cache.is_admin("carol"));
+    }
+
+    #[test]
+    fn is_admin_true_only_for_admin_level_case_insensitive() {
+        let cache = AssociationCache::new();
+        cache.insert_admin_level("carol", "admin");
+        cache.insert_admin_level("dave", "Operator");
+        assert!(cache.is_admin("carol"));
+        assert!(!cache.is_admin("dave"));
+        assert!(!cache.is_admin("erin"));
     }
 
     #[test]
@@ -340,6 +380,7 @@ mod tests {
             HashSet::from([("bob".to_string(), "eng".to_string())]),
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
         );
         assert_eq!(
             cache.resolve("alice", Some("research")),
@@ -383,6 +424,7 @@ mod tests {
             HashMap::from([(("bob".to_string(), "eng".to_string()), "new".to_string())]),
             HashMap::new(),
             HashSet::from([("bob".to_string(), "eng".to_string())]),
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
         );
@@ -525,6 +567,7 @@ mod tests {
                     ..Default::default()
                 },
             )]),
+            HashMap::new(),
             HashMap::new(),
         );
         assert_eq!(
