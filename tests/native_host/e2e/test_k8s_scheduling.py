@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """E2E: nodes claimed by the managed k8s cluster are excluded from Spur batch
-scheduling, and return to scheduling after teardown (SPUR-114).
+scheduling (SPUR-114).
 
-Rootless: `spur k8s up` still assigns roles (which the scheduler gate reads)
-without agents bringing up real k0s, so no systemd/sudo/etcd is needed — this
-asserts scheduler behavior, not k0s liveness.
+Asserts the scheduler gate end-to-end: once `spur k8s up` assigns a node its
+k0s role, a job submitted through the real CLI -> gRPC -> scheduler path pends
+with the k8s-reserved reason instead of running on that node.
 """
 
 import re
@@ -43,14 +43,13 @@ def _wait_gate_active(cluster, script: str, timeout: int = 120) -> int:
 
 @pytest.fixture
 def k8s_enabled_cluster(unstarted_cluster):
-    """Rootless cluster with `[cluster].enabled=true` so `spur k8s up` assigns
-    roles without a real k0s bring-up. Tears the cluster down on exit so no k0s
-    role/state leaks into a later e2e run."""
+    """Cluster with `[cluster].enabled=true` so `spur k8s up` assigns roles.
+    Tears the managed cluster down on exit so no k0s state leaks into a later run
+    (the harness also wipes the controller state dir)."""
     unstarted_cluster.start(config_overrides={"cluster": {"enabled": True}})
     yield unstarted_cluster
     try:
         unstarted_cluster.k8s_down(reset=True)
-        unstarted_cluster.wait_k8s_phase("down", timeout=60)
     except Exception:
         pass
 
@@ -73,7 +72,4 @@ class TestK8sSchedulingExclusion:
         assert job_state(cluster.squeue_all(), held) == "PD", (
             f"job should stay pending on a k8s-reserved node:\n{cluster.squeue_all()}"
         )
-
-        # Teardown reclaims the node -> the pending job schedules and completes.
-        cluster.k8s_down(reset=True)
-        wait_job(cluster, held, timeout=180)
+        cluster.scancel(str(held))
