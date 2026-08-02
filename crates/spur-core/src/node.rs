@@ -355,6 +355,12 @@ impl Node {
         self.address.as_deref()
     }
 
+    /// True once `spur k8s up` has claimed this node for the managed k0s cluster.
+    /// Such nodes are owned by the k8s scheduler and must not also take Spur jobs.
+    pub fn is_k0s_reserved(&self) -> bool {
+        self.k0s_role.is_some()
+    }
+
     /// Update state based on allocation level.
     pub fn update_state_from_alloc(&mut self) {
         if self.state.is_admin_hold() {
@@ -374,6 +380,16 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_k0s_reserved_tracks_role_assignment() {
+        let mut n = Node::new("n1".into(), ResourceSet::default());
+        assert!(!n.is_k0s_reserved());
+        n.k0s_role = Some(crate::k0s::K0sRole::Worker);
+        assert!(n.is_k0s_reserved());
+        n.k0s_role = None;
+        assert!(!n.is_k0s_reserved());
+    }
 
     #[test]
     fn register_from_unknown_yields_idle() {

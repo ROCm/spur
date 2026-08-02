@@ -654,12 +654,17 @@ async fn converge_provisioning(
 }
 
 /// Stop every assigned component that is still running (cluster teardown).
+/// Once a node's component is confirmed inactive, clear its k0s role so it
+/// returns to Spur batch scheduling instead of staying gated out forever.
 async fn stop_all_components(cluster: &ClusterManager, reset: bool) {
     for node in cluster.get_nodes() {
         if node.k0s_role.is_none() {
             continue;
         }
         if fetch_component_state(cluster, &node.name).await.as_deref() == Some("inactive") {
+            if let Err(e) = cluster.clear_node_k0s(&node.name) {
+                warn!(node = %node.name, error = %e, "failed to clear k0s role after teardown");
+            }
             continue;
         }
         spawn_stop_component(cluster, &node.name, reset);

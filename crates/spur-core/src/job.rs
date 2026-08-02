@@ -298,6 +298,9 @@ pub enum PendingReason {
     AssocGrpMemLimit,
     AssocGrpGpuLimit,
     AssocMaxWallDurationPerJobLimit,
+
+    /// Node is reserved for the SPUR-managed k0s cluster and not available to batch jobs.
+    K0sReserved,
 }
 
 impl PendingReason {
@@ -375,6 +378,7 @@ impl PendingReason {
             Self::AssocGrpMemLimit => "AssocGrpMemLimit",
             Self::AssocGrpGpuLimit => "AssocGrpGRES",
             Self::AssocMaxWallDurationPerJobLimit => "AssocMaxWallDurationPerJobLimit",
+            Self::K0sReserved => "ReqNodeNotAvail, Reserved for k0s cluster",
         }
     }
 }
