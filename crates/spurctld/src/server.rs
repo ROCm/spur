@@ -3080,6 +3080,7 @@ mod tests {
             svc.cluster
                 .register_node(
                     (*name).into(),
+                    (*name).into(),
                     spur_core::resource::ResourceSet {
                         cpus: 4,
                         memory_mb: 8000,
