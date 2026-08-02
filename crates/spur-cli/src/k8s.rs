@@ -54,7 +54,7 @@ pub enum K8sCommand {
     /// Print a kubeconfig to stdout. Default: your own scope. `--admin`: cluster-admin (admins only).
     /// `--user X`: another user's scope (admins only).
     Kubeconfig {
-        /// Mint a scoped kubeconfig for this SPUR user instead of your own (requires cluster admin).
+        /// Mint a scoped kubeconfig for this SPUR user; targeting anyone but yourself needs admin.
         #[arg(long)]
         user: Option<String>,
         /// Fetch the cluster-admin kubeconfig instead of a scoped one (requires cluster admin).

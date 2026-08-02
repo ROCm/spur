@@ -3320,8 +3320,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_kubeconfig_bare_self_scope_clears_authz_for_non_admin() {
-        // A non-admin bare request (own scope) must pass authz and reach target resolution; the
-        // absent control-plane agent then yields Unavailable — never PermissionDenied/InvalidArgument.
+        // A non-admin bare request (own scope) clears authz; the absent control-plane agent then
+        // yields Unavailable, never PermissionDenied/InvalidArgument.
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
         svc.cluster
@@ -3330,6 +3330,44 @@ mod tests {
         let err = svc
             .cluster_kubeconfig(Request::new(ClusterKubeconfigRequest {
                 caller: "alice".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("no control-plane agent is running in this test");
+        assert_eq!(err.code(), Code::Unavailable);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_kubeconfig_admin_may_target_other_user() {
+        // An Admin caller clears authz for another user's scope; failure is the absent agent
+        // (Unavailable), not PermissionDenied.
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let cache = svc.cluster.association_cache();
+        cache.insert_admin_level("carol", "Admin");
+        cache.insert_default_account("bob", "chem");
+        let err = svc
+            .cluster_kubeconfig(Request::new(ClusterKubeconfigRequest {
+                caller: "carol".into(),
+                user: "bob".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("no control-plane agent is running in this test");
+        assert_eq!(err.code(), Code::Unavailable);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_kubeconfig_admin_flag_allowed_for_admin_level_caller() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .association_cache()
+            .insert_admin_level("carol", "Admin");
+        let err = svc
+            .cluster_kubeconfig(Request::new(ClusterKubeconfigRequest {
+                caller: "carol".into(),
+                admin: true,
                 ..Default::default()
             }))
             .await
