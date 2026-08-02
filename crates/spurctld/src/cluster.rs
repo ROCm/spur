@@ -1869,16 +1869,19 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// set the cluster-wide k0s phase (+ optional control-plane node / reset flag).
+    /// set the cluster-wide k0s phase (+ optional control-plane node/set / reset flag). A `None`
+    /// `control_plane_node` or empty `control_plane_nodes` leaves the persisted value untouched.
     pub fn set_k0s_phase(
         &self,
         phase: spur_core::k0s::K0sPhase,
         control_plane_node: Option<String>,
+        control_plane_nodes: Vec<String>,
         reset_requested: bool,
     ) -> anyhow::Result<()> {
         self.propose(WalOperation::K0sSetPhase {
             phase,
             control_plane_node,
+            control_plane_nodes,
             reset_requested,
         })?;
         info!(?phase, "k0s cluster phase set");
@@ -4107,12 +4110,16 @@ impl ClusterManager {
             WalOperation::K0sSetPhase {
                 phase,
                 control_plane_node,
+                control_plane_nodes,
                 reset_requested,
             } => {
                 let mut k0s = self.k0s.write();
                 k0s.phase = *phase;
                 if control_plane_node.is_some() {
                     k0s.control_plane_node = control_plane_node.clone();
+                }
+                if !control_plane_nodes.is_empty() {
+                    k0s.control_plane_nodes = control_plane_nodes.clone();
                 }
                 k0s.reset_requested = *reset_requested;
             }
@@ -10867,7 +10874,7 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         cm.assign_node_k0s("n1", K0sRole::Worker, "10.44.0.2", "10.42.2.0/24")
             .unwrap();
-        cm.set_k0s_phase(K0sPhase::Ready, Some("head-node".into()), false)
+        cm.set_k0s_phase(K0sPhase::Ready, Some("head-node".into()), Vec::new(), false)
             .unwrap();
         wait_for("k0s state applied", || {
             cm.k0s_state().phase == K0sPhase::Ready
@@ -10957,7 +10964,7 @@ mod tests {
         register_node(&cm, "node-a", 4, 8000);
         wait_for("registered", || cm.get_node("node-a").is_some());
         // Cluster is Ready with the control plane already recorded, but node-a has no k0s role.
-        cm.set_k0s_phase(K0sPhase::Ready, Some("node-a".into()), false)
+        cm.set_k0s_phase(K0sPhase::Ready, Some("node-a".into()), Vec::new(), false)
             .unwrap();
         wait_for("phase ready", || cm.k0s_state().phase == K0sPhase::Ready);
         assert!(cm.get_node("node-a").and_then(|n| n.k0s_role).is_none());
@@ -11015,6 +11022,119 @@ mod tests {
         assert_ne!(a.k0s_mesh_ip, b.k0s_mesh_ip);
         assert_ne!(a.k0s_pod_cidr, b.k0s_pod_cidr);
         assert_eq!(cm.k0s_state().control_plane_node.as_deref(), Some("node-a"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_assigns_three_controllers_for_ha_set() {
+        use spur_core::k0s::{K0sPhase, K0sRole};
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        for name in ["cp-a", "cp-b", "cp-c", "w-d"] {
+            register_node(&cm, name, 4, 8000);
+        }
+        wait_for("all registered", || {
+            ["cp-a", "cp-b", "cp-c", "w-d"]
+                .iter()
+                .all(|n| cm.get_node(n).is_some())
+        });
+        // A 3-CP HA set recorded up front (as `cluster_up` does), bootstrap cp-a first.
+        cm.set_k0s_phase(
+            K0sPhase::Provisioning,
+            Some("cp-a".into()),
+            vec!["cp-a".into(), "cp-b".into(), "cp-c".into()],
+            false,
+        )
+        .unwrap();
+        wait_for("cp set recorded", || {
+            cm.k0s_state().controllers().len() == 3
+        });
+
+        let net = crate::cluster_k8s::ClusterNetworking {
+            mesh_cidr: "10.44.0.0/16".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
+            cni: "kuberouter".into(),
+            control_plane_node: None,
+        };
+        crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
+        wait_for("all four assigned", || {
+            ["cp-a", "cp-b", "cp-c", "w-d"]
+                .iter()
+                .all(|n| cm.get_node(n).and_then(|x| x.k0s_role).is_some())
+        });
+
+        // All three CP nodes are Controllers; the fourth is a Worker. The bootstrap keeps `.1`.
+        for cp in ["cp-a", "cp-b", "cp-c"] {
+            assert_eq!(
+                cm.get_node(cp).unwrap().k0s_role,
+                Some(K0sRole::Controller),
+                "{cp} is a controller"
+            );
+        }
+        assert_eq!(cm.get_node("w-d").unwrap().k0s_role, Some(K0sRole::Worker));
+        assert_eq!(
+            cm.get_node("cp-a").unwrap().k0s_mesh_ip.as_deref(),
+            Some("10.44.0.1"),
+            "bootstrap holds .1"
+        );
+        // Every node has a distinct mesh IP.
+        let ips: std::collections::HashSet<_> = ["cp-a", "cp-b", "cp-c", "w-d"]
+            .iter()
+            .map(|n| cm.get_node(n).unwrap().k0s_mesh_ip.clone())
+            .collect();
+        assert_eq!(ips.len(), 4, "distinct mesh IPs");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_derives_bootstrap_from_set_when_singular_absent() {
+        use spur_core::k0s::{K0sPhase, K0sRole};
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        for name in ["cp-a", "cp-b", "cp-c"] {
+            register_node(&cm, name, 4, 8000);
+        }
+        wait_for("all registered", || {
+            ["cp-a", "cp-b", "cp-c"]
+                .iter()
+                .all(|n| cm.get_node(n).is_some())
+        });
+        // HA set recorded bootstrap-first (cp-b) with the singular field unset. The first-of-set must
+        // hold `.1` — cp-b, NOT the sorted-first cp-a, so this fails if bootstrap ignores the set.
+        cm.set_k0s_phase(
+            K0sPhase::Provisioning,
+            None,
+            vec!["cp-b".into(), "cp-a".into(), "cp-c".into()],
+            false,
+        )
+        .unwrap();
+        wait_for("cp set recorded", || {
+            cm.k0s_state().controllers().len() == 3
+        });
+
+        let net = crate::cluster_k8s::ClusterNetworking {
+            mesh_cidr: "10.44.0.0/16".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
+            cni: "kuberouter".into(),
+            control_plane_node: None,
+        };
+        crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
+        wait_for("all assigned", || {
+            ["cp-a", "cp-b", "cp-c"]
+                .iter()
+                .all(|n| cm.get_node(n).and_then(|x| x.k0s_role).is_some())
+        });
+
+        for cp in ["cp-a", "cp-b", "cp-c"] {
+            assert_eq!(cm.get_node(cp).unwrap().k0s_role, Some(K0sRole::Controller));
+        }
+        assert_eq!(
+            cm.get_node("cp-b").unwrap().k0s_mesh_ip.as_deref(),
+            Some("10.44.0.1"),
+            "bootstrap (first of recorded set) holds .1"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

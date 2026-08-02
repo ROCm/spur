@@ -57,10 +57,9 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>, net: Clust
     info!(mesh = %net.mesh_cidr, pod = %net.pod_cidr, "k0s cluster reconcile loop started");
     let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
     let mut last_mesh: Vec<MeshNode> = Vec::new();
-    // Cache of the worker join token minted per node, so we mint once (not every tick) while a
-    // worker joins — re-minting each tick churns k0s server tokens and races the join. Cleared when
-    // the worker's component reports active.
-    let mut worker_tokens: HashMap<String, String> = HashMap::new();
+    // Cache of the join token minted per node (worker or secondary control-plane), so we mint once
+    // (not every tick) while it joins — re-minting churns k0s server tokens and races the join.
+    let mut join_tokens: HashMap<String, String> = HashMap::new();
     loop {
         interval.tick().await;
         if !raft.is_leader() {
@@ -89,7 +88,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>, net: Clust
         }
         last_mesh = mesh.nodes.clone();
 
-        reconcile_phase(&cluster, &net, &state, &mut worker_tokens).await;
+        reconcile_phase(&cluster, &net, &state, &mut join_tokens).await;
     }
 }
 
@@ -105,7 +104,7 @@ pub(crate) async fn reconcile_phase(
     cluster: &ClusterManager,
     net: &ClusterNetworking,
     state: &K0sClusterState,
-    worker_tokens: &mut HashMap<String, String>,
+    join_tokens: &mut HashMap<String, String>,
 ) {
     match state.phase {
         K0sPhase::Ready | K0sPhase::Provisioning => {
@@ -113,7 +112,7 @@ pub(crate) async fn reconcile_phase(
                 warn!(error = %e, "k0s provisioning assignment failed; will retry next tick");
                 return;
             }
-            converge_provisioning(cluster, net, worker_tokens).await;
+            converge_provisioning(cluster, net, join_tokens).await;
         }
         K0sPhase::Down => stop_all_components(cluster, state.reset_requested).await,
         K0sPhase::Degraded => warn!("k0s cluster degraded"),
@@ -135,27 +134,27 @@ pub(crate) fn provision_assignments(
     }
     nodes.sort_by(|a, b| a.name.cmp(&b.name)); // deterministic
 
-    // Control-plane node. Derive from an ALREADY-ASSIGNED Controller/Single node FIRST: the persisted
-    // role assignment is the durable source of truth. The CP-choice persist below is a separate raft
-    // write that lands *after* the assignment loop, so a crash between the first `assign(CP, .1)` and
-    // that persist would otherwise let a restart (with `state.control_plane_node` still None) pick a
-    // different, lexically-earlier node as CP and hand it the same `.1`/Controller — two controllers
-    // silently sharing the mesh IP across the failover. Fall back to the recorded choice -> config
-    // override -> lexically-first only when nothing is assigned yet.
-    let cp_node = nodes
-        .iter()
-        .find(|n| {
-            matches!(
-                n.k0s_role,
-                Some(K0sRole::Controller) | Some(K0sRole::Single)
-            )
+    // Bootstrap control-plane (etcd seed, holder of `.1`). Recorded bootstrap outranks a scanned
+    // role (secondary CPs also carry `Controller`) so `.1` stays put across a 1->3 grow.
+    let bootstrap = state
+        .bootstrap()
+        .or_else(|| {
+            nodes
+                .iter()
+                .find(|n| matches!(n.k0s_role, Some(K0sRole::Single | K0sRole::Controller)))
+                .map(|n| n.name.clone())
         })
-        .map(|n| n.name.clone())
-        .or_else(|| state.control_plane_node.clone())
         .or_else(|| net.control_plane_node.clone())
         .unwrap_or_else(|| nodes[0].name.clone());
 
-    // Re-seed the mesh pool from persisted assignments + reserve .1 for the controller.
+    // Control-plane set: the persisted HA set (from `cluster_up`), or just the bootstrap for the
+    // legacy single-CP path where no set was recorded.
+    let mut cp_set: HashSet<String> = state.controllers().into_iter().collect();
+    if cp_set.is_empty() {
+        cp_set.insert(bootstrap.clone());
+    }
+
+    // Re-seed the mesh pool from persisted assignments + reserve .1 for the bootstrap controller.
     let mut pool = AddressPool::new(&net.mesh_cidr)?;
     let controller_ip = first_host(&net.mesh_cidr)?;
     let _ = pool.allocate_specific(controller_ip); // reserve .1 (ignore if already reserved)
@@ -177,11 +176,18 @@ pub(crate) fn provision_assignments(
         .collect();
 
     let single = nodes.len() == 1;
-    for node in &nodes {
+    // Two passes so control planes take the lowest mesh IPs deterministically (bootstrap keeps `.1`,
+    // secondary CPs `.2`/`.3`...) regardless of where they sort among workers.
+    let ordered: Vec<_> = nodes
+        .iter()
+        .filter(|n| cp_set.contains(&n.name))
+        .chain(nodes.iter().filter(|n| !cp_set.contains(&n.name)))
+        .collect();
+    for node in ordered {
         if node.k0s_role.is_some() {
             continue; // already assigned
         }
-        let is_cp = node.name == cp_node;
+        let is_cp = cp_set.contains(&node.name);
         let role = if is_cp {
             if single {
                 K0sRole::Single
@@ -191,7 +197,7 @@ pub(crate) fn provision_assignments(
         } else {
             K0sRole::Worker
         };
-        let mesh_ip = if is_cp {
+        let mesh_ip = if node.name == bootstrap {
             controller_ip
         } else {
             pool.allocate()?
@@ -202,11 +208,83 @@ pub(crate) fn provision_assignments(
         cluster.assign_node_k0s(&node.name, role, &mesh_ip.to_string(), &pod_cidr)?;
     }
 
-    // Persist the control-plane choice if not already recorded.
-    if state.control_plane_node.as_deref() != Some(cp_node.as_str()) {
-        cluster.set_k0s_phase(K0sPhase::Provisioning, Some(cp_node), false)?;
+    // Persist the bootstrap choice if not already recorded (legacy single-CP path; `cluster_up`
+    // records the full set up front for HA).
+    if state.control_plane_node.as_deref() != Some(bootstrap.as_str()) {
+        cluster.set_k0s_phase(K0sPhase::Provisioning, Some(bootstrap), Vec::new(), false)?;
     }
     Ok(())
+}
+
+/// Resolve the control-plane set for `spur k8s up`, fail-closed, bootstrap node first: an explicit
+/// `nodes` list wins, else the lowest `replicas` candidates. Count must be 1/3/5 and fit the nodes.
+pub(crate) fn resolve_control_plane_set(
+    mut candidates: Vec<String>,
+    explicit: &[String],
+    pinned_bootstrap: Option<&str>,
+    replicas: u32,
+) -> Result<Vec<String>, String> {
+    candidates.sort();
+    candidates.dedup();
+    if !explicit.is_empty() {
+        spur_core::k0s::validate_control_plane_replicas(explicit.len() as u32)?;
+        let mut seen = HashSet::new();
+        for n in explicit {
+            if !candidates.contains(n) {
+                return Err(format!("control-plane node {n} is not a registered node"));
+            }
+            if !seen.insert(n.clone()) {
+                return Err(format!("duplicate control-plane node {n}"));
+            }
+        }
+        // Fail closed on a contradictory bootstrap: if a bootstrap is pinned (operator override or a
+        // previously-recorded CP) but absent from the explicit list, `.1`/etcd-seed would silently
+        // land on a different node than intended.
+        if let Some(boot) = pinned_bootstrap {
+            if !explicit.iter().any(|n| n == boot) {
+                return Err(format!(
+                    "bootstrap control-plane {boot} is not in the requested set [{}]",
+                    explicit.join(", ")
+                ));
+            }
+        }
+        let mut set = explicit.to_vec();
+        order_bootstrap_first(&mut set, pinned_bootstrap);
+        return Ok(set);
+    }
+    spur_core::k0s::validate_control_plane_replicas(replicas)?;
+    if replicas as usize > candidates.len() {
+        return Err(format!(
+            "requested {replicas} control planes but only {} node(s) are registered",
+            candidates.len()
+        ));
+    }
+    // Pin the bootstrap into the set first so `.1` lands on it, then fill from the lowest names.
+    let mut set: Vec<String> = Vec::new();
+    if let Some(boot) = pinned_bootstrap {
+        if candidates.iter().any(|c| c == boot) {
+            set.push(boot.to_string());
+        }
+    }
+    for c in candidates {
+        if set.len() >= replicas as usize {
+            break;
+        }
+        if !set.contains(&c) {
+            set.push(c);
+        }
+    }
+    order_bootstrap_first(&mut set, pinned_bootstrap);
+    Ok(set)
+}
+
+/// Move the pinned bootstrap node to the front of the CP set (it holds `.1` + seeds etcd).
+fn order_bootstrap_first(set: &mut [String], pinned_bootstrap: Option<&str>) {
+    if let Some(boot) = pinned_bootstrap {
+        if let Some(pos) = set.iter().position(|n| n == boot) {
+            set.swap(0, pos);
+        }
+    }
 }
 
 /// The `.1` host of a CIDR (mesh controller IP).
@@ -347,30 +425,47 @@ fn agent_endpoint(cluster: &ClusterManager, node: &str) -> Option<String> {
     Some(format!("http://{}:{}", addr, n.port))
 }
 
-/// Dial the control-plane node's agent, timing out per `AGENT_TIMEOUT`. Errors if no control-plane
-/// node is assigned yet or it has no reachable address.
+/// Dial a healthy control-plane agent, timing out per `AGENT_TIMEOUT`. Tries the bootstrap node
+/// first (its k0s API answers admin/token RPCs) then any other control plane, so admin/kubeconfig/
+/// token minting survive the loss of a single control plane while etcd quorum holds. Errors if no
+/// control-plane node is assigned yet or none is reachable.
 async fn connect_control_plane(
     cluster: &ClusterManager,
 ) -> anyhow::Result<SlurmAgentClient<tonic::transport::Channel>> {
-    let cp = cluster
-        .k0s_state()
-        .control_plane_node
-        .ok_or_else(|| anyhow::anyhow!("no control-plane node assigned yet"))?;
-    let endpoint = agent_endpoint(cluster, &cp)
-        .ok_or_else(|| anyhow::anyhow!("control-plane node {cp} has no agent address"))?;
-    tokio::time::timeout(AGENT_TIMEOUT, SlurmAgentClient::connect(endpoint))
-        .await
-        .map_err(|_| anyhow::anyhow!("connect to control-plane agent timed out"))?
-        .map_err(|e| anyhow::anyhow!("connect to control-plane agent failed: {e}"))
+    let state = cluster.k0s_state();
+    let mut candidates = state.controllers();
+    if candidates.is_empty() {
+        anyhow::bail!("no control-plane node assigned yet");
+    }
+    // Bootstrap node first (stable admin endpoint), then the rest as failover.
+    if let Some(boot) = &state.control_plane_node {
+        if let Some(pos) = candidates.iter().position(|n| n == boot) {
+            candidates.swap(0, pos);
+        }
+    }
+    let mut last_err = String::new();
+    for cp in &candidates {
+        let Some(endpoint) = agent_endpoint(cluster, cp) else {
+            last_err = format!("control-plane node {cp} has no agent address");
+            continue;
+        };
+        match tokio::time::timeout(AGENT_TIMEOUT, SlurmAgentClient::connect(endpoint)).await {
+            Ok(Ok(client)) => return Ok(client),
+            Ok(Err(e)) => last_err = format!("connect to control-plane agent {cp} failed: {e}"),
+            Err(_) => last_err = format!("connect to control-plane agent {cp} timed out"),
+        }
+    }
+    anyhow::bail!("no reachable control-plane agent ({last_err})")
 }
 
-/// Mint a worker join token from the control-plane node's agent (`k0s token create --role worker`).
-/// Errors until the control-plane component is up (its k0s API must answer); the caller retries.
-async fn mint_worker_token(cluster: &ClusterManager) -> anyhow::Result<String> {
+/// Mint a join token of `role` ("worker" | "controller") from a control-plane agent (`k0s token
+/// create --role <role>`). Errors until a control-plane component is up (its k0s API must answer);
+/// the caller retries. A controller token lets a secondary CP join the bootstrap's etcd quorum.
+async fn mint_join_token(cluster: &ClusterManager, role: &str) -> anyhow::Result<String> {
     let mut client = connect_control_plane(cluster).await?;
     let resp = client
         .create_k0s_join_token(CreateK0sJoinTokenRequest {
-            role: "worker".to_string(),
+            role: role.to_string(),
             expiry_seconds: 0, // k0s default lifetime
         })
         .await
@@ -457,11 +552,11 @@ fn controller_k0s_config(net: &ClusterNetworking, node: &spur_core::node::Node) 
 }
 
 /// Start any assigned component that is not yet active; when all are active, mark the cluster Ready.
-/// `worker_tokens` caches each worker's minted join token across ticks so we mint once per join.
+/// `join_tokens` caches each worker's minted join token across ticks so we mint once per join.
 async fn converge_provisioning(
     cluster: &ClusterManager,
     net: &ClusterNetworking,
-    worker_tokens: &mut HashMap<String, String>,
+    join_tokens: &mut HashMap<String, String>,
 ) {
     let assigned: Vec<_> = cluster
         .get_nodes()
@@ -469,71 +564,89 @@ async fn converge_provisioning(
         .filter(|n| n.k0s_role.is_some())
         .collect();
     if assigned.is_empty() {
-        worker_tokens.clear();
+        join_tokens.clear();
         return;
     }
+    let bootstrap = cluster.k0s_state().bootstrap();
     let mut all_active = true;
-    // Control-plane (controller/single) first: a worker needs the control-plane's k0s API up to
-    // mint its join token, so the control-plane must be started before we try any worker.
+    let mut bootstrap_active = false;
+    // Bootstrap control-plane first: it seeds etcd (tokenless) and its k0s API must answer before any
+    // secondary control-plane or worker can mint a join token. A Single node is always the bootstrap.
     for node in &assigned {
         let role = node.k0s_role.expect("assigned above");
         if role == K0sRole::Worker {
             continue;
         }
+        let is_bootstrap = role == K0sRole::Single || bootstrap.as_deref() == Some(&node.name);
+        if !is_bootstrap {
+            continue;
+        }
         if fetch_component_state(cluster, &node.name).await.as_deref() == Some("active") {
+            bootstrap_active = true;
             continue;
         }
         all_active = false;
         // Mesh-native cluster: generate the k0s config (api on the mesh IP + Calico bird) when
-        // cni=calico; None keeps the default kube-router. Control-plane needs no join token.
+        // cni=calico; None keeps the default kube-router. The bootstrap seeds etcd — no join token.
         let k0s_config = controller_k0s_config(net, node);
         spawn_start_component(cluster, &node.name, role, None, k0s_config, None);
     }
-    // Workers: mint a fresh join token from the control-plane agent, then start with it.
-    // Minting errors until the control-plane's k0s API is reachable — treated as "retry next tick".
+    // Don't touch secondary CPs / workers until the bootstrap's etcd is seeded and its API answers:
+    // a controller token minted before then would race the quorum. Retry on the next tick.
+    if !bootstrap_active {
+        return;
+    }
+    // Secondary CPs join the etcd quorum with a `controller` token, then workers with a `worker`
+    // token; both mint from a healthy CP agent, and a minting error just retries next tick.
     for node in &assigned {
-        if node.k0s_role != Some(K0sRole::Worker) {
-            continue;
+        let role = node.k0s_role.expect("assigned above");
+        let is_bootstrap = role == K0sRole::Single || bootstrap.as_deref() == Some(&node.name);
+        if is_bootstrap {
+            continue; // handled above
         }
         if fetch_component_state(cluster, &node.name).await.as_deref() == Some("active") {
-            worker_tokens.remove(&node.name); // joined — drop the cached token
+            join_tokens.remove(&node.name); // joined — drop the cached token
             continue;
         }
         all_active = false;
-        // For a native-routing CNI, pin the worker's kubelet node-ip to its mesh IP.
+        let token_role = if role == K0sRole::Controller {
+            "controller"
+        } else {
+            "worker"
+        };
+        // For a native-routing CNI, pin the node's kubelet node-ip to its mesh IP.
         let node_ip = if net.cni == "calico" {
             node.k0s_mesh_ip.clone()
         } else {
             None
         };
-        // Mint the worker's join token once and cache it: re-minting every tick churns k0s server
-        // tokens and races the join. Reuse the cached token on later ticks until the worker joins.
-        let token = match worker_tokens.get(&node.name) {
+        // A secondary control-plane also needs its own generated k0s config (API SANs on its mesh IP).
+        let k0s_config = if role == K0sRole::Controller {
+            controller_k0s_config(net, node)
+        } else {
+            None
+        };
+        // Mint the join token once and cache it: re-minting every tick churns k0s server tokens and
+        // races the join. Reuse the cached token on later ticks until the node joins.
+        let token = match join_tokens.get(&node.name) {
             Some(cached) => cached.clone(),
-            None => match mint_worker_token(cluster).await {
+            None => match mint_join_token(cluster, token_role).await {
                 Ok(token) => {
-                    worker_tokens.insert(node.name.clone(), token.clone());
+                    join_tokens.insert(node.name.clone(), token.clone());
                     token
                 }
                 Err(e) => {
-                    warn!(node = %node.name, error = %e, "could not mint worker join token yet; will retry");
+                    warn!(node = %node.name, error = %e, "could not mint {token_role} join token yet; will retry");
                     continue;
                 }
             },
         };
-        spawn_start_component(
-            cluster,
-            &node.name,
-            K0sRole::Worker,
-            Some(token),
-            None,
-            node_ip,
-        );
+        spawn_start_component(cluster, &node.name, role, Some(token), k0s_config, node_ip);
     }
     // Only transition on the edge — this reconcile also runs every tick while already Ready (to
     // heal re-added nodes), so an unconditional set would churn a WAL write + log line each tick.
     if all_active && cluster.k0s_state().phase != K0sPhase::Ready {
-        match cluster.set_k0s_phase(K0sPhase::Ready, None, false) {
+        match cluster.set_k0s_phase(K0sPhase::Ready, None, Vec::new(), false) {
             Ok(()) => info!("k0s cluster converged: all components active -> Ready"),
             Err(e) => warn!(error = %e, "failed to mark k0s cluster Ready"),
         }
@@ -720,6 +833,99 @@ mod tests {
         let used: HashSet<u32> = [0, 1, 3].into_iter().collect();
         assert_eq!(next_free_ordinal(&used), 2);
         assert_eq!(next_free_ordinal(&HashSet::new()), 0);
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn resolve_cp_set_replicas_picks_lowest_bootstrap_first() {
+        let set =
+            resolve_control_plane_set(names(&["d", "b", "a", "c", "e"]), &[], None, 3).unwrap();
+        // lowest 3 names, sorted; no pin so bootstrap-first is a no-op.
+        assert_eq!(set, names(&["a", "b", "c"]));
+    }
+
+    #[test]
+    fn resolve_cp_set_pins_bootstrap_to_front_and_into_the_set() {
+        let set =
+            resolve_control_plane_set(names(&["a", "b", "c", "d"]), &[], Some("c"), 3).unwrap();
+        assert_eq!(set[0], "c", "pinned bootstrap leads (holds .1)");
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(&"a".to_string()) && set.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn resolve_cp_set_explicit_list_wins_and_orders_bootstrap() {
+        let set = resolve_control_plane_set(
+            names(&["a", "b", "c", "d", "e"]),
+            &names(&["e", "c", "a"]),
+            Some("c"),
+            5, // ignored when explicit list is present
+        )
+        .unwrap();
+        assert_eq!(set[0], "c");
+        assert_eq!(set.len(), 3);
+    }
+
+    #[test]
+    fn resolve_cp_set_rejects_even_count() {
+        assert!(resolve_control_plane_set(names(&["a", "b"]), &[], None, 2).is_err());
+        assert!(
+            resolve_control_plane_set(names(&["a", "b", "c", "d"]), &names(&["a", "b"]), None, 1)
+                .is_err(),
+            "explicit even list rejected"
+        );
+    }
+
+    #[test]
+    fn resolve_cp_set_rejects_more_cps_than_nodes() {
+        let err = resolve_control_plane_set(names(&["a", "b"]), &[], None, 3).unwrap_err();
+        assert!(err.contains("only 2 node"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_cp_set_rejects_unknown_or_duplicate_explicit_node() {
+        assert!(
+            resolve_control_plane_set(names(&["a", "b", "c"]), &names(&["a", "x", "c"]), None, 3)
+                .is_err(),
+            "unknown node rejected"
+        );
+        assert!(
+            resolve_control_plane_set(names(&["a", "b"]), &names(&["a", "a", "b"]), None, 3)
+                .is_err(),
+            "duplicate node rejected"
+        );
+    }
+
+    #[test]
+    fn resolve_cp_set_rejects_pinned_bootstrap_outside_explicit_list() {
+        // A recorded/overridden bootstrap not in the requested set would silently move `.1`.
+        let err = resolve_control_plane_set(
+            names(&["a", "b", "c", "d"]),
+            &names(&["a", "b", "c"]),
+            Some("d"),
+            3,
+        )
+        .unwrap_err();
+        assert!(err.contains("bootstrap control-plane d"), "got: {err}");
+        // In-list pinned bootstrap is fine and leads the set.
+        let set = resolve_control_plane_set(
+            names(&["a", "b", "c"]),
+            &names(&["a", "b", "c"]),
+            Some("b"),
+            3,
+        )
+        .unwrap();
+        assert_eq!(set[0], "b");
+    }
+
+    #[test]
+    fn resolve_cp_set_legacy_single_cp_reup_is_idempotent() {
+        // A 1-CP cluster re-upped with replicas=1 resolves to the same single-node set (guard allows).
+        let set = resolve_control_plane_set(names(&["a", "b"]), &[], Some("a"), 1).unwrap();
+        assert_eq!(set, names(&["a"]));
     }
 
     #[test]

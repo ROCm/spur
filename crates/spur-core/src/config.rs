@@ -686,6 +686,9 @@ pub struct ClusterConfig {
     /// Hostname of the node that runs the k0s control plane. Empty = pick from inventory.
     #[serde(default)]
     pub control_plane_node: Option<String>,
+    /// HA control-plane count (1, 3, or 5). Overridden per-invocation by `spur k8s up --replicas`.
+    #[serde(default = "default_control_plane_replicas")]
+    pub control_plane_replicas: u32,
     /// k0s release to install/run (e.g. "v1.36.2+k0s.0", or "latest"). Pinned to a known-good
     /// version by default; bumped per spur release. spurd installs this if the binary is missing.
     #[serde(default = "default_k0s_version")]
@@ -715,6 +718,9 @@ fn default_cluster_distro() -> String {
 }
 fn default_k0s_version() -> String {
     crate::k0s::K0S_PINNED_VERSION.into()
+}
+fn default_control_plane_replicas() -> u32 {
+    1
 }
 fn default_k0s_binary() -> String {
     crate::k0s::K0S_DEFAULT_BINARY.into()
@@ -747,6 +753,7 @@ impl Default for ClusterConfig {
             service_cidr: default_service_cidr(),
             cni_mtu: default_cni_mtu(),
             control_plane_node: None,
+            control_plane_replicas: default_control_plane_replicas(),
             k0s_version: default_k0s_version(),
             k0s_binary: default_k0s_binary(),
             cni: default_cni(),
@@ -1136,6 +1143,14 @@ impl SlurmConfig {
                     value: format!("{} (only \"k0s\" is supported)", self.cluster.distro),
                 });
             }
+            if let Err(msg) =
+                crate::k0s::validate_control_plane_replicas(self.cluster.control_plane_replicas)
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "cluster.control_plane_replicas".into(),
+                    value: msg,
+                });
+            }
             // The mesh CIDR feeds the k0s IPAM (AddressPool) exactly like pod/service, so assert it is
             // a valid IPv4 CIDR in the same pass — otherwise a malformed wg_cidr bypasses validate()
             // and fails every reconcile tick in AddressPool::new, leaving the cluster silently stuck.
@@ -1433,6 +1448,15 @@ cni_mtu = 1400
             "cluster_name=\"t\"\n[cluster]\nenabled=true\ndistro=\"k3s\"\n"
         )
         .is_err());
+        // control_plane_replicas must be 1/3/5 (etcd quorum); even/too-large is rejected.
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\ncontrol_plane_replicas=2\n"
+        )
+        .is_err());
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\ncontrol_plane_replicas=3\n"
+        )
+        .is_ok());
         // Unknown storage provisioner is rejected; "none" and "local-path" are accepted.
         assert!(SlurmConfig::load_from_str(
             "cluster_name=\"t\"\n[cluster]\nenabled=true\nstorage_provisioner=\"nfs\"\n"
