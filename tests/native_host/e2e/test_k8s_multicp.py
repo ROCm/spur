@@ -32,5 +32,6 @@ class TestK8sMultiControlPlane:
 
     def test_even_replica_count_rejected(self, k8s_multicp_cluster):
         cluster = k8s_multicp_cluster
-        out = cluster.cli_allow_fail(["spur", "k8s", "up", "--replicas", "2"])
+        # k0s up is admin-gated; run as root to reach the replica-count validation.
+        out = cluster.cli_as_user("root", ["spur", "k8s", "up", "--replicas", "2"])
         assert "1, 3, or 5" in out, f"even replica count must be rejected: {out}"
