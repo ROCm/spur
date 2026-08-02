@@ -1348,6 +1348,7 @@ impl ClusterManager {
     pub fn register_node(
         &self,
         name: String,
+        hostname: String,
         resources: ResourceSet,
         address: String,
         port: u16,
@@ -1356,6 +1357,11 @@ impl ClusterManager {
         source: NodeSource,
         labels: HashMap<String, String>,
     ) -> anyhow::Result<()> {
+        let hostname = if hostname.is_empty() {
+            name.clone()
+        } else {
+            hostname
+        };
         let action = {
             let nodes = self.nodes.read();
             evaluate_registration(nodes.get(&name), &resources)
@@ -1365,10 +1371,32 @@ impl ClusterManager {
             RegistrationAction::Skip => {
                 debug!(node = %name, "node unchanged, skipping");
                 self.sync_node_labels(&name, labels)?;
+                if let Some(existing) = self.get_node(&name) {
+                    let needs_update = existing.address.as_deref() != Some(address.as_str())
+                        || existing.hostname != hostname
+                        || existing.port != port
+                        || (!wg_pubkey.is_empty()
+                            && existing.wg_pubkey.as_deref() != Some(wg_pubkey.as_str()))
+                        || (!version.is_empty()
+                            && existing.version.as_deref() != Some(version.as_str()));
+                    if needs_update {
+                        self.propose(WalOperation::NodeUpdate {
+                            name: name.clone(),
+                            hostname: hostname.clone(),
+                            resources: existing.total_resources.clone(),
+                            address,
+                            port,
+                            wg_pubkey,
+                            version,
+                        })?;
+                        info!(node = %name, "node comm address or metadata updated");
+                    }
+                }
             }
             RegistrationAction::Update => {
                 self.propose(WalOperation::NodeUpdate {
                     name: name.clone(),
+                    hostname: hostname.clone(),
                     resources,
                     address,
                     port,
@@ -1384,6 +1412,7 @@ impl ClusterManager {
             RegistrationAction::Register => {
                 self.propose(WalOperation::NodeRegister {
                     name: name.clone(),
+                    hostname: hostname.clone(),
                     resources,
                     address,
                     port,
@@ -3897,6 +3926,7 @@ impl ClusterManager {
             }
             WalOperation::NodeRegister {
                 name,
+                hostname,
                 resources,
                 address,
                 port,
@@ -3905,9 +3935,17 @@ impl ClusterManager {
                 labels,
             } => {
                 let mut node = Node::new(name.clone(), resources.clone());
-                node.address = Some(address.clone());
-                node.port = *port;
+                node.hostname = if hostname.is_empty() {
+                    name.clone()
+                } else {
+                    hostname.clone()
+                };
                 node.labels = labels.clone();
+                self.apply_node_config_policy(&mut node);
+                if !address.is_empty() {
+                    node.address = Some(address.clone());
+                }
+                node.port = *port;
                 if !wg_pubkey.is_empty() {
                     node.wg_pubkey = Some(wg_pubkey.clone());
                 }
@@ -3937,8 +3975,6 @@ impl ClusterManager {
                 }
                 drop(partitions);
 
-                self.apply_node_config_policy(&mut node);
-
                 let mut nodes = self.nodes.write();
                 nodes.insert(name.clone(), node);
                 self.next_job_id.store(next_id, Ordering::Relaxed);
@@ -3946,6 +3982,7 @@ impl ClusterManager {
             }
             WalOperation::NodeUpdate {
                 name,
+                hostname,
                 resources,
                 address,
                 port,
@@ -3954,7 +3991,12 @@ impl ClusterManager {
             } => {
                 if let Some(node) = nodes.get_mut(name) {
                     node.total_resources = resources.clone();
-                    node.address = Some(address.clone());
+                    if !hostname.is_empty() {
+                        node.hostname = hostname.clone();
+                    }
+                    if !address.is_empty() {
+                        node.address = Some(address.clone());
+                    }
                     node.port = *port;
                     if !wg_pubkey.is_empty() {
                         node.wg_pubkey = Some(wg_pubkey.clone());
@@ -4161,6 +4203,11 @@ impl ClusterManager {
             if node_config_matches(nc, &node.name, &node.labels) {
                 node.features = nc.features.clone();
                 node.weight = nc.weight;
+                if node.address.is_none() {
+                    if let Some(ref cfg_addr) = nc.address {
+                        node.address = Some(cfg_addr.clone());
+                    }
+                }
                 return;
             }
         }
@@ -5196,6 +5243,7 @@ mod tests {
     fn register_node(cm: &ClusterManager, name: &str, cpus: u32, mem: u64) {
         cm.register_node(
             name.into(),
+            name.into(),
             ResourceSet {
                 cpus,
                 memory_mb: mem,
@@ -5632,6 +5680,7 @@ mod tests {
 
         cm.apply_operation(&WalOperation::NodeRegister {
             name: "gpu-node".into(),
+            hostname: String::new(),
             resources: ResourceSet {
                 cpus: 64,
                 memory_mb: 256000,
@@ -5648,6 +5697,7 @@ mod tests {
         assert_eq!(node.total_resources.cpus, 64);
         assert_eq!(node.state, NodeState::Idle);
         assert_eq!(node.address, Some("10.0.0.1".into()));
+        assert_eq!(node.hostname, "gpu-node");
         // Dynamically registered nodes get the default partition
         assert!(
             !node.partitions.is_empty(),
@@ -11608,6 +11658,7 @@ mod tests {
         // Agent reconnects — re-registration must NOT recover to Idle
         cm.register_node(
             "locked".into(),
+            "locked".into(),
             ResourceSet {
                 cpus: 4,
                 memory_mb: 8000,
@@ -13141,6 +13192,7 @@ mod tests {
 
         cm.register_node(
             "dyn-node".into(),
+            "dyn-node".into(),
             ResourceSet {
                 cpus: 8,
                 memory_mb: 16000,
@@ -13207,6 +13259,7 @@ mod tests {
         // First registration with labels
         cm.register_node(
             "worker1".into(),
+            "worker1".into(),
             ResourceSet {
                 cpus: 4,
                 memory_mb: 8000,
@@ -13228,6 +13281,7 @@ mod tests {
 
         // Re-register with same resources but different labels
         cm.register_node(
+            "worker1".into(),
             "worker1".into(),
             ResourceSet {
                 cpus: 4,
@@ -13253,6 +13307,130 @@ mod tests {
         assert_eq!(node.labels.get("tier"), Some(&"1".into()));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reregistration_updates_comm_address_without_resource_change() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let resources = ResourceSet {
+            cpus: 4,
+            memory_mb: 8000,
+            ..Default::default()
+        };
+
+        cm.register_node(
+            "worker1".into(),
+            "worker1".into(),
+            resources.clone(),
+            "10.0.0.1".into(),
+            6818,
+            String::new(),
+            String::new(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::new(),
+        )
+        .unwrap();
+        wait_for("node registered", || cm.get_node("worker1").is_some());
+
+        cm.register_node(
+            "worker1".into(),
+            "worker1".into(),
+            resources,
+            "10.0.0.2".into(),
+            6818,
+            String::new(),
+            String::new(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::new(),
+        )
+        .unwrap();
+        wait_for("comm address updated", || {
+            cm.get_node("worker1").and_then(|n| n.address).as_deref() == Some("10.0.0.2")
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_config_address_does_not_override_registered_comm_addr() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.nodes = vec![spur_core::config::NodeConfig {
+            names: "worker1".into(),
+            selector: HashMap::new(),
+            cpus: 0,
+            memory_mb: 0,
+            gres: Vec::new(),
+            features: Vec::new(),
+            address: Some("10.0.0.99".into()),
+            weight: 1,
+        }];
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        cm.register_node(
+            "worker1".into(),
+            "worker1".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            "10.0.0.1".into(),
+            6818,
+            String::new(),
+            String::new(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::from([("pool".into(), "train".into())]),
+        )
+        .unwrap();
+        wait_for("node registered", || cm.get_node("worker1").is_some());
+
+        cm.apply_operation(&WalOperation::NodeLabelsUpdate {
+            name: "worker1".into(),
+            set: HashMap::from([("pool".into(), "infer".into())]),
+            remove: Vec::new(),
+        });
+
+        assert_eq!(
+            cm.get_node("worker1").unwrap().address,
+            Some("10.0.0.1".into())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_config_address_fills_when_agent_address_empty() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.nodes = vec![spur_core::config::NodeConfig {
+            names: "worker1".into(),
+            selector: HashMap::new(),
+            cpus: 0,
+            memory_mb: 0,
+            gres: Vec::new(),
+            features: Vec::new(),
+            address: Some("10.0.0.99".into()),
+            weight: 1,
+        }];
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "worker1".into(),
+            hostname: "worker1".into(),
+            resources: ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            address: String::new(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+        });
+
+        assert_eq!(
+            cm.get_node("worker1").unwrap().address,
+            Some("10.0.0.99".into())
+        );
+    }
+
     #[test]
     fn label_update_applies_nodeconfig_features() {
         let dir = TempDir::new().unwrap();
@@ -13272,6 +13450,7 @@ mod tests {
         // Register a node directly via WAL apply
         cm.apply_operation(&WalOperation::NodeRegister {
             name: "gpu-node".into(),
+            hostname: String::new(),
             resources: ResourceSet {
                 cpus: 8,
                 memory_mb: 16000,
@@ -13317,6 +13496,7 @@ mod tests {
 
         cm.apply_operation(&WalOperation::NodeRegister {
             name: "gpu-node".into(),
+            hostname: String::new(),
             resources: ResourceSet {
                 cpus: 8,
                 memory_mb: 16000,
@@ -13362,6 +13542,7 @@ mod tests {
 
         cm.apply_operation(&WalOperation::NodeRegister {
             name: "cpu-node".into(),
+            hostname: String::new(),
             resources: ResourceSet {
                 cpus: 8,
                 memory_mb: 16000,

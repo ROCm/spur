@@ -70,21 +70,18 @@ fn get_wg_address(interface: &str) -> Option<String> {
     None
 }
 
-/// Resolve hostname to IP address.
+/// Resolve hostname to IP address, preferring non-loopback results.
 fn resolve_hostname(hostname: &str) -> String {
-    use std::net::ToSocketAddrs;
-    let addr_str = format!("{}:0", hostname);
-    match addr_str.to_socket_addrs() {
-        Ok(mut addrs) => {
-            if let Some(addr) = addrs.next() {
-                addr.ip().to_string()
-            } else {
+    match crate::comm_addr::normalize_comm_address(hostname) {
+        Ok(addr) => {
+            if crate::comm_addr::normalized_comm_addr_is_unusable(&addr) {
                 warn!(
                     hostname,
-                    "hostname resolved to no addresses, using 127.0.0.1"
+                    comm_addr = %addr,
+                    "hostname resolved to a non-routable address; set --address/--comm-address to a routable IP"
                 );
-                "127.0.0.1".to_string()
             }
+            addr
         }
         Err(e) => {
             warn!(hostname, error = %e, "failed to resolve hostname, using 127.0.0.1");

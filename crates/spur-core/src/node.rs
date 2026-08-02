@@ -226,7 +226,11 @@ pub enum NodeSource {
 /// A compute node in the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
+    /// Cluster node name (NodeName): used by `-w`, partitions, and display.
     pub name: String,
+    /// OS hostname reported at agent registration (NodeHostname).
+    #[serde(default)]
+    pub hostname: String,
     pub state: NodeState,
     pub state_reason: Option<String>,
     /// When true, the current state was set by an operator (admin API, drain,
@@ -261,7 +265,7 @@ pub struct Node {
     pub agent_start_time: Option<DateTime<Utc>>,
     pub last_heartbeat: Option<DateTime<Utc>>,
 
-    /// Agent address for gRPC communication.
+    /// Routable comm address for agent gRPC and inter-node TCP (NodeAddr).
     pub address: Option<String>,
     /// Agent gRPC listen port.
     pub port: u16,
@@ -297,6 +301,7 @@ impl Node {
     pub fn new(name: String, resources: ResourceSet) -> Self {
         Self {
             name,
+            hostname: String::new(),
             state: NodeState::Unknown,
             state_reason: None,
             admin_locked: false,
@@ -343,6 +348,11 @@ impl Node {
     /// Whether this node can accept new work.
     pub fn is_schedulable(&self) -> bool {
         self.state.is_available()
+    }
+
+    /// Routable comm address (NodeAddr), when registered.
+    pub fn comm_addr(&self) -> Option<&str> {
+        self.address.as_deref()
     }
 
     /// Update state based on allocation level.

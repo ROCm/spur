@@ -556,7 +556,8 @@ pub struct NodeConfig {
     pub gres: Vec<String>,
     #[serde(default)]
     pub features: Vec<String>,
-    /// Override address (if different from hostname).
+    /// Default comm address when the agent has not registered one yet. Does not
+    /// override an agent-registered address.
     pub address: Option<String>,
     /// Scheduling weight. Higher weight = preferred for scheduling.
     #[serde(default = "default_one")]
@@ -581,6 +582,10 @@ pub struct NetworkConfig {
     /// Agent gRPC listen port (default: 6818).
     #[serde(default = "default_agent_port")]
     pub agent_port: u16,
+    /// Reject agent registrations whose comm address is not routable (loopback,
+    /// unspecified, or link-local).
+    #[serde(default)]
+    pub reject_loopback_comm_addr: bool,
 }
 
 fn default_wg_cidr() -> String {
@@ -604,6 +609,7 @@ impl Default for NetworkConfig {
             wg_interface: "spur0".into(),
             wg_port: 51820,
             agent_port: 6818,
+            reject_loopback_comm_addr: false,
         }
     }
 }

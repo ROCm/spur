@@ -138,6 +138,8 @@ pub enum WalOperation {
     // Node operations
     NodeRegister {
         name: String,
+        #[serde(default)]
+        hostname: String,
         resources: ResourceSet,
         address: String,
         #[serde(default = "default_port")]
@@ -151,6 +153,8 @@ pub enum WalOperation {
     },
     NodeUpdate {
         name: String,
+        #[serde(default)]
+        hostname: String,
         resources: ResourceSet,
         address: String,
         port: u16,
