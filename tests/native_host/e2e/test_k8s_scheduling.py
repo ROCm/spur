@@ -4,10 +4,9 @@
 """E2E: nodes claimed by the managed k8s cluster are excluded from Spur batch
 scheduling, and return to scheduling after teardown (SPUR-114).
 
-Uses rootless spurd: `spur k8s up` still assigns k0s roles on the controller
-(the scheduler gate reads those), while the agents never bring up real k0s, so
-no systemd/sudo/etcd is required. The cluster stays in `provisioning`, which is
-all this test needs — it asserts scheduler behavior, not k0s liveness.
+Rootless: `spur k8s up` still assigns roles (which the scheduler gate reads)
+without agents bringing up real k0s, so no systemd/sudo/etcd is needed — this
+asserts scheduler behavior, not k0s liveness.
 """
 
 import re
@@ -29,9 +28,8 @@ def _reason(cluster, job_id: int) -> str:
 
 
 def _wait_gate_active(cluster, script: str, timeout: int = 90) -> int:
-    """The k0s role is assigned a reconcile tick after `k8s up`; before that a job
-    still runs. Submit probes until one pends with the reserved reason, proving the
-    gate is live, and return that still-pending job's id."""
+    """Submit probes until one pends with the reserved reason (role assignment
+    lands a reconcile tick after `k8s up`); returns that pending job's id."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         jid = parse_job_id(cluster.sbatch(["-J", "probe", "-o",
@@ -52,7 +50,6 @@ def k8s_enabled_cluster(unstarted_cluster):
     yield unstarted_cluster
 
 
-@pytest.mark.k0s
 class TestK8sSchedulingExclusion:
     def test_k8s_reserved_node_pends_then_reschedules_after_down(self, k8s_enabled_cluster):
         cluster = k8s_enabled_cluster
