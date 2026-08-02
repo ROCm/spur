@@ -3108,7 +3108,7 @@ impl ClusterManager {
                     })
                     .count();
                 if free_now + k0s_blocked >= needed {
-                    PendingReason::K0sReserved
+                    PendingReason::K8sReserved
                 } else {
                     PendingReason::Resources
                 }
@@ -7646,17 +7646,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn k0s_reserved_node_reports_k0s_reserved_not_resources() {
-        // A job that would fit but for the node being claimed by k0s must report
-        // K0sReserved, so `squeue` explains why an "idle"-looking node won't run it.
+    async fn k8s_reserved_node_reports_k8s_reserved_not_resources() {
+        // A job that would fit but for the node being claimed by k8s must report
+        // K8sReserved, so `squeue` explains why an "idle"-looking node won't run it.
         use spur_core::k0s::K0sRole;
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 4, 8000);
-        let job_id = submit_and_wait(&cm, basic_spec("wants-k0s-node"));
+        let job_id = submit_and_wait(&cm, basic_spec("wants-k8s-node"));
         let snapshot = cm.get_job(job_id).unwrap();
 
-        // Idle node with capacity, but reserved for k0s -> K0sReserved.
+        // Idle node with capacity, but reserved for k8s -> K8sReserved.
         let mut node = cm.get_node("n1").unwrap();
         node.k0s_role = Some(K0sRole::Worker);
         let nodes = vec![node];
@@ -7669,11 +7669,11 @@ mod tests {
         cm.update_pending_reasons(&[&snapshot], &state);
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
-            PendingReason::K0sReserved
+            PendingReason::K8sReserved
         );
 
-        // An exclusive job needs an idle node, so a busy k0s node would not run it
-        // even if the role were cleared -> plain Resources, not K0sReserved.
+        // An exclusive job needs an idle node, so a busy k8s node would not run it
+        // even if the role were cleared -> plain Resources, not K8sReserved.
         let mut busy = cm.get_node("n1").unwrap();
         busy.k0s_role = Some(K0sRole::Worker);
         busy.alloc_resources = scalar_alloc(2, 4000);
@@ -11066,7 +11066,7 @@ mod tests {
         cm.update_pending_reasons(&[&snap], &state);
         assert_ne!(
             cm.get_job(job).unwrap().pending_reason,
-            PendingReason::K0sReserved
+            PendingReason::K8sReserved
         );
     }
 

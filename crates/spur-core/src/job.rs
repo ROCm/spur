@@ -298,7 +298,7 @@ pub enum PendingReason {
     AssocGrpMemLimit,
     AssocGrpGpuLimit,
     AssocMaxWallDurationPerJobLimit,
-    K0sReserved,
+    K8sReserved,
 }
 
 impl PendingReason {
@@ -376,7 +376,7 @@ impl PendingReason {
             Self::AssocGrpMemLimit => "AssocGrpMemLimit",
             Self::AssocGrpGpuLimit => "AssocGrpGRES",
             Self::AssocMaxWallDurationPerJobLimit => "AssocMaxWallDurationPerJobLimit",
-            Self::K0sReserved => "ReqNodeNotAvail, Reserved for k0s cluster",
+            Self::K8sReserved => "ReqNodeNotAvail, Reserved for Kubernetes cluster",
         }
     }
 }
