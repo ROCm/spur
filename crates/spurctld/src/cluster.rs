@@ -1901,6 +1901,12 @@ impl ClusterManager {
     /// Clear a node's k0s role + mesh IP + pod /24 (replicated via Raft). Returns the node to
     /// Spur batch scheduling after k0s teardown. Idempotent: a no-op on an already-cleared node.
     pub fn clear_node_k0s(&self, name: &str) -> anyhow::Result<()> {
+        {
+            let nodes = self.nodes.read();
+            if !nodes.contains_key(name) {
+                anyhow::bail!("node {} not found", name);
+            }
+        }
         self.propose(WalOperation::NodeK0sClear {
             name: name.to_string(),
         })?;
@@ -3080,10 +3086,7 @@ impl ClusterManager {
             // Fewer nodes free (schedulable, available resources) than needed →
             // Resources; otherwise queued behind higher priority.
             let has_capacity = |n: &spur_core::node::Node| {
-                if n.alloc_resources.cpus >= n.total_resources.cpus && n.total_resources.cpus > 0 {
-                    return false;
-                }
-                n.can_satisfy_request(&required)
+                n.has_free_cpu_capacity() && n.can_satisfy_request(&required)
             };
             let free_now = eligible
                 .iter()
@@ -3094,11 +3097,15 @@ impl ClusterManager {
             let reason = if free_now >= needed {
                 PendingReason::Priority
             } else {
-                // k0s-caused shortfall: eligible nodes free but for their k0s
-                // reservation (placement/reservation already cleared by `eligible`).
+                // k0s-caused shortfall: nodes that would match but for the k0s gate.
+                // Uses matches_ignoring_k0s so exclusive/idle rules stay in lockstep.
                 let k0s_blocked = eligible
                     .iter()
-                    .filter(|n| n.is_k0s_reserved() && n.is_schedulable() && has_capacity(n))
+                    .filter(|n| {
+                        n.is_k0s_reserved()
+                            && placement.matches_ignoring_k0s(n, cluster_state.reservations, now)
+                            && has_capacity(n)
+                    })
                     .count();
                 if free_now + k0s_blocked >= needed {
                     PendingReason::K0sReserved
@@ -7665,15 +7672,26 @@ mod tests {
             PendingReason::K0sReserved
         );
 
-        // Same k0s node but the request is too big for it -> plain Resources,
-        // since freeing k0s would still not satisfy the job.
-        let mut big_spec = basic_spec("too-big");
-        big_spec.cpus_per_task = 16;
-        let big = submit_and_wait(&cm, big_spec);
-        let big_snap = cm.get_job(big).unwrap();
-        cm.update_pending_reasons(&[&big_snap], &state);
+        // An exclusive job needs an idle node, so a busy k0s node would not run it
+        // even if the role were cleared -> plain Resources, not K0sReserved.
+        let mut busy = cm.get_node("n1").unwrap();
+        busy.k0s_role = Some(K0sRole::Worker);
+        busy.alloc_resources = scalar_alloc(2, 4000);
+        busy.state = NodeState::Mixed;
+        let nodes = vec![busy];
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        let mut excl_spec = basic_spec("excl");
+        excl_spec.exclusive = true;
+        let excl = submit_and_wait(&cm, excl_spec);
+        let excl_snap = cm.get_job(excl).unwrap();
+        cm.update_pending_reasons(&[&excl_snap], &state);
         assert_eq!(
-            cm.get_job(big).unwrap().pending_reason,
+            cm.get_job(excl).unwrap().pending_reason,
             PendingReason::Resources
         );
     }

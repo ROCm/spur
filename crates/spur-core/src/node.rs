@@ -345,6 +345,11 @@ impl Node {
             .can_satisfy_with_allocated(&self.alloc_resources, request)
     }
 
+    /// Whether the node has any unallocated CPU headroom (a saturated node is full).
+    pub fn has_free_cpu_capacity(&self) -> bool {
+        !(self.alloc_resources.cpus >= self.total_resources.cpus && self.total_resources.cpus > 0)
+    }
+
     /// Whether this node can accept new work.
     pub fn is_schedulable(&self) -> bool {
         self.state.is_available()

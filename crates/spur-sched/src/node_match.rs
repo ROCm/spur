@@ -128,15 +128,23 @@ impl<'a> NodePlacement<'a> {
     /// [`eligible`](Self::eligible) plus runtime state (schedulable,
     /// exclusive-idle), still ignoring free capacity.
     pub fn matches(&self, node: &Node, reservations: &[Reservation], now: DateTime<Utc>) -> bool {
+        // A node claimed by the managed k0s cluster is owned by the k8s
+        // scheduler; Spur must not also place jobs on it (no GPU double-booking).
+        !node.is_k0s_reserved() && self.matches_ignoring_k0s(node, reservations, now)
+    }
+
+    /// [`matches`](Self::matches) without the k0s-reservation gate, so the pending-reason
+    /// classifier can ask "would this node match if it weren't reserved for k0s?".
+    pub fn matches_ignoring_k0s(
+        &self,
+        node: &Node,
+        reservations: &[Reservation],
+        now: DateTime<Utc>,
+    ) -> bool {
         if !self.eligible(node, reservations, now) {
             return false;
         }
         if !node.is_schedulable() {
-            return false;
-        }
-        // A node claimed by the managed k0s cluster is owned by the k8s
-        // scheduler; Spur must not also place jobs on it (no GPU double-booking).
-        if node.is_k0s_reserved() {
             return false;
         }
         // Exclusive jobs need an idle node.
