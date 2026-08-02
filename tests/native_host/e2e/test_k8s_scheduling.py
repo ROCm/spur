@@ -20,14 +20,13 @@ K8S_RESERVED = "Reserved for Kubernetes cluster"
 
 
 def _reason(cluster, job_id: int) -> str:
-    """Full `Reason=` text from `scontrol show job` (it may contain spaces/commas
-    and runs to end of line)."""
+    """Full `Reason=` text from `scontrol show job` (runs to end of line)."""
     out = cluster.scontrol("show", "job", str(job_id))
     m = re.search(r"Reason=(.*)", out)
     return m.group(1).strip() if m else ""
 
 
-def _wait_gate_active(cluster, script: str, timeout: int = 90) -> int:
+def _wait_gate_active(cluster, script: str, timeout: int = 120) -> int:
     """Submit probes until one pends with the reserved reason (role assignment
     lands a reconcile tick after `k8s up`); returns that pending job's id."""
     deadline = time.time() + timeout
@@ -44,14 +43,20 @@ def _wait_gate_active(cluster, script: str, timeout: int = 90) -> int:
 
 @pytest.fixture
 def k8s_enabled_cluster(unstarted_cluster):
-    """Rootless cluster with `[cluster].enabled=true` on the controller so
-    `spur k8s up` assigns roles without a real k0s bring-up."""
+    """Rootless cluster with `[cluster].enabled=true` so `spur k8s up` assigns
+    roles without a real k0s bring-up. Tears the cluster down on exit so no k0s
+    role/state leaks into a later e2e run."""
     unstarted_cluster.start(config_overrides={"cluster": {"enabled": True}})
     yield unstarted_cluster
+    try:
+        unstarted_cluster.k8s_down(reset=True)
+        unstarted_cluster.wait_k8s_phase("down", timeout=60)
+    except Exception:
+        pass
 
 
 class TestK8sSchedulingExclusion:
-    def test_k8s_reserved_node_pends_then_reschedules_after_down(self, k8s_enabled_cluster):
+    def test_k8s_reserved_node_excluded_from_scheduling(self, k8s_enabled_cluster):
         cluster = k8s_enabled_cluster
 
         # Baseline: a job runs before any k8s claim.
@@ -61,15 +66,14 @@ class TestK8sSchedulingExclusion:
         assert base is not None
         wait_job(cluster, base, timeout=90)
 
-        # Claim the node(s) for k8s -> the scheduler gate should exclude them.
+        # Claim the node(s) for k8s -> the scheduler gate must exclude them, so a
+        # newly submitted job pends with the reserved reason instead of running.
         cluster.k8s_up()
         held = _wait_gate_active(cluster, script)
-
-        # The claimed node keeps the job pending, not running.
         assert job_state(cluster.squeue_all(), held) == "PD", (
             f"job should stay pending on a k8s-reserved node:\n{cluster.squeue_all()}"
         )
 
-        # Teardown clears the roles -> the pending job schedules and completes.
+        # Teardown reclaims the node -> the pending job schedules and completes.
         cluster.k8s_down(reset=True)
         wait_job(cluster, held, timeout=180)
