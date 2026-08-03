@@ -103,12 +103,13 @@ fn parse_label_args(label_args: &[String]) -> Result<(HashMap<String, String>, V
 }
 
 async fn cmd_label(controller: &str, node_pattern: String, label_args: Vec<String>) -> Result<()> {
-    let mut client = spur_proto::controller_client(spur_client::connect_channel(controller).await?);
     let (set_labels, remove_labels) = parse_label_args(&label_args)?;
     let nodes = expand_node_pattern(&node_pattern)?;
+    let mut client = spur_proto::controller_client(spur_client::connect_channel(controller).await?);
 
+    let mut failed: Vec<String> = Vec::new();
     for node in &nodes {
-        client
+        match client
             .update_node(UpdateNodeRequest {
                 name: node.to_string(),
                 state: None,
@@ -116,44 +117,75 @@ async fn cmd_label(controller: &str, node_pattern: String, label_args: Vec<Strin
                 labels: set_labels.clone(),
                 remove_labels: remove_labels.clone(),
             })
-            .await?;
-
-        for (k, v) in &set_labels {
-            println!("  {node}: {k}={v}");
-        }
-        for k in &remove_labels {
-            println!("  {node}: {k} removed");
+            .await
+        {
+            Ok(_) => {
+                for (k, v) in &set_labels {
+                    println!("  {node}: {k}={v}");
+                }
+                for k in &remove_labels {
+                    println!("  {node}: {k} removed");
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {node}: {e}");
+                failed.push(node.clone());
+            }
         }
     }
 
+    if !failed.is_empty() {
+        bail!(
+            "failed on {} of {} node(s): {}",
+            failed.len(),
+            nodes.len(),
+            failed.join(", ")
+        );
+    }
     Ok(())
 }
 
 async fn cmd_drain(controller: &str, node_pattern: String, reason: Option<String>) -> Result<()> {
-    let mut client = spur_proto::controller_client(spur_client::connect_channel(controller).await?);
     let nodes = expand_node_pattern(&node_pattern)?;
+    let mut client = spur_proto::controller_client(spur_client::connect_channel(controller).await?);
 
+    let mut failed: Vec<String> = Vec::new();
     for node in &nodes {
-        let resp = client
+        match client
             .drain_node(spur_proto::proto::DrainNodeRequest {
                 name: node.to_string(),
                 reason: reason.clone().unwrap_or_default(),
             })
-            .await?
-            .into_inner();
-
-        if resp.running_jobs > 0 {
-            println!(
-                "Node {node} set to draining ({} running job{} will finish first)",
-                resp.running_jobs,
-                if resp.running_jobs == 1 { "" } else { "s" }
-            );
-        } else {
-            println!("Node {node} set to drain");
+            .await
+        {
+            Ok(resp) => {
+                let resp = resp.into_inner();
+                if resp.running_jobs > 0 {
+                    println!(
+                        "Node {node} set to draining ({} running job{} will finish first)",
+                        resp.running_jobs,
+                        if resp.running_jobs == 1 { "" } else { "s" }
+                    );
+                } else {
+                    println!("Node {node} set to drain");
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {node}: {e}");
+                failed.push(node.clone());
+            }
         }
     }
     if let Some(r) = &reason {
         println!("  reason: {r}");
+    }
+    if !failed.is_empty() {
+        bail!(
+            "failed on {} of {} node(s): {}",
+            failed.len(),
+            nodes.len(),
+            failed.join(", ")
+        );
     }
     Ok(())
 }
@@ -164,35 +196,51 @@ async fn cmd_remove(
     force: bool,
     reason: Option<String>,
 ) -> Result<()> {
-    let mut client = spur_proto::controller_client(spur_client::connect_channel(controller).await?);
     let nodes = expand_node_pattern(&node_pattern)?;
+    let mut client = spur_proto::controller_client(spur_client::connect_channel(controller).await?);
 
+    let mut failed: Vec<String> = Vec::new();
     for node in &nodes {
-        let resp = client
+        match client
             .deregister_node(spur_proto::proto::DeregisterNodeRequest {
                 name: node.to_string(),
                 force,
                 reason: reason.clone().unwrap_or_default(),
             })
-            .await?
-            .into_inner();
-
-        if resp.evicted_jobs_count > 0 {
-            println!(
-                "Node {node} removed from cluster ({} job{} evicted)",
-                resp.evicted_jobs_count,
-                if resp.evicted_jobs_count == 1 {
-                    ""
+            .await
+        {
+            Ok(resp) => {
+                let resp = resp.into_inner();
+                if resp.evicted_jobs_count > 0 {
+                    println!(
+                        "Node {node} removed from cluster ({} job{} evicted)",
+                        resp.evicted_jobs_count,
+                        if resp.evicted_jobs_count == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    );
                 } else {
-                    "s"
+                    println!("Node {node} removed from cluster");
                 }
-            );
-        } else {
-            println!("Node {node} removed from cluster");
+            }
+            Err(e) => {
+                eprintln!("error: {node}: {e}");
+                failed.push(node.clone());
+            }
         }
     }
     if let Some(r) = &reason {
         println!("  reason: {r}");
+    }
+    if !failed.is_empty() {
+        bail!(
+            "failed on {} of {} node(s): {}",
+            failed.len(),
+            nodes.len(),
+            failed.join(", ")
+        );
     }
     Ok(())
 }

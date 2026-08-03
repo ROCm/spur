@@ -7,13 +7,14 @@
 //! Follows the same shape as the `MockAgent` harness in `spurctld`: bind an
 //! ephemeral localhost port, serve a hand-written service on it, and hand the
 //! caller back the address plus a shared record of what the server observed.
-//! Only `CreateJobStep` and `RunStep` are implemented; every other RPC reports
-//! `unimplemented` so an unexpected call fails loudly instead of silently
-//! returning a default.
+//! Only a handful of RPCs are implemented (`CreateJobStep`, `RunStep`,
+//! `UpdateNode`); every other RPC reports `unimplemented` so an unexpected call
+//! fails loudly instead of silently returning a default.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{self, slurm_controller_server};
@@ -32,6 +33,9 @@ pub(crate) struct StepCapture {
     create_step_num_tasks: Arc<AtomicU32>,
     run_step_step_id: Arc<AtomicU32>,
     run_step_calls: Arc<AtomicU32>,
+    update_node_names: Arc<Mutex<Vec<String>>>,
+    /// Node names that `update_node` should reject with `NotFound`.
+    update_node_fail_names: Arc<Mutex<HashSet<String>>>,
 }
 
 impl StepCapture {
@@ -48,6 +52,14 @@ impl StepCapture {
     /// Number of `RunStep` calls, so tests can assert dispatch stopped early.
     pub(crate) fn run_step_calls(&self) -> u32 {
         self.run_step_calls.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn update_node_names(&self) -> Vec<String> {
+        self.update_node_names.lock().unwrap().clone()
+    }
+
+    pub(crate) fn set_update_node_fail_names(&self, names: HashSet<String>) {
+        *self.update_node_fail_names.lock().unwrap() = names;
     }
 }
 
@@ -109,6 +121,18 @@ mock_controller_impl! {
                 node: String::new(),
             }))
         }
+
+        async fn update_node(
+            &self,
+            request: tonic::Request<proto::UpdateNodeRequest>,
+        ) -> Result<tonic::Response<()>, tonic::Status> {
+            let name = request.into_inner().name;
+            self.capture.update_node_names.lock().unwrap().push(name.clone());
+            if self.capture.update_node_fail_names.lock().unwrap().contains(&name) {
+                return Err(tonic::Status::not_found(format!("node {name} not found")));
+            }
+            Ok(tonic::Response::new(()))
+        }
     }
     unimplemented {
         submit_job(proto::SubmitJobRequest) -> proto::SubmitJobResponse;
@@ -121,7 +145,6 @@ mock_controller_impl! {
         update_job(proto::UpdateJobRequest) -> ();
         get_nodes(proto::GetNodesRequest) -> proto::GetNodesResponse;
         get_node(proto::GetNodeRequest) -> proto::NodeInfo;
-        update_node(proto::UpdateNodeRequest) -> ();
         drain_node(proto::DrainNodeRequest) -> proto::DrainNodeResponse;
         deregister_node(proto::DeregisterNodeRequest) -> proto::DeregisterNodeResponse;
         deregister_agent(proto::DeregisterAgentRequest) -> ();

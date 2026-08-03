@@ -24,6 +24,7 @@ pub fn expand(pattern: &str) -> Result<Vec<String>, HostlistError> {
     for part in split_top_level(pattern) {
         expand_single(part.trim(), &mut results)?;
     }
+    results.retain(|s| !s.is_empty());
     Ok(results)
 }
 
@@ -306,7 +307,19 @@ mod tests {
     #[test]
     fn test_empty_string() {
         let hosts = expand("").unwrap();
-        assert_eq!(hosts, vec![""]);
+        assert!(hosts.is_empty());
+    }
+
+    #[test]
+    fn test_trailing_comma() {
+        let hosts = expand("node1,node2,").unwrap();
+        assert_eq!(hosts, vec!["node1", "node2"]);
+    }
+
+    #[test]
+    fn test_leading_and_doubled_commas() {
+        let hosts = expand(",node1,,node2").unwrap();
+        assert_eq!(hosts, vec!["node1", "node2"]);
     }
 
     #[test]

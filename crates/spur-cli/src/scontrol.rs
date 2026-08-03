@@ -634,8 +634,6 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
 
     // Node update takes priority if NodeName is specified
     if let Some(node_pattern) = node_name {
-        // Reject an invalid state before touching any node, so a typo cannot
-        // leave part of the list updated.
         let proto_state = node_state.as_deref().map(parse_node_state).transpose()?;
 
         let channel = spur_client::connect_channel(controller)
@@ -644,8 +642,20 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
         let mut client = spur_proto::controller_client(channel);
 
         let names = resolve_node_names(&mut client, &node_pattern).await?;
+        let mut failed: Vec<String> = Vec::new();
         for name in &names {
-            update_node(&mut client, name, proto_state, node_reason.clone()).await?;
+            if let Err(e) = update_node(&mut client, name, proto_state, node_reason.clone()).await {
+                eprintln!("error: {name}: {e}");
+                failed.push(name.clone());
+            }
+        }
+        if !failed.is_empty() {
+            bail!(
+                "failed on {} of {} node(s): {}",
+                failed.len(),
+                names.len(),
+                failed.join(", ")
+            );
         }
         return Ok(());
     }
@@ -712,7 +722,6 @@ fn parse_node_state(state: &str) -> Result<i32> {
         "idle" | "resume" => Ok(spur_proto::proto::NodeState::NodeIdle as i32),
         "drain" => Ok(spur_proto::proto::NodeState::NodeDrain as i32),
         "down" => Ok(spur_proto::proto::NodeState::NodeDown as i32),
-        // Echo what the caller typed, not the lowercased form.
         _ => bail!(
             "scontrol: unknown node state '{}'. Valid states: IDLE, RESUME, DRAIN, DOWN",
             state
@@ -884,5 +893,63 @@ mod tests {
     #[test]
     fn parse_node_state_rejects_empty() {
         assert!(parse_node_state("").is_err());
+    }
+
+    #[tokio::test]
+    async fn scontrol_update_expands_hostlist() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        main_with_args(vec![
+            "scontrol".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "update".into(),
+            "NodeName=n[1-3]".into(),
+            "State=DRAIN".into(),
+            "Reason=test".into(),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(capture.update_node_names(), vec!["n1", "n2", "n3"]);
+    }
+
+    #[tokio::test]
+    async fn scontrol_update_best_effort_continues_on_failure() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_update_node_fail_names(["n2".to_string()].into());
+        let err = main_with_args(vec![
+            "scontrol".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "update".into(),
+            "NodeName=n[1-3]".into(),
+            "State=DRAIN".into(),
+        ])
+        .await
+        .unwrap_err();
+
+        let names = capture.update_node_names();
+        assert_eq!(names, vec!["n1", "n2", "n3"]);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("n2"),
+            "error should mention failed node: {msg}"
+        );
+        assert!(msg.contains("1 of 3"), "error should report counts: {msg}");
+    }
+
+    #[tokio::test]
+    async fn scontrol_update_invalid_state_sends_no_rpcs() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let result = main_with_args(vec![
+            "scontrol".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "update".into(),
+            "NodeName=n[1-3]".into(),
+            "State=BOGUS".into(),
+        ])
+        .await;
+        assert!(result.is_err());
+        assert!(capture.update_node_names().is_empty());
     }
 }
