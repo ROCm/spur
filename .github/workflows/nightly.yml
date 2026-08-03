@@ -214,7 +214,7 @@ jobs:
 
       - name: Upload SARIF to GitHub Security
         if: always() && steps.scan.outcome != 'skipped'
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@v4.37.4
         with:
           sarif_file: trivy-nightly.sarif
           category: trivy-nightly
