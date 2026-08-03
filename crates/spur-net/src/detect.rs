@@ -78,7 +78,7 @@ fn resolve_hostname(hostname: &str) -> String {
                 warn!(
                     hostname,
                     comm_addr = %addr,
-                    "hostname resolved to a non-routable address; set --address to a routable IP"
+                    "hostname resolved to a non-routable address; set --address to a routable IP or FQDN"
                 );
             }
             addr
