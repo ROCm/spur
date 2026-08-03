@@ -2457,7 +2457,8 @@ impl AgentService {
         });
     }
 
-    /// Reject `user` unless they own job `job_id`.
+    /// Gate `user` for `action` on job `job_id`, per
+    /// [`spur_core::auth::check_job_owner`].
     ///
     /// Enforced here as well as on the controller because `sattach` and the
     /// output stream dial the agent's port directly.

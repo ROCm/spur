@@ -88,17 +88,11 @@ impl Identity {
 
 /// Check that `user` is allowed to perform `action` on a job owned by `owner`.
 ///
-/// An empty `user` is accepted because daemon-to-daemon calls and clients from
-/// before the identity field existed send nothing; root is an admin override.
-/// Callers that reach this from a self-reported client field get only as much
-/// assurance as that field carries.
-///
-/// An empty `owner` is also accepted: a job whose submitter was never recorded
-/// (REST submission without `user`, or an allocation registered by a controller
-/// predating the field) is unattributable, so it cannot be matched against any
-/// caller. Denying it would lock the real owner out of their own job instead of
-/// stopping an intruder. Note this reasoning does not extend to a non-empty
-/// placeholder owner, which matches nobody and so restricts the job to root.
+/// Allows the owner, root, an empty `user` (daemon calls and clients predating
+/// the identity field), and an empty `owner` (an unattributed job matches no
+/// caller, so denying would lock out its real owner rather than an intruder).
+/// A non-empty placeholder owner is not covered by that last rule and so stays
+/// restricted to root.
 pub fn check_job_owner(user: &str, owner: &str, action: &str) -> Result<(), AuthError> {
     if user.is_empty() || owner.is_empty() || user == "root" || user == owner {
         return Ok(());

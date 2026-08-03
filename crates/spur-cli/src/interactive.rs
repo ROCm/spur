@@ -19,10 +19,10 @@ pub async fn connect_agent(addr: &str) -> Result<SlurmAgentClient<tonic::transpo
 }
 
 /// Local username sent with exec/attach requests so the server can enforce job
-/// ownership. Falls back to a non-matching placeholder so lookup failure denies
-/// access rather than granting it.
+/// ownership. The fallback is deliberately not a legal UNIX username, so a
+/// lookup failure cannot collide with a real account and grant access.
 pub fn current_user() -> String {
-    whoami::username().unwrap_or_else(|_| "unknown".into())
+    whoami::username().unwrap_or_else(|_| "<lookup-failed>".into())
 }
 
 pub fn get_terminal_size() -> spur_proto::proto::WindowSize {

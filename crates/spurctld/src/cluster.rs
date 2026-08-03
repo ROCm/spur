@@ -647,7 +647,7 @@ impl ClusterManager {
     }
 
     /// Check that `user` is allowed to perform `action` on a job owned by `owner`.
-    /// Empty user (internal/daemon calls) and root are always allowed.
+    /// Delegates to [`spur_core::auth::check_job_owner`]; see there for the bypass rules.
     fn check_job_owner(user: &str, owner: &str, action: &str) -> anyhow::Result<()> {
         spur_core::auth::check_job_owner(user, owner, action).map_err(Into::into)
     }
