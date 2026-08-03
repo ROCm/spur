@@ -8,6 +8,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -49,7 +50,7 @@ struct spur_modex_session {
     struct spur_modex_blob remote[SPUR_MODEX_MAX_NODES];
     int listen_fd;
     pthread_t accept_thread;
-    bool accept_running;
+    _Atomic bool accept_running;
     bool aborted;
     spur_modex_timeouts_t timeouts;
     pthread_mutex_t lock;
@@ -199,10 +200,10 @@ static void store_remote_blob(
 
 static void *accept_loop(void *arg) {
     spur_modex_session_t *session = (spur_modex_session_t *)arg;
-    while (session->accept_running) {
+    while (atomic_load(&session->accept_running)) {
         int client = accept(session->listen_fd, NULL, NULL);
         if (client < 0) {
-            if (!session->accept_running) {
+            if (!atomic_load(&session->accept_running)) {
                 break;
             }
             if (errno == EINTR) {
@@ -273,7 +274,7 @@ spur_modex_session_t *spur_modex_session_create(
     session->node_index = node_index;
     session->port = spur_modex_port_for_job(job_id);
     session->listen_fd = -1;
-    session->accept_running = false;
+    atomic_store(&session->accept_running, false);
     session->aborted = false;
     if (timeouts != NULL) {
         session->timeouts = *timeouts;
@@ -313,9 +314,9 @@ int spur_modex_session_start(spur_modex_session_t *session) {
         return SPUR_MODEX_ERR_CONNECT;
     }
     session->listen_fd = fd;
-    session->accept_running = true;
+    atomic_store(&session->accept_running, true);
     if (pthread_create(&session->accept_thread, NULL, accept_loop, session) != 0) {
-        session->accept_running = false;
+        atomic_store(&session->accept_running, false);
         close(fd);
         session->listen_fd = -1;
         return SPUR_MODEX_ERR_NOMEM;
@@ -327,8 +328,8 @@ void spur_modex_session_destroy(spur_modex_session_t *session) {
     if (session == NULL) {
         return;
     }
-    if (session->accept_running) {
-        session->accept_running = false;
+    if (atomic_load(&session->accept_running)) {
+        atomic_store(&session->accept_running, false);
         if (session->listen_fd >= 0) {
             shutdown(session->listen_fd, SHUT_RDWR);
             close(session->listen_fd);

@@ -157,6 +157,7 @@ log "Extracting..."
 tar xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}"
 
 # --- Install ---
+INSTALL_DIR="${INSTALL_DIR%/}"
 mkdir -p "${INSTALL_DIR}"
 # Find the extracted directory (name varies for nightly)
 EXTRACTED=$(find "${TMPDIR}" -maxdepth 1 -type d -name 'spur-*' | head -1)
@@ -164,7 +165,7 @@ EXTRACTED=$(find "${TMPDIR}" -maxdepth 1 -type d -name 'spur-*' | head -1)
 cp -f "${EXTRACTED}"/bin/* "${INSTALL_DIR}/"
 chmod +x "${INSTALL_DIR}/spur" "${INSTALL_DIR}/spurctld" "${INSTALL_DIR}/spurd"
 
-PLUGIN_DIR="${INSTALL_DIR%/bin}/lib/spur"
+PLUGIN_DIR="$(dirname "${INSTALL_DIR}")/lib/spur"
 if [ -f "${EXTRACTED}/lib/spur/spur_mpi_pmix.so" ]; then
     mkdir -p "${PLUGIN_DIR}"
     cp -f "${EXTRACTED}/lib/spur/spur_mpi_pmix.so" "${PLUGIN_DIR}/"

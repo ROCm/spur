@@ -546,16 +546,16 @@ impl MpiPluginHost {
             .lock()
             .map_err(|_| "prepared lock poisoned".to_string())?
             .remove(&job_id);
-        let active = self
+        if was_prepared.is_none() {
+            return Ok(());
+        }
+        if self
             .active_namespaces
             .lock()
             .map_err(|_| "namespace lock poisoned".to_string())?
-            .contains_key(&job_id);
-        if active {
+            .contains_key(&job_id)
+        {
             return self.release_pmix_server(job_id);
-        }
-        if was_prepared.is_none() {
-            return Ok(());
         }
         let namespace = PmixLaunchPlan::namespace_for_job(job_id);
         self.call_server_stop(job_id, &namespace)
@@ -1102,6 +1102,20 @@ mod tests {
     fn release_prepared_is_noop_when_not_prepared() {
         let host = MpiPluginHost::new(MpiConfig::default());
         host.release_prepared_pmix(99).unwrap();
+    }
+
+    #[test]
+    fn release_prepared_does_not_stop_active_launched_namespace() {
+        let host = MpiPluginHost::new(MpiConfig::default());
+        host.active_namespaces.lock().unwrap().insert(
+            42,
+            ActiveNamespace {
+                namespace: "spur.42".into(),
+                refs: 1,
+            },
+        );
+        host.release_prepared_pmix(42).unwrap();
+        assert!(host.active_namespaces.lock().unwrap().contains_key(&42));
     }
 
     #[test]

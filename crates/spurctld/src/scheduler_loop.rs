@@ -1451,10 +1451,8 @@ async fn confirm_dispatch_on_nodes(
             pmix_dispatch::prepare_pmix_on_nodes(job_id, run_attempt, prepare_nodes).await
         {
             error!(job_id, error = %detail, "PMIx prepare failed — aborting dispatch");
-            let _ = cluster.set_job_launch_failure_detail(
-                job_id,
-                format!("PMIx prepare failed: {detail}"),
-            );
+            let _ = cluster
+                .set_job_launch_failure_detail(job_id, format!("PMIx prepare failed: {detail}"));
             return DispatchConfirmOutcome::Aborted;
         }
     }
@@ -1537,11 +1535,8 @@ async fn confirm_dispatch_on_nodes(
     );
 
     if needs_pmix_prepare {
-        for (node_name, agent_addr) in &node_agents {
-            if !succeeded_nodes.iter().any(|n| n == node_name) {
-                pmix_dispatch::release_pmix_on_agent(agent_addr, job_id).await;
-            }
-        }
+        let agent_addrs: Vec<String> = node_agents.iter().map(|(_, addr)| addr.clone()).collect();
+        pmix_dispatch::release_pmix_on_agents(&agent_addrs, job_id).await;
     }
 
     // Stop whatever DID launch before the job settles anywhere: a node that
@@ -2393,6 +2388,7 @@ mod tests {
         /// under a synthetic per-node launch cost rather than estimating it.
         struct MockAgent {
             cancel_calls: Arc<AtomicU32>,
+            release_pmix_calls: Arc<AtomicU32>,
             reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
             launch_delay: Duration,
             /// Records each `LaunchJobRequest.task_fanout` this agent receives,
@@ -2458,6 +2454,7 @@ mod tests {
                 _request: tonic::Request<spur_proto::proto::ReleasePmixRequest>,
             ) -> Result<tonic::Response<spur_proto::proto::ReleasePmixResponse>, tonic::Status>
             {
+                self.release_pmix_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(tonic::Response::new(
                     spur_proto::proto::ReleasePmixResponse {},
                 ))
@@ -2609,7 +2606,7 @@ mod tests {
             reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
             launch_delay: Duration,
         ) -> (std::net::SocketAddr, Arc<AtomicU32>) {
-            let (addr, cancel_calls, _) =
+            let (addr, cancel_calls, _, _) =
                 spawn_mock_agent_capturing_fanout(reject_launch_as, launch_delay, false).await;
             (addr, cancel_calls)
         }
@@ -2626,14 +2623,17 @@ mod tests {
         ) -> (
             std::net::SocketAddr,
             Arc<AtomicU32>,
+            Arc<AtomicU32>,
             Arc<std::sync::Mutex<Vec<bool>>>,
         ) {
             let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
             let addr = incoming.local_addr().unwrap();
             let cancel_calls = Arc::new(AtomicU32::new(0));
+            let release_pmix_calls = Arc::new(AtomicU32::new(0));
             let fanout_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
             let agent = MockAgent {
                 cancel_calls: cancel_calls.clone(),
+                release_pmix_calls: release_pmix_calls.clone(),
                 reject_launch_as,
                 launch_delay,
                 fanout_calls: capture.then(|| fanout_calls.clone()),
@@ -2646,7 +2646,7 @@ mod tests {
                     .serve_with_incoming(incoming)
                     .await;
             });
-            (addr, cancel_calls, fanout_calls)
+            (addr, cancel_calls, release_pmix_calls, fanout_calls)
         }
 
         /// Reserve a localhost port with nothing listening on it, so a
@@ -3162,6 +3162,73 @@ mod tests {
                 "a partial dispatch failure must not record an output path"
             );
             assert!(job.actual_stderr_path.is_none());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn partial_multinode_pmix_dispatch_releases_on_all_agents() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (good_addr, cancel_calls, release_pmix_good, _) =
+                spawn_mock_agent_capturing_fanout(None, Duration::ZERO, false).await;
+            let (bad_addr, _, release_pmix_bad, _) = spawn_mock_agent_capturing_fanout(
+                Some(spur_proto::proto::LaunchFailureKind::LaunchFailureUnspecified),
+                Duration::ZERO,
+                false,
+            )
+            .await;
+            register_node_at(&cm, "n1", good_addr);
+            register_node_at(&cm, "n2", bad_addr);
+
+            let spec = JobSpec {
+                name: "pmix-partial-dispatch".into(),
+                user: "testuser".into(),
+                num_nodes: 2,
+                num_tasks: 2,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                mpi: Some(MPI_PMIX.into()),
+                ..Default::default()
+            };
+            let job_id = submit_and_wait(&cm, spec.clone());
+            let spec = cm.get_job(job_id).unwrap().spec;
+
+            let nodes = vec!["n1".to_string(), "n2".to_string()];
+            let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
+                .iter()
+                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+
+            let outcome = confirm_dispatch_on_nodes(
+                cm.clone(),
+                job_id,
+                nodes,
+                spec,
+                Vec::new(),
+                per_node_allocs,
+                "n1,n2".into(),
+                1,
+                1,
+                false,
+            )
+            .await;
+
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert_eq!(
+                cancel_calls.load(Ordering::SeqCst),
+                1,
+                "n1 launched the job, so it must be stopped before the job settles"
+            );
+            assert_eq!(
+                release_pmix_good.load(Ordering::SeqCst),
+                1,
+                "PMIx must be released on every agent that participated in prepare, including the one that launched"
+            );
+            assert_eq!(
+                release_pmix_bad.load(Ordering::SeqCst),
+                1,
+                "PMIx must be released on every agent that participated in prepare, including the one whose launch failed"
+            );
         }
 
         // ── prolog failure: drain the node, hold the job ──
@@ -3731,7 +3798,7 @@ mod tests {
         async fn process_assignment_dispatches_a_plain_batch_job_with_task_fanout_false() {
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
-            let (addr, _, fanout_calls) =
+            let (addr, _, _, fanout_calls) =
                 spawn_mock_agent_capturing_fanout(None, Duration::ZERO, true).await;
             register_node_at(&cm, "n1", addr);
 
@@ -3752,7 +3819,7 @@ mod tests {
         async fn process_assignment_dispatches_srun_batch_fallback_with_task_fanout_true() {
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
-            let (addr, _, fanout_calls) =
+            let (addr, _, _, fanout_calls) =
                 spawn_mock_agent_capturing_fanout(None, Duration::ZERO, true).await;
             register_k8s_node_at(&cm, "k1", addr);
 

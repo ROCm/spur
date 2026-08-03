@@ -415,6 +415,15 @@ agents). Example on an agent:
    srun --mpi=pmix -n4 /path/to/hello_mpi   # single-node smoke test
    srun --mpi=pmix -N2 -n4 /path/to/hello_mpi   # multi-node smoke test
 
+Multi-node ``--mpi=pmix`` requires a **uniform task layout**: ``-n`` must be
+evenly divisible by ``-N`` (same number of tasks on every node). For example,
+``-N2 -n4`` (two tasks per node) is valid; ``-N2 -n3`` is rejected at prepare
+time because ranks cannot be split evenly across nodes.
+
+For multi-node ``srun``, the command path and any binaries or scripts it
+``exec``\ s must exist at the **same path on every participating agent** (for
+example ``/tmp/hello_mpi`` on each node, not only on the submission host).
+
 Expected ``hello_mpi`` output for ``-n4``: four lines with ``rank=0`` …
 ``rank=3`` and ``size=4`` on each.
 
@@ -422,10 +431,13 @@ Upgrade / rollout
 ~~~~~~~~~~~~~~~~~
 
 1. Pick the new nightly (or pinned) tarball on GitHub or artifactory.
-2. Run ``install.sh`` with the **same** ``INSTALL_DIR`` on the controller and
+2. **Stop** ``spurctld`` and ``spurd`` on each host before replacing binaries
+   (SCP or ``install.sh`` fails with "text file busy" while daemons are running).
+   When copying manually, stage to ``/tmp`` then ``mv`` into ``~/spur/bin/``.
+3. Run ``install.sh`` with the **same** ``INSTALL_DIR`` on the controller and
    **every** agent (replaces binaries and ``spur_mpi_pmix.so`` together).
-3. Restart ``spurctld`` on the controller, then ``spurd`` on each agent.
-4. Re-run the smoke tests above before returning the cluster to users.
+4. Restart ``spurctld`` on the controller, then ``spurd`` on each agent.
+5. Re-run the smoke tests above before returning the cluster to users.
 
 Keep ``spurctld``, ``spurd``, and ``spur_mpi_pmix.so`` on the **same build**
 across the cluster during an upgrade.
@@ -447,10 +459,12 @@ Architecture
    Slurm-compatible ``SLURM_*`` twins remain set (same as Slurm under
    ``--mpi=pmix``).
 
-The embedded PMIx server leaves ``fence_nb`` unset for single-node jobs so
-OpenPMIx GDS handles modex locally. Multi-node jobs register ``fence_nb`` and
-exchange modex blobs over TCP between agents (peer addresses come from the
-controller allocation).
+The embedded PMIx server registers ``fence_nb`` once at ``PMIx_server_init``.
+Single-node jobs never call it (OpenPMIx GDS handles modex locally). Multi-node
+jobs use ``fence_nb`` to exchange modex blobs over TCP between agents (peer
+addresses come from the controller allocation). The plugin does **not**
+finalize/reinit PMIx when switching between single- and multi-node jobs on the
+same agent.
 
 Multi-node bootstrap uses a **two-phase** controller dispatch:
 
@@ -485,8 +499,13 @@ With libpmix development files (``pkg-config pmix``):
    cargo build --release -p spur-mpi-pmix
    sudo install -D target/release/spur_mpi_pmix.so /usr/lib/spur/spur_mpi_pmix.so
 
-If ``pkg-config pmix`` is unavailable but system headers exist (e.g.
-``/usr/lib/x86_64-linux-gnu/pmix2/include``), compile on the agent:
+If ``pkg-config pmix`` is unavailable, compile on the agent against **that
+node's** ``libpmix.so``. Include paths vary by site — common layouts:
+
+- ``/usr/lib/x86_64-linux-gnu/pmix2/include`` (Debian-style)
+- ``/usr/mpi/gcc/openmpi-*/include`` (Open MPI bundled PMIx headers, e.g. Crusoe)
+
+Example (adjust ``-I`` and ``libpmix`` paths for your agent):
 
 .. code-block:: bash
 
@@ -568,8 +587,9 @@ Operational notes
 - Set ``SPUR_MPI_DEBUG=1`` in ``spurd`` environment for plugin debug logs.
 - Each agent holds at most 64 active PMIx namespaces; additional concurrent
   ``--mpi=pmix`` jobs on the same node fail until a job finishes.
-- Single-node and multi-node PMIx jobs can run on the same agent; the plugin
-  uses local GDS modex for ``num_nodes == 1`` and TCP modex for multi-node jobs.
+- Single-node and multi-node PMIx jobs can run back-to-back on the same agent
+  (for example a single-node smoke test followed by a multi-node job). Single-node
+  jobs use local GDS modex; multi-node jobs use TCP modex via ``fence_nb``.
 - Multi-node ``--mpi=pmix`` is not supported on K8s virtual agents (the
   ``spur-k8s`` in-cluster agent returns ``Unimplemented`` for ``PreparePmix``).
 - Multi-node ``--mpi=pmix`` requires agent addresses in the cluster registry to

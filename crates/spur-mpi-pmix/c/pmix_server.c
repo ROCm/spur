@@ -125,21 +125,19 @@ static pmix_status_t spur_client_finalized(
 }
 
 /*
- * Single-node jobs use PMIx GDS (fence_nb unset). Multi-node jobs enable fence_nb
- * to exchange modex blobs across agents via TCP.
+ * Always register fence_nb at PMIx_server_init. Single-node jobs never call it;
+ * multi-node jobs use it for TCP modex exchange. Toggling fence_nb between jobs
+ * via PMIx_server_finalize/reinit breaks PMIx_server_setup_fork on OpenPMIx 5.x.
  */
 static pmix_server_module_t spur_module = {
     .client_connected = spur_client_connected,
     .client_finalized = spur_client_finalized,
-    .fence_nb = NULL,
+    .fence_nb = spur_fence_nb,
 };
 
 static void update_multinode_fence_hook(int delta) {
     if (delta > 0) {
         g_multinode_fence_sessions += (uint32_t)delta;
-        if (g_multinode_fence_sessions == (uint32_t)delta) {
-            spur_module.fence_nb = spur_fence_nb;
-        }
         return;
     }
     if (delta < 0) {
@@ -149,39 +147,16 @@ static void update_multinode_fence_hook(int delta) {
         } else {
             g_multinode_fence_sessions -= dec;
         }
-        if (g_multinode_fence_sessions == 0) {
-            spur_module.fence_nb = NULL;
-        }
     }
 }
 
 static int ensure_server_init(const spur_mpi_launch_plan_t *plan, char *errbuf, size_t errlen) {
-    int want_fence = plan != NULL && plan->num_nodes > 1;
-    int have_fence = spur_module.fence_nb != NULL;
-
-    if (g_server_initialized && want_fence != have_fence) {
-        pmix_status_t fin = PMIx_server_finalize();
-        if (!pmix_status_ok(fin)) {
-            if (errbuf != NULL && errlen > 0) {
-                snprintf(
-                    errbuf,
-                    errlen,
-                    "PMIx_server_finalize failed: %s",
-                    PMIx_Error_string(fin)
-                );
-            }
-            return -1;
-        }
-        g_server_initialized = 0;
-        g_multinode_fence_sessions = 0;
-        have_fence = false;
-    }
-
+    (void)plan;
     if (g_server_initialized) {
         return 0;
     }
 
-    spur_module.fence_nb = want_fence ? spur_fence_nb : NULL;
+    spur_module.fence_nb = spur_fence_nb;
     pmix_status_t rc = PMIx_server_init(&spur_module, NULL, 0);
     if (!pmix_status_ok(rc)) {
         if (errbuf != NULL && errlen > 0) {
@@ -190,9 +165,6 @@ static int ensure_server_init(const spur_mpi_launch_plan_t *plan, char *errbuf, 
         return -1;
     }
     g_server_initialized = 1;
-    if (want_fence) {
-        g_multinode_fence_sessions = 1;
-    }
     spur_mpi_debug("spur_mpi_pmix: PMIx_server_init ok\n");
     return 0;
 }
