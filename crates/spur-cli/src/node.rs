@@ -169,15 +169,15 @@ async fn cmd_drain(controller: &str, node_pattern: String, reason: Option<String
                 } else {
                     println!("Node {node} set to drain");
                 }
+                if let Some(r) = &reason {
+                    println!("  reason: {r}");
+                }
             }
             Err(e) => {
                 eprintln!("error: {node}: {e}");
                 failed.push(node.clone());
             }
         }
-    }
-    if let Some(r) = &reason {
-        println!("  reason: {r}");
     }
     if !failed.is_empty() {
         bail!(
@@ -224,15 +224,15 @@ async fn cmd_remove(
                 } else {
                     println!("Node {node} removed from cluster");
                 }
+                if let Some(r) = &reason {
+                    println!("  reason: {r}");
+                }
             }
             Err(e) => {
                 eprintln!("error: {node}: {e}");
                 failed.push(node.clone());
             }
         }
-    }
-    if let Some(r) = &reason {
-        println!("  reason: {r}");
     }
     if !failed.is_empty() {
         bail!(
