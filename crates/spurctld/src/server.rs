@@ -3156,26 +3156,24 @@ mod tests {
         assert_eq!(err.code(), Code::PermissionDenied);
     }
 
-    /// A REST submission omitting `user` records no owner. Such a job must stay
-    /// reachable rather than becoming root-only.
+    /// A REST submission omitting `user` records no owner. Such a job runs as
+    /// root, so non-root users must be denied to prevent privilege escalation.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn exec_in_job_allows_caller_when_owner_unrecorded() {
+    async fn exec_in_job_denies_non_root_on_empty_owner_job() {
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
         let job_id = running_job_owned_by(&svc, "").await;
 
-        // The ownership gate must pass; dispatch to the fake agent still fails.
-        let code = svc
+        let err = svc
             .exec_in_job(Request::new(ExecInJobRequest {
                 job_id,
                 command: vec!["whoami".into()],
                 user: "alice".into(),
             }))
             .await
-            .err()
-            .map(|e| e.code());
+            .expect_err("empty-owner jobs run as root; non-root must be denied");
 
-        assert_ne!(code, Some(Code::PermissionDenied));
+        assert_eq!(err.code(), Code::PermissionDenied);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

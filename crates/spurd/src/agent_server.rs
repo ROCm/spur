@@ -3231,10 +3231,9 @@ mod tests {
         assert_eq!(missing.code(), tonic::Code::NotFound);
     }
 
-    /// An allocation registered by a controller predating the identity field
-    /// leaves the owner blank; the real owner must not be locked out of it.
+    /// An empty-owner job runs as root, so non-root callers must be denied.
     #[tokio::test]
-    async fn check_job_access_allows_attach_when_owner_unrecorded() {
+    async fn check_job_access_denies_non_root_on_empty_owner() {
         let svc = AgentService::new(
             test_reporter(),
             HooksConfig::default(),
@@ -3245,9 +3244,19 @@ mod tests {
         job.user = String::new();
         svc.insert_test_job(47, job).await;
 
-        svc.check_job_access(47, "alice", "attach to")
+        let err = svc
+            .check_job_access(47, "alice", "attach to")
             .await
-            .expect("an unattributed job stays reachable by its owner");
+            .expect_err("empty-owner jobs run as root; non-root must be denied");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        svc.check_job_access(47, "root", "attach to")
+            .await
+            .expect("root must always be allowed");
+
+        svc.check_job_access(47, "", "attach to")
+            .await
+            .expect("daemon (empty user) must always be allowed");
     }
 
     // --- srun step dispatch via RunCommand ---

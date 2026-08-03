@@ -88,13 +88,12 @@ impl Identity {
 
 /// Check that `user` is allowed to perform `action` on a job owned by `owner`.
 ///
-/// Allows the owner, root, an empty `user` (daemon calls and clients predating
-/// the identity field), and an empty `owner` (an unattributed job matches no
-/// caller, so denying would lock out its real owner rather than an intruder).
-/// A non-empty placeholder owner is not covered by that last rule and so stays
-/// restricted to root.
+/// Allows the owner, root, or an empty `user` (daemon calls and clients
+/// predating the identity field). Jobs with an empty owner are restricted to
+/// root only, since they run as root and granting access to any caller would
+/// be a privilege escalation.
 pub fn check_job_owner(user: &str, owner: &str, action: &str) -> Result<(), AuthError> {
-    if user.is_empty() || owner.is_empty() || user == "root" || user == owner {
+    if user.is_empty() || user == "root" || user == owner {
         return Ok(());
     }
     Err(AuthError::NotJobOwner {
@@ -249,14 +248,16 @@ mod tests {
         );
     }
 
-    /// A job with no recorded submitter must stay reachable by its real owner.
-    /// Reachable via REST submission without `user`, and via an allocation
-    /// registered by a controller predating the identity field.
+    /// Jobs with an empty owner run as root, so only root and daemon (empty
+    /// user) are allowed. A regular user must be denied.
     #[test]
-    fn test_check_job_owner_allows_any_user_when_owner_unrecorded() {
-        assert!(check_job_owner("alice", "", "exec").is_ok());
-        assert!(check_job_owner("bob", "", "attach to").is_ok());
+    fn test_check_job_owner_empty_owner_restricts_to_root() {
+        assert!(check_job_owner("root", "", "exec").is_ok());
         assert!(check_job_owner("", "", "exec").is_ok());
+        assert!(
+            check_job_owner("alice", "", "exec").is_err(),
+            "empty-owner jobs run as root; granting access is a privilege escalation"
+        );
     }
 
     /// A non-empty placeholder owner matches no caller, so it restricts the job
