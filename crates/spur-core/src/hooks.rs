@@ -4,9 +4,12 @@
 use std::process::Stdio;
 
 use anyhow::Context;
+use chrono::{DateTime, Utc};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{info, warn};
 
+use crate::job::JobSpec;
 use crate::spur_env::SpurEnv;
 
 pub type JobId = u32;
@@ -101,6 +104,279 @@ pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()
     }
 
     Ok(())
+}
+
+/// Context for the job-submission hook. Feeds env twins and the audit line;
+/// `spec_json` is the fully-resolved spec sent to the script on stdin.
+pub struct SubmitHookContext {
+    pub spec_json: String,
+    pub user: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub partition: String,
+}
+
+/// Whitelisted spec fields a submit hook may change. Identity, script/argv, and
+/// resource-count fields are absent by construction, so a hook cannot forge them.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SubmitHookChanges {
+    pub qos: Option<String>,
+    pub partition: Option<String>,
+    pub account: Option<String>,
+    pub constraint: Option<String>,
+    pub comment: Option<String>,
+    pub reservation: Option<String>,
+    pub priority: Option<u32>,
+    pub time_limit_minutes: Option<i64>,
+    pub begin_time: Option<DateTime<Utc>>,
+    pub gres: Option<Vec<String>>,
+    pub hold: Option<bool>,
+}
+
+/// Decision returned by a job-submission hook.
+#[derive(Debug)]
+pub enum SubmitHookOutcome {
+    Accept,
+    Reject(String),
+    Modify(SubmitHookChanges),
+}
+
+const SUBMIT_HOOK_WHITELIST: &[&str] = &[
+    "qos",
+    "partition",
+    "account",
+    "constraint",
+    "comment",
+    "reservation",
+    "priority",
+    "time_limit_minutes",
+    "begin_time",
+    "gres",
+    "hold",
+];
+
+/// Run the job-submission hook: spec as JSON on stdin; non-zero exit = reject
+/// (stderr to user), exit 0 blank = accept, exit 0 + JSON = modify, else `Err`.
+pub async fn run_submit_hook(
+    script_path: &str,
+    ctx: &SubmitHookContext,
+) -> anyhow::Result<SubmitHookOutcome> {
+    info!(
+        target: "audit",
+        hook = "job_submit",
+        script = script_path,
+        user = %ctx.user,
+        uid = ctx.uid,
+        partition = %ctx.partition,
+        "running job_submit hook"
+    );
+
+    let mut env = SpurEnv::new();
+    env.set_with_slurm_twin("SPUR_JOB_PARTITION", &ctx.partition);
+    env.set("SPUR_JOB_USER", &ctx.user);
+    env.set("SPUR_JOB_UID", ctx.uid);
+    env.set("SPUR_JOB_GID", ctx.gid);
+    env.set("SPUR_SCRIPT_CONTEXT", "job_submit");
+
+    let mut cmd = Command::new(script_path);
+    for (k, v) in env.into_map() {
+        cmd.env(k, v);
+    }
+    cmd.current_dir("/tmp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("job_submit script failed to execute: {script_path}"))?;
+
+    // Drain output concurrently with the stdin write: a multi-MB spec plus a
+    // script that emits before consuming stdin would otherwise deadlock.
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("job_submit stdin was not captured")?;
+    let spec_bytes = ctx.spec_json.clone().into_bytes();
+    let writer = async move {
+        // A hook that ignores stdin closes the pipe early; a broken pipe there
+        // is expected, not a failure.
+        if let Err(e) = stdin.write_all(&spec_bytes).await {
+            if e.kind() != std::io::ErrorKind::BrokenPipe {
+                return Err(e);
+            }
+        }
+        stdin.shutdown().await.or_else(ignore_broken_pipe)
+    };
+    let (write_res, output) = tokio::join!(writer, child.wait_with_output());
+    write_res.context("failed to write spec to job_submit stdin")?;
+    let output = output.context("job_submit script failed to complete")?;
+
+    let stderr_text = String::from_utf8_lossy(&output.stderr);
+    for line in stderr_text.lines() {
+        warn!(target: "audit", hook = "job_submit", "{}", line);
+    }
+
+    if !output.status.success() {
+        let reason = stderr_text.trim();
+        let reason = if reason.is_empty() {
+            format!("job rejected by job_submit hook (exit {})", output.status)
+        } else {
+            reason.to_string()
+        };
+        return Ok(SubmitHookOutcome::Reject(reason));
+    }
+
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    if stdout_text.trim().is_empty() {
+        return Ok(SubmitHookOutcome::Accept);
+    }
+
+    let changes = parse_submit_changes(stdout_text.trim())?;
+    Ok(SubmitHookOutcome::Modify(changes))
+}
+
+/// Parse the hook's stdout into whitelisted changes; malformed JSON or a wrong
+/// type fails closed. Non-whitelisted keys are ignored and logged, not applied.
+fn parse_submit_changes(stdout: &str) -> anyhow::Result<SubmitHookChanges> {
+    let map: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(stdout).context("job_submit hook emitted unparseable JSON")?;
+
+    let mut leftover = Vec::new();
+    let mut changes = SubmitHookChanges::default();
+    for (key, value) in &map {
+        match key.as_str() {
+            "qos" => changes.qos = Some(take_string(key, value)?),
+            "partition" => changes.partition = Some(take_string(key, value)?),
+            "account" => changes.account = Some(take_string(key, value)?),
+            "constraint" => changes.constraint = Some(take_string(key, value)?),
+            "comment" => changes.comment = Some(take_string(key, value)?),
+            "reservation" => changes.reservation = Some(take_string(key, value)?),
+            "priority" => changes.priority = Some(take_u32(key, value)?),
+            "time_limit_minutes" => changes.time_limit_minutes = Some(take_i64(key, value)?),
+            "begin_time" => changes.begin_time = Some(take_datetime(key, value)?),
+            "gres" => changes.gres = Some(take_string_vec(key, value)?),
+            "hold" => changes.hold = Some(take_bool(key, value)?),
+            _ => leftover.push(key.clone()),
+        }
+    }
+
+    if !leftover.is_empty() {
+        warn!(
+            target: "audit",
+            hook = "job_submit",
+            ignored = ?leftover,
+            whitelist = ?SUBMIT_HOOK_WHITELIST,
+            "job_submit hook set non-whitelisted fields; ignoring them"
+        );
+    }
+
+    Ok(changes)
+}
+
+fn ignore_broken_pipe(e: std::io::Error) -> std::io::Result<()> {
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        Ok(())
+    } else {
+        Err(e)
+    }
+}
+
+fn take_string(key: &str, value: &serde_json::Value) -> anyhow::Result<String> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .with_context(|| format!("job_submit field `{key}` must be a string"))
+}
+
+fn take_bool(key: &str, value: &serde_json::Value) -> anyhow::Result<bool> {
+    value
+        .as_bool()
+        .with_context(|| format!("job_submit field `{key}` must be a boolean"))
+}
+
+fn take_i64(key: &str, value: &serde_json::Value) -> anyhow::Result<i64> {
+    value
+        .as_i64()
+        .with_context(|| format!("job_submit field `{key}` must be an integer"))
+}
+
+fn take_u32(key: &str, value: &serde_json::Value) -> anyhow::Result<u32> {
+    let n = take_i64(key, value)?;
+    u32::try_from(n).with_context(|| format!("job_submit field `{key}` is out of range for u32"))
+}
+
+fn take_string_vec(key: &str, value: &serde_json::Value) -> anyhow::Result<Vec<String>> {
+    let arr = value
+        .as_array()
+        .with_context(|| format!("job_submit field `{key}` must be an array of strings"))?;
+    arr.iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .with_context(|| format!("job_submit field `{key}` must be an array of strings"))
+        })
+        .collect()
+}
+
+fn take_datetime(key: &str, value: &serde_json::Value) -> anyhow::Result<DateTime<Utc>> {
+    let s = take_string(key, value)?;
+    DateTime::parse_from_rfc3339(&s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .with_context(|| format!("job_submit field `{key}` must be an RFC3339 timestamp"))
+}
+
+/// Apply whitelisted hook changes onto the spec, returning the names of the
+/// fields actually changed (for the audit line). Only `Some` fields are touched.
+pub fn apply_submit_changes(spec: &mut JobSpec, changes: &SubmitHookChanges) -> Vec<&'static str> {
+    let mut modified = Vec::new();
+    // Empty is ignored for these three: blanking them would skip the existence /
+    // ACL checks that treat an empty value as "unset, nothing to validate".
+    if let Some(qos) = changes.qos.as_deref().filter(|s| !s.is_empty()) {
+        spec.qos = Some(qos.to_string());
+        modified.push("qos");
+    }
+    if let Some(partition) = changes.partition.as_deref().filter(|s| !s.is_empty()) {
+        spec.partition = Some(partition.to_string());
+        modified.push("partition");
+    }
+    if let Some(account) = changes.account.as_deref().filter(|s| !s.is_empty()) {
+        spec.account = Some(account.to_string());
+        modified.push("account");
+    }
+    if let Some(ref constraint) = changes.constraint {
+        spec.constraint = Some(constraint.clone());
+        modified.push("constraint");
+    }
+    if let Some(ref comment) = changes.comment {
+        spec.comment = Some(comment.clone());
+        modified.push("comment");
+    }
+    if let Some(ref reservation) = changes.reservation {
+        spec.reservation = Some(reservation.clone());
+        modified.push("reservation");
+    }
+    if let Some(priority) = changes.priority {
+        spec.priority = Some(priority);
+        modified.push("priority");
+    }
+    if let Some(minutes) = changes.time_limit_minutes {
+        spec.time_limit = Some(chrono::Duration::minutes(minutes));
+        modified.push("time_limit");
+    }
+    if let Some(begin_time) = changes.begin_time {
+        spec.begin_time = Some(begin_time);
+        modified.push("begin_time");
+    }
+    if let Some(ref gres) = changes.gres {
+        spec.gres = gres.clone();
+        modified.push("gres");
+    }
+    if let Some(hold) = changes.hold {
+        spec.hold = hold;
+        modified.push("hold");
+    }
+    modified
 }
 
 /// Spawn a hook in `work_dir`, retrying from `/tmp` if the spawn fails there.
@@ -325,5 +601,222 @@ mod tests {
         ctx.work_dir = "/nonexistent/submitted/dir".into();
         let result = run_hook("/nonexistent/hook_script.sh", &ctx).await;
         assert!(result.is_err());
+    }
+
+    fn submit_ctx() -> SubmitHookContext {
+        SubmitHookContext {
+            spec_json: r#"{"name":"j1","partition":"gpu"}"#.into(),
+            user: "alice".into(),
+            uid: nix::unistd::getuid().as_raw(),
+            gid: nix::unistd::getgid().as_raw(),
+            partition: "gpu".into(),
+        }
+    }
+
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn submit_hook_accept() {
+        let script = make_script("exit 0");
+        let out = run_submit_hook(script.to_str().unwrap(), &submit_ctx())
+            .await
+            .unwrap();
+        assert!(matches!(out, SubmitHookOutcome::Accept));
+    }
+
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn submit_hook_reject_surfaces_stderr() {
+        let script = make_script("echo 'partition required' >&2\nexit 1");
+        let out = run_submit_hook(script.to_str().unwrap(), &submit_ctx())
+            .await
+            .unwrap();
+        match out {
+            SubmitHookOutcome::Reject(msg) => assert_eq!(msg, "partition required"),
+            other => panic!("expected reject, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn submit_hook_reject_empty_stderr_gets_generic_message() {
+        let script = make_script("exit 3");
+        let out = run_submit_hook(script.to_str().unwrap(), &submit_ctx())
+            .await
+            .unwrap();
+        match out {
+            SubmitHookOutcome::Reject(msg) => assert!(msg.contains("job_submit hook")),
+            other => panic!("expected reject, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn submit_hook_modify_whitelisted_field() {
+        let script = make_script(r#"echo '{"qos":"high"}'"#);
+        let out = run_submit_hook(script.to_str().unwrap(), &submit_ctx())
+            .await
+            .unwrap();
+        match out {
+            SubmitHookOutcome::Modify(c) => assert_eq!(c.qos.as_deref(), Some("high")),
+            other => panic!("expected modify, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn submit_hook_ignores_non_whitelisted_field() {
+        let script = make_script(r#"echo '{"uid":0,"qos":"high"}'"#);
+        let out = run_submit_hook(script.to_str().unwrap(), &submit_ctx())
+            .await
+            .unwrap();
+        match out {
+            SubmitHookOutcome::Modify(c) => assert_eq!(c.qos.as_deref(), Some("high")),
+            other => panic!("expected modify, got {other:?}"),
+        }
+    }
+
+    // A hook that exits 0 but emits garbage is a misconfiguration; fail closed
+    // rather than silently accept and bypass enforcement.
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn submit_hook_malformed_json_fails_closed() {
+        let script = make_script("echo '{not json'");
+        let result = run_submit_hook(script.to_str().unwrap(), &submit_ctx()).await;
+        assert!(result.is_err());
+    }
+
+    // A whitelisted key with the wrong type also fails closed.
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn submit_hook_wrong_type_fails_closed() {
+        let script = make_script(r#"echo '{"priority":"high"}'"#);
+        let result = run_submit_hook(script.to_str().unwrap(), &submit_ctx()).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn submit_hook_receives_spec_on_stdin() {
+        let marker = NamedTempFile::new().unwrap();
+        let marker_path = marker.path().to_str().unwrap().to_string();
+        let script = make_script(&format!("cat > {marker_path}"));
+        run_submit_hook(script.to_str().unwrap(), &submit_ctx())
+            .await
+            .unwrap();
+        let content = std::fs::read_to_string(&marker_path).unwrap();
+        assert!(content.contains("\"partition\":\"gpu\""));
+    }
+
+    // A hook that never reads stdin closes the pipe early; the broken-pipe write
+    // must be tolerated, not surfaced as a failure.
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn submit_hook_that_ignores_stdin_still_succeeds() {
+        let script = make_script(r#"echo '{"qos":"high"}'"#);
+        let out = run_submit_hook(script.to_str().unwrap(), &submit_ctx())
+            .await
+            .unwrap();
+        match out {
+            SubmitHookOutcome::Modify(c) => assert_eq!(c.qos.as_deref(), Some("high")),
+            other => panic!("expected modify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_changes_sets_all_whitelisted_and_leaves_identity() {
+        let mut spec = JobSpec {
+            user: "alice".into(),
+            uid: 1000,
+            script: Some("run.sh".into()),
+            num_nodes: 4,
+            ..Default::default()
+        };
+        let begin = DateTime::parse_from_rfc3339("2026-08-03T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let changes = SubmitHookChanges {
+            qos: Some("high".into()),
+            partition: Some("gpu".into()),
+            account: Some("research".into()),
+            constraint: Some("mi300x".into()),
+            comment: Some("audited".into()),
+            reservation: Some("resv1".into()),
+            priority: Some(500),
+            time_limit_minutes: Some(120),
+            begin_time: Some(begin),
+            gres: Some(vec!["gpu:mi300x:4".into()]),
+            hold: Some(true),
+        };
+        let modified = apply_submit_changes(&mut spec, &changes);
+
+        assert_eq!(spec.qos.as_deref(), Some("high"));
+        assert_eq!(spec.partition.as_deref(), Some("gpu"));
+        assert_eq!(spec.account.as_deref(), Some("research"));
+        assert_eq!(spec.constraint.as_deref(), Some("mi300x"));
+        assert_eq!(spec.comment.as_deref(), Some("audited"));
+        assert_eq!(spec.reservation.as_deref(), Some("resv1"));
+        assert_eq!(spec.priority, Some(500));
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(120)));
+        assert_eq!(spec.begin_time, Some(begin));
+        assert_eq!(spec.gres, vec!["gpu:mi300x:4".to_string()]);
+        assert!(spec.hold);
+        for field in [
+            "qos",
+            "partition",
+            "account",
+            "constraint",
+            "comment",
+            "reservation",
+            "priority",
+            "time_limit",
+            "begin_time",
+            "gres",
+            "hold",
+        ] {
+            assert!(modified.contains(&field), "missing {field}");
+        }
+
+        assert_eq!(spec.user, "alice");
+        assert_eq!(spec.uid, 1000);
+        assert_eq!(spec.script.as_deref(), Some("run.sh"));
+        assert_eq!(spec.num_nodes, 4);
+    }
+
+    #[test]
+    fn apply_changes_ignores_empty_partition_qos_account() {
+        let mut spec = JobSpec {
+            partition: Some("gpu".into()),
+            qos: Some("high".into()),
+            account: Some("acct".into()),
+            ..Default::default()
+        };
+        let changes = SubmitHookChanges {
+            partition: Some(String::new()),
+            qos: Some(String::new()),
+            account: Some(String::new()),
+            ..Default::default()
+        };
+        let modified = apply_submit_changes(&mut spec, &changes);
+        assert!(modified.is_empty());
+        assert_eq!(spec.partition.as_deref(), Some("gpu"));
+        assert_eq!(spec.qos.as_deref(), Some("high"));
+        assert_eq!(spec.account.as_deref(), Some("acct"));
+    }
+
+    #[test]
+    fn parse_changes_handles_all_typed_fields() {
+        let json = r#"{
+            "priority": 7,
+            "time_limit_minutes": 90,
+            "begin_time": "2026-08-03T12:00:00Z",
+            "gres": ["gpu:mi300x:2"],
+            "hold": true
+        }"#;
+        let c = parse_submit_changes(json).unwrap();
+        assert_eq!(c.priority, Some(7));
+        assert_eq!(c.time_limit_minutes, Some(90));
+        assert!(c.begin_time.is_some());
+        assert_eq!(c.gres.as_deref(), Some(&["gpu:mi300x:2".to_string()][..]));
+        assert_eq!(c.hold, Some(true));
     }
 }

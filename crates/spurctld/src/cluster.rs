@@ -465,6 +465,8 @@ impl ClusterManager {
         spur_core::mpi::validate_single_node_pmix(mpi, spec.num_nodes)
             .map_err(SubmitError::invalid)?;
 
+        self.run_job_submit_hook(&mut spec)?;
+
         // Checked after defaults are applied so we measure the final spec.
         // Array expansion only adds bounded integer metadata per task, so a
         // single pre-expansion check still bounds each Raft log entry.
@@ -543,6 +545,70 @@ impl ClusterManager {
             "requested node count {nodes} is outside partition '{}' limits (min {}, max {})",
             part.name, part.min_nodes, max
         )))
+    }
+
+    /// Run the configured job-submission hook against the resolved spec: reject
+    /// maps to an invalid-argument error; modify applies whitelisted changes.
+    fn run_job_submit_hook(&self, spec: &mut JobSpec) -> Result<(), SubmitError> {
+        let config = self.config();
+        let Some(script) = config.hooks.job_submit.as_deref() else {
+            return Ok(());
+        };
+
+        let spec_json = serde_json::to_string(spec).map_err(|e| {
+            SubmitError::internal(format!(
+                "failed to encode job spec for job_submit hook: {e}"
+            ))
+        })?;
+        let ctx = spur_core::hooks::SubmitHookContext {
+            spec_json,
+            user: spec.user.clone(),
+            uid: spec.uid,
+            gid: spec.gid,
+            partition: spec.partition.clone().unwrap_or_default(),
+        };
+
+        let outcome = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { spur_core::hooks::run_submit_hook(script, &ctx).await })
+        })
+        .map_err(|e| SubmitError::internal(format!("job_submit hook failed: {e}")))?;
+
+        match outcome {
+            spur_core::hooks::SubmitHookOutcome::Accept => Ok(()),
+            spur_core::hooks::SubmitHookOutcome::Reject(reason) => {
+                Err(SubmitError::invalid(reason))
+            }
+            spur_core::hooks::SubmitHookOutcome::Modify(changes) => {
+                let modified = spur_core::hooks::apply_submit_changes(spec, &changes);
+                info!(
+                    target: "audit",
+                    hook = "job_submit",
+                    user = %spec.user,
+                    uid = spec.uid,
+                    partition = %spec.partition.clone().unwrap_or_default(),
+                    gpus = spur_core::job::effective_gpus(spec, spec.num_nodes),
+                    modified = ?modified,
+                    "job_submit hook modified spec"
+                );
+                // Hook-set qos is trusted policy (not re-authorized), but
+                // partition/account still get ACL re-checks against the owner.
+                if changes.partition.is_some() || changes.account.is_some() {
+                    validate_user_account(spec, &self.association_cache)?;
+                    self.validate_partition(spec)?;
+                }
+                // Existence is still enforced: an unknown QOS silently resolves
+                // to the limitless default, which would bypass QOS limits.
+                if let Some(name) = changes.qos.as_deref().filter(|n| !n.is_empty()) {
+                    if self.qos_cache.get(name).is_none() {
+                        return Err(SubmitError::invalid(format!(
+                            "job_submit hook set unknown QOS '{name}'"
+                        )));
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Validate partition constraints: access control and node limits.
@@ -6156,6 +6222,71 @@ mod tests {
         assert_eq!(job.spec.name, "test-job");
         assert_eq!(job.state, JobState::Pending);
         assert!(cm.next_job_id.load(Ordering::Relaxed) >= 2);
+    }
+
+    fn write_hook_script(dir: &TempDir, body: &str) -> String {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.path().join("job_submit.sh");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "#!/bin/bash\n{body}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_rejects() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(
+            &dir,
+            "echo 'denied by policy' >&2\nexit 1",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("blocked")).unwrap_err();
+        assert_eq!(err, SubmitError::invalid("denied by policy"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_modifies_spec() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"qos":"high"}'"#));
+        let cm = test_cluster_with_config(&dir, config).await;
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 5000,
+            ..Default::default()
+        });
+
+        let id = submit_and_wait(&cm, basic_spec("modme"));
+        assert_eq!(cm.get_job(id).unwrap().spec.qos.as_deref(), Some("high"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_modify_to_invalid_partition_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"partition":"nope"}'"#));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("bad-part")).unwrap_err();
+        assert_eq!(err, SubmitError::invalid("partition 'nope' not found"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_modify_to_unknown_qos_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"qos":"ghost"}'"#));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("bad-qos")).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid("job_submit hook set unknown QOS 'ghost'")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
