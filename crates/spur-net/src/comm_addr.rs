@@ -33,7 +33,7 @@ pub fn normalized_comm_addr_is_unusable(normalized: &str) -> bool {
     normalized.parse::<IpAddr>().is_ok_and(is_unusable_comm_ip)
 }
 
-/// Whether a comm-address string resolves to an address unsuitable for
+/// Whether a comm address string resolves to an address unsuitable for
 /// inter-node reachability (loopback, unspecified, or link-local).
 pub fn comm_addr_is_unusable(input: &str) -> bool {
     normalize_comm_address(input)
