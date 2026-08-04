@@ -73,11 +73,18 @@ class TestJobSubmitHook:
 
     def test_unset_hook_is_inert(self, unstarted_cluster):
         cluster = unstarted_cluster
+        # Write a hook that WOULD modify, but leave it unconfigured: the field
+        # must stay untouched, proving the hook only runs when configured.
+        cluster.write_file("hooks/job_submit.sh", MODIFY_HOOK)
         cluster.start()
 
         script = cluster.write_file("job.sh", "#!/bin/bash\necho hi\n")
         job_id = parse_job_id(cluster.sbatch(["-J", "plain", script]))
         assert job_id is not None
+
+        detail = cluster.scontrol("show", "job", str(job_id))
+        assert "policy-tagged" not in detail
+        assert "Priority=777" not in detail
 
     def test_lua_reject_message_reaches_user(self, unstarted_cluster):
         cluster = unstarted_cluster
