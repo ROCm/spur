@@ -497,6 +497,10 @@ mod tests {
         deregister_agent(pb::DeregisterAgentRequest) -> ();
         get_job_steps(pb::GetJobStepsRequest) -> pb::GetJobStepsResponse;
         create_job_step(pb::CreateJobStepRequest) -> pb::CreateJobStepResponse;
+        create_partition(pb::CreatePartitionRequest) -> ();
+        update_partition(pb::UpdatePartitionRequest) -> ();
+        delete_partition(pb::DeletePartitionRequest) -> ();
+        reconfigure(()) -> ();
         ping(()) -> pb::PingResponse;
         get_job_metrics(()) -> pb::JobMetrics;
         get_node_metrics(()) -> pb::NodeMetrics;
