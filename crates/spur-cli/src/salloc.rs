@@ -24,6 +24,10 @@ pub struct SallocArgs {
     #[arg(short = 'A', long)]
     pub account: Option<String>,
 
+    /// QoS
+    #[arg(short = 'q', long)]
+    pub qos: Option<String>,
+
     /// Number of nodes
     #[arg(short = 'N', long, default_value = "1")]
     pub nodes: u32,
@@ -113,74 +117,13 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     resolve_salloc_env(&matches, &mut args);
     let nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
 
-    let name = args.job_name.unwrap_or_else(|| "interactive".into());
-    let gres = args.gres;
-    let gpus = crate::sbatch::parse_gpu_flag(args.gpus.as_deref())?;
-    let gpus_per_node = crate::sbatch::parse_gpu_flag(args.gpus_per_node.as_deref())?;
-    let gpus_per_task = crate::sbatch::parse_gpu_flag(args.gpus_per_task.as_deref())?;
-    crate::sbatch::validate_gpu_flags(
-        gpus.is_some(),
-        gpus_per_node.is_some(),
-        gpus_per_task.is_some(),
-        &gres,
-    )?;
-
-    let time_limit =
-        spur_core::config::parse_time_minutes(&args.time).map(|mins| prost_types::Duration {
-            seconds: mins as i64 * 60,
-            nanos: 0,
-        });
-
-    let memory_mb = args
-        .mem
-        .as_ref()
-        .map(|m| parse_memory_mb(m))
-        .transpose()?
-        .unwrap_or(0);
-
-    let nodes = args.nodes;
     let controller = args.controller.clone();
-    let exclusive = args.exclusive;
-    let constraint = args.constraint;
-    let exclude = args.exclude;
-    let reservation = args.reservation;
-    let partition = args.partition;
-    let account = args.account;
-    let ntasks = crate::sbatch::effective_ntasks(args.ntasks, None, nodes);
-    let cpus_per_task = args.cpus_per_task;
+    let job_spec = build_salloc_job_spec(&args, nodelist)?;
 
     let channel = spur_client::connect_channel(&controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
-
-    // Submit interactive allocation (sleep infinity holds the allocation)
-    let job_spec = JobSpec {
-        name,
-        partition: partition.unwrap_or_default(),
-        account: account.unwrap_or_default(),
-        user: whoami::username().unwrap_or_else(|_| "unknown".into()),
-        uid: nix::unistd::getuid().as_raw(),
-        gid: nix::unistd::getgid().as_raw(),
-        num_nodes: nodes,
-        num_tasks: ntasks,
-        cpus_per_task,
-        memory_per_node_mb: memory_mb,
-        gres,
-        gpus,
-        gpus_per_node,
-        gpus_per_task,
-        script: "#!/bin/bash\nsleep infinity\n".into(),
-        time_limit,
-        exclusive,
-        constraint: constraint.unwrap_or_default(),
-        nodelist: nodelist.unwrap_or_default(),
-        exclude: exclude.unwrap_or_default(),
-        reservation: reservation.unwrap_or_default(),
-        interactive: true,
-        environment: HashMap::new(),
-        ..Default::default()
-    };
 
     let response = client
         .submit_job(SubmitJobRequest {
@@ -309,6 +252,63 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     std::process::exit(status.code().unwrap_or(0));
 }
 
+fn build_salloc_job_spec(args: &SallocArgs, nodelist: Option<String>) -> Result<JobSpec> {
+    let gres = args.gres.clone();
+    let gpus = crate::sbatch::parse_gpu_flag(args.gpus.as_deref())?;
+    let gpus_per_node = crate::sbatch::parse_gpu_flag(args.gpus_per_node.as_deref())?;
+    let gpus_per_task = crate::sbatch::parse_gpu_flag(args.gpus_per_task.as_deref())?;
+    crate::sbatch::validate_gpu_flags(
+        gpus.is_some(),
+        gpus_per_node.is_some(),
+        gpus_per_task.is_some(),
+        &gres,
+    )?;
+
+    let time_limit =
+        spur_core::config::parse_time_minutes(&args.time).map(|mins| prost_types::Duration {
+            seconds: mins as i64 * 60,
+            nanos: 0,
+        });
+
+    let memory_mb = args
+        .mem
+        .as_ref()
+        .map(|m| parse_memory_mb(m))
+        .transpose()?
+        .unwrap_or(0);
+
+    Ok(JobSpec {
+        name: args
+            .job_name
+            .clone()
+            .unwrap_or_else(|| "interactive".into()),
+        partition: args.partition.clone().unwrap_or_default(),
+        account: args.account.clone().unwrap_or_default(),
+        qos: args.qos.clone().unwrap_or_default(),
+        user: whoami::username().unwrap_or_else(|_| "unknown".into()),
+        uid: nix::unistd::getuid().as_raw(),
+        gid: nix::unistd::getgid().as_raw(),
+        num_nodes: args.nodes,
+        num_tasks: crate::sbatch::effective_ntasks(args.ntasks, None, args.nodes),
+        cpus_per_task: args.cpus_per_task,
+        memory_per_node_mb: memory_mb,
+        gres,
+        gpus,
+        gpus_per_node,
+        gpus_per_task,
+        script: "#!/bin/bash\nsleep infinity\n".into(),
+        time_limit,
+        exclusive: args.exclusive,
+        constraint: args.constraint.clone().unwrap_or_default(),
+        nodelist: nodelist.unwrap_or_default(),
+        exclude: args.exclude.clone().unwrap_or_default(),
+        reservation: args.reservation.clone().unwrap_or_default(),
+        interactive: true,
+        environment: HashMap::new(),
+        ..Default::default()
+    })
+}
+
 /// Apply `SALLOC_*` environment-variable defaults (plus `SPUR_*` native twins)
 /// to any flag not set on the command line. Mirrors real Slurm: salloc reads
 /// command-prefixed `SALLOC_*` vars, and notably provides no env var for
@@ -326,6 +326,7 @@ fn resolve_salloc_env(matches: &ArgMatches, args: &mut SallocArgs) {
         &["SPUR_ACCOUNT", "SALLOC_ACCOUNT"],
         &mut args.account,
     );
+    apply_str(matches, "qos", &["SPUR_QOS", "SALLOC_QOS"], &mut args.qos);
     apply_str(
         matches,
         "mem",
@@ -416,6 +417,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_qos_short_and_long() {
+        let short = SallocArgs::try_parse_from(["salloc", "-q", "high"]).expect("parse short qos");
+        assert_eq!(short.qos.as_deref(), Some("high"));
+
+        let long = SallocArgs::try_parse_from(["salloc", "--qos=normal"]).expect("parse long qos");
+        assert_eq!(long.qos.as_deref(), Some("normal"));
+    }
+
+    #[test]
+    fn build_job_spec_sets_qos() {
+        let args = SallocArgs::try_parse_from(["salloc", "--qos", "high"]).expect("parse");
+        let spec = build_salloc_job_spec(&args, None).expect("build spec");
+        assert_eq!(spec.qos, "high");
+        assert!(spec.interactive);
+    }
+
+    #[test]
+    fn build_job_spec_qos_defaults_empty() {
+        let args = SallocArgs::try_parse_from(["salloc"]).expect("parse");
+        let spec = build_salloc_job_spec(&args, None).expect("build spec");
+        assert!(spec.qos.is_empty());
+    }
+
+    #[test]
     fn ntasks_defaults_to_node_count() {
         let args = SallocArgs::try_parse_from(["salloc", "-N", "4"]).expect("parse failed");
         assert_eq!(args.ntasks, None);
@@ -472,6 +497,33 @@ mod tests {
         let args = resolve_from(&["salloc"]);
         assert_eq!(args.partition.as_deref(), Some("gpu"));
         assert_eq!(args.account.as_deref(), Some("proj"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn qos_env_default_cli_override_and_spur_alias() {
+        let env = EnvGuard::new();
+
+        env.set("SALLOC_QOS", "burst");
+        assert_eq!(resolve_from(&["salloc"]).qos.as_deref(), Some("burst"));
+
+        assert_eq!(
+            resolve_from(&["salloc", "--qos=normal"]).qos.as_deref(),
+            Some("normal")
+        );
+
+        env.set("SPUR_QOS", "from-spur");
+        assert_eq!(resolve_from(&["salloc"]).qos.as_deref(), Some("from-spur"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn env_only_qos_reaches_job_spec() {
+        let env = EnvGuard::new();
+        env.set("SALLOC_QOS", "burst");
+        let args = resolve_from(&["salloc"]);
+        let spec = build_salloc_job_spec(&args, None).expect("build spec");
+        assert_eq!(spec.qos, "burst");
     }
 
     #[test]
