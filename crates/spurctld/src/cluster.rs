@@ -612,12 +612,21 @@ impl ClusterManager {
         outcome: spur_core::hooks::SubmitHookOutcome,
     ) -> Result<(), SubmitError> {
         match outcome {
-            spur_core::hooks::SubmitHookOutcome::Accept => Ok(()),
+            spur_core::hooks::SubmitHookOutcome::Accept => {
+                info!(target: "audit", hook, user = %spec.user, uid = spec.uid, "job_submit hook accepted");
+                Ok(())
+            }
             spur_core::hooks::SubmitHookOutcome::Reject(reason) => {
+                info!(target: "audit", hook, user = %spec.user, uid = spec.uid, reason = %reason, "job_submit hook rejected");
                 Err(SubmitError::invalid(reason))
             }
             spur_core::hooks::SubmitHookOutcome::Modify(changes) => {
                 let modified = spur_core::hooks::apply_submit_changes(spec, &changes);
+                // An empty change set is an accept, not a modify (no bogus audit line).
+                if modified.is_empty() {
+                    info!(target: "audit", hook, user = %spec.user, uid = spec.uid, "job_submit hook accepted");
+                    return Ok(());
+                }
                 info!(
                     target: "audit",
                     hook,
@@ -6513,6 +6522,37 @@ mod tests {
         assert_eq!(
             cm.get_job(id).unwrap().spec.comment.as_deref(),
             Some("lua-tagged")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_modify_to_invalid_partition_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  j.partition = 'nope'\n  return slurm.SUCCESS\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("lua-bad-part")).unwrap_err();
+        assert_eq!(err, SubmitError::invalid("partition 'nope' not found"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_modify_to_unknown_qos_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  j.qos = 'ghost'\n  return slurm.SUCCESS\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("lua-bad-qos")).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid("job_submit hook set unknown QOS 'ghost'")
         );
     }
 

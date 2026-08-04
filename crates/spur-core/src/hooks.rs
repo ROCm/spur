@@ -155,12 +155,29 @@ const SUBMIT_HOOK_WHITELIST: &[&str] = &[
     "hold",
 ];
 
+/// Wall-clock ceiling for a shell job_submit hook; a hung hook is killed and the
+/// submission fails closed rather than stalling the controller.
+const SUBMIT_HOOK_TIMEOUT_SECS: u64 = 30;
+/// Max bytes captured from the hook's stdout/stderr each; a chatty hook can't
+/// grow controller memory without bound.
+const SUBMIT_HOOK_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+
+/// Reject a non-absolute hook path: a bare name would resolve via `$PATH` and
+/// silently run the wrong binary. The config contract requires a fully-qualified path.
+fn require_absolute_hook_path(script_path: &str) -> anyhow::Result<()> {
+    if !std::path::Path::new(script_path).is_absolute() {
+        anyhow::bail!("job_submit hook path must be absolute: {script_path}");
+    }
+    Ok(())
+}
+
 /// Run the job-submission hook: spec as JSON on stdin; non-zero exit = reject
 /// (stderr to user), exit 0 blank = accept, exit 0 + JSON = modify, else `Err`.
 pub async fn run_submit_hook(
     script_path: &str,
     ctx: &SubmitHookContext,
 ) -> anyhow::Result<SubmitHookOutcome> {
+    require_absolute_hook_path(script_path)?;
     info!(
         target: "audit",
         hook = "job_submit",
@@ -197,6 +214,14 @@ pub async fn run_submit_hook(
         .stdin
         .take()
         .context("job_submit stdin was not captured")?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("job_submit stdout was not captured")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("job_submit stderr was not captured")?;
     let spec_bytes = ctx.spec_json.clone().into_bytes();
     let writer = async move {
         // A hook that ignores stdin closes the pipe early; a broken pipe there
@@ -208,32 +233,65 @@ pub async fn run_submit_hook(
         }
         stdin.shutdown().await.or_else(ignore_broken_pipe)
     };
-    let (write_res, output) = tokio::join!(writer, child.wait_with_output());
-    write_res.context("failed to write spec to job_submit stdin")?;
-    let output = output.context("job_submit script failed to complete")?;
 
-    let stderr_text = String::from_utf8_lossy(&output.stderr);
+    let timeout = std::time::Duration::from_secs(SUBMIT_HOOK_TIMEOUT_SECS);
+    let collected = tokio::time::timeout(timeout, async {
+        tokio::join!(
+            writer,
+            read_capped(&mut stdout, SUBMIT_HOOK_MAX_OUTPUT_BYTES),
+            read_capped(&mut stderr, SUBMIT_HOOK_MAX_OUTPUT_BYTES),
+            child.wait(),
+        )
+    })
+    .await;
+    let (write_res, out_bytes, err_bytes, status) = match collected {
+        Ok(tuple) => tuple,
+        Err(_) => {
+            let _ = child.kill().await;
+            anyhow::bail!(
+                "job_submit hook timed out after {SUBMIT_HOOK_TIMEOUT_SECS}s (script: {script_path})"
+            );
+        }
+    };
+    write_res.context("failed to write spec to job_submit stdin")?;
+    let out_bytes = out_bytes.context("failed to read job_submit stdout")?;
+    let err_bytes = err_bytes.context("failed to read job_submit stderr")?;
+    let status = status.context("job_submit script failed to complete")?;
+
+    let stderr_text = String::from_utf8_lossy(&err_bytes);
     for line in stderr_text.lines() {
         warn!(target: "audit", hook = "job_submit", "{}", line);
     }
 
-    if !output.status.success() {
+    if !status.success() {
         let reason = stderr_text.trim();
         let reason = if reason.is_empty() {
-            format!("job rejected by job_submit hook (exit {})", output.status)
+            format!("job rejected by job_submit hook (exit {status})")
         } else {
             reason.to_string()
         };
         return Ok(SubmitHookOutcome::Reject(reason));
     }
 
-    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let stdout_text = String::from_utf8_lossy(&out_bytes);
     if stdout_text.trim().is_empty() {
         return Ok(SubmitHookOutcome::Accept);
     }
 
     let changes = parse_submit_changes(stdout_text.trim())?;
     Ok(SubmitHookOutcome::Modify(changes))
+}
+
+/// Read up to `cap` bytes from `reader`; excess is left unread (the child then
+/// blocks on a full pipe and is caught by the caller's wall-clock timeout).
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    cap: usize,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    reader.take(cap as u64).read_to_end(&mut buf).await?;
+    Ok(buf)
 }
 
 /// Parse the shell hook's stdout into whitelisted changes; malformed JSON or a
@@ -260,7 +318,9 @@ fn changes_from_map(
             "comment" => changes.comment = Some(take_string(key, value)?),
             "reservation" => changes.reservation = Some(take_string(key, value)?),
             "priority" => changes.priority = Some(take_u32(key, value)?),
-            "time_limit_minutes" => changes.time_limit_minutes = Some(take_i64(key, value)?),
+            "time_limit_minutes" => {
+                changes.time_limit_minutes = Some(take_time_limit_minutes(value)?)
+            }
             "begin_time" => changes.begin_time = Some(take_datetime(key, value)?),
             "gres" => changes.gres = Some(take_string_vec(key, value)?),
             "hold" => changes.hold = Some(take_bool(key, value)?),
@@ -314,6 +374,19 @@ fn take_i64(key: &str, value: &serde_json::Value) -> anyhow::Result<i64> {
         .with_context(|| format!("job_submit field `{key}` must be an integer"))
 }
 
+/// Fail closed on a walltime a hook must not set: negative (would slip past the
+/// partition max-time cap) or so large it overflows `Duration::try_minutes`.
+fn take_time_limit_minutes(value: &serde_json::Value) -> anyhow::Result<i64> {
+    let minutes = take_i64("time_limit_minutes", value)?;
+    if minutes < 0 {
+        anyhow::bail!("job_submit field `time_limit_minutes` must not be negative");
+    }
+    if chrono::Duration::try_minutes(minutes).is_none() {
+        anyhow::bail!("job_submit field `time_limit_minutes` is out of range");
+    }
+    Ok(minutes)
+}
+
 fn take_u32(key: &str, value: &serde_json::Value) -> anyhow::Result<u32> {
     let n = take_i64(key, value)?;
     u32::try_from(n).with_context(|| format!("job_submit field `{key}` is out of range for u32"))
@@ -356,6 +429,7 @@ pub fn run_submit_hook_lua(
 ) -> anyhow::Result<SubmitHookOutcome> {
     use mlua::{Lua, LuaSerdeExt, StdLib, Value};
 
+    require_absolute_hook_path(script_path)?;
     info!(
         target: "audit",
         hook = "job_submit_lua",
@@ -598,8 +672,13 @@ pub fn apply_submit_changes(spec: &mut JobSpec, changes: &SubmitHookChanges) -> 
         spec.priority = Some(priority);
         modified.push("priority");
     }
-    if let Some(minutes) = changes.time_limit_minutes {
-        spec.time_limit = Some(chrono::Duration::minutes(minutes));
+    // Validated in `take_time_limit_minutes`; `try_minutes` keeps this panic-free
+    // even if that guard is ever bypassed.
+    if let Some(dur) = changes
+        .time_limit_minutes
+        .and_then(chrono::Duration::try_minutes)
+    {
+        spec.time_limit = Some(dur);
         modified.push("time_limit");
     }
     if let Some(begin_time) = changes.begin_time {
@@ -1324,5 +1403,47 @@ mod tests {
         let lua = make_lua("function slurm_job_submit(  this is not lua");
         let res = run_submit_hook_lua(lua.to_str().unwrap(), &lua_ctx(r#"{"partition":"gpu"}"#));
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn time_limit_minutes_rejects_negative_and_huge() {
+        assert!(parse_submit_changes(r#"{"time_limit_minutes": -1}"#).is_err());
+        assert!(parse_submit_changes(r#"{"time_limit_minutes": 9223372036854775807}"#).is_err());
+        // A sane positive value is still accepted.
+        let c = parse_submit_changes(r#"{"time_limit_minutes": 60}"#).unwrap();
+        assert_eq!(c.time_limit_minutes, Some(60));
+    }
+
+    #[test]
+    fn lua_modify_sets_gres_and_begin_time() {
+        let lua = make_lua(
+            "function slurm_job_submit(j,u)\n  j.gres = {'gpu:mi300x:2'}\n  j.begin_time = '2026-08-04T12:00:00Z'\n  return slurm.SUCCESS\nend",
+        );
+        let out =
+            run_submit_hook_lua(lua.to_str().unwrap(), &lua_ctx(r#"{"partition":"gpu"}"#)).unwrap();
+        match out {
+            SubmitHookOutcome::Modify(c) => {
+                assert_eq!(c.gres.as_deref(), Some(&["gpu:mi300x:2".to_string()][..]));
+                assert!(c.begin_time.is_some());
+            }
+            other => panic!("expected modify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lua_non_integer_return_fails_closed() {
+        for ret in ["return 'nope'", "return {}", "return nil"] {
+            let lua = make_lua(&format!("function slurm_job_submit(j,u)\n  {ret}\nend"));
+            let res =
+                run_submit_hook_lua(lua.to_str().unwrap(), &lua_ctx(r#"{"partition":"gpu"}"#));
+            assert!(res.is_err(), "non-integer return must fail closed: {ret}");
+        }
+    }
+
+    #[test]
+    fn hook_paths_must_be_absolute() {
+        assert!(require_absolute_hook_path("job_submit.sh").is_err());
+        assert!(require_absolute_hook_path("./rel/path.sh").is_err());
+        assert!(require_absolute_hook_path("/etc/spur/job_submit.sh").is_ok());
     }
 }
