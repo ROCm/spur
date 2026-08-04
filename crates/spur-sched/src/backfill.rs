@@ -78,9 +78,7 @@ impl BackfillScheduler {
             if !placement.matches(node, reservations, now) {
                 return false;
             }
-            if node.alloc_resources.cpus >= node.total_resources.cpus
-                && node.total_resources.cpus > 0
-            {
+            if !node.has_free_cpu_capacity() {
                 return false;
             }
             node.total_resources.can_satisfy(&required)

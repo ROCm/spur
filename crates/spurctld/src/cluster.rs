@@ -1898,6 +1898,22 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Clear a node's k0s role + mesh IP + pod /24 (replicated via Raft). Returns the node to
+    /// Spur batch scheduling after k0s teardown. Idempotent: a no-op on an already-cleared node.
+    pub fn clear_node_k0s(&self, name: &str) -> anyhow::Result<()> {
+        {
+            let nodes = self.nodes.read();
+            if !nodes.contains_key(name) {
+                anyhow::bail!("node {} not found", name);
+            }
+        }
+        self.propose(WalOperation::NodeK0sClear {
+            name: name.to_string(),
+        })?;
+        info!(node = %name, "node k0s role cleared");
+        Ok(())
+    }
+
     /// set the cluster-wide k0s phase (+ optional control-plane node/set / reset flag). A `None`
     /// `control_plane_node` or empty `control_plane_nodes` leaves the persisted value untouched.
     pub fn set_k0s_phase(
@@ -3069,24 +3085,35 @@ impl ClusterManager {
 
             // Fewer nodes free (schedulable, available resources) than needed →
             // Resources; otherwise queued behind higher priority.
+            let has_capacity = |n: &spur_core::node::Node| {
+                n.has_free_cpu_capacity() && n.can_satisfy_request(&required)
+            };
             let free_now = eligible
                 .iter()
                 .filter(|n| placement.matches(n, cluster_state.reservations, now))
-                .filter(|n| {
-                    if n.alloc_resources.cpus >= n.total_resources.cpus
-                        && n.total_resources.cpus > 0
-                    {
-                        return false;
-                    }
-                    n.can_satisfy_request(&required)
-                })
+                .filter(|n| has_capacity(n))
                 .count();
 
-            job_entry.set_pending_reason(if free_now < needed {
-                PendingReason::Resources
-            } else {
+            let reason = if free_now >= needed {
                 PendingReason::Priority
-            });
+            } else {
+                // k0s-caused shortfall: nodes that would match but for the k0s gate.
+                // Uses matches_ignoring_k0s so exclusive/idle rules stay in lockstep.
+                let k0s_blocked = eligible
+                    .iter()
+                    .filter(|n| {
+                        n.is_k0s_reserved()
+                            && placement.matches_ignoring_k0s(n, cluster_state.reservations, now)
+                            && has_capacity(n)
+                    })
+                    .count();
+                if free_now + k0s_blocked >= needed {
+                    PendingReason::K8sReserved
+                } else {
+                    PendingReason::Resources
+                }
+            };
+            job_entry.set_pending_reason(reason);
         }
     }
 
@@ -4147,6 +4174,13 @@ impl ClusterManager {
                     node.k0s_role = Some(*role);
                     node.k0s_mesh_ip = Some(mesh_ip.clone());
                     node.k0s_pod_cidr = Some(pod_cidr.clone());
+                }
+            }
+            WalOperation::NodeK0sClear { name } => {
+                if let Some(node) = nodes.get_mut(name) {
+                    node.k0s_role = None;
+                    node.k0s_mesh_ip = None;
+                    node.k0s_pod_cidr = None;
                 }
             }
             WalOperation::K0sSetPhase {
@@ -7612,6 +7646,57 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn k8s_reserved_node_reports_k8s_reserved_not_resources() {
+        // A job that would fit but for the node being claimed by k8s must report
+        // K8sReserved, so `squeue` explains why an "idle"-looking node won't run it.
+        use spur_core::k0s::K0sRole;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let job_id = submit_and_wait(&cm, basic_spec("wants-k8s-node"));
+        let snapshot = cm.get_job(job_id).unwrap();
+
+        // Idle node with capacity, but reserved for k8s -> K8sReserved.
+        let mut node = cm.get_node("n1").unwrap();
+        node.k0s_role = Some(K0sRole::Worker);
+        let nodes = vec![node];
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::K8sReserved
+        );
+
+        // An exclusive job needs an idle node, so a busy k8s node would not run it
+        // even if the role were cleared -> plain Resources, not K8sReserved.
+        let mut busy = cm.get_node("n1").unwrap();
+        busy.k0s_role = Some(K0sRole::Worker);
+        busy.alloc_resources = scalar_alloc(2, 4000);
+        busy.state = NodeState::Mixed;
+        let nodes = vec![busy];
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        let mut excl_spec = basic_spec("excl");
+        excl_spec.exclusive = true;
+        let excl = submit_and_wait(&cm, excl_spec);
+        let excl_snap = cm.get_job(excl).unwrap();
+        cm.update_pending_reasons(&[&excl_snap], &state);
+        assert_eq!(
+            cm.get_job(excl).unwrap().pending_reason,
+            PendingReason::Resources
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nodelist_that_cannot_match_reports_req_node_not_avail() {
         // A job pinned to a node that isn't idle/usable must report
         // ReqNodeNotAvail, not Priority (as if merely queued behind others).
@@ -10945,6 +11030,44 @@ mod tests {
         let n1 = cm2.get_node("n1").unwrap();
         assert_eq!(n1.k0s_role, Some(K0sRole::Worker));
         assert_eq!(n1.k0s_mesh_ip.as_deref(), Some("10.44.0.2"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_node_k0s_returns_node_to_scheduling() {
+        use spur_core::k0s::K0sRole;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        cm.assign_node_k0s("n1", K0sRole::Worker, "10.44.0.2", "10.42.2.0/24")
+            .unwrap();
+        wait_for("role assigned", || {
+            cm.get_node("n1").is_some_and(|n| n.is_k0s_reserved())
+        });
+
+        cm.clear_node_k0s("n1").unwrap();
+        wait_for("role cleared", || {
+            cm.get_node("n1").is_some_and(|n| !n.is_k0s_reserved())
+        });
+        let n1 = cm.get_node("n1").unwrap();
+        assert!(n1.k0s_mesh_ip.is_none());
+        assert!(n1.k0s_pod_cidr.is_none());
+
+        // A cleared node must place jobs again (teardown reverses the gate).
+        let job = submit_and_wait(&cm, basic_spec("post-teardown"));
+        let nodes = vec![cm.get_node("n1").unwrap()];
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        let snap = cm.get_job(job).unwrap();
+        cm.update_pending_reasons(&[&snap], &state);
+        assert_ne!(
+            cm.get_job(job).unwrap().pending_reason,
+            PendingReason::K8sReserved
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

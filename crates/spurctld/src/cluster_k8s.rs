@@ -653,16 +653,25 @@ async fn converge_provisioning(
     }
 }
 
-/// Stop every assigned component that is still running (cluster teardown).
+/// Cluster teardown: keep stopping a node's component while k0s still runs, else
+/// (stopped/failed/unreachable) clear its role so it is never stranded out of scheduling.
 async fn stop_all_components(cluster: &ClusterManager, reset: bool) {
     for node in cluster.get_nodes() {
         if node.k0s_role.is_none() {
             continue;
         }
-        if fetch_component_state(cluster, &node.name).await.as_deref() == Some("inactive") {
+        let state = fetch_component_state(cluster, &node.name).await;
+        let still_running = matches!(
+            state.as_deref(),
+            Some("active") | Some("activating") | Some("deactivating")
+        );
+        if still_running {
+            spawn_stop_component(cluster, &node.name, reset);
             continue;
         }
-        spawn_stop_component(cluster, &node.name, reset);
+        if let Err(e) = cluster.clear_node_k0s(&node.name) {
+            warn!(node = %node.name, error = %e, "failed to clear k0s role after teardown");
+        }
     }
 }
 

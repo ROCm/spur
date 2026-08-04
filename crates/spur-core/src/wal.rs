@@ -223,6 +223,9 @@ pub enum WalOperation {
         #[serde(default)]
         reset_requested: bool,
     },
+    NodeK0sClear {
+        name: String,
+    },
 }
 
 impl WalOperation {
@@ -709,6 +712,16 @@ mod deregistration_wal_tests {
                 assert_eq!(mesh_ip, "10.44.0.2");
                 assert_eq!(pod_cidr, "10.42.2.0/24");
             }
+            _ => panic!("wrong variant"),
+        }
+
+        let op = WalOperation::NodeK0sClear {
+            name: "gpu-node-1".into(),
+        };
+        let back: WalOperation =
+            serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
+        match back {
+            WalOperation::NodeK0sClear { name } => assert_eq!(name, "gpu-node-1"),
             _ => panic!("wrong variant"),
         }
 

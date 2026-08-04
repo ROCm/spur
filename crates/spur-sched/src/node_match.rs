@@ -128,6 +128,19 @@ impl<'a> NodePlacement<'a> {
     /// [`eligible`](Self::eligible) plus runtime state (schedulable,
     /// exclusive-idle), still ignoring free capacity.
     pub fn matches(&self, node: &Node, reservations: &[Reservation], now: DateTime<Utc>) -> bool {
+        // A node claimed by the managed k0s cluster is owned by the k8s
+        // scheduler; Spur must not also place jobs on it (no GPU double-booking).
+        !node.is_k0s_reserved() && self.matches_ignoring_k0s(node, reservations, now)
+    }
+
+    /// [`matches`](Self::matches) without the k0s-reservation gate, so the pending-reason
+    /// classifier can ask "would this node match if it weren't reserved for k0s?".
+    pub fn matches_ignoring_k0s(
+        &self,
+        node: &Node,
+        reservations: &[Reservation],
+        now: DateTime<Utc>,
+    ) -> bool {
         if !self.eligible(node, reservations, now) {
             return false;
         }
@@ -228,6 +241,42 @@ mod tests {
             num_tasks: 1,
             cpus_per_task: 1,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn k0s_reserved_node_is_not_a_scheduling_match() {
+        let job = job_with(base_spec());
+        let p = NodePlacement::new(&job);
+        let now = Utc::now();
+
+        let mut n = node("n1");
+        assert!(p.matches(&n, &[], now), "idle node should match");
+
+        n.k0s_role = Some(spur_core::k0s::K0sRole::Worker);
+        assert!(!p.matches(&n, &[], now), "k0s worker must not match");
+        // Placement identity is unchanged; only the runtime gate rejects it.
+        assert!(p.eligible(&n, &[], now));
+
+        n.k0s_role = None;
+        assert!(
+            p.matches(&n, &[], now),
+            "cleared role reverts to schedulable"
+        );
+    }
+
+    #[test]
+    fn k0s_controller_and_single_are_also_excluded() {
+        let job = job_with(base_spec());
+        let p = NodePlacement::new(&job);
+        let now = Utc::now();
+        for role in [
+            spur_core::k0s::K0sRole::Controller,
+            spur_core::k0s::K0sRole::Single,
+        ] {
+            let mut n = node("n1");
+            n.k0s_role = Some(role);
+            assert!(!p.matches(&n, &[], now), "{role:?} must be excluded");
         }
     }
 
