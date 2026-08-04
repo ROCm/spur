@@ -391,8 +391,13 @@ pub fn run_submit_hook_lua(
             None => obj.insert("time_limit".into(), serde_json::Value::Null),
         };
     }
+    // Map JSON null to Lua nil (not the null userdata sentinel) so a script can
+    // check unset fields naturally, e.g. `if job_desc.time_limit == nil`.
+    let ser_opts = mlua::serde::SerializeOptions::new()
+        .serialize_none_to_null(false)
+        .serialize_unit_to_null(false);
     let job_desc = lua
-        .to_value(&spec_value)
+        .to_value_with(&spec_value, ser_opts)
         .map_err(|e| lua_err("expose job spec to lua", e))?;
 
     let rejection: std::rc::Rc<std::cell::RefCell<Option<String>>> = Default::default();
@@ -1235,6 +1240,24 @@ mod tests {
             matches!(out, SubmitHookOutcome::Accept),
             "non-whitelisted edits must not register as a modify"
         );
+    }
+
+    // An unset spec field must read as Lua nil (not a null userdata), so a
+    // script can test `if job_desc.time_limit == nil` without a type error.
+    #[test]
+    fn lua_unset_field_reads_as_nil() {
+        let lua = make_lua(
+            "function slurm_job_submit(j,u)\n  if j.time_limit == nil then j.comment = 'was-nil' end\n  return slurm.SUCCESS\nend",
+        );
+        let out = run_submit_hook_lua(
+            lua.to_str().unwrap(),
+            &lua_ctx(r#"{"partition":"gpu","time_limit":null}"#),
+        )
+        .unwrap();
+        match out {
+            SubmitHookOutcome::Modify(c) => assert_eq!(c.comment.as_deref(), Some("was-nil")),
+            other => panic!("expected modify, got {other:?}"),
+        }
     }
 
     #[test]
