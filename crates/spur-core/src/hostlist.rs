@@ -24,6 +24,7 @@ pub fn expand(pattern: &str) -> Result<Vec<String>, HostlistError> {
     for part in split_top_level(pattern) {
         expand_single(part.trim(), &mut results)?;
     }
+    results.retain(|s| !s.is_empty());
     Ok(results)
 }
 
@@ -258,5 +259,75 @@ mod tests {
         let compressed = compress(&expanded);
         let re_expanded = expand(&compressed).unwrap();
         assert_eq!(expanded, re_expanded);
+    }
+
+    #[test]
+    fn test_long_comma_separated_list() {
+        let hosts = expand(
+            "crsuse2-m2m-052,crsuse2-m2m-331,crsuse2-m2m-301,crsuse2-m2m-199,crsuse2-m2m-251",
+        )
+        .unwrap();
+        assert_eq!(
+            hosts,
+            vec![
+                "crsuse2-m2m-052",
+                "crsuse2-m2m-331",
+                "crsuse2-m2m-301",
+                "crsuse2-m2m-199",
+                "crsuse2-m2m-251",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_mixed_range_and_plain() {
+        let hosts = expand("gpu[1-2],login01,cpu[01-03]").unwrap();
+        assert_eq!(
+            hosts,
+            vec!["gpu1", "gpu2", "login01", "cpu01", "cpu02", "cpu03"]
+        );
+    }
+
+    #[test]
+    fn test_single_element_range() {
+        let hosts = expand("node[5]").unwrap();
+        assert_eq!(hosts, vec!["node5"]);
+    }
+
+    #[test]
+    fn test_unmatched_bracket() {
+        assert!(expand("node[1-3").is_err());
+    }
+
+    #[test]
+    fn test_reversed_range() {
+        assert!(expand("node[5-3]").is_err());
+    }
+
+    #[test]
+    fn test_empty_string() {
+        let hosts = expand("").unwrap();
+        assert!(hosts.is_empty());
+    }
+
+    #[test]
+    fn test_trailing_comma() {
+        let hosts = expand("node1,node2,").unwrap();
+        assert_eq!(hosts, vec!["node1", "node2"]);
+    }
+
+    #[test]
+    fn test_leading_and_doubled_commas() {
+        let hosts = expand(",node1,,node2").unwrap();
+        assert_eq!(hosts, vec!["node1", "node2"]);
+    }
+
+    #[test]
+    fn test_suffix_after_bracket() {
+        let hosts = expand("rack[1-2]-node[1-2]").unwrap();
+        assert_eq!(
+            hosts,
+            vec!["rack1-node1", "rack1-node2", "rack2-node1", "rack2-node2"]
+        );
     }
 }

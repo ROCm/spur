@@ -12,6 +12,25 @@ import time
 from cluster import parse_job_id, job_state, wait_job
 
 
+def _wait_node_state(cluster, node_name, target_states, timeout=60):
+    """Poll sinfo until a node reaches one of the target states."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            out = cluster.sinfo()
+            for line in out.splitlines():
+                if node_name in line:
+                    for state in target_states:
+                        if state in line:
+                            return state
+        except Exception:
+            pass
+        time.sleep(2)
+    raise TimeoutError(
+        f"Node {node_name} did not reach {target_states} within {timeout}s"
+    )
+
+
 class TestMultiNodeDispatch:
     def test_two_node_job_completes(self, multi_node_cluster):
         cluster = multi_node_cluster
@@ -158,3 +177,22 @@ class TestMultiNodeScheduling:
         c2 = cluster.read_output_on_any_node(out2)
         assert "CONCURRENT_DONE" in c1, f"job1 missing CONCURRENT_DONE:\n{c1}"
         assert "CONCURRENT_DONE" in c2, f"job2 missing CONCURRENT_DONE:\n{c2}"
+
+
+class TestMultiNodeStateUpdate:
+    def test_scontrol_update_drains_multiple_nodes(self, multi_node_cluster):
+        cluster = multi_node_cluster
+        n0, n1 = cluster.node_names[0], cluster.node_names[1]
+        hostlist = f"{n0},{n1}"
+
+        cluster.scontrol("update", f"NodeName={hostlist}",
+                         "State=DRAIN", "Reason=e2e-multi")
+
+        for name in [n0, n1]:
+            _wait_node_state(cluster, name, ["drain"])
+
+        cluster.scontrol("update", f"NodeName={hostlist}",
+                         "State=RESUME")
+
+        for name in [n0, n1]:
+            _wait_node_state(cluster, name, ["idle"])

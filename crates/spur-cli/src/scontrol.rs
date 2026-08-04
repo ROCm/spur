@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use crate::exit_fmt::{format_exit, render_reason};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 
 /// Administrative control commands.
 #[derive(Parser, Debug)]
@@ -632,8 +633,31 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
     }
 
     // Node update takes priority if NodeName is specified
-    if let Some(name) = node_name {
-        return update_node(controller, &name, node_state.as_deref(), node_reason).await;
+    if let Some(node_pattern) = node_name {
+        let proto_state = node_state.as_deref().map(parse_node_state).transpose()?;
+
+        let channel = spur_client::connect_channel(controller)
+            .await
+            .context("failed to connect to spurctld")?;
+        let mut client = spur_proto::controller_client(channel);
+
+        let names = resolve_node_names(&mut client, &node_pattern).await?;
+        let mut failed: Vec<String> = Vec::new();
+        for name in &names {
+            if let Err(e) = update_node(&mut client, name, proto_state, node_reason.clone()).await {
+                eprintln!("error: {name}: {e}");
+                failed.push(name.clone());
+            }
+        }
+        if !failed.is_empty() {
+            bail!(
+                "failed on {} of {} node(s): {}",
+                failed.len(),
+                names.len(),
+                failed.join(", ")
+            );
+        }
+        return Ok(());
     }
 
     let jid =
@@ -662,35 +686,60 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
     .await
 }
 
+/// Resolve a node name pattern to a list of individual node names.
+///
+/// Supports Slurm-compatible hostlist expressions (`node[1-3]`),
+/// comma-separated lists (`node1,node2`), and the `ALL` keyword.
+async fn resolve_node_names(
+    client: &mut SlurmControllerClient<tonic::transport::Channel>,
+    pattern: &str,
+) -> Result<Vec<String>> {
+    if pattern.eq_ignore_ascii_case("ALL") {
+        let resp = client
+            .get_nodes(spur_proto::proto::GetNodesRequest {
+                nodelist: String::new(),
+                ..Default::default()
+            })
+            .await
+            .context("failed to get nodes")?;
+        let names: Vec<String> = resp
+            .into_inner()
+            .nodes
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        if names.is_empty() {
+            bail!("no nodes registered in the cluster");
+        }
+        return Ok(names);
+    }
+    spur_core::hostlist::expand(pattern).context("invalid node name pattern")
+}
+
+/// Parse a Slurm node state name into its proto representation.
+fn parse_node_state(state: &str) -> Result<i32> {
+    match state.to_lowercase().as_str() {
+        "idle" | "resume" => Ok(spur_proto::proto::NodeState::NodeIdle as i32),
+        "drain" => Ok(spur_proto::proto::NodeState::NodeDrain as i32),
+        "down" => Ok(spur_proto::proto::NodeState::NodeDown as i32),
+        _ => bail!(
+            "scontrol: unknown node state '{}'. Valid states: IDLE, RESUME, DRAIN, DOWN",
+            state
+        ),
+    }
+}
+
 /// Update a node's state via the controller.
 async fn update_node(
-    controller: &str,
+    client: &mut SlurmControllerClient<tonic::transport::Channel>,
     name: &str,
-    state: Option<&str>,
+    state: Option<i32>,
     reason: Option<String>,
 ) -> Result<()> {
-    let channel = spur_client::connect_channel(controller)
-        .await
-        .context("failed to connect to spurctld")?;
-    let mut client = spur_proto::controller_client(channel);
-
-    let proto_state = state.map(|s| match s.to_lowercase().as_str() {
-        "idle" | "resume" => spur_proto::proto::NodeState::NodeIdle as i32,
-        "drain" => spur_proto::proto::NodeState::NodeDrain as i32,
-        "down" => spur_proto::proto::NodeState::NodeDown as i32,
-        other => {
-            eprintln!(
-                "scontrol: unknown node state '{}', defaulting to idle",
-                other
-            );
-            spur_proto::proto::NodeState::NodeIdle as i32
-        }
-    });
-
     client
         .update_node(spur_proto::proto::UpdateNodeRequest {
             name: name.to_string(),
-            state: proto_state,
+            state,
             reason,
             labels: HashMap::new(),
             remove_labels: Vec::new(),
@@ -807,5 +856,100 @@ mod tests {
     fn gpu_tres_label_total() {
         assert_eq!(gpu_tres_label("gpu:8"), "TresPerJob");
         assert_eq!(gpu_tres_label("gpu:mi300x:4"), "TresPerJob");
+    }
+
+    #[test]
+    fn parse_node_state_known_states() {
+        let idle = spur_proto::proto::NodeState::NodeIdle as i32;
+        assert_eq!(parse_node_state("idle").unwrap(), idle);
+        assert_eq!(parse_node_state("resume").unwrap(), idle);
+        assert_eq!(
+            parse_node_state("drain").unwrap(),
+            spur_proto::proto::NodeState::NodeDrain as i32
+        );
+        assert_eq!(
+            parse_node_state("down").unwrap(),
+            spur_proto::proto::NodeState::NodeDown as i32
+        );
+    }
+
+    #[test]
+    fn parse_node_state_is_case_insensitive() {
+        let drain = spur_proto::proto::NodeState::NodeDrain as i32;
+        assert_eq!(parse_node_state("DRAIN").unwrap(), drain);
+        assert_eq!(parse_node_state("Drain").unwrap(), drain);
+    }
+
+    #[test]
+    fn parse_node_state_rejects_unknown() {
+        let err = parse_node_state("DRAIM").unwrap_err().to_string();
+        assert!(err.contains("DRAIM"), "error should echo the input: {err}");
+        assert!(
+            err.contains("DRAIN"),
+            "error should list valid states: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_node_state_rejects_empty() {
+        assert!(parse_node_state("").is_err());
+    }
+
+    #[tokio::test]
+    async fn scontrol_update_expands_hostlist() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        main_with_args(vec![
+            "scontrol".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "update".into(),
+            "NodeName=n[1-3]".into(),
+            "State=DRAIN".into(),
+            "Reason=test".into(),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(capture.update_node_names(), vec!["n1", "n2", "n3"]);
+    }
+
+    #[tokio::test]
+    async fn scontrol_update_best_effort_continues_on_failure() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_update_node_fail_names(["n2".to_string()].into());
+        let err = main_with_args(vec![
+            "scontrol".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "update".into(),
+            "NodeName=n[1-3]".into(),
+            "State=DRAIN".into(),
+        ])
+        .await
+        .unwrap_err();
+
+        let names = capture.update_node_names();
+        assert_eq!(names, vec!["n1", "n2", "n3"]);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("n2"),
+            "error should mention failed node: {msg}"
+        );
+        assert!(msg.contains("1 of 3"), "error should report counts: {msg}");
+    }
+
+    #[tokio::test]
+    async fn scontrol_update_invalid_state_sends_no_rpcs() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let result = main_with_args(vec![
+            "scontrol".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "update".into(),
+            "NodeName=n[1-3]".into(),
+            "State=BOGUS".into(),
+        ])
+        .await;
+        assert!(result.is_err());
+        assert!(capture.update_node_names().is_empty());
     }
 }
