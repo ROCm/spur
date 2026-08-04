@@ -726,6 +726,7 @@ async fn dispatch_step(
             pty: false,
             winsize: None,
             node: String::new(),
+            user: crate::interactive::current_user(),
         })
         .await
         .context("failed to create job step")?
@@ -1007,6 +1008,7 @@ async fn try_stream_output(
         .stream_job_output(StreamJobOutputRequest {
             job_id,
             stream: "stdout".into(),
+            user: crate::interactive::current_user(),
         })
         .await
     {
@@ -1219,6 +1221,7 @@ async fn run_interactive_pty(
                     pty: true,
                     winsize: Some(winsize),
                     node: node.clone(),
+                    user: crate::interactive::current_user(),
                 })
                 .await
             {

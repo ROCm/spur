@@ -18,6 +18,13 @@ pub async fn connect_agent(addr: &str) -> Result<SlurmAgentClient<tonic::transpo
         .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE))
 }
 
+/// Local username sent with exec/attach requests so the server can enforce job
+/// ownership. The fallback is deliberately not a legal UNIX username, so a
+/// lookup failure cannot collide with a real account and grant access.
+pub fn current_user() -> String {
+    whoami::username().unwrap_or_else(|_| "<lookup-failed>".into())
+}
+
 pub fn get_terminal_size() -> spur_proto::proto::WindowSize {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     spur_proto::proto::WindowSize {
@@ -54,6 +61,7 @@ pub async fn open_interactive_session(
             winsize: Some(winsize),
             argv,
             env: HashMap::new(),
+            user: current_user(),
         })),
     };
 

@@ -13,7 +13,6 @@ use tracing::{debug, info, warn};
 
 use spur_core::account_limits::{check_account_limits, AccountCheckResult};
 use spur_core::accounting::{Qos, TresRecord, TresType};
-use spur_core::auth::AuthError;
 use spur_core::burst_buffer::BbStageState;
 use spur_core::config::SlurmConfig;
 use spur_core::job::{
@@ -648,17 +647,9 @@ impl ClusterManager {
     }
 
     /// Check that `user` is allowed to perform `action` on a job owned by `owner`.
-    /// Empty user (internal/daemon calls) and root are always allowed.
+    /// Delegates to [`spur_core::auth::check_job_owner`]; see there for the bypass rules.
     fn check_job_owner(user: &str, owner: &str, action: &str) -> anyhow::Result<()> {
-        if user.is_empty() || user == "root" || user == owner {
-            return Ok(());
-        }
-        Err(AuthError::NotJobOwner {
-            user: user.into(),
-            owner: owner.into(),
-            action: action.into(),
-        }
-        .into())
+        spur_core::auth::check_job_owner(user, owner, action).map_err(Into::into)
     }
 
     /// Cancel a job. The requesting `user` must be the job owner, root, or

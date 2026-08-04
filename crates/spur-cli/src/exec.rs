@@ -46,6 +46,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .exec_in_job(ExecInJobRequest {
             job_id: args.job_id,
             command: args.command.clone(),
+            user: crate::interactive::current_user(),
         })
         .await
         .context("exec failed")?;
