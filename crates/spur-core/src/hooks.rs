@@ -524,7 +524,44 @@ fn lua_table_to_changes(
         }
         map.insert((*key).to_string(), json);
     }
+    let ignored = ignored_lua_fields(lua, job_desc, original)?;
+    if !ignored.is_empty() {
+        warn!(
+            target: "audit",
+            hook = "job_submit_lua",
+            ignored = ?ignored,
+            whitelist = ?SUBMIT_HOOK_WHITELIST,
+            "job_submit lua hook set non-whitelisted fields; ignoring them"
+        );
+    }
     changes_from_map(&map)
+}
+
+/// Non-whitelisted `job_desc` keys the script added or changed vs its input
+/// (which also lives in `job_desc`), so only script-set keys are surfaced.
+fn ignored_lua_fields(
+    lua: &mlua::Lua,
+    job_desc: &mlua::Table,
+    original: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> anyhow::Result<Vec<String>> {
+    use mlua::LuaSerdeExt;
+    let mut ignored = Vec::new();
+    for pair in job_desc.pairs::<String, mlua::Value>() {
+        let (key, value) = pair.map_err(|e| lua_err("iterate lua job_desc", e))?;
+        // `time_limit` is the Lua name of the whitelisted `time_limit_minutes`.
+        if SUBMIT_HOOK_WHITELIST.contains(&key.as_str()) || key == "time_limit" {
+            continue;
+        }
+        let json: serde_json::Value = lua.from_value(value).unwrap_or(serde_json::Value::Null);
+        let unchanged = original
+            .and_then(|o| o.get(&key))
+            .is_some_and(|o| o == &json);
+        if !unchanged {
+            ignored.push(key);
+        }
+    }
+    ignored.sort();
+    Ok(ignored)
 }
 
 /// Apply whitelisted hook changes onto the spec, returning the names of the
@@ -1240,6 +1277,21 @@ mod tests {
             matches!(out, SubmitHookOutcome::Accept),
             "non-whitelisted edits must not register as a modify"
         );
+    }
+
+    // Only script-added/changed non-whitelisted keys are flagged; an unchanged
+    // input field (name) and a whitelisted one (qos) are not.
+    #[test]
+    fn lua_ignored_fields_detects_only_script_edits() {
+        let lua = mlua::Lua::new();
+        let job_desc = lua.create_table().unwrap();
+        job_desc.set("name", "job1").unwrap(); // unchanged input, non-whitelisted
+        job_desc.set("qos", "high").unwrap(); // whitelisted
+        job_desc.set("uid", 0).unwrap(); // changed input, non-whitelisted
+        job_desc.set("evil", "x").unwrap(); // added, non-whitelisted
+        let original = serde_json::json!({"name": "job1", "uid": 1000});
+        let ignored = ignored_lua_fields(&lua, &job_desc, original.as_object()).unwrap();
+        assert_eq!(ignored, vec!["evil".to_string(), "uid".to_string()]);
     }
 
     // An unset spec field must read as Lua nil (not a null userdata), so a
