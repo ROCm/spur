@@ -112,6 +112,18 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup/spur";
 /// never hit an NFS root_squash mount. Mirrors Slurm's SlurmdSpoolDir.
 const SPOOL_ROOT: &str = "/var/spool/spur";
 
+/// Candidate spool bases, highest priority first. The user-controlled temp
+/// fallback is only used when spurd is NOT root — root must never scan or write
+/// a world-reachable base (a user could plant a manifest there and have root
+/// trust it verbatim on restart).
+fn spool_bases() -> Vec<PathBuf> {
+    let mut bases = vec![PathBuf::from(SPOOL_ROOT)];
+    if !nix::unistd::geteuid().is_root() {
+        bases.push(std::env::temp_dir().join("spur"));
+    }
+    bases
+}
+
 pub struct ContainerLaunchConfig {
     pub config: ContainerConfig,
     pub rootfs: PathBuf,
@@ -134,6 +146,9 @@ pub enum LaunchIo {
 
 pub struct JobLaunchConfig {
     pub job_id: JobId,
+    /// Disambiguates the cgroup path across a same-node redispatch of the
+    /// same job_id, so displacing an old run can never SIGKILL the new one.
+    pub run_attempt: u32,
     pub script: String,
     pub work_dir: String,
     /// Needed to expand `%x`/`%u`/`%N`/`%a`/`%A` in output paths as the controller does.
@@ -173,6 +188,7 @@ pub struct LaunchResult {
     pub stderr_path: String,
     /// Master fd of the PTY (only set when `io_mode == LaunchIo::Pty`).
     pub pty_master: Option<OwnedFd>,
+    pub spool_dir: PathBuf,
 }
 
 /// Owns the resolved fds for a job's stdio, built once and consumed by both
@@ -310,6 +326,15 @@ pub enum RunningJob {
     },
     /// Allocation registered without a batch process (standalone srun).
     AllocationOnly,
+    /// A job re-adopted from a manifest after spurd restarted; the new process
+    /// isn't spurd's child, so completion is detected via cgroup population
+    /// rather than waitpid. See `reconcile_running_jobs`.
+    Resumed {
+        pid: i32,
+        start_time: u64,
+        cgroup_path: Option<PathBuf>,
+        exit_status_path: PathBuf,
+    },
 }
 
 /// Split a finished process's wait status into (exit_code, signal).
@@ -364,6 +389,18 @@ impl RunningJob {
         match self {
             RunningJob::Managed { child, .. } => child.id(),
             RunningJob::Forked { pid, .. } => Some(*pid as u32),
+            RunningJob::Resumed { pid, .. } => Some(*pid as u32),
+            RunningJob::AllocationOnly => None,
+        }
+    }
+
+    /// Non-consuming peek at the cgroup path, for recording it in a job
+    /// manifest without disturbing `take_cgroup`'s completion-time handoff.
+    pub fn cgroup_path(&self) -> Option<&Path> {
+        match self {
+            RunningJob::Managed { cgroup_path, .. } => cgroup_path.as_deref(),
+            RunningJob::Forked { cgroup_path, .. } => cgroup_path.as_deref(),
+            RunningJob::Resumed { cgroup_path, .. } => cgroup_path.as_deref(),
             RunningJob::AllocationOnly => None,
         }
     }
@@ -404,6 +441,36 @@ impl RunningJob {
                     Err(e) => Err(e.into()),
                 }
             }
+            RunningJob::Resumed {
+                pid,
+                start_time,
+                cgroup_path,
+                exit_status_path,
+            } => {
+                // A populated cgroup is authoritative proof the job is alive; an
+                // empty one, proof it exited. But an unreadable cgroup.events
+                // (non-v2 host, or the process was never moved in) is NOT proof
+                // of exit — falling straight to "done" there would report every
+                // adopted job complete on the first post-restart tick and release
+                // its GPUs while the real workload keeps running. Fall back to a
+                // direct pid liveness check in that case.
+                let done = match cgroup_path {
+                    Some(cg) => match cgroup_liveness(cg) {
+                        CgroupLiveness::Populated => false,
+                        CgroupLiveness::Empty => true,
+                        CgroupLiveness::Unknown => !proc_alive(*pid, *start_time),
+                    },
+                    None => !proc_alive(*pid, *start_time),
+                };
+                if !done {
+                    return Ok(None);
+                }
+                Ok(Some(
+                    read_exit_status(exit_status_path)
+                        .map(decode_shell_exit)
+                        .unwrap_or((-1, 0)),
+                ))
+            }
             RunningJob::AllocationOnly => Ok(None),
         }
     }
@@ -432,6 +499,15 @@ impl RunningJob {
                 kill_process_tree(*pid, sig);
                 Ok(())
             }
+            RunningJob::Resumed {
+                pid, cgroup_path, ..
+            } => {
+                match cgroup_path {
+                    Some(cg) => cgroup_signal_all(cg, sig),
+                    None => kill_process_tree(*pid, sig),
+                }
+                Ok(())
+            }
             RunningJob::AllocationOnly => Ok(()),
         }
     }
@@ -440,9 +516,370 @@ impl RunningJob {
         match self {
             RunningJob::Managed { cgroup_path, .. } => cgroup_path.take(),
             RunningJob::Forked { cgroup_path, .. } => cgroup_path.take(),
+            RunningJob::Resumed { cgroup_path, .. } => cgroup_path.take(),
             RunningJob::AllocationOnly => None,
         }
     }
+}
+
+const MANIFEST_SCHEMA_VERSION: u32 = 1;
+
+/// What the agent still owes a job whose process has ended. Persisted in the
+/// manifest and cleared step by step as each obligation is discharged, so a
+/// restart that interrupts teardown (e.g. a completion report that never
+/// reached the controller) resumes from where it left off instead of re-running
+/// an already-done, possibly non-idempotent step like the epilog. Absent the
+/// ledger, a retried teardown would run the epilog (GPU reset, scratch purge,
+/// SPANK JobEpilog) twice.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct PendingObligations {
+    /// Run the epilog + SPANK TaskExit/JobEpilog hooks (and drain on failure).
+    #[serde(default = "default_true")]
+    pub epilog: bool,
+    /// Report the completion to the controller.
+    #[serde(default = "default_true")]
+    pub report_completion: bool,
+    /// Set when the epilog failed, so the still-owed completion report carries a
+    /// drain request even if it lands on a later restart (the epilog itself is
+    /// no longer owed by then, so the drain intent must be remembered here).
+    #[serde(default)]
+    pub drain: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for PendingObligations {
+    fn default() -> Self {
+        Self {
+            epilog: true,
+            report_completion: true,
+            drain: false,
+        }
+    }
+}
+
+impl PendingObligations {
+    /// True once nothing is owed, so the job's spool/manifest can be removed.
+    pub fn all_discharged(&self) -> bool {
+        !self.epilog && !self.report_completion
+    }
+}
+
+/// The record spurd re-adopts a job from after a restart. Split into two
+/// concerns: **identity** — how to find the process and confirm it's still the
+/// same one — and **obligations** — what the agent still owes the job once its
+/// process ends (resource release, epilog, completion report). Structuring the
+/// record around "what must still happen" rather than only "what the process
+/// looks like" keeps the restart teardown honest: every obligation has an
+/// explicit home in the schema instead of being re-derived by the reconcile
+/// code, which is where obligations were silently dropped before.
+///
+/// Written right after a successful spawn so a graceful restart doesn't lose
+/// track of (or double-book resources for) a job that's still running, then
+/// rewritten as obligations are discharged during teardown.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct JobManifest {
+    pub schema_version: u32,
+    pub job_id: JobId,
+    pub run_attempt: u32,
+
+    // --- Identity: locate and verify the process on restart. ---
+    pub pid: i32,
+    pub start_time: u64,
+    pub cgroup_path: Option<PathBuf>,
+    pub forked: bool,
+    /// Host path to the job's exit-status sentinel (inside rootfs for containers).
+    #[serde(default)]
+    pub exit_status_path: Option<String>,
+    pub rootfs_mode: crate::container::RootfsMode,
+
+    // --- Obligations: what the agent still owes this job. ---
+    /// Remaining teardown steps; each cleared as it is discharged.
+    #[serde(default)]
+    pub pending: PendingObligations,
+    /// The resolved (exit_code, signal), recorded once the process is first seen
+    /// dead. A container's exit sentinel lives in the job rootfs, which is torn
+    /// down as soon as the job is adopted dead, so the outcome must be captured
+    /// here for a report that only lands on a later restart to still be accurate.
+    #[serde(default)]
+    pub exit: Option<(i32, i32)>,
+    /// Resources held by the job, released back to the node on teardown.
+    pub cpu_ids: Vec<u32>,
+    pub gpu_devices: Vec<u32>,
+    pub cpus: u32,
+    pub memory_mb: u64,
+    /// Context the epilog + completion report need.
+    pub uid: u32,
+    pub gid: u32,
+    /// Owning username, restored on re-adopt so exec/attach access gating still
+    /// recognizes the owner of a job that survived a restart.
+    #[serde(default)]
+    pub user: String,
+    pub stdout_path: String,
+    pub stderr_path: String,
+    pub work_dir: String,
+    pub partition: String,
+    pub nodelist: String,
+    pub mpi: String,
+}
+
+fn manifest_path(spool_dir: &Path) -> PathBuf {
+    spool_dir.join("manifest.json")
+}
+
+pub(crate) fn exit_status_path(spool_dir: &Path) -> PathBuf {
+    spool_dir.join("exit_status")
+}
+
+/// Write a job's manifest. Best-effort: a failure here just means the job
+/// won't survive a spurd restart, same as not having this feature. Written via
+/// a temp file + rename so a crash mid-write can't leave a torn manifest.
+///
+/// Mode 0600: the manifest carries the job's uid/gid/cgroup/resource ids, and a
+/// co-located user could open it by its predictable path in the traversable spool dir.
+pub fn write_job_manifest(spool_dir: &Path, manifest: &JobManifest) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = manifest_path(spool_dir);
+    let tmp = path.with_extension("json.tmp");
+    let bytes = match serde_json::to_vec(manifest) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(job_id = manifest.job_id, error = %e, "failed to serialize job manifest");
+            return;
+        }
+    };
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &path)
+    };
+    if let Err(e) = write() {
+        warn!(job_id = manifest.job_id, error = %e, "failed to write job manifest");
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// `/proc/<pid>/stat` field 22 (starttime) — disambiguates a live process
+/// from a different one that has since reused the same pid.
+pub fn proc_start_time(pid: i32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm (field 2) is parenthesized and may itself contain ')'; split on
+    // the last one so the fixed-width fields after it parse safely.
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+fn proc_alive(pid: i32, start_time: u64) -> bool {
+    proc_start_time(pid) == Some(start_time)
+}
+
+/// Liveness verdict from a cgroup's `cgroup.events`.
+#[derive(Debug, PartialEq, Eq)]
+enum CgroupLiveness {
+    /// `populated 1`: at least one process is still in the cgroup.
+    Populated,
+    /// `populated 0`: the cgroup exists but is empty — everything has exited.
+    Empty,
+    /// `cgroup.events` is missing or unreadable. On cgroup-v2 this means the dir
+    /// was already removed (empty); but a non-v2/hybrid host, or a job never
+    /// moved into the cgroup, also lands here — so it is NOT proof of exit and
+    /// the caller must fall back to a direct pid liveness check.
+    Unknown,
+}
+
+/// Read a cgroup-v2 `cgroup.events` to decide whether it still holds processes.
+fn cgroup_liveness(cgroup_path: &Path) -> CgroupLiveness {
+    let Ok(events) = std::fs::read_to_string(cgroup_path.join("cgroup.events")) else {
+        return CgroupLiveness::Unknown;
+    };
+    if events.lines().any(|line| line.trim() == "populated 1") {
+        CgroupLiveness::Populated
+    } else {
+        CgroupLiveness::Empty
+    }
+}
+
+/// Signal every process in a cgroup, regardless of whether spurd is their
+/// parent. SIGKILL uses the atomic `cgroup.kill` (5.14+) when available;
+/// other signals, and older kernels, signal each `cgroup.procs` pid directly.
+fn cgroup_signal_all(cgroup_path: &Path, sig: Signal) {
+    if sig == Signal::SIGKILL && std::fs::write(cgroup_path.join("cgroup.kill"), "1").is_ok() {
+        return;
+    }
+    if let Ok(pids) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) {
+        for pid_str in pids.lines() {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                let _ = signal::kill(Pid::from_raw(pid), sig);
+            }
+        }
+    }
+}
+
+/// Decode a shell `$?` value the way `decode_wait_status` decodes a real wait
+/// status: 128+N means death by signal N.
+fn decode_shell_exit(raw: i32) -> (i32, i32) {
+    if (129..=192).contains(&raw) {
+        (0, raw - 128)
+    } else {
+        (raw, 0)
+    }
+}
+
+fn read_exit_status(path: &Path) -> Option<i32> {
+    // The container sentinel lives in a job-writable rootfs, so it is fully
+    // untrusted input on the restart path. O_NONBLOCK means opening a planted
+    // FIFO can't block spurd startup forever (a blocking open of a writer-less
+    // FIFO never returns); O_NOFOLLOW refuses a symlink; the regular-file +
+    // single-link fstat check refuses a FIFO/device/hardlink; and the capped
+    // read refuses an arbitrarily large file.
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let meta = f.metadata().ok()?;
+    if !meta.file_type().is_file() || meta.nlink() != 1 {
+        return None;
+    }
+    let mut buf = String::new();
+    f.take(64).read_to_string(&mut buf).ok()?;
+    buf.trim().parse().ok()
+}
+
+/// Wrap a job script so its exit code survives even if spurd isn't around to
+/// `wait()` it. A top-level `trap ... EXIT` fires on any exit — normal end,
+/// internal `exit N`, or an uncaught error under `set -e` — and re-exits with
+/// the same code so the wrapper's own exit status (what the normal,
+/// non-restarted path reports via `Child::try_wait`) is unchanged. Read back by
+/// `decode_shell_exit` on resume.
+///
+/// The trap is prepended rather than wrapping the body in a subshell: bash
+/// parses (and runs) a plain script incrementally, so a syntax error deep in the
+/// script still runs the lines above it, exactly as an unwrapped job would. A
+/// subshell (or brace group) is one compound command that must parse in full
+/// before any of it runs, which would change failure semantics for every job on
+/// the universal launch path to buy an exit code only on the rare restart path.
+pub(crate) fn wrap_with_exit_sentinel(script: &str, exit_status_path: &Path) -> String {
+    format!(
+        "trap '_spur_rc=$?; echo $_spur_rc > {}; exit $_spur_rc' EXIT\n{}\n",
+        exit_status_path.display(),
+        script,
+    )
+}
+
+/// Outcome of checking one manifest found on startup.
+pub enum ReconcileOutcome {
+    Alive {
+        job: RunningJob,
+        manifest: JobManifest,
+    },
+    /// The process is gone; the controller must not be left waiting forever
+    /// for a completion report that will never come. The manifest carries the
+    /// resolved exit (in `manifest.exit`) and the still-owed obligations.
+    Dead { manifest: JobManifest },
+}
+
+/// Find every job manifest left behind by a previous spurd process.
+pub fn scan_job_manifests() -> Vec<(PathBuf, JobManifest)> {
+    let mut found = Vec::new();
+    for base in spool_bases() {
+        let Ok(entries) = std::fs::read_dir(&base) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let spool_dir = entry.path();
+            let Ok(bytes) = std::fs::read(manifest_path(&spool_dir)) else {
+                continue;
+            };
+            match serde_json::from_slice::<JobManifest>(&bytes) {
+                Ok(manifest) if manifest.schema_version == MANIFEST_SCHEMA_VERSION => {
+                    found.push((spool_dir, manifest));
+                }
+                Ok(manifest) => warn!(
+                    job_id = manifest.job_id,
+                    version = manifest.schema_version,
+                    "skipping job manifest with unknown schema version"
+                ),
+                Err(e) => warn!(dir = %spool_dir.display(), error = %e, "unreadable job manifest"),
+            }
+        }
+    }
+    dedup_manifests_by_job_id(found)
+}
+
+/// A job_id should only ever have one manifest (whichever `SPOOL_ROOT`/tmp
+/// base `create_job_spool_dir` used), but a stale leftover in the other base
+/// (e.g. from a run under a different privilege level) would otherwise make
+/// `reconcile_running_jobs` double-restore its allocation. Keep only the
+/// highest run_attempt per job_id.
+fn dedup_manifests_by_job_id(found: Vec<(PathBuf, JobManifest)>) -> Vec<(PathBuf, JobManifest)> {
+    let mut by_job: HashMap<JobId, (PathBuf, JobManifest)> = HashMap::new();
+    for (dir, manifest) in found {
+        match by_job.get(&manifest.job_id) {
+            Some((_, existing)) if existing.run_attempt >= manifest.run_attempt => {
+                warn!(
+                    job_id = manifest.job_id,
+                    dir = %dir.display(),
+                    "ignoring duplicate/stale job manifest"
+                );
+            }
+            _ => {
+                by_job.insert(manifest.job_id, (dir, manifest));
+            }
+        }
+    }
+    by_job.into_values().collect()
+}
+
+/// Decide whether a manifested job's process survived the restart.
+pub fn reconcile_manifest(spool_dir: &Path, mut manifest: JobManifest) -> ReconcileOutcome {
+    let sentinel = manifest
+        .exit_status_path
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| exit_status_path(spool_dir));
+    if proc_alive(manifest.pid, manifest.start_time) {
+        let job = RunningJob::Resumed {
+            pid: manifest.pid,
+            start_time: manifest.start_time,
+            cgroup_path: manifest.cgroup_path.clone(),
+            exit_status_path: sentinel,
+        };
+        return ReconcileOutcome::Alive { job, manifest };
+    }
+    // Resolve the exit only the first time the job is seen dead. On a retry
+    // after a partial teardown the sentinel/cgroup may already be gone, so trust
+    // the exit recorded in the manifest instead of re-reading and getting -1.
+    if manifest.exit.is_none() {
+        let (exit_code, mut signal) = read_exit_status(&sentinel)
+            .map(decode_shell_exit)
+            .unwrap_or((-1, 0));
+        // An OOM kill while spurd was down writes no sentinel; recover it from
+        // the cgroup so the outcome isn't a bare -1, matching the live monitor.
+        if let Some(ref cgroup) = manifest.cgroup_path {
+            if cgroup_oom_killed(cgroup) {
+                signal |= spur_core::job::OOM_SIGNAL_FLAG;
+            }
+        }
+        manifest.exit = Some((exit_code, signal));
+    }
+    ReconcileOutcome::Dead { manifest }
 }
 
 /// Launch a job script on this node.
@@ -483,6 +920,7 @@ async fn spawn_job_process(
 ) -> Result<LaunchResult, LaunchError> {
     let JobLaunchConfig {
         job_id,
+        run_attempt,
         ref script,
         ref work_dir,
         ref environment,
@@ -502,7 +940,7 @@ async fn spawn_job_process(
     info!(job_id, work_dir, "launching job");
 
     // Set up cgroup for isolation
-    let cgroup_path = setup_cgroup(job_id, cpus, memory_mb, cpu_ids)?;
+    let cgroup_path = setup_cgroup(job_id, run_attempt, cpus, memory_mb, cpu_ids)?;
 
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
     // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
@@ -532,10 +970,16 @@ async fn spawn_job_process(
 
     // Script + wrapper live in the node-local spool dir, not work_dir (see
     // SPOOL_ROOT), so root-side writes survive NFS root_squash work_dirs.
-    let spool_dir = create_job_spool_dir(job_id, uid, gid)?;
+    let spool_dir = create_job_spool_dir(job_id, run_attempt, uid, gid)?;
     let script_path = spool_dir.join("spur_job.sh");
-    write_job_scratch(&script_path, script, uid, gid)
+    let wrapped_script = wrap_with_exit_sentinel(script, &exit_status_path(&spool_dir));
+    write_job_scratch(&script_path, &wrapped_script, uid, gid)
         .context("failed to write job script")
+        .map_err(|e| classify_spool_error(&spool_dir, e))?;
+    // Pre-create the exit-status sentinel owned by the job, so the wrapped
+    // script can truncate-write it without the spool dir being world-writable.
+    write_job_scratch(&exit_status_path(&spool_dir), "", uid, gid)
+        .context("failed to create exit-status sentinel")
         .map_err(|e| classify_spool_error(&spool_dir, e))?;
 
     // Build resolved output paths (empty for PTY mode since output goes to the terminal).
@@ -670,6 +1114,7 @@ async fn spawn_job_process(
             stdout_path: stdout_resolved,
             stderr_path: stderr_resolved,
             pty_master,
+            spool_dir,
         });
     }
 
@@ -849,12 +1294,15 @@ async fn spawn_job_process(
     // Drop the slave fd immediately so the master gets EOF when the child exits.
     let pty_master = job_io.into_master();
 
-    // Move process into cgroup
-    if let Some(ref cgroup) = cgroup_path {
-        if let Some(pid) = child.id() {
-            move_to_cgroup(cgroup, pid);
-        }
-    }
+    // Move process into cgroup. If the move fails the process runs outside the
+    // cgroup, so the cgroup can't report its liveness on restart — drop the path
+    // so reconcile falls back to a direct pid check instead of misreading an
+    // empty cgroup as an exited job.
+    let cgroup_path = match (cgroup_path, child.id()) {
+        (Some(cgroup), Some(pid)) if move_to_cgroup(&cgroup, pid) => Some(cgroup),
+        (Some(_), _) => None,
+        (None, _) => None,
+    };
 
     debug!(
         job_id,
@@ -868,18 +1316,46 @@ async fn spawn_job_process(
         stdout_path: stdout_resolved,
         stderr_path: stderr_resolved,
         pty_master,
+        spool_dir,
     })
+}
+
+/// The cgroup path for one job run. Keyed by job_id *and* run_attempt so a
+/// same-node redispatch never shares a cgroup with (and can't accidentally
+/// cgroup-wide-kill) a still-finishing prior run.
+fn cgroup_path_for(job_id: JobId, run_attempt: u32) -> PathBuf {
+    PathBuf::from(CGROUP_ROOT).join(format!("job_{}_{}", job_id, run_attempt))
+}
+
+/// Whether `/sys/fs/cgroup` is a unified cgroup-v2 mount. A v1/hybrid host has a
+/// tmpfs there instead, so a job dir created under it is an ordinary directory
+/// with no `cgroup.events` — which the reconcile path can't tell apart from an
+/// exited job. Detecting this up front lets `setup_cgroup` decline to create a
+/// fake hierarchy and run without cgroup isolation instead.
+fn cgroup_v2_available() -> bool {
+    matches!(
+        nix::sys::statfs::statfs(Path::new("/sys/fs/cgroup")),
+        Ok(s) if s.filesystem_type() == nix::sys::statfs::CGROUP2_SUPER_MAGIC
+    )
 }
 
 /// Set up a cgroups v2 hierarchy for a job.
 fn setup_cgroup(
     job_id: JobId,
+    run_attempt: u32,
     cpus: u32,
     memory_mb: u64,
     cpu_ids: &[u32],
 ) -> anyhow::Result<Option<PathBuf>> {
+    // Without a real cgroup-v2 mount, create_dir_all would make a plain
+    // directory that never gets a cgroup.events file — indistinguishable on
+    // restart from an exited job. Run without isolation rather than lie.
+    if !cgroup_v2_available() {
+        warn!(job_id, "cgroup v2 not available, running without isolation");
+        return Ok(None);
+    }
     let cgroup_root = PathBuf::from(CGROUP_ROOT);
-    let cgroup_path = cgroup_root.join(format!("job_{}", job_id));
+    let cgroup_path = cgroup_path_for(job_id, run_attempt);
 
     // Delegate controllers to children: in cgroup-v2 a child only gets
     // memory.*/cpu.*/pids.* files if the parent lists them in subtree_control;
@@ -1279,23 +1755,24 @@ fn create_dir_as_user(dir: &Path, uid: u32, gid: u32) -> bool {
 
 /// Create a node-local spool directory for a job's scratch files. Prefers
 /// `SPOOL_ROOT`; falls back to a temp dir when it isn't writable (e.g. non-root
-/// dev runs). When spurd is root and the job targets a user, the dir is handed
-/// to that user so the job — which runs as the user — can traverse it.
-fn create_job_spool_dir(job_id: JobId, uid: u32, gid: u32) -> Result<PathBuf, LaunchError> {
+/// dev runs). Kept root-owned and 0o711 so a co-located user can't plant a
+/// symlink over the root-authored manifest, which is trusted on restart. Keyed
+/// by `(job_id, run_attempt)` so a same-node redispatch never reuses a prior
+/// run's dir.
+fn create_job_spool_dir(
+    job_id: JobId,
+    run_attempt: u32,
+    uid: u32,
+    _gid: u32,
+) -> Result<PathBuf, LaunchError> {
     let mut failures = Vec::new();
-    for base in [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")] {
-        let dir = base.join(format!("job{}", job_id));
+    for base in spool_bases() {
+        let dir = base.join(format!("job{}_{}", job_id, run_attempt));
         match std::fs::create_dir_all(&dir) {
             Ok(()) => {
                 if should_run_as_user(uid) {
-                    use nix::unistd::{Gid, Uid};
-                    // Path-based chown is safe here: the spool tree is
-                    // root-owned, not user-controlled, so no symlink TOCTOU.
-                    let _ = nix::unistd::chown(
-                        &dir,
-                        Some(Uid::from_raw(uid)),
-                        Some(Gid::from_raw(gid)),
-                    );
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o711));
                 }
                 return Ok(dir);
             }
@@ -1369,12 +1846,40 @@ pub(crate) fn write_job_scratch(
     Ok(())
 }
 
-/// Remove a job's spool directory (best-effort), mirroring Slurm purging its
-/// batchdir after completion. Tries both candidate roots since the fallback
-/// location isn't recorded.
-pub fn cleanup_job_spool(job_id: JobId) {
-    for base in [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")] {
-        let _ = std::fs::remove_dir_all(base.join(format!("job{}", job_id)));
+/// Remove one run attempt's spool dir. Scoped to `run_attempt` so cleaning a
+/// completed run never deletes a concurrent same-node redispatch's live spool.
+pub fn cleanup_job_spool(job_id: JobId, run_attempt: u32) {
+    let dir = format!("job{}_{}", job_id, run_attempt);
+    for base in spool_bases() {
+        let _ = std::fs::remove_dir_all(base.join(&dir));
+    }
+}
+
+/// Mark a job's epilog obligation discharged in its on-disk manifest, recording
+/// the resolved exit and any drain intent. Called on the live monitor path only
+/// when a completion report fails: the job is already gone from `running`, so a
+/// restart re-adopts it from this manifest — without this, the retry would
+/// re-run the (possibly non-idempotent) epilog. No-op if the manifest is already
+/// gone. Kept off the common success path so a normal completion pays nothing.
+pub fn mark_manifest_epilog_discharged(
+    job_id: JobId,
+    run_attempt: u32,
+    exit: (i32, i32),
+    drain: bool,
+) {
+    let dir = format!("job{}_{}", job_id, run_attempt);
+    for base in spool_bases() {
+        let spool_dir = base.join(&dir);
+        let Ok(bytes) = std::fs::read(manifest_path(&spool_dir)) else {
+            continue;
+        };
+        if let Ok(mut manifest) = serde_json::from_slice::<JobManifest>(&bytes) {
+            manifest.pending.epilog = false;
+            manifest.pending.drain = drain;
+            manifest.exit = Some(exit);
+            write_job_manifest(&spool_dir, &manifest);
+            return;
+        }
     }
 }
 
@@ -1411,7 +1916,13 @@ async fn launch_container_job(
     job_io: JobIo,
 ) -> anyhow::Result<(RunningJob, Option<OwnedFd>)> {
     let job_id = cfg.job_id;
-    let cgroup_path = setup_cgroup(job_id, cfg.cpus, cfg.memory_mb, &cfg.cpu_ids)?;
+    let cgroup_path = setup_cgroup(
+        job_id,
+        cfg.run_attempt,
+        cfg.cpus,
+        cfg.memory_mb,
+        &cfg.cpu_ids,
+    )?;
 
     // Sync pipe: child writes status, parent reads.
     // Convert OwnedFd to raw fds for manual lifecycle management across fork.
@@ -1537,9 +2048,13 @@ async fn launch_container_job(
 
             let child_pid = child.as_raw();
 
-            if let Some(ref cgroup) = cgroup_path {
-                let _ = std::fs::write(cgroup.join("cgroup.procs"), child_pid.to_string());
-            }
+            // If the move fails the process runs outside the cgroup, so the
+            // cgroup can't report its liveness on restart — drop the path so
+            // reconcile falls back to a direct pid check (see the Managed path).
+            let cgroup_path = match cgroup_path {
+                Some(cgroup) if move_to_cgroup(&cgroup, child_pid as u32) => Some(cgroup),
+                _ => None,
+            };
 
             // pidfd prevents PID recycling; falls back gracefully on kernels < 5.3
             let pidfd = pidfd_open(child_pid).ok();
@@ -1694,6 +2209,575 @@ fn wrap_with_burst_buffer(script: &str, bb: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_manifest(job_id: JobId, run_attempt: u32) -> JobManifest {
+        JobManifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            job_id,
+            run_attempt,
+            pid: 1,
+            start_time: 0,
+            cgroup_path: None,
+            forked: false,
+            cpu_ids: vec![0, 1],
+            gpu_devices: vec![],
+            cpus: 2,
+            memory_mb: 1024,
+            uid: nix::unistd::getuid().as_raw(),
+            gid: nix::unistd::getgid().as_raw(),
+            user: String::new(),
+            stdout_path: "/tmp/out".into(),
+            stderr_path: "/tmp/err".into(),
+            work_dir: "/tmp".into(),
+            partition: "default".into(),
+            nodelist: "n1".into(),
+            mpi: String::new(),
+            rootfs_mode: crate::container::RootfsMode::Extracted,
+            exit_status_path: None,
+            pending: PendingObligations::default(),
+            exit: None,
+        }
+    }
+
+    #[test]
+    fn decode_shell_exit_splits_normal_and_signal() {
+        assert_eq!(decode_shell_exit(0), (0, 0));
+        assert_eq!(decode_shell_exit(5), (5, 0));
+        assert_eq!(decode_shell_exit(137), (0, 9)); // 128 + SIGKILL
+        assert_eq!(decode_shell_exit(143), (0, 15)); // 128 + SIGTERM
+    }
+
+    #[test]
+    fn proc_start_time_matches_a_live_process_and_disappears_once_reaped() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("2")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let start_time = proc_start_time(pid).expect("live process must have a start time");
+        assert!(proc_alive(pid, start_time));
+        assert!(!proc_alive(pid, start_time.wrapping_add(1)));
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(proc_start_time(pid), None);
+        assert!(!proc_alive(pid, start_time));
+    }
+
+    #[test]
+    fn wrap_with_exit_sentinel_captures_normal_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let exit_path = dir.path().join("exit_status");
+        let script = wrap_with_exit_sentinel("exit 5", &exit_path);
+        let script_path = dir.path().join("script.sh");
+        std::fs::write(&script_path, script).unwrap();
+
+        let status = std::process::Command::new("bash")
+            .arg(&script_path)
+            .status()
+            .unwrap();
+        // The wrapper's own exit status must match the original script's, so
+        // the normal (non-restarted) Managed path's Child::try_wait is
+        // unaffected by wrapping.
+        assert_eq!(status.code(), Some(5));
+        assert_eq!(std::fs::read_to_string(&exit_path).unwrap().trim(), "5");
+    }
+
+    #[test]
+    fn wrap_with_exit_sentinel_captures_child_signal_death() {
+        // A child command dying by signal makes bash exit 128+N; the EXIT trap
+        // sees that in $? and records it, matching how bash already reports an
+        // unwrapped script whose last command dies by signal.
+        let dir = tempfile::tempdir().unwrap();
+        let exit_path = dir.path().join("exit_status");
+        let script = wrap_with_exit_sentinel("(kill -TERM $BASHPID; sleep 5)", &exit_path);
+        let script_path = dir.path().join("script.sh");
+        std::fs::write(&script_path, script).unwrap();
+
+        let status = std::process::Command::new("bash")
+            .arg(&script_path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(143));
+        assert_eq!(std::fs::read_to_string(&exit_path).unwrap().trim(), "143");
+    }
+
+    #[test]
+    fn wrap_with_exit_sentinel_runs_lines_before_a_later_syntax_error() {
+        // The universal-path guarantee: a syntax error deep in the script must
+        // not prevent the lines above it from running (a subshell/brace-group
+        // wrapper parses the whole body first and would run nothing).
+        let dir = tempfile::tempdir().unwrap();
+        let exit_path = dir.path().join("exit_status");
+        let marker = dir.path().join("marker");
+        let body = format!("echo ran > {}\nif [\n", marker.display());
+        let script = wrap_with_exit_sentinel(&body, &exit_path);
+        let script_path = dir.path().join("script.sh");
+        std::fs::write(&script_path, script).unwrap();
+
+        let status = std::process::Command::new("bash")
+            .arg(&script_path)
+            .status()
+            .unwrap();
+        assert!(!status.success(), "the syntax error still fails the job");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            "ran",
+            "the line before the syntax error still ran"
+        );
+    }
+
+    #[test]
+    fn cgroup_path_for_disambiguates_run_attempts_of_same_job() {
+        // A same-node redispatch must never land the new run in the old
+        // run's cgroup, or displacing the old run (cgroup-wide SIGKILL for a
+        // Resumed job) would kill the new run too.
+        let a = cgroup_path_for(42, 1);
+        let b = cgroup_path_for(42, 2);
+        assert_ne!(a, b);
+        assert_eq!(cgroup_path_for(42, 1), a, "must be deterministic");
+    }
+
+    #[test]
+    fn cgroup_liveness_reflects_events_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Missing file is Unknown (not proof of exit): a non-v2 host or a
+        // process never moved in also lands here, so the caller must fall back
+        // to a direct pid check rather than assume the job finished.
+        assert_eq!(cgroup_liveness(dir.path()), CgroupLiveness::Unknown);
+        std::fs::write(dir.path().join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        assert_eq!(cgroup_liveness(dir.path()), CgroupLiveness::Populated);
+        std::fs::write(dir.path().join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+        assert_eq!(cgroup_liveness(dir.path()), CgroupLiveness::Empty);
+    }
+
+    #[test]
+    fn resumed_without_cgroup_events_falls_back_to_pid_liveness() {
+        // The Issue-1 regression guard: a Resumed job whose cgroup dir has no
+        // cgroup.events (non-v2 host, or process never moved in) must NOT be
+        // reported complete while its pid is still alive.
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let start_time = proc_start_time(pid).unwrap();
+        let mut job = RunningJob::Resumed {
+            pid,
+            start_time,
+            cgroup_path: Some(dir.path().to_path_buf()),
+            exit_status_path: dir.path().join("exit_status"),
+        };
+        // Alive pid + unreadable cgroup.events => not done (falls back to pid).
+        assert_eq!(job.try_wait().unwrap(), None);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn cgroup_signal_all_uses_procs_list_for_non_kill_signals() {
+        // Non-SIGKILL signals (graceful_cancel's initial SIGTERM,
+        // suspend/resume) always go through the per-pid cgroup.procs path —
+        // only SIGKILL ever attempts the atomic cgroup.kill fast path.
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        std::fs::write(dir.path().join("cgroup.procs"), child.id().to_string()).unwrap();
+
+        cgroup_signal_all(dir.path(), Signal::SIGTERM);
+
+        use std::os::unix::process::ExitStatusExt;
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(15));
+    }
+
+    #[test]
+    fn cgroup_signal_all_falls_back_when_cgroup_kill_unwritable() {
+        // A plain tempdir would let `cgroup.kill` be created as an ordinary
+        // (inert) file, masking the fallback. Making the dir read-only
+        // forces the write to fail, like a kernel without cgroup.kill (<5.14)
+        // would, so this only exercises the intended fallback as non-root.
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        std::fs::write(dir.path().join("cgroup.procs"), child.id().to_string()).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        cgroup_signal_all(dir.path(), Signal::SIGKILL);
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(9));
+    }
+
+    #[test]
+    fn resumed_try_wait_uses_cgroup_population_when_available() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        let exit_path = dir.path().join("exit_status");
+        let mut job = RunningJob::Resumed {
+            pid: 1,
+            start_time: 0,
+            cgroup_path: Some(dir.path().to_path_buf()),
+            exit_status_path: exit_path.clone(),
+        };
+        assert_eq!(job.try_wait().unwrap(), None);
+
+        std::fs::write(dir.path().join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+        std::fs::write(&exit_path, "3\n").unwrap();
+        assert_eq!(job.try_wait().unwrap(), Some((3, 0)));
+    }
+
+    #[test]
+    fn resumed_try_wait_falls_back_to_proc_liveness_without_cgroup() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("2")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let start_time = proc_start_time(pid).unwrap();
+        let mut job = RunningJob::Resumed {
+            pid,
+            start_time,
+            cgroup_path: None,
+            exit_status_path: PathBuf::from("/nonexistent/exit_status"),
+        };
+        assert_eq!(job.try_wait().unwrap(), None);
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // No sentinel file for this fallback path -> best-effort -1.
+        assert_eq!(job.try_wait().unwrap(), Some((-1, 0)));
+    }
+
+    // A resumed container (forked) job reports its real exit code from the
+    // in-rootfs sentinel, not an approximate -1.
+    #[test]
+    fn resumed_try_wait_reads_real_exit_code_from_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+        let exit_path = dir.path().join("spur_exit_status");
+        std::fs::write(&exit_path, "7\n").unwrap();
+        let mut job = RunningJob::Resumed {
+            pid: 1,
+            start_time: 0,
+            cgroup_path: Some(dir.path().to_path_buf()),
+            exit_status_path: exit_path,
+        };
+        assert_eq!(job.try_wait().unwrap(), Some((7, 0)));
+    }
+
+    // A job-planted symlink at the sentinel path must not be followed by root.
+    #[test]
+    fn read_exit_status_refuses_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real");
+        std::fs::write(&target, "7\n").unwrap();
+        let link = dir.path().join("spur_exit_status");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(read_exit_status(&link), None, "symlinked sentinel refused");
+        assert_eq!(
+            read_exit_status(&target),
+            Some(7),
+            "a real file still reads"
+        );
+    }
+
+    // A job-planted FIFO at the sentinel path must not block spurd startup: a
+    // blocking read-only open of a writer-less FIFO never returns, and this runs
+    // before the gRPC server starts, so it would brick the agent.
+    #[test]
+    fn read_exit_status_refuses_fifo() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spur_exit_status");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        // No writer is ever opened; if the guard regressed this call would hang.
+        assert_eq!(read_exit_status(&path), None, "FIFO sentinel refused");
+    }
+
+    // A job under a writable rootfs can bloat the sentinel; the read is capped.
+    #[test]
+    fn read_exit_status_reads_only_the_capped_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spur_exit_status");
+        // Interior space past the 64-byte cap: unbounded read fails to parse, the
+        // capped read sees only the leading "7".
+        let body = format!("7{}8", " ".repeat(100));
+        std::fs::write(&path, body).unwrap();
+        assert_eq!(read_exit_status(&path), Some(7));
+    }
+
+    #[test]
+    fn write_job_manifest_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write_job_manifest(dir.path(), &sample_manifest(1, 1));
+        let mode = std::fs::metadata(manifest_path(dir.path()))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "manifest must not be world/group readable"
+        );
+    }
+
+    #[test]
+    fn manifest_round_trip_scan_and_reconcile_alive() {
+        // Serialize against other tests that scan the shared spool-root
+        // manifest tree — see MANIFEST_SCAN_TEST_LOCK.
+        let _guard = crate::MANIFEST_SCAN_TEST_LOCK.blocking_lock();
+        let job_id: JobId = 987_654_324;
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let spool_dir = create_job_spool_dir(job_id, 1, uid, gid)
+            .unwrap_or_else(|e| panic!("create spool dir: {e}"));
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("2")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let start_time = proc_start_time(pid).unwrap();
+
+        write_job_manifest(
+            &spool_dir,
+            &JobManifest {
+                schema_version: MANIFEST_SCHEMA_VERSION,
+                job_id,
+                run_attempt: 1,
+                pid,
+                start_time,
+                cgroup_path: None,
+                forked: false,
+                cpu_ids: vec![0, 1],
+                gpu_devices: vec![],
+                cpus: 2,
+                memory_mb: 1024,
+                uid,
+                gid,
+                user: String::new(),
+                stdout_path: "/tmp/out".into(),
+                stderr_path: "/tmp/err".into(),
+                work_dir: "/tmp".into(),
+                partition: "default".into(),
+                nodelist: "n1".into(),
+                mpi: String::new(),
+                rootfs_mode: crate::container::RootfsMode::Extracted,
+                exit_status_path: None,
+                pending: PendingObligations::default(),
+                exit: None,
+            },
+        );
+
+        let (found_dir, found_manifest) = scan_job_manifests()
+            .into_iter()
+            .find(|(_, m)| m.job_id == job_id)
+            .expect("manifest not found by scan");
+        assert_eq!(found_dir, spool_dir);
+        assert_eq!(found_manifest.cpu_ids, vec![0, 1]);
+
+        match reconcile_manifest(&found_dir, found_manifest) {
+            ReconcileOutcome::Alive { job, manifest } => {
+                assert_eq!(manifest.job_id, job_id);
+                assert!(matches!(job, RunningJob::Resumed { pid: p, .. } if p == pid));
+            }
+            ReconcileOutcome::Dead { .. } => panic!("expected Alive outcome for a live process"),
+        }
+
+        child.kill().unwrap();
+        let _ = child.wait();
+        cleanup_job_spool(job_id, 1);
+    }
+
+    #[test]
+    fn reconcile_manifest_dead_reports_exit_status_from_sentinel() {
+        let _guard = crate::MANIFEST_SCAN_TEST_LOCK.blocking_lock();
+        let job_id: JobId = 987_654_325;
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let spool_dir = create_job_spool_dir(job_id, 1, uid, gid)
+            .unwrap_or_else(|e| panic!("create spool dir: {e}"));
+
+        // Spawn and fully reap so the pid is verifiably gone before we
+        // reconcile, mirroring a job that finished while spurd was down.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as i32;
+        child.wait().unwrap();
+        std::fs::write(exit_status_path(&spool_dir), "7\n").unwrap();
+
+        let manifest = JobManifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            job_id,
+            run_attempt: 1,
+            pid,
+            start_time: 0,
+            cgroup_path: None,
+            forked: false,
+            cpu_ids: vec![],
+            gpu_devices: vec![],
+            cpus: 1,
+            memory_mb: 0,
+            uid,
+            gid,
+            user: String::new(),
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            work_dir: "/tmp".into(),
+            partition: "default".into(),
+            nodelist: "n1".into(),
+            mpi: String::new(),
+            rootfs_mode: crate::container::RootfsMode::Extracted,
+            exit_status_path: None,
+            pending: PendingObligations::default(),
+            exit: None,
+        };
+
+        match reconcile_manifest(&spool_dir, manifest) {
+            ReconcileOutcome::Dead { manifest } => {
+                assert_eq!(manifest.exit, Some((7, 0)))
+            }
+            ReconcileOutcome::Alive { .. } => panic!("gone process must not be Alive"),
+        }
+        cleanup_job_spool(job_id, 1);
+    }
+
+    // A job OOM-killed while spurd was down writes no sentinel; the OOM flag is
+    // recovered from the cgroup so the outcome isn't a bare -1.
+    #[test]
+    fn reconcile_manifest_dead_recovers_oom_from_cgroup() {
+        let _guard = crate::MANIFEST_SCAN_TEST_LOCK.blocking_lock();
+        let job_id: JobId = 987_654_332;
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let spool_dir = create_job_spool_dir(job_id, 1, uid, gid)
+            .unwrap_or_else(|e| panic!("create spool dir: {e}"));
+        let cgroup = tempfile::tempdir().unwrap();
+        std::fs::write(cgroup.path().join("memory.events"), "oom_kill 1\n").unwrap();
+
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as i32;
+        child.wait().unwrap();
+
+        let manifest = JobManifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            job_id,
+            run_attempt: 1,
+            pid,
+            start_time: 0,
+            cgroup_path: Some(cgroup.path().to_path_buf()),
+            forked: false,
+            cpu_ids: vec![],
+            gpu_devices: vec![],
+            cpus: 1,
+            memory_mb: 0,
+            uid,
+            gid,
+            user: String::new(),
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            work_dir: "/tmp".into(),
+            partition: "default".into(),
+            nodelist: "n1".into(),
+            mpi: String::new(),
+            rootfs_mode: crate::container::RootfsMode::Extracted,
+            exit_status_path: None,
+            pending: PendingObligations::default(),
+            exit: None,
+        };
+
+        match reconcile_manifest(&spool_dir, manifest) {
+            ReconcileOutcome::Dead { manifest } => {
+                let (_, signal) = manifest.exit.expect("dead outcome records the exit");
+                assert_ne!(signal & spur_core::job::OOM_SIGNAL_FLAG, 0, "OOM flag set");
+            }
+            ReconcileOutcome::Alive { .. } => panic!("gone process must not be Alive"),
+        }
+        cleanup_job_spool(job_id, 1);
+    }
+
+    // Distinct run_attempts get distinct spool dirs, and cleaning one attempt
+    // must leave a concurrent redispatch's attempt untouched.
+    #[test]
+    fn spool_dir_cleanup_is_scoped_to_one_run_attempt() {
+        let _guard = crate::MANIFEST_SCAN_TEST_LOCK.blocking_lock();
+        let job_id: JobId = 987_654_330;
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+
+        let d1 = create_job_spool_dir(job_id, 1, uid, gid)
+            .unwrap_or_else(|e| panic!("create spool dir: {e}"));
+        let d2 = create_job_spool_dir(job_id, 2, uid, gid)
+            .unwrap_or_else(|e| panic!("create spool dir: {e}"));
+        assert_ne!(d1, d2, "distinct run_attempts must get distinct dirs");
+        assert!(d1.is_dir() && d2.is_dir());
+
+        cleanup_job_spool(job_id, 1);
+        assert!(!d1.exists(), "the cleaned attempt is removed");
+        assert!(d2.exists(), "a different attempt's spool must survive");
+
+        cleanup_job_spool(job_id, 2);
+        assert!(!d2.exists());
+    }
+
+    // write_job_manifest replaces atomically: a leftover temp file is never
+    // picked up as a live manifest by the scanner.
+    #[test]
+    fn manifest_write_leaves_no_temp_file() {
+        let _guard = crate::MANIFEST_SCAN_TEST_LOCK.blocking_lock();
+        let job_id: JobId = 987_654_331;
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let spool_dir = create_job_spool_dir(job_id, 1, uid, gid)
+            .unwrap_or_else(|e| panic!("create spool dir: {e}"));
+
+        write_job_manifest(
+            &spool_dir,
+            &JobManifest {
+                schema_version: MANIFEST_SCHEMA_VERSION,
+                job_id,
+                run_attempt: 1,
+                pid: 1,
+                start_time: 0,
+                cgroup_path: None,
+                forked: false,
+                cpu_ids: vec![],
+                gpu_devices: vec![],
+                cpus: 1,
+                memory_mb: 0,
+                uid,
+                gid,
+                user: String::new(),
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                work_dir: "/tmp".into(),
+                partition: "default".into(),
+                nodelist: "n1".into(),
+                mpi: String::new(),
+                rootfs_mode: crate::container::RootfsMode::Extracted,
+                exit_status_path: None,
+                pending: PendingObligations::default(),
+                exit: None,
+            },
+        );
+
+        assert!(manifest_path(&spool_dir).is_file());
+        assert!(!spool_dir.join("manifest.json.tmp").exists());
+        cleanup_job_spool(job_id, 1);
+    }
 
     #[test]
     fn decode_wait_status_splits_exit_and_signal() {
@@ -2064,11 +3148,12 @@ mod tests {
         let job_id: JobId = 987_654_321;
         // LaunchError has no Debug impl on purpose (it must not be convertible
         // back into an anyhow::Error), so report it through Display.
-        let dir = create_job_spool_dir(job_id, uid, gid)
+        let dir = create_job_spool_dir(job_id, 1, uid, gid)
             .unwrap_or_else(|e| panic!("create spool dir: {e}"));
+
         assert!(dir.is_dir());
         write_job_scratch(&dir.join("spur_job.sh"), "x", uid, gid).unwrap();
-        cleanup_job_spool(job_id);
+        cleanup_job_spool(job_id, 1);
         assert!(!dir.exists());
     }
 
@@ -2139,6 +3224,7 @@ mod tests {
     fn launch_cfg_for_paths(job_id: JobId, name: &str, user: &str, node: &str) -> JobLaunchConfig {
         JobLaunchConfig {
             job_id,
+            run_attempt: 0,
             script: String::new(),
             work_dir: String::new(),
             name: name.to_string(),
