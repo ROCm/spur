@@ -89,7 +89,7 @@ struct Args {
 
     /// Advertised comm address (IP or routable hostname) for inter-node reachability.
     /// If not set, auto-detected from WireGuard interface or hostname resolution.
-    #[arg(long, alias = "comm-address", env = "SPUR_NODE_ADDRESS")]
+    #[arg(long, env = "SPUR_NODE_ADDRESS")]
     address: Option<String>,
 
     /// Node labels for partition routing (key=value pairs).
@@ -179,11 +179,8 @@ async fn main() -> anyhow::Result<()> {
         spur_update::SPUR_BINARIES,
     );
 
-    // Detect node address (explicit --address/--comm-address > WireGuard > hostname)
-    let explicit_addr = args
-        .address
-        .clone()
-        .or_else(|| std::env::var("SPUR_COMM_ADDRESS").ok());
+    // Detect node address (explicit --address > WireGuard > hostname)
+    let explicit_addr = args.address.clone();
     let node_address = if let Some(ref addr) = explicit_addr {
         let addr_input = addr.clone();
         match tokio::task::spawn_blocking(move || spur_net::normalize_comm_address(&addr_input))

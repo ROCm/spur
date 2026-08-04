@@ -132,8 +132,8 @@ Start the agent:
        --address 10.44.0.2 \
        --listen [::]:6818
 
-``--address`` and ``--comm-address`` are equivalent. You can also set
-``SPUR_NODE_ADDRESS`` or ``SPUR_COMM_ADDRESS``. Pass a routable IP or FQDN,
+``--address`` sets the advertised comm address. Alternatively, set the
+``SPUR_NODE_ADDRESS`` environment variable. Pass a routable IP or FQDN,
 not the short hostname alone when ``/etc/hosts`` maps it to loopback.
 
 The agent auto-detects CPUs, memory, and GPUs, then registers with the controller over the mesh.
