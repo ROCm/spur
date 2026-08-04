@@ -66,6 +66,9 @@ schemars = "1"
 # Unix
 nix = { version = "0.31", features = ["process", "signal", "fs", "user", "sched", "mount", "socket", "term"] }
 
+# Embedded Lua for the job_submit hook (vendored: no system Lua needed)
+mlua = { version = "0.12", features = ["lua54", "vendored", "serialize"] }
+
 # Auth
 jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 

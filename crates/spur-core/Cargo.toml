@@ -24,6 +24,7 @@ rand = { workspace = true }
 subtle = { workspace = true }
 whoami = "2"
 nix = { workspace = true }
+mlua = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

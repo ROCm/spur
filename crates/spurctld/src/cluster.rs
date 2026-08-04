@@ -553,33 +553,64 @@ impl ClusterManager {
         )))
     }
 
-    /// Run the configured job-submission hook against the resolved spec: reject
+    /// Run the configured job-submission hooks against the resolved spec: reject
     /// maps to an invalid-argument error; modify applies whitelisted changes.
+    /// The shell hook runs first, then the Lua hook, each on the evolving spec
+    /// (mirroring Slurm's config-ordered plugin chain).
     fn run_job_submit_hook(&self, spec: &mut JobSpec) -> Result<(), SubmitError> {
         let config = self.config();
-        let Some(script) = config.hooks.job_submit.as_deref() else {
+        let shell = config.hooks.job_submit.as_deref();
+        let lua = config.hooks.job_submit_lua.as_deref();
+        if shell.is_none() && lua.is_none() {
             return Ok(());
-        };
+        }
 
+        if let Some(script) = shell {
+            let ctx = self.submit_hook_ctx(spec)?;
+            let outcome = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(async { spur_core::hooks::run_submit_hook(script, &ctx).await })
+            })
+            .map_err(|e| SubmitError::internal(format!("job_submit hook failed: {e}")))?;
+            self.apply_submit_outcome(spec, "job_submit", outcome)?;
+        }
+
+        if let Some(script) = lua {
+            let ctx = self.submit_hook_ctx(spec)?;
+            let outcome = spur_core::hooks::run_submit_hook_lua(script, &ctx)
+                .map_err(|e| SubmitError::internal(format!("job_submit lua hook failed: {e}")))?;
+            self.apply_submit_outcome(spec, "job_submit_lua", outcome)?;
+        }
+
+        Ok(())
+    }
+
+    fn submit_hook_ctx(
+        &self,
+        spec: &JobSpec,
+    ) -> Result<spur_core::hooks::SubmitHookContext, SubmitError> {
         let spec_json = serde_json::to_string(spec).map_err(|e| {
             SubmitError::internal(format!(
                 "failed to encode job spec for job_submit hook: {e}"
             ))
         })?;
-        let ctx = spur_core::hooks::SubmitHookContext {
+        Ok(spur_core::hooks::SubmitHookContext {
             spec_json,
             user: spec.user.clone(),
             uid: spec.uid,
             gid: spec.gid,
             partition: spec.partition.clone().unwrap_or_default(),
-        };
-
-        let outcome = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { spur_core::hooks::run_submit_hook(script, &ctx).await })
         })
-        .map_err(|e| SubmitError::internal(format!("job_submit hook failed: {e}")))?;
+    }
 
+    /// Apply one hook's outcome: reject fails the submission; modify applies
+    /// whitelisted changes, then re-validates partition/account ACLs and QOS.
+    fn apply_submit_outcome(
+        &self,
+        spec: &mut JobSpec,
+        hook: &str,
+        outcome: spur_core::hooks::SubmitHookOutcome,
+    ) -> Result<(), SubmitError> {
         match outcome {
             spur_core::hooks::SubmitHookOutcome::Accept => Ok(()),
             spur_core::hooks::SubmitHookOutcome::Reject(reason) => {
@@ -589,7 +620,7 @@ impl ClusterManager {
                 let modified = spur_core::hooks::apply_submit_changes(spec, &changes);
                 info!(
                     target: "audit",
-                    hook = "job_submit",
+                    hook,
                     user = %spec.user,
                     uid = spec.uid,
                     partition = %spec.partition.clone().unwrap_or_default(),
@@ -6443,6 +6474,106 @@ mod tests {
         assert_eq!(
             err,
             SubmitError::invalid("job_submit hook set unknown QOS 'ghost'")
+        );
+    }
+
+    fn write_lua_script(dir: &TempDir, body: &str) -> String {
+        use std::io::Write;
+        let path = dir.path().join("job_submit.lua");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "{body}").unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_hook_rejects() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  slurm.log_user('denied by lua')\n  return slurm.ERROR\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("blocked-lua")).unwrap_err();
+        assert_eq!(err, SubmitError::invalid("denied by lua"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_hook_modifies_spec() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  j.comment = 'lua-tagged'\n  return slurm.SUCCESS\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let id = submit_and_wait(&cm, basic_spec("lua-mod"));
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.comment.as_deref(),
+            Some("lua-tagged")
+        );
+    }
+
+    // Shell runs first, then Lua, each on the evolving spec.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_shell_then_lua_chain() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"priority": 100}'"#));
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  j.comment = 'chained'\n  return slurm.SUCCESS\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let id = submit_and_wait(&cm, basic_spec("chain"));
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.spec.priority, Some(100));
+        assert_eq!(job.spec.comment.as_deref(), Some("chained"));
+    }
+
+    // A shell rejection short-circuits the chain: the Lua hook never runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_shell_reject_skips_lua() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(&dir, "echo 'shell says no' >&2\nexit 1"));
+        // If this Lua ran it would mkdir a marker; assert the file never appears.
+        let marker = dir.path().join("lua-ran");
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            &format!(
+                "function slurm_job_submit(j, u)\n  j.comment = '{}'\n  return slurm.SUCCESS\nend",
+                marker.display()
+            ),
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("shell-first")).unwrap_err();
+        assert_eq!(err, SubmitError::invalid("shell says no"));
+    }
+
+    // When both hooks set the same field, Lua (second) wins on the evolving spec.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_overrides_shell_field() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(
+            &dir,
+            r#"echo '{"comment": "from-shell"}'"#,
+        ));
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  j.comment = 'from-lua'\n  return slurm.SUCCESS\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let id = submit_and_wait(&cm, basic_spec("override"));
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.comment.as_deref(),
+            Some("from-lua")
         );
     }
 
