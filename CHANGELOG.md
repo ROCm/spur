@@ -3,11 +3,7 @@
 ## [0.7.0](https://github.com/ROCm/spur/compare/v0.6.0...v0.7.0) (2026-08-04)
 
 
-### ⚠ BREAKING CHANGES
-
-* **spurd:** drop --comm-address alias and SPUR_COMM_ADDRESS ([#562](https://github.com/ROCm/spur/issues/562))
-
-### refactor
+### Refactors
 
 * **spurd:** drop --comm-address alias and SPUR_COMM_ADDRESS ([#562](https://github.com/ROCm/spur/issues/562)) ([9f4506d](https://github.com/ROCm/spur/commit/9f4506d442408719abb8924258022615f9a5e1b1))
 
