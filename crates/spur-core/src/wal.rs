@@ -721,6 +721,24 @@ mod suspend_wal_tests {
             }
         }
     }
+
+    #[test]
+    fn job_time_limit_signaled_op_round_trips() {
+        let at = chrono::Utc::now();
+        let op = WalOperation::JobTimeLimitSignaled { job_id: 13, at };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobTimeLimitSignaled {
+                job_id,
+                at: at_back,
+            } => {
+                assert_eq!(job_id, 13);
+                assert_eq!(at_back, at);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
 }
 
 #[cfg(test)]

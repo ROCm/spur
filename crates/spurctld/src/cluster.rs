@@ -967,8 +967,15 @@ impl ClusterManager {
         exit_code: i32,
         state: JobState,
     ) -> anyhow::Result<()> {
-        // Validate
-        {
+        // A time-limit expiry has to win over the caller's outcome here, not
+        // just in the per-node completion path. The marker is only ever set on
+        // a run the watchdog signalled, so any completion routed through this
+        // method — the completing-timeout force-finish and the srun path, both
+        // of which finalize without seeing node_completions — is a wall-time
+        // expiry that would otherwise be reported as an ordinary failure and
+        // skip the Timeout requeue. Cancelled (user cancel, preemption) and an
+        // already-correct Timeout pass through untouched.
+        let state = {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
@@ -976,7 +983,14 @@ impl ClusterManager {
             if job.state.is_terminal() {
                 anyhow::bail!("invalid transition from {:?} to {:?}", job.state, state);
             }
-        }
+            if job.time_limit_signaled_at.is_some()
+                && matches!(state, JobState::Failed | JobState::Completed)
+            {
+                JobState::Timeout
+            } else {
+                state
+            }
+        };
 
         // propose() handles: state transition, exit_code, end_time,
         // resource deallocation, step completion, license return
@@ -6219,6 +6233,53 @@ mod tests {
         let job = cm.get_job(job_id).unwrap();
         assert_eq!(job.pending_reason, PendingReason::TimeLimit);
         assert_eq!(job.exit_code, Some(-1));
+    }
+
+    // The completing-timeout force-finish and srun completion paths finalize
+    // through complete_job with a state derived from exit status alone, never
+    // consulting the marker. A run the watchdog already signalled must still
+    // report TIMEOUT through those paths, or a well-behaved job skips requeue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn complete_job_promotes_a_signaled_run_to_timeout() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let record_marker = |job_id: JobId| {
+            cm.signal_time_limit(job_id, Utc::now()).unwrap();
+            wait_for("time limit expiry recorded", || {
+                cm.get_job(job_id)
+                    .is_some_and(|j| j.time_limit_signaled_at.is_some())
+            });
+        };
+
+        // force_finish_completing_job passes Failed (e.g. a node never reported)
+        // and its exit_code must survive the promotion.
+        let failed = run_job_on(&cm, "completing-timeout", "worker1");
+        record_marker(failed);
+        cm.complete_job(failed, 1, JobState::Failed).unwrap();
+        settle(&cm, failed, JobState::Timeout);
+        let job = cm.get_job(failed).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::TimeLimit);
+        assert_eq!(job.exit_code, Some(1));
+
+        // finish_srun_job passes Completed for a handler that trapped SIGTERM
+        // and exited 0; the run still expired, matching Job::completion_verdict.
+        let clean = run_job_on(&cm, "srun-timeout", "worker1");
+        record_marker(clean);
+        cm.complete_job(clean, 0, JobState::Completed).unwrap();
+        settle(&cm, clean, JobState::Timeout);
+        assert_eq!(
+            cm.get_job(clean).unwrap().pending_reason,
+            PendingReason::TimeLimit
+        );
+
+        // The promotion is narrow: a cancel on a signalled run stays Cancelled,
+        // since the user's intent is not a time-limit expiry.
+        let cancelled = run_job_on(&cm, "cancel-wins", "worker1");
+        record_marker(cancelled);
+        cm.complete_job(cancelled, -1, JobState::Cancelled).unwrap();
+        settle(&cm, cancelled, JobState::Cancelled);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
