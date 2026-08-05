@@ -97,9 +97,13 @@ runtime-only changes not reflected in the file are overwritten.
 
 **Applied live** (no restart): ``[[partitions]]`` (created, updated, or deleted
 to match the file), ``[[nodes]]`` features and weight, ``licenses``,
-``burst_buffer``, ``[hooks]``, ``[notifications]``, ``[federation]``,
+``burst_buffer``, controller-side ``[hooks]`` (``prolog_slurmctld``,
+``epilog_slurmctld``), ``[notifications]``, ``[federation]``,
 ``[power]`` suspend/resume commands, ``[admission]`` mode, and the
 ``[scheduler]`` tunables ``complete_wait_secs`` and ``resv_overrun_minutes``.
+Node-side hooks (the per-node prolog/epilog run by ``spurd``), the device
+registry, and memlock are read by the node agent at its own startup;
+``reconfigure`` does not reach compute nodes, so those need a ``spurd`` restart.
 
 **Restart-only**: settings baked in when the daemon starts — listen addresses
 and ports (``[controller]``, ``[metrics]``, ``[rest_api]``), the accounting

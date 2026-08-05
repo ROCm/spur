@@ -305,6 +305,11 @@ pub struct ClusterManager {
     /// Names of partitions that were runtime-deleted. Used to suppress config-file
     /// partitions with the same name from re-appearing on restart.
     deleted_partition_names: RwLock<HashSet<String>>,
+    /// Partition names seeded from config before WAL replay. A replayed
+    /// `PartitionCreate` for one overwrites the seed (WAL is authoritative);
+    /// once overridden the name is removed, so later duplicates stay
+    /// first-writer-wins. Runtime-only, never persisted.
+    config_seeded_partitions: RwLock<HashSet<String>>,
     next_job_id: AtomicU32,
     reservations: RwLock<Vec<Reservation>>,
     steps: RwLock<HashMap<(JobId, u32), JobStep>>,
@@ -354,6 +359,8 @@ impl ClusterManager {
         config_path: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
         let partitions = config.build_partitions();
+        let config_seeded_partitions: HashSet<String> =
+            partitions.iter().map(|p| p.name.clone()).collect();
         let license_pool = config.licenses.clone();
         let burst_buffer_total_gb = config.burst_buffer.total_gb;
         let fairshare_cache = Arc::new(FairshareCache::new());
@@ -370,6 +377,7 @@ impl ClusterManager {
             nodes: RwLock::new(HashMap::new()),
             partitions: RwLock::new(partitions),
             deleted_partition_names: RwLock::new(HashSet::new()),
+            config_seeded_partitions: RwLock::new(config_seeded_partitions),
             reservations: RwLock::new(Vec::new()),
             steps: RwLock::new(HashMap::new()),
             next_job_id: AtomicU32::new(first_job_id),
@@ -404,17 +412,19 @@ impl ClusterManager {
         apply_default_time_limit(&mut spec, &self.partitions.read());
         apply_default_account(&mut spec, &self.association_cache);
         validate_user_account(&spec, &self.association_cache)?;
-        self.validate_partition(&spec)?;
-        let mpi = spec.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
-        spur_core::mpi::validate_single_node_pmix(mpi, spec.num_nodes)
-            .map_err(SubmitError::invalid)?;
         let config = self.config();
+        // Default QoS must resolve before the partition ACL, or `allow_qos` sees
+        // an empty QoS and wrongly rejects a user's inherited default.
         apply_default_qos(
             &mut spec,
             &self.association_cache,
             &self.qos_cache,
             &config.accounting,
         )?;
+        self.validate_partition(&spec)?;
+        let mpi = spec.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
+        spur_core::mpi::validate_single_node_pmix(mpi, spec.num_nodes)
+            .map_err(SubmitError::invalid)?;
 
         // Checked after defaults are applied so we measure the final spec.
         // Array expansion only adds bounded integer metadata per task, so a
@@ -4482,22 +4492,42 @@ impl ClusterManager {
                 self.deleted_partition_names.write().remove(&partition.name);
                 {
                     let mut partitions = self.partitions.write();
-                    if partitions.iter().any(|p| p.name == partition.name) {
-                        warn!(
-                            name = %partition.name,
-                            "duplicate partition create in WAL apply, ignoring"
-                        );
-                    } else {
-                        // Promote exactly one default: clear all others when
-                        // the new partition is created as the default.
-                        if partition.is_default {
-                            for p in partitions.iter_mut() {
-                                p.is_default = false;
+                    let existing = partitions.iter().position(|p| p.name == partition.name);
+                    // Seeded name => the existing entry is only the pre-replay
+                    // config seed, so the WAL entry overrides it; else duplicate.
+                    let seeded = self
+                        .config_seeded_partitions
+                        .write()
+                        .remove(&partition.name);
+                    match existing {
+                        Some(idx) if seeded => {
+                            if partition.is_default {
+                                for p in partitions.iter_mut() {
+                                    p.is_default = false;
+                                }
                             }
+                            partitions[idx] = partition.clone();
+                            response.partition_created = true;
+                            info!(name = %partition.name, "partition restored from WAL over config seed");
                         }
-                        partitions.push(partition.clone());
-                        response.partition_created = true;
-                        info!(name = %partition.name, "partition created");
+                        Some(_) => {
+                            warn!(
+                                name = %partition.name,
+                                "duplicate partition create in WAL apply, ignoring"
+                            );
+                        }
+                        None => {
+                            // Promote exactly one default: clear all others when
+                            // the new partition is created as the default.
+                            if partition.is_default {
+                                for p in partitions.iter_mut() {
+                                    p.is_default = false;
+                                }
+                            }
+                            partitions.push(partition.clone());
+                            response.partition_created = true;
+                            info!(name = %partition.name, "partition created");
+                        }
                     }
                 }
                 // Node-to-partition membership is derived from the partition
@@ -4722,11 +4752,12 @@ struct ClusterSnapshot {
     jobs: Vec<Job>,
     nodes: Vec<Node>,
     reservations: Vec<Reservation>,
-    /// Runtime-created/modified partitions. On restore these overlay the
-    /// config-file baseline; names in `deleted_partition_names` are skipped
-    /// from the baseline entirely.
+    /// The leader's authoritative partition table. `None` = pre-partition-support
+    /// snapshot (field absent) → restore falls back to the config baseline.
+    /// `Some(_)`, empty included, is installed verbatim so a leader with zero
+    /// partitions is not reseeded from a follower's local config.
     #[serde(default)]
-    partitions: Vec<Partition>,
+    partitions: Option<Vec<Partition>>,
     /// Names of partitions deleted at runtime. Suppresses config-file
     /// partitions with the same name from re-seeding on restart.
     #[serde(default)]
@@ -4803,7 +4834,7 @@ impl StateMachineApply for ClusterManager {
             jobs: self.jobs.read().values().cloned().collect(),
             nodes: self.nodes.read().values().cloned().collect(),
             reservations: self.reservations.read().clone(),
-            partitions: self.partitions.read().clone(),
+            partitions: Some(self.partitions.read().clone()),
             deleted_partition_names: self.deleted_partition_names.read().clone(),
             steps: self.steps.read().values().cloned().collect(),
             license_pool: self.license_pool.read().clone(),
@@ -4836,24 +4867,23 @@ impl StateMachineApply for ClusterManager {
         // Restore tombstone set first — used below to filter the config baseline.
         *self.deleted_partition_names.write() = snap.deleted_partition_names.clone();
 
-        // Restore the partition table wholesale from the snapshot, like every
-        // other collection here. snap.partitions is the leader's complete
-        // authoritative set (snapshot_state clones the full live vec), so a
-        // stale in-memory partition can't survive install and local config
-        // can't reintroduce one the leader doesn't have. Only fall back to the
-        // config baseline for a pre-partition-snapshot snapshot, where the
-        // serde-default leaves snap.partitions empty and there is nothing
-        // authoritative to restore.
+        // `snap.partitions` is the leader's authoritative set, installed
+        // wholesale. Only a pre-partition snapshot (`None`) falls back to the
+        // config baseline; an authoritative empty set installs verbatim.
         {
             let mut partitions = self.partitions.write();
-            *partitions = if snap.partitions.is_empty() {
-                let mut base = self.config().build_partitions();
-                base.retain(|p| !snap.deleted_partition_names.contains(&p.name));
-                base
-            } else {
-                snap.partitions
+            *partitions = match snap.partitions {
+                Some(p) => p,
+                None => {
+                    let mut base = self.config().build_partitions();
+                    base.retain(|p| !snap.deleted_partition_names.contains(&p.name));
+                    base
+                }
             };
         }
+        // The installed table is authoritative; no config seed remains for the
+        // tail log to override.
+        self.config_seeded_partitions.write().clear();
 
         let mut steps = self.steps.write();
         steps.clear();
@@ -12053,6 +12083,32 @@ mod tests {
         );
     }
 
+    // An authoritative empty set (leader deleted them all) must install verbatim,
+    // not reseed from local config — the case `is_empty()` conflated with legacy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_from_authoritative_empty_snapshot_wipes_partitions() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        assert!(
+            !cm.get_partitions().is_empty(),
+            "test config must seed a partition"
+        );
+
+        // A leader snapshot with an explicit empty (Some(vec![])) partition set.
+        let mut snap: serde_json::Value =
+            serde_json::from_slice(&cm.snapshot_state().unwrap()).unwrap();
+        snap.as_object_mut()
+            .unwrap()
+            .insert("partitions".into(), serde_json::json!([]));
+        let data = serde_json::to_vec(&snap).unwrap();
+
+        cm.restore_from_snapshot(&data).unwrap();
+        assert!(
+            cm.get_partitions().is_empty(),
+            "authoritative empty set must wipe local partitions, not reseed from config"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restore_from_snapshot_rejects_corrupt_data() {
         let dir = TempDir::new().unwrap();
@@ -14465,7 +14521,7 @@ mod tests {
             jobs: Vec::new(),
             nodes: vec![stale],
             reservations: Vec::new(),
-            partitions: Vec::new(),
+            partitions: None,
             deleted_partition_names: HashSet::new(),
             steps: Vec::new(),
             license_pool: HashMap::new(),
@@ -15147,6 +15203,64 @@ mod tests {
         );
     }
 
+    // A config-seeded partition must lose to a replayed WAL PartitionCreate of
+    // the same name, or a runtime edit later codified into spur.conf reverts on
+    // restart and two controllers with differing confs diverge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_partition_create_overrides_config_seed() {
+        let dir = TempDir::new().unwrap();
+        // Default test config seeds a partition named "default".
+        let cm = test_cluster(&dir).await;
+        assert!(
+            cm.config_seeded_partitions.read().contains("default"),
+            "precondition: 'default' is config-seeded"
+        );
+
+        let runtime = spur_core::partition::Partition {
+            name: "default".into(),
+            state: spur_core::partition::PartitionState::Up,
+            is_default: true,
+            nodes: "node[01-09]".into(),
+            max_time_minutes: Some(720),
+            allow_accounts: vec!["runtime-team".into()],
+            priority_tier: 7,
+            ..Default::default()
+        };
+        cm.apply_operation(&WalOperation::PartitionCreate {
+            partition: runtime.clone(),
+        });
+
+        let parts = cm.get_partitions();
+        let def = parts.iter().find(|p| p.name == "default").unwrap();
+        assert_eq!(def.nodes, "node[01-09]", "WAL value must overwrite seed");
+        assert_eq!(def.max_time_minutes, Some(720));
+        assert_eq!(def.priority_tier, 7);
+        assert_eq!(
+            parts.iter().filter(|p| p.name == "default").count(),
+            1,
+            "override must not add a second entry"
+        );
+        assert!(
+            !cm.config_seeded_partitions.read().contains("default"),
+            "seed marker must be cleared once the WAL has overridden it"
+        );
+
+        // The seed override is one-shot: a further duplicate is a genuine
+        // create race and stays first-writer-wins.
+        let mut evil = runtime.clone();
+        evil.priority_tier = 99;
+        cm.apply_operation(&WalOperation::PartitionCreate { partition: evil });
+        let def = cm
+            .get_partitions()
+            .into_iter()
+            .find(|p| p.name == "default")
+            .unwrap();
+        assert_eq!(
+            def.priority_tier, 7,
+            "post-override duplicate must be ignored (first-writer-wins)"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_partition_update_unknown_is_a_noop() {
         let dir = TempDir::new().unwrap();
@@ -15550,6 +15664,45 @@ mod tests {
         assert!(
             cm.validate_partition(&spec).is_ok(),
             "empty allow_qos must not restrict any QoS"
+        );
+    }
+
+    // Full submit path: a user with no explicit `-q` whose association default
+    // QoS is in the partition's allow_qos must be admitted. The tests above call
+    // validate_partition with an explicit qos, so none covers this ordering.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_admits_association_default_qos_on_allow_qos_partition() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache().insert(Qos {
+            name: "premium".into(),
+            ..Default::default()
+        });
+        cm.association_cache()
+            .insert_default_qos("testuser", "research", "premium");
+
+        let part = spur_core::partition::Partition {
+            name: "restricted".into(),
+            nodes: "ALL".into(),
+            allow_qos: vec!["premium".into()],
+            ..Default::default()
+        };
+        cm.create_partition(part).unwrap();
+        wait_for("restricted created", || {
+            cm.get_partitions().iter().any(|p| p.name == "restricted")
+        });
+
+        let mut spec = basic_spec("inherits-default");
+        spec.account = Some("research".into());
+        spec.partition = Some("restricted".into());
+        spec.qos = None;
+        let id = cm
+            .submit_job(spec)
+            .expect("association default QoS must satisfy the partition allow_qos");
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.qos.as_deref(),
+            Some("premium"),
+            "the resolved default QoS must be recorded on the job"
         );
     }
 }

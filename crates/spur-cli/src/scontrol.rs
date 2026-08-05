@@ -223,8 +223,9 @@ pub enum ScontrolCommand {
         name: String,
     },
     /// Re-read spur.conf and apply it live on the leader (partitions, nodes,
-    /// licenses, hooks, scheduler tunables, etc.). Ports/DB/raft/jwt_key need a
-    /// restart; followers converge on restart.
+    /// licenses, controller hooks, complete_wait_secs/resv_overrun_minutes, etc.).
+    /// Ports/DB/raft/jwt_key, the scheduler loop cadence, and node-side settings
+    /// need a restart; followers converge on restart.
     Reconfigure,
     /// Create a reservation
     #[command(name = "create-reservation")]
