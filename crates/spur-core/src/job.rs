@@ -438,8 +438,9 @@ pub struct JobSpec {
     // Scheduling
     pub qos: Option<String>,
     /// Explicit base priority request; `None` means "unset", resolved to
-    /// [`DEFAULT_PRIORITY`] in [`Job::new`]. Not the effective priority the
-    /// scheduler ranks on (that is derived from this each cycle).
+    /// [`DEFAULT_PRIORITY`] in [`Job::new`] (except when `hold` is set, which
+    /// forces base priority to 0). Not the effective priority the scheduler
+    /// ranks on (that is derived from this each cycle).
     pub priority: Option<u32>,
     pub reservation: Option<String>,
     pub dependency: Vec<String>,

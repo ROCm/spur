@@ -764,8 +764,9 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
             nanos: 0,
         }),
         qos: s.qos.clone().unwrap_or_default(),
-        // Proto `priority` is non-optional; 0 encodes "unset" and is resolved
-        // back to the default by the receiver, not a base priority of zero.
+        // Proto `priority` is non-optional; 0 encodes "unset", not a base
+        // priority of zero. The receiver decodes 0 back to `None`, which
+        // `Job::new` then resolves to the default.
         priority: s.priority.unwrap_or(0),
         reservation: s.reservation.clone().unwrap_or_default(),
         dependency: s.dependency.clone(),
