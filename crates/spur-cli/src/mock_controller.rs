@@ -149,6 +149,10 @@ mock_controller_impl! {
         deregister_node(proto::DeregisterNodeRequest) -> proto::DeregisterNodeResponse;
         deregister_agent(proto::DeregisterAgentRequest) -> ();
         get_partitions(proto::GetPartitionsRequest) -> proto::GetPartitionsResponse;
+        create_partition(proto::CreatePartitionRequest) -> ();
+        update_partition(proto::UpdatePartitionRequest) -> ();
+        delete_partition(proto::DeletePartitionRequest) -> ();
+        reconfigure(()) -> ();
         get_job_steps(proto::GetJobStepsRequest) -> proto::GetJobStepsResponse;
         ping(()) -> proto::PingResponse;
         get_job_metrics(()) -> proto::JobMetrics;

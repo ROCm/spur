@@ -85,6 +85,14 @@ Resolution precedence is: explicit ``controller.node_id`` -> position in
 one), the controller fails fast at startup rather than joining with a wrong ID.
 
 Adjust partition definitions and node resources to match your cluster hardware.
+Once the controller is running, ``scontrol reconfigure`` applies most section
+changes (partitions, nodes, licenses, hooks, scheduler tunables) without a
+restart; listen ports, the accounting database, Raft peers, and ``jwt_key``
+still require restarting the controller. ``reconfigure`` runs on the Raft
+leader only — followers keep their startup config until restarted, at which
+point they re-read this same ConfigMap and converge. To roll all controllers
+onto an updated ConfigMap, restart the StatefulSet pods. See
+:doc:`partitioning` for the full breakdown.
 
 Submitting Jobs
 ---------------

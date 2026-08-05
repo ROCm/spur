@@ -18,7 +18,7 @@ use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::slurm_controller_server::SlurmController;
 use spur_proto::proto::*;
 
-use crate::cluster::{ClusterManager, ReservationError};
+use crate::cluster::{ClusterManager, PartitionError, ReservationError};
 use crate::raft::RaftHandle;
 use crate::rpc_middleware::RpcStatsLayer;
 use crate::rpc_stats::RpcStatsCollector;
@@ -119,6 +119,11 @@ pub struct ControllerService {
     /// Default HA control-plane count (`[cluster] control_plane_replicas`) when `spur k8s up`
     /// requests neither `--replicas` nor an explicit node set.
     control_plane_replicas: u32,
+    /// JWT signing key for node tokens, captured at startup. Deliberately NOT
+    /// re-read on `scontrol reconfigure`: swapping it live would instantly fail
+    /// verification of every outstanding node token (7-day TTL), silently
+    /// partitioning healthy nodes. Like Slurm's AuthType, it is restart-only.
+    jwt_key: String,
 }
 
 struct LeaderProxy {
@@ -180,6 +185,28 @@ impl LeaderProxy {
     ) -> Option<SlurmControllerClient<tonic::transport::Channel>> {
         self.get_leader_client().await.ok()
     }
+}
+
+/// Resolve the node-token signing key from config at startup. Captured once by
+/// `serve` into `ControllerService::jwt_key`; deliberately not re-read on
+/// `reconfigure` (see the field doc). Falls back to a shared default so
+/// key-less dev clusters interoperate.
+fn resolve_startup_jwt_key(config: &spur_core::config::SlurmConfig) -> String {
+    if let Some(key) = &config.auth.jwt_key {
+        return key.clone();
+    }
+    // Token admission signs/verifies node tokens with this key. A well-known
+    // default is trivially forgeable by anyone who can reach the controller.
+    if matches!(
+        config.admission.mode,
+        spur_core::config::AdmissionMode::Token
+    ) {
+        warn!(
+            "admission.mode=Token but auth.jwt_key is unset: node tokens are signed with a \
+             well-known default key and are forgeable. Set auth.jwt_key to a secret value."
+        );
+    }
+    "spur-default-key".to_string()
 }
 
 impl ControllerService {
@@ -270,7 +297,7 @@ impl ControllerService {
     fn validate_admission(&self, join_token: &str, hostname: &str) -> Result<String, Status> {
         use spur_core::config::AdmissionMode;
 
-        if !matches!(self.cluster.config.admission.mode, AdmissionMode::Token) {
+        if !matches!(self.cluster.config().admission.mode, AdmissionMode::Token) {
             return Ok(String::new());
         }
 
@@ -285,15 +312,7 @@ impl ControllerService {
         spur_core::admission::validate_token(token_id, secret, &token_store)
             .map_err(|e| Status::permission_denied(e.to_string()))?;
 
-        let jwt_key = self
-            .cluster
-            .config
-            .auth
-            .jwt_key
-            .as_deref()
-            .unwrap_or("spur-default-key");
-
-        spur_core::admission::generate_node_token(hostname, jwt_key.as_bytes())
+        spur_core::admission::generate_node_token(hostname, self.jwt_key.as_bytes())
             .map_err(|e| Status::internal(e.to_string()))
     }
 }
@@ -850,21 +869,14 @@ impl SlurmController for ControllerService {
         let req = request.into_inner();
 
         if matches!(
-            self.cluster.config.admission.mode,
+            self.cluster.config().admission.mode,
             spur_core::config::AdmissionMode::Token
         ) {
             if req.node_token.is_empty() {
                 return Err(Status::unauthenticated("node token required"));
             }
-            let jwt_key = self
-                .cluster
-                .config
-                .auth
-                .jwt_key
-                .as_deref()
-                .unwrap_or("spur-default-key");
             let identity =
-                spur_core::admission::verify_node_token(&req.node_token, jwt_key.as_bytes())
+                spur_core::admission::verify_node_token(&req.node_token, self.jwt_key.as_bytes())
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
             if identity.hostname != req.hostname {
                 return Err(Status::permission_denied("node token hostname mismatch"));
@@ -915,7 +927,7 @@ impl SlurmController for ControllerService {
 
         let federation_peers: Vec<String> = self
             .cluster
-            .config
+            .config()
             .federation
             .clusters
             .iter()
@@ -1059,7 +1071,7 @@ impl SlurmController for ControllerService {
         let req = request.into_inner();
         let resources = req.resources.map(proto_to_resource_set).unwrap_or_default();
 
-        let reject_loopback = self.cluster.config.network.reject_loopback_comm_addr;
+        let reject_loopback = self.cluster.config().network.reject_loopback_comm_addr;
         let advertised = req.address.clone();
         let agent_addr = tokio::task::spawn_blocking(move || {
             resolve_registration_comm_addr(&advertised, &remote_addr, reject_loopback)
@@ -1209,21 +1221,14 @@ impl SlurmController for ControllerService {
         let req = request.into_inner();
 
         if matches!(
-            self.cluster.config.admission.mode,
+            self.cluster.config().admission.mode,
             spur_core::config::AdmissionMode::Token
         ) {
             if req.node_token.is_empty() {
                 return Err(Status::unauthenticated("node token required"));
             }
-            let jwt_key = self
-                .cluster
-                .config
-                .auth
-                .jwt_key
-                .as_deref()
-                .unwrap_or("spur-default-key");
             let identity =
-                spur_core::admission::verify_node_token(&req.node_token, jwt_key.as_bytes())
+                spur_core::admission::verify_node_token(&req.node_token, self.jwt_key.as_bytes())
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
             if identity.hostname != req.hostname {
                 return Err(Status::permission_denied("node token hostname mismatch"));
@@ -1433,6 +1438,266 @@ impl SlurmController for ControllerService {
             .map_err(|e| Status::internal(format!("failed to create job step: {e}")))?;
 
         Ok(Response::new(CreateJobStepResponse { step_id, node_addr }))
+    }
+
+    async fn create_partition(
+        &self,
+        request: Request<CreatePartitionRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.create_partition(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward create_partition to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+
+        let req = request.into_inner();
+
+        if req.nodes.is_empty() && req.selector.is_empty() {
+            return Err(Status::invalid_argument(
+                "partition must specify at least one of nodes or selector",
+            ));
+        }
+
+        let max_time_minutes = if req.max_time.is_empty()
+            || req.max_time.eq_ignore_ascii_case("INFINITE")
+            || req.max_time.eq_ignore_ascii_case("UNLIMITED")
+        {
+            None
+        } else {
+            Some(
+                spur_core::config::parse_time_minutes(&req.max_time).ok_or_else(|| {
+                    Status::invalid_argument(format!("invalid max_time: {}", req.max_time))
+                })?,
+            )
+        };
+
+        let default_time_minutes = if req.default_time.is_empty() {
+            None
+        } else {
+            Some(
+                spur_core::config::parse_time_minutes(&req.default_time).ok_or_else(|| {
+                    Status::invalid_argument(format!("invalid default_time: {}", req.default_time))
+                })?,
+            )
+        };
+
+        let state = match req.state.to_uppercase().as_str() {
+            "" | "UP" => spur_core::partition::PartitionState::Up,
+            "DOWN" => spur_core::partition::PartitionState::Down,
+            "DRAIN" => spur_core::partition::PartitionState::Drain,
+            "INACTIVE" => spur_core::partition::PartitionState::Inactive,
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown partition state '{}'; expected UP, DOWN, DRAIN, or INACTIVE",
+                    other
+                )))
+            }
+        };
+
+        let preempt_mode = match req.preempt_mode.to_uppercase().as_str() {
+            "" | "OFF" => spur_core::partition::PreemptMode::Off,
+            "CANCEL" => spur_core::partition::PreemptMode::Cancel,
+            "REQUEUE" => spur_core::partition::PreemptMode::Requeue,
+            "SUSPEND" => spur_core::partition::PreemptMode::Suspend,
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown preempt_mode '{}'; expected OFF, CANCEL, REQUEUE, or SUSPEND",
+                    other
+                )))
+            }
+        };
+
+        let partition = spur_core::partition::Partition {
+            name: req.name,
+            state,
+            is_default: req.is_default,
+            nodes: req.nodes,
+            selector: req.selector.into_iter().collect(),
+            max_time_minutes,
+            default_time_minutes,
+            // A literal 0 means "no limit" (matches the update-partition
+            // contract) rather than a partition that can never run a job.
+            max_nodes: req.max_nodes.filter(|&n| n != 0),
+            min_nodes: if req.min_nodes == 0 { 1 } else { req.min_nodes },
+            allow_accounts: req.allow_accounts,
+            allow_groups: req.allow_groups,
+            deny_accounts: req.deny_accounts,
+            deny_qos: req.deny_qos,
+            allow_qos: req.allow_qos,
+            priority_tier: req.priority_tier,
+            preempt_mode,
+            ..Default::default()
+        };
+
+        self.cluster
+            .create_partition(partition)
+            .map_err(partition_rpc_status)?;
+
+        Ok(Response::new(()))
+    }
+
+    async fn update_partition(
+        &self,
+        request: Request<UpdatePartitionRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.update_partition(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward update_partition to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+
+        let req = request.into_inner();
+
+        let state = req
+            .state
+            .map(|s| match s.to_uppercase().as_str() {
+                v @ ("UP" | "DOWN" | "DRAIN" | "INACTIVE") => Ok(v.to_string()),
+                other => Err(Status::invalid_argument(format!(
+                    "unknown partition state '{}'; expected UP, DOWN, DRAIN, or INACTIVE",
+                    other
+                ))),
+            })
+            .transpose()?;
+
+        let preempt_mode = req
+            .preempt_mode
+            .map(|pm| match pm.to_uppercase().as_str() {
+                v @ ("OFF" | "CANCEL" | "REQUEUE" | "SUSPEND") => Ok(v.to_string()),
+                other => Err(Status::invalid_argument(format!(
+                    "unknown preempt_mode '{}'; expected OFF, CANCEL, REQUEUE, or SUSPEND",
+                    other
+                ))),
+            })
+            .transpose()?;
+
+        let max_time = req.max_time;
+        let allow_accounts = if req.set_allow_accounts {
+            Some(req.allow_accounts)
+        } else {
+            None
+        };
+        let allow_groups = if req.set_allow_groups {
+            Some(req.allow_groups)
+        } else {
+            None
+        };
+        let deny_accounts = if req.set_deny_accounts {
+            Some(req.deny_accounts)
+        } else {
+            None
+        };
+        let deny_qos = if req.set_deny_qos {
+            Some(req.deny_qos)
+        } else {
+            None
+        };
+        let allow_qos = if req.set_allow_qos {
+            Some(req.allow_qos)
+        } else {
+            None
+        };
+        let (max_nodes, clear_max_nodes) =
+            resolve_max_nodes_update(req.max_nodes_value, req.clear_max_nodes);
+
+        let selector = if req.set_selector || !req.selector.is_empty() {
+            Some(req.selector.into_iter().collect())
+        } else {
+            None
+        };
+        // Match create_partition's "0 means unset, not literally zero" rule.
+        let min_nodes = req.min_nodes.map(|mn| if mn == 0 { 1 } else { mn });
+
+        self.cluster
+            .update_partition(
+                &req.name,
+                req.nodes,
+                selector,
+                state,
+                req.is_default,
+                max_time,
+                req.default_time,
+                max_nodes,
+                clear_max_nodes,
+                min_nodes,
+                allow_accounts,
+                allow_groups,
+                deny_accounts,
+                deny_qos,
+                allow_qos,
+                req.priority_tier,
+                preempt_mode,
+            )
+            .map_err(partition_rpc_status)?;
+
+        Ok(Response::new(()))
+    }
+
+    async fn delete_partition(
+        &self,
+        request: Request<DeletePartitionRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.delete_partition(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward delete_partition to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+
+        let name = request.into_inner().name;
+        self.cluster
+            .delete_partition(&name)
+            .map_err(partition_rpc_status)?;
+
+        Ok(Response::new(()))
+    }
+
+    async fn reconfigure(&self, request: Request<()>) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.reconfigure(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward reconfigure to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+
+        self.cluster
+            .reconfigure()
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(()))
     }
 
     async fn create_reservation(
@@ -1714,7 +1979,7 @@ impl SlurmController for ControllerService {
         let mpi = spur_core::mpi::resolve_step_mpi(req.mpi.as_str(), job_mpi).to_string();
         spur_core::mpi::validate_pmix_step_agents(mpi.as_str(), plan.len())
             .map_err(Status::invalid_argument)?;
-        let pmix_tmpdir = self.cluster.config.mpi.pmix_tmpdir.clone();
+        let pmix_tmpdir = self.cluster.config().mpi.pmix_tmpdir.clone();
 
         struct NodeDispatch {
             node_name: String,
@@ -2091,6 +2356,8 @@ pub async fn serve(
 
     let leader_proxy = LeaderProxy::new(raft_handle.clone(), client_addrs.clone());
 
+    let jwt_key = resolve_startup_jwt_key(&cluster.config());
+
     let service = ControllerService {
         cluster,
         client_addrs,
@@ -2099,6 +2366,7 @@ pub async fn serve(
         rpc_stats: rpc_stats.clone(),
         sched_stats: sched_stats.clone(),
         control_plane_replicas,
+        jwt_key,
     };
 
     let stats_layer = RpcStatsLayer::new(rpc_stats, raft_handle);
@@ -2526,6 +2794,7 @@ fn partition_to_proto(part: &spur_core::partition::Partition) -> PartitionInfo {
         allow_groups: part.allow_groups.join(","),
         allow_qos: part.allow_qos.join(","),
         deny_accounts: part.deny_accounts.join(","),
+        deny_qos: part.deny_qos.join(","),
         preempt_mode: format!("{:?}", part.preempt_mode),
         priority_tier: part.priority_tier,
     }
@@ -2684,6 +2953,29 @@ fn submit_rpc_status(err: crate::cluster::SubmitError) -> Status {
         crate::cluster::SubmitError::InvalidArgument(m) => Status::invalid_argument(m),
         crate::cluster::SubmitError::Internal(m) => Status::internal(m),
     }
+}
+
+fn partition_rpc_status(err: PartitionError) -> Status {
+    match err {
+        PartitionError::InvalidArgument(m) => Status::invalid_argument(m),
+        PartitionError::NotFound(m) => Status::not_found(m),
+        PartitionError::AlreadyExists(m) => Status::already_exists(m),
+        PartitionError::Raft(m) => Status::internal(m),
+    }
+}
+
+/// Resolve an `UpdatePartitionRequest`'s max-nodes intent into the
+/// `(max_nodes, clear)` pair `ClusterManager::update_partition` expects.
+///
+/// `clear_max_nodes` and a literal `max_nodes_value == 0` both mean "no limit"
+/// (0 is documented as "clear limit" in the proto); neither can express a real
+/// 0-node cap. The two inputs must be collapsed into a single `clear` bool that
+/// is passed through — forwarding the raw request flag would drop a `--max-nodes
+/// 0` clear, since that arrives as `Some(0)` with the flag unset.
+fn resolve_max_nodes_update(max_nodes_value: Option<u32>, clear_flag: bool) -> (Option<u32>, bool) {
+    let clear = clear_flag || max_nodes_value == Some(0);
+    let max_nodes = if clear { None } else { max_nodes_value };
+    (max_nodes, clear)
 }
 
 fn cluster_err_to_status(err: anyhow::Error) -> Status {
@@ -2876,6 +3168,7 @@ mod tests {
             rpc_stats: Arc::new(RpcStatsCollector::new()),
             sched_stats: Arc::new(SchedStatsCollector::new("sched/backfill")),
             control_plane_replicas: 1,
+            jwt_key: String::new(),
         }
     }
 
@@ -2949,6 +3242,73 @@ mod tests {
         assert_eq!(status.message(), "partition 'gpu' not found");
     }
 
+    /// GATE: `auth.jwt_key` is captured at startup and must NOT change on
+    /// `reconfigure`. Swapping it live would instantly invalidate every
+    /// outstanding node token. This drives the real capture path
+    /// (`resolve_startup_jwt_key`) and the real `reconfigure`, then proves the
+    /// running controller still verifies a token minted with the startup key.
+    #[tokio::test]
+    async fn reconfigure_does_not_adopt_new_jwt_key() {
+        use spur_core::admission::{generate_node_token, verify_node_token};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let conf_path = dir.path().join("spur.conf");
+        std::fs::write(
+            &conf_path,
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\njwt_key = \"old-secret\"\n",
+        )
+        .unwrap();
+
+        let config = spur_core::config::SlurmConfig::load_from_file(&conf_path).unwrap();
+        let cluster = Arc::new(
+            ClusterManager::new_with_config_path(config, dir.path(), Some(conf_path.clone()))
+                .unwrap(),
+        );
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cluster.clone())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .unwrap();
+        cluster.set_raft(handle.raft);
+
+        // The controller captures the signing key exactly here, at startup.
+        let startup_key = resolve_startup_jwt_key(&cluster.config());
+        assert_eq!(startup_key, "old-secret");
+        let token = generate_node_token("node-1", startup_key.as_bytes()).unwrap();
+
+        // Operator edits jwt_key and reconfigures.
+        std::fs::write(
+            &conf_path,
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\njwt_key = \"new-secret\"\n",
+        )
+        .unwrap();
+        cluster.reconfigure().unwrap();
+
+        // The live config reflects the new key (proving reconfigure did swap
+        // config)...
+        assert_eq!(
+            cluster.config().auth.jwt_key.as_deref(),
+            Some("new-secret"),
+            "reconfigure must swap the live config"
+        );
+        // ...but the controller's captured key is unchanged, so tokens minted
+        // with the startup key still verify. A live-reloaded key would reject
+        // this token.
+        assert_eq!(startup_key, "old-secret", "captured key must not change");
+        assert!(
+            verify_node_token(&token, startup_key.as_bytes()).is_ok(),
+            "outstanding node token must still verify against the startup key"
+        );
+        assert!(
+            verify_node_token(&token, b"new-secret").is_err(),
+            "sanity: the token would fail under the new key (proving the key matters)"
+        );
+    }
+
     #[test]
     fn submit_rpc_status_maps_internal() {
         use crate::cluster::SubmitError;
@@ -2989,6 +3349,7 @@ mod tests {
             rpc_stats: std::sync::Arc::new(RpcStatsCollector::new()),
             sched_stats: std::sync::Arc::new(SchedStatsCollector::new("backfill")),
             control_plane_replicas: 1,
+            jwt_key: String::new(),
         }
     }
 
@@ -3602,6 +3963,20 @@ mod tests {
         let info = job_to_proto(&job);
         assert_eq!(info.stdout_path, "/tmp/spur-42.out");
         assert_eq!(info.stderr_path, "/tmp/spur-42.out");
+    }
+
+    #[test]
+    fn resolve_max_nodes_update_maps_intents() {
+        // `--max-nodes 0` (Some(0), flag unset) must resolve to a clear, not a
+        // silent no-op: cluster.rs only clears when the passed bool is true.
+        assert_eq!(resolve_max_nodes_update(Some(0), false), (None, true));
+        // Explicit clear flag, regardless of value.
+        assert_eq!(resolve_max_nodes_update(None, true), (None, true));
+        assert_eq!(resolve_max_nodes_update(Some(4), true), (None, true));
+        // A real positive cap is preserved and does not clear.
+        assert_eq!(resolve_max_nodes_update(Some(4), false), (Some(4), false));
+        // No value and no flag means "leave unchanged".
+        assert_eq!(resolve_max_nodes_update(None, false), (None, false));
     }
 
     fn make_node_info(name: &str) -> NodeInfo {
