@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use spur_proto::proto::UpdateNodeRequest;
+use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
+use spur_proto::proto::{GetNodesRequest, UpdateNodeRequest};
 
 /// Node management commands.
 #[derive(Parser, Debug)]
@@ -104,8 +105,8 @@ fn parse_label_args(label_args: &[String]) -> Result<(HashMap<String, String>, V
 
 async fn cmd_label(controller: &str, node_pattern: String, label_args: Vec<String>) -> Result<()> {
     let (set_labels, remove_labels) = parse_label_args(&label_args)?;
-    let nodes = expand_node_pattern(&node_pattern)?;
     let mut client = spur_proto::controller_client(spur_client::connect_channel(controller).await?);
+    let nodes = resolve_node_names(&mut client, &node_pattern).await?;
 
     let mut failed: Vec<String> = Vec::new();
     for node in &nodes {
@@ -146,8 +147,8 @@ async fn cmd_label(controller: &str, node_pattern: String, label_args: Vec<Strin
 }
 
 async fn cmd_drain(controller: &str, node_pattern: String, reason: Option<String>) -> Result<()> {
-    let nodes = expand_node_pattern(&node_pattern)?;
     let mut client = spur_proto::controller_client(spur_client::connect_channel(controller).await?);
+    let nodes = resolve_node_names(&mut client, &node_pattern).await?;
 
     let mut failed: Vec<String> = Vec::new();
     for node in &nodes {
@@ -196,8 +197,8 @@ async fn cmd_remove(
     force: bool,
     reason: Option<String>,
 ) -> Result<()> {
-    let nodes = expand_node_pattern(&node_pattern)?;
     let mut client = spur_proto::controller_client(spur_client::connect_channel(controller).await?);
+    let nodes = resolve_node_names(&mut client, &node_pattern).await?;
 
     let mut failed: Vec<String> = Vec::new();
     for node in &nodes {
@@ -243,6 +244,36 @@ async fn cmd_remove(
         );
     }
     Ok(())
+}
+
+fn is_all_node_pattern(pattern: &str) -> bool {
+    pattern.eq_ignore_ascii_case("ALL")
+}
+
+async fn resolve_node_names(
+    client: &mut SlurmControllerClient<tonic::transport::Channel>,
+    pattern: &str,
+) -> Result<Vec<String>> {
+    if is_all_node_pattern(pattern) {
+        let response = client
+            .get_nodes(GetNodesRequest {
+                nodelist: String::new(),
+                ..Default::default()
+            })
+            .await
+            .context("failed to get nodes")?;
+        let names: Vec<String> = response
+            .into_inner()
+            .nodes
+            .into_iter()
+            .map(|node| node.name)
+            .collect();
+        if names.is_empty() {
+            bail!("no nodes registered in the cluster");
+        }
+        return Ok(names);
+    }
+    expand_node_pattern(pattern)
 }
 
 fn expand_node_pattern(pattern: &str) -> Result<Vec<String>> {
@@ -302,5 +333,25 @@ mod tests {
         let (set, remove) = parse_label_args(&args).unwrap();
         assert_eq!(set.get("env").unwrap(), "prod-");
         assert!(remove.is_empty());
+    }
+
+    #[test]
+    fn test_all_node_pattern_is_case_insensitive() {
+        for pattern in ["ALL", "all", "All"] {
+            assert!(is_all_node_pattern(pattern));
+        }
+        assert!(!is_all_node_pattern("node-all"));
+    }
+
+    #[test]
+    fn test_expand_node_pattern_preserves_hostlists() {
+        assert_eq!(
+            expand_node_pattern("node[1-3]").unwrap(),
+            vec![
+                "node1".to_string(),
+                "node2".to_string(),
+                "node3".to_string()
+            ]
+        );
     }
 }
