@@ -127,6 +127,7 @@ mod tests {
             ),
             (PendingReason::ReservationDeleted, "ReservationDeleted"),
             (PendingReason::JobHoldMaxRequeue, "JobHoldMaxRequeue"),
+            (PendingReason::TimeLimit, "TimeLimit"),
             (PendingReason::QosMaxCpuPerJobLimit, "QOSMaxCpuPerJobLimit"),
             (
                 PendingReason::QosMaxWallDurationPerJobLimit,

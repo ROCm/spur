@@ -69,6 +69,15 @@ pub enum WalOperation {
         exit_code: i32,
         signal: i32,
     },
+    /// The time-limit watchdog signalled a running job for exhausting its wall
+    /// clock. Durable so the grace period survives a leadership change and so
+    /// every replica finalizes the run as `Timeout` rather than reading the
+    /// terminating signal as an ordinary failure. `at` is stamped on the leader
+    /// so replicas share one instant instead of consulting their own clocks.
+    JobTimeLimitSignaled {
+        job_id: JobId,
+        at: chrono::DateTime<chrono::Utc>,
+    },
     /// An srun job step finished. Records the step's exit code durably so the
     /// job's DerivedExitCode (running max over steps) survives restart/replay.
     JobStepComplete {
@@ -881,6 +890,24 @@ mod suspend_wal_tests {
                 }
                 _ => panic!("variant mismatch after round-trip"),
             }
+        }
+    }
+
+    #[test]
+    fn job_time_limit_signaled_op_round_trips() {
+        let at = chrono::Utc::now();
+        let op = WalOperation::JobTimeLimitSignaled { job_id: 13, at };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobTimeLimitSignaled {
+                job_id,
+                at: at_back,
+            } => {
+                assert_eq!(job_id, 13);
+                assert_eq!(at_back, at);
+            }
+            _ => panic!("wrong variant"),
         }
     }
 }
