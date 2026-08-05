@@ -129,6 +129,7 @@ pub(crate) fn provision_assignments(
     state: &K0sClusterState,
 ) -> anyhow::Result<()> {
     let mut nodes = cluster.get_nodes();
+    nodes.retain(|n| state.is_member(&n.name));
     if nodes.is_empty() {
         return Ok(());
     }
@@ -211,9 +212,66 @@ pub(crate) fn provision_assignments(
     // Persist the bootstrap choice if not already recorded (legacy single-CP path; `cluster_up`
     // records the full set up front for HA).
     if state.control_plane_node.as_deref() != Some(bootstrap.as_str()) {
-        cluster.set_k0s_phase(K0sPhase::Provisioning, Some(bootstrap), Vec::new(), false)?;
+        cluster.set_k0s_phase(
+            K0sPhase::Provisioning,
+            Some(bootstrap),
+            Vec::new(),
+            Vec::new(),
+            false,
+        )?;
     }
     Ok(())
+}
+
+/// Resolve the member scope for `spur k8s up` fail-closed: the UNION of a `nodes` hostlist, a
+/// `partition`'s members, and a label `selector` (all pairs match). Empty (nothing given) = whole inventory.
+pub(crate) fn resolve_member_nodes(
+    all_nodes: &[spur_core::node::Node],
+    nodes_hostlist: &str,
+    partition: &str,
+    selector: &HashMap<String, String>,
+) -> Result<Vec<String>, String> {
+    if nodes_hostlist.is_empty() && partition.is_empty() && selector.is_empty() {
+        return Ok(Vec::new());
+    }
+    let registered: HashSet<&str> = all_nodes.iter().map(|n| n.name.as_str()).collect();
+    let mut members: HashSet<String> = HashSet::new();
+
+    if !nodes_hostlist.is_empty() {
+        let expanded = spur_core::hostlist::expand(nodes_hostlist)
+            .map_err(|e| format!("invalid --nodes hostlist {nodes_hostlist}: {e}"))?;
+        for name in expanded {
+            if !registered.contains(name.as_str()) {
+                return Err(format!("node {name} is not a registered node"));
+            }
+            members.insert(name);
+        }
+    }
+    if !partition.is_empty() {
+        let mut any = false;
+        for n in all_nodes {
+            if n.partitions.iter().any(|p| p == partition) {
+                members.insert(n.name.clone());
+                any = true;
+            }
+        }
+        if !any {
+            return Err(format!("partition {partition} has no registered nodes"));
+        }
+    }
+    if !selector.is_empty() {
+        for n in all_nodes {
+            if selector.iter().all(|(k, v)| n.labels.get(k) == Some(v)) {
+                members.insert(n.name.clone());
+            }
+        }
+    }
+    if members.is_empty() {
+        return Err("node selection matched no registered nodes".to_string());
+    }
+    let mut out: Vec<String> = members.into_iter().collect();
+    out.sort();
+    Ok(out)
 }
 
 /// Resolve the control-plane set for `spur k8s up`, fail-closed, bootstrap node first: an explicit
@@ -259,12 +317,19 @@ pub(crate) fn resolve_control_plane_set(
             candidates.len()
         ));
     }
+    // Fail closed on a pinned bootstrap outside the candidate set (e.g. a --control-plane-node not in
+    // the requested node scope) — else `.1`/etcd-seed silently lands on a different, in-scope node.
+    if let Some(boot) = pinned_bootstrap {
+        if !candidates.iter().any(|c| c == boot) {
+            return Err(format!(
+                "control-plane node {boot} is not among the selected cluster nodes"
+            ));
+        }
+    }
     // Pin the bootstrap into the set first so `.1` lands on it, then fill from the lowest names.
     let mut set: Vec<String> = Vec::new();
     if let Some(boot) = pinned_bootstrap {
-        if candidates.iter().any(|c| c == boot) {
-            set.push(boot.to_string());
-        }
+        set.push(boot.to_string());
     }
     for c in candidates {
         if set.len() >= replicas as usize {
@@ -646,7 +711,7 @@ async fn converge_provisioning(
     // Only transition on the edge — this reconcile also runs every tick while already Ready (to
     // heal re-added nodes), so an unconditional set would churn a WAL write + log line each tick.
     if all_active && cluster.k0s_state().phase != K0sPhase::Ready {
-        match cluster.set_k0s_phase(K0sPhase::Ready, None, Vec::new(), false) {
+        match cluster.set_k0s_phase(K0sPhase::Ready, None, Vec::new(), Vec::new(), false) {
             Ok(()) => info!("k0s cluster converged: all components active -> Ready"),
             Err(e) => warn!(error = %e, "failed to mark k0s cluster Ready"),
         }
@@ -938,11 +1003,117 @@ mod tests {
     }
 
     #[test]
+    fn resolve_cp_set_rejects_singular_pin_outside_candidates() {
+        // With candidates narrowed to the member scope, a --control-plane-node outside it must error
+        // rather than be silently dropped and a different in-scope node elected.
+        let err = resolve_control_plane_set(names(&["a", "b"]), &[], Some("z"), 1).unwrap_err();
+        assert!(
+            err.contains("control-plane node z is not among the selected"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
     fn first_host_is_dot_one() {
         assert_eq!(
             first_host("10.44.0.0/16").unwrap(),
             "10.44.0.1".parse::<Ipv4Addr>().unwrap()
         );
+    }
+
+    fn scope_node(name: &str, parts: &[&str], labels: &[(&str, &str)]) -> spur_core::node::Node {
+        let mut n = spur_core::node::Node::new(name.to_string(), Default::default());
+        n.partitions = parts.iter().map(|s| s.to_string()).collect();
+        n.labels = labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        n
+    }
+
+    fn sel(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn resolve_members_empty_selection_is_whole_inventory() {
+        let nodes = vec![scope_node("a", &[], &[]), scope_node("b", &[], &[])];
+        assert_eq!(
+            resolve_member_nodes(&nodes, "", "", &HashMap::new()).unwrap(),
+            Vec::<String>::new(),
+            "no selection = empty = whole inventory"
+        );
+    }
+
+    #[test]
+    fn resolve_members_hostlist_expands_and_sorts() {
+        let nodes = vec![
+            scope_node("gpu01", &[], &[]),
+            scope_node("gpu02", &[], &[]),
+            scope_node("gpu03", &[], &[]),
+        ];
+        let out = resolve_member_nodes(&nodes, "gpu[01-02]", "", &HashMap::new()).unwrap();
+        assert_eq!(out, names(&["gpu01", "gpu02"]));
+    }
+
+    #[test]
+    fn resolve_members_hostlist_rejects_unregistered() {
+        let nodes = vec![scope_node("a", &[], &[])];
+        let err = resolve_member_nodes(&nodes, "a,ghost", "", &HashMap::new()).unwrap_err();
+        assert!(err.contains("ghost is not a registered node"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_members_partition_selects_members() {
+        let nodes = vec![
+            scope_node("a", &["gpu"], &[]),
+            scope_node("b", &["cpu"], &[]),
+            scope_node("c", &["gpu"], &[]),
+        ];
+        let out = resolve_member_nodes(&nodes, "", "gpu", &HashMap::new()).unwrap();
+        assert_eq!(out, names(&["a", "c"]));
+    }
+
+    #[test]
+    fn resolve_members_empty_partition_rejected() {
+        let nodes = vec![scope_node("a", &["gpu"], &[])];
+        let err = resolve_member_nodes(&nodes, "", "nope", &HashMap::new()).unwrap_err();
+        assert!(err.contains("partition nope has no"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_members_selector_matches_all_pairs() {
+        let nodes = vec![
+            scope_node("a", &[], &[("zone", "z1"), ("gpu", "mi300")]),
+            scope_node("b", &[], &[("zone", "z1"), ("gpu", "mi200")]),
+            scope_node("c", &[], &[("zone", "z2"), ("gpu", "mi300")]),
+        ];
+        let out = resolve_member_nodes(&nodes, "", "", &sel(&[("zone", "z1"), ("gpu", "mi300")]))
+            .unwrap();
+        assert_eq!(out, names(&["a"]), "only the node matching BOTH pairs");
+    }
+
+    #[test]
+    fn resolve_members_union_dedups_across_surfaces() {
+        let nodes = vec![
+            scope_node("a", &["gpu"], &[("fast", "1")]),
+            scope_node("b", &["gpu"], &[]),
+            scope_node("c", &[], &[("fast", "1")]),
+            scope_node("d", &[], &[]),
+        ];
+        // hostlist {a} ∪ partition gpu {a,b} ∪ selector fast=1 {a,c} = {a,b,c}, a not duplicated.
+        let out = resolve_member_nodes(&nodes, "a", "gpu", &sel(&[("fast", "1")])).unwrap();
+        assert_eq!(out, names(&["a", "b", "c"]));
+    }
+
+    #[test]
+    fn resolve_members_selector_no_match_rejected() {
+        let nodes = vec![scope_node("a", &[], &[("zone", "z1")])];
+        let err = resolve_member_nodes(&nodes, "", "", &sel(&[("zone", "z9")])).unwrap_err();
+        assert!(err.contains("matched no registered nodes"), "got: {err}");
     }
 
     fn mesh_node(

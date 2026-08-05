@@ -73,3 +73,20 @@ class TestK8sSchedulingExclusion:
             f"job should stay pending on a k8s-reserved node:\n{cluster.squeue_all()}"
         )
         cluster.scancel(str(held))
+
+    def test_k8s_up_scopes_membership_to_selected_node(self, k8s_enabled_cluster):
+        # `spur k8s up --nodes <node>` records exactly that node as the member scope
+        # (SPUR-112); an empty scope would report "all nodes" instead.
+        cluster = k8s_enabled_cluster
+        target = cluster.node_names[0]
+        cluster.k8s_up(["--nodes", target])
+        deadline = time.time() + 60
+        members = ""
+        while time.time() < deadline:
+            members = cluster.k8s_members()
+            if members == target:
+                break
+            time.sleep(3)
+        assert members == target, (
+            f"members scope should be exactly [{target}], got [{members}]:\n{cluster.k8s_status()}"
+        )

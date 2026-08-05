@@ -42,6 +42,16 @@ pub enum K8sCommand {
         /// Overrides --replicas.
         #[arg(long = "control-plane-nodes", value_delimiter = ',')]
         control_plane_nodes: Vec<String>,
+        /// Scope the cluster to a subset of nodes (hostlist, e.g. "gpu[01-08]"). Combined with
+        /// --partition/--selector as a union; empty = enroll the whole inventory.
+        #[arg(long)]
+        nodes: Option<String>,
+        /// Scope the cluster to a partition's nodes.
+        #[arg(long)]
+        partition: Option<String>,
+        /// Scope the cluster to nodes matching every key=value label (repeatable).
+        #[arg(long = "selector", value_parser = parse_key_val)]
+        selector: Vec<(String, String)>,
     },
     /// Tear the k0s cluster down.
     Down {
@@ -88,12 +98,18 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             control_plane_node,
             replicas,
             control_plane_nodes,
+            nodes,
+            partition,
+            selector,
         } => {
             cmd_up(
                 &controller,
                 control_plane_node,
                 replicas,
                 control_plane_nodes,
+                nodes,
+                partition,
+                selector,
             )
             .await
         }
@@ -110,6 +126,16 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
 fn effective_user() -> String {
     whoami::username().unwrap_or_else(|_| "unknown".into())
+}
+
+fn parse_key_val(s: &str) -> Result<(String, String), String> {
+    let (k, v) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected key=value, got {s}"))?;
+    if k.is_empty() {
+        return Err(format!("empty selector key in {s}"));
+    }
+    Ok((k.to_string(), v.to_string()))
 }
 
 async fn cmd_install_k0s(version: &str, path: &str, force: bool) -> Result<()> {
@@ -130,11 +156,15 @@ async fn cmd_install_k0s(version: &str, path: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_up(
     controller: &str,
     control_plane_node: Option<String>,
     replicas: Option<u32>,
     control_plane_nodes: Vec<String>,
+    nodes: Option<String>,
+    partition: Option<String>,
+    selector: Vec<(String, String)>,
 ) -> Result<()> {
     let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
     let resp = client
@@ -143,6 +173,9 @@ async fn cmd_up(
             control_plane_replicas: replicas,
             control_plane_nodes,
             caller: effective_user(),
+            nodes: nodes.unwrap_or_default(),
+            partition: partition.unwrap_or_default(),
+            selector: selector.into_iter().collect(),
         })
         .await?
         .into_inner();
@@ -186,6 +219,11 @@ async fn cmd_status(controller: &str) -> Result<()> {
     } else if !resp.control_plane_node.is_empty() {
         println!("control-plane: {}", resp.control_plane_node);
     }
+    if resp.member_nodes.is_empty() {
+        println!("members: all nodes");
+    } else {
+        println!("members: {}", resp.member_nodes.join(", "));
+    }
     for n in resp.nodes {
         println!(
             "  {:<24} {:<11} {:<11} enabled={}",
@@ -223,6 +261,7 @@ mod tests {
                 control_plane_node,
                 replicas,
                 control_plane_nodes,
+                ..
             } => {
                 assert_eq!(control_plane_node.as_deref(), Some("head-node"));
                 assert_eq!(replicas, None);
@@ -230,6 +269,47 @@ mod tests {
             }
             _ => panic!("wrong command"),
         }
+    }
+
+    #[test]
+    fn parses_up_with_node_scope_flags() {
+        let args = K8sArgs::try_parse_from([
+            "k8s",
+            "up",
+            "--nodes",
+            "gpu[01-08]",
+            "--partition",
+            "batch",
+            "--selector",
+            "zone=z1",
+            "--selector",
+            "gpu=mi300",
+        ])
+        .unwrap();
+        match args.command {
+            K8sCommand::Up {
+                nodes,
+                partition,
+                selector,
+                ..
+            } => {
+                assert_eq!(nodes.as_deref(), Some("gpu[01-08]"));
+                assert_eq!(partition.as_deref(), Some("batch"));
+                assert_eq!(
+                    selector,
+                    vec![
+                        ("zone".to_string(), "z1".to_string()),
+                        ("gpu".to_string(), "mi300".to_string())
+                    ]
+                );
+            }
+            _ => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn selector_without_equals_is_rejected() {
+        assert!(K8sArgs::try_parse_from(["k8s", "up", "--selector", "bogus"]).is_err());
     }
 
     #[test]

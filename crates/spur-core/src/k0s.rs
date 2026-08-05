@@ -125,7 +125,7 @@ mod cluster_state_tests {
             phase: K0sPhase::Ready,
             control_plane_node: Some("cp-1".into()),
             control_plane_nodes: vec!["cp-1".into(), "cp-2".into(), "cp-3".into()],
-            reset_requested: false,
+            ..Default::default()
         };
         assert_eq!(st.controllers(), vec!["cp-1", "cp-2", "cp-3"]);
         assert_eq!(st.bootstrap().as_deref(), Some("cp-1"));
@@ -135,9 +135,8 @@ mod cluster_state_tests {
     fn bootstrap_falls_back_to_first_of_set_when_singular_absent() {
         let st = K0sClusterState {
             phase: K0sPhase::Ready,
-            control_plane_node: None,
             control_plane_nodes: vec!["cp-1".into(), "cp-2".into(), "cp-3".into()],
-            reset_requested: false,
+            ..Default::default()
         };
         assert_eq!(st.bootstrap().as_deref(), Some("cp-1"));
     }
@@ -145,6 +144,23 @@ mod cluster_state_tests {
     #[test]
     fn controllers_empty_when_down() {
         assert!(K0sClusterState::default().controllers().is_empty());
+    }
+
+    #[test]
+    fn is_member_empty_scope_matches_all() {
+        let st = K0sClusterState::default();
+        assert!(st.is_member("anything"), "empty scope = whole inventory");
+    }
+
+    #[test]
+    fn is_member_respects_recorded_scope() {
+        let st = K0sClusterState {
+            member_nodes: vec!["a".into(), "b".into()],
+            ..Default::default()
+        };
+        assert!(st.is_member("a"));
+        assert!(st.is_member("b"));
+        assert!(!st.is_member("c"), "out-of-scope node excluded");
     }
 }
 
@@ -233,6 +249,9 @@ pub struct K0sClusterState {
     /// All control-plane nodes (1/3/5). Empty on pre-multi-CP state — read via [`Self::controllers`].
     #[serde(default)]
     pub control_plane_nodes: Vec<String>,
+    /// Nodes the cluster is scoped to. Empty = enroll the whole inventory (back-compat).
+    #[serde(default)]
+    pub member_nodes: Vec<String>,
     #[serde(default)]
     pub reset_requested: bool,
 }
@@ -253,5 +272,10 @@ impl K0sClusterState {
         self.control_plane_node
             .clone()
             .or_else(|| self.control_plane_nodes.first().cloned())
+    }
+
+    /// Whether `name` is in scope for enrollment. An empty `member_nodes` means the whole inventory.
+    pub fn is_member(&self, name: &str) -> bool {
+        self.member_nodes.is_empty() || self.member_nodes.iter().any(|n| n == name)
     }
 }

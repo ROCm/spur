@@ -2159,9 +2159,29 @@ impl SlurmController for ControllerService {
         let nodes = self.cluster.get_nodes();
         let assigned = nodes.iter().any(|n| n.k0s_role.is_some());
 
+        // Resolve the node scope fail-closed; a bare re-up of an assigned cluster keeps the recorded
+        // scope, a fresh up with no selection = whole inventory. CP candidates are the in-scope members.
+        let scope_requested =
+            !req.nodes.is_empty() || !req.partition.is_empty() || !req.selector.is_empty();
+        let member_nodes = if assigned && !scope_requested {
+            state.member_nodes.clone()
+        } else {
+            crate::cluster_k8s::resolve_member_nodes(
+                &nodes,
+                &req.nodes,
+                &req.partition,
+                &req.selector,
+            )
+            .map_err(Status::invalid_argument)?
+        };
+        let candidates: Vec<String> = if member_nodes.is_empty() {
+            nodes.iter().map(|n| n.name.clone()).collect()
+        } else {
+            member_nodes.clone()
+        };
+
         // Resolve the HA control-plane set fail-closed BEFORE recording intent: an explicit node
         // list wins, else `--replicas` (or the config default) picks the lowest-named nodes.
-        let candidates: Vec<String> = nodes.into_iter().map(|n| n.name).collect();
         let explicit_override =
             !req.control_plane_nodes.is_empty() || req.control_plane_replicas.is_some();
         let replicas = req
@@ -2201,6 +2221,12 @@ impl SlurmController for ControllerService {
                     cp_set.join(", "),
                 )));
             }
+            if scope_requested && member_nodes != state.member_nodes {
+                return Err(Status::failed_precondition(
+                    "cluster membership is already assigned; tear the cluster down \
+                     (spur k8s down --reset) before changing the node scope",
+                ));
+            }
         }
 
         let bootstrap = cp_set.first().cloned();
@@ -2209,6 +2235,7 @@ impl SlurmController for ControllerService {
                 spur_core::k0s::K0sPhase::Provisioning,
                 bootstrap,
                 cp_set,
+                member_nodes,
                 false,
             )
             .map_err(|e| Status::internal(format!("set k0s phase: {e}")))?;
@@ -2243,7 +2270,13 @@ impl SlurmController for ControllerService {
             ));
         }
         self.cluster
-            .set_k0s_phase(spur_core::k0s::K0sPhase::Down, None, Vec::new(), req.reset)
+            .set_k0s_phase(
+                spur_core::k0s::K0sPhase::Down,
+                None,
+                Vec::new(),
+                Vec::new(),
+                req.reset,
+            )
             .map_err(|e| Status::internal(format!("set k0s phase: {e}")))?;
         Ok(Response::new(ClusterDownResponse {
             accepted: true,
@@ -2267,6 +2300,7 @@ impl SlurmController for ControllerService {
             phase: crate::cluster_k8s::phase_str(state.phase),
             control_plane_node: state.control_plane_node.unwrap_or_default(),
             control_plane_nodes,
+            member_nodes: state.member_nodes,
             nodes: crate::cluster_k8s::live_node_statuses(&self.cluster).await,
         }))
     }
@@ -3692,6 +3726,7 @@ mod tests {
                 K0sPhase::Ready,
                 Some("cp-a".into()),
                 vec!["cp-a".into(), "cp-b".into(), "cp-c".into()],
+                Vec::new(),
                 false,
             )
             .unwrap();
@@ -3798,6 +3833,121 @@ mod tests {
             .expect("an Admin-level caller may bring the cluster up")
             .into_inner();
         assert!(resp.accepted);
+    }
+
+    async fn register_plain_node(svc: &ControllerService, name: &str, port: u16) {
+        svc.cluster
+            .register_node(
+                name.into(),
+                name.into(),
+                spur_core::resource::ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                port,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                std::collections::HashMap::new(),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_scopes_membership_to_selected_nodes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        for (i, n) in ["node-a", "node-b", "node-c"].iter().enumerate() {
+            register_plain_node(&svc, n, 6818 + i as u16).await;
+        }
+        let resp = svc
+            .cluster_up(Request::new(ClusterUpRequest {
+                nodes: "node-a,node-b".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect("scoped up accepted")
+            .into_inner();
+        assert!(resp.accepted);
+        assert_eq!(
+            svc.cluster.k0s_state().member_nodes,
+            vec!["node-a", "node-b"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_rejects_control_plane_outside_scope() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        for (i, n) in ["node-a", "node-b", "node-c"].iter().enumerate() {
+            register_plain_node(&svc, n, 6818 + i as u16).await;
+        }
+        let err = svc
+            .cluster_up(Request::new(ClusterUpRequest {
+                nodes: "node-a,node-b".into(),
+                control_plane_nodes: vec!["node-c".into()],
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a control plane outside the node scope must be rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    async fn scoped_assigned_cluster(svc: &ControllerService) {
+        for (i, n) in ["node-a", "node-b", "node-c"].iter().enumerate() {
+            register_plain_node(svc, n, 6818 + i as u16).await;
+        }
+        svc.cluster
+            .set_k0s_phase(
+                spur_core::k0s::K0sPhase::Provisioning,
+                Some("node-a".into()),
+                vec!["node-a".into()],
+                vec!["node-a".into(), "node-b".into()],
+                false,
+            )
+            .unwrap();
+        svc.cluster
+            .assign_node_k0s(
+                "node-a",
+                spur_core::k0s::K0sRole::Single,
+                "10.44.0.1",
+                "10.42.0.0/24",
+            )
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_bare_reup_preserves_recorded_scope() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        scoped_assigned_cluster(&svc).await;
+        let resp = svc
+            .cluster_up(Request::new(ClusterUpRequest::default()))
+            .await
+            .expect("bare re-up accepted")
+            .into_inner();
+        assert!(resp.accepted);
+        assert_eq!(
+            svc.cluster.k0s_state().member_nodes,
+            vec!["node-a", "node-b"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_rejects_scope_change_on_assigned_cluster() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        scoped_assigned_cluster(&svc).await;
+        let err = svc
+            .cluster_up(Request::new(ClusterUpRequest {
+                nodes: "node-a,node-c".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("changing scope on an assigned cluster must be rejected");
+        assert_eq!(err.code(), Code::FailedPrecondition);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

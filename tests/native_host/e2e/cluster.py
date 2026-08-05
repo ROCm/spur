@@ -463,6 +463,13 @@ class SpurCluster:
                 return [n.strip() for n in names.split(",") if n.strip()]
         return []
 
+    def k8s_members(self) -> str:
+        """Parse the `members:` line from `spur k8s status` ("all nodes" or a name list)."""
+        for line in self.k8s_status().splitlines():
+            if line.startswith("members:"):
+                return line.split(":", 1)[1].strip()
+        return ""
+
     def k8s_active_controllers(self) -> list[str]:
         """Node names whose `spur k8s status` row is role=controller/single and active."""
         out = []
