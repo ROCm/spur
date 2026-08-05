@@ -13,16 +13,16 @@ def _wait_registered(cluster, timeout=30):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            out = cluster.sinfo()
-            if all(name in out for name in cluster.node_names):
-                return out
+            nodes = cluster.sinfo_nodes()
+            if all(name in nodes for name in cluster.node_names):
+                return nodes
         except Exception:
             pass
         time.sleep(2)
-    out = cluster.sinfo()
+    nodes = cluster.sinfo_nodes()
     for name in cluster.node_names:
-        assert name in out, f"node {name} not registered within {timeout}s"
-    return out
+        assert name in nodes, f"node {name} not registered within {timeout}s"
+    return nodes
 
 
 def _assert_not_registered(cluster, timeout=15):
@@ -30,12 +30,12 @@ def _assert_not_registered(cluster, timeout=15):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            out = cluster.sinfo()
+            nodes = cluster.sinfo_nodes()
         except Exception:
             time.sleep(2)
             continue
         for name in cluster.node_names:
-            assert name not in out, (
+            assert name not in nodes, (
                 f"node {name} registered unexpectedly"
             )
         time.sleep(2)
@@ -45,10 +45,10 @@ class TestAdmissionOpen:
     """Verify open mode (default) works without tokens."""
 
     def test_open_mode_agents_register_without_token(self, cluster):
-        out = cluster.sinfo()
+        states = cluster.sinfo_nodes()
         for name in cluster.node_names:
-            assert name in out, f"node {name} not found in sinfo"
-        assert "idle" in out
+            assert name in states, f"node {name} not found in sinfo"
+        assert any(s.startswith("idle") for s in states.values())
 
 
 class TestAdmissionToken:
@@ -130,9 +130,9 @@ class TestAdmissionToken:
 
         time.sleep(45)
 
-        out = cluster.sinfo()
+        states = cluster.sinfo_nodes()
         for name in cluster.node_names:
-            assert name in out, f"node {name} disappeared after heartbeat interval"
-        for line in out.splitlines():
-            if any(name in line for name in cluster.node_names):
-                assert "down" not in line.split(), "node marked down - heartbeat JWT likely failing"
+            assert name in states, f"node {name} disappeared after heartbeat interval"
+            assert not states[name].startswith("down"), (
+                "node marked down - heartbeat JWT likely failing"
+            )

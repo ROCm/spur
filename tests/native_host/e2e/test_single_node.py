@@ -14,11 +14,11 @@ class TestClusterHealth:
         assert out.strip(), "sinfo produced no output"
 
     def test_all_nodes_registered_and_idle(self, cluster):
-        out = cluster.sinfo()
+        states = cluster.sinfo_nodes()
         for name in cluster.node_names:
-            assert name in out, f"node {name} not in sinfo:\n{out}"
-        assert cluster._cluster_is_ready(out), (
-            f"expected {len(cluster.node_names)} idle nodes, sinfo:\n{out}"
+            assert name in states, f"node {name} not in sinfo:\n{states}"
+        assert cluster._cluster_is_ready(), (
+            f"expected {len(cluster.node_names)} idle nodes, states:\n{states}"
         )
 
 
@@ -138,8 +138,8 @@ class TestJobLifecycle:
 
         deadline = time.time() + 15
         while time.time() < deadline:
-            info = cluster.sinfo()
-            if "idle" in info and "mix" not in info and "alloc" not in info:
+            states = cluster.sinfo_nodes()
+            if states and all(s.startswith("idle") for s in states.values()):
                 return
             time.sleep(2)
         assert False, "node should return to idle after cancel"

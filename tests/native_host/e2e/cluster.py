@@ -436,6 +436,41 @@ class SpurCluster:
     def sinfo(self) -> str:
         return self.cli(["sinfo"])
 
+    def sinfo_nodes(self, controller_addr: str | None = None) -> dict[str, str]:
+        """Map node name to state via node-oriented sinfo.
+
+        ``sinfo -N`` emits one line per node with the full, uncompressed name,
+        so this is agnostic to NODELIST hostlist compression (``node[1-4]``).
+        The state is the short form (idle/mix/alloc/down/drain/resv), with any
+        trailing ``*`` (non-responding marker) stripped.
+
+        *controller_addr* overrides the endpoint(s) as in :meth:`cli`.
+        """
+        out = self.cli(["sinfo", "-N", "-h", "-o", "%N %t"],
+                       controller_addr=controller_addr)
+        states: dict[str, str] = {}
+        for line in out.splitlines():
+            fields = line.split()
+            if len(fields) >= 2:
+                states[fields[0]] = fields[1].rstrip("*")
+        return states
+
+    def nodes_in_partition(self, partition: str) -> set[str]:
+        """Return the set of node names belonging to *partition*.
+
+        Uses node-oriented sinfo so membership is exact even when the default
+        output would compress several nodes into one bracketed hostlist. A node
+        in multiple partitions appears once per partition. The partition name
+        carries a trailing ``*`` when it is the default, so that is stripped.
+        """
+        out = self.cli(["sinfo", "-N", "-h", "-o", "%N %P"])
+        members: set[str] = set()
+        for line in out.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and fields[1].rstrip("*") == partition:
+                members.add(fields[0])
+        return members
+
     def scancel(self, job_id: str) -> str:
         return self.cli(["scancel", job_id])
 
@@ -776,7 +811,8 @@ class SpurCluster:
         deadline = time.time() + 60
         while time.time() < deadline:
             try:
-                if all(n in self.sinfo() for n in self.node_names):
+                nodes = self.sinfo_nodes()
+                if all(n in nodes for n in self.node_names):
                     return
             except Exception:
                 pass
@@ -1034,8 +1070,7 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                out = self.sinfo()
-                if self._cluster_is_ready(out):
+                if self._cluster_is_ready():
                     return
             except Exception:
                 pass
@@ -1046,22 +1081,14 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
             f"sinfo output:\n{self.sinfo()}"
         )
 
-    def _cluster_is_ready(self, sinfo_output: str) -> bool:
-        for name in self.node_names:
-            if name not in sinfo_output:
-                return False
-        total_idle = 0
-        for line in sinfo_output.splitlines():
-            if "idle" not in line:
-                continue
-            fields = line.split()
-            for j, field in enumerate(fields):
-                if field == "idle" and j > 0:
-                    try:
-                        total_idle += int(fields[j - 1])
-                    except ValueError:
-                        pass
-        return total_idle >= len(self.node_names)
+    def _cluster_is_ready(self) -> bool:
+        states = self.sinfo_nodes()
+        if not all(name in states for name in self.node_names):
+            return False
+        idle = sum(
+            1 for name in self.node_names if states[name].startswith("idle")
+        )
+        return idle >= len(self.node_names)
 
 
 # --- Job helpers ---

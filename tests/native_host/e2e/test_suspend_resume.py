@@ -245,9 +245,9 @@ class TestSuspendScheduling:
             job_id = _submit_sleep(cluster, "sr-alloc")
             cluster.scontrol("suspend", str(job_id))
             assert _wait_state(cluster, job_id, "S")
-            info = cluster.sinfo()
-            assert ("alloc" in info or "mix" in info), (
-                f"node should remain allocated while job suspended:\n{info}"
+            states = cluster.sinfo_nodes()
+            assert any(s.startswith(("alloc", "mix")) for s in states.values()), (
+                f"node should remain allocated while job suspended:\n{states}"
             )
         finally:
             _cleanup(cluster, job_id)

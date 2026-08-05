@@ -131,14 +131,14 @@ def _wait_node_state(cluster, target_state, timeout=15):
     """Poll sinfo until any node shows *target_state* (case-insensitive)."""
     target = target_state.lower()
     deadline = time.time() + timeout
-    info = ""
+    states = {}
     while time.time() < deadline:
-        info = cluster.sinfo()
-        if target in info.lower():
-            return info
+        states = cluster.sinfo_nodes()
+        if any(target in s.lower() for s in states.values()):
+            return states
         time.sleep(1)
     assert False, (
-        f"no node reached '{target_state}' within {timeout}s:\n{info}"
+        f"no node reached '{target_state}' within {timeout}s:\n{states}"
     )
 
 
@@ -447,9 +447,9 @@ class TestHookFailure:
             f"job with a missing WorkDir should complete, got {state}"
         )
 
-        info = cluster.sinfo()
-        assert "drain" not in info.lower(), (
-            f"a missing WorkDir must not drain the node:\n{info}"
+        states = cluster.sinfo_nodes()
+        assert not any(s.startswith("drain") for s in states.values()), (
+            f"a missing WorkDir must not drain the node:\n{states}"
         )
 
         content = cluster.read_output_on_any_node(out_path)
@@ -481,7 +481,7 @@ class TestHookFailure:
         content = cluster.read_output_on_any_node(out_path)
         assert "NONFATAL_OK" in content
 
-        info = cluster.sinfo()
-        assert "drain" not in info.lower(), (
-            f"EpilogSlurmctld failure should not drain nodes:\n{info}"
+        states = cluster.sinfo_nodes()
+        assert not any(s.startswith("drain") for s in states.values()), (
+            f"EpilogSlurmctld failure should not drain nodes:\n{states}"
         )
