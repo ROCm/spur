@@ -422,6 +422,13 @@ impl ClusterManager {
             &config.accounting,
         )?;
         self.validate_partition(&spec)?;
+
+        // A job with fewer tasks than nodes (and no explicit per-node layout)
+        // cannot place work on the surplus nodes. Reduce to what will actually
+        // be allocated so reported node/GPU counts match the allocation and the
+        // in-job SLURM_NNODES, matching Slurm's submission-time reduction.
+        spec.num_nodes = spec.effective_num_nodes();
+
         let mpi = spec.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
         spur_core::mpi::validate_single_node_pmix(mpi, spec.num_nodes)
             .map_err(SubmitError::invalid)?;
@@ -6547,6 +6554,50 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_reduces_nodes_to_task_count() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let mut spec = basic_spec("fewer-tasks");
+        spec.num_nodes = 4;
+        spec.num_tasks = 1;
+        let id = submit_and_wait(&cm, spec);
+
+        // The persisted spec (what all reporting reads) reflects the node count
+        // actually allocatable, not the over-request.
+        assert_eq!(cm.get_job(id).unwrap().spec.num_nodes, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_keeps_nodes_when_tasks_match() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let mut spec = basic_spec("full-fit");
+        spec.num_nodes = 4;
+        spec.num_tasks = 4;
+        let id = submit_and_wait(&cm, spec);
+
+        assert_eq!(cm.get_job(id).unwrap().spec.num_nodes, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_keeps_nodes_with_explicit_tasks_per_node() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let mut spec = basic_spec("per-node-layout");
+        spec.num_nodes = 4;
+        spec.num_tasks = 1;
+        spec.tasks_per_node = Some(2);
+        let id = submit_and_wait(&cm, spec);
+
+        // An explicit per-node layout pins the node count regardless of the
+        // task total.
+        assert_eq!(cm.get_job(id).unwrap().spec.num_nodes, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_multiple_jobs_increments_ids() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -8861,6 +8912,7 @@ mod tests {
         let mut spec = basic_spec("toobig");
         spec.partition = Some("default".into());
         spec.num_nodes = 2;
+        spec.num_tasks = 2;
         let job_id = submit_and_wait(&cm, spec);
 
         cm.tag_blocked_pending_reasons();
@@ -11302,6 +11354,7 @@ mod tests {
         let mut big = basic_spec("big");
         big.qos = Some("burst".into());
         big.num_nodes = 2;
+        big.num_tasks = 2;
         big.priority = Some(1000);
         let big_id = submit_and_wait(&cm, big);
 

@@ -478,11 +478,13 @@ impl Scheduler for BackfillScheduler {
 /// are modeled separately (see [`resolve_gpu_demand`]) so total-vs-per-node
 /// semantics are preserved.
 pub fn base_node_request(job: &Job) -> ResourceSet {
-    let cpus = if job.spec.tasks_per_node.is_some() {
-        job.spec.tasks_per_node.unwrap_or(1) * job.spec.cpus_per_task
-    } else {
-        (job.spec.num_tasks / job.spec.num_nodes.max(1)) * job.spec.cpus_per_task
-    };
+    // Rounds up so the busiest node's share is never under-reserved, and floors
+    // at one CPU so an allocated node always consumes tracked capacity.
+    let cpus = match job.spec.tasks_per_node {
+        Some(tasks_per_node) => tasks_per_node * job.spec.cpus_per_task,
+        None => job.spec.num_tasks.div_ceil(job.spec.num_nodes.max(1)) * job.spec.cpus_per_task,
+    }
+    .max(1);
 
     let memory = job
         .spec
@@ -2020,5 +2022,88 @@ mod tests {
 
         let request = job_resource_request(&job);
         assert_eq!(request.generic.get("bandwidth:lustre"), Some(&100));
+    }
+
+    fn cpu_request(num_nodes: u32, num_tasks: u32, cpus_per_task: u32) -> u32 {
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "cpu-job".into(),
+                partition: Some("default".into()),
+                user: "test".into(),
+                num_nodes,
+                num_tasks,
+                cpus_per_task,
+                ..Default::default()
+            },
+        );
+        base_node_request(&job).cpus
+    }
+
+    // A per-node share that truncated to zero left the allocation invisible to
+    // resource tracking, so any number of such jobs could stack on one node.
+    #[test]
+    fn base_node_request_reserves_cpus_when_tasks_below_nodes() {
+        assert_eq!(cpu_request(4, 1, 1), 1);
+    }
+
+    #[test]
+    fn base_node_request_scales_cpus_per_task_when_tasks_below_nodes() {
+        assert_eq!(cpu_request(4, 1, 4), 4);
+    }
+
+    #[test]
+    fn base_node_request_rounds_partial_task_share_up() {
+        assert_eq!(cpu_request(4, 3, 2), 2);
+    }
+
+    #[test]
+    fn base_node_request_rounds_uneven_share_up() {
+        // 7 tasks over 2 nodes: the busiest node runs 4, so reserve for 4.
+        assert_eq!(cpu_request(2, 7, 1), 4);
+    }
+
+    #[test]
+    fn base_node_request_keeps_exact_fit_unchanged() {
+        assert_eq!(cpu_request(4, 4, 1), 1);
+        assert_eq!(cpu_request(4, 8, 2), 4);
+    }
+
+    #[test]
+    fn base_node_request_uses_explicit_tasks_per_node() {
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "cpu-job".into(),
+                partition: Some("default".into()),
+                user: "test".into(),
+                num_nodes: 4,
+                num_tasks: 1,
+                tasks_per_node: Some(2),
+                cpus_per_task: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(base_node_request(&job).cpus, 6);
+    }
+
+    #[test]
+    fn base_node_request_derives_memory_from_corrected_cpu_count() {
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "cpu-job".into(),
+                partition: Some("default".into()),
+                user: "test".into(),
+                num_nodes: 4,
+                num_tasks: 1,
+                cpus_per_task: 2,
+                memory_per_cpu_mb: Some(512),
+                ..Default::default()
+            },
+        );
+        let request = base_node_request(&job);
+        assert_eq!(request.cpus, 2);
+        assert_eq!(request.memory_mb, 1024);
     }
 }
