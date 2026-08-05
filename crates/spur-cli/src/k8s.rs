@@ -42,8 +42,8 @@ pub enum K8sCommand {
         /// Overrides --replicas.
         #[arg(long = "control-plane-nodes", value_delimiter = ',')]
         control_plane_nodes: Vec<String>,
-        /// Scope the cluster to a subset of nodes (hostlist, e.g. "gpu[01-08]"). Combined with
-        /// --partition/--selector as a union; empty = enroll the whole inventory.
+        /// Scope the cluster to a subset of nodes (hostlist, e.g. "gpu[01-08]"), unioned with
+        /// --partition/--selector; empty = whole inventory. Resolved once here (not re-evaluated).
         #[arg(long)]
         nodes: Option<String>,
         /// Scope the cluster to a partition's nodes.
@@ -138,6 +138,20 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
     Ok((k.to_string(), v.to_string()))
 }
 
+/// Fold repeated `--selector key=val` into a map, rejecting a duplicate key rather than silently
+/// dropping the earlier value (last-wins would change the intended AND scope).
+fn selector_map(
+    selector: Vec<(String, String)>,
+) -> Result<std::collections::HashMap<String, String>, anyhow::Error> {
+    let mut map = std::collections::HashMap::new();
+    for (k, v) in selector {
+        if map.insert(k.clone(), v).is_some() {
+            anyhow::bail!("duplicate --selector key {k}");
+        }
+    }
+    Ok(map)
+}
+
 async fn cmd_install_k0s(version: &str, path: &str, force: bool) -> Result<()> {
     let dest = std::path::Path::new(path);
     if dest.exists() && !force {
@@ -166,6 +180,7 @@ async fn cmd_up(
     partition: Option<String>,
     selector: Vec<(String, String)>,
 ) -> Result<()> {
+    let selector = selector_map(selector)?;
     let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
     let resp = client
         .cluster_up(ClusterUpRequest {
@@ -175,7 +190,7 @@ async fn cmd_up(
             caller: effective_user(),
             nodes: nodes.unwrap_or_default(),
             partition: partition.unwrap_or_default(),
-            selector: selector.into_iter().collect(),
+            selector,
         })
         .await?
         .into_inner();
@@ -310,6 +325,22 @@ mod tests {
     #[test]
     fn selector_without_equals_is_rejected() {
         assert!(K8sArgs::try_parse_from(["k8s", "up", "--selector", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn selector_map_rejects_duplicate_key() {
+        let dup = vec![
+            ("zone".to_string(), "z1".to_string()),
+            ("zone".to_string(), "z2".to_string()),
+        ];
+        let err = selector_map(dup).unwrap_err().to_string();
+        assert!(err.contains("duplicate --selector key zone"), "got: {err}");
+        let ok = selector_map(vec![
+            ("zone".to_string(), "z1".to_string()),
+            ("gpu".to_string(), "mi300".to_string()),
+        ])
+        .unwrap();
+        assert_eq!(ok.len(), 2);
     }
 
     #[test]

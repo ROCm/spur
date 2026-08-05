@@ -2042,7 +2042,7 @@ impl ClusterManager {
     }
 
     /// set the cluster-wide k0s phase. A `None`/empty control-plane or `member_nodes` leaves the
-    /// persisted value untouched; a `reset_requested` teardown clears the member scope.
+    /// persisted value untouched; the `Down` phase clears the member scope + control-plane set.
     pub fn set_k0s_phase(
         &self,
         phase: spur_core::k0s::K0sPhase,
@@ -4772,8 +4772,11 @@ impl ClusterManager {
                     k0s.member_nodes = member_nodes.clone();
                 }
                 k0s.reset_requested = *reset_requested;
-                if *reset_requested {
+                // Teardown resets cluster identity so the next `up` starts clean (no stale scope/CP).
+                if *phase == spur_core::k0s::K0sPhase::Down {
                     k0s.member_nodes.clear();
+                    k0s.control_plane_node = None;
+                    k0s.control_plane_nodes.clear();
                 }
             }
         }
@@ -12130,8 +12133,7 @@ mod tests {
                 .iter()
                 .all(|n| cm.get_node(n).is_some())
         });
-        // Scope to a/b only. node-c is out of scope and must NEVER get a role, so it stays
-        // schedulable for Spur — the SPUR-112 fix (whole-inventory enrollment was the bug).
+        // Scope to a/b only; node-c is out of scope and must never get a role (stays schedulable).
         cm.set_k0s_phase(
             K0sPhase::Provisioning,
             Some("node-a".into()),
@@ -12159,6 +12161,34 @@ mod tests {
             cm.get_node("node-c").and_then(|n| n.k0s_role).is_none(),
             "out-of-scope node must stay un-roled and schedulable"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn down_clears_member_scope_and_control_plane() {
+        use spur_core::k0s::K0sPhase;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.set_k0s_phase(
+            K0sPhase::Provisioning,
+            Some("node-a".into()),
+            vec!["node-a".into()],
+            vec!["node-a".into(), "node-b".into()],
+            false,
+        )
+        .unwrap();
+        wait_for("scope recorded", || {
+            cm.k0s_state().member_nodes.len() == 2 && !cm.k0s_state().controllers().is_empty()
+        });
+        // A plain down (reset=false) must clear the recorded scope + control plane so the next up
+        // starts clean rather than silently reusing stale identity.
+        cm.set_k0s_phase(K0sPhase::Down, None, Vec::new(), Vec::new(), false)
+            .unwrap();
+        wait_for("state cleared on down", || {
+            let s = cm.k0s_state();
+            s.member_nodes.is_empty()
+                && s.control_plane_node.is_none()
+                && s.controllers().is_empty()
+        });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

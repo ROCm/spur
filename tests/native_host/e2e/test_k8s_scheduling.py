@@ -75,8 +75,8 @@ class TestK8sSchedulingExclusion:
         cluster.scancel(str(held))
 
     def test_k8s_up_scopes_membership_to_selected_node(self, k8s_enabled_cluster):
-        # `spur k8s up --nodes <node>` records exactly that node as the member scope
-        # (SPUR-112); an empty scope would report "all nodes" instead.
+        # `spur k8s up --nodes <node>` records exactly that node as the member scope;
+        # an empty scope would report "all nodes" instead.
         cluster = k8s_enabled_cluster
         target = cluster.node_names[0]
         cluster.k8s_up(["--nodes", target])

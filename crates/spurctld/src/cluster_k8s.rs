@@ -260,10 +260,15 @@ pub(crate) fn resolve_member_nodes(
         }
     }
     if !selector.is_empty() {
+        let mut any = false;
         for n in all_nodes {
             if selector.iter().all(|(k, v)| n.labels.get(k) == Some(v)) {
                 members.insert(n.name.clone());
+                any = true;
             }
+        }
+        if !any {
+            return Err("--selector matched no registered nodes".to_string());
         }
     }
     if members.is_empty() {
@@ -1114,6 +1119,15 @@ mod tests {
         let nodes = vec![scope_node("a", &[], &[("zone", "z1")])];
         let err = resolve_member_nodes(&nodes, "", "", &sel(&[("zone", "z9")])).unwrap_err();
         assert!(err.contains("matched no registered nodes"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_members_bogus_selector_rejected_even_when_other_surface_matches() {
+        // A supplied selector that matches nothing must error even if --nodes/--partition matched,
+        // so a typo'd selector isn't silently ignored.
+        let nodes = vec![scope_node("a", &["gpu"], &[("zone", "z1")])];
+        let err = resolve_member_nodes(&nodes, "a", "", &sel(&[("zone", "z9")])).unwrap_err();
+        assert!(err.contains("--selector matched no"), "got: {err}");
     }
 
     fn mesh_node(
