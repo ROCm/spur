@@ -926,7 +926,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         name,
         partition: args.partition.unwrap_or_default(),
         account: args.account.unwrap_or_default(),
-        user: whoami::username().unwrap_or_else(|_| "unknown".into()),
+        user: crate::interactive::current_user()?,
         uid: nix::unistd::getuid().as_raw(),
         gid: nix::unistd::getgid().as_raw(),
         num_nodes: args.nodes,

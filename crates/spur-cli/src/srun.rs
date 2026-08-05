@@ -561,7 +561,7 @@ fn build_srun_job_spec(
         partition: args.partition.clone().unwrap_or_default(),
         account: args.account.clone().unwrap_or_default(),
         qos: args.qos.clone().unwrap_or_default(),
-        user: whoami::username().unwrap_or_else(|_| "unknown".into()),
+        user: crate::interactive::current_user()?,
         uid: nix::unistd::getuid().as_raw(),
         gid: nix::unistd::getgid().as_raw(),
         num_nodes: args.nodes,
@@ -726,7 +726,7 @@ async fn dispatch_step(
             pty: false,
             winsize: None,
             node: String::new(),
-            user: crate::interactive::current_user(),
+            user: crate::interactive::current_user()?,
         })
         .await
         .context("failed to create job step")?
@@ -834,9 +834,8 @@ async fn run_standalone_srun(
         .await
         .context("failed to connect to spurctld")?;
     let mut client = SlurmControllerClient::new(channel);
-    let user = whoami::username().unwrap_or_else(|_| "unknown".into());
-
     let job_spec = build_srun_job_spec(args, work_dir, &io, mpi)?;
+    let user = job_spec.user.clone();
     let job_id = client
         .submit_job(SubmitJobRequest {
             spec: Some(job_spec),
@@ -914,7 +913,7 @@ async fn run_standalone_srun(
     }
 
     let output_streamed = if io.stdout.is_empty() {
-        try_stream_output(&mut client, &nodelist, job_id).await
+        try_stream_output(&mut client, &nodelist, job_id).await?
     } else {
         false
     };
@@ -981,10 +980,10 @@ async fn try_stream_output(
     controller: &mut SlurmControllerClient<tonic::transport::Channel>,
     nodelist: &str,
     job_id: u32,
-) -> bool {
+) -> Result<bool> {
     let first_node = nodelist.split(',').next().unwrap_or_default().trim();
     if first_node.is_empty() {
-        return false;
+        return Ok(false);
     }
 
     if controller
@@ -994,26 +993,26 @@ async fn try_stream_output(
         .await
         .is_err()
     {
-        return false;
+        return Ok(false);
     }
 
     let agent_addr = format!("http://{first_node}:6818");
 
     let mut agent = match crate::interactive::connect_agent(&agent_addr).await {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(_) => return Ok(false),
     };
 
     let mut stream = match agent
         .stream_job_output(StreamJobOutputRequest {
             job_id,
             stream: "stdout".into(),
-            user: crate::interactive::current_user(),
+            user: crate::interactive::current_user()?,
         })
         .await
     {
         Ok(resp) => resp.into_inner(),
-        Err(_) => return false,
+        Err(_) => return Ok(false),
     };
 
     let stdout = std::io::stdout();
@@ -1022,13 +1021,13 @@ async fn try_stream_output(
         match stream.message().await {
             Ok(Some(chunk)) => {
                 if chunk.eof {
-                    return true;
+                    return Ok(true);
                 }
                 let _ = handle.write_all(&chunk.data);
                 let _ = handle.flush();
             }
-            Ok(None) => return true,
-            Err(_) => return false,
+            Ok(None) => return Ok(true),
+            Err(_) => return Ok(false),
         }
     }
 }
@@ -1221,7 +1220,7 @@ async fn run_interactive_pty(
                     pty: true,
                     winsize: Some(winsize),
                     node: node.clone(),
-                    user: crate::interactive::current_user(),
+                    user: crate::interactive::current_user()?,
                 })
                 .await
             {
