@@ -764,6 +764,8 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
             nanos: 0,
         }),
         qos: s.qos.clone().unwrap_or_default(),
+        // Proto `priority` is non-optional; 0 encodes "unset" and is resolved
+        // back to the default by the receiver, not a base priority of zero.
         priority: s.priority.unwrap_or(0),
         reservation: s.reservation.clone().unwrap_or_default(),
         dependency: s.dependency.clone(),
@@ -948,6 +950,8 @@ async fn dispatch_to_agent(
         }),
         time_min: None,
         qos: spec.qos.clone().unwrap_or_default(),
+        // Proto `priority` is non-optional; 0 encodes "unset". The agent does
+        // not schedule, so this value is carried for fidelity only.
         priority: spec.priority.unwrap_or(0),
         reservation: spec.reservation.clone().unwrap_or_default(),
         dependency: spec.dependency.clone(),
