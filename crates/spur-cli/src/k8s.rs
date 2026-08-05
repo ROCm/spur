@@ -43,7 +43,7 @@ pub enum K8sCommand {
         #[arg(long = "control-plane-nodes", value_delimiter = ',')]
         control_plane_nodes: Vec<String>,
         /// Scope the cluster to a subset of nodes (hostlist, e.g. "gpu[01-08]"), unioned with
-        /// --partition/--selector; empty = whole inventory. Resolved once here (not re-evaluated).
+        /// --partition/--selector; empty = whole inventory. Resolved once at up time (not re-evaluated).
         #[arg(long)]
         nodes: Option<String>,
         /// Scope the cluster to a partition's nodes.

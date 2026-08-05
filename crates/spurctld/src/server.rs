@@ -2159,6 +2159,14 @@ impl SlurmController for ControllerService {
         let nodes = self.cluster.get_nodes();
         let assigned = nodes.iter().any(|n| n.k0s_role.is_some());
 
+        // Teardown clears the recorded scope/CP but roles drain on later reconcile ticks; block a
+        // re-up in that window so it can't reuse the emptied scope and silently enroll every node.
+        if state.phase == spur_core::k0s::K0sPhase::Down && assigned {
+            return Err(Status::failed_precondition(
+                "cluster teardown is in progress; wait for it to finish before bringing it back up",
+            ));
+        }
+
         // Resolve the node scope fail-closed; a bare re-up of an assigned cluster keeps the recorded
         // scope, a fresh up with no selection = whole inventory. CP candidates are the in-scope members.
         let scope_requested =
@@ -3947,6 +3955,29 @@ mod tests {
             }))
             .await
             .expect_err("changing scope on an assigned cluster must be rejected");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_rejected_while_teardown_drains_roles() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        scoped_assigned_cluster(&svc).await;
+        // down clears the recorded scope/CP immediately; node-a's role drains on a later tick. A
+        // re-up in that window must be rejected, not silently widen to the whole inventory.
+        svc.cluster
+            .set_k0s_phase(
+                spur_core::k0s::K0sPhase::Down,
+                None,
+                Vec::new(),
+                Vec::new(),
+                false,
+            )
+            .unwrap();
+        let err = svc
+            .cluster_up(Request::new(ClusterUpRequest::default()))
+            .await
+            .expect_err("re-up during teardown must be rejected");
         assert_eq!(err.code(), Code::FailedPrecondition);
     }
 
