@@ -132,7 +132,11 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .await
         .context("job submission failed")?;
 
-    let job_id = response.into_inner().job_id;
+    let response = response.into_inner();
+    for warning in &response.warnings {
+        eprintln!("salloc: warning: {warning}");
+    }
+    let job_id = response.job_id;
     let user = whoami::username().unwrap_or_else(|_| "unknown".into());
     eprintln!("salloc: Pending job allocation {}...", job_id);
 

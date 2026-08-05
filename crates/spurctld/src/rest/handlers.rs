@@ -68,6 +68,14 @@ pub async fn get_job(
     }))
 }
 
+/// Default an absent or zero REST `ntasks` to one task per requested node
+/// (Slurm's default), so a multi-node request is not silently collapsed to one.
+fn rest_effective_ntasks(ntasks: Option<u32>, nodes: Option<u32>) -> u32 {
+    ntasks
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| nodes.unwrap_or(1).max(1))
+}
+
 pub async fn submit_job(
     State(state): State<Arc<RestState>>,
     Json(body): Json<SubmitRequest>,
@@ -89,7 +97,7 @@ pub async fn submit_job(
         partition: body.job.partition,
         account: body.job.account,
         num_nodes: body.job.nodes.unwrap_or(1),
-        num_tasks: body.job.ntasks.unwrap_or(1),
+        num_tasks: rest_effective_ntasks(body.job.ntasks, body.job.nodes),
         cpus_per_task: body.job.cpus_per_task.unwrap_or(1),
         time_limit,
         script: body.job.script,
@@ -101,13 +109,13 @@ pub async fn submit_job(
         ..Default::default()
     };
 
-    // Validate the GPU request (mutually exclusive forms, --gpus >= num_nodes).
-    spur_core::gpu_request::resolve_gpu_demand(&spec)
-        .map_err(|e| bad_request_response(&e.to_string()))?;
+    // GPU demand is validated in submit_job after node-count normalization.
+    let outcome = state.cluster.submit_job(spec).map_err(submit_rest_error)?;
 
-    let job_id = state.cluster.submit_job(spec).map_err(submit_rest_error)?;
-
-    Ok(ApiResponse::ok(SubmitResponse { job_id }))
+    Ok(ApiResponse::ok(SubmitResponse {
+        job_id: outcome.job_id,
+        warnings: outcome.warnings,
+    }))
 }
 
 /// Parse a REST GPU field ("4" or "mi300x:4") into a core GPU request.
@@ -191,6 +199,18 @@ pub async fn get_partitions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rest_effective_ntasks_defaults_absent_to_nodes() {
+        // C1 (REST): absent ntasks -> one task per node, not 1.
+        assert_eq!(rest_effective_ntasks(None, Some(4)), 4);
+        // Zero is treated as unset.
+        assert_eq!(rest_effective_ntasks(Some(0), Some(4)), 4);
+        // Explicit ntasks is preserved (reduces the job to one node later).
+        assert_eq!(rest_effective_ntasks(Some(1), Some(4)), 1);
+        // No nodes given falls back to a single task.
+        assert_eq!(rest_effective_ntasks(None, None), 1);
+    }
 
     #[test]
     fn parse_rest_gpu_valid() {

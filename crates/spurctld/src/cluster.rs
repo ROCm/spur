@@ -159,6 +159,14 @@ impl SubmitError {
     }
 }
 
+/// A successful submission: the (parent) job id plus any user-facing warnings
+/// (e.g. a node-count reduction) to surface at the CLI and REST response.
+#[derive(Debug, Clone, Default)]
+pub struct SubmitOutcome {
+    pub job_id: JobId,
+    pub warnings: Vec<String>,
+}
+
 /// Maximum serialized size of a single job submission, in bytes.
 ///
 /// A submission becomes one Raft log entry (`WalOperation::JobSubmit`) that is
@@ -407,7 +415,7 @@ impl ClusterManager {
     }
 
     /// Submit a new job. If it has an array spec, expand into individual tasks.
-    pub fn submit_job(&self, mut spec: JobSpec) -> Result<JobId, SubmitError> {
+    pub fn submit_job(&self, mut spec: JobSpec) -> Result<SubmitOutcome, SubmitError> {
         apply_default_partition(&mut spec, &self.partitions.read());
         apply_default_time_limit(&mut spec, &self.partitions.read());
         apply_default_account(&mut spec, &self.association_cache);
@@ -423,11 +431,35 @@ impl ClusterManager {
         )?;
         self.validate_partition(&spec)?;
 
-        // A job with fewer tasks than nodes (and no explicit per-node layout)
-        // cannot place work on the surplus nodes. Reduce to what will actually
-        // be allocated so reported node/GPU counts match the allocation and the
-        // in-job SLURM_NNODES, matching Slurm's submission-time reduction.
+        // Fewer tasks than nodes cannot use the surplus nodes; cap at the task
+        // count so reported node/GPU counts match the allocation (unless a
+        // per-node layout is pinned).
+        let requested_nodes = spec.num_nodes.max(1);
         spec.num_nodes = spec.effective_num_nodes();
+
+        let mut warnings = Vec::new();
+        if spec.num_nodes < requested_nodes {
+            warn!(
+                requested_nodes,
+                allocated_nodes = spec.num_nodes,
+                num_tasks = spec.num_tasks,
+                "reduced requested node count to task count at submit"
+            );
+            warnings.push(format!(
+                "requested {requested_nodes} nodes but only {} will be allocated \
+                 ({} task(s), one per node)",
+                spec.num_nodes, spec.num_tasks
+            ));
+        }
+
+        // Validate GPU demand against the normalized node count so a request
+        // like `-N4 -n1 --gpus=2` (valid once reduced to one node) is accepted.
+        spur_core::gpu_request::resolve_gpu_demand(&spec)
+            .map_err(|e| SubmitError::invalid(e.to_string()))?;
+
+        // Reject a node count outside the partition's bounds at submit, matching
+        // Slurm, instead of accepting a job that would pend forever.
+        self.validate_partition_node_bounds(&spec)?;
 
         let mpi = spec.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
         spur_core::mpi::validate_single_node_pmix(mpi, spec.num_nodes)
@@ -471,7 +503,46 @@ impl ClusterManager {
         self.scheduler_notify.notify_one();
 
         info!(job_id, "job submitted");
-        Ok(job_id)
+        Ok(SubmitOutcome { job_id, warnings })
+    }
+
+    /// Reject a submission whose (normalized) node count falls outside the
+    /// bounds of every requested partition. Matches Slurm, which rejects such
+    /// jobs at submit rather than leaving them permanently pending. A partition
+    /// list is accepted if any one partition can hold the request.
+    fn validate_partition_node_bounds(&self, spec: &JobSpec) -> Result<(), SubmitError> {
+        let Some(partition_spec) = spec.partition.as_deref().filter(|p| !p.is_empty()) else {
+            return Ok(());
+        };
+
+        let partitions = self.partitions.read();
+        let requested: Vec<&Partition> = requested_partition_names(Some(partition_spec))
+            .filter_map(|name| partitions.iter().find(|part| part.name == name))
+            .collect();
+        // Existence was already checked in validate_partition.
+        if requested.is_empty() {
+            return Ok(());
+        }
+
+        let nodes = spec.num_nodes;
+        let fits = |part: &Partition| {
+            let below_min = part.min_nodes > 0 && nodes < part.min_nodes;
+            let above_max = part.max_nodes.is_some_and(|max| nodes > max);
+            !below_min && !above_max
+        };
+        if requested.iter().copied().any(fits) {
+            return Ok(());
+        }
+
+        let part = requested[0];
+        let max = part
+            .max_nodes
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "unlimited".into());
+        Err(SubmitError::invalid(format!(
+            "requested node count {nodes} is outside partition '{}' limits (min {}, max {})",
+            part.name, part.min_nodes, max
+        )))
     }
 
     /// Validate partition constraints: access control and node limits.
@@ -6055,7 +6126,7 @@ mod tests {
     }
 
     fn submit_and_wait(cm: &ClusterManager, spec: JobSpec) -> JobId {
-        let id = cm.submit_job(spec).unwrap();
+        let id = cm.submit_job(spec).unwrap().job_id;
         wait_for(&format!("job {id} applied"), || cm.get_job(id).is_some());
         id
     }
@@ -6595,6 +6666,138 @@ mod tests {
         // An explicit per-node layout pins the node count regardless of the
         // task total.
         assert_eq!(cm.get_job(id).unwrap().spec.num_nodes, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_accepts_gpu_after_node_reduction() {
+        // C3: -N4 -n1 --gpus=2 is valid once the node count is reduced to one;
+        // the pre-normalization guard used to reject it.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let mut spec = basic_spec("gpu-reduced");
+        spec.num_nodes = 4;
+        spec.num_tasks = 1;
+        spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(2, None));
+        let outcome = cm.submit_job(spec).unwrap();
+        wait_for("job applied", || cm.get_job(outcome.job_id).is_some());
+        assert_eq!(cm.get_job(outcome.job_id).unwrap().spec.num_nodes, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_warns_when_node_count_reduced() {
+        // I2: a shrunk request returns a user-facing warning; an exact-fit
+        // request returns none.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let mut shrunk = basic_spec("shrunk");
+        shrunk.num_nodes = 4;
+        shrunk.num_tasks = 1;
+        let outcome = cm.submit_job(shrunk).unwrap();
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.contains("requested 4 nodes but only 1")),
+            "expected a node-reduction warning, got {:?}",
+            outcome.warnings
+        );
+
+        let mut exact = basic_spec("exact");
+        exact.num_nodes = 4;
+        exact.num_tasks = 4;
+        let outcome = cm.submit_job(exact).unwrap();
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_rejects_below_partition_min_nodes() {
+        // I1: -N4 -n1 on a MinNodes=4 partition is rejected at submit, not left
+        // pending forever.
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].min_nodes = 4;
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("undersize");
+        spec.partition = Some("default".into());
+        spec.num_nodes = 4;
+        spec.num_tasks = 1; // reduces to 1 node, below min 4
+        let err = cm.submit_job(spec).unwrap_err();
+        assert!(matches!(err, SubmitError::InvalidArgument(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_rejects_above_partition_max_nodes() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].max_nodes = Some(1);
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("oversize");
+        spec.partition = Some("default".into());
+        spec.num_nodes = 2;
+        spec.num_tasks = 2;
+        assert!(cm.submit_job(spec).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_accepts_within_partition_node_bounds() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].min_nodes = 1;
+        config.partitions[0].max_nodes = Some(4);
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("fits");
+        spec.partition = Some("default".into());
+        spec.num_nodes = 2;
+        spec.num_tasks = 2;
+        assert!(cm.submit_job(spec).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_pmix_accepts_single_node_after_reduction() {
+        // I5: -N4 -n1 --mpi=pmix reduces to one node and is accepted.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let mut spec = basic_spec("pmix-one");
+        spec.num_nodes = 4;
+        spec.num_tasks = 1;
+        spec.mpi = Some(spur_core::mpi::MPI_PMIX.into());
+        assert!(cm.submit_job(spec).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_pmix_rejects_multi_node() {
+        // I5: -N4 -n4 --mpi=pmix stays multi-node and is rejected.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let mut spec = basic_spec("pmix-many");
+        spec.num_nodes = 4;
+        spec.num_tasks = 4;
+        spec.mpi = Some(spur_core::mpi::MPI_PMIX.into());
+        assert!(cm.submit_job(spec).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_keeps_full_node_count_for_total_gpus() {
+        // C2: -N4 --gpus=8 (ntasks defaulted to nodes) keeps all four nodes so
+        // the eight GPUs spread across them instead of collapsing to one node.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let mut spec = basic_spec("gpu-spread");
+        spec.num_nodes = 4;
+        spec.num_tasks = 4; // one task per node (adapter default for absent -n)
+        spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(8, None));
+        let outcome = cm.submit_job(spec).unwrap();
+        wait_for("job applied", || cm.get_job(outcome.job_id).is_some());
+        assert_eq!(cm.get_job(outcome.job_id).unwrap().spec.num_nodes, 4);
+        assert!(outcome.warnings.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8903,7 +9106,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tag_blocked_sets_partition_config_reason() {
-        // Request exceeds partition max_nodes -> PartitionConfig, not Resources.
+        // A job exceeding partition max_nodes that reaches the scheduler (e.g. a
+        // replayed pre-upgrade WAL entry predating submit-time bounds checking)
+        // must be tagged PartitionConfig and dropped, not scheduled. Fresh
+        // submits are rejected earlier (see submit_rejects_node_bounds_*).
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.partitions[0].max_nodes = Some(1);
@@ -8913,7 +9119,12 @@ mod tests {
         spec.partition = Some("default".into());
         spec.num_nodes = 2;
         spec.num_tasks = 2;
-        let job_id = submit_and_wait(&cm, spec);
+        let job_id = 1;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id,
+            spec: Box::new(spec),
+        });
+        wait_for("job applied", || cm.get_job(job_id).is_some());
 
         cm.tag_blocked_pending_reasons();
         assert_eq!(
@@ -8936,15 +9147,26 @@ mod tests {
         config.partitions[0].min_nodes = 2;
         let cm = test_cluster_with_config(&dir, config).await;
 
+        // Meets min_nodes but exceeds max_time: the time cap is not a
+        // submit-time bound, so this is admitted and pends with PartitionConfig.
         let mut over_time = basic_spec("overtime");
         over_time.partition = Some("default".into());
+        over_time.num_nodes = 2;
+        over_time.num_tasks = 2;
         over_time.time_limit = Some(chrono::Duration::hours(1));
         let t_id = submit_and_wait(&cm, over_time);
 
+        // Below min_nodes is rejected at submit now, so inject directly to
+        // exercise the scheduler's PartitionConfig tagging for replayed entries.
         let mut under_nodes = basic_spec("undernodes");
         under_nodes.partition = Some("default".into());
         under_nodes.num_nodes = 1; // below min_nodes=2
-        let n_id = submit_and_wait(&cm, under_nodes);
+        let n_id = 999;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: n_id,
+            spec: Box::new(under_nodes),
+        });
+        wait_for("undernodes applied", || cm.get_job(n_id).is_some());
 
         cm.tag_blocked_pending_reasons();
         assert_eq!(
@@ -11066,7 +11288,7 @@ mod tests {
 
         let mut spec = basic_spec("arr-throttle-pass");
         spec.array_spec = Some("0-2%1".into());
-        let parent_id = cm.submit_job(spec).unwrap();
+        let parent_id = cm.submit_job(spec).unwrap().job_id;
         let task_ids: Vec<JobId> = (1..=3).map(|offset| parent_id + offset).collect();
         for id in &task_ids {
             wait_for(&format!("array task {id}"), || cm.get_job(*id).is_some());
@@ -11089,7 +11311,7 @@ mod tests {
 
         let mut spec = basic_spec("arr-throttle");
         spec.array_spec = Some("0-2%1".into());
-        let parent_id = cm.submit_job(spec).unwrap();
+        let parent_id = cm.submit_job(spec).unwrap().job_id;
         let task_ids: Vec<JobId> = (1..=3).map(|offset| parent_id + offset).collect();
         for id in &task_ids {
             wait_for(&format!("array task {id}"), || cm.get_job(*id).is_some());
@@ -11121,7 +11343,7 @@ mod tests {
         let mut spec = basic_spec("arr-lic");
         spec.array_spec = Some("0-1%1".into());
         spec.gres = vec!["license:fluent:1".into()];
-        let parent_id = cm.submit_job(spec).unwrap();
+        let parent_id = cm.submit_job(spec).unwrap().job_id;
         let t1 = parent_id + 1;
         let t2 = parent_id + 2;
         wait_for("array license tasks", || {
@@ -11173,7 +11395,7 @@ mod tests {
         let mut spec = basic_spec("arr-bb");
         spec.array_spec = Some("0-1%1".into());
         spec.burst_buffer = Some("capacity=60".into());
-        let parent_id = cm.submit_job(spec).unwrap();
+        let parent_id = cm.submit_job(spec).unwrap().job_id;
         let t1 = parent_id + 1;
         let t2 = parent_id + 2;
         wait_for("array bb tasks", || {
@@ -14806,7 +15028,7 @@ mod tests {
         // array parent id, which is not stored — only per-task ids exist in `jobs`.
         let mut spec = basic_spec("array");
         spec.array_spec = Some("0-2".into()); // Creates 3 tasks
-        let parent_id = cm.submit_job(spec).unwrap();
+        let parent_id = cm.submit_job(spec).unwrap().job_id;
         let first_task_id = parent_id + 1;
         wait_for(&format!("array task {first_task_id} applied"), || {
             cm.get_job(first_task_id).is_some()
@@ -15923,7 +16145,8 @@ mod tests {
         spec.qos = None;
         let id = cm
             .submit_job(spec)
-            .expect("association default QoS must satisfy the partition allow_qos");
+            .expect("association default QoS must satisfy the partition allow_qos")
+            .job_id;
         assert_eq!(
             cm.get_job(id).unwrap().spec.qos.as_deref(),
             Some("premium"),

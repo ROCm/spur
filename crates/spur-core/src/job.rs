@@ -600,13 +600,9 @@ impl Default for JobSpec {
 }
 
 impl JobSpec {
-    /// Node count to actually allocate for this job.
-    ///
-    /// A task never spans nodes, so like Slurm's cons_tres we cap at
-    /// `min(num_nodes, num_tasks)` unless a per-node layout is pinned.
-    /// `submit_job` applies this at intake so the stored `num_nodes` matches
-    /// what is allocated and what all reporting shows. An explicit
-    /// `--ntasks-per-node` pins the layout, so the request stands.
+    /// Node count to actually allocate: `min(num_nodes, num_tasks)`, since a
+    /// task never spans nodes. An explicit `--ntasks-per-node` pins the layout
+    /// and skips the cap.
     pub fn effective_num_nodes(&self) -> u32 {
         let nodes = self.num_nodes.max(1);
         if self.tasks_per_node.is_some() {
