@@ -2215,10 +2215,9 @@ impl ClusterManager {
             });
         }
 
-        // A begin-deferred job reaches none of the blocker checks above, which
-        // all pass ineligible candidates straight through, so this is the only
-        // place its wait can be named. Structural blockers already claimed the
-        // jobs they explain, keeping their precedence over the hold.
+        // The only tagger for begin-deferred jobs: the blocker checks above pass
+        // ineligible candidates through without claiming them. Running after them
+        // preserves their precedence, so a structural blocker still outranks the hold.
         candidates.retain(|candidate| {
             if candidate.scheduling_eligible {
                 return true;
