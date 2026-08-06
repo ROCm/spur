@@ -10,7 +10,7 @@ import logging
 import os
 import shlex
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -119,6 +119,8 @@ class FixtureConfig:
     replicas: int
     image: str
     config_toml: str
+    extra_operator_args: list[str] = field(default_factory=list)
+    needs_postgres: bool = False
 
     @classmethod
     def single_node(cls) -> FixtureConfig:
@@ -133,6 +135,9 @@ cluster_name = "k8s-ci"
 interval_secs = 1
 plugin = "backfill"
 
+[metrics]
+bind = "all"
+
 [[partitions]]
 name = "default"
 state = "UP"
@@ -142,6 +147,23 @@ max_time = "1h"
 default_time = "10m"
 """.strip(),
         )
+
+    @classmethod
+    def with_quota(cls) -> FixtureConfig:
+        """Single controller with the operator's quota controller switched on.
+
+        Quota projection reads accounts over the SlurmAccounting RPC, which
+        spurctld only serves when accounting is backed by a database, so this
+        variant also brings up an ephemeral Postgres.
+        """
+        cfg = cls.single_node()
+        cfg.extra_operator_args = ["--enable-quota"]
+        cfg.needs_postgres = True
+        cfg.config_toml += (
+            "\n\n[accounting]\n"
+            'database_url = "postgresql://spur:spur@spur-postgres:5432/spur"\n'
+        )
+        return cfg
 
     @classmethod
     def raft_ha(cls) -> FixtureConfig:
@@ -253,6 +275,11 @@ class ClusterFixture:
         fixture.teardown_workloads()
         fixture.apply_rbac()
         fixture.apply_configmap()
+        if cfg.needs_postgres:
+            # spurctld only builds its accounting pool at startup, so the
+            # database has to be serving before the controller comes up.
+            fixture.apply_postgres()
+            fixture.wait_postgres_ready()
         fixture.apply_controller()
         fixture.apply_operator()
         fixture.wait_ready()
@@ -344,7 +371,12 @@ class ClusterFixture:
             if not _is_not_found(exc):
                 raise
 
-    def _apply_yaml_docs(self, yaml_path: Path, replicas: int | None) -> None:
+    def _apply_yaml_docs(
+        self,
+        yaml_path: Path,
+        replicas: int | None,
+        mutate: Callable[[dict], None] | None = None,
+    ) -> None:
         content = yaml_path.read_text()
         api_client = client.ApiClient()
         for doc in content.split("\n---"):
@@ -357,6 +389,8 @@ class ClusterFixture:
             value = yaml.safe_load(patched)
             value = patch_namespace_in_value(value, self.namespace)
             value.setdefault("metadata", {})["namespace"] = self.namespace
+            if mutate is not None:
+                mutate(value)
             kind = value.get("kind", "")
             name = value["metadata"]["name"]
             self._delete_resource(kind, name)
@@ -398,8 +432,37 @@ class ClusterFixture:
         )
 
     def apply_operator(self) -> None:
-        self._apply_yaml_docs(_MANIFESTS_DIR / "operator.yaml", None)
-        logger.info("operator Deployment applied (image=%s)", self.config.image)
+        def add_extra_args(value: dict) -> None:
+            if value.get("kind") != "Deployment":
+                return
+            for container in value["spec"]["template"]["spec"]["containers"]:
+                if container["name"] == "operator":
+                    container.setdefault("args", []).extend(
+                        self.config.extra_operator_args
+                    )
+
+        mutate = add_extra_args if self.config.extra_operator_args else None
+        self._apply_yaml_docs(_MANIFESTS_DIR / "operator.yaml", None, mutate)
+        logger.info(
+            "operator Deployment applied (image=%s, extra_args=%s)",
+            self.config.image,
+            self.config.extra_operator_args,
+        )
+
+    def apply_postgres(self) -> None:
+        self._apply_yaml_docs(_MANIFESTS_DIR / "postgres.yaml", None)
+        logger.info("postgres Deployment applied")
+
+    def wait_postgres_ready(self, timeout: int = 180) -> None:
+        wait_until(
+            lambda: count_ready_pods(self.namespace, "app=spur-postgres") >= 1,
+            timeout,
+            "postgres pod not ready",
+            interval=3,
+        )
+
+    def postgres_available(self) -> bool:
+        return count_ready_pods(self.namespace, "app=spur-postgres") >= 1
 
     def wait_ready(self, timeout: int = 120) -> None:
         wait_until(
@@ -433,8 +496,18 @@ class ClusterFixture:
     def teardown_workloads(self) -> None:
         self._force_delete_pods("app=spurctld")
         self._force_delete_pods("app=spur-k8s-operator")
+        self._force_delete_pods("app=spur-postgres")
 
         for delete_fn in [
+            lambda: self.apps_v1.delete_namespaced_deployment(
+                "spur-postgres",
+                self.namespace,
+                grace_period_seconds=0,
+                propagation_policy="Background",
+            ),
+            lambda: self.core_v1.delete_namespaced_service(
+                "spur-postgres", self.namespace
+            ),
             lambda: self.apps_v1.delete_namespaced_deployment(
                 "spur-k8s-operator",
                 self.namespace,
@@ -472,6 +545,7 @@ class ClusterFixture:
 
         self._wait_pods_gone("app=spurctld")
         self._wait_pods_gone("app=spur-k8s-operator")
+        self._wait_pods_gone("app=spur-postgres", raise_on_timeout=False)
         logger.info("workload teardown complete")
 
     def cleanup_test_workloads(self) -> None:
@@ -507,6 +581,48 @@ class ClusterFixture:
             lambda: self._operator_available(),
             timeout,
             "operator deployment not ready",
+        )
+
+    def spur_cli(self, args: list[str]) -> str:
+        """Run the Spur CLI inside the controller pod.
+
+        The controller pod is the only place that has both the binary and a
+        loopback route to spurctld, so admin commands go through it.
+        """
+        cmd = " ".join(shlex.quote(a) for a in ["spur", *args])
+        return exec_in_pod(self.namespace, "spurctld-0", ["sh", "-c", f"{cmd} 2>&1"])
+
+    def operator_pods(self) -> list:
+        return self.core_v1.list_namespaced_pod(
+            self.namespace, label_selector="app=spur-k8s-operator"
+        ).items
+
+    def operator_logs(self, tail_lines: int = 400) -> str:
+        return "\n".join(
+            self.core_v1.read_namespaced_pod_log(
+                pod.metadata.name, self.namespace, tail_lines=tail_lines
+            )
+            for pod in self.operator_pods()
+        )
+
+    def restart_operator(self, timeout: int = 150) -> None:
+        """Delete the operator pod and wait for a fresh one to be ready.
+
+        Startup-only paths (orphan pod cleanup) are only reachable this way.
+        """
+        before = {pod.metadata.name for pod in self.operator_pods()}
+        self._force_delete_pods("app=spur-k8s-operator")
+
+        def replaced() -> bool:
+            pods = self.operator_pods()
+            fresh = [p for p in pods if p.metadata.name not in before]
+            return bool(fresh) and all(
+                p.status.phase == "Running" for p in fresh
+            )
+
+        wait_until(replaced, timeout, "operator pod was not replaced", interval=3)
+        wait_until(
+            self._operator_available, timeout, "operator deployment not ready", interval=3
         )
 
     def create_spurjob(self, body: dict) -> dict:
@@ -588,6 +704,165 @@ def spurjob_with_env(name: str, command: list[str], env: dict[str, str]) -> dict
 
 def multinode_spurjob(name: str, command: list[str], num_nodes: int) -> dict:
     return spurjob_body(name, base_spec(name, command, num_nodes))
+
+
+def spurjob_with_spec(name: str, command: list[str], **overrides) -> dict:
+    """SpurJob with arbitrary spec fields layered onto the defaults.
+
+    Keys are CRD field names (camelCase), e.g. ``hostNetwork=True`` or
+    ``volumes=["/tmp:/mnt:ro"]``.
+    """
+    spec = base_spec(name, command, overrides.pop("numNodes", 1))
+    spec.update(overrides)
+    return spurjob_body(name, spec)
+
+
+def gpu_spurjob(name: str, command: list[str], count: int, gpu_type: str | None = None) -> dict:
+    gpus: dict = {"count": count}
+    if gpu_type:
+        gpus["gpuType"] = gpu_type
+    return spurjob_with_spec(name, command, gpus=gpus)
+
+
+def volume_spurjob(name: str, command: list[str], volumes: list[str]) -> dict:
+    return spurjob_with_spec(name, command, volumes=volumes)
+
+
+def secret_env_spurjob(name: str, command: list[str], secret_env: dict[str, str]) -> dict:
+    return spurjob_with_spec(name, command, secretEnv=secret_env)
+
+
+def security_spurjob(
+    name: str,
+    command: list[str],
+    *,
+    host_network: bool = False,
+    host_ipc: bool = False,
+    privileged: bool = False,
+    shm_size: str | None = None,
+) -> dict:
+    overrides: dict = {
+        "hostNetwork": host_network,
+        "hostIpc": host_ipc,
+        "privileged": privileged,
+    }
+    if shm_size:
+        overrides["shmSize"] = shm_size
+    return spurjob_with_spec(name, command, **overrides)
+
+
+def resource_spurjob(
+    name: str,
+    command: list[str],
+    *,
+    tasks_per_node: int = 1,
+    cpus_per_task: int = 1,
+    memory_per_node: str = "100Mi",
+    extra_resources: dict[str, str] | None = None,
+) -> dict:
+    return spurjob_with_spec(
+        name,
+        command,
+        tasksPerNode=tasks_per_node,
+        cpusPerTask=cpus_per_task,
+        memoryPerNode=memory_per_node,
+        extraResources=extra_resources or {},
+    )
+
+
+def list_spurjob_pods(fixture: ClusterFixture, name: str, namespace: str | None = None):
+    ns = namespace or fixture.namespace
+    return fixture.core_v1.list_namespaced_pod(
+        ns, label_selector=f"spur.amd.com/job-name={name}"
+    ).items
+
+
+def wait_spurjob_pod(
+    fixture: ClusterFixture,
+    name: str,
+    timeout: int = DEFAULT_TIMEOUT,
+    namespace: str | None = None,
+):
+    """Wait for the operator to create a pod for the SpurJob and return it."""
+    pods: list = []
+
+    def created() -> bool:
+        nonlocal pods
+        pods = list_spurjob_pods(fixture, name, namespace)
+        return bool(pods)
+
+    wait_until(created, timeout, f"no pods created for SpurJob {name}")
+    return pods[0]
+
+
+def _resolve_attr(obj, dotted: str):
+    for part in dotted.split("."):
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            obj = obj.get(part)
+        elif isinstance(obj, list):
+            obj = obj[int(part)]
+        else:
+            obj = getattr(obj, part)
+    return obj
+
+
+def assert_pod_spec(
+    fixture: ClusterFixture,
+    name: str,
+    expected: dict,
+    namespace: str | None = None,
+) -> None:
+    """Assert dotted paths on the pod created for a SpurJob.
+
+    Paths are relative to the pod and use the Python client's snake_case
+    attribute names, e.g. ``spec.host_network`` or
+    ``spec.containers.0.resources.limits``.
+    """
+    pod = wait_spurjob_pod(fixture, name, namespace=namespace)
+    for path, want in expected.items():
+        got = _resolve_attr(pod, path)
+        assert got == want, (
+            f"SpurJob {name} pod {pod.metadata.name}: {path} is {got!r}, "
+            f"expected {want!r}"
+        )
+
+
+def job_service_exists(
+    fixture: ClusterFixture, spur_job_id: int | str, namespace: str | None = None
+) -> bool:
+    """Whether the headless Service for a multi-node job still exists.
+
+    The operator names it after the Spur job ID (`spur-job-{id}`), not the
+    SpurJob resource name.
+    """
+    ns = namespace or fixture.namespace
+    try:
+        fixture.core_v1.read_namespaced_service(f"spur-job-{spur_job_id}", ns)
+        return True
+    except ApiException as exc:
+        if _is_not_found(exc):
+            return False
+        raise
+
+
+def read_all_spurjob_pod_logs(
+    fixture: ClusterFixture,
+    name: str,
+    namespace: str | None = None,
+) -> dict[str, str]:
+    """Logs of every pod backing a SpurJob, keyed by pod name."""
+    ns = namespace or fixture.namespace
+    pods = list_spurjob_pods(fixture, name, ns)
+    if not pods:
+        raise AssertionError(f"no pods found for SpurJob {name} in namespace {ns}")
+    return {
+        pod.metadata.name: fixture.core_v1.read_namespaced_pod_log(
+            pod.metadata.name, ns
+        )
+        for pod in pods
+    }
 
 
 def wait_spurjob_state(
@@ -698,6 +973,25 @@ def delete_namespace(name: str, *, wait: bool = False, timeout: int = 120) -> No
         wait_until(gone, timeout, f"namespace {name} not deleted")
     except TimeoutError:
         logger.warning("timed out waiting for namespace %s to be deleted", name)
+
+
+def service_http_get(
+    namespace: str, service: str, port: str | int, path: str
+) -> tuple[int, str]:
+    """GET an in-cluster HTTP endpoint through the apiserver's service proxy.
+
+    The Spur image ships no HTTP client, so proxying through the apiserver is
+    the only way to reach operator endpoints without adding a sidecar.
+    """
+    _load_kube_config()
+    core = client.CoreV1Api()
+    try:
+        body = core.connect_get_namespaced_service_proxy_with_path(
+            f"{service}:{port}", namespace, path.lstrip("/")
+        )
+        return 200, body if isinstance(body, str) else str(body)
+    except ApiException as exc:
+        return exc.status, exc.body or ""
 
 
 def exec_in_pod(namespace: str, pod_name: str, command: list[str]) -> str:

@@ -9,7 +9,9 @@ from k8s_cluster import (
     cross_namespace_name,
     delete_namespace,
     ensure_namespace,
+    job_service_exists,
     multinode_spurjob,
+    read_all_spurjob_pod_logs,
     read_spurjob_pod_logs,
     simple_spurjob,
     spurjob_with_env,
@@ -45,6 +47,27 @@ class TestSpurJobLifecycle:
         job_val = logs[job_idx + 4 :].split()[0] if logs[job_idx + 4 :] else ""
         assert job_val, f"expected non-empty SPUR_JOB_ID in logs:\n{logs}"
 
+    def test_job_passes_through_pending_before_running(self, cluster):
+        """The operator must surface the pre-Running state, not just terminal ones."""
+        job = simple_spurjob("it-pending", ["sh", "-c", "sleep 20"])
+        cluster.create_spurjob(job)
+
+        seen: set[str] = set()
+
+        def reached_running() -> bool:
+            state = (cluster.get_spurjob("it-pending").get("status") or {}).get("state")
+            if state:
+                seen.add(state)
+            return state == "Running"
+
+        assert_eventually(
+            DEFAULT_TIMEOUT, 1, "SpurJob never reached Running", reached_running
+        )
+        assert "Pending" in seen, (
+            f"expected a Pending observation before Running, saw {sorted(seen)}"
+        )
+        cluster.delete_spurjob("it-pending")
+
     def test_multinode_job_assigns_nodes(self, cluster):
         job = multinode_spurjob(
             "it-multi",
@@ -62,6 +85,69 @@ class TestSpurJobLifecycle:
         )
         assigned = (completed.get("status") or {}).get("assignedNodes") or []
         assert assigned, "multi-node job should have assigned nodes"
+
+    def test_multinode_ranks_and_master_addr_are_distinct(self, cluster):
+        """Each pod must get its own rank and a shared rendezvous address."""
+        job = multinode_spurjob(
+            "it-multi-env",
+            [
+                "sh",
+                "-c",
+                "echo rank=$SPUR_NODE_RANK nnodes=$SPUR_NNODES "
+                "master=$MASTER_ADDR world=$WORLD_SIZE",
+            ],
+            2,
+        )
+        cluster.create_spurjob(job)
+        wait_spurjob_state(cluster, "it-multi-env", "Completed", timeout=90)
+
+        logs = read_all_spurjob_pod_logs(cluster, "it-multi-env")
+        assert len(logs) == 2, f"expected 2 pods, got {sorted(logs)}"
+
+        def field(text: str, key: str) -> str:
+            for token in text.split():
+                if token.startswith(f"{key}="):
+                    return token.split("=", 1)[1]
+            return ""
+
+        ranks = {field(text, "rank") for text in logs.values()}
+        assert ranks == {"0", "1"}, f"expected ranks 0 and 1, got {ranks}:\n{logs}"
+
+        masters = {field(text, "master") for text in logs.values()}
+        assert len(masters) == 1 and masters != {""}, (
+            f"every pod must share one MASTER_ADDR, got {masters}:\n{logs}"
+        )
+
+        for text in logs.values():
+            assert field(text, "nnodes") == "2", f"SPUR_NNODES must be 2:\n{text}"
+            assert field(text, "world") == "2", f"WORLD_SIZE must be 2:\n{text}"
+
+    def test_headless_service_is_removed_on_cancel(self, cluster):
+        """Cancelling a multi-node job must clean up its Service, not just pods."""
+        job = multinode_spurjob("it-multi-svc", ["sleep", "600"], 2)
+        cluster.create_spurjob(job)
+
+        wait_spurjob_pods_exist(cluster, "it-multi-svc", timeout=90)
+        spur_job_id = (
+            cluster.get_spurjob("it-multi-svc").get("status") or {}
+        ).get("spurJobId")
+        assert spur_job_id is not None, "multi-node job never got a Spur job ID"
+
+        assert_eventually(
+            DEFAULT_TIMEOUT,
+            2,
+            f"headless Service spur-job-{spur_job_id} was never created",
+            lambda: job_service_exists(cluster, spur_job_id),
+        )
+
+        cluster.delete_spurjob("it-multi-svc")
+
+        assert_eventually(
+            DEFAULT_TIMEOUT,
+            2,
+            f"headless Service spur-job-{spur_job_id} outlived the cancelled job",
+            lambda: not job_service_exists(cluster, spur_job_id),
+        )
 
     def test_cancellation_cleans_up_pods(self, cluster):
         job = simple_spurjob("it-cancel", ["sleep", "600"])

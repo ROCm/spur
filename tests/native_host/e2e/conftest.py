@@ -350,6 +350,63 @@ def mpi_multi_node_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     yield c
     c.teardown()
 
+def metrics_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
+    """
+    Per-test fixture with the metrics server reachable off-loopback.
+
+    ``[metrics] bind`` defaults to ``loopback``; ``all`` lets a test scrape
+    from any node. ``high_cardinality`` is left off so the 404 gating on
+    /metrics/jobs-users-accts stays observable.
+    """
+    overrides = deep_merge(
+        dict(cluster_config_overrides or {}),
+        {"metrics": {"bind": "all"}},
+    )
+    spur_cluster = _deploy_cluster(ssh_nodes, remote_bin_dir, config_overrides=overrides)
+    spur_cluster.curl_preflight()
+    yield spur_cluster
+    spur_cluster.teardown()
+
+
+@pytest.fixture
+def raft_cluster(ssh_nodes, remote_bin_dir):
+    """
+    Per-test fixture running spurctld on three nodes as Raft peers.
+
+    Clients address the full endpoint list, so CLI calls survive a leader
+    change. Skips unless three nodes are available for a quorum.
+    """
+    if len(ssh_nodes) < 3:
+        pytest.skip(
+            f"Raft HA tests require at least 3 nodes for a quorum "
+            f"(got {len(ssh_nodes)})"
+        )
+
+    c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
+    c.enable_raft(3)
+    try:
+        c.provision()
+        c.curl_preflight()
+        c.start()
+    except Exception:
+        c.teardown()
+        raise
+    yield c
+    c.teardown()
+
+
+@pytest.fixture
+def spank_cluster(ssh_nodes, remote_bin_dir):
+    """
+    Per-test fixture for SPANK plugin tests.
+
+    Provisioned but not started: the test compiles its plugin, calls
+    ``write_plugstack``, then ``start()`` so spurd picks up SPUR_PLUGSTACK.
+    """
+    spur_cluster = _provision_cluster(ssh_nodes, remote_bin_dir)
+    yield spur_cluster
+    spur_cluster.teardown()
+
 
 @pytest.fixture
 def mpi_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
