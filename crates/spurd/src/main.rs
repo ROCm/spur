@@ -270,6 +270,10 @@ async fn main() -> anyhow::Result<()> {
     // every register/heartbeat so the controller learns a key that appears/changes after startup.
     let wg_iface = std::env::var("SPUR_WG_INTERFACE").unwrap_or_else(|_| "spur0".into());
 
+    // Shared between the reporter (reads held ids for heartbeats) and the agent
+    // service (owns/mutates it) so the controller can reconcile stale allocations.
+    let running_jobs = agent_server::new_running_jobs();
+
     // Create the node reporter
     let reporter = Arc::new(NodeReporter::new(
         hostname.clone(),
@@ -279,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
         labels,
         args.token.unwrap_or_default(),
         wg_iface,
+        running_jobs.clone(),
     ));
 
     // Register with controller
@@ -309,6 +314,7 @@ async fn main() -> anyhow::Result<()> {
         &cluster_config,
         memlock,
         mpi_config,
+        running_jobs,
     );
 
     // the RPC-driven k0s component owner is idle until the controller sends
