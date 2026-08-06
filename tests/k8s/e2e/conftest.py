@@ -34,12 +34,22 @@ def ha_cluster(k8s_suite):
     c.teardown_workloads()
 
 
+@pytest.fixture(scope="class")
+def quota_cluster(k8s_suite):
+    """Operator deployed with --enable-quota for the quota projection tests."""
+    c = ClusterFixture.deploy(k8s_suite, FixtureConfig.with_quota())
+    yield c
+    c.teardown_workloads()
+
+
 @pytest.fixture(autouse=True)
 def _cleanup_between_tests(request):
     yield
-    if "cluster" in request.fixturenames:
-        request.getfixturevalue("cluster").cleanup_test_workloads()
-    elif "ha_cluster" in request.fixturenames:
+    for name in ("cluster", "quota_cluster"):
+        if name in request.fixturenames:
+            request.getfixturevalue(name).cleanup_test_workloads()
+            return
+    if "ha_cluster" in request.fixturenames:
         fixture = request.getfixturevalue("ha_cluster")
         fixture.cleanup_test_workloads()
         fixture.ensure_controllers_ready()

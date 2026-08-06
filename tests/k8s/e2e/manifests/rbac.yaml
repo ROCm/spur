@@ -31,6 +31,25 @@ rules:
   - apiGroups: [policy]
     resources: [poddisruptionbudgets]
     verbs: [get, list, watch, create, update, patch, delete]
+  # Quota projection (--enable-quota): one Namespace, ResourceQuota, LimitRange,
+  # Role and RoleBinding per Spur account.
+  - apiGroups: [""]
+    resources: [namespaces, resourcequotas, limitranges, serviceaccounts]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # RBAC self-protection means granting a Role requires already holding its
+  # verbs, or escalate/bind.
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [roles, rolebindings]
+    verbs: [get, list, watch, create, update, patch, delete, escalate, bind]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [apps]
+    resources: [deployments, replicasets, statefulsets, daemonsets]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [pods/exec, pods/attach, pods/portforward, secrets, persistentvolumeclaims]
+    verbs: [get, list, watch, create, update, patch, delete]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

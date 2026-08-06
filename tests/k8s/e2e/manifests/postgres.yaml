@@ -1,0 +1,64 @@
+# Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Ephemeral Postgres for the accounting-backed suites (quota projection reads
+# accounts over the SlurmAccounting RPC, which spurctld only serves when
+# accounting.database_url is set). Storage is emptyDir: the data is disposable
+# and dies with the namespace.
+apiVersion: v1
+kind: Service
+metadata:
+  name: spur-postgres
+  namespace: spur
+  labels:
+    app: spur-postgres
+spec:
+  selector:
+    app: spur-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spur-postgres
+  namespace: spur
+  labels:
+    app: spur-postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spur-postgres
+  template:
+    metadata:
+      labels:
+        app: spur-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - name: POSTGRES_USER
+              value: spur
+            - name: POSTGRES_PASSWORD
+              value: spur
+            - name: POSTGRES_DB
+              value: spur
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "spur"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          emptyDir: {}
