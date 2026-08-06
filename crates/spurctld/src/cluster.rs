@@ -465,12 +465,11 @@ impl ClusterManager {
         spur_core::mpi::validate_single_node_pmix(mpi, spec.num_nodes)
             .map_err(SubmitError::invalid)?;
 
-        self.run_job_submit_hook(&mut spec)?;
-
-        // Checked after defaults are applied so we measure the final spec.
-        // Array expansion only adds bounded integer metadata per task, so a
-        // single pre-expansion check still bounds each Raft log entry.
+        // Bound the spec before the hook forks/parses it; the hook only edits
+        // bounded whitelist fields, so this still measures what gets persisted.
         check_submission_size(&spec)?;
+
+        self.run_job_submit_hook(&mut spec)?;
 
         // Reject unknown/malformed dependency types up front so users get a
         // clear error instead of a silently-deadlocked job (e.g. `expand:N`).
@@ -571,8 +570,13 @@ impl ClusterManager {
 
         if let Some(script) = lua {
             let ctx = self.submit_hook_ctx(spec)?;
-            let outcome = spur_core::hooks::run_submit_hook_lua(script, &ctx)
-                .map_err(|e| SubmitError::internal(format!("job_submit lua hook failed: {e}")))?;
+            // The Lua VM runs synchronously; block_in_place keeps it off the async
+            // worker, matching the shell path and the `propose()` convention.
+            let outcome =
+                tokio::task::block_in_place(|| crate::hooks::run_submit_hook_lua(script, &ctx))
+                    .map_err(|e| {
+                        SubmitError::internal(format!("job_submit lua hook failed: {e}"))
+                    })?;
             self.apply_submit_outcome(spec, "job_submit_lua", outcome)?;
         }
 
@@ -645,6 +649,17 @@ impl ClusterManager {
                             "job_submit hook set unknown QOS '{name}'"
                         )));
                     }
+                }
+                // A hook-set gres conflicting with an explicit --gpus request would
+                // otherwise surface only at schedule time; reject it at submit.
+                if changes.gres.is_some() {
+                    spur_core::gpu_request::resolve_gpu_demand_for(spec, spec.num_nodes).map_err(
+                        |e| {
+                            SubmitError::invalid(format!(
+                                "job_submit hook set a conflicting gres request: {e}"
+                            ))
+                        },
+                    )?;
                 }
                 Ok(())
             }
@@ -3127,6 +3142,9 @@ impl ClusterManager {
             anyhow::bail!("reconfigure requires a config file path, but none is configured");
         };
         let new_config = spur_core::config::SlurmConfig::load_from_file(path)?;
+        // Reject a broken submit hook before it goes live, so reconfigure can't
+        // silently swap in a hook that fails every subsequent submission.
+        crate::hooks::validate_submit_hooks(&new_config.hooks)?;
         let conf_partitions = new_config.build_partitions();
 
         let conf_names: std::collections::HashSet<String> =
@@ -6329,11 +6347,39 @@ mod tests {
         );
     }
 
+    // A hook that sets gres conflicting with an explicit --gpus request is
+    // rejected at submit time, not silently deferred to schedule time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_gres_conflict_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(
+            &dir,
+            r#"echo '{"gres":["gpu:mi300x:2"]}'"#,
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("gres-conflict");
+        spec.gpus = Some(spur_core::gpu_request::GpuRequest {
+            count: 4,
+            gpu_type: None,
+        });
+        let err = cm.submit_job(spec).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("conflicting gres"),
+            "expected a gres-conflict rejection, got: {err:?}"
+        );
+    }
+
     fn write_lua_script(dir: &TempDir, body: &str) -> String {
         use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
         let path = dir.path().join("job_submit.lua");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, "{body}").unwrap();
+        // The runner refuses a group/world-writable hook; a permissive umask
+        // would otherwise trip that check on the temp file.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         path.to_string_lossy().into_owned()
     }
 
