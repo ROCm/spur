@@ -1363,7 +1363,9 @@ message DeleteReservationRequest {
   string user = 2;             // requesting user; must be the owner (root and trusted internal callers always allowed; legacy reservations with no recorded owner are mutable by anyone)
 }
 
-message ListReservationsRequest { }
+message ListReservationsRequest {
+  string name = 1;  // empty = all
+}
 
 message ListReservationsResponse {
   repeated ReservationInfo reservations = 1;

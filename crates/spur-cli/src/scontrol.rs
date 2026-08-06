@@ -735,11 +735,21 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
         }
         "reservation" | "reservations" => {
             let resp = client
-                .list_reservations(spur_proto::proto::ListReservationsRequest {})
+                .list_reservations(spur_proto::proto::ListReservationsRequest {
+                    name: name.unwrap_or("").into(),
+                })
                 .await
                 .context("failed to list reservations")?;
 
-            for res in resp.into_inner().reservations {
+            let reservations = resp.into_inner().reservations;
+            if reservations.is_empty() {
+                if let Some(name) = name {
+                    bail!("Reservation {} not found", name);
+                }
+                return Ok(());
+            }
+
+            for res in reservations {
                 println!("ReservationName={}", res.name);
                 println!("   StartTime={}", res.start_time);
                 println!("   EndTime={}", res.end_time);
