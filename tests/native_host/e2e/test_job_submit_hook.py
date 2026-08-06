@@ -37,6 +37,11 @@ function slurm_job_submit(job_desc, submit_uid)
 end
 """
 
+GRES_CONFLICT_HOOK = """\
+#!/bin/bash
+echo '{"gres": ["gpu:2"]}'
+"""
+
 
 def _hook_config(cluster, body: str) -> dict:
     path = cluster.write_file("hooks/job_submit.sh", body)
@@ -107,3 +112,15 @@ class TestJobSubmitHook:
         detail = cluster.scontrol("show", "job", str(job_id))
         assert "Priority=555" in detail
         assert "lua-tagged" in detail
+
+    def test_gres_conflict_is_rejected_at_submit(self, unstarted_cluster):
+        # A hook-set gres that conflicts with an explicit --gpus request is
+        # rejected at submission, not silently deferred to schedule time.
+        cluster = unstarted_cluster
+        cluster.start(_hook_config(cluster, GRES_CONFLICT_HOOK))
+
+        script = cluster.write_file("job.sh", "#!/bin/bash\necho hi\n")
+        out = cluster.cli_allow_fail(["sbatch", "-J", "gres-x", "--gpus=4", script])
+
+        assert "conflicting gres" in out
+        assert parse_job_id(out) is None

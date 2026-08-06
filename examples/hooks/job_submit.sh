@@ -11,6 +11,9 @@
 # Whitelist: qos, partition, account, constraint, comment, reservation, priority,
 # time_limit_minutes (integer minutes), begin_time (RFC3339), gres (array), hold.
 # Non-whitelisted keys (identity, script, resource counts) are ignored and logged.
+# Emitting "" for constraint/comment/reservation clears that field; "" for
+# qos/partition/account is ignored (treated as unset).
+# The hook runs at submission only -- `scontrol update` does not re-run it.
 # Requires jq. Also available in the environment: SPUR_JOB_USER, SPUR_JOB_UID,
 # SPUR_JOB_GID, SPUR_JOB_PARTITION.
 

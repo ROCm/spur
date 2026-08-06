@@ -141,7 +141,7 @@ pub enum SubmitHookOutcome {
     Modify(SubmitHookChanges),
 }
 
-const SUBMIT_HOOK_WHITELIST: &[&str] = &[
+pub const SUBMIT_HOOK_WHITELIST: &[&str] = &[
     "qos",
     "partition",
     "account",
@@ -161,14 +161,57 @@ const SUBMIT_HOOK_TIMEOUT_SECS: u64 = 30;
 /// Max bytes captured from the hook's stdout/stderr each; a chatty hook can't
 /// grow controller memory without bound.
 const SUBMIT_HOOK_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+/// Max length of the user-facing rejection reason. stderr doubles as the hook's
+/// log stream, so a large or noisy stderr must not become a multi-MB gRPC status.
+const SUBMIT_HOOK_MAX_REASON_BYTES: usize = 4096;
 
 /// Reject a non-absolute hook path: a bare name would resolve via `$PATH` and
 /// silently run the wrong binary. The config contract requires a fully-qualified path.
-fn require_absolute_hook_path(script_path: &str) -> anyhow::Result<()> {
+pub fn require_absolute_hook_path(script_path: &str) -> anyhow::Result<()> {
     if !std::path::Path::new(script_path).is_absolute() {
         anyhow::bail!("job_submit hook path must be absolute: {script_path}");
     }
     Ok(())
+}
+
+/// Refuse a hook the controller's account does not exclusively control: the file
+/// is executed / loaded as the (root) controller and a hook-set QoS bypasses the
+/// per-user ACL, so anyone who can write it gains that privilege. Require it be
+/// owned by root or the controller's own uid and not group/world-writable.
+#[cfg(unix)]
+pub fn require_secure_hook_file(script_path: &str) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(script_path)
+        .with_context(|| format!("job_submit hook not found: {script_path}"))?;
+    let euid = nix::unistd::geteuid().as_raw();
+    if meta.uid() != 0 && meta.uid() != euid {
+        anyhow::bail!(
+            "job_submit hook must be owned by root or the controller user: {script_path}"
+        );
+    }
+    if meta.mode() & 0o022 != 0 {
+        anyhow::bail!("job_submit hook must not be group- or world-writable: {script_path}");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn require_secure_hook_file(_script_path: &str) -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// Truncate an over-long hook rejection reason to roughly the last
+/// [`SUBMIT_HOOK_MAX_REASON_BYTES`], keeping the tail (where a script's final
+/// error line usually is) and snapping to a char boundary.
+pub fn cap_hook_reason(reason: &str) -> String {
+    if reason.len() <= SUBMIT_HOOK_MAX_REASON_BYTES {
+        return reason.to_string();
+    }
+    let mut cut = reason.len() - SUBMIT_HOOK_MAX_REASON_BYTES;
+    while cut < reason.len() && !reason.is_char_boundary(cut) {
+        cut += 1;
+    }
+    format!("[reason truncated] …{}", &reason[cut..])
 }
 
 /// Run the job-submission hook: spec as JSON on stdin; non-zero exit = reject
@@ -178,6 +221,7 @@ pub async fn run_submit_hook(
     ctx: &SubmitHookContext,
 ) -> anyhow::Result<SubmitHookOutcome> {
     require_absolute_hook_path(script_path)?;
+    require_secure_hook_file(script_path)?;
     info!(
         target: "audit",
         hook = "job_submit",
@@ -234,6 +278,8 @@ pub async fn run_submit_hook(
         stdin.shutdown().await.or_else(ignore_broken_pipe)
     };
 
+    // Drain both streams to EOF, finish the stdin write, and reap the child under
+    // one deadline; read_capped keeps reading past the cap so this can't deadlock.
     let timeout = std::time::Duration::from_secs(SUBMIT_HOOK_TIMEOUT_SECS);
     let collected = tokio::time::timeout(timeout, async {
         tokio::join!(
@@ -244,19 +290,29 @@ pub async fn run_submit_hook(
         )
     })
     .await;
-    let (write_res, out_bytes, err_bytes, status) = match collected {
+    let (write_res, out_capped, err_capped, status) = match collected {
         Ok(tuple) => tuple,
         Err(_) => {
             let _ = child.kill().await;
+            let _ = child.wait().await;
             anyhow::bail!(
                 "job_submit hook timed out after {SUBMIT_HOOK_TIMEOUT_SECS}s (script: {script_path})"
             );
         }
     };
     write_res.context("failed to write spec to job_submit stdin")?;
-    let out_bytes = out_bytes.context("failed to read job_submit stdout")?;
-    let err_bytes = err_bytes.context("failed to read job_submit stderr")?;
+    let (out_bytes, out_truncated) = out_capped.context("failed to read job_submit stdout")?;
+    let (err_bytes, err_truncated) = err_capped.context("failed to read job_submit stderr")?;
     let status = status.context("job_submit script failed to complete")?;
+
+    // Overflowing the cap gets a distinct error rather than being silently
+    // truncated (or masked as a timeout).
+    if out_truncated || err_truncated {
+        let stream = if out_truncated { "stdout" } else { "stderr" };
+        anyhow::bail!(
+            "job_submit hook {stream} exceeded {SUBMIT_HOOK_MAX_OUTPUT_BYTES} bytes (script: {script_path})"
+        );
+    }
 
     let stderr_text = String::from_utf8_lossy(&err_bytes);
     for line in stderr_text.lines() {
@@ -268,7 +324,7 @@ pub async fn run_submit_hook(
         let reason = if reason.is_empty() {
             format!("job rejected by job_submit hook (exit {status})")
         } else {
-            reason.to_string()
+            cap_hook_reason(reason)
         };
         return Ok(SubmitHookOutcome::Reject(reason));
     }
@@ -282,16 +338,30 @@ pub async fn run_submit_hook(
     Ok(SubmitHookOutcome::Modify(changes))
 }
 
-/// Read up to `cap` bytes from `reader`; excess is left unread (the child then
-/// blocks on a full pipe and is caught by the caller's wall-clock timeout).
+/// Read `reader` to EOF, returning `(bytes, truncated)`. Retains at most `cap`
+/// bytes but keeps draining past it (discarding the excess) so the child never
+/// blocks on a full pipe; `truncated` is set once the cap is exceeded, letting
+/// the caller fail with a distinct "output too large" error instead of a hang.
 async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     cap: usize,
-) -> std::io::Result<Vec<u8>> {
+) -> std::io::Result<(Vec<u8>, bool)> {
     use tokio::io::AsyncReadExt;
-    let mut buf = Vec::new();
-    reader.take(cap as u64).read_to_end(&mut buf).await?;
-    Ok(buf)
+    let mut buf = Vec::with_capacity(cap.min(64 * 1024));
+    let mut chunk = [0u8; 64 * 1024];
+    let mut total = 0usize;
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+        if buf.len() < cap {
+            let room = cap - buf.len();
+            buf.extend_from_slice(&chunk[..n.min(room)]);
+        }
+    }
+    Ok((buf, total > cap))
 }
 
 /// Parse the shell hook's stdout into whitelisted changes; malformed JSON or a
@@ -304,7 +374,7 @@ fn parse_submit_changes(stdout: &str) -> anyhow::Result<SubmitHookChanges> {
 
 /// Type-check the whitelisted keys of a JSON object into `SubmitHookChanges`,
 /// logging (not applying) non-whitelisted keys. Shared by the shell and Lua paths.
-fn changes_from_map(
+pub fn changes_from_map(
     map: &serde_json::Map<String, serde_json::Value>,
 ) -> anyhow::Result<SubmitHookChanges> {
     let mut leftover = Vec::new();
@@ -410,232 +480,6 @@ fn take_datetime(key: &str, value: &serde_json::Value) -> anyhow::Result<DateTim
     DateTime::parse_from_rfc3339(&s)
         .map(|dt| dt.with_timezone(&Utc))
         .with_context(|| format!("job_submit field `{key}` must be an RFC3339 timestamp"))
-}
-
-/// Memory ceiling for a job_submit lua script (a runaway policy must not OOM the
-/// controller). Generous for policy logic; not a user-tunable.
-const LUA_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
-/// Instruction budget before a lua script is interrupted (guards infinite loops).
-const LUA_INSTRUCTION_LIMIT: u32 = 100_000_000;
-/// Base globals that reach the filesystem or the bytecode loader; removed so a
-/// sandboxed script cannot read/execute on-disk Lua even without `os`/`io`.
-const LUA_UNSAFE_GLOBALS: &[&str] = &["dofile", "loadfile", "load", "loadstring", "collectgarbage"];
-
-/// Run the Lua job_submit hook (Slurm `job_submit/lua` parity): the script defines
-/// `slurm_job_submit(job_desc, submit_uid)`. Sandboxed (see [`harden_lua_sandbox`]).
-pub fn run_submit_hook_lua(
-    script_path: &str,
-    ctx: &SubmitHookContext,
-) -> anyhow::Result<SubmitHookOutcome> {
-    use mlua::{Lua, LuaSerdeExt, StdLib, Value};
-
-    require_absolute_hook_path(script_path)?;
-    info!(
-        target: "audit",
-        hook = "job_submit_lua",
-        script = script_path,
-        user = %ctx.user,
-        uid = ctx.uid,
-        partition = %ctx.partition,
-        "running job_submit lua hook"
-    );
-
-    let source = std::fs::read_to_string(script_path)
-        .with_context(|| format!("job_submit lua script unreadable: {script_path}"))?;
-
-    let safe_libs =
-        StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8 | StdLib::COROUTINE;
-    let lua = Lua::new_with(safe_libs, mlua::LuaOptions::default())
-        .map_err(|e| lua_err("initialize sandboxed Lua", e))?;
-    harden_lua_sandbox(&lua)?;
-
-    let mut spec_value: serde_json::Value =
-        serde_json::from_str(&ctx.spec_json).context("failed to decode job spec for lua hook")?;
-    // Present time_limit to Lua as integer minutes (Slurm convention), replacing
-    // the internal [secs, nanos] encoding the script would not understand.
-    if let Some(obj) = spec_value.as_object_mut() {
-        let minutes = obj
-            .get("time_limit")
-            .and_then(|v| v.as_array())
-            .and_then(|a| a.first())
-            .and_then(|s| s.as_i64())
-            .map(|secs| secs / 60);
-        match minutes {
-            Some(m) => obj.insert("time_limit".into(), m.into()),
-            None => obj.insert("time_limit".into(), serde_json::Value::Null),
-        };
-    }
-    // Map JSON null to Lua nil (not the null userdata sentinel) so a script can
-    // check unset fields naturally, e.g. `if job_desc.time_limit == nil`.
-    let ser_opts = mlua::serde::SerializeOptions::new()
-        .serialize_none_to_null(false)
-        .serialize_unit_to_null(false);
-    let job_desc = lua
-        .to_value_with(&spec_value, ser_opts)
-        .map_err(|e| lua_err("expose job spec to lua", e))?;
-
-    let rejection: std::rc::Rc<std::cell::RefCell<Option<String>>> = Default::default();
-    let slurm = build_slurm_table(&lua, &rejection)?;
-    lua.globals()
-        .set("slurm", slurm)
-        .map_err(|e| lua_err("set slurm global", e))?;
-
-    lua.load(source.as_str())
-        .set_name("job_submit.lua")
-        .exec()
-        .map_err(|e| lua_err("load job_submit lua script", e))?;
-
-    let func: mlua::Function = lua.globals().get("slurm_job_submit").map_err(|_| {
-        anyhow::anyhow!("job_submit lua must define slurm_job_submit(job_desc, submit_uid)")
-    })?;
-    let rc: i64 = func
-        .call((&job_desc, ctx.uid))
-        .map_err(|e| lua_err("call slurm_job_submit", e))?;
-
-    if rc != 0 {
-        let reason = rejection
-            .borrow()
-            .clone()
-            .unwrap_or_else(|| format!("job rejected by job_submit lua hook (rc {rc})"));
-        return Ok(SubmitHookOutcome::Reject(reason));
-    }
-
-    let job_desc: mlua::Table = match job_desc {
-        Value::Table(t) => t,
-        _ => anyhow::bail!("job_desc must remain a table"),
-    };
-    let changes = lua_table_to_changes(&lua, &job_desc, spec_value.as_object())?;
-    if changes == SubmitHookChanges::default() {
-        Ok(SubmitHookOutcome::Accept)
-    } else {
-        Ok(SubmitHookOutcome::Modify(changes))
-    }
-}
-
-/// `mlua::Error` is neither `Send` nor `Sync`, so it cannot cross into `anyhow`
-/// directly; flatten it to a string at the boundary.
-fn lua_err(what: &str, e: mlua::Error) -> anyhow::Error {
-    anyhow::anyhow!("failed to {what}: {e}")
-}
-
-/// Close the holes `Lua::new_with` leaves: the always-loaded base library exposes
-/// filesystem/bytecode globals; remove them and cap memory + instructions.
-fn harden_lua_sandbox(lua: &mlua::Lua) -> anyhow::Result<()> {
-    let globals = lua.globals();
-    for name in LUA_UNSAFE_GLOBALS {
-        globals
-            .set(*name, mlua::Value::Nil)
-            .map_err(|e| lua_err(&format!("remove unsafe global `{name}`"), e))?;
-    }
-    lua.set_memory_limit(LUA_MEMORY_LIMIT_BYTES)
-        .map_err(|e| lua_err("set lua memory limit", e))?;
-    lua.set_hook(
-        mlua::HookTriggers::new().every_nth_instruction(LUA_INSTRUCTION_LIMIT),
-        |_lua, _debug| {
-            Err(mlua::Error::runtime(
-                "job_submit lua hook exceeded its instruction budget",
-            ))
-        },
-    )
-    .map_err(|e| lua_err("set lua instruction hook", e))?;
-    Ok(())
-}
-
-/// Build the minimal `slurm` table exposed to the Lua script: return-code
-/// constants and `log_user`, which records the message shown on rejection.
-fn build_slurm_table(
-    lua: &mlua::Lua,
-    rejection: &std::rc::Rc<std::cell::RefCell<Option<String>>>,
-) -> anyhow::Result<mlua::Table> {
-    let build = || -> mlua::Result<mlua::Table> {
-        let slurm = lua.create_table()?;
-        slurm.set("SUCCESS", 0)?;
-        slurm.set("ERROR", -1)?;
-        slurm.set("FAILURE", -1)?;
-        let sink = rejection.clone();
-        let log_user = lua.create_function(move |_, msg: String| {
-            *sink.borrow_mut() = Some(msg);
-            Ok(())
-        })?;
-        slurm.set("log_user", log_user)?;
-        Ok(slurm)
-    };
-    build().map_err(|e| lua_err("build slurm table", e))
-}
-
-/// Diff whitelisted fields on `job_desc` against their pre-call values, reporting
-/// only changed ones. Non-whitelisted keys are never read (no identity/resource edits).
-fn lua_table_to_changes(
-    lua: &mlua::Lua,
-    job_desc: &mlua::Table,
-    original: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> anyhow::Result<SubmitHookChanges> {
-    use mlua::LuaSerdeExt;
-    let mut map = serde_json::Map::new();
-    for key in SUBMIT_HOOK_WHITELIST {
-        // time_limit_minutes is surfaced to Lua as `time_limit` (minutes),
-        // matching Slurm; read it under that name and map it back.
-        let lua_key = if *key == "time_limit_minutes" {
-            "time_limit"
-        } else {
-            key
-        };
-        let value: mlua::Value = job_desc
-            .get(lua_key)
-            .map_err(|e| lua_err(&format!("read lua field `{lua_key}`"), e))?;
-        let json: serde_json::Value = lua
-            .from_value(value)
-            .map_err(|e| lua_err(&format!("convert lua field `{lua_key}`"), e))?;
-        if json.is_null() {
-            continue;
-        }
-        // Only report fields the script actually changed from their input value.
-        let unchanged = original
-            .and_then(|o| o.get(lua_key))
-            .is_some_and(|orig| orig == &json);
-        if unchanged {
-            continue;
-        }
-        map.insert((*key).to_string(), json);
-    }
-    let ignored = ignored_lua_fields(lua, job_desc, original)?;
-    if !ignored.is_empty() {
-        warn!(
-            target: "audit",
-            hook = "job_submit_lua",
-            ignored = ?ignored,
-            whitelist = ?SUBMIT_HOOK_WHITELIST,
-            "job_submit lua hook set non-whitelisted fields; ignoring them"
-        );
-    }
-    changes_from_map(&map)
-}
-
-/// Non-whitelisted `job_desc` keys the script added or changed vs its input
-/// (which also lives in `job_desc`), so only script-set keys are surfaced.
-fn ignored_lua_fields(
-    lua: &mlua::Lua,
-    job_desc: &mlua::Table,
-    original: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> anyhow::Result<Vec<String>> {
-    use mlua::LuaSerdeExt;
-    let mut ignored = Vec::new();
-    for pair in job_desc.pairs::<String, mlua::Value>() {
-        let (key, value) = pair.map_err(|e| lua_err("iterate lua job_desc", e))?;
-        // `time_limit` is the Lua name of the whitelisted `time_limit_minutes`.
-        if SUBMIT_HOOK_WHITELIST.contains(&key.as_str()) || key == "time_limit" {
-            continue;
-        }
-        let json: serde_json::Value = lua.from_value(value).unwrap_or(serde_json::Value::Null);
-        let unchanged = original
-            .and_then(|o| o.get(&key))
-            .is_some_and(|o| o == &json);
-        if !unchanged {
-            ignored.push(key);
-        }
-    }
-    ignored.sort();
-    Ok(ignored)
 }
 
 /// Apply whitelisted hook changes onto the spec, returning the names of the
@@ -1137,274 +981,6 @@ mod tests {
         assert_eq!(c.hold, Some(true));
     }
 
-    fn make_lua(body: &str) -> tempfile::TempPath {
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "{body}").unwrap();
-        f.into_temp_path()
-    }
-
-    fn lua_ctx(spec_json: &str) -> SubmitHookContext {
-        SubmitHookContext {
-            spec_json: spec_json.into(),
-            user: "alice".into(),
-            uid: 1000,
-            gid: 1000,
-            partition: "gpu".into(),
-        }
-    }
-
-    #[test]
-    fn lua_accept_when_unchanged() {
-        let lua = make_lua("function slurm_job_submit(job_desc, uid)\n  return slurm.SUCCESS\nend");
-        let out =
-            run_submit_hook_lua(lua.to_str().unwrap(), &lua_ctx(r#"{"partition":"gpu"}"#)).unwrap();
-        assert!(matches!(out, SubmitHookOutcome::Accept));
-    }
-
-    #[test]
-    fn lua_reject_with_log_user_message() {
-        let lua = make_lua(
-            "function slurm_job_submit(job_desc, uid)\n  slurm.log_user('needs a partition')\n  return slurm.ERROR\nend",
-        );
-        let out =
-            run_submit_hook_lua(lua.to_str().unwrap(), &lua_ctx(r#"{"partition":"gpu"}"#)).unwrap();
-        match out {
-            SubmitHookOutcome::Reject(m) => assert_eq!(m, "needs a partition"),
-            other => panic!("expected reject, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn lua_modify_sets_qos() {
-        let lua = make_lua(
-            "function slurm_job_submit(job_desc, uid)\n  job_desc.qos = 'high'\n  return slurm.SUCCESS\nend",
-        );
-        let out =
-            run_submit_hook_lua(lua.to_str().unwrap(), &lua_ctx(r#"{"partition":"gpu"}"#)).unwrap();
-        match out {
-            SubmitHookOutcome::Modify(c) => assert_eq!(c.qos.as_deref(), Some("high")),
-            other => panic!("expected modify, got {other:?}"),
-        }
-    }
-
-    // Unchanged whitelisted fields must not be reported as edits.
-    #[test]
-    fn lua_untouched_partition_is_not_a_change() {
-        let lua = make_lua(
-            "function slurm_job_submit(job_desc, uid)\n  job_desc.comment = 'tag'\n  return slurm.SUCCESS\nend",
-        );
-        let out = run_submit_hook_lua(
-            lua.to_str().unwrap(),
-            &lua_ctx(r#"{"partition":"gpu","qos":"low"}"#),
-        )
-        .unwrap();
-        match out {
-            SubmitHookOutcome::Modify(c) => {
-                assert_eq!(c.comment.as_deref(), Some("tag"));
-                assert!(c.partition.is_none(), "unchanged partition must not appear");
-                assert!(c.qos.is_none(), "unchanged qos must not appear");
-            }
-            other => panic!("expected modify, got {other:?}"),
-        }
-    }
-
-    // time_limit is surfaced to Lua in minutes (Slurm convention).
-    #[test]
-    fn lua_time_limit_is_minutes() {
-        let lua = make_lua(
-            "function slurm_job_submit(job_desc, uid)\n  if job_desc.time_limit > 60 then job_desc.time_limit = 60 end\n  return slurm.SUCCESS\nend",
-        );
-        // 7200s = 120 min on input; script caps to 60.
-        let out = run_submit_hook_lua(
-            lua.to_str().unwrap(),
-            &lua_ctx(r#"{"partition":"gpu","time_limit":[7200,0]}"#),
-        )
-        .unwrap();
-        match out {
-            SubmitHookOutcome::Modify(c) => assert_eq!(c.time_limit_minutes, Some(60)),
-            other => panic!("expected modify, got {other:?}"),
-        }
-    }
-
-    // The sandbox omits the os library, so os.execute is unavailable.
-    #[test]
-    fn lua_sandbox_denies_os_execute() {
-        let lua = make_lua(
-            "function slurm_job_submit(job_desc, uid)\n  os.execute('touch /tmp/pwned')\n  return slurm.SUCCESS\nend",
-        );
-        let res = run_submit_hook_lua(lua.to_str().unwrap(), &lua_ctx(r#"{"partition":"gpu"}"#));
-        assert!(
-            res.is_err(),
-            "os.execute must not be callable in the sandbox"
-        );
-    }
-
-    // The sandbox omits io and package too.
-    #[test]
-    fn lua_sandbox_denies_io_and_require() {
-        for body in [
-            "function slurm_job_submit(j,u)\n  io.open('/etc/passwd')\n  return 0\nend",
-            "function slurm_job_submit(j,u)\n  require('os')\n  return 0\nend",
-        ] {
-            let lua = make_lua(body);
-            let res =
-                run_submit_hook_lua(lua.to_str().unwrap(), &lua_ctx(r#"{"partition":"gpu"}"#));
-            assert!(res.is_err(), "sandbox must deny: {body}");
-        }
-    }
-
-    // The base library always loads, so dofile/loadfile/load must be stripped;
-    // otherwise a script could read and execute arbitrary on-disk Lua.
-    #[test]
-    fn lua_sandbox_denies_filesystem_base_globals() {
-        for body in [
-            "function slurm_job_submit(j,u)\n  dofile('/etc/hostname')\n  return 0\nend",
-            "function slurm_job_submit(j,u)\n  loadfile('/etc/hostname')\n  return 0\nend",
-            "function slurm_job_submit(j,u)\n  load('return 1')\n  return 0\nend",
-        ] {
-            let lua = make_lua(body);
-            let res =
-                run_submit_hook_lua(lua.to_str().unwrap(), &lua_ctx(r#"{"partition":"gpu"}"#));
-            assert!(res.is_err(), "sandbox must deny: {body}");
-        }
-    }
-
-    #[test]
-    fn lua_infinite_loop_is_interrupted() {
-        let lua = make_lua(
-            "function slurm_job_submit(j,u)\n  while true do end\n  return slurm.SUCCESS\nend",
-        );
-        let res = run_submit_hook_lua(lua.to_str().unwrap(), &lua_ctx(r#"{"partition":"gpu"}"#));
-        assert!(
-            res.is_err(),
-            "an infinite loop must be interrupted, not hang"
-        );
-    }
-
-    // Lua arithmetic yields floats; a whole-valued float time_limit is accepted.
-    #[test]
-    fn lua_time_limit_float_is_accepted() {
-        let lua = make_lua(
-            "function slurm_job_submit(j,u)\n  j.time_limit = j.time_limit / 2\n  return slurm.SUCCESS\nend",
-        );
-        let out = run_submit_hook_lua(
-            lua.to_str().unwrap(),
-            &lua_ctx(r#"{"partition":"gpu","time_limit":[7200,0]}"#),
-        )
-        .unwrap();
-        match out {
-            SubmitHookOutcome::Modify(c) => assert_eq!(c.time_limit_minutes, Some(60)),
-            other => panic!("expected modify, got {other:?}"),
-        }
-    }
-
-    // An untouched time_limit must not be reported as a change (minutes round-trip).
-    #[test]
-    fn lua_untouched_time_limit_is_not_a_change() {
-        let lua = make_lua(
-            "function slurm_job_submit(j,u)\n  j.comment = 'x'\n  return slurm.SUCCESS\nend",
-        );
-        let out = run_submit_hook_lua(
-            lua.to_str().unwrap(),
-            &lua_ctx(r#"{"partition":"gpu","time_limit":[7200,0]}"#),
-        )
-        .unwrap();
-        match out {
-            SubmitHookOutcome::Modify(c) => {
-                assert_eq!(c.comment.as_deref(), Some("x"));
-                assert!(
-                    c.time_limit_minutes.is_none(),
-                    "untouched time_limit leaked"
-                );
-            }
-            other => panic!("expected modify, got {other:?}"),
-        }
-    }
-
-    // Untouched array (gres) and numeric (priority) fields must not be reported.
-    #[test]
-    fn lua_untouched_gres_and_priority_not_reported() {
-        let lua = make_lua(
-            "function slurm_job_submit(j,u)\n  j.comment = 'x'\n  return slurm.SUCCESS\nend",
-        );
-        let out = run_submit_hook_lua(
-            lua.to_str().unwrap(),
-            &lua_ctx(r#"{"partition":"gpu","gres":["gpu:mi300x:2"],"priority":50}"#),
-        )
-        .unwrap();
-        match out {
-            SubmitHookOutcome::Modify(c) => {
-                assert!(c.gres.is_none(), "untouched gres leaked");
-                assert!(c.priority.is_none(), "untouched priority leaked");
-            }
-            other => panic!("expected modify, got {other:?}"),
-        }
-    }
-
-    // A script setting a non-whitelisted field cannot change identity/resources.
-    #[test]
-    fn lua_non_whitelisted_field_is_ignored() {
-        let lua = make_lua(
-            "function slurm_job_submit(j,u)\n  j.uid = 0\n  j.num_nodes = 99\n  j.script = '/evil'\n  return slurm.SUCCESS\nend",
-        );
-        let out = run_submit_hook_lua(
-            lua.to_str().unwrap(),
-            &lua_ctx(r#"{"partition":"gpu","uid":1000}"#),
-        )
-        .unwrap();
-        assert!(
-            matches!(out, SubmitHookOutcome::Accept),
-            "non-whitelisted edits must not register as a modify"
-        );
-    }
-
-    // Only script-added/changed non-whitelisted keys are flagged; an unchanged
-    // input field (name) and a whitelisted one (qos) are not.
-    #[test]
-    fn lua_ignored_fields_detects_only_script_edits() {
-        let lua = mlua::Lua::new();
-        let job_desc = lua.create_table().unwrap();
-        job_desc.set("name", "job1").unwrap(); // unchanged input, non-whitelisted
-        job_desc.set("qos", "high").unwrap(); // whitelisted
-        job_desc.set("uid", 0).unwrap(); // changed input, non-whitelisted
-        job_desc.set("evil", "x").unwrap(); // added, non-whitelisted
-        let original = serde_json::json!({"name": "job1", "uid": 1000});
-        let ignored = ignored_lua_fields(&lua, &job_desc, original.as_object()).unwrap();
-        assert_eq!(ignored, vec!["evil".to_string(), "uid".to_string()]);
-    }
-
-    // An unset spec field must read as Lua nil (not a null userdata), so a
-    // script can test `if job_desc.time_limit == nil` without a type error.
-    #[test]
-    fn lua_unset_field_reads_as_nil() {
-        let lua = make_lua(
-            "function slurm_job_submit(j,u)\n  if j.time_limit == nil then j.comment = 'was-nil' end\n  return slurm.SUCCESS\nend",
-        );
-        let out = run_submit_hook_lua(
-            lua.to_str().unwrap(),
-            &lua_ctx(r#"{"partition":"gpu","time_limit":null}"#),
-        )
-        .unwrap();
-        match out {
-            SubmitHookOutcome::Modify(c) => assert_eq!(c.comment.as_deref(), Some("was-nil")),
-            other => panic!("expected modify, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn lua_missing_entry_point_errors() {
-        let lua = make_lua("local x = 1");
-        let res = run_submit_hook_lua(lua.to_str().unwrap(), &lua_ctx(r#"{"partition":"gpu"}"#));
-        assert!(res.is_err());
-    }
-
-    #[test]
-    fn lua_syntax_error_fails_closed() {
-        let lua = make_lua("function slurm_job_submit(  this is not lua");
-        let res = run_submit_hook_lua(lua.to_str().unwrap(), &lua_ctx(r#"{"partition":"gpu"}"#));
-        assert!(res.is_err());
-    }
-
     #[test]
     fn time_limit_minutes_rejects_negative_and_huge() {
         assert!(parse_submit_changes(r#"{"time_limit_minutes": -1}"#).is_err());
@@ -1415,35 +991,71 @@ mod tests {
     }
 
     #[test]
-    fn lua_modify_sets_gres_and_begin_time() {
-        let lua = make_lua(
-            "function slurm_job_submit(j,u)\n  j.gres = {'gpu:mi300x:2'}\n  j.begin_time = '2026-08-04T12:00:00Z'\n  return slurm.SUCCESS\nend",
-        );
-        let out =
-            run_submit_hook_lua(lua.to_str().unwrap(), &lua_ctx(r#"{"partition":"gpu"}"#)).unwrap();
-        match out {
-            SubmitHookOutcome::Modify(c) => {
-                assert_eq!(c.gres.as_deref(), Some(&["gpu:mi300x:2".to_string()][..]));
-                assert!(c.begin_time.is_some());
-            }
-            other => panic!("expected modify, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn lua_non_integer_return_fails_closed() {
-        for ret in ["return 'nope'", "return {}", "return nil"] {
-            let lua = make_lua(&format!("function slurm_job_submit(j,u)\n  {ret}\nend"));
-            let res =
-                run_submit_hook_lua(lua.to_str().unwrap(), &lua_ctx(r#"{"partition":"gpu"}"#));
-            assert!(res.is_err(), "non-integer return must fail closed: {ret}");
-        }
-    }
-
-    #[test]
     fn hook_paths_must_be_absolute() {
         assert!(require_absolute_hook_path("job_submit.sh").is_err());
         assert!(require_absolute_hook_path("./rel/path.sh").is_err());
         assert!(require_absolute_hook_path("/etc/spur/job_submit.sh").is_ok());
+    }
+
+    // A hung hook is killed at the wall-clock deadline and fails closed, rather
+    // than stalling submission forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(run_hooks)]
+    async fn submit_hook_timeout_fails_closed() {
+        let script = make_script("sleep 60");
+        let err = run_submit_hook(script.to_str().unwrap(), &submit_ctx())
+            .await
+            .expect_err("a hung hook must fail, not hang");
+        assert!(err.to_string().contains("timed out"), "got: {err}");
+    }
+
+    // Overflowing the output cap is reported as a distinct "too large" error, not
+    // masked as a generic timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(run_hooks)]
+    async fn submit_hook_output_cap_is_distinct_error() {
+        // Emit ~2 MiB to stdout, over the 1 MiB cap, then exit 0.
+        let script = make_script("head -c 2097152 /dev/zero | tr '\\0' 'a'\nexit 0");
+        let err = run_submit_hook(script.to_str().unwrap(), &submit_ctx())
+            .await
+            .expect_err("output past the cap must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeded"),
+            "expected a size error, got: {msg}"
+        );
+        assert!(!msg.contains("timed out"), "must not be a timeout: {msg}");
+    }
+
+    #[test]
+    fn cap_hook_reason_truncates_long_reason() {
+        let short = "denied: bad partition";
+        assert_eq!(cap_hook_reason(short), short);
+        let long = "x".repeat(SUBMIT_HOOK_MAX_REASON_BYTES * 2);
+        let capped = cap_hook_reason(&long);
+        assert!(capped.len() < long.len());
+        assert!(capped.starts_with("[reason truncated]"));
+    }
+
+    // A group/world-writable hook is an arbitrary-code / QoS-escalation surface
+    // and must be refused. Root bypasses Unix perm checks, so skip as root.
+    #[cfg(unix)]
+    #[test]
+    fn secure_hook_file_rejects_world_writable() {
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "#!/bin/bash\nexit 0").unwrap();
+        let path = f.into_temp_path();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = require_secure_hook_file(path.to_str().unwrap())
+            .expect_err("world-writable hook must be refused");
+        assert!(err.to_string().contains("writable"), "got: {err}");
+        // A tightened mode is accepted.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(require_secure_hook_file(path.to_str().unwrap()).is_ok());
     }
 }

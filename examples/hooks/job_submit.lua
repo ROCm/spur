@@ -10,6 +10,9 @@
 -- begin_time (RFC3339 string), gres (array), hold. Other fields (identity,
 -- script, resource counts) are ignored. The sandbox has no os/io/require, so a
 -- policy script cannot shell out, read files, or load modules.
+-- Setting a field to nil is a no-op (it cannot clear a value); assign a new
+-- value to change it. The hook runs at submission only -- `scontrol update`
+-- does not re-run it.
 
 local MAX_MINUTES = 1440
 
