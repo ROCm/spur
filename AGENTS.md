@@ -65,6 +65,7 @@ cargo test --locked                                                 # all tests 
 - **IMPORTANT**: Do not add comments that explain *what* the code does. Comments are only for *why* — non-obvious intent, trade-offs, or constraints the code itself cannot convey. Self-explanatory code gets no comments.
 - **IMPORTANT**: Do not reference issue numbers, PR numbers, or task IDs in code comments. That context belongs in git history, not in the source.
 - Do not add comments that narrate the intent of a fix or review feedback (e.g. "changed per review", "moved here to fix X"). The code should stand on its own — review context belongs in the commit message or PR discussion.
+- Keep comments short — 1-3 lines is the norm. Do not write long, multi-line comment blocks unless it is really a must; if an explanation needs a full paragraph, it usually belongs in the commit message or PR description, not the source.
 - **IMPORTANT**: Do not apply band-aid fixes. If a fix would be cleaner with a broader refactor that improves testability or idiomaticness, do the refactor. Explain the reasoning to the user. Maintainability over fast delivery.
 - Do not write tests that simulate a unit's behavior instead of calling the actual unit. Tests must exercise real code.
 - Do not write tests that depend on the test runner's environment. Use explicit fixtures so tests pass identically everywhere.
