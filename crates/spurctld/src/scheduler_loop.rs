@@ -138,7 +138,12 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         }
         let hit_depth_limit = pending.len() > max_jobs;
 
-        let nodes = cluster.get_nodes();
+        let cooling = cluster.nodes_on_dispatch_cooldown();
+        let nodes: Vec<spur_core::node::Node> = cluster
+            .get_nodes()
+            .into_iter()
+            .filter(|n| !cooling.contains(&n.name))
+            .collect();
         let partitions = cluster.get_partitions();
         let reservations = cluster.get_reservations();
 
@@ -862,6 +867,9 @@ enum DispatchError {
     /// own context, so the same failure recurs everywhere: Slurm drains the node
     /// and holds the job instead of retrying it onto the next one.
     PrologFailed(String),
+    /// The agent rejected the dispatch because the controller-allocated resources
+    /// are already in use locally — the controller's view of this node is stale.
+    ResourcesUnavailable,
     Other(anyhow::Error),
 }
 
@@ -869,6 +877,9 @@ impl std::fmt::Display for DispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::PrologFailed(reason) => write!(f, "agent rejected job: {reason}"),
+            Self::ResourcesUnavailable => {
+                write!(f, "agent rejected job: allocated resources unavailable")
+            }
             Self::Other(e) => write!(f, "{e:#}"),
         }
     }
@@ -1021,7 +1032,11 @@ async fn dispatch_to_agent(
             task_fanout: params.task_fanout,
             pmix_prepared: params.pmix_prepared,
         })
-        .await?;
+        .await
+        .map_err(|s| match s.code() {
+            tonic::Code::ResourceExhausted => DispatchError::ResourcesUnavailable,
+            _ => DispatchError::Other(s.into()),
+        })?;
 
     let inner = response.into_inner();
     if !inner.success {
@@ -1519,8 +1534,12 @@ async fn confirm_dispatch_on_nodes(
             Ok((node_name, _, Err(e))) => {
                 error!(job_id, node = %node_name, error = %e, "dispatch confirmation failed");
                 failures += 1;
-                if let DispatchError::PrologFailed(reason) = e {
-                    prolog_failed.push((node_name, reason));
+                match e {
+                    DispatchError::PrologFailed(reason) => {
+                        prolog_failed.push((node_name, reason));
+                    }
+                    DispatchError::ResourcesUnavailable => cluster.cool_down_node(&node_name),
+                    DispatchError::Other(_) => {}
                 }
             }
             Err(e) => {
@@ -2492,6 +2511,9 @@ mod tests {
             release_pmix_calls: Arc<AtomicU32>,
             reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
             launch_delay: Duration,
+            /// launch_job returns a ResourceExhausted status, standing in for a
+            /// node whose local allocation table already holds the GPUs.
+            reject_resources: bool,
             /// Records each `LaunchJobRequest.task_fanout` this agent receives,
             /// so tests can assert on it without a real spurd behind the RPC.
             fanout_calls: Option<Arc<std::sync::Mutex<Vec<bool>>>>,
@@ -2511,6 +2533,11 @@ mod tests {
             {
                 if !self.launch_delay.is_zero() {
                     tokio::time::sleep(self.launch_delay).await;
+                }
+                if self.reject_resources {
+                    return Err(tonic::Status::resource_exhausted(
+                        "controller-allocated GPUs unavailable on this node",
+                    ));
                 }
                 if let Some(kind) = self.reject_launch_as {
                     return Ok(tonic::Response::new(spur_proto::proto::LaunchJobResponse {
@@ -2744,6 +2771,7 @@ mod tests {
                 release_pmix_calls: release_pmix_calls.clone(),
                 reject_launch_as,
                 launch_delay,
+                reject_resources: false,
                 fanout_calls: capture.then(|| fanout_calls.clone()),
             };
             tokio::spawn(async move {
@@ -2755,6 +2783,28 @@ mod tests {
                     .await;
             });
             (addr, cancel_calls, release_pmix_calls, fanout_calls)
+        }
+
+        /// Mock agent whose launch_job always rejects with ResourceExhausted.
+        async fn spawn_mock_agent_rejecting_resources() -> std::net::SocketAddr {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let agent = MockAgent {
+                cancel_calls: Arc::new(AtomicU32::new(0)),
+                reject_launch_as: None,
+                launch_delay: Duration::ZERO,
+                reject_resources: true,
+                fanout_calls: None,
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            addr
         }
 
         /// Reserve a localhost port with nothing listening on it, so a
@@ -4234,6 +4284,25 @@ mod tests {
                 cm.get_job(job_id).unwrap().state,
                 JobState::Cancelled,
                 "the job must stay exactly as the earlier, real cancel left it"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn resources_unavailable_reject_cools_down_the_node() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let addr = spawn_mock_agent_rejecting_resources().await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("resource-reject", 1));
+
+            assert!(cm.nodes_on_dispatch_cooldown().is_empty());
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(
+                cm.nodes_on_dispatch_cooldown().contains("n1"),
+                "a resources-unavailable reject must put the node on cooldown"
             );
         }
     }
