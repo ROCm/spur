@@ -3303,6 +3303,24 @@ impl ClusterManager {
         }
     }
 
+    /// Evict terminal jobs whose end_time is older than the retention window,
+    /// bounding controller memory. No-op when nothing has aged out.
+    pub fn evict_expired_terminal_jobs(&self) {
+        let retention = self.config().controller.terminal_job_retention_secs;
+        let before = Utc::now() - chrono::Duration::seconds(retention as i64);
+        let any = self
+            .jobs
+            .read()
+            .values()
+            .any(|j| j.state.is_terminal() && j.end_time.is_some_and(|t| t < before));
+        if !any {
+            return;
+        }
+        if let Err(e) = self.propose(WalOperation::EvictTerminalJobs { before }) {
+            warn!(error = %e, "failed to evict expired terminal jobs");
+        }
+    }
+
     /// Cancel running jobs whose reservation window has ended (after optional grace).
     pub fn enforce_reservation_end_times(&self) {
         let now = Utc::now();
@@ -4845,6 +4863,23 @@ impl ClusterManager {
                 }
                 k0s.reset_requested = *reset_requested;
             }
+            WalOperation::EvictTerminalJobs { before } => {
+                let evicted: Vec<JobId> = jobs
+                    .iter()
+                    .filter(|(_, j)| {
+                        j.state.is_terminal() && j.end_time.is_some_and(|t| t < *before)
+                    })
+                    .map(|(&id, _)| id)
+                    .collect();
+                if !evicted.is_empty() {
+                    for id in &evicted {
+                        jobs.remove(id);
+                    }
+                    self.steps
+                        .write()
+                        .retain(|_, s| !evicted.contains(&s.job_id));
+                }
+            }
         }
         self.next_job_id.store(next_id, Ordering::Relaxed);
         response
@@ -6259,6 +6294,56 @@ mod tests {
         let node = cm.get_node("node1").unwrap();
         assert_eq!(node.alloc_resources.cpus, 0);
         assert_eq!(node.alloc_resources.memory_mb, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_terminal_jobs_drops_only_aged_terminal_jobs() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("done")),
+        });
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Cancelled,
+        });
+        assert!(
+            cm.get_job(1).unwrap().state.is_terminal(),
+            "job 1 is terminal"
+        );
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 2,
+            spec: Box::new(basic_spec("running")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            2,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 3,
+            spec: Box::new(basic_spec("pending")),
+        });
+
+        // A cutoff before the just-set end_time spares even the terminal job.
+        cm.apply_operation(&WalOperation::EvictTerminalJobs {
+            before: chrono::Utc::now() - chrono::Duration::hours(1),
+        });
+        assert!(
+            cm.get_job(1).is_some(),
+            "recent terminal job must be spared"
+        );
+
+        // A cutoff after it evicts the terminal job only.
+        cm.apply_operation(&WalOperation::EvictTerminalJobs {
+            before: chrono::Utc::now() + chrono::Duration::seconds(1),
+        });
+        assert!(cm.get_job(1).is_none(), "aged terminal job must be evicted");
+        assert!(cm.get_job(2).is_some(), "running job must be spared");
+        assert!(cm.get_job(3).is_some(), "pending job must be spared");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

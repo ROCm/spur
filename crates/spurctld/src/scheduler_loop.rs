@@ -125,6 +125,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         cluster.drive_bb_stage_in();
         cluster.purge_expired_reservations();
         cluster.enforce_reservation_end_times();
+        cluster.evict_expired_terminal_jobs();
 
         // Classify once, apply reasons, and stage only candidates admitted by
         // that classification. Run before the empty-check so reasons stay fresh

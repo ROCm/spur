@@ -320,10 +320,19 @@ pub struct ControllerConfig {
     /// the inverse `SchedulerParameters=nohold_on_prolog_fail`.
     #[serde(default = "default_hold_on_prolog_fail")]
     pub hold_on_prolog_fail: bool,
+
+    /// Seconds a terminal job stays in controller memory/snapshots before eviction
+    /// (default 3600); Postgres accounting history is unaffected.
+    #[serde(default = "default_terminal_job_retention_secs")]
+    pub terminal_job_retention_secs: u64,
 }
 
 fn default_max_batch_requeue() -> u32 {
     5
+}
+
+fn default_terminal_job_retention_secs() -> u64 {
+    3600
 }
 
 fn default_hold_on_prolog_fail() -> bool {
@@ -374,6 +383,7 @@ impl Default for ControllerConfig {
             max_batch_requeue: default_max_batch_requeue(),
             max_launch_backoff_secs: default_max_launch_backoff_secs(),
             hold_on_prolog_fail: default_hold_on_prolog_fail(),
+            terminal_job_retention_secs: default_terminal_job_retention_secs(),
         }
     }
 }

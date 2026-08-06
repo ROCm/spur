@@ -262,6 +262,12 @@ pub enum WalOperation {
     NodeK0sClear {
         name: String,
     },
+
+    /// Evict terminal jobs whose end_time is older than `before` from the
+    /// in-memory map and snapshots, bounding controller memory.
+    EvictTerminalJobs {
+        before: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 impl WalOperation {
@@ -821,6 +827,22 @@ mod deregistration_wal_tests {
             WalOperation::NodeRemove { name, reason } => {
                 assert_eq!(name, "n0");
                 assert!(reason.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // Frozen on-wire shape; a new field without #[serde(default)] fails here
+    // instead of crashing a controller replaying this entry after upgrade.
+    #[test]
+    fn evict_terminal_jobs_frozen_payload_still_deserializes() {
+        const EVICT: &str = r#"{"EvictTerminalJobs":{"before":"2026-08-06T00:00:00Z"}}"#;
+        let op: WalOperation = serde_json::from_str(EVICT).expect(
+            "frozen EvictTerminalJobs must deserialize; a new field needs #[serde(default)]",
+        );
+        match op {
+            WalOperation::EvictTerminalJobs { before } => {
+                assert_eq!(before.to_rfc3339(), "2026-08-06T00:00:00+00:00");
             }
             _ => panic!("wrong variant"),
         }
