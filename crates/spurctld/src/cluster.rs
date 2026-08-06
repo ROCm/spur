@@ -4864,7 +4864,7 @@ impl ClusterManager {
                 k0s.reset_requested = *reset_requested;
             }
             WalOperation::EvictTerminalJobs { before } => {
-                let evicted: Vec<JobId> = jobs
+                let evicted: HashSet<JobId> = jobs
                     .iter()
                     .filter(|(_, j)| {
                         j.state.is_terminal() && j.end_time.is_some_and(|t| t < *before)
@@ -4872,9 +4872,7 @@ impl ClusterManager {
                     .map(|(&id, _)| id)
                     .collect();
                 if !evicted.is_empty() {
-                    for id in &evicted {
-                        jobs.remove(id);
-                    }
+                    jobs.retain(|id, _| !evicted.contains(id));
                     self.steps
                         .write()
                         .retain(|_, s| !evicted.contains(&s.job_id));
@@ -6328,6 +6326,25 @@ mod tests {
             spec: Box::new(basic_spec("pending")),
         });
 
+        // A step on each of the terminal (1) and live (2) jobs: eviction must
+        // drop the evicted job's step and keep the live one's.
+        let step = |job_id: JobId| JobStep {
+            job_id,
+            step_id: 0,
+            name: "s".into(),
+            state: StepState::Running,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            resources: scalar_alloc(1, 0),
+            nodes: vec!["node1".into()],
+            distribution: spur_core::step::TaskDistribution::Block,
+            start_time: None,
+            end_time: None,
+            exit_code: None,
+        };
+        cm.steps.write().insert((1, 0), step(1));
+        cm.steps.write().insert((2, 0), step(2));
+
         // A cutoff before the just-set end_time spares even the terminal job.
         cm.apply_operation(&WalOperation::EvictTerminalJobs {
             before: chrono::Utc::now() - chrono::Duration::hours(1),
@@ -6344,6 +6361,40 @@ mod tests {
         assert!(cm.get_job(1).is_none(), "aged terminal job must be evicted");
         assert!(cm.get_job(2).is_some(), "running job must be spared");
         assert!(cm.get_job(3).is_some(), "pending job must be spared");
+        assert!(
+            cm.steps.read().get(&(1, 0)).is_none(),
+            "evicted job's step must be removed"
+        );
+        assert!(
+            cm.steps.read().get(&(2, 0)).is_some(),
+            "live job's step must be kept"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_expired_terminal_jobs_honors_retention_window() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.controller.terminal_job_retention_secs = 0;
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("done")),
+        });
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Cancelled,
+        });
+
+        // retention 0: end_time is already < now, so the producer proposes and
+        // the job is gone after one pass.
+        cm.evict_expired_terminal_jobs();
+        assert!(
+            cm.get_job(1).is_none(),
+            "with zero retention the terminal job is evicted"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

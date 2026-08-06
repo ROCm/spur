@@ -348,6 +348,10 @@ fn default_max_launch_backoff_secs() -> u64 {
 /// out of chrono's representable range.
 pub const MAX_LAUNCH_BACKOFF_SECS: u64 = 86_400;
 
+/// Upper bound for `terminal_job_retention_secs` (one year). Keeps the eviction
+/// cutoff (`now - retention`) inside chrono's representable range.
+pub const MAX_TERMINAL_JOB_RETENTION_SECS: u64 = 366 * 24 * 60 * 60;
+
 fn default_listen_addr() -> String {
     "[::]:6817".into()
 }
@@ -1156,6 +1160,16 @@ impl SlurmConfig {
                 ),
             });
         }
+        // Bounded so the eviction cutoff `now - retention` stays representable.
+        if self.controller.terminal_job_retention_secs > MAX_TERMINAL_JOB_RETENTION_SECS {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.terminal_job_retention_secs".into(),
+                value: format!(
+                    "{} (must be at most {})",
+                    self.controller.terminal_job_retention_secs, MAX_TERMINAL_JOB_RETENTION_SECS
+                ),
+            });
+        }
         if self.cluster.enabled {
             if self.cluster.distro != "k0s" {
                 return Err(ConfigError::InvalidValue {
@@ -1930,6 +1944,43 @@ max_launch_backoff_secs = 0
         assert!(
             err.to_string().contains("max_launch_backoff_secs"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn controller_config_rejects_out_of_range_terminal_job_retention_secs() {
+        // Past this bound the eviction cutoff overflows chrono and panics the
+        // controller, so it must be refused at load rather than at first use.
+        let toml = format!(
+            r#"
+cluster_name = "test"
+
+[controller]
+terminal_job_retention_secs = {}
+"#,
+            MAX_TERMINAL_JOB_RETENTION_SECS + 1
+        );
+        let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("terminal_job_retention_secs"),
+            "unexpected error: {err}"
+        );
+
+        let ok = format!(
+            r#"
+cluster_name = "test"
+
+[controller]
+terminal_job_retention_secs = {MAX_TERMINAL_JOB_RETENTION_SECS}
+"#
+        );
+        assert_eq!(
+            SlurmConfig::load_from_str(&ok)
+                .unwrap()
+                .controller
+                .terminal_job_retention_secs,
+            MAX_TERMINAL_JOB_RETENTION_SECS,
+            "the bound itself must be accepted"
         );
     }
 
