@@ -341,6 +341,9 @@ pub struct ClusterManager {
     /// Wake signal for the scheduler loop.
     pub(crate) scheduler_notify: Arc<Notify>,
     sched_stats: OnceLock<Arc<SchedStatsCollector>>,
+    /// Nodes skipped for new dispatch until the given instant after a
+    /// resources-unavailable reject. Leader-local and transient, never persisted.
+    node_dispatch_cooldowns: RwLock<HashMap<String, std::time::Instant>>,
 }
 
 struct PendingJobClassification {
@@ -400,6 +403,7 @@ impl ClusterManager {
             association_cache,
             scheduler_notify: Arc::new(Notify::new()),
             sched_stats: OnceLock::new(),
+            node_dispatch_cooldowns: RwLock::new(HashMap::new()),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -412,6 +416,27 @@ impl ClusterManager {
     /// from their point of view.
     pub fn config(&self) -> Arc<SlurmConfig> {
         self.config.read().clone()
+    }
+
+    /// Skip a node for new dispatch for the configured cooldown after it rejected
+    /// one as resources-unavailable, so the scheduler stops re-picking it each tick.
+    pub fn cool_down_node(&self, name: &str) {
+        let secs = self.config().controller.dispatch_reject_cooldown_secs;
+        if secs == 0 {
+            return;
+        }
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        self.node_dispatch_cooldowns
+            .write()
+            .insert(name.to_string(), until);
+    }
+
+    /// Names still within their dispatch cooldown, pruning any that have expired.
+    pub fn nodes_on_dispatch_cooldown(&self) -> HashSet<String> {
+        let now = std::time::Instant::now();
+        let mut cooldowns = self.node_dispatch_cooldowns.write();
+        cooldowns.retain(|_, &mut until| until > now);
+        cooldowns.keys().cloned().collect()
     }
 
     /// Submit a new job. If it has an array spec, expand into individual tasks.
@@ -1732,6 +1757,18 @@ impl ClusterManager {
     /// Get all nodes.
     pub fn get_nodes(&self) -> Vec<Node> {
         self.nodes.read().values().cloned().collect()
+    }
+
+    /// Nodes eligible for new placement this tick: all nodes minus those within
+    /// a dispatch cooldown after a resources-unavailable reject.
+    pub fn schedulable_nodes(&self) -> Vec<Node> {
+        let cooling = self.nodes_on_dispatch_cooldown();
+        self.nodes
+            .read()
+            .values()
+            .filter(|n| !cooling.contains(&n.name))
+            .cloned()
+            .collect()
     }
 
     /// Get a node by name.
@@ -5951,6 +5988,45 @@ mod tests {
             .expect("single-node raft did not self-elect within 5s");
         cm.set_raft(handle.raft);
         (cm, conf_path)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_cooldown_marks_then_expires_and_respects_disable() {
+        let dir = TempDir::new().unwrap();
+
+        // Enabled (default 30s): a cooled node is reported until it expires.
+        let cm = test_cluster_with_config(&dir, test_config()).await;
+        register_node(&cm, "worker1", 8, 16000);
+        register_node(&cm, "worker2", 8, 16000);
+        assert!(cm.nodes_on_dispatch_cooldown().is_empty());
+        cm.cool_down_node("worker1");
+        assert!(cm.nodes_on_dispatch_cooldown().contains("worker1"));
+
+        // The scheduler's node view excludes the cooled node, keeps the other.
+        let names: HashSet<String> = cm.schedulable_nodes().into_iter().map(|n| n.name).collect();
+        assert!(
+            !names.contains("worker1"),
+            "cooled node excluded from scheduling"
+        );
+        assert!(names.contains("worker2"), "healthy node still schedulable");
+
+        // A past instant is pruned on read, so an expired cooldown clears.
+        cm.node_dispatch_cooldowns.write().insert(
+            "worker1".into(),
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        );
+        assert!(!cm.nodes_on_dispatch_cooldown().contains("worker1"));
+        assert!(
+            cm.schedulable_nodes().iter().any(|n| n.name == "worker1"),
+            "expired cooldown makes the node schedulable again"
+        );
+
+        // Disabled (0s): cool_down_node is a no-op.
+        let mut cfg = test_config();
+        cfg.controller.dispatch_reject_cooldown_secs = 0;
+        let cm0 = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
+        cm0.cool_down_node("worker1");
+        assert!(cm0.nodes_on_dispatch_cooldown().is_empty());
     }
 
     /// Consumer-driven: `maybe_requeue` must honor the new `max_batch_requeue`

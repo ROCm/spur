@@ -320,10 +320,19 @@ pub struct ControllerConfig {
     /// the inverse `SchedulerParameters=nohold_on_prolog_fail`.
     #[serde(default = "default_hold_on_prolog_fail")]
     pub hold_on_prolog_fail: bool,
+
+    /// Seconds a node is skipped for new dispatch after rejecting one as
+    /// resources-unavailable, so it isn't re-picked every tick (default 30, 0 disables).
+    #[serde(default = "default_dispatch_reject_cooldown_secs")]
+    pub dispatch_reject_cooldown_secs: u64,
 }
 
 fn default_max_batch_requeue() -> u32 {
     5
+}
+
+fn default_dispatch_reject_cooldown_secs() -> u64 {
+    30
 }
 
 fn default_hold_on_prolog_fail() -> bool {
@@ -374,6 +383,7 @@ impl Default for ControllerConfig {
             max_batch_requeue: default_max_batch_requeue(),
             max_launch_backoff_secs: default_max_launch_backoff_secs(),
             hold_on_prolog_fail: default_hold_on_prolog_fail(),
+            dispatch_reject_cooldown_secs: default_dispatch_reject_cooldown_secs(),
         }
     }
 }
@@ -1143,6 +1153,16 @@ impl SlurmConfig {
                 value: format!(
                     "{} (must be between 1 and {})",
                     self.controller.max_launch_backoff_secs, MAX_LAUNCH_BACKOFF_SECS
+                ),
+            });
+        }
+        // Bounded so `Instant::now() + cooldown` cannot overflow and panic.
+        if self.controller.dispatch_reject_cooldown_secs > MAX_LAUNCH_BACKOFF_SECS {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.dispatch_reject_cooldown_secs".into(),
+                value: format!(
+                    "{} (must be at most {})",
+                    self.controller.dispatch_reject_cooldown_secs, MAX_LAUNCH_BACKOFF_SECS
                 ),
             });
         }
@@ -1920,6 +1940,41 @@ max_launch_backoff_secs = 0
         assert!(
             err.to_string().contains("max_launch_backoff_secs"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn controller_config_rejects_out_of_range_dispatch_reject_cooldown_secs() {
+        // Past this bound `Instant::now() + cooldown` overflows and panics, so
+        // it must be refused at load. Zero is valid (disables the cooldown).
+        let toml = format!(
+            r#"
+cluster_name = "test"
+
+[controller]
+dispatch_reject_cooldown_secs = {}
+"#,
+            MAX_LAUNCH_BACKOFF_SECS + 1
+        );
+        let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("dispatch_reject_cooldown_secs"),
+            "unexpected error: {err}"
+        );
+
+        let ok = r#"
+cluster_name = "test"
+
+[controller]
+dispatch_reject_cooldown_secs = 0
+"#;
+        assert_eq!(
+            SlurmConfig::load_from_str(ok)
+                .unwrap()
+                .controller
+                .dispatch_reject_cooldown_secs,
+            0,
+            "zero (disabled) must be accepted"
         );
     }
 
