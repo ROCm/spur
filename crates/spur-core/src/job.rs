@@ -12,6 +12,11 @@ use crate::resource::ResourceAllocations;
 /// Unique job identifier assigned by the controller.
 pub type JobId = u32;
 
+/// Base priority assigned to a job that does not request one explicitly.
+/// Non-zero so the multiplicative effective-priority formula (fair-share, age,
+/// partition tier) has a factor to scale, rather than collapsing to the floor.
+pub const DEFAULT_PRIORITY: u32 = 1000;
+
 /// Job states matching Slurm's state model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -436,6 +441,10 @@ pub struct JobSpec {
 
     // Scheduling
     pub qos: Option<String>,
+    /// Explicit base priority request; `None` means "unset", resolved to
+    /// [`DEFAULT_PRIORITY`] in [`Job::new`] (except when `hold` is set, which
+    /// forces base priority to 0). Not the effective priority the scheduler
+    /// ranks on (that is derived from this each cycle).
     pub priority: Option<u32>,
     pub reservation: Option<String>,
     pub dependency: Vec<String>,
@@ -775,7 +784,7 @@ impl Job {
         let priority = if spec.hold {
             0
         } else {
-            spec.priority.unwrap_or(1000)
+            spec.priority.unwrap_or(DEFAULT_PRIORITY)
         };
         let state = JobState::Pending;
         let pending_reason = if spec.hold {

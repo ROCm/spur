@@ -17,7 +17,7 @@ use spur_core::burst_buffer::BbStageState;
 use spur_core::config::SlurmConfig;
 use spur_core::job::{
     effective_gpus, effective_memory_mb, Job, JobId, JobSpec, JobState, NodeCompleteError,
-    PendingReason, TransitionOutcome,
+    PendingReason, TransitionOutcome, DEFAULT_PRIORITY,
 };
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
@@ -1893,7 +1893,7 @@ impl ClusterManager {
         self.propose(WalOperation::JobPriorityChange {
             job_id,
             old_priority,
-            new_priority: 1000,
+            new_priority: DEFAULT_PRIORITY,
             pending_reason: Some(PendingReason::Priority),
             pending_reason_desc: None,
             reset_requeue_count: reset_requeue,
