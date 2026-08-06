@@ -240,8 +240,8 @@ impl ControllerService {
                     node = %node,
                     "agent still holds a terminal job — re-sending cancel to reclaim its allocation"
                 );
-                // Signal 0 = the graceful srun/salloc release path, which drops an
-                // allocation-only entry by id; safe because ids are never reused.
+                // Signal 0 = graceful release: drops an idle allocation, or re-signals
+                // a still-draining process. Safe to repeat because ids are never reused.
                 crate::scheduler_loop::cancel_job_on_nodes(
                     &cluster,
                     job_id,
