@@ -562,6 +562,11 @@ impl ClusterManager {
         self.jobs.read().get(&job_id).cloned()
     }
 
+    /// A job's state by ID, without cloning the whole `Job`.
+    pub fn job_state(&self, job_id: JobId) -> Option<JobState> {
+        self.jobs.read().get(&job_id).map(|j| j.state)
+    }
+
     /// Get a job by ID, synthesizing an aggregate record for an array *parent*
     /// id (which has no stored job — Spur stores only per-task jobs) so
     /// `scontrol show job <array_parent>` matches Slurm instead of returning

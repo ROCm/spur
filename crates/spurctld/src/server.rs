@@ -240,8 +240,8 @@ impl ControllerService {
                     node = %node,
                     "agent still holds a terminal job — re-sending cancel to reclaim its allocation"
                 );
-                // Signal 0 = the srun/salloc release path: frees an allocation-only
-                // entry, and its run_attempt guard spares a rare same-id relaunch.
+                // Signal 0 = the graceful srun/salloc release path, which drops an
+                // allocation-only entry by id; safe because ids are never reused.
                 crate::scheduler_loop::cancel_job_on_nodes(
                     &cluster,
                     job_id,
@@ -380,8 +380,10 @@ fn stale_reported_jobs(cluster: &ClusterManager, reported: &[RunningJobStatus]) 
     reported
         .iter()
         .filter_map(|r| {
-            let job = cluster.get_job(r.job_id)?;
-            job.state.is_terminal().then_some(r.job_id)
+            cluster
+                .job_state(r.job_id)?
+                .is_terminal()
+                .then_some(r.job_id)
         })
         .collect()
 }
@@ -3315,10 +3317,12 @@ mod tests {
             );
         };
 
-        // 10: Pending (just submitted, never dispatched). 11: Running. 12: terminal.
+        // 10 Pending, 11 Running, 12 terminal, and the non-Running active states
+        // that must also be spared: 13 Completing, 14 Suspended, 15 Preempted.
         apply(&submit(10, "pending"));
-        apply(&submit(11, "running"));
-        apply(&submit(12, "done"));
+        for id in [11, 12, 13, 14, 15] {
+            apply(&submit(id, "job"));
+        }
 
         let res = spur_core::resource::ResourceAllocations {
             cpus: 1,
@@ -3327,34 +3331,48 @@ mod tests {
         };
         let mut per_node = std::collections::HashMap::new();
         per_node.insert("n1".to_string(), res.clone());
-        apply(&WalOperation::job_start(
-            11,
-            vec!["n1".into()],
-            res.clone(),
-            per_node.clone(),
-        ));
-        apply(&WalOperation::job_start(
-            12,
-            vec!["n1".into()],
-            res,
-            per_node,
-        ));
+        for id in [11, 12, 13, 14, 15] {
+            apply(&WalOperation::job_start(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node.clone(),
+            ));
+            apply(&WalOperation::job_state_change(
+                id,
+                JobState::Pending,
+                JobState::Running,
+            ));
+        }
         apply(&WalOperation::job_state_change(
-            11,
-            JobState::Pending,
+            12,
             JobState::Running,
-        ));
-        apply(&WalOperation::job_state_change(
-            12,
-            JobState::Pending,
             JobState::Cancelled,
         ));
+        apply(&WalOperation::job_state_change(
+            13,
+            JobState::Running,
+            JobState::Completing,
+        ));
+        apply(&WalOperation::job_state_change(
+            14,
+            JobState::Running,
+            JobState::Suspended,
+        ));
+        apply(&WalOperation::job_state_change(
+            15,
+            JobState::Running,
+            JobState::Preempted,
+        ));
 
-        assert_eq!(cluster.get_job(10).unwrap().state, JobState::Pending);
-        assert_eq!(cluster.get_job(11).unwrap().state, JobState::Running);
-        assert!(cluster.get_job(12).unwrap().state.is_terminal());
+        assert_eq!(cluster.job_state(10), Some(JobState::Pending));
+        assert_eq!(cluster.job_state(11), Some(JobState::Running));
+        assert!(cluster.job_state(12).unwrap().is_terminal());
+        assert_eq!(cluster.job_state(13), Some(JobState::Completing));
+        assert_eq!(cluster.job_state(14), Some(JobState::Suspended));
+        assert_eq!(cluster.job_state(15), Some(JobState::Preempted));
 
-        let reported: Vec<RunningJobStatus> = [10, 11, 12, 999]
+        let reported: Vec<RunningJobStatus> = [10, 11, 12, 13, 14, 15, 999]
             .into_iter()
             .map(|job_id| RunningJobStatus {
                 job_id,
@@ -3366,7 +3384,7 @@ mod tests {
         assert_eq!(
             stale,
             vec![12],
-            "only the terminal job is reclaimed; Pending/Running/unknown are spared"
+            "only the terminal job is reclaimed; Pending/Running/Completing/Suspended/Preempted/unknown are spared"
         );
     }
 
