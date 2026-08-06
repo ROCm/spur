@@ -1786,6 +1786,18 @@ impl ClusterManager {
         self.nodes.read().values().cloned().collect()
     }
 
+    /// Nodes eligible for new placement this tick: all nodes minus those within
+    /// a dispatch cooldown after a resources-unavailable reject.
+    pub fn schedulable_nodes(&self) -> Vec<Node> {
+        let cooling = self.nodes_on_dispatch_cooldown();
+        self.nodes
+            .read()
+            .values()
+            .filter(|n| !cooling.contains(&n.name))
+            .cloned()
+            .collect()
+    }
+
     /// Get a node by name.
     pub fn get_node(&self, name: &str) -> Option<Node> {
         self.nodes.read().get(name).cloned()
@@ -6103,10 +6115,20 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         // Enabled (default 30s): a cooled node is reported until it expires.
-        let cm = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+        let cm = test_cluster_with_config(&dir, test_config()).await;
+        register_node(&cm, "worker1", 8, 16000);
+        register_node(&cm, "worker2", 8, 16000);
         assert!(cm.nodes_on_dispatch_cooldown().is_empty());
         cm.cool_down_node("worker1");
         assert!(cm.nodes_on_dispatch_cooldown().contains("worker1"));
+
+        // The scheduler's node view excludes the cooled node, keeps the other.
+        let names: HashSet<String> = cm.schedulable_nodes().into_iter().map(|n| n.name).collect();
+        assert!(
+            !names.contains("worker1"),
+            "cooled node excluded from scheduling"
+        );
+        assert!(names.contains("worker2"), "healthy node still schedulable");
 
         // A past instant is pruned on read, so an expired cooldown clears.
         cm.node_dispatch_cooldowns.write().insert(
@@ -6114,6 +6136,10 @@ mod tests {
             std::time::Instant::now() - std::time::Duration::from_secs(1),
         );
         assert!(!cm.nodes_on_dispatch_cooldown().contains("worker1"));
+        assert!(
+            cm.schedulable_nodes().iter().any(|n| n.name == "worker1"),
+            "expired cooldown makes the node schedulable again"
+        );
 
         // Disabled (0s): cool_down_node is a no-op.
         let mut cfg = test_config();

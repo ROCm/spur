@@ -1203,6 +1203,16 @@ impl SlurmConfig {
                 ),
             });
         }
+        // Bounded so `Instant::now() + cooldown` cannot overflow and panic.
+        if self.controller.dispatch_reject_cooldown_secs > MAX_LAUNCH_BACKOFF_SECS {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.dispatch_reject_cooldown_secs".into(),
+                value: format!(
+                    "{} (must be at most {})",
+                    self.controller.dispatch_reject_cooldown_secs, MAX_LAUNCH_BACKOFF_SECS
+                ),
+            });
+        }
         if self.cluster.enabled {
             if self.cluster.distro != "k0s" {
                 return Err(ConfigError::InvalidValue {
@@ -2014,6 +2024,41 @@ terminal_job_retention_secs = {MAX_TERMINAL_JOB_RETENTION_SECS}
                 .terminal_job_retention_secs,
             MAX_TERMINAL_JOB_RETENTION_SECS,
             "the bound itself must be accepted"
+        );
+    }
+
+    #[test]
+    fn controller_config_rejects_out_of_range_dispatch_reject_cooldown_secs() {
+        // Past this bound `Instant::now() + cooldown` overflows and panics, so
+        // it must be refused at load. Zero is valid (disables the cooldown).
+        let toml = format!(
+            r#"
+cluster_name = "test"
+
+[controller]
+dispatch_reject_cooldown_secs = {}
+"#,
+            MAX_LAUNCH_BACKOFF_SECS + 1
+        );
+        let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("dispatch_reject_cooldown_secs"),
+            "unexpected error: {err}"
+        );
+
+        let ok = r#"
+cluster_name = "test"
+
+[controller]
+dispatch_reject_cooldown_secs = 0
+"#;
+        assert_eq!(
+            SlurmConfig::load_from_str(ok)
+                .unwrap()
+                .controller
+                .dispatch_reject_cooldown_secs,
+            0,
+            "zero (disabled) must be accepted"
         );
     }
 

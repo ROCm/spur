@@ -138,12 +138,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         }
         let hit_depth_limit = pending.len() > max_jobs;
 
-        let cooling = cluster.nodes_on_dispatch_cooldown();
-        let nodes: Vec<spur_core::node::Node> = cluster
-            .get_nodes()
-            .into_iter()
-            .filter(|n| !cooling.contains(&n.name))
-            .collect();
+        let nodes = cluster.schedulable_nodes();
         let partitions = cluster.get_partitions();
         let reservations = cluster.get_reservations();
 
