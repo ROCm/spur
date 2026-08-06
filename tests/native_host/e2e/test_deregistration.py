@@ -38,12 +38,11 @@ def _wait_node_state(cluster, node_name, target_states, timeout=60):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            out = cluster.sinfo()
-            for line in out.splitlines():
-                if node_name in line:
-                    for state in target_states:
-                        if state in line:
-                            return state
+            state = cluster.sinfo_nodes().get(node_name)
+            if state is not None:
+                for target in target_states:
+                    if state.startswith(target):
+                        return state
         except Exception:
             pass
         time.sleep(2)
@@ -57,8 +56,7 @@ def _wait_node_gone(cluster, node_name, timeout=60):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            out = cluster.sinfo()
-            if node_name not in out:
+            if node_name not in cluster.sinfo_nodes():
                 return
         except Exception:
             pass
@@ -165,7 +163,7 @@ class TestForcedEviction:
             f"expected rejection, got: {out}"
         )
 
-        assert node0 in cluster.sinfo()
+        assert node0 in cluster.sinfo_nodes()
         cluster.scancel(str(job_id))
 
 
