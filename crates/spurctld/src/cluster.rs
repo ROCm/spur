@@ -406,6 +406,9 @@ pub struct ClusterManager {
     /// reaper. Ephemeral soft state (like `Node::last_heartbeat`): keepalives
     /// arrive too often to persist, and on failover the reaper reseeds lazily.
     interactive_last_seen: RwLock<HashMap<JobId, DateTime<Utc>>>,
+    /// Nodes skipped for new dispatch until the given instant after a
+    /// resources-unavailable reject. Leader-local and transient, never persisted.
+    node_dispatch_cooldowns: RwLock<HashMap<String, std::time::Instant>>,
 }
 
 struct PendingJobClassification {
@@ -485,6 +488,7 @@ impl ClusterManager {
             scheduler_notify: Arc::new(Notify::new()),
             sched_stats: OnceLock::new(),
             interactive_last_seen: RwLock::new(HashMap::new()),
+            node_dispatch_cooldowns: RwLock::new(HashMap::new()),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -497,6 +501,27 @@ impl ClusterManager {
     /// from their point of view.
     pub fn config(&self) -> Arc<SlurmConfig> {
         self.config.read().clone()
+    }
+
+    /// Skip a node for new dispatch for the configured cooldown after it rejected
+    /// one as resources-unavailable, so the scheduler stops re-picking it each tick.
+    pub fn cool_down_node(&self, name: &str) {
+        let secs = self.config().controller.dispatch_reject_cooldown_secs;
+        if secs == 0 {
+            return;
+        }
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        self.node_dispatch_cooldowns
+            .write()
+            .insert(name.to_string(), until);
+    }
+
+    /// Names still within their dispatch cooldown, pruning any that have expired.
+    pub fn nodes_on_dispatch_cooldown(&self) -> HashSet<String> {
+        let now = std::time::Instant::now();
+        let mut cooldowns = self.node_dispatch_cooldowns.write();
+        cooldowns.retain(|_, &mut until| until > now);
+        cooldowns.keys().cloned().collect()
     }
 
     /// Submit a new job. If it has an array spec, expand into individual tasks.
@@ -6768,6 +6793,31 @@ mod tests {
             .expect("single-node raft did not self-elect within 5s");
         cm.set_raft(handle.raft);
         (cm, conf_path)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_cooldown_marks_then_expires_and_respects_disable() {
+        let dir = TempDir::new().unwrap();
+
+        // Enabled (default 30s): a cooled node is reported until it expires.
+        let cm = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+        assert!(cm.nodes_on_dispatch_cooldown().is_empty());
+        cm.cool_down_node("worker1");
+        assert!(cm.nodes_on_dispatch_cooldown().contains("worker1"));
+
+        // A past instant is pruned on read, so an expired cooldown clears.
+        cm.node_dispatch_cooldowns.write().insert(
+            "worker1".into(),
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        );
+        assert!(!cm.nodes_on_dispatch_cooldown().contains("worker1"));
+
+        // Disabled (0s): cool_down_node is a no-op.
+        let mut cfg = test_config();
+        cfg.controller.dispatch_reject_cooldown_secs = 0;
+        let cm0 = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
+        cm0.cool_down_node("worker1");
+        assert!(cm0.nodes_on_dispatch_cooldown().is_empty());
     }
 
     /// Consumer-driven: `maybe_requeue` must honor the new `max_batch_requeue`
