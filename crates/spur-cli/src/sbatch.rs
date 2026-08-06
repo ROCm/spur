@@ -1033,7 +1033,11 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         .await
         .context("job submission failed")?;
 
-    let job_id = response.into_inner().job_id;
+    let response = response.into_inner();
+    for warning in &response.warnings {
+        eprintln!("sbatch: warning: {warning}");
+    }
+    let job_id = response.job_id;
     if args.parsable {
         println!("{}", job_id);
     } else {

@@ -599,6 +599,20 @@ impl Default for JobSpec {
     }
 }
 
+impl JobSpec {
+    /// Node count to actually allocate: `min(num_nodes, num_tasks)`, since a
+    /// task never spans nodes. An explicit `--ntasks-per-node` pins the layout
+    /// and skips the cap.
+    pub fn effective_num_nodes(&self) -> u32 {
+        let nodes = self.num_nodes.max(1);
+        if self.tasks_per_node.is_some() {
+            nodes
+        } else {
+            nodes.min(self.num_tasks.max(1))
+        }
+    }
+}
+
 /// Total memory (MB) a job of `num_nodes` nodes requests, derived from
 /// either an explicit per-node request or a per-CPU request applied across
 /// the job's total CPU count. Falls back to 0 (unconstrained) if neither is
@@ -1334,6 +1348,72 @@ mod tests {
             },
         );
         assert_eq!(job.resolved_stdout(), "relwork/out.log");
+    }
+
+    #[test]
+    fn effective_num_nodes_caps_at_task_count() {
+        let spec = JobSpec {
+            num_nodes: 4,
+            num_tasks: 1,
+            tasks_per_node: None,
+            ..Default::default()
+        };
+        assert_eq!(spec.effective_num_nodes(), 1);
+    }
+
+    #[test]
+    fn effective_num_nodes_caps_at_partial_task_count() {
+        let spec = JobSpec {
+            num_nodes: 4,
+            num_tasks: 3,
+            tasks_per_node: None,
+            ..Default::default()
+        };
+        assert_eq!(spec.effective_num_nodes(), 3);
+    }
+
+    #[test]
+    fn effective_num_nodes_keeps_exact_fit() {
+        let spec = JobSpec {
+            num_nodes: 4,
+            num_tasks: 4,
+            tasks_per_node: None,
+            ..Default::default()
+        };
+        assert_eq!(spec.effective_num_nodes(), 4);
+    }
+
+    #[test]
+    fn effective_num_nodes_does_not_grow_beyond_request() {
+        let spec = JobSpec {
+            num_nodes: 4,
+            num_tasks: 8,
+            tasks_per_node: None,
+            ..Default::default()
+        };
+        assert_eq!(spec.effective_num_nodes(), 4);
+    }
+
+    #[test]
+    fn effective_num_nodes_honors_explicit_tasks_per_node() {
+        let spec = JobSpec {
+            num_nodes: 4,
+            num_tasks: 1,
+            tasks_per_node: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(spec.effective_num_nodes(), 4);
+    }
+
+    #[test]
+    fn effective_num_nodes_floors_at_one() {
+        let spec = JobSpec {
+            num_nodes: 0,
+            num_tasks: 0,
+            tasks_per_node: None,
+            ..Default::default()
+        };
+        assert_eq!(spec.effective_num_nodes(), 1);
     }
 
     #[test]

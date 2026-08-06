@@ -94,6 +94,8 @@ message JobSpec {
 
   // Resources
   uint32 num_nodes = 10;
+  // 0 means unset: the controller defaults it to one task per node (num_nodes),
+  // matching Slurm, rather than collapsing a multi-node request onto one node.
   uint32 num_tasks = 11;
   uint32 tasks_per_node = 12;
   uint32 cpus_per_task = 13;
@@ -456,6 +458,7 @@ message SubmitJobRequest {
 
 message SubmitJobResponse {
   uint32 job_id = 1;
+  repeated string warnings = 2;
 }
 
 message GetJobsRequest {

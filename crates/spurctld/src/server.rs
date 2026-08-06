@@ -372,12 +372,15 @@ impl SlurmController for ControllerService {
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
 
         let core_spec = proto_to_job_spec(spec)?;
-        let job_id = self
+        let outcome = self
             .cluster
             .submit_job(core_spec)
             .map_err(submit_rpc_status)?;
 
-        Ok(Response::new(SubmitJobResponse { job_id }))
+        Ok(Response::new(SubmitJobResponse {
+            job_id: outcome.job_id,
+            warnings: outcome.warnings,
+        }))
     }
 
     async fn get_jobs(
@@ -2429,7 +2432,13 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         uid: spec.uid,
         gid: spec.gid,
         num_nodes: spec.num_nodes.max(1),
-        num_tasks: spec.num_tasks.max(1),
+        // 0 means the caller did not set ntasks: default to one task per node
+        // (Slurm's default) so it scales with num_nodes rather than collapsing.
+        num_tasks: if spec.num_tasks > 0 {
+            spec.num_tasks
+        } else {
+            spec.num_nodes.max(1)
+        },
         tasks_per_node: if spec.tasks_per_node > 0 {
             Some(spec.tasks_per_node)
         } else {
@@ -2618,9 +2627,9 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         pty: spec.pty,
     };
 
-    spur_core::gpu_request::resolve_gpu_demand(&job_spec)
-        .map_err(|e| Status::invalid_argument(e.to_string()))?;
-
+    // GPU demand is validated in `Cluster::submit_job` after node-count
+    // normalization, so `-N4 -n1 --gpus=2` (valid once reduced to one node)
+    // is not rejected against the pre-normalization node count.
     Ok(job_spec)
 }
 
@@ -3396,7 +3405,7 @@ mod tests {
             ..Default::default()
         };
         spec.srun_job = true;
-        let job_id = svc.cluster.submit_job(spec).unwrap();
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
         // Allocate to a real node plus a ghost node that is never registered.
         let res = ResourceAllocations::with_scalar(2, 4000);
         let per_node: std::collections::HashMap<_, _> = [
@@ -3463,7 +3472,7 @@ mod tests {
             work_dir: "/tmp".into(),
             ..Default::default()
         };
-        let job_id = svc.cluster.submit_job(spec).unwrap();
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
 
         let err = svc
             .exec_in_job(Request::new(ExecInJobRequest {
@@ -3491,7 +3500,7 @@ mod tests {
             ..Default::default()
         };
         spec.srun_job = true;
-        let job_id = svc.cluster.submit_job(spec).unwrap();
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
 
         let err = svc
             .create_job_step(Request::new(CreateJobStepRequest {
@@ -3547,7 +3556,7 @@ mod tests {
             work_dir: "/tmp".into(),
             ..Default::default()
         };
-        let job_id = svc.cluster.submit_job(spec).unwrap();
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
 
         let res = ResourceAllocations::with_scalar(1, 1000);
         let per_node: std::collections::HashMap<_, _> =
@@ -4310,5 +4319,48 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(requested_gpus_detail(&spec), "gpu:4/node");
+    }
+
+    #[test]
+    fn proto_to_job_spec_defaults_absent_ntasks_to_nodes() {
+        // C1: num_tasks=0 (unset over the wire) defaults to one task per node,
+        // not 1, so the node count is not silently collapsed.
+        let spec = spur_proto::proto::JobSpec {
+            num_nodes: 4,
+            num_tasks: 0,
+            ..Default::default()
+        };
+        let core = proto_to_job_spec(spec).unwrap();
+        assert_eq!(core.num_tasks, 4);
+        assert_eq!(core.effective_num_nodes(), 4);
+    }
+
+    #[test]
+    fn proto_to_job_spec_respects_explicit_single_task() {
+        // An explicit --ntasks=1 is preserved and reduces the job to one node.
+        let spec = spur_proto::proto::JobSpec {
+            num_nodes: 4,
+            num_tasks: 1,
+            ..Default::default()
+        };
+        let core = proto_to_job_spec(spec).unwrap();
+        assert_eq!(core.num_tasks, 1);
+        assert_eq!(core.effective_num_nodes(), 1);
+    }
+
+    #[test]
+    fn proto_to_job_spec_defers_gpu_validation() {
+        // C3: proto_to_job_spec no longer rejects -N4 -n1 --gpus=2. GPU demand
+        // is validated in submit_job against the normalized (1) node count.
+        let spec = spur_proto::proto::JobSpec {
+            num_nodes: 4,
+            num_tasks: 1,
+            gpus: Some(spur_proto::proto::GpuRequest {
+                count: 2,
+                gpu_type: String::new(),
+            }),
+            ..Default::default()
+        };
+        assert!(proto_to_job_spec(spec).is_ok());
     }
 }

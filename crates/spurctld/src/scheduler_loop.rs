@@ -2616,7 +2616,7 @@ mod tests {
         }
 
         fn submit_and_wait(cm: &ClusterManager, spec: JobSpec) -> spur_core::job::JobId {
-            let id = cm.submit_job(spec).unwrap();
+            let id = cm.submit_job(spec).unwrap().job_id;
             wait_for(&format!("job {id} applied"), || cm.get_job(id).is_some());
             id
         }

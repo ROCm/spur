@@ -5,6 +5,10 @@
 
 use std::os::raw::{c_char, c_uint};
 
+/// Slurm's "field not set" sentinel (`NO_VAL`). A descriptor left at this value
+/// means the caller did not specify it, so the controller applies its default.
+pub const NO_VAL: c_uint = u32::MAX;
+
 /// Job submission descriptor (simplified).
 #[repr(C)]
 pub struct SlurmJobDescMsg {
@@ -31,7 +35,9 @@ impl Default for SlurmJobDescMsg {
             work_dir: std::ptr::null(),
             min_nodes: 1,
             max_nodes: 1,
-            num_tasks: 1,
+            // NO_VAL, not 1: an unset task count must default to one task per
+            // node at the controller, matching slurm_init_job_desc_msg.
+            num_tasks: NO_VAL,
             cpus_per_task: 1,
             time_limit: 0,
             priority: 0,

@@ -837,14 +837,17 @@ async fn run_standalone_srun(
     let user = whoami::username().unwrap_or_else(|_| "unknown".into());
 
     let job_spec = build_srun_job_spec(args, work_dir, &io, mpi)?;
-    let job_id = client
+    let submit_resp = client
         .submit_job(SubmitJobRequest {
             spec: Some(job_spec),
         })
         .await
         .context("job submission failed")?
-        .into_inner()
-        .job_id;
+        .into_inner();
+    for warning in &submit_resp.warnings {
+        eprintln!("srun: warning: {warning}");
+    }
+    let job_id = submit_resp.job_id;
 
     eprintln!("srun: Pending job allocation {}...", job_id);
 
