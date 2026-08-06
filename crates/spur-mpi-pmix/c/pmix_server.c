@@ -197,28 +197,23 @@ static pmix_status_t spur_fence_nb(
     spur_pmix_session_t *session = find_session_by_proc(&procs[0]);
     if (session == NULL) {
         pthread_mutex_unlock(&g_session_lock);
-#if PMIX_VERSION_MAJOR >= 6
         cbfunc(PMIX_ERR_NOT_FOUND, NULL, 0, cbdata, NULL, NULL);
-#else
-        cbfunc(PMIX_ERR_NOT_FOUND, NULL, 0, cbdata, NULL, NULL);
-#endif
         return PMIX_SUCCESS;
     }
     if (session->modex == NULL) {
         pthread_mutex_unlock(&g_session_lock);
-#if PMIX_VERSION_MAJOR >= 6
         cbfunc(PMIX_ERR_NOT_SUPPORTED, NULL, 0, cbdata, NULL, NULL);
-#else
-        cbfunc(PMIX_ERR_NOT_SUPPORTED, NULL, 0, cbdata, NULL, NULL);
-#endif
         return PMIX_SUCCESS;
     }
     spur_modex_session_t *modex = session->modex;
-    pthread_mutex_unlock(&g_session_lock);
-
     char *merged = NULL;
     size_t merged_len = 0;
+    /* Hold g_session_lock for the full fence so server_stop cannot destroy
+     * session->modex mid-flight. That blocks every other PMIx session on this
+     * agent until the fence completes (up to modex_fence_timeout_secs). Per-
+     * modex refcounts would allow finer-grained teardown if that becomes hot. */
     int modex_rc = spur_modex_fence_collect(modex, data, ndata, &merged, &merged_len);
+    pthread_mutex_unlock(&g_session_lock);
     if (modex_rc != SPUR_MODEX_OK) {
         pmix_status_t perr = PMIX_ERROR;
         if (modex_rc == SPUR_MODEX_ERR_TIMEOUT) {
@@ -230,19 +225,11 @@ static pmix_status_t spur_fence_nb(
             "spur_mpi_pmix: modex fence failed: %s\n",
             spur_modex_strerror(modex_rc)
         );
-#if PMIX_VERSION_MAJOR >= 6
         cbfunc(perr, NULL, 0, cbdata, NULL, NULL);
-#else
-        cbfunc(perr, NULL, 0, cbdata, NULL, NULL);
-#endif
         return PMIX_SUCCESS;
     }
 
-#if PMIX_VERSION_MAJOR >= 6
     cbfunc(PMIX_SUCCESS, merged, merged_len, cbdata, spur_modex_release, merged);
-#else
-    cbfunc(PMIX_SUCCESS, merged, merged_len, cbdata, spur_modex_release, merged);
-#endif
     spur_mpi_debug(
         "spur_mpi_pmix: modex fence ok node=%u merged_len=%zu\n",
         session->node_index,
@@ -842,8 +829,7 @@ int spur_mpi_pmix_verify_peers(const spur_mpi_launch_plan_t *plan, char *errbuf,
         return -1;
     }
     spur_modex_session_t *modex = session->modex;
-    pthread_mutex_unlock(&g_session_lock);
-
+    /* Same lifetime rule as spur_fence_nb: keep modex valid until verify finishes. */
     int rc = spur_modex_verify_peers(modex);
     if (rc != SPUR_MODEX_OK) {
         spur_modex_session_abort(modex);
@@ -855,8 +841,10 @@ int spur_mpi_pmix_verify_peers(const spur_mpi_launch_plan_t *plan, char *errbuf,
                 spur_modex_strerror(rc)
             );
         }
+        pthread_mutex_unlock(&g_session_lock);
         return -1;
     }
+    pthread_mutex_unlock(&g_session_lock);
     return 0;
 }
 

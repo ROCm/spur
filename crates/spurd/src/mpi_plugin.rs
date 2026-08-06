@@ -458,20 +458,6 @@ impl MpiPluginHost {
         self.apply_modex_timeouts(&mut plan);
         mpi::validate_pmix_plan(&plan)?;
         self.load_plugin()?;
-        self.call_server_start(&plan)?;
-        if plan.num_nodes > 1 {
-            if let Err(err) = self.call_verify_peers(&plan) {
-                if let Err(stop_err) = self.call_server_stop(plan.job_id, &plan.namespace) {
-                    warn!(
-                        job_id = plan.job_id,
-                        namespace = %plan.namespace,
-                        error = %stop_err,
-                        "PMIx server stop failed during prepare verify rollback"
-                    );
-                }
-                return Err(err);
-            }
-        }
         {
             let mut namespaces = self
                 .active_namespaces
@@ -484,6 +470,32 @@ impl MpiPluginHost {
                     refs: 0,
                 },
             );
+        }
+        if let Err(err) = self.call_server_start(&plan) {
+            let _ = self
+                .active_namespaces
+                .lock()
+                .map_err(|_| "namespace lock poisoned".to_string())?
+                .remove(&plan.job_id);
+            return Err(err);
+        }
+        if plan.num_nodes > 1 {
+            if let Err(err) = self.call_verify_peers(&plan) {
+                if let Err(stop_err) = self.call_server_stop(plan.job_id, &plan.namespace) {
+                    warn!(
+                        job_id = plan.job_id,
+                        namespace = %plan.namespace,
+                        error = %stop_err,
+                        "PMIx server stop failed during prepare verify rollback"
+                    );
+                }
+                let _ = self
+                    .active_namespaces
+                    .lock()
+                    .map_err(|_| "namespace lock poisoned".to_string())?
+                    .remove(&plan.job_id);
+                return Err(err);
+            }
         }
         self.prepared
             .lock()
@@ -546,7 +558,13 @@ impl MpiPluginHost {
             .lock()
             .map_err(|_| "prepared lock poisoned".to_string())?
             .remove(&job_id);
-        if was_prepared.is_none() {
+        let has_unrefd_namespace = self
+            .active_namespaces
+            .lock()
+            .map_err(|_| "namespace lock poisoned".to_string())?
+            .get(&job_id)
+            .is_some_and(|entry| entry.refs == 0);
+        if was_prepared.is_none() && !has_unrefd_namespace {
             return Ok(());
         }
         if self
@@ -1102,6 +1120,20 @@ mod tests {
     fn release_prepared_is_noop_when_not_prepared() {
         let host = MpiPluginHost::new(MpiConfig::default());
         host.release_prepared_pmix(99).unwrap();
+    }
+
+    #[test]
+    fn release_prepared_stops_unrefd_namespace_before_prepared_insert() {
+        let host = MpiPluginHost::new(MpiConfig::default());
+        host.active_namespaces.lock().unwrap().insert(
+            55,
+            ActiveNamespace {
+                namespace: "spur.55".into(),
+                refs: 0,
+            },
+        );
+        host.release_prepared_pmix(55).unwrap();
+        assert!(!host.active_namespaces.lock().unwrap().contains_key(&55));
     }
 
     #[test]

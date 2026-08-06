@@ -2036,8 +2036,6 @@ impl SlurmController for ControllerService {
         let label = req.label;
         let job_mpi = job.spec.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
         let mpi = spur_core::mpi::resolve_step_mpi(req.mpi.as_str(), job_mpi).to_string();
-        spur_core::mpi::validate_pmix_step_agents(mpi.as_str(), plan.len())
-            .map_err(Status::invalid_argument)?;
         let pmix_tmpdir = self.cluster.config().mpi.pmix_tmpdir.clone();
         let modex_connect_timeout_secs = self.cluster.config().mpi.modex_connect_timeout_secs;
         let modex_fence_timeout_secs = self.cluster.config().mpi.modex_fence_timeout_secs;
@@ -2262,9 +2260,8 @@ impl SlurmController for ControllerService {
         }
 
         if needs_pmix_prepare {
-            for dispatch in &dispatches {
-                pmix_dispatch::release_pmix_on_agent(&dispatch.agent_addr, job_id).await;
-            }
+            let addrs: Vec<String> = dispatches.iter().map(|d| d.agent_addr.clone()).collect();
+            pmix_dispatch::release_pmix_on_agents(&addrs, job_id).await;
         }
 
         if let Err(e) = self.cluster.record_step_complete(job_id, step_id, max_exit) {

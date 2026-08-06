@@ -834,11 +834,11 @@ impl Job {
     }
 
     /// Slurm-style state reason, including PMIx bootstrap detail when present.
+    /// When `pending_reason_desc` is set it wins over the reason code, matching
+    /// Slurm `state_desc` and [`Job::state_reason_display`].
     pub fn state_reason(&self) -> String {
-        if self.state == JobState::Pending {
-            if let Some(ref detail) = self.launch_failure_detail {
-                return format!("LaunchFailure ({detail})");
-            }
+        if let Some(ref desc) = self.pending_reason_desc {
+            return desc.clone();
         }
         if self.pending_reason == PendingReason::JobLaunchFailure {
             if let Some(ref detail) = self.launch_failure_detail {
@@ -1151,23 +1151,35 @@ impl Job {
     /// carried. Every write to `pending_reason` goes through here or
     /// [`Job::set_pending_reason_desc`]: a description left behind by an
     /// earlier reason would mask the new one everywhere it is displayed.
+    ///
+    /// Clearing `launch_failure_detail` here is in-memory only; durable detail
+    /// lives in the WAL (`JobLaunchFailureDetail`) until `JobStart` or a new
+    /// detail proposal overwrites it.
     pub fn set_pending_reason(&mut self, reason: PendingReason) {
+        if self.pending_reason == PendingReason::JobLaunchFailure
+            && reason != PendingReason::JobLaunchFailure
+        {
+            self.launch_failure_detail = None;
+        }
         self.pending_reason = reason;
         self.pending_reason_desc = None;
     }
 
     /// Set the reason together with a Slurm-style `state_desc` override.
     pub fn set_pending_reason_desc(&mut self, reason: PendingReason, desc: impl Into<String>) {
+        if self.pending_reason == PendingReason::JobLaunchFailure
+            && reason != PendingReason::JobLaunchFailure
+        {
+            self.launch_failure_detail = None;
+        }
         self.pending_reason = reason;
         self.pending_reason_desc = Some(desc.into());
     }
 
     /// The reason as users see it. Mirrors Slurm, where a `state_desc` wins
     /// over the reason code in both `squeue` and `scontrol show job`.
-    pub fn state_reason_display(&self) -> &str {
-        self.pending_reason_desc
-            .as_deref()
-            .unwrap_or_else(|| self.pending_reason.display())
+    pub fn state_reason_display(&self) -> String {
+        self.state_reason()
     }
 
     /// Attempt a state transition, enforcing the state machine.
@@ -2099,6 +2111,7 @@ mod tests {
 
         job.set_pending_reason_desc(PendingReason::Held, "launch failed requeued held");
         assert_eq!(job.state_reason_display(), "launch failed requeued held");
+        assert_eq!(job.state_reason(), "launch failed requeued held");
         assert_eq!(
             job.pending_reason,
             PendingReason::Held,
@@ -2110,10 +2123,39 @@ mod tests {
     fn state_reason_shows_launch_failure_detail_while_pending() {
         let mut job = make_job();
         job.state = JobState::Pending;
+        job.set_pending_reason(PendingReason::JobLaunchFailure);
         job.launch_failure_detail = Some("PMIx prepare failed: n1: connect failed".into());
         assert_eq!(
             job.state_reason(),
-            "LaunchFailure (PMIx prepare failed: n1: connect failed)"
+            "JobLaunchFailure (PMIx prepare failed: n1: connect failed)"
+        );
+        assert_eq!(
+            job.state_reason_display(),
+            "JobLaunchFailure (PMIx prepare failed: n1: connect failed)"
+        );
+    }
+
+    #[test]
+    fn state_reason_omits_stale_launch_failure_detail_after_requeue() {
+        let mut job = make_job();
+        job.state = JobState::Pending;
+        job.set_pending_reason(PendingReason::JobLaunchFailure);
+        job.launch_failure_detail = Some("PMIx prepare failed: n1: connect failed".into());
+        job.set_pending_reason(PendingReason::Priority);
+        assert_eq!(job.state_reason(), "Priority");
+        assert!(job.launch_failure_detail.is_none());
+    }
+
+    #[test]
+    fn job_dispatch_backoff_preserves_launch_failure_detail() {
+        let mut job = make_job();
+        job.set_pending_reason(PendingReason::JobLaunchFailure);
+        job.launch_failure_detail = Some("PMIx prepare failed: n1: timeout".into());
+        job.requeue_count += 1;
+        job.set_pending_reason(PendingReason::JobLaunchFailure);
+        assert_eq!(
+            job.state_reason(),
+            "JobLaunchFailure (PMIx prepare failed: n1: timeout)"
         );
     }
 

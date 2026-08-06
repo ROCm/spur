@@ -918,26 +918,8 @@ async fn dispatch_to_agent(
     } else {
         (spec.num_tasks / spec.num_nodes.max(1)).max(1)
     };
-    let mpi = spec.mpi.clone().unwrap_or_default();
-    let pmix_plan = spur_core::mpi::build_validated_pmix_plan_proto(
-        &mpi,
-        spur_core::mpi::PmixLocalDispatch {
-            job_id: params.job_id,
-            universe_size: spec.num_tasks,
-            task_offset: params.task_offset,
-            local_count: tasks_per_node,
-            tmpdir: params.pmix_tmpdir.to_string(),
-            job_uid: spec.uid,
-            job_gid: spec.gid,
-            num_nodes: spec.num_nodes,
-            node_index: params.node_index,
-            peer_hosts: params.peer_hosts.to_vec(),
-            modex_connect_timeout_secs: params.modex_connect_timeout_secs,
-            modex_fence_timeout_secs: params.modex_fence_timeout_secs,
-            modex_verify_timeout_secs: params.modex_verify_timeout_secs,
-        },
-    )
-    .map_err(|e| anyhow::anyhow!("invalid PMIx launch plan: {e}"))?;
+    let pmix_plan = build_pmix_plan_proto(params, spec, tasks_per_node)
+        .map_err(|e| anyhow::anyhow!("invalid PMIx launch plan: {e}"))?;
     let proto_spec = ProtoJobSpec {
         name: spec.name.clone(),
         partition: spec.partition.clone().unwrap_or_default(),
@@ -1070,7 +1052,7 @@ fn build_pmix_plan_proto(
     params: &AgentDispatchParams<'_>,
     spec: &spur_core::job::JobSpec,
     tasks_per_node: u32,
-) -> Result<spur_proto::proto::PmixLaunchPlan, String> {
+) -> Result<Option<spur_proto::proto::PmixLaunchPlan>, String> {
     let mpi = spec.mpi.as_deref().unwrap_or("");
     spur_core::mpi::build_validated_pmix_plan_proto(
         mpi,
@@ -1089,8 +1071,7 @@ fn build_pmix_plan_proto(
             modex_fence_timeout_secs: params.modex_fence_timeout_secs,
             modex_verify_timeout_secs: params.modex_verify_timeout_secs,
         },
-    )?
-    .ok_or_else(|| "job is not configured for PMIx".to_string())
+    )
 }
 
 /// Outcome of parallel RegisterJobAllocation RPCs for a standalone srun job.
@@ -1267,6 +1248,18 @@ enum DispatchConfirmOutcome {
     Aborted,
 }
 
+fn abort_pending_pmix_dispatch(
+    cluster: &ClusterManager,
+    job_id: spur_core::job::JobId,
+    detail: String,
+) -> DispatchConfirmOutcome {
+    let _ = cluster.set_job_launch_failure_detail(job_id, detail);
+    if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
+        error!(job_id, error = %e, "failed to back off after PMIx dispatch failure");
+    }
+    DispatchConfirmOutcome::Aborted
+}
+
 /// Dispatch a batch job to every assigned node and *wait* for every LaunchJob
 /// RPC to resolve before returning anything the caller can use to flip the
 /// job to Running.
@@ -1388,15 +1381,12 @@ async fn confirm_dispatch_on_nodes(
                 expected = dispatch_nodes.len(),
                 "incomplete agent set for multi-node PMIx — aborting dispatch"
             );
-            let _ = cluster.set_job_launch_failure_detail(
-                job_id,
-                format!(
-                    "incomplete PMIx agent set: {} of {} nodes reachable",
-                    node_agents.len(),
-                    dispatch_nodes.len()
-                ),
+            let detail = format!(
+                "incomplete PMIx agent set: {} of {} nodes reachable",
+                node_agents.len(),
+                dispatch_nodes.len()
             );
-            return DispatchConfirmOutcome::Aborted;
+            return abort_pending_pmix_dispatch(&cluster, job_id, detail);
         }
 
         if let Some(detail) = pmix_dispatch::multi_node_pmix_unsupported(
@@ -1405,7 +1395,10 @@ async fn confirm_dispatch_on_nodes(
                 .filter_map(|name| cluster.get_node(name).map(|node| node.source.clone())),
         ) {
             error!(job_id, "{detail}");
-            let _ = cluster.set_job_launch_failure_detail(job_id, detail);
+            let _ = cluster.set_job_launch_failure_detail(job_id, detail.clone());
+            if let Err(e) = cluster.hold_job_for_launch_failure(job_id, Some(&detail)) {
+                error!(job_id, error = %e, "failed to hold job for unsupported multi-node PMIx");
+            }
             return DispatchConfirmOutcome::Aborted;
         }
 
@@ -1432,12 +1425,16 @@ async fn confirm_dispatch_on_nodes(
                 pmix_prepared: false,
             };
             let pmix_plan = match build_pmix_plan_proto(&params, &spec, tasks_per_node) {
-                Ok(plan) => plan,
+                Ok(Some(plan)) => plan,
+                Ok(None) => {
+                    let detail = format!("job is not configured for PMIx on node {node_name}");
+                    error!(job_id, node = %node_name, "{detail}");
+                    return abort_pending_pmix_dispatch(&cluster, job_id, detail);
+                }
                 Err(detail) => {
                     let detail = format!("invalid PMIx launch plan for node {node_name}: {detail}");
                     error!(job_id, node = %node_name, "{detail}");
-                    let _ = cluster.set_job_launch_failure_detail(job_id, detail);
-                    return DispatchConfirmOutcome::Aborted;
+                    return abort_pending_pmix_dispatch(&cluster, job_id, detail);
                 }
             };
             prepare_nodes.push(PmixPrepareNode {
@@ -1451,9 +1448,11 @@ async fn confirm_dispatch_on_nodes(
             pmix_dispatch::prepare_pmix_on_nodes(job_id, run_attempt, prepare_nodes).await
         {
             error!(job_id, error = %detail, "PMIx prepare failed — aborting dispatch");
-            let _ = cluster
-                .set_job_launch_failure_detail(job_id, format!("PMIx prepare failed: {detail}"));
-            return DispatchConfirmOutcome::Aborted;
+            return abort_pending_pmix_dispatch(
+                &cluster,
+                job_id,
+                format!("PMIx prepare failed: {detail}"),
+            );
         }
     }
 
@@ -1539,6 +1538,13 @@ async fn confirm_dispatch_on_nodes(
         pmix_dispatch::release_pmix_on_agents(&agent_addrs, job_id).await;
     }
 
+    let confirmation_detail = if needs_pmix_prepare {
+        format!("PMIx dispatch confirmation failed: {successes} of {total} nodes confirmed")
+    } else {
+        format!("dispatch confirmation failed: {successes} of {total} nodes confirmed")
+    };
+    let _ = cluster.set_job_launch_failure_detail(job_id, confirmation_detail.clone());
+
     // Stop whatever DID launch before the job settles anywhere: a node that
     // never confirmed will never report completion, and letting it keep
     // running while the job as a whole is aborted back to Pending would
@@ -1563,7 +1569,9 @@ async fn confirm_dispatch_on_nodes(
             if let Err(e) = cluster.cancel_job(job_id, &spec.user) {
                 error!(job_id, error = %e, "failed to cancel interactive job after prolog failure");
             }
-        } else if let Err(e) = cluster.hold_job_for_launch_failure(job_id) {
+        } else if let Err(e) =
+            cluster.hold_job_for_launch_failure(job_id, Some(&confirmation_detail))
+        {
             error!(job_id, error = %e, "failed to hold job after prolog failure");
         }
     } else if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
@@ -3325,14 +3333,19 @@ mod tests {
             // never reached Running, so this hold is applied directly on the
             // still-Pending job (`hold_job_for_launch_failure`) rather than
             // via the old Running->Failed->Held detour — same end state
-            // (Pending, priority 0, Held, identical description).
+            // (Pending, priority 0, Held) with the dispatch failure detail
+            // surfaced in state_reason_display.
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(job.state, JobState::Pending);
             assert_eq!(job.pending_reason, PendingReason::Held);
             assert_eq!(job.priority, 0);
             assert_eq!(
                 job.state_reason_display(),
-                crate::cluster::LAUNCH_FAILURE_HELD_DESC
+                "dispatch confirmation failed: 0 of 1 nodes confirmed"
+            );
+            assert_eq!(
+                job.state_reason(),
+                "dispatch confirmation failed: 0 of 1 nodes confirmed"
             );
             assert!(
                 !cm.pending_jobs().iter().any(|j| j.job_id == job_id),

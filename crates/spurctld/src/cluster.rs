@@ -35,6 +35,7 @@ use crate::accounting::{AccountingNotifier, JobStartRecord};
 use crate::association_cache::{qos_permitted, AccountMembership, AssociationCache};
 use crate::fairshare_cache::FairshareCache;
 use crate::limits_cache::QosCache;
+use crate::pmix_dispatch;
 use crate::raft::{ClientResponse, JobFinalized, SpurRaft, StateMachineApply};
 use crate::sched_stats::SchedStatsCollector;
 
@@ -462,8 +463,13 @@ impl ClusterManager {
         self.validate_partition_node_bounds(&spec)?;
 
         let mpi = spec.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
-        spur_core::mpi::validate_single_node_pmix(mpi, spec.num_nodes)
-            .map_err(SubmitError::invalid)?;
+        pmix_dispatch::validate_multi_node_pmix_nodelist(
+            mpi,
+            spec.num_nodes,
+            spec.nodelist.as_deref(),
+            |name| self.nodes.read().get(name).map(|node| node.source.clone()),
+        )
+        .map_err(SubmitError::invalid)?;
 
         // Checked after defaults are applied so we measure the final spec.
         // Array expansion only adds bounded integer metadata per task, so a
@@ -1801,7 +1807,11 @@ impl ClusterManager {
     /// launch-failure description so it reads the same as the pre-fix path
     /// that reached this via a Running→Failed→Held detour: the job here never
     /// actually left Pending, so that detour isn't available.
-    pub(crate) fn hold_job_for_launch_failure(&self, job_id: JobId) -> anyhow::Result<()> {
+    pub(crate) fn hold_job_for_launch_failure(
+        &self,
+        job_id: JobId,
+        reason_desc: Option<&str>,
+    ) -> anyhow::Result<()> {
         let old_priority = {
             let jobs = self.jobs.read();
             let job = jobs
@@ -1822,7 +1832,7 @@ impl ClusterManager {
             old_priority,
             new_priority: 0,
             pending_reason: Some(PendingReason::Held),
-            pending_reason_desc: Some(LAUNCH_FAILURE_HELD_DESC.to_string()),
+            pending_reason_desc: Some(reason_desc.unwrap_or(LAUNCH_FAILURE_HELD_DESC).to_string()),
             reset_requeue_count: false,
             clear_reservation: false,
         })?;
@@ -3874,7 +3884,8 @@ impl ClusterManager {
         job.allocated_resources = None;
         job.per_node_alloc.clear();
         job.time_limit_signaled_at = None;
-        job.set_pending_reason(PendingReason::None);
+        job.pending_reason = PendingReason::None;
+        job.pending_reason_desc = None;
         // Stale after requeue (points at nodes the job left); next dispatch resets it.
         job.actual_stdout_path = None;
         job.actual_stderr_path = None;
@@ -13027,7 +13038,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
         let id = submit_and_wait(&cm, basic_spec("prolog-hold"));
 
-        cm.hold_job_for_launch_failure(id).unwrap();
+        cm.hold_job_for_launch_failure(id, None).unwrap();
         wait_for("hold applied", || {
             cm.get_job(id).is_some_and(|j| j.priority == 0)
         });
@@ -13069,7 +13080,7 @@ mod tests {
         .unwrap();
         settle(&cm, id, JobState::Running);
 
-        assert!(cm.hold_job_for_launch_failure(id).is_err());
+        assert!(cm.hold_job_for_launch_failure(id, None).is_err());
     }
 
     // backoff_pending_job_after_dispatch_failure is confirm_dispatch_on_nodes's
@@ -13113,6 +13124,63 @@ mod tests {
         assert_eq!(job.state, JobState::Pending);
         assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
         assert!(job.spec.begin_time.is_some_and(|t| t > Utc::now()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_dispatch_backoff_preserves_launch_failure_detail() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("backoff-detail"));
+        cm.set_job_launch_failure_detail(id, "PMIx prepare failed: n2: timeout".into())
+            .unwrap();
+
+        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        wait_for("backoff applied", || {
+            cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+        assert_eq!(
+            job.launch_failure_detail.as_deref(),
+            Some("PMIx prepare failed: n2: timeout")
+        );
+        assert_eq!(
+            job.state_reason(),
+            "JobLaunchFailure (PMIx prepare failed: n2: timeout)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn second_dispatch_backoff_preserves_launch_failure_detail() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("backoff-detail-twice"));
+
+        cm.set_job_launch_failure_detail(id, "PMIx prepare failed: n1: timeout".into())
+            .unwrap();
+        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        wait_for("first backoff applied", || {
+            cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
+        });
+
+        cm.set_job_launch_failure_detail(id, "PMIx prepare failed: n2: timeout".into())
+            .unwrap();
+        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        wait_for("second backoff applied", || {
+            cm.get_job(id).is_some_and(|j| j.requeue_count == 2)
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+        assert_eq!(
+            job.launch_failure_detail.as_deref(),
+            Some("PMIx prepare failed: n2: timeout")
+        );
+        assert_eq!(
+            job.state_reason(),
+            "JobLaunchFailure (PMIx prepare failed: n2: timeout)"
+        );
     }
 
     // The apply-level checks mirror the public method's, guarding against a
