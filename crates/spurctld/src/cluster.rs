@@ -3308,6 +3308,8 @@ impl ClusterManager {
     pub fn evict_expired_terminal_jobs(&self) {
         let retention = self.config().controller.terminal_job_retention_secs;
         let before = Utc::now() - chrono::Duration::seconds(retention as i64);
+        // is_finalized is load-bearing, not redundant: end_time survives a
+        // requeue, so a re-dispatched job's stale end_time alone would reap it.
         let job_ids: Vec<JobId> = self
             .jobs
             .read()
@@ -4866,6 +4868,8 @@ impl ClusterManager {
                 k0s.reset_requested = *reset_requested;
             }
             WalOperation::EvictTerminalJobs { job_ids } => {
+                // Re-check finalized: spare an id requeued between propose and
+                // apply. Deterministic — every replica applies in the same order.
                 let evicted: HashSet<JobId> = job_ids
                     .iter()
                     .filter(|id| jobs.get(id).is_some_and(|j| j.state.is_finalized()))
@@ -6384,8 +6388,8 @@ mod tests {
         );
     }
 
-    // The id list, not per-replica end_time, decides eviction: two replicas with
-    // divergent end_times must converge on the same set.
+    // Apply-time state, not per-replica end_time, decides eviction: a replica
+    // where the id requeued before apply spares it; skew never changes the set.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn evict_terminal_jobs_is_replica_deterministic() {
         let dir_a = TempDir::new().unwrap();
@@ -6404,7 +6408,8 @@ mod tests {
                 state: JobState::Cancelled,
             });
         }
-        // Force divergent local end_times across the two replicas.
+        // Divergent local end_times: skew must not change the outcome, since the
+        // apply guard reads state, not end_time.
         cm_a.jobs.write().get_mut(&1).unwrap().end_time =
             Some(chrono::Utc::now() - chrono::Duration::hours(2));
         cm_b.jobs.write().get_mut(&1).unwrap().end_time =
@@ -6413,12 +6418,29 @@ mod tests {
         let entry = WalOperation::EvictTerminalJobs { job_ids: vec![1] };
         cm_a.apply_operation(&entry);
         cm_b.apply_operation(&entry);
-
-        assert!(cm_a.get_job(1).is_none());
-        assert_eq!(
-            cm_a.get_job(1).is_none(),
+        assert!(cm_a.get_job(1).is_none(), "finalized id is evicted");
+        assert!(
             cm_b.get_job(1).is_none(),
-            "both replicas must evict the same set despite end_time skew"
+            "end_time skew must not change the evicted set",
+        );
+
+        // A replica where the id left the finalized set before apply spares it:
+        // the guard is what makes eviction converge with real state, not the id.
+        let dir_c = TempDir::new().unwrap();
+        let cm_c = test_cluster(&dir_c).await;
+        cm_c.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("requeued")),
+        });
+        cm_c.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm_c.apply_operation(&entry);
+        assert!(
+            cm_c.get_job(1).is_some(),
+            "an id no longer finalized at apply is spared",
         );
     }
 
@@ -6445,6 +6467,27 @@ mod tests {
         assert!(
             cm.get_job(1).is_none(),
             "with zero retention the terminal job is evicted"
+        );
+
+        // A large retention window spares a fresh terminal job: guards against a
+        // producer that proposes everything regardless of age.
+        let dir2 = TempDir::new().unwrap();
+        let mut cfg2 = test_config();
+        cfg2.controller.terminal_job_retention_secs = 86_400;
+        let cm2 = test_cluster_with_config(&dir2, cfg2).await;
+        cm2.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("fresh")),
+        });
+        cm2.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Cancelled,
+        });
+        cm2.evict_expired_terminal_jobs();
+        assert!(
+            cm2.get_job(1).is_some(),
+            "a fresh terminal job within the retention window is spared"
         );
     }
 
