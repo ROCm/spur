@@ -631,6 +631,9 @@ impl ClusterManager {
                     info!(target: "audit", hook, user = %spec.user, uid = spec.uid, "job_submit hook accepted");
                     return Ok(());
                 }
+                // comment/constraint/gres are unbounded strings; re-enforce the
+                // Raft entry size cap the hook could otherwise grow past.
+                check_submission_size(spec)?;
                 info!(
                     target: "audit",
                     hook,
@@ -642,10 +645,11 @@ impl ClusterManager {
                     "job_submit hook modified spec"
                 );
                 // Hook-set qos is trusted policy (not re-authorized), but
-                // partition/account still get ACL re-checks against the owner.
+                // partition/account still get ACL and node-bounds re-checks.
                 if changes.partition.is_some() || changes.account.is_some() {
                     validate_user_account(spec, &self.association_cache)?;
                     self.validate_partition(spec)?;
+                    self.validate_partition_node_bounds(spec)?;
                 }
                 // Existence is still enforced: an unknown QOS silently resolves
                 // to the limitless default, which would bypass QOS limits.
@@ -6525,6 +6529,65 @@ mod tests {
         assert!(
             format!("{err:?}").contains("conflicting gres"),
             "expected a gres-conflict rejection, got: {err:?}"
+        );
+    }
+
+    // A hook can grow an unbounded field (comment/constraint/gres) past the
+    // pre-hook size cap; the post-modify re-check must catch that.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_modify_reenforces_size_cap() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        let huge_comment = "c".repeat(200 * 1024);
+        config.hooks.job_submit = Some(write_hook_script(
+            &dir,
+            &format!(r#"echo '{{"comment":"{huge_comment}"}}'"#),
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("size-bypass");
+        spec.script = Some("x".repeat(MAX_JOB_SPEC_SIZE - 100 * 1024));
+        let err = cm.submit_job(spec).unwrap_err();
+        assert!(
+            err.to_string().contains("too large"),
+            "expected a size-cap rejection, got: {err:?}"
+        );
+    }
+
+    // A hook-set partition must be re-validated for node-count bounds too,
+    // not just ACLs, or it reopens the pend-forever hole this check closes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_modify_partition_bypasses_node_bounds_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions.push(spur_core::config::PartitionConfig {
+            name: "small".into(),
+            default: false,
+            state: "UP".into(),
+            nodes: "ALL".into(),
+            selector: Default::default(),
+            max_time: None,
+            default_time: None,
+            max_nodes: Some(1),
+            min_nodes: 1,
+            allow_accounts: Vec::new(),
+            allow_groups: Vec::new(),
+            deny_accounts: Vec::new(),
+            deny_qos: Vec::new(),
+            allow_qos: Vec::new(),
+            priority_tier: 1,
+            preempt_mode: String::new(),
+        });
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"partition":"small"}'"#));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("bounds-bypass");
+        spec.num_nodes = 2;
+        spec.num_tasks = 2;
+        let err = cm.submit_job(spec).unwrap_err();
+        assert!(
+            err.to_string().contains("outside partition"),
+            "expected a node-bounds rejection, got: {err:?}"
         );
     }
 

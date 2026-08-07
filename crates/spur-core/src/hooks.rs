@@ -200,6 +200,38 @@ pub fn require_secure_hook_file(_script_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Read a hook script, checking ownership/permissions on the open handle
+/// (fstat) rather than a separate path check, closing the check-then-open race.
+#[cfg(unix)]
+pub fn read_secure_hook_file(script_path: &str) -> anyhow::Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    let mut file = std::fs::File::open(script_path)
+        .with_context(|| format!("job_submit hook not found: {script_path}"))?;
+    let meta = file
+        .metadata()
+        .with_context(|| format!("failed to stat job_submit hook: {script_path}"))?;
+    let euid = nix::unistd::geteuid().as_raw();
+    if meta.uid() != 0 && meta.uid() != euid {
+        anyhow::bail!(
+            "job_submit hook must be owned by root or the controller user: {script_path}"
+        );
+    }
+    if meta.mode() & 0o022 != 0 {
+        anyhow::bail!("job_submit hook must not be group- or world-writable: {script_path}");
+    }
+    let mut source = String::new();
+    file.read_to_string(&mut source)
+        .with_context(|| format!("job_submit lua script unreadable: {script_path}"))?;
+    Ok(source)
+}
+
+#[cfg(not(unix))]
+pub fn read_secure_hook_file(script_path: &str) -> anyhow::Result<String> {
+    std::fs::read_to_string(script_path)
+        .with_context(|| format!("job_submit lua script unreadable: {script_path}"))
+}
+
 /// Truncate an over-long hook rejection reason to roughly the last
 /// [`SUBMIT_HOOK_MAX_REASON_BYTES`], keeping the tail (where a script's final
 /// error line usually is) and snapping to a char boundary.
