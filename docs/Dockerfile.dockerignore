@@ -1,0 +1,14 @@
+# Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Build context for docs/Dockerfile. The root .dockerignore excludes docs/ (it
+# targets the Rust application image); the docs image needs the opposite, so
+# this file — which Docker prefers for docs/Dockerfile — starts from nothing and
+# allows only what the doc build touches.
+*
+!docs
+!.wordlist.txt
+!.markdownlint.yaml
+!.spellcheck.yaml
+docs/_build
+docs/.venv

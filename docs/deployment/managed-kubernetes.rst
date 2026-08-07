@@ -1,9 +1,9 @@
-SPUR-Managed Kubernetes (k0s)
+Spur-Managed Kubernetes (k0s)
 =============================
 
-SPUR can **provision and own** a Kubernetes cluster across its own nodes using
+Spur can **provision and own** a Kubernetes cluster across its own nodes using
 `k0s <https://k0sproject.io>`_. This is the inverse of :doc:`kubernetes` (running
-SPUR *inside* an existing cluster): here ``spur k8s up`` builds the cluster and a
+Spur *inside* an existing cluster): here ``spur k8s up`` builds the cluster and a
 spurd-owned systemd unit keeps k0s running on each node.
 
 One command assigns roles, mesh IPs and pod CIDRs, installs a pinned k0s on every
@@ -23,7 +23,7 @@ Overview
   assignment and phase, replicated through Raft so it survives a restart.
 - **spurd** (on every node) owns that node's k0s systemd unit: it installs k0s if
   missing, writes the config/join-token, and reconciles the unit. k0s is never a
-  SPUR job, so it survives a spurd restart (spurd re-adopts it on startup).
+  Spur job, so it survives a spurd restart (spurd re-adopts it on startup).
 - **Roles** are assigned automatically: a single node becomes an all-in-one
   ``controller --single``; with two or more nodes the control-plane node becomes a
   ``controller`` and the rest become ``worker`` s.
@@ -34,7 +34,7 @@ For Administrators
 Prerequisites
 ~~~~~~~~~~~~~~
 
-- A working native-host SPUR deployment — ``spurctld`` on the head node and
+- A working native-host Spur deployment — ``spurctld`` on the head node and
   ``spurd`` on every node, all registered. See :doc:`native-host`.
 - ``spurd`` must run as root (it manages systemd units).
 - Outbound HTTPS to ``github.com`` on each node for the k0s download (or
@@ -113,7 +113,7 @@ queried live from each agent.
 Networking / CNI
 ~~~~~~~~~~~~~~~~~
 
-**kuberouter** (default) — k0s's built-in CNI. The control-plane API is advertised
+**kuberouter** (default) — the built-in k0s CNI. The control-plane API is advertised
 on the node's primary interface and workers join over it. No mesh required.
 
 **calico** (``cni = "calico"``) — mesh-native routing. ``spur k8s up`` generates a
@@ -132,11 +132,11 @@ Storage
 ~~~~~~~
 
 k0s bundles no storage, so a plain cluster has no ``StorageClass`` and any
-``PersistentVolumeClaim`` stays ``Pending``. By default SPUR ships the
+``PersistentVolumeClaim`` stays ``Pending``. By default Spur ships the
 `local-path-provisioner <https://github.com/rancher/local-path-provisioner>`_
 (``storage_provisioner = "local-path"``) as the cluster's **default**
 StorageClass — RWO, node-local — so PVC workloads bind out of the box. The
-control-plane agent writes the manifest into k0s's manifest-deployer directory,
+control-plane agent writes the manifest into the k0s manifest-deployer directory,
 which k0s applies automatically (no in-cluster client).
 
 Local-path stores volumes under ``local_path_dir`` (default
@@ -172,7 +172,7 @@ cluster back up with the new ``cni`` setting.
 For Users
 ---------
 
-Users do not need SPUR access — they interact with the cluster through the
+Users do not need Spur access — they interact with the cluster through the
 standard Kubernetes tooling.
 
 Get a kubeconfig
@@ -254,7 +254,7 @@ Configuration reference (``[cluster]``)
      - Meaning
    * - ``enabled``
      - ``false``
-     - Enable SPUR-managed k0s. When off, spurd never touches systemd/k0s.
+     - Enable Spur-managed k0s. When off, spurd never touches systemd/k0s.
    * - ``control_plane_node``
      - (first node)
      - Hostname of the k0s control plane.
@@ -272,7 +272,7 @@ Configuration reference (``[cluster]``)
      - Calico MTU emitted into the generated k0s config (leaves WireGuard headroom).
    * - ``storage_provisioner``
      - ``local-path``
-     - Storage SPUR ships as the default StorageClass (``local-path`` or ``none``).
+     - Storage Spur ships as the default StorageClass (``local-path`` or ``none``).
    * - ``local_path_dir``
      - ``/var/lib/local-path-provisioner``
      - On-node directory local-path stores PVs in; point at a big disk for data-heavy PVCs.

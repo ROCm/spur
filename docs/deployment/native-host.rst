@@ -1,32 +1,130 @@
-Native-Host Deployment
-=====================
+Manual Deployment (systemd)
+===========================
 
-Deploy Spur across physical or virtual machines.
+Deploy Spur by hand across physical or virtual machines: install the binaries, write a
+config file, and run the daemons as systemd services. This page is the no-Ansible path.
 
-Install
--------
+.. note::
 
-Get Spur binaries onto all nodes.
+   For production clusters, use the Ansible toolkit instead — see :doc:`ansible`. It
+   automates everything below, including systemd units, symlinks, and PostgreSQL
+   accounting. Follow this page to understand the internals or to stand up a small,
+   ad-hoc cluster.
+
+Get the Binaries
+----------------
+
+Install the latest stable release with the one-line installer. By default it installs
+to ``~/.local/bin`` (no sudo required):
 
 .. code-block:: bash
 
    curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash
    export PATH="$HOME/.local/bin:$PATH"
 
-To build from source instead, see :doc:`/developer/building`.
+This installs the three binaries — ``spur``, ``spurctld``, and ``spurd`` — and makes the
+CLI reachable under its Slurm-compatible names (``sbatch``, ``squeue``, ``sinfo``, …).
+
+To build from source instead, install the Rust toolchain and ``protobuf-compiler``, then
+build the three binaries:
+
+.. code-block:: bash
+
+   git clone https://github.com/ROCm/spur.git && cd spur
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source "$HOME/.cargo/env"
+   sudo apt install -y protobuf-compiler build-essential
+   cargo build --release -p spur-cli -p spurctld -p spurd
+
+The binaries land in ``target/release/``. For a fuller build walkthrough see
+:doc:`/developer/building`.
+
+.. note::
+
+   Ports used across hosts: **6817** (controller gRPC API and accounting), **6818**
+   (agent gRPC), and **6821** (Raft, controller-to-controller). Open these between the
+   relevant hosts.
+
+Daemon Flags
+------------
+
+The two daemons are configured with command-line flags. The most common are below.
+
+``spurctld``
+~~~~~~~~~~~~
+
+.. list-table::
+   :header-rows: 1
+
+   * - Flag
+     - Default
+     - Meaning
+   * - ``-f, --config <PATH>``
+     - ``/etc/spur/spur.conf``
+     - Config file. If it does not exist, built-in defaults are used.
+   * - ``--listen <ADDR>``
+     - *(from config)*
+     - gRPC listen address; overrides the config file.
+   * - ``--state-dir <PATH>``
+     - ``/var/spool/spur``
+     - Raft and scheduler state directory.
+   * - ``--log-level <LEVEL>``
+     - ``info``
+     - Log verbosity.
+   * - ``-D, --foreground``
+     - off
+     - Run in the foreground instead of daemonizing.
+
+``spurd``
+~~~~~~~~~
+
+.. list-table::
+   :header-rows: 1
+
+   * - Flag
+     - Default
+     - Meaning
+   * - ``-f, --config <PATH>``
+     - ``/etc/spur/spur.conf``
+     - Config file for local agent settings (see the note below).
+   * - ``--controller <ADDR>``
+     - ``http://localhost:6817``
+     - Controller endpoint(s). Accepts a comma-separated list for HA failover.
+   * - ``-N, --hostname <NAME>``
+     - *(system hostname)*
+     - Node name as it appears in ``spur nodes``.
+   * - ``--address <IP>``
+     - *(auto-detected)*
+     - Advertised IP the controller uses to reach this agent.
+   * - ``--listen <ADDR>``
+     - ``[::]:6818``
+     - Agent gRPC listen address.
+   * - ``--log-level <LEVEL>``
+     - ``info``
+     - Log verbosity.
+
+.. note::
+
+   Node identity and networking (controller address, hostname, listen address) come
+   from CLI flags. ``spurd`` also reads ``spur.conf`` for local agent settings —
+   ``[hooks]``, ``[devices]`` (GRES and CDI), ``rlimits.memlock``, ``[cluster]``, and
+   ``[mpi]``. If the file is absent, the agent logs a warning and falls back to
+   defaults for those sections, which is fine when none of them are in use.
 
 Setting Up the Controller
 -------------------------
 
-Initialize the network for encrypted node-to-node communication:
+Initialize the network for encrypted node-to-node communication (skip this for a direct
+LAN deployment):
 
 .. code-block:: bash
 
    sudo spur net init --cidr 10.44.0.0/16 --port 51820
 
-This sets up a WireGuard mesh, prints the server public key, and outputs a join command template for workers.
+This sets up a WireGuard mesh, prints the server public key, and outputs a join command
+template for workers.
 
-Create ``/etc/spur/spur.conf``. The repository includes ``examples/spur.conf``. A minimal example:
+Create ``/etc/spur/spur.conf``. The repository includes ``examples/spur.conf`` with the
+full annotated set of fields. A minimal example:
 
 .. code-block:: toml
 
@@ -60,51 +158,70 @@ Create ``/etc/spur/spur.conf``. The repository includes ``examples/spur.conf``. 
    gres = ["gpu:mi300x:8"]
    # address = "10.44.0.2"   # optional default comm address before the agent registers
 
-Start the controller:
+Start the controller in the foreground to check it comes up:
 
 .. code-block:: bash
 
    sudo mkdir -p /var/spool/spur
    spurctld -D -f /etc/spur/spur.conf
 
-.. tip::
+For production, run it as a systemd service. Copy the binary to ``/usr/local/bin`` and
+use ``/var/spool/spur`` for state (the daemon default):
 
-   For production, run as a systemd service, e.g.:
+.. code-block:: ini
 
-   .. code-block:: ini
+   # /etc/systemd/system/spurctld.service
+   [Unit]
+   Description=Spur Controller Daemon (spurctld)
+   After=network-online.target
+   Wants=network-online.target
 
-      # /etc/systemd/system/spurctld.service
-      [Unit]
-      Description=Spur Controller
-      After=network.target
+   [Service]
+   Type=simple
+   ExecStart=/usr/local/bin/spurctld -f /etc/spur/spur.conf --state-dir /var/spool/spur --log-level info
+   Restart=on-failure
+   RestartSec=3
+   User=root
+   LimitNOFILE=65536
 
-      [Service]
-      ExecStart=/usr/local/bin/spurctld -f /etc/spur/spur.conf
-      StateDirectory=spur
-      Restart=on-failure
+   [Install]
+   WantedBy=multi-user.target
 
-   Adjust ``ExecStart`` to match your install path. Then ``systemctl enable --now spurctld``.
+Enable and start it:
+
+.. code-block:: bash
+
+   systemctl daemon-reload
+   systemctl enable --now spurctld
+
+.. note::
+
+   The one-line installer places binaries in ``~/.local/bin`` by default. If you install
+   that way, adjust ``ExecStart`` to match — this unit assumes ``/usr/local/bin``.
 
 High Availability
-^^^^^^^^^^^^^^^^^
+~~~~~~~~~~~~~~~~~
 
-For HA, run ``spurctld`` on 3 (or 5) nodes with Raft consensus. Add all controller addresses to the ``peers`` list in the config:
+For HA, run ``spurctld`` on 3 (or 5) nodes with Raft consensus. Add all controller
+addresses, in the same order on every controller, to the ``peers`` list in the config
+(Raft uses port 6821):
 
 .. code-block:: toml
 
    [controller]
    peers = [
      "10.44.0.1:6821",
-     "10.44.0.4:6821",
-     "10.44.0.5:6821",
+     "10.44.0.2:6821",
+     "10.44.0.3:6821",
    ]
 
-Raft automatically elects a leader. Workers connect to any controller and are redirected to the current leader.
+Raft automatically elects a leader. Workers connect to any controller and are redirected
+to the current leader.
 
 Joining Worker Nodes
 --------------------
 
-On each worker, join the WireGuard mesh:
+On each worker, join the WireGuard mesh (skip for a direct LAN deployment):
 
 .. code-block:: bash
 
@@ -138,9 +255,9 @@ not the short hostname alone when ``/etc/hosts`` maps it to loopback.
 
 The agent auto-detects CPUs, memory, and GPUs, then registers with the controller over the mesh.
 
-For an HA quorum, pass every controller as a comma-separated list so the agent
-and CLI fail over to a surviving node if one is unreachable. The same format
-works for the ``SPUR_CONTROLLER_ADDR`` environment variable:
+For an HA quorum, pass every controller as a comma-separated list so the agent and CLI
+fail over to a surviving node if one is unreachable. The same format works for the
+``SPUR_CONTROLLER_ADDR`` environment variable:
 
 .. code-block:: bash
 
@@ -148,11 +265,32 @@ works for the ``SPUR_CONTROLLER_ADDR`` environment variable:
 
 Repeat for each worker, incrementing the WireGuard address.
 
+For production, run the agent as a systemd service:
+
+.. code-block:: ini
+
+   # /etc/systemd/system/spurd.service
+   [Unit]
+   Description=Spur Node Agent (spurd)
+   After=network-online.target
+   Wants=network-online.target
+
+   [Service]
+   Type=simple
+   ExecStart=/usr/local/bin/spurd --controller http://10.44.0.1:6817 --hostname gpu-node-1 --address 10.44.0.2 --listen 0.0.0.0:6818 --log-level info
+   Restart=on-failure
+   RestartSec=3
+   User=root
+   LimitNOFILE=65536
+
+   [Install]
+   WantedBy=multi-user.target
+
 Verify:
 
 .. code-block:: bash
 
-   spur net status    # WireGuard peers and handshake times
+   spur net status    # WireGuard peers and handshake times (mesh only)
    spur nodes         # All registered nodes
 
 Resource Limits (rlimits)
@@ -358,7 +496,14 @@ Each node in a multi-node job receives:
 GPU Isolation
 -------------
 
-Spur automatically restricts GPU visibility per job:
+Spur automatically restricts GPU visibility per job by exporting the allocated
+device ordinals into the standard GPU runtime variables:
+``ROCR_VISIBLE_DEVICES``, ``CUDA_VISIBLE_DEVICES``, and ``GPU_DEVICE_ORDINAL``.
 
-- **AMD (ROCm):** Sets ``ROCR_VISIBLE_DEVICES``
-- **NVIDIA (CUDA):** Sets ``CUDA_VISIBLE_DEVICES``
+See Also
+--------
+
+- :doc:`ansible`
+- :doc:`upgrading`
+- :doc:`uninstalling`
+- :doc:`/admin-guide/configuration`

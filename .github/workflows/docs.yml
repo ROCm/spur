@@ -1,0 +1,64 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.readthedocs.yaml'
+      - '.wordlist.txt'
+      - '.markdownlint.yaml'
+      - '.spellcheck.yaml'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.readthedocs.yaml'
+      - '.wordlist.txt'
+      - '.markdownlint.yaml'
+      - '.spellcheck.yaml'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build & Lint (containerized)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Build docs image
+        run: docker build -f docs/Dockerfile -t spur-docs .
+
+      - name: Sphinx build
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work spur-docs \
+            sphinx-build -W --keep-going -b html docs docs/_build/html
+
+      - name: Spellcheck (pyspelling)
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work spur-docs \
+            pyspelling -c .spellcheck.yaml
+
+      - name: Markdownlint
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work spur-docs \
+            markdownlint-cli2 "docs/**/*.md"
+
+      - name: Upload HTML artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-html
+          path: docs/_build/html
+          if-no-files-found: ignore
