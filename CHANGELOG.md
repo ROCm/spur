@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.8.0](https://github.com/ROCm/spur/compare/v0.7.0...v0.8.0) (2026-08-07)
+
+
+### Features
+
+* **spur-cli:** runtime partition CRUD via Raft WAL with scontrol reconfigure ([#425](https://github.com/ROCm/spur/issues/425)) ([05cf9a6](https://github.com/ROCm/spur/commit/05cf9a6469b29e02c0b791d101b21d9a1c00cbc5))
+
+
+### Bug Fixes
+
+* **spur-cli:** compress sinfo NODELIST as a Slurm-style hostlist ([#574](https://github.com/ROCm/spur/issues/574)) ([bce95e1](https://github.com/ROCm/spur/commit/bce95e1c36d3790c60c0412e762fb7634f8d8948))
+* **spur-sched:** allocate CPUs and cap nodes when tasks fewer than nodes ([#570](https://github.com/ROCm/spur/issues/570)) ([877b274](https://github.com/ROCm/spur/commit/877b2748e9876cfb4cca73d246c560ea501bf136))
+* **spurctld:** evict aged terminal jobs to bound controller memory ([#583](https://github.com/ROCm/spur/issues/583)) ([a261284](https://github.com/ROCm/spur/commit/a261284eb66541b9b99b558e7019b594965519d8))
+* **spurctld:** filter reservations by name in scontrol show ([#581](https://github.com/ROCm/spur/issues/581)) ([2bd8a4b](https://github.com/ROCm/spur/commit/2bd8a4b2826e95a038bdd5dbc080a4286ec912c3))
+* **spurctld:** report wall-time expiry as TIMEOUT ([#554](https://github.com/ROCm/spur/issues/554)) ([4b9a138](https://github.com/ROCm/spur/commit/4b9a138d6deb9ae3b745d5b31b90d6275fafa915))
+* **spurd:** reclaim stranded interactive allocations via heartbeat ([#580](https://github.com/ROCm/spur/issues/580)) ([2dea550](https://github.com/ROCm/spur/commit/2dea5505fe23e2e286a7dc3966239ecaef979199))
+
 ## [0.7.0](https://github.com/ROCm/spur/compare/v0.6.0...v0.7.0) (2026-08-04)
 
 
