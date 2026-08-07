@@ -321,8 +321,10 @@ pub struct ControllerConfig {
     #[serde(default = "default_hold_on_prolog_fail")]
     pub hold_on_prolog_fail: bool,
 
-    /// Seconds a terminal job stays in controller memory/snapshots before eviction
-    /// (default 3600); Postgres accounting history is unaffected.
+    /// Seconds a terminal job stays in controller memory before eviction (default
+    /// 3600). `sacct` history is unaffected but `scontrol show job` stops finding
+    /// it after the window; runs once per `scheduler.interval_secs` and is floored
+    /// to the accounting reconcile interval so a job's DB row can be repaired first.
     #[serde(default = "default_terminal_job_retention_secs")]
     pub terminal_job_retention_secs: u64,
 }

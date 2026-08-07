@@ -202,7 +202,7 @@ async fn main() -> anyhow::Result<()> {
                         pool.clone(),
                         cluster.clone(),
                         raft_handle.clone(),
-                        std::time::Duration::from_secs(120),
+                        std::time::Duration::from_secs(accounting::RECONCILE_INTERVAL_SECS),
                     );
 
                     cluster.fairshare_cache().spawn_refresh_loop(

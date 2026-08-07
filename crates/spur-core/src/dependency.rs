@@ -29,6 +29,21 @@ pub enum Dependency {
     Singleton,
 }
 
+impl Dependency {
+    /// The target job id this dependency references, or `None` for `Singleton`
+    /// (which matches on name+user, not a specific id).
+    pub fn target_job_id(&self) -> Option<JobId> {
+        match self {
+            Dependency::After { job_id, .. } => Some(*job_id),
+            Dependency::AfterOk(id)
+            | Dependency::AfterAny(id)
+            | Dependency::AfterNotOk(id)
+            | Dependency::AfterCorr(id) => Some(*id),
+            Dependency::Singleton => None,
+        }
+    }
+}
+
 /// Dependency string parse failure, surfaced at submit time so users get a
 /// clear rejection instead of a silently-deadlocked job.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -905,5 +920,22 @@ mod tests {
             &|_, _| Vec::new(),
         );
         assert_eq!(result, DependencyResult::Waiting);
+    }
+
+    #[test]
+    fn test_target_job_id_extracts_id_for_id_bearing_deps() {
+        assert_eq!(
+            Dependency::After {
+                job_id: 7,
+                delay_minutes: 5
+            }
+            .target_job_id(),
+            Some(7)
+        );
+        assert_eq!(Dependency::AfterOk(8).target_job_id(), Some(8));
+        assert_eq!(Dependency::AfterAny(9).target_job_id(), Some(9));
+        assert_eq!(Dependency::AfterNotOk(10).target_job_id(), Some(10));
+        assert_eq!(Dependency::AfterCorr(11).target_job_id(), Some(11));
+        assert_eq!(Dependency::Singleton.target_job_id(), None);
     }
 }
