@@ -3308,15 +3308,17 @@ impl ClusterManager {
     pub fn evict_expired_terminal_jobs(&self) {
         let retention = self.config().controller.terminal_job_retention_secs;
         let before = Utc::now() - chrono::Duration::seconds(retention as i64);
-        let any = self
+        let job_ids: Vec<JobId> = self
             .jobs
             .read()
-            .values()
-            .any(|j| j.state.is_terminal() && j.end_time.is_some_and(|t| t < before));
-        if !any {
+            .iter()
+            .filter(|(_, j)| j.state.is_terminal() && j.end_time.is_some_and(|t| t < before))
+            .map(|(&id, _)| id)
+            .collect();
+        if job_ids.is_empty() {
             return;
         }
-        if let Err(e) = self.propose(WalOperation::EvictTerminalJobs { before }) {
+        if let Err(e) = self.propose(WalOperation::EvictTerminalJobs { job_ids }) {
             warn!(error = %e, "failed to evict expired terminal jobs");
         }
     }
@@ -4863,13 +4865,11 @@ impl ClusterManager {
                 }
                 k0s.reset_requested = *reset_requested;
             }
-            WalOperation::EvictTerminalJobs { before } => {
-                let evicted: HashSet<JobId> = jobs
+            WalOperation::EvictTerminalJobs { job_ids } => {
+                let evicted: HashSet<JobId> = job_ids
                     .iter()
-                    .filter(|(_, j)| {
-                        j.state.is_terminal() && j.end_time.is_some_and(|t| t < *before)
-                    })
-                    .map(|(&id, _)| id)
+                    .filter(|id| jobs.get(id).is_some_and(|j| j.state.is_terminal()))
+                    .copied()
                     .collect();
                 if !evicted.is_empty() {
                     jobs.retain(|id, _| !evicted.contains(id));
@@ -6345,20 +6345,15 @@ mod tests {
         cm.steps.write().insert((1, 0), step(1));
         cm.steps.write().insert((2, 0), step(2));
 
-        // A cutoff before the just-set end_time spares even the terminal job.
+        // Apply removes only ids still terminal; live ids 2 and 3 are no-ops
+        // even when named (a job requeued between propose and apply).
         cm.apply_operation(&WalOperation::EvictTerminalJobs {
-            before: chrono::Utc::now() - chrono::Duration::hours(1),
+            job_ids: vec![1, 2, 3],
         });
         assert!(
-            cm.get_job(1).is_some(),
-            "recent terminal job must be spared"
+            cm.get_job(1).is_none(),
+            "named terminal job must be evicted"
         );
-
-        // A cutoff after it evicts the terminal job only.
-        cm.apply_operation(&WalOperation::EvictTerminalJobs {
-            before: chrono::Utc::now() + chrono::Duration::seconds(1),
-        });
-        assert!(cm.get_job(1).is_none(), "aged terminal job must be evicted");
         assert!(cm.get_job(2).is_some(), "running job must be spared");
         assert!(cm.get_job(3).is_some(), "pending job must be spared");
         assert!(
@@ -6368,6 +6363,44 @@ mod tests {
         assert!(
             cm.steps.read().get(&(2, 0)).is_some(),
             "live job's step must be kept"
+        );
+    }
+
+    // The id list, not per-replica end_time, decides eviction: two replicas with
+    // divergent end_times must converge on the same set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_terminal_jobs_is_replica_deterministic() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let cm_a = test_cluster(&dir_a).await;
+        let cm_b = test_cluster(&dir_b).await;
+
+        for cm in [&cm_a, &cm_b] {
+            cm.apply_operation(&WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(basic_spec("done")),
+            });
+            cm.apply_operation(&WalOperation::JobComplete {
+                job_id: 1,
+                exit_code: 0,
+                state: JobState::Cancelled,
+            });
+        }
+        // Force divergent local end_times across the two replicas.
+        cm_a.jobs.write().get_mut(&1).unwrap().end_time =
+            Some(chrono::Utc::now() - chrono::Duration::hours(2));
+        cm_b.jobs.write().get_mut(&1).unwrap().end_time =
+            Some(chrono::Utc::now() + chrono::Duration::hours(2));
+
+        let entry = WalOperation::EvictTerminalJobs { job_ids: vec![1] };
+        cm_a.apply_operation(&entry);
+        cm_b.apply_operation(&entry);
+
+        assert!(cm_a.get_job(1).is_none());
+        assert_eq!(
+            cm_a.get_job(1).is_none(),
+            cm_b.get_job(1).is_none(),
+            "both replicas must evict the same set despite end_time skew"
         );
     }
 

@@ -348,8 +348,8 @@ fn default_max_launch_backoff_secs() -> u64 {
 /// out of chrono's representable range.
 pub const MAX_LAUNCH_BACKOFF_SECS: u64 = 86_400;
 
-/// Upper bound for `terminal_job_retention_secs` (one year). Keeps the eviction
-/// cutoff (`now - retention`) inside chrono's representable range.
+/// Upper bound for `terminal_job_retention_secs` (one year). Operational
+/// guardrail: retaining terminal jobs longer defeats the memory bound.
 pub const MAX_TERMINAL_JOB_RETENTION_SECS: u64 = 366 * 24 * 60 * 60;
 
 fn default_listen_addr() -> String {
@@ -1160,7 +1160,7 @@ impl SlurmConfig {
                 ),
             });
         }
-        // Bounded so the eviction cutoff `now - retention` stays representable.
+        // Guardrail: retention beyond the cap defeats the memory bound.
         if self.controller.terminal_job_retention_secs > MAX_TERMINAL_JOB_RETENTION_SECS {
             return Err(ConfigError::InvalidValue {
                 field: "controller.terminal_job_retention_secs".into(),
@@ -1949,8 +1949,8 @@ max_launch_backoff_secs = 0
 
     #[test]
     fn controller_config_rejects_out_of_range_terminal_job_retention_secs() {
-        // Past this bound the eviction cutoff overflows chrono and panics the
-        // controller, so it must be refused at load rather than at first use.
+        // Beyond the guardrail, load must reject up front rather than silently
+        // retaining terminal jobs long enough to defeat the memory bound.
         let toml = format!(
             r#"
 cluster_name = "test"
