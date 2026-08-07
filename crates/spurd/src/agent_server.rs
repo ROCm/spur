@@ -31,7 +31,7 @@ use crate::mpi_plugin::{self, MpiPluginHost, PmixLaunchGuard};
 use crate::pmi::PmiServer;
 use crate::reporter::NodeReporter;
 
-struct TrackedJob {
+pub(crate) struct TrackedJob {
     job: executor::RunningJob,
     rootfs_mode: crate::container::RootfsMode,
     stdout_path: String,
@@ -93,11 +93,19 @@ async fn cleanup_completed_job_mpi(
     }
 }
 
+/// Job ids this node holds, shared with the reporter so heartbeats carry them.
+pub(crate) type RunningJobs = Arc<Mutex<HashMap<u32, TrackedJob>>>;
+
+/// Build an empty running-jobs map to share between the reporter and the agent.
+pub(crate) fn new_running_jobs() -> RunningJobs {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
 pub struct AgentService {
     pub reporter: Arc<NodeReporter>,
     /// In-memory only: starts empty on every spurd start/restart, regardless
     /// of whether the controller still reports a job Running from before.
-    running: Arc<Mutex<HashMap<u32, TrackedJob>>>,
+    running: RunningJobs,
     allocation: Arc<Mutex<NodeAllocation>>,
     spank: Arc<Option<SpankHost>>,
     pmi_servers: PmiServers,
@@ -127,11 +135,13 @@ impl AgentService {
             &spur_core::config::ClusterConfig::default(),
             memlock,
             MpiConfig::default(),
+            new_running_jobs(),
         )
     }
 
     /// Construct with the `[cluster]` config so this node's K0sAgent honors the operator's k0s
     /// version + install path.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_cluster_config(
         reporter: Arc<NodeReporter>,
         hooks: HooksConfig,
@@ -139,6 +149,7 @@ impl AgentService {
         cluster: &spur_core::config::ClusterConfig,
         memlock: spur_core::config::MemlockLimit,
         mpi: MpiConfig,
+        running: RunningJobs,
     ) -> Self {
         let allocation = NodeAllocation::new(
             hostname::get()
@@ -193,7 +204,7 @@ impl AgentService {
 
         Self {
             reporter,
-            running: Arc::new(Mutex::new(HashMap::new())),
+            running,
             allocation: Arc::new(Mutex::new(allocation)),
             spank: Arc::new(spank),
             pmi_servers: Arc::new(Mutex::new(HashMap::new())),
@@ -2979,6 +2990,7 @@ mod tests {
             std::collections::HashMap::new(),
             String::new(),
             String::new(),
+            new_running_jobs(),
         ))
     }
 
@@ -3443,6 +3455,7 @@ mod tests {
             std::collections::HashMap::new(),
             String::new(),
             "spur0".into(),
+            new_running_jobs(),
         ))
     }
 
@@ -4098,6 +4111,67 @@ mod tests {
             svc.free_gpu_count().await,
             0,
             "committed+tracked allocation must survive reconcile"
+        );
+    }
+
+    // The heartbeat's held-job source must report an allocation-only (srun/salloc)
+    // job so the controller can reconcile it — the strand this fix addresses.
+    #[tokio::test]
+    async fn heartbeat_reports_held_allocation_only_job() {
+        // One shared running map wired into both the reporter (heartbeat source)
+        // and the agent service (owner) — the production wiring from main.rs.
+        let running = new_running_jobs();
+        let reporter = Arc::new(NodeReporter::new(
+            "test-node".into(),
+            "http://localhost:6817".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8192,
+                ..Default::default()
+            },
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "test-node".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            std::collections::HashMap::new(),
+            String::new(),
+            String::new(),
+            running.clone(),
+        ));
+        let svc = AgentService::with_cluster_config(
+            reporter.clone(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            &spur_core::config::ClusterConfig::default(),
+            spur_core::config::MemlockLimit::Unlimited,
+            MpiConfig::default(),
+            running,
+        );
+
+        assert!(
+            reporter.held_job_ids().is_empty(),
+            "reporter sees no jobs before registration"
+        );
+
+        svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            job_id: 77,
+            cpus: 1,
+            allocated: Some(ResourceAllocations {
+                cpus: 1,
+                memory_mb: 0,
+                devices: std::collections::HashMap::new(),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("register");
+
+        assert_eq!(
+            reporter.held_job_ids(),
+            vec![77],
+            "reporter's heartbeat must observe the agent-registered allocation-only job"
         );
     }
 

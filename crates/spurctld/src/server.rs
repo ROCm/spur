@@ -224,6 +224,40 @@ impl ControllerService {
         Err(self.not_leader_status())
     }
 
+    /// Re-send a terminal-job cancel to a node still reporting it on heartbeat,
+    /// freeing an allocation whose terminal cancel never landed. Spawned, best-effort.
+    fn reclaim_stale_agent_jobs(&self, node: &str, reported: &[RunningJobStatus]) {
+        let stale = stale_reported_jobs(&self.cluster, reported);
+        if stale.is_empty() {
+            return;
+        }
+        let cluster = self.cluster.clone();
+        let node = node.to_string();
+        tokio::spawn(async move {
+            for job_id in stale {
+                // Re-check: a requeue since the snapshot above would otherwise
+                // send an unguarded cancel into the job's new run.
+                if !is_still_terminal(&cluster, job_id) {
+                    continue;
+                }
+                warn!(
+                    job_id,
+                    node = %node,
+                    "agent still holds a terminal job — re-sending cancel to reclaim its allocation"
+                );
+                // Signal 0 = graceful release, no-op on an unknown id. Not
+                // epoch-gated — a requeue racing this send is still possible.
+                crate::scheduler_loop::cancel_job_on_nodes(
+                    &cluster,
+                    job_id,
+                    std::slice::from_ref(&node),
+                    0,
+                )
+                .await;
+            }
+        });
+    }
+
     /// Reads never require the leader (every node applies the committed log),
     /// so forwarding is only an optional freshness hop. Skipping already-
     /// forwarded requests avoids forward loops between non-leaders.
@@ -343,6 +377,21 @@ fn resolve_user_namespace_sa(
 /// Fails closed when accounting is off (cache reports no admins), leaving only root/internal.
 fn is_k0s_admin(cache: &crate::association_cache::AssociationCache, caller: &str) -> bool {
     caller.is_empty() || caller == "root" || cache.is_admin(caller)
+}
+
+/// Whether the controller still considers `job_id` terminal right now — guards
+/// the spawned reclaim loop against a requeue landing after its stale snapshot.
+fn is_still_terminal(cluster: &ClusterManager, job_id: u32) -> bool {
+    cluster.job_state(job_id).is_some_and(|s| s.is_terminal())
+}
+
+/// Reported ids the controller's own record marks terminal. Non-terminal (incl.
+/// Pending mid-dispatch) and unknown ids are spared, so no live job is reclaimed.
+fn stale_reported_jobs(cluster: &ClusterManager, reported: &[RunningJobStatus]) -> Vec<u32> {
+    reported
+        .iter()
+        .filter_map(|r| is_still_terminal(cluster, r.job_id).then_some(r.job_id))
+        .collect()
 }
 
 #[tonic::async_trait]
@@ -1250,6 +1299,7 @@ impl SlurmController for ControllerService {
             {
                 info!(node = %req.hostname, "learned updated WireGuard mesh key from heartbeat");
             }
+            self.reclaim_stale_agent_jobs(&req.hostname, &req.running_jobs);
             Ok(Response::new(HeartbeatResponse {}))
         } else {
             Err(Status::not_found(format!(
@@ -3252,6 +3302,177 @@ mod tests {
         let status = submit_rpc_status(SubmitError::invalid("partition 'gpu' not found"));
         assert_eq!(status.code(), Code::InvalidArgument);
         assert_eq!(status.message(), "partition 'gpu' not found");
+    }
+
+    /// Only a controller-terminal job is stale; Pending (mid-dispatch), Running,
+    /// and unknown ids are all spared.
+    #[tokio::test]
+    async fn stale_reported_jobs_selects_only_terminal_jobs() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState};
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+
+        let submit = |job_id: u32, name: &str| WalOperation::JobSubmit {
+            job_id,
+            spec: Box::new(JobSpec {
+                name: name.into(),
+                user: "alice".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            }),
+        };
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                cluster.as_ref(),
+                op,
+            );
+        };
+
+        // 10 Pending, 11 Running, 12 terminal, and the non-Running active states
+        // that must also be spared: 13 Completing, 14 Suspended, 15 Preempted.
+        apply(&submit(10, "pending"));
+        for id in [11, 12, 13, 14, 15] {
+            apply(&submit(id, "job"));
+        }
+
+        let res = spur_core::resource::ResourceAllocations {
+            cpus: 1,
+            memory_mb: 0,
+            devices: std::collections::HashMap::new(),
+        };
+        let mut per_node = std::collections::HashMap::new();
+        per_node.insert("n1".to_string(), res.clone());
+        for id in [11, 12, 13, 14, 15] {
+            apply(&WalOperation::job_start(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node.clone(),
+            ));
+            apply(&WalOperation::job_state_change(
+                id,
+                JobState::Pending,
+                JobState::Running,
+            ));
+        }
+        apply(&WalOperation::job_state_change(
+            12,
+            JobState::Running,
+            JobState::Cancelled,
+        ));
+        apply(&WalOperation::job_state_change(
+            13,
+            JobState::Running,
+            JobState::Completing,
+        ));
+        apply(&WalOperation::job_state_change(
+            14,
+            JobState::Running,
+            JobState::Suspended,
+        ));
+        apply(&WalOperation::job_state_change(
+            15,
+            JobState::Running,
+            JobState::Preempted,
+        ));
+
+        assert_eq!(cluster.job_state(10), Some(JobState::Pending));
+        assert_eq!(cluster.job_state(11), Some(JobState::Running));
+        assert!(cluster.job_state(12).unwrap().is_terminal());
+        assert_eq!(cluster.job_state(13), Some(JobState::Completing));
+        assert_eq!(cluster.job_state(14), Some(JobState::Suspended));
+        assert_eq!(cluster.job_state(15), Some(JobState::Preempted));
+
+        let reported: Vec<RunningJobStatus> = [10, 11, 12, 13, 14, 15, 999]
+            .into_iter()
+            .map(|job_id| RunningJobStatus {
+                job_id,
+                ..Default::default()
+            })
+            .collect();
+
+        let stale = stale_reported_jobs(&cluster, &reported);
+        assert_eq!(
+            stale,
+            vec![12],
+            "only the terminal job is reclaimed; Pending/Running/Completing/Suspended/Preempted/unknown are spared"
+        );
+    }
+
+    /// GATE: a job requeued (Timeout -> Pending) between the reclaim snapshot
+    /// and the spawned loop's send must fail the re-check, not just the snapshot.
+    #[tokio::test]
+    async fn is_still_terminal_false_after_requeue_race() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState};
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                cluster.as_ref(),
+                op,
+            );
+        };
+
+        apply(&WalOperation::JobSubmit {
+            job_id: 77,
+            spec: Box::new(JobSpec {
+                name: "interactive".into(),
+                user: "alice".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                requeue: true,
+                ..Default::default()
+            }),
+        });
+        let res = spur_core::resource::ResourceAllocations {
+            cpus: 1,
+            memory_mb: 0,
+            devices: std::collections::HashMap::new(),
+        };
+        let mut per_node = std::collections::HashMap::new();
+        per_node.insert("n1".to_string(), res.clone());
+        apply(&WalOperation::job_start(
+            77,
+            vec!["n1".into()],
+            res,
+            per_node,
+        ));
+        apply(&WalOperation::job_state_change(
+            77,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        apply(&WalOperation::job_state_change(
+            77,
+            JobState::Running,
+            JobState::Timeout,
+        ));
+        assert!(is_still_terminal(&cluster, 77), "snapshot sees Timeout");
+
+        // Concurrent requeue lands before the reclaim loop's re-check.
+        apply(&WalOperation::job_state_change(
+            77,
+            JobState::Timeout,
+            JobState::Pending,
+        ));
+
+        assert!(
+            !is_still_terminal(&cluster, 77),
+            "re-check must skip a job requeued since the snapshot"
+        );
     }
 
     /// GATE: `auth.jwt_key` is captured at startup and must NOT change on
