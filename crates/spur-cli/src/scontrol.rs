@@ -510,6 +510,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             add_accounts,
             remove_accounts,
         } => {
+            crate::privilege::require_privileged("manage reservations")?;
+
             let channel = spur_client::connect_channel(&args.controller)
                 .await
                 .context("failed to connect to spurctld")?;
@@ -1486,6 +1488,8 @@ async fn create_reservation(
     users: &str,
     flags: &str,
 ) -> Result<()> {
+    crate::privilege::require_privileged("manage reservations")?;
+
     let channel = spur_client::connect_channel(controller)
         .await
         .context("failed to connect to spurctld")?;
@@ -1532,6 +1536,8 @@ async fn create_reservation(
 
 /// Delete a reservation via the controller.
 async fn delete_reservation(controller: &str, name: &str) -> Result<()> {
+    crate::privilege::require_privileged("manage reservations")?;
+
     let channel = spur_client::connect_channel(controller)
         .await
         .context("failed to connect to spurctld")?;
