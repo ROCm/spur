@@ -995,7 +995,7 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
         node.exec_allow_fail(f"docker rm -f '{self._pg_container}' 2>/dev/null || true")
         # Default to an ephemeral host port (-p 5432) so concurrent/serial tests
         # never collide on a fixed port; SPUR_TEST_PG_PORT pins it when needed.
-        publish = f"{self._pg_port}:5432" if self._pg_port else "5432"
+        publish = f"127.0.0.1:{self._pg_port}:5432" if self._pg_port else "127.0.0.1::5432"
         node.exec(
             f"docker run -d --name '{self._pg_container}' "
             f"-e POSTGRES_USER=spur -e POSTGRES_PASSWORD=spur -e POSTGRES_DB=spur "
