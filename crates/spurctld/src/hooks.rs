@@ -9,8 +9,8 @@
 
 use anyhow::Context;
 use spur_core::hooks::{
-    changes_from_map, require_absolute_hook_path, require_secure_hook_file, SubmitHookChanges,
-    SubmitHookContext, SubmitHookOutcome, SUBMIT_HOOK_WHITELIST,
+    changes_from_map, read_secure_hook_file, require_absolute_hook_path, require_secure_hook_file,
+    SubmitHookChanges, SubmitHookContext, SubmitHookOutcome, SUBMIT_HOOK_WHITELIST,
 };
 use tracing::{info, warn};
 
@@ -27,15 +27,26 @@ const LUA_UNSAFE_GLOBALS: &[&str] = &["dofile", "loadfile", "load", "loadstring"
 /// so a syntax error is caught at startup, not on the first user submission.
 pub fn validate_lua_hook(script_path: &str) -> anyhow::Result<()> {
     require_absolute_hook_path(script_path)?;
-    require_secure_hook_file(script_path)?;
-    let source = std::fs::read_to_string(script_path)
-        .with_context(|| format!("job_submit lua script unreadable: {script_path}"))?;
-    let lua = mlua::Lua::new();
+    let source = read_secure_hook_file(script_path)?;
+    let lua = sandboxed_lua()?;
     lua.load(source.as_str())
         .set_name("job_submit.lua")
+        .set_mode(mlua::chunk::ChunkMode::Text)
         .into_function()
         .map_err(|e| lua_err("compile job_submit lua script", e))?;
     Ok(())
+}
+
+/// Build the sandboxed Lua VM used for both compiling (validate) and running
+/// (submit) hooks, so a compile-time check can never diverge from runtime trust.
+fn sandboxed_lua() -> anyhow::Result<mlua::Lua> {
+    use mlua::{Lua, StdLib};
+    let safe_libs =
+        StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8 | StdLib::COROUTINE;
+    let lua = Lua::new_with(safe_libs, mlua::LuaOptions::default())
+        .map_err(|e| lua_err("initialize sandboxed Lua", e))?;
+    harden_lua_sandbox(&lua)?;
+    Ok(lua)
 }
 
 /// Validate configured submit hooks at startup / reconfigure so a bad path is a
@@ -82,10 +93,9 @@ pub fn run_submit_hook_lua(
     script_path: &str,
     ctx: &SubmitHookContext,
 ) -> anyhow::Result<SubmitHookOutcome> {
-    use mlua::{Lua, LuaSerdeExt, StdLib, Value};
+    use mlua::{LuaSerdeExt, Value};
 
     require_absolute_hook_path(script_path)?;
-    require_secure_hook_file(script_path)?;
     info!(
         target: "audit",
         hook = "job_submit_lua",
@@ -96,14 +106,8 @@ pub fn run_submit_hook_lua(
         "running job_submit lua hook"
     );
 
-    let source = std::fs::read_to_string(script_path)
-        .with_context(|| format!("job_submit lua script unreadable: {script_path}"))?;
-
-    let safe_libs =
-        StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8 | StdLib::COROUTINE;
-    let lua = Lua::new_with(safe_libs, mlua::LuaOptions::default())
-        .map_err(|e| lua_err("initialize sandboxed Lua", e))?;
-    harden_lua_sandbox(&lua)?;
+    let source = read_secure_hook_file(script_path)?;
+    let lua = sandboxed_lua()?;
 
     let mut spec_value: serde_json::Value =
         serde_json::from_str(&ctx.spec_json).context("failed to decode job spec for lua hook")?;
@@ -138,6 +142,7 @@ pub fn run_submit_hook_lua(
 
     lua.load(source.as_str())
         .set_name("job_submit.lua")
+        .set_mode(mlua::chunk::ChunkMode::Text)
         .exec()
         .map_err(|e| lua_err("load job_submit lua script", e))?;
 
@@ -304,6 +309,17 @@ mod tests {
     fn make_lua(body: &str) -> tempfile::TempPath {
         let mut f = NamedTempFile::new().unwrap();
         writeln!(f, "{body}").unwrap();
+        f.into_temp_path()
+    }
+
+    // Precompiled Lua bytecode is a well-known VM sandbox escape (the loader
+    // doesn't verify it); `ChunkMode::Text` must make both load sites refuse it.
+    fn make_lua_bytecode(body: &str) -> tempfile::TempPath {
+        let compiler = mlua::Lua::new();
+        let function = compiler.load(body).into_function().unwrap();
+        let bytecode = function.dump(false);
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(&bytecode).unwrap();
         f.into_temp_path()
     }
 
@@ -607,5 +623,50 @@ mod tests {
     fn validate_lua_hook_rejects_syntax_error() {
         let lua = make_lua("function slurm_job_submit(  this is not lua");
         assert!(validate_lua_hook(lua.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn lua_sandbox_denies_precompiled_bytecode() {
+        let lua = make_lua_bytecode("function slurm_job_submit(j,u)\n  return slurm.SUCCESS\nend");
+        let res = run_submit_hook_lua(lua.to_str().unwrap(), &lua_ctx(r#"{"partition":"gpu"}"#));
+        assert!(res.is_err(), "precompiled bytecode must be refused");
+    }
+
+    #[test]
+    fn validate_lua_hook_rejects_precompiled_bytecode() {
+        let lua = make_lua_bytecode("function slurm_job_submit(j,u)\n  return slurm.SUCCESS\nend");
+        assert!(validate_lua_hook(lua.to_str().unwrap()).is_err());
+    }
+
+    // The two tests above go through a UTF-8 file read that incidentally blocks
+    // most bytecode; isolate the chunk-mode guard on the raw bytes directly.
+    #[test]
+    fn chunk_mode_text_rejects_bytecode_even_when_not_utf8_gated() {
+        let compiler = mlua::Lua::new();
+        let bytecode = compiler
+            .load("return 1")
+            .into_function()
+            .unwrap()
+            .dump(false);
+
+        let auto_detected: i64 = mlua::Lua::new()
+            .load(bytecode.as_slice())
+            .eval()
+            .expect("auto-detection executes raw bytecode when not forced to text mode");
+        assert_eq!(
+            auto_detected, 1,
+            "sanity: the dumped bytes are real, runnable bytecode"
+        );
+
+        let lua = sandboxed_lua().unwrap();
+        let res = lua
+            .load(bytecode.as_slice())
+            .set_name("job_submit.lua")
+            .set_mode(mlua::chunk::ChunkMode::Text)
+            .exec();
+        assert!(
+            res.is_err(),
+            "ChunkMode::Text must refuse the same bytecode bytes"
+        );
     }
 }
