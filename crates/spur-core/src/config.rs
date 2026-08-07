@@ -721,6 +721,10 @@ pub struct ClusterConfig {
     /// large scratch disk if PVCs will hold much data — the default lives under `/var/lib` (root fs).
     #[serde(default = "default_local_path_dir")]
     pub local_path_dir: String,
+    /// Seconds a cluster may sit in `provisioning` before the reconcile loop marks it `degraded`
+    /// (surfacing which nodes failed). Covers the ~262 MB k0s download plus multi-node join.
+    #[serde(default = "default_provisioning_timeout_secs")]
+    pub provisioning_timeout_secs: u64,
 }
 
 fn default_cluster_distro() -> String {
@@ -753,6 +757,9 @@ fn default_storage_provisioner() -> String {
 fn default_local_path_dir() -> String {
     crate::k0s::DEFAULT_LOCAL_PATH_DIR.into()
 }
+fn default_provisioning_timeout_secs() -> u64 {
+    600
+}
 
 impl Default for ClusterConfig {
     fn default() -> Self {
@@ -769,6 +776,7 @@ impl Default for ClusterConfig {
             cni: default_cni(),
             storage_provisioner: default_storage_provisioner(),
             local_path_dir: default_local_path_dir(),
+            provisioning_timeout_secs: default_provisioning_timeout_secs(),
         }
     }
 }
@@ -1161,6 +1169,13 @@ impl SlurmConfig {
                     value: msg,
                 });
             }
+            if self.cluster.provisioning_timeout_secs == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "cluster.provisioning_timeout_secs".into(),
+                    value: "0 (must be > 0; a cluster would degrade before any node could start)"
+                        .into(),
+                });
+            }
             // The mesh CIDR feeds the k0s IPAM (AddressPool) exactly like pod/service, so assert it is
             // a valid IPv4 CIDR in the same pass — otherwise a malformed wg_cidr bypasses validate()
             // and fails every reconcile tick in AddressPool::new, leaving the cluster silently stuck.
@@ -1470,6 +1485,11 @@ cni_mtu = 1400
             "cluster_name=\"t\"\n[cluster]\nenabled=true\ncontrol_plane_replicas=3\n"
         )
         .is_ok());
+        // A zero provisioning timeout would degrade before any node could start; rejected.
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\nprovisioning_timeout_secs=0\n"
+        )
+        .is_err());
         // Unknown storage provisioner is rejected; "none" and "local-path" are accepted.
         assert!(SlurmConfig::load_from_str(
             "cluster_name=\"t\"\n[cluster]\nenabled=true\nstorage_provisioner=\"nfs\"\n"

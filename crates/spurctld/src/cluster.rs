@@ -2119,6 +2119,22 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Record (or clear, with `None`) why a node blocked k0s convergence, replicated via Raft so
+    /// `spur k8s status` can surface it. Errors on an unknown node.
+    pub fn set_node_k0s_error(&self, name: &str, error: Option<String>) -> anyhow::Result<()> {
+        {
+            let nodes = self.nodes.read();
+            if !nodes.contains_key(name) {
+                anyhow::bail!("node {name} not found");
+            }
+        }
+        self.propose(WalOperation::NodeK0sSetError {
+            name: name.to_string(),
+            error,
+        })?;
+        Ok(())
+    }
+
     /// set the cluster-wide k0s phase (+ optional control-plane node/set / reset flag). A `None`
     /// `control_plane_node` or empty `control_plane_nodes` leaves the persisted value untouched.
     pub fn set_k0s_phase(
@@ -4827,6 +4843,12 @@ impl ClusterManager {
                     node.k0s_role = None;
                     node.k0s_mesh_ip = None;
                     node.k0s_pod_cidr = None;
+                    node.k0s_last_error = None;
+                }
+            }
+            WalOperation::NodeK0sSetError { name, error } => {
+                if let Some(node) = nodes.get_mut(name) {
+                    node.k0s_last_error = error.clone();
                 }
             }
             WalOperation::K0sSetPhase {
@@ -12264,6 +12286,7 @@ mod tests {
             cni_mtu: 1450,
             cni: "kuberouter".into(),
             control_plane_node: None,
+            provisioning_timeout: std::time::Duration::from_secs(600),
         };
         crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
         wait_for("both assigned", || {
@@ -12323,14 +12346,103 @@ mod tests {
             cni_mtu: 1450,
             cni: "kuberouter".into(),
             control_plane_node: Some("node-a".into()),
+            provisioning_timeout: std::time::Duration::from_secs(600),
         };
         let mut tokens = std::collections::HashMap::new();
-        crate::cluster_k8s::reconcile_phase(&cm, &net, &cm.k0s_state(), &mut tokens).await;
+        crate::cluster_k8s::reconcile_phase(&cm, &net, &cm.k0s_state(), &mut tokens, false).await;
 
         wait_for("un-roled node assigned by a Ready-phase tick", || {
             cm.get_node("node-a").and_then(|n| n.k0s_role).is_some()
         });
         assert!(cm.get_node("node-a").and_then(|n| n.k0s_mesh_ip).is_some());
+    }
+
+    fn k0s_test_net() -> crate::cluster_k8s::ClusterNetworking {
+        crate::cluster_k8s::ClusterNetworking {
+            mesh_cidr: "10.44.0.0/16".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
+            cni: "kuberouter".into(),
+            control_plane_node: None,
+            provisioning_timeout: std::time::Duration::from_secs(600),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provisioning_timeout_degrades_records_reason_keeps_roles() {
+        use spur_core::k0s::K0sPhase;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        wait_for("registered", || cm.get_node("node-a").is_some());
+        cm.set_k0s_phase(
+            K0sPhase::Provisioning,
+            Some("node-a".into()),
+            Vec::new(),
+            false,
+        )
+        .unwrap();
+        wait_for("phase provisioning", || {
+            cm.k0s_state().phase == K0sPhase::Provisioning
+        });
+
+        let net = k0s_test_net();
+        let mut tokens = std::collections::HashMap::new();
+        crate::cluster_k8s::reconcile_phase(&cm, &net, &cm.k0s_state(), &mut tokens, true).await;
+
+        wait_for("degraded", || cm.k0s_state().phase == K0sPhase::Degraded);
+        let node = cm.get_node("node-a").unwrap();
+        // The node kept its role (recoverable retry) and carries a surfaced reason.
+        assert!(node.k0s_role.is_some());
+        assert!(node.k0s_last_error.unwrap().contains("not active"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provisioning_within_deadline_stays_provisioning() {
+        use spur_core::k0s::K0sPhase;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        wait_for("registered", || cm.get_node("node-a").is_some());
+        cm.set_k0s_phase(
+            K0sPhase::Provisioning,
+            Some("node-a".into()),
+            Vec::new(),
+            false,
+        )
+        .unwrap();
+        wait_for("phase provisioning", || {
+            cm.k0s_state().phase == K0sPhase::Provisioning
+        });
+
+        let net = k0s_test_net();
+        let mut tokens = std::collections::HashMap::new();
+        crate::cluster_k8s::reconcile_phase(&cm, &net, &cm.k0s_state(), &mut tokens, false).await;
+
+        assert_eq!(cm.k0s_state().phase, K0sPhase::Provisioning);
+        assert!(cm.get_node("node-a").unwrap().k0s_last_error.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_node_k0s_error_records_and_clears() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        wait_for("registered", || cm.get_node("node-a").is_some());
+
+        cm.set_node_k0s_error("node-a", Some("boom".into()))
+            .unwrap();
+        wait_for("error recorded", || {
+            cm.get_node("node-a").and_then(|n| n.k0s_last_error) == Some("boom".into())
+        });
+
+        cm.set_node_k0s_error("node-a", None).unwrap();
+        wait_for("error cleared", || {
+            cm.get_node("node-a").unwrap().k0s_last_error.is_none()
+        });
+
+        assert!(cm.set_node_k0s_error("ghost", Some("x".into())).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -12351,6 +12463,7 @@ mod tests {
             cni_mtu: 1450,
             cni: "kuberouter".into(),
             control_plane_node: None,
+            provisioning_timeout: std::time::Duration::from_secs(600),
         };
         crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
         wait_for("both nodes assigned k0s roles", || {
@@ -12403,6 +12516,7 @@ mod tests {
             cni_mtu: 1450,
             cni: "kuberouter".into(),
             control_plane_node: None,
+            provisioning_timeout: std::time::Duration::from_secs(600),
         };
         crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
         wait_for("all four assigned", || {
@@ -12466,6 +12580,7 @@ mod tests {
             cni_mtu: 1450,
             cni: "kuberouter".into(),
             control_plane_node: None,
+            provisioning_timeout: std::time::Duration::from_secs(600),
         };
         crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
         wait_for("all assigned", || {
