@@ -8,15 +8,14 @@ required; every section has a default and may be omitted, and unknown keys are
 silently ignored. The controller validates the file on load.
 
 The sections below are grouped by subsystem. Every field lists its type, default,
-and meaning. The authoritative source of truth is ``crates/spur-core/src/config.rs`` —
-keep this reference in sync with it.
+and meaning.
 
 .. note::
 
-   Only ``spurctld`` reads ``spur.conf``. ``spurd`` is configured entirely through
-   CLI flags and does **not** read a config file — node CPU, memory, and GRES are
-   declared to the controller under ``[[nodes]]`` here, and agent runtime options
-   are passed on the ``spurd`` command line.
+   ``spurctld`` reads every section of ``spur.conf``. ``spurd`` reads the same file
+   but only for local agent settings (``[hooks]``, ``[devices]``, ``rlimits.memlock``,
+   ``[cluster]``, and ``[mpi]``); its identity and networking come from CLI flags.
+   Node CPU, memory, and GRES are declared to the controller under ``[[nodes]]`` here.
 
 Minimal configuration
 ----------------------
@@ -885,8 +884,13 @@ See :doc:`/deployment/managed-kubernetes` for provisioning a Spur-owned cluster.
    ``"http://peer-ctrl:6817"``). Defaults to no peers.
 
 ``[topology]``
-   Optional switch-hierarchy configuration for locality-aware scheduling. Its fields
-   are defined in the topology module rather than the core config schema.
+   Optional switch-hierarchy configuration for locality-aware scheduling.
+   ``plugin`` (string, default ``"none"``) selects the model: ``"tree"`` for a
+   switch hierarchy, ``"block"`` for fixed-size blocks, or ``"none"`` to disable.
+   In tree mode, each ``[[topology.switches]]`` entry has ``name`` (string),
+   ``nodes`` (hostlist pattern for a leaf switch), and ``switches`` (comma-separated
+   child switch names for an aggregation switch). In block mode, ``block_size``
+   (integer) sets the number of nodes per block. Defaults to no topology.
 
 ``[burst_buffer]``
    Burst-buffer capacity. ``total_gb`` (integer, default ``0``) sets total capacity

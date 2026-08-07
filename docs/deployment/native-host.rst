@@ -85,7 +85,7 @@ The two daemons are configured with command-line flags. The most common are belo
      - Meaning
    * - ``-f, --config <PATH>``
      - ``/etc/spur/spur.conf``
-     - Config file (largely ignored; see the note below).
+     - Config file for local agent settings (see the note below).
    * - ``--controller <ADDR>``
      - ``http://localhost:6817``
      - Controller endpoint(s). Accepts a comma-separated list for HA failover.
@@ -104,8 +104,11 @@ The two daemons are configured with command-line flags. The most common are belo
 
 .. note::
 
-   ``spurd`` is configured entirely by CLI flags. It logs ``failed to load spur.conf``
-   at startup — this is harmless; the agent never truly reads a config file.
+   Node identity and networking (controller address, hostname, listen address) come
+   from CLI flags. ``spurd`` also reads ``spur.conf`` for local agent settings —
+   ``[hooks]``, ``[devices]`` (GRES and CDI), ``rlimits.memlock``, ``[cluster]``, and
+   ``[mpi]``. If the file is absent, the agent logs a warning and falls back to
+   defaults for those sections, which is fine when none of them are in use.
 
 Setting Up the Controller
 -------------------------
