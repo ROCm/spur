@@ -734,12 +734,23 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
             }
         }
         "reservation" | "reservations" => {
+            let name = normalize_show_name(name);
             let resp = client
-                .list_reservations(spur_proto::proto::ListReservationsRequest {})
+                .list_reservations(spur_proto::proto::ListReservationsRequest {
+                    name: name.unwrap_or("").into(),
+                })
                 .await
                 .context("failed to list reservations")?;
 
-            for res in resp.into_inner().reservations {
+            let reservations = resp.into_inner().reservations;
+            if reservations.is_empty() {
+                if let Some(name) = name {
+                    bail!("Reservation {name} not found");
+                }
+                return Ok(());
+            }
+
+            for res in reservations {
                 println!("ReservationName={}", res.name);
                 println!("   StartTime={}", res.start_time);
                 println!("   EndTime={}", res.end_time);
@@ -1327,6 +1338,14 @@ async fn update_node(
     Ok(())
 }
 
+/// Normalize a `scontrol show <entity> <name>` filter: trim surrounding
+/// whitespace and treat a blank name as "no filter". Keeping this on the client
+/// side means the request field and the not-found decision use the same value,
+/// so the CLI and the server (which also trims) never disagree.
+fn normalize_show_name(name: Option<&str>) -> Option<&str> {
+    name.map(str::trim).filter(|s| !s.is_empty())
+}
+
 /// Split a comma-separated list into trimmed, non-empty entries.
 fn split_csv(s: &str) -> Vec<String> {
     s.split(',')
@@ -1579,6 +1598,17 @@ mod tests {
 
     fn p(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn normalize_show_name_trims_and_blanks_to_none() {
+        assert_eq!(normalize_show_name(None), None);
+        assert_eq!(normalize_show_name(Some("   ")), None);
+        assert_eq!(
+            normalize_show_name(Some(" rocm_patch ")),
+            Some("rocm_patch")
+        );
+        assert_eq!(normalize_show_name(Some("rocm_patch")), Some("rocm_patch"));
     }
 
     #[test]

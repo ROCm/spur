@@ -1823,9 +1823,10 @@ impl SlurmController for ControllerService {
         request: Request<ListReservationsRequest>,
     ) -> Result<Response<ListReservationsResponse>, Status> {
         let forward = self.read_should_forward(&request);
+        let req = request.into_inner();
         if let Some(resp) = self
             .forward_read_optional(
-                forward.then(|| request.into_inner()),
+                forward.then(|| req.clone()),
                 "list_reservations",
                 |mut c, r| async move { c.list_reservations(r).await },
             )
@@ -1833,10 +1834,12 @@ impl SlurmController for ControllerService {
         {
             return Ok(resp);
         }
+        let name = req.name.trim();
         let reservations = self.cluster.get_reservations();
         let now = Utc::now();
         let infos: Vec<ReservationInfo> = reservations
             .iter()
+            .filter(|r| name.is_empty() || r.name == name)
             .map(|r| ReservationInfo {
                 name: r.name.clone(),
                 start_time: r.start_time.to_rfc3339(),
@@ -4362,5 +4365,93 @@ mod tests {
             ..Default::default()
         };
         assert!(proto_to_job_spec(spec).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_reservations_filters_by_name() {
+        use spur_core::resource::ResourceSet;
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        for n in ["n1", "n2"] {
+            svc.cluster
+                .register_node(
+                    n.into(),
+                    n.into(),
+                    ResourceSet {
+                        cpus: 4,
+                        memory_mb: 8000,
+                        ..Default::default()
+                    },
+                    "127.0.0.1".into(),
+                    6818,
+                    String::new(),
+                    String::new(),
+                    spur_core::node::NodeSource::NativeHost,
+                    std::collections::HashMap::new(),
+                )
+                .unwrap();
+        }
+        for _ in 0..200 {
+            if svc.cluster.get_node("n1").is_some() && svc.cluster.get_node("n2").is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        for (name, node) in [("rocm_patch", "n1"), ("other_resv", "n2")] {
+            svc.create_reservation(Request::new(CreateReservationRequest {
+                name: name.into(),
+                start_time: "now".into(),
+                duration_minutes: 60,
+                nodes: vec![node.into()],
+                accounts: Vec::new(),
+                users: Vec::new(),
+                flags: Vec::new(),
+                user: String::new(),
+            }))
+            .await
+            .unwrap();
+        }
+
+        let one = svc
+            .list_reservations(Request::new(ListReservationsRequest {
+                name: "rocm_patch".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .reservations;
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].name, "rocm_patch");
+
+        let all = svc
+            .list_reservations(Request::new(ListReservationsRequest {
+                name: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .reservations;
+        assert_eq!(all.len(), 2);
+
+        // A whitespace-only name is trimmed to empty and treated as no filter.
+        let blank = svc
+            .list_reservations(Request::new(ListReservationsRequest { name: "   ".into() }))
+            .await
+            .unwrap()
+            .into_inner()
+            .reservations;
+        assert_eq!(blank.len(), 2);
+
+        let none = svc
+            .list_reservations(Request::new(ListReservationsRequest {
+                name: "does_not_exist".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .reservations;
+        assert!(none.is_empty());
     }
 }

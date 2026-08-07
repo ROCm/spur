@@ -29,6 +29,36 @@ class TestReservations:
         assert node in show_out
         assert "ACTIVE" in show_out or "INACTIVE" in show_out
 
+        # A distinct node avoids overlap; fall back to the overlap flag when the cluster has one node.
+        other_name = f"res-e2e-other-{int(time.time())}"
+        if len(cluster.node_names) >= 2:
+            other_node = cluster.node_names[1]
+            overlap_flags = []
+        else:
+            other_node = node
+            overlap_flags = ["--flags=overlap"]
+        cluster.scontrol(
+            "create-reservation",
+            f"--name={other_name}",
+            "--start-time=now",
+            "--duration=60",
+            f"--nodes={other_node}",
+            *overlap_flags,
+        )
+
+        filtered = cluster.scontrol("show", "reservation", res_name)
+        assert res_name in filtered
+        assert other_name not in filtered
+
+        # An unknown reservation name is an error, not an empty success.
+        code, out = cluster.cli_with_exit(
+            ["scontrol", "show", "reservation", "no-such-reservation"]
+        )
+        assert code != 0
+        assert "not found" in out.lower()
+
+        cluster.scontrol("delete-reservation", other_name)
+
         delete_out = cluster.scontrol("delete-reservation", res_name)
         assert "deleted" in delete_out.lower()
 

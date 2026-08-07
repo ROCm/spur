@@ -385,6 +385,20 @@ class SpurCluster:
         cmd = f"{self._sudo_prefix()}-u '{run_as}' env {' '.join(inner)}"
         return self.nodes[0].exec_allow_fail(cmd)
 
+    def cli_with_exit(
+        self, args: list[str], controller_addr: str | None = None
+    ) -> tuple[int, str]:
+        """Run a spur CLI command and return (exit_code, combined stdout+stderr)."""
+        cmd_parts = [
+            f"SPUR_CONTROLLER_ADDR='{controller_addr or self.controller_addr}'",
+            f"PATH='{self.bin_dir}':$PATH",
+            f"'{self.bin_dir}/{args[0]}'",
+        ]
+        cmd_parts.extend(f"'{a}'" for a in args[1:])
+        _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
+        code = stdout.channel.recv_exit_status()
+        return code, stdout.read().decode() + stderr.read().decode()
+
     def sbatch(self, args: list[str]) -> str:
         return self.cli(["sbatch"] + args)
 
