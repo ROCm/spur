@@ -50,6 +50,13 @@ class TestReservations:
         assert res_name in filtered
         assert other_name not in filtered
 
+        # An unknown reservation name is an error, not an empty success.
+        code, out = cluster.cli_with_exit(
+            ["scontrol", "show", "reservation", "no-such-reservation"]
+        )
+        assert code != 0
+        assert "not found" in out.lower()
+
         cluster.scontrol("delete-reservation", other_name)
 
         delete_out = cluster.scontrol("delete-reservation", res_name)

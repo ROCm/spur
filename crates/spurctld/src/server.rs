@@ -4435,6 +4435,15 @@ mod tests {
             .reservations;
         assert_eq!(all.len(), 2);
 
+        // A whitespace-only name is trimmed to empty and treated as no filter.
+        let blank = svc
+            .list_reservations(Request::new(ListReservationsRequest { name: "   ".into() }))
+            .await
+            .unwrap()
+            .into_inner()
+            .reservations;
+        assert_eq!(blank.len(), 2);
+
         let none = svc
             .list_reservations(Request::new(ListReservationsRequest {
                 name: "does_not_exist".into(),
