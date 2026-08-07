@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use tracing::{info, warn};
@@ -49,6 +49,9 @@ pub struct ClusterNetworking {
     pub cni: String,
     /// Operator-pinned control-plane node (cluster.control_plane_node), if any.
     pub control_plane_node: Option<String>,
+    /// How long a cluster may stay `provisioning` before the loop marks it `degraded`
+    /// (cluster.provisioning_timeout_secs).
+    pub provisioning_timeout: Duration,
 }
 
 /// Leader-gated k0s reconcile loop. Spawned from `main.rs` when `[cluster].enabled`; it still
@@ -60,13 +63,24 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>, net: Clust
     // Cache of the join token minted per node (worker or secondary control-plane), so we mint once
     // (not every tick) while it joins — re-minting churns k0s server tokens and races the join.
     let mut join_tokens: HashMap<String, String> = HashMap::new();
+    // Leader-local provisioning clock: a leader-flip or restart resets it, so the timeout re-arms
+    // on the new leader rather than tripping instantly off a persisted start time.
+    let mut provisioning_since: Option<Instant> = None;
     loop {
         interval.tick().await;
         if !raft.is_leader() {
             last_mesh.clear(); // forget on leadership loss so a new term re-logs the membership
+            provisioning_since = None;
             continue; // only the leader reconciles
         }
         let state = cluster.k0s_state();
+
+        let timed_out = update_provisioning_clock(
+            state.phase,
+            &mut provisioning_since,
+            Instant::now(),
+            net.provisioning_timeout,
+        );
 
         // Mesh: derive the authoritative full-mesh membership (pubkey + mesh IP + pod /24) from
         // live inventory and push it to every meshed node's agent (ApplyMesh) so a native-routing
@@ -88,8 +102,24 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>, net: Clust
         }
         last_mesh = mesh.nodes.clone();
 
-        reconcile_phase(&cluster, &net, &state, &mut join_tokens).await;
+        reconcile_phase(&cluster, &net, &state, &mut join_tokens, timed_out).await;
     }
+}
+
+/// Advance the leader-local provisioning clock and report whether the deadline passed. Arms on the
+/// first Provisioning observation and resets on any other phase, so re-entry restarts the timer.
+fn update_provisioning_clock(
+    phase: K0sPhase,
+    since: &mut Option<Instant>,
+    now: Instant,
+    timeout: Duration,
+) -> bool {
+    if phase != K0sPhase::Provisioning {
+        *since = None;
+        return false;
+    }
+    let started = *since.get_or_insert(now);
+    now.saturating_duration_since(started) >= timeout
 }
 
 /// Run one reconcile tick for the current phase. Extracted from `run` so it is testable.
@@ -105,6 +135,7 @@ pub(crate) async fn reconcile_phase(
     net: &ClusterNetworking,
     state: &K0sClusterState,
     join_tokens: &mut HashMap<String, String>,
+    timed_out: bool,
 ) {
     match state.phase {
         K0sPhase::Ready | K0sPhase::Provisioning => {
@@ -113,6 +144,11 @@ pub(crate) async fn reconcile_phase(
                 return;
             }
             converge_provisioning(cluster, net, join_tokens).await;
+            // converge may have flipped us to Ready this tick; only degrade a still-provisioning
+            // cluster that has blown its deadline.
+            if timed_out && cluster.k0s_state().phase == K0sPhase::Provisioning {
+                degrade_stuck_cluster(cluster, net, join_tokens).await;
+            }
         }
         K0sPhase::Down => stop_all_components(cluster, state.reset_requested).await,
         K0sPhase::Degraded => warn!("k0s cluster degraded"),
@@ -370,6 +406,7 @@ pub fn node_statuses(cluster: &ClusterManager) -> Vec<ClusterNodeStatus> {
                 role: role_str(role),
                 component_state: "unknown".to_string(),
                 enabled: true,
+                reason: n.k0s_last_error.unwrap_or_default(),
             })
         })
         .collect()
@@ -583,6 +620,7 @@ async fn converge_provisioning(
         }
         if fetch_component_state(cluster, &node.name).await.as_deref() == Some("active") {
             bootstrap_active = true;
+            clear_node_error(cluster, node);
             continue;
         }
         all_active = false;
@@ -606,6 +644,7 @@ async fn converge_provisioning(
         }
         if fetch_component_state(cluster, &node.name).await.as_deref() == Some("active") {
             join_tokens.remove(&node.name); // joined — drop the cached token
+            clear_node_error(cluster, node);
             continue;
         }
         all_active = false;
@@ -650,6 +689,51 @@ async fn converge_provisioning(
             Ok(()) => info!("k0s cluster converged: all components active -> Ready"),
             Err(e) => warn!(error = %e, "failed to mark k0s cluster Ready"),
         }
+    }
+}
+
+/// Drop a node's stale degrade reason once it is healthy again, so status reports honestly on retry.
+/// Guarded so a converged cluster does not churn a WAL write per tick.
+fn clear_node_error(cluster: &ClusterManager, node: &spur_core::node::Node) {
+    if node.k0s_last_error.is_none() {
+        return;
+    }
+    if let Err(e) = cluster.set_node_k0s_error(&node.name, None) {
+        warn!(node = %node.name, error = %e, "failed to clear k0s node error");
+    }
+}
+
+/// Provisioning blew its deadline: record why each non-active node blocked convergence, stop its
+/// half-started unit (non-reset, keeping the role so `spur k8s up` can retry), then mark `degraded`.
+async fn degrade_stuck_cluster(
+    cluster: &ClusterManager,
+    net: &ClusterNetworking,
+    join_tokens: &mut HashMap<String, String>,
+) {
+    let timeout_secs = net.provisioning_timeout.as_secs();
+    for node in cluster.get_nodes() {
+        if node.k0s_role.is_none() {
+            continue;
+        }
+        let state = fetch_component_state(cluster, &node.name).await;
+        if state.as_deref() == Some("active") {
+            clear_node_error(cluster, &node);
+            continue;
+        }
+        let observed = state.as_deref().unwrap_or("unreachable");
+        let reason = format!("not active after {timeout_secs}s (component {observed})");
+        if let Err(e) = cluster.set_node_k0s_error(&node.name, Some(reason)) {
+            warn!(node = %node.name, error = %e, "failed to record k0s node error");
+        }
+        spawn_stop_component(cluster, &node.name, false);
+    }
+    join_tokens.clear();
+    match cluster.set_k0s_phase(K0sPhase::Degraded, None, Vec::new(), false) {
+        Ok(()) => warn!(
+            timeout_secs,
+            "k0s provisioning timed out -> Degraded; see `spur k8s status` for per-node reasons"
+        ),
+        Err(e) => warn!(error = %e, "failed to mark k0s cluster Degraded"),
     }
 }
 
@@ -805,6 +889,7 @@ pub async fn live_node_statuses(cluster: &ClusterManager) -> Vec<ClusterNodeStat
             role: role_str(role),
             component_state,
             enabled,
+            reason: n.k0s_last_error.unwrap_or_default(),
         });
     }
     out
@@ -813,6 +898,57 @@ pub async fn live_node_statuses(cluster: &ClusterManager) -> Vec<ClusterNodeStat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provisioning_clock_arms_then_trips_at_deadline() {
+        let start = Instant::now();
+        let timeout = Duration::from_secs(600);
+        let mut since = None;
+        // First Provisioning observation arms the clock; not yet timed out.
+        assert!(!update_provisioning_clock(
+            K0sPhase::Provisioning,
+            &mut since,
+            start,
+            timeout
+        ));
+        assert!(since.is_some());
+        // Before the deadline: still false. At/after: true.
+        assert!(!update_provisioning_clock(
+            K0sPhase::Provisioning,
+            &mut since,
+            start + Duration::from_secs(599),
+            timeout
+        ));
+        assert!(update_provisioning_clock(
+            K0sPhase::Provisioning,
+            &mut since,
+            start + timeout,
+            timeout
+        ));
+    }
+
+    #[test]
+    fn provisioning_clock_resets_off_provisioning() {
+        let start = Instant::now();
+        let timeout = Duration::from_secs(600);
+        let mut since = Some(start);
+        // A non-Provisioning phase disarms the clock and never reports timed out.
+        assert!(!update_provisioning_clock(
+            K0sPhase::Ready,
+            &mut since,
+            start + timeout,
+            timeout
+        ));
+        assert!(since.is_none());
+        // Re-entering Provisioning re-arms from the new now, not the old start.
+        assert!(!update_provisioning_clock(
+            K0sPhase::Provisioning,
+            &mut since,
+            start + timeout,
+            timeout
+        ));
+        assert_eq!(since, Some(start + timeout));
+    }
 
     #[test]
     fn carve_pod_cidr_from_16() {

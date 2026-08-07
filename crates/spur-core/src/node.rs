@@ -288,6 +288,9 @@ pub struct Node {
     /// per-node pod /24 carved from the cluster pod_cidr.
     #[serde(default)]
     pub k0s_pod_cidr: Option<String>,
+    /// Why this node blocked convergence when the cluster went `degraded` (surfaced in status).
+    #[serde(default)]
+    pub k0s_last_error: Option<String>,
 }
 
 fn default_weight() -> u32 {
@@ -328,6 +331,7 @@ impl Node {
             k0s_role: None,
             k0s_mesh_ip: None,
             k0s_pod_cidr: None,
+            k0s_last_error: None,
         }
     }
 
@@ -394,6 +398,17 @@ mod tests {
         assert!(n.is_k0s_reserved());
         n.k0s_role = None;
         assert!(!n.is_k0s_reserved());
+    }
+
+    #[test]
+    fn a_node_snapshot_without_k0s_last_error_still_deserializes() {
+        // Pre-upgrade snapshots carry no k0s_last_error; replay must load it as absent
+        // rather than failing the whole restore.
+        let node = Node::new("n1".into(), ResourceSet::default());
+        let mut value = serde_json::to_value(&node).expect("serialize node");
+        value.as_object_mut().unwrap().remove("k0s_last_error");
+        let back: Node = serde_json::from_value(value).expect("deserialize node");
+        assert_eq!(back.k0s_last_error, None);
     }
 
     #[test]

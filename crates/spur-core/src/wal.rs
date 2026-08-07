@@ -262,6 +262,10 @@ pub enum WalOperation {
     NodeK0sClear {
         name: String,
     },
+    NodeK0sSetError {
+        name: String,
+        error: Option<String>,
+    },
 }
 
 impl WalOperation {
@@ -758,6 +762,20 @@ mod deregistration_wal_tests {
             serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
         match back {
             WalOperation::NodeK0sClear { name } => assert_eq!(name, "gpu-node-1"),
+            _ => panic!("wrong variant"),
+        }
+
+        let op = WalOperation::NodeK0sSetError {
+            name: "gpu-node-1".into(),
+            error: Some("not active after 10m".into()),
+        };
+        let back: WalOperation =
+            serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
+        match back {
+            WalOperation::NodeK0sSetError { name, error } => {
+                assert_eq!(name, "gpu-node-1");
+                assert_eq!(error.as_deref(), Some("not active after 10m"));
+            }
             _ => panic!("wrong variant"),
         }
 
