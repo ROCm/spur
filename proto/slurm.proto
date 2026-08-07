@@ -880,6 +880,7 @@ message ClusterNodeStatus {
   string role = 2;             // "controller" | "worker" | "single"
   string component_state = 3;  // systemd active-state: "active" | "inactive" | "failed" | "unknown"
   bool enabled = 4;
+  string reason = 5;           // why this node blocked convergence when degraded; empty otherwise
 }
 
 message ClusterKubeconfigRequest {
