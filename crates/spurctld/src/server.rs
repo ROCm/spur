@@ -235,13 +235,18 @@ impl ControllerService {
         let node = node.to_string();
         tokio::spawn(async move {
             for job_id in stale {
+                // Re-check: a requeue since the snapshot above would otherwise
+                // send an unguarded cancel into the job's new run.
+                if !is_still_terminal(&cluster, job_id) {
+                    continue;
+                }
                 warn!(
                     job_id,
                     node = %node,
                     "agent still holds a terminal job — re-sending cancel to reclaim its allocation"
                 );
-                // Signal 0 = graceful release. Safe to repeat: the agent no-ops an
-                // unknown id and epoch-gates a requeued one.
+                // Signal 0 = graceful release, no-op on an unknown id. Not
+                // epoch-gated — a requeue racing this send is still possible.
                 crate::scheduler_loop::cancel_job_on_nodes(
                     &cluster,
                     job_id,
@@ -374,17 +379,18 @@ fn is_k0s_admin(cache: &crate::association_cache::AssociationCache, caller: &str
     caller.is_empty() || caller == "root" || cache.is_admin(caller)
 }
 
+/// Whether the controller still considers `job_id` terminal right now — guards
+/// the spawned reclaim loop against a requeue landing after its stale snapshot.
+fn is_still_terminal(cluster: &ClusterManager, job_id: u32) -> bool {
+    cluster.job_state(job_id).is_some_and(|s| s.is_terminal())
+}
+
 /// Reported ids the controller's own record marks terminal. Non-terminal (incl.
 /// Pending mid-dispatch) and unknown ids are spared, so no live job is reclaimed.
 fn stale_reported_jobs(cluster: &ClusterManager, reported: &[RunningJobStatus]) -> Vec<u32> {
     reported
         .iter()
-        .filter_map(|r| {
-            cluster
-                .job_state(r.job_id)?
-                .is_terminal()
-                .then_some(r.job_id)
-        })
+        .filter_map(|r| is_still_terminal(cluster, r.job_id).then_some(r.job_id))
         .collect()
 }
 
@@ -3385,6 +3391,75 @@ mod tests {
             stale,
             vec![12],
             "only the terminal job is reclaimed; Pending/Running/Completing/Suspended/Preempted/unknown are spared"
+        );
+    }
+
+    /// GATE: a job requeued (Timeout -> Pending) between the reclaim snapshot
+    /// and the spawned loop's send must fail the re-check, not just the snapshot.
+    #[tokio::test]
+    async fn is_still_terminal_false_after_requeue_race() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState};
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                cluster.as_ref(),
+                op,
+            );
+        };
+
+        apply(&WalOperation::JobSubmit {
+            job_id: 77,
+            spec: Box::new(JobSpec {
+                name: "interactive".into(),
+                user: "alice".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                requeue: true,
+                ..Default::default()
+            }),
+        });
+        let res = spur_core::resource::ResourceAllocations {
+            cpus: 1,
+            memory_mb: 0,
+            devices: std::collections::HashMap::new(),
+        };
+        let mut per_node = std::collections::HashMap::new();
+        per_node.insert("n1".to_string(), res.clone());
+        apply(&WalOperation::job_start(
+            77,
+            vec!["n1".into()],
+            res,
+            per_node,
+        ));
+        apply(&WalOperation::job_state_change(
+            77,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        apply(&WalOperation::job_state_change(
+            77,
+            JobState::Running,
+            JobState::Timeout,
+        ));
+        assert!(is_still_terminal(&cluster, 77), "snapshot sees Timeout");
+
+        // Concurrent requeue lands before the reclaim loop's re-check.
+        apply(&WalOperation::job_state_change(
+            77,
+            JobState::Timeout,
+            JobState::Pending,
+        ));
+
+        assert!(
+            !is_still_terminal(&cluster, 77),
+            "re-check must skip a job requeued since the snapshot"
         );
     }
 
