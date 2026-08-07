@@ -209,10 +209,13 @@ class SpurCluster:
         self.agent_token: str | None = None
         self.accounting_enabled: bool = False
         self._pg_container = f"spur-e2e-pg-{os.getpid()}-{time.time_ns()}"
-        self._pg_port = int(os.environ.get("SPUR_TEST_PG_PORT", "55432"))
-        self._db_url = (
-            f"postgresql://spur:spur@127.0.0.1:{self._pg_port}/spur"
-        )
+        # When set, pin Postgres to this host port; otherwise Docker picks an
+        # ephemeral port at start time. A fixed port flakes because docker-proxy
+        # releases it asynchronously, so the next test's bind collides.
+        env_port = os.environ.get("SPUR_TEST_PG_PORT")
+        self._pg_port = int(env_port) if env_port else None
+        # Resolved once the container is up and the host port is known.
+        self._db_url: str | None = None
 
     # --- Lifecycle ---
 
@@ -990,13 +993,28 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
         """Bring up Postgres (Docker) on node 0. Accounting runs inside spurctld."""
         node = self.nodes[0]
         node.exec_allow_fail(f"docker rm -f '{self._pg_container}' 2>/dev/null || true")
+        # Default to an ephemeral host port (-p 5432) so concurrent/serial tests
+        # never collide on a fixed port; SPUR_TEST_PG_PORT pins it when needed.
+        publish = f"{self._pg_port}:5432" if self._pg_port else "5432"
         node.exec(
             f"docker run -d --name '{self._pg_container}' "
             f"-e POSTGRES_USER=spur -e POSTGRES_PASSWORD=spur -e POSTGRES_DB=spur "
-            f"-p {self._pg_port}:5432 postgres:16-alpine"
+            f"-p {publish} postgres:16-alpine"
         )
+        host_port = self._pg_port or self._resolve_pg_port(node)
+        self._db_url = f"postgresql://spur:spur@127.0.0.1:{host_port}/spur"
         self._wait_pg(node)
         logger.info("postgres ready on %s, spurctld handles accounting", self.node_names[0])
+
+    def _resolve_pg_port(self, node: SshNode) -> int:
+        """Read the ephemeral host port Docker assigned to the container."""
+        out = node.exec(f"docker port '{self._pg_container}' 5432/tcp").strip()
+        # Output is one or more "host:port" lines (e.g. "0.0.0.0:49153").
+        for line in out.splitlines():
+            _, _, port = line.rpartition(":")
+            if port.isdigit():
+                return int(port)
+        raise RuntimeError(f"could not resolve Postgres host port from: {out!r}")
 
     def _wait_pg(self, node: SshNode, timeout: int = 60):
         deadline = time.time() + timeout
