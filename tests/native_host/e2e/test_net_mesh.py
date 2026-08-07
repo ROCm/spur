@@ -5,8 +5,8 @@
 
 Bringing an interface up rewrites `/etc/wireguard` and adds routes on a shared
 test node, so anything mutating is opt-in behind `SPUR_TEST_WIREGUARD=1`. The
-read-only and error paths run everywhere, since those are what a user hits
-first on a node where WireGuard was never set up.
+read-only and error paths need only the WireGuard tools installed, since those
+are what a user hits first on a node where WireGuard was never configured.
 """
 
 import os
@@ -29,11 +29,16 @@ def net_cli(cluster, args: list[str]) -> tuple[int, str]:
 
 
 class TestStatus:
+    @pytest.fixture(autouse=True)
+    def _wireguard_installed(self, cluster):
+        """`status` shells out to `wg`, so without the tools every assertion
+        here only ever sees a missing-binary errno."""
+        cluster.wireguard_preflight()
+
     def test_status_on_a_missing_interface_explains_itself(self, cluster):
         """The first thing a user runs on an unconfigured node. A bare `wg
         show` error would leave them with nothing to act on."""
-        code, out = net_cli(cluster, ["status", "--interface", "spurtest-absent"])
-        assert code != 0, out
+        _, out = net_cli(cluster, ["status", "--interface", "spurtest-absent"])
         assert "is not up" in out, out
         assert "spur net init" in out, out
 

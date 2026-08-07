@@ -201,7 +201,7 @@ pub struct AgentService {
     spank: Arc<Option<SpankHost>>,
     mpi_host: Arc<MpiPluginHost>,
     hooks: Arc<HooksConfig>,
-    memlock: spur_core::config::MemlockLimit,
+    limits: spur_core::config::JobLimits,
     #[allow(dead_code)]
     device_registry: Arc<Mutex<DeviceRegistry>>,
     /// RPC-driven owner of this node's k0s systemd unit.
@@ -225,7 +225,10 @@ impl AgentService {
             hooks,
             device_registry,
             &spur_core::config::ClusterConfig::default(),
-            memlock,
+            spur_core::config::JobLimits {
+                memlock,
+                ..Default::default()
+            },
             MpiConfig::default(),
             new_running_jobs(),
         )
@@ -239,7 +242,7 @@ impl AgentService {
         hooks: HooksConfig,
         device_registry: Arc<Mutex<DeviceRegistry>>,
         cluster: &spur_core::config::ClusterConfig,
-        memlock: spur_core::config::MemlockLimit,
+        limits: spur_core::config::JobLimits,
         mpi: MpiConfig,
         running: RunningJobs,
     ) -> Self {
@@ -301,7 +304,7 @@ impl AgentService {
             spank: Arc::new(spank),
             mpi_host: Arc::new(MpiPluginHost::new(mpi)),
             hooks: Arc::new(hooks),
-            memlock,
+            limits,
             device_registry,
             k0s: Arc::new(crate::cluster::K0sAgent::from_config(cluster)),
             active_steps: Arc::new(Mutex::new(HashMap::new())),
@@ -1353,7 +1356,8 @@ impl SlurmAgent for AgentService {
             partition: spec.partition.clone(),
             nodelist: spec.nodelist.clone(),
             host_device_plan: Some(host_device_plan),
-            memlock: self.memlock,
+            memlock: self.limits.memlock,
+            swap_limit: self.limits.swap,
             io_mode: if spec.pty {
                 executor::LaunchIo::Pty
             } else {
@@ -2049,7 +2053,7 @@ impl SlurmAgent for AgentService {
             cmd.env(k, v);
         }
 
-        let memlock = self.memlock;
+        let memlock = self.limits.memlock;
         let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(req.uid, req.gid);
         unsafe {
             cmd.pre_exec(move || {

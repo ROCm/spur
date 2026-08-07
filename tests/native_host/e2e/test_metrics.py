@@ -82,10 +82,15 @@ class TestMetricsRoutes:
         ), "/metrics must expose the same families as /metrics/jobs"
 
     def test_node_gauges_match_the_cluster_size(self, scrapeable):
+        """The gauge has to agree with the node view a user gets from sinfo."""
         body = _scrape(scrapeable, "/metrics/nodes")
         cpus = _gauge(body, "spur_nodes_cpus")
-        assert cpus >= 64 * len(scrapeable.node_names), (
-            f"spur_nodes_cpus ({cpus}) is below the configured cluster size"
+        reported = scrapeable.cli(["sinfo", "-N", "-h", "-o", "%c"])
+        expected = sum(int(line) for line in reported.split() if line.isdigit())
+        assert expected > 0, f"sinfo reported no per-node CPU counts:\n{reported}"
+        assert cpus == expected, (
+            f"spur_nodes_cpus ({cpus}) disagrees with the {expected} CPUs "
+            f"sinfo reports across {len(scrapeable.node_names)} nodes"
         )
 
 

@@ -54,6 +54,51 @@ def make_remote_dir() -> str:
     return f"/tmp/spur-e2e-{os.getpid()}-{time.time_ns()}"
 
 
+def expand_hostlist(spec: str) -> list[str]:
+    """Expand a Slurm-style hostlist into individual node names.
+
+    Every node-facing surface (``squeue`` NODELIST, ``scontrol show job``,
+    ``sinfo``) renders node sets in bracket form -- ``node[1-3,7]`` -- so
+    splitting on commas yields fragments like ``node[1`` rather than names.
+    """
+    names: list[str] = []
+    for item in _split_hostlist(spec):
+        match = re.fullmatch(r"(.*?)\[([^\]]+)\](.*)", item)
+        if not match:
+            names.append(item)
+            continue
+        prefix, body, suffix = match.groups()
+        for part in body.split(","):
+            low, _, high = part.partition("-")
+            if not high:
+                names.append(f"{prefix}{low}{suffix}")
+                continue
+            # A range keeps the zero padding of its lower bound: node[08-10].
+            width = len(low)
+            for number in range(int(low), int(high) + 1):
+                names.append(f"{prefix}{number:0{width}d}{suffix}")
+    return names
+
+
+def _split_hostlist(spec: str) -> list[str]:
+    """Split a hostlist on its top-level commas, ignoring bracketed ones."""
+    items: list[str] = []
+    current = ""
+    depth = 0
+    for char in spec:
+        if char == "," and depth == 0:
+            items.append(current)
+            current = ""
+            continue
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+        current += char
+    items.append(current)
+    return [item.strip() for item in items if item.strip()]
+
+
 def deep_merge(base: dict, overrides: dict) -> dict:
     """Deep-merge *overrides* into *base* (mutates and returns *base*).
 
@@ -596,7 +641,12 @@ class SpurCluster:
         return self.cli(["sreport"] + args)
 
     def smd(self, args: list[str] | None = None) -> str:
-        return self.cli(["smd"] + (args or []))
+        """Run smd, returning the report and its trailing health summary.
+
+        smd prints the table on stdout but the summary line on stderr, so the
+        merged capture is the only view that carries both.
+        """
+        return self.cli_allow_fail(["smd"] + (args or []))
 
     def srun_with_exit(self, args: list[str]) -> tuple[int, str]:
         """Run srun and return (exit_code, combined stdout+stderr)."""
@@ -627,7 +677,14 @@ class SpurCluster:
         return self.cli(["squeue"] + args)
 
     def squeue_all(self) -> str:
-        return self.cli(["squeue", "-t", "all"])
+        """`squeue -t all` with a state column wide enough for every code.
+
+        Slurm's default format clips ST to two characters, which renders the
+        only three-character code, OOM, as a state that does not exist.
+        """
+        return self.cli(
+            ["squeue", "-t", "all", "-o", "%.18i %.9P %.8j %.8u %.4t %10M %6D %R"]
+        )
 
     def running_job_ids_by_name(self, name: str) -> list[int]:
         """Return running job IDs matching *name* (uses server-side name filter)."""
@@ -982,6 +1039,22 @@ class SpurCluster:
                         f"hostname-derived Raft node_id needs DNS or /etc/hosts "
                         f"entries for every peer"
                     )
+
+    def agent_resolution_preflight(self):
+        """Skip unless the client node resolves every node's hostname.
+
+        `sattach` builds its endpoint as ``http://<name>:6818`` from the job's
+        NodeList, so probing turns an opaque "dns error" into a stated skip.
+        """
+        for name in self.node_names:
+            probe = self.nodes[0].exec_allow_fail(
+                f"getent hosts {shlex.quote(name)} >/dev/null && echo OK || echo MISSING"
+            )
+            if "OK" not in probe:
+                pytest.skip(
+                    f"{self.node_names[0]} cannot resolve {name!r}; attaching to "
+                    f"an agent needs DNS or /etc/hosts entries for every node"
+                )
 
     def require_nodes(self, min_nodes: int):
         """Skip the test if fewer than min_nodes are configured."""
@@ -1639,6 +1712,12 @@ def wait_job_state(
     )
 
 
+# Mirrors JobState::is_terminal(); Preempted is excluded there because it may
+# still requeue. A code missing here does not just slow the poll -- the job is
+# purged from the queue and its last transient state is returned instead.
+TERMINAL_STATES = {"CD", "F", "CA", "TO", "NF", "DL", "OOM"}
+
+
 def wait_job(cluster: SpurCluster, job_id: int, timeout: int = 120) -> str:
     """
     Wait for a job to reach a terminal state. Returns the final state string.
@@ -1651,7 +1730,7 @@ def wait_job(cluster: SpurCluster, job_id: int, timeout: int = 120) -> str:
     while time.time() < deadline:
         sq = cluster.squeue_all()
         state = job_state(sq, job_id)
-        if state in ("CD", "F", "CA", "TO"):
+        if state in TERMINAL_STATES:
             return state
         if state is None:
             if seen:

@@ -6002,6 +6002,7 @@ mod tests {
             devices: Default::default(),
             admission: Default::default(),
             rlimits: Default::default(),
+            cgroup: Default::default(),
             mpi: Default::default(),
         }
     }

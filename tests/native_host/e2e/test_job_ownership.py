@@ -76,6 +76,9 @@ class TestJobOwnership:
 
     def test_non_owner_cannot_attach_to_job(self, cluster):
         _require_second_identity(cluster)
+        # The owner check lives on the agent, so the denial is only observable
+        # once the client can reach it.
+        cluster.agent_resolution_preflight()
         job_id = _start_long_job(cluster, "own-attach")
         try:
             out = cluster.cli_as_user(NON_OWNER, ["sattach", str(job_id)])
@@ -87,6 +90,7 @@ class TestJobOwnership:
 
     def test_non_owner_cannot_stream_job_output(self, cluster):
         _require_second_identity(cluster)
+        cluster.agent_resolution_preflight()
         job_id = _start_long_job(cluster, "own-stream")
         try:
             out = cluster.cli_as_user(
