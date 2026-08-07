@@ -25,9 +25,11 @@ class TestK8sMultiControlPlane:
         active = cluster.k8s_active_controllers()
         assert len(active) == 3, f"expected 3 active controllers, got {active}"
 
-        # Ground truth: the embedded etcd formed a real 3-member quorum.
-        assert cluster.etcd_member_count() == 3, (
-            f"expected a 3-member etcd quorum\n{cluster.k8s_status()}"
+        # Ground truth: the embedded etcd formed a real 3-member quorum. etcd
+        # membership converges shortly after the cluster reports ready.
+        members = cluster.wait_etcd_members(3)
+        assert members == 3, (
+            f"expected a 3-member etcd quorum, got {members}\n{cluster.k8s_status()}"
         )
 
     def test_even_replica_count_rejected(self, k8s_multicp_cluster):
