@@ -140,6 +140,7 @@ mock_controller_impl! {
         get_job(proto::GetJobRequest) -> proto::JobInfo;
         cancel_job(proto::CancelJobRequest) -> ();
         complete_job(proto::CompleteJobRequest) -> ();
+        job_keepalive(proto::JobKeepaliveRequest) -> proto::JobKeepaliveResponse;
         suspend_job(proto::SuspendJobRequest) -> ();
         resume_job(proto::ResumeJobRequest) -> ();
         update_job(proto::UpdateJobRequest) -> ();
