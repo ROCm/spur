@@ -20,10 +20,10 @@
 #include <unistd.h>
 
 #define SPUR_MODEX_MAGIC 0x53505552u
-#define SPUR_MODEX_VERSION 1u
+#define SPUR_MODEX_VERSION 2u
+#define SPUR_MODEX_NO_ROUND UINT32_MAX
 #define SPUR_MODEX_FLAG_ABORT 0x00000001u
 #define SPUR_MODEX_CONNECT_SLEEP_US 100000
-#define SPUR_MODEX_MAX_BLOB (16u * 1024u * 1024u)
 #define SPUR_MODEX_CONNECT_RETRIES 300
 
 typedef struct __attribute__((packed)) {
@@ -31,6 +31,7 @@ typedef struct __attribute__((packed)) {
     uint32_t version;
     uint32_t job_id;
     uint32_t node_index;
+    uint32_t fence_seq;
     uint32_t data_len;
     uint32_t flags;
 } spur_modex_hdr_t;
@@ -52,6 +53,8 @@ struct spur_modex_session {
     pthread_t accept_thread;
     _Atomic bool accept_running;
     bool aborted;
+    uint32_t fence_seq;
+    uint32_t active_round_seq;
     spur_modex_timeouts_t timeouts;
     pthread_mutex_t lock;
     pthread_cond_t progress;
@@ -170,6 +173,18 @@ static int send_blob(int fd, const spur_modex_hdr_t *hdr, const char *payload) {
     return SPUR_MODEX_OK;
 }
 
+static void reset_remote_blobs(spur_modex_session_t *session) {
+    for (uint32_t i = 0; i < session->num_nodes; i++) {
+        if (i == session->node_index) {
+            continue;
+        }
+        free(session->remote[i].data);
+        session->remote[i].data = NULL;
+        session->remote[i].len = 0;
+        session->remote[i].present = false;
+    }
+}
+
 static void mark_aborted(spur_modex_session_t *session) {
     pthread_mutex_lock(&session->lock);
     session->aborted = true;
@@ -180,6 +195,7 @@ static void mark_aborted(spur_modex_session_t *session) {
 static void store_remote_blob(
     spur_modex_session_t *session,
     uint32_t node_index,
+    uint32_t fence_seq,
     char *data,
     size_t len
 ) {
@@ -188,6 +204,11 @@ static void store_remote_blob(
         return;
     }
     pthread_mutex_lock(&session->lock);
+    if (session->active_round_seq == SPUR_MODEX_NO_ROUND || fence_seq != session->active_round_seq) {
+        pthread_mutex_unlock(&session->lock);
+        free(data);
+        return;
+    }
     if (session->remote[node_index].present) {
         free(session->remote[node_index].data);
     }
@@ -231,13 +252,14 @@ static void *accept_loop(void *arg) {
             close(client);
             continue;
         }
-        store_remote_blob(session, hdr.node_index, payload, hdr.data_len);
+        store_remote_blob(session, hdr.node_index, hdr.fence_seq, payload, hdr.data_len);
 
         spur_modex_hdr_t ack = {
             .magic = SPUR_MODEX_MAGIC,
             .version = SPUR_MODEX_VERSION,
             .job_id = session->job_id,
             .node_index = session->node_index,
+            .fence_seq = hdr.fence_seq,
             .data_len = 0,
             .flags = 0,
         };
@@ -276,6 +298,8 @@ spur_modex_session_t *spur_modex_session_create(
     session->listen_fd = -1;
     atomic_store(&session->accept_running, false);
     session->aborted = false;
+    session->fence_seq = 0;
+    session->active_round_seq = SPUR_MODEX_NO_ROUND;
     if (timeouts != NULL) {
         session->timeouts = *timeouts;
     }
@@ -438,6 +462,7 @@ int spur_modex_session_abort(spur_modex_session_t *session) {
         .version = SPUR_MODEX_VERSION,
         .job_id = session->job_id,
         .node_index = session->node_index,
+        .fence_seq = 0,
         .data_len = 0,
         .flags = SPUR_MODEX_FLAG_ABORT,
     };
@@ -460,12 +485,18 @@ int spur_modex_session_abort(spur_modex_session_t *session) {
     return SPUR_MODEX_OK;
 }
 
-static int push_local_blob(spur_modex_session_t *session, const char *local_data, size_t local_len) {
+static int push_local_blob(
+    spur_modex_session_t *session,
+    uint32_t fence_seq,
+    const char *local_data,
+    size_t local_len
+) {
     spur_modex_hdr_t hdr = {
         .magic = SPUR_MODEX_MAGIC,
         .version = SPUR_MODEX_VERSION,
         .job_id = session->job_id,
         .node_index = session->node_index,
+        .fence_seq = fence_seq,
         .data_len = (uint32_t)local_len,
         .flags = 0,
     };
@@ -592,13 +623,34 @@ int spur_modex_fence_collect(
     if (local_len > SPUR_MODEX_MAX_BLOB) {
         return SPUR_MODEX_ERR_BLOB;
     }
-    int push_rc = push_local_blob(session, local_data, local_len);
+
+    pthread_mutex_lock(&session->lock);
+    uint32_t round_seq = session->fence_seq;
+    reset_remote_blobs(session);
+    session->aborted = false;
+    session->active_round_seq = round_seq;
+    pthread_mutex_unlock(&session->lock);
+
+    int push_rc = push_local_blob(session, round_seq, local_data, local_len);
     if (push_rc != SPUR_MODEX_OK) {
+        pthread_mutex_lock(&session->lock);
+        session->active_round_seq = SPUR_MODEX_NO_ROUND;
+        pthread_mutex_unlock(&session->lock);
         return push_rc;
     }
     int wait_rc = wait_for_remotes(session);
     if (wait_rc != SPUR_MODEX_OK) {
+        pthread_mutex_lock(&session->lock);
+        session->active_round_seq = SPUR_MODEX_NO_ROUND;
+        pthread_mutex_unlock(&session->lock);
         return wait_rc;
     }
-    return merge_blobs(session, local_data, local_len, out_merged, out_merged_len);
+    pthread_mutex_lock(&session->lock);
+    int merge_rc = merge_blobs(session, local_data, local_len, out_merged, out_merged_len);
+    if (merge_rc == SPUR_MODEX_OK) {
+        session->fence_seq++;
+    }
+    session->active_round_seq = SPUR_MODEX_NO_ROUND;
+    pthread_mutex_unlock(&session->lock);
+    return merge_rc;
 }

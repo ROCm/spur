@@ -397,6 +397,8 @@ service SlurmAgent {
   rpc ExecInJob(ExecInJobRequest) returns (ExecInJobResponse);
   // Run a one-shot command on this node (for srun step dispatch).
   rpc RunCommand(RunCommandRequest) returns (RunCommandResponse);
+  // Stop an in-flight srun step on this node without cancelling the allocation job.
+  rpc CancelStep(CancelStepRequest) returns (google.protobuf.Empty);
   // Record an allocation on this node without launching a batch process.
   rpc RegisterJobAllocation(RegisterJobAllocationRequest) returns (RegisterJobAllocationResponse);
   rpc StreamJobOutput(StreamJobOutputRequest) returns (stream StreamJobOutputChunk);
@@ -1003,6 +1005,12 @@ message RunCommandResponse {
   int32 exit_code = 1;
   string stdout = 2;
   string stderr = 3;
+}
+
+message CancelStepRequest {
+  uint32 job_id = 1;
+  uint32 step_id = 2;
+  int32 signal = 3;  // 0 = SIGTERM, 9 = SIGKILL, etc.
 }
 
 message StreamJobOutputRequest {

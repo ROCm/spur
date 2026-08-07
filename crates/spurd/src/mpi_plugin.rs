@@ -596,11 +596,16 @@ impl MpiPluginHost {
             entry.namespace.clone()
         };
         if let Err(err) = self.call_server_stop(job_id, &namespace) {
-            if let Ok(mut guard) = self.active_namespaces.lock() {
-                if let Some(entry) = guard.get_mut(&job_id) {
-                    entry.refs = entry.refs.saturating_add(1);
-                }
-            }
+            warn!(
+                job_id,
+                namespace = %namespace,
+                error = %err,
+                "PMIx server stop failed — evicting stale namespace entry"
+            );
+            self.active_namespaces
+                .lock()
+                .map_err(|_| "namespace lock poisoned".to_string())?
+                .remove(&job_id);
             return Err(err);
         }
         self.active_namespaces
@@ -622,7 +627,19 @@ impl MpiPluginHost {
         let Some(namespace) = namespace else {
             return Ok(());
         };
-        self.call_server_stop(job_id, &namespace)?;
+        if let Err(err) = self.call_server_stop(job_id, &namespace) {
+            warn!(
+                job_id,
+                namespace = %namespace,
+                error = %err,
+                "PMIx server stop failed — evicting stale namespace entry"
+            );
+            self.active_namespaces
+                .lock()
+                .map_err(|_| "namespace lock poisoned".to_string())?
+                .remove(&job_id);
+            return Err(err);
+        }
         self.active_namespaces
             .lock()
             .map_err(|_| "namespace lock poisoned".to_string())?
@@ -630,7 +647,7 @@ impl MpiPluginHost {
         Ok(())
     }
 
-    /// Bulk `PMIx_server_setup_fork` env for one rank (Slurm `mpi_p_slurmstepd_task` input).
+    /// Bulk `PMIx_server_setup_fork` env for one rank.
     pub fn pmix_setup_fork_env(
         &self,
         plan: &PmixLaunchPlan,
@@ -686,7 +703,7 @@ fn normalize_pmix_fork_env(env: &mut HashMap<String, String>, plan: &PmixLaunchP
         .or_insert_with(|| plan.tmpdir.clone());
 }
 
-/// Slurm `mpi_p_slurmstepd_task` equivalent: merge per-rank setup_fork env into task env.
+/// Merge per-rank setup_fork env into task env before exec.
 pub fn apply_pmix_setup_fork_env(
     host: &MpiPluginHost,
     plan: &PmixLaunchPlan,
@@ -714,6 +731,34 @@ pub fn pmix_setup_fork_env_for_node_tasks(
         out.push(rank_env);
     }
     Ok(out)
+}
+
+/// Remove launcher-level MPI/PMIx variables so a per-rank wrapper owns them.
+///
+/// Batch jobs inherit the submitter's full environment through the executor;
+/// stale `PMI_*` or `OMPI_MCA_ess*` values can make Open MPI ignore the
+/// per-rank `PMIX_*` exports from [`build_multi_task_pmix_wrapper`].
+pub fn strip_launcher_mpi_env(env: &mut HashMap<String, String>) {
+    env.retain(|key, _| !is_stale_launcher_mpi_env_key(key));
+}
+
+fn is_stale_launcher_mpi_env_key(key: &str) -> bool {
+    key.starts_with("PMIX_")
+        || key.starts_with("PMI")
+        || key.starts_with("OMPI_MCA_ess")
+        || matches!(
+            key,
+            "LOCAL_RANK"
+                | "LOCAL_WORLD_SIZE"
+                | "NPROC_PER_NODE"
+                | "NODE_RANK"
+                | "SPUR_NODE_RANK"
+                | "WORLD_SIZE"
+                | "RANK"
+                | "MASTER_ADDR"
+                | "MASTER_PORT"
+                | "SPUR_PEER_NODES"
+        )
 }
 
 fn apply_pmix_uri_aliases(env: &mut HashMap<String, String>) {
@@ -1073,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn release_restores_ref_when_stop_fails() {
+    fn release_evicts_namespace_when_stop_fails() {
         let host = MpiPluginHost::new(MpiConfig::default());
         host.active_namespaces.lock().unwrap().insert(
             5,
@@ -1083,15 +1128,11 @@ mod tests {
             },
         );
         assert!(host.release_pmix_server(5).is_err());
-        assert!(host.has_active_pmix(5));
-        assert_eq!(
-            host.active_namespaces.lock().unwrap().get(&5).unwrap().refs,
-            1
-        );
+        assert!(!host.has_active_pmix(5));
     }
 
     #[test]
-    fn stop_pmix_server_keeps_entry_when_stop_fails() {
+    fn stop_pmix_server_evicts_namespace_when_stop_fails() {
         let host = MpiPluginHost::new(MpiConfig::default());
         host.active_namespaces.lock().unwrap().insert(
             6,
@@ -1101,11 +1142,7 @@ mod tests {
             },
         );
         assert!(host.stop_pmix_server(6).is_err());
-        assert!(host.has_active_pmix(6));
-        assert_eq!(
-            host.active_namespaces.lock().unwrap().get(&6).unwrap().refs,
-            2
-        );
+        assert!(!host.has_active_pmix(6));
     }
 
     #[test]
@@ -1114,6 +1151,30 @@ mod tests {
         let plan = PmixLaunchPlan::local_tasks(42, 2, 0, 2, "/tmp/pmix", 0, 0, 2, 0, vec![]);
         let err = host.join_prepared_pmix(&plan).unwrap_err();
         assert!(err.contains("was not prepared"));
+    }
+
+    #[test]
+    fn strip_launcher_mpi_env_removes_stale_launcher_keys() {
+        let mut env = HashMap::from([
+            ("PMIX_RANK".into(), "0".into()),
+            ("PMIX_SIZE".into(), "1".into()),
+            ("PMI_RANK".into(), "0".into()),
+            ("PMI_SIZE".into(), "1".into()),
+            ("OMPI_MCA_ess".into(), "singleton".into()),
+            ("LOCAL_RANK".into(), "0".into()),
+            ("LOCAL_WORLD_SIZE".into(), "4".into()),
+            ("NODE_RANK".into(), "0".into()),
+            ("PATH".into(), "/usr/bin".into()),
+            ("HOME".into(), "/home/user".into()),
+        ]);
+        strip_launcher_mpi_env(&mut env);
+        assert_eq!(
+            env,
+            HashMap::from([
+                ("PATH".into(), "/usr/bin".into()),
+                ("HOME".into(), "/home/user".into()),
+            ])
+        );
     }
 
     #[test]

@@ -152,6 +152,41 @@ pub async fn prepare_pmix_on_nodes(
     Err(detail)
 }
 
+/// Rolls back controller-side PMIx prepare when an srun step handler is cancelled
+/// before the normal release path runs.
+pub struct PmixPreparedReleaseGuard {
+    job_id: u32,
+    agent_addrs: Vec<String>,
+    release: bool,
+}
+
+impl PmixPreparedReleaseGuard {
+    pub fn new(job_id: u32, agent_addrs: Vec<String>) -> Self {
+        Self {
+            job_id,
+            agent_addrs,
+            release: true,
+        }
+    }
+
+    pub fn disarm(&mut self) {
+        self.release = false;
+    }
+}
+
+impl Drop for PmixPreparedReleaseGuard {
+    fn drop(&mut self) {
+        if !self.release {
+            return;
+        }
+        let job_id = self.job_id;
+        let addrs = self.agent_addrs.clone();
+        tokio::spawn(async move {
+            release_pmix_on_agents(&addrs, job_id).await;
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

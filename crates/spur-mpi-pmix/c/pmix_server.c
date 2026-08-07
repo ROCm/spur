@@ -3,6 +3,7 @@
 
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,23 @@
 #include "modex_exchange.h"
 
 #define SPUR_PMIX_MAX_SESSIONS 64
+#define SPUR_PMIX_MAX_LOCAL_PROCS 256
+
+typedef struct {
+    bool active;
+    uint32_t arrivals;
+    bool rank_arrived[SPUR_PMIX_MAX_LOCAL_PROCS];
+    char *local_data[SPUR_PMIX_MAX_LOCAL_PROCS];
+    size_t local_len[SPUR_PMIX_MAX_LOCAL_PROCS];
+    pmix_modex_cbfunc_t cbfunc[SPUR_PMIX_MAX_LOCAL_PROCS];
+    void *cbdata[SPUR_PMIX_MAX_LOCAL_PROCS];
+} spur_local_fence_t;
+
+typedef struct {
+    _Atomic int refs;
+    size_t len;
+    char data[];
+} spur_modex_shared_t;
 
 static int pmix_status_ok(pmix_status_t rc) {
     return rc == PMIX_SUCCESS || rc == PMIX_OPERATION_SUCCEEDED;
@@ -34,6 +52,7 @@ typedef struct {
     uint32_t num_peer_hosts;
     spur_modex_session_t *modex;
     spur_modex_timeouts_t modex_timeouts;
+    spur_local_fence_t local_fence;
 } spur_pmix_session_t;
 
 static int local_procs_match(const spur_pmix_session_t *session, const spur_mpi_launch_plan_t *plan) {
@@ -51,7 +70,6 @@ static int local_procs_match(const spur_pmix_session_t *session, const spur_mpi_
 static spur_pmix_session_t g_sessions[SPUR_PMIX_MAX_SESSIONS];
 static pthread_mutex_t g_session_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_server_initialized = 0;
-static uint32_t g_multinode_fence_sessions = 0;
 
 static pmix_status_t spur_fence_nb(
     const pmix_proc_t procs[],
@@ -65,7 +83,145 @@ static pmix_status_t spur_fence_nb(
 );
 
 static void spur_modex_release(void *release_cbdata) {
-    free(release_cbdata);
+    spur_modex_shared_t *shared = (spur_modex_shared_t *)release_cbdata;
+    if (shared == NULL) {
+        return;
+    }
+    if (atomic_fetch_sub(&shared->refs, 1) == 1) {
+        free(shared);
+    }
+}
+
+static spur_modex_shared_t *spur_modex_shared_create(const char *merged, size_t merged_len, int refs) {
+    if (refs <= 0) {
+        return NULL;
+    }
+    size_t alloc = merged_len > 0 ? merged_len : 1;
+    spur_modex_shared_t *shared = malloc(sizeof(*shared) + alloc);
+    if (shared == NULL) {
+        return NULL;
+    }
+    atomic_init(&shared->refs, refs);
+    shared->len = merged_len;
+    if (merged_len > 0 && merged != NULL) {
+        memcpy(shared->data, merged, merged_len);
+    }
+    return shared;
+}
+
+static int local_rank_index(const spur_pmix_session_t *session, uint32_t rank) {
+    for (uint32_t i = 0; i < session->num_local_procs; i++) {
+        if (session->local_ranks[i] == rank) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static void clear_local_fence(spur_local_fence_t *fence, uint32_t num_local_procs) {
+    if (num_local_procs > SPUR_PMIX_MAX_LOCAL_PROCS) {
+        num_local_procs = SPUR_PMIX_MAX_LOCAL_PROCS;
+    }
+    for (uint32_t i = 0; i < num_local_procs; i++) {
+        free(fence->local_data[i]);
+        fence->local_data[i] = NULL;
+        fence->local_len[i] = 0;
+        fence->cbfunc[i] = NULL;
+        fence->cbdata[i] = NULL;
+        fence->rank_arrived[i] = false;
+    }
+    fence->active = false;
+    fence->arrivals = 0;
+}
+
+static pmix_status_t modex_rc_to_pmix(int modex_rc) {
+    if (modex_rc == SPUR_MODEX_ERR_TIMEOUT) {
+        return PMIX_ERR_TIMEOUT;
+    }
+    if (modex_rc == SPUR_MODEX_ERR_ABORT) {
+        return PMIX_ERR_JOB_TERMINATED;
+    }
+    return PMIX_ERROR;
+}
+
+static void finish_local_fence(
+    spur_pmix_session_t *session,
+    pmix_status_t status,
+    char *merged,
+    size_t merged_len
+) {
+    spur_local_fence_t *fence = &session->local_fence;
+    uint32_t num_local = session->num_local_procs;
+    if (num_local > SPUR_PMIX_MAX_LOCAL_PROCS) {
+        num_local = SPUR_PMIX_MAX_LOCAL_PROCS;
+    }
+
+    spur_modex_shared_t *shared = NULL;
+    if (status == PMIX_SUCCESS) {
+        shared = spur_modex_shared_create(merged, merged_len, (int)fence->arrivals);
+        free(merged);
+        if (shared == NULL) {
+            status = PMIX_ERR_NOMEM;
+        }
+    }
+
+    for (uint32_t i = 0; i < num_local; i++) {
+        if (!fence->rank_arrived[i] || fence->cbfunc[i] == NULL) {
+            continue;
+        }
+        if (status == PMIX_SUCCESS && shared != NULL) {
+            fence->cbfunc[i](
+                PMIX_SUCCESS,
+                shared->data,
+                shared->len,
+                fence->cbdata[i],
+                spur_modex_release,
+                shared
+            );
+        } else {
+            fence->cbfunc[i](status, NULL, 0, fence->cbdata[i], NULL, NULL);
+        }
+    }
+
+    if (status != PMIX_SUCCESS) {
+        free(merged);
+    }
+
+    clear_local_fence(fence, num_local);
+}
+
+static int concat_local_blobs(
+    const spur_pmix_session_t *session,
+    const spur_local_fence_t *fence,
+    char **out_data,
+    size_t *out_len
+) {
+    size_t total = 0;
+    uint32_t num_local = session->num_local_procs;
+    if (num_local > SPUR_PMIX_MAX_LOCAL_PROCS) {
+        return -1;
+    }
+    for (uint32_t i = 0; i < num_local; i++) {
+        total += fence->local_len[i];
+    }
+    if (total > SPUR_MODEX_MAX_BLOB) {
+        return -1;
+    }
+
+    char *merged = malloc(total > 0 ? total : 1);
+    if (merged == NULL) {
+        return -1;
+    }
+    size_t offset = 0;
+    for (uint32_t i = 0; i < num_local; i++) {
+        if (fence->local_len[i] > 0 && fence->local_data[i] != NULL) {
+            memcpy(merged + offset, fence->local_data[i], fence->local_len[i]);
+            offset += fence->local_len[i];
+        }
+    }
+    *out_data = merged;
+    *out_len = offset;
+    return 0;
 }
 
 static spur_modex_timeouts_t modex_timeouts_from_plan(const spur_mpi_launch_plan_t *plan) {
@@ -135,21 +291,6 @@ static pmix_server_module_t spur_module = {
     .fence_nb = spur_fence_nb,
 };
 
-static void update_multinode_fence_hook(int delta) {
-    if (delta > 0) {
-        g_multinode_fence_sessions += (uint32_t)delta;
-        return;
-    }
-    if (delta < 0) {
-        uint32_t dec = (uint32_t)(-delta);
-        if (dec >= g_multinode_fence_sessions) {
-            g_multinode_fence_sessions = 0;
-        } else {
-            g_multinode_fence_sessions -= dec;
-        }
-    }
-}
-
 static int ensure_server_init(const spur_mpi_launch_plan_t *plan, char *errbuf, size_t errlen) {
     (void)plan;
     if (g_server_initialized) {
@@ -205,36 +346,87 @@ static pmix_status_t spur_fence_nb(
         cbfunc(PMIX_ERR_NOT_SUPPORTED, NULL, 0, cbdata, NULL, NULL);
         return PMIX_SUCCESS;
     }
+
+    int rank_idx = local_rank_index(session, procs[0].rank);
+    if (rank_idx < 0) {
+        pthread_mutex_unlock(&g_session_lock);
+        cbfunc(PMIX_ERR_NOT_FOUND, NULL, 0, cbdata, NULL, NULL);
+        return PMIX_SUCCESS;
+    }
+
+    spur_local_fence_t *fence = &session->local_fence;
+    if (fence->active && fence->rank_arrived[rank_idx]) {
+        pthread_mutex_unlock(&g_session_lock);
+        cbfunc(PMIX_ERR_BAD_PARAM, NULL, 0, cbdata, NULL, NULL);
+        return PMIX_SUCCESS;
+    }
+    if (!fence->active) {
+        fence->active = true;
+        fence->arrivals = 0;
+    }
+
+    char *local_copy = NULL;
+    if (ndata > 0 && data != NULL) {
+        local_copy = malloc(ndata);
+        if (local_copy == NULL) {
+            fence->cbfunc[rank_idx] = cbfunc;
+            fence->cbdata[rank_idx] = cbdata;
+            fence->rank_arrived[rank_idx] = true;
+            fence->arrivals++;
+            finish_local_fence(session, PMIX_ERR_NOMEM, NULL, 0);
+            pthread_mutex_unlock(&g_session_lock);
+            return PMIX_SUCCESS;
+        }
+        memcpy(local_copy, data, ndata);
+    }
+
+    fence->local_data[rank_idx] = local_copy;
+    fence->local_len[rank_idx] = ndata;
+    fence->cbfunc[rank_idx] = cbfunc;
+    fence->cbdata[rank_idx] = cbdata;
+    fence->rank_arrived[rank_idx] = true;
+    fence->arrivals++;
+
+    if (fence->arrivals < session->num_local_procs) {
+        pthread_mutex_unlock(&g_session_lock);
+        return PMIX_SUCCESS;
+    }
+
+    char *local_merged = NULL;
+    size_t local_merged_len = 0;
+    if (concat_local_blobs(session, fence, &local_merged, &local_merged_len) != 0) {
+        finish_local_fence(session, PMIX_ERR_NOMEM, NULL, 0);
+        pthread_mutex_unlock(&g_session_lock);
+        return PMIX_SUCCESS;
+    }
+
+    /* Hold g_session_lock for the inter-node collect so server_stop cannot
+     * destroy session->modex mid-flight. */
     spur_modex_session_t *modex = session->modex;
     char *merged = NULL;
     size_t merged_len = 0;
-    /* Hold g_session_lock for the full fence so server_stop cannot destroy
-     * session->modex mid-flight. That blocks every other PMIx session on this
-     * agent until the fence completes (up to modex_fence_timeout_secs). Per-
-     * modex refcounts would allow finer-grained teardown if that becomes hot. */
-    int modex_rc = spur_modex_fence_collect(modex, data, ndata, &merged, &merged_len);
-    pthread_mutex_unlock(&g_session_lock);
+    int modex_rc = spur_modex_fence_collect(modex, local_merged, local_merged_len, &merged, &merged_len);
+    free(local_merged);
+
     if (modex_rc != SPUR_MODEX_OK) {
-        pmix_status_t perr = PMIX_ERROR;
-        if (modex_rc == SPUR_MODEX_ERR_TIMEOUT) {
-            perr = PMIX_ERR_TIMEOUT;
-        } else if (modex_rc == SPUR_MODEX_ERR_ABORT) {
-            perr = PMIX_ERR_JOB_TERMINATED;
-        }
+        pmix_status_t perr = modex_rc_to_pmix(modex_rc);
         spur_mpi_debug(
             "spur_mpi_pmix: modex fence failed: %s\n",
             spur_modex_strerror(modex_rc)
         );
-        cbfunc(perr, NULL, 0, cbdata, NULL, NULL);
+        finish_local_fence(session, perr, NULL, 0);
+        pthread_mutex_unlock(&g_session_lock);
         return PMIX_SUCCESS;
     }
 
-    cbfunc(PMIX_SUCCESS, merged, merged_len, cbdata, spur_modex_release, merged);
+    finish_local_fence(session, PMIX_SUCCESS, merged, merged_len);
     spur_mpi_debug(
-        "spur_mpi_pmix: modex fence ok node=%u merged_len=%zu\n",
+        "spur_mpi_pmix: modex fence ok node=%u merged_len=%zu local_procs=%u\n",
         session->node_index,
-        merged_len
+        merged_len,
+        session->num_local_procs
     );
+    pthread_mutex_unlock(&g_session_lock);
     return PMIX_SUCCESS;
 }
 
@@ -250,6 +442,7 @@ static spur_pmix_session_t *find_session(const char *namespace_) {
 static spur_pmix_session_t *alloc_session(const char *namespace_) {
     for (size_t i = 0; i < SPUR_PMIX_MAX_SESSIONS; i++) {
         if (!g_sessions[i].active) {
+            memset(&g_sessions[i], 0, sizeof(g_sessions[i]));
             g_sessions[i].active = 1;
             strncpy(g_sessions[i].namespace_, namespace_, sizeof(g_sessions[i].namespace_) - 1);
             g_sessions[i].namespace_[sizeof(g_sessions[i].namespace_) - 1] = '\0';
@@ -571,30 +764,6 @@ static pmix_status_t spur_register_clients(const spur_mpi_launch_plan_t *plan) {
     return PMIX_SUCCESS;
 }
 
-#if PMIX_VERSION_MAJOR < 6
-static int spur_copy_server_uri(char **env, char *val, size_t vallen) {
-    static const char *candidates[] = {
-        "PMIX_SERVER_URI4",
-        "PMIX_SERVER_URI41",
-        "PMIX_SERVER_URI3",
-        "PMIX_SERVER_URI2",
-        "PMIX_SERVER_URI",
-        NULL,
-    };
-
-    for (int i = 0; candidates[i] != NULL; i++) {
-        size_t prefix_len = strlen(candidates[i]);
-        for (char **cur = env; cur != NULL && *cur != NULL; cur++) {
-            if (strncmp(*cur, candidates[i], prefix_len) == 0 && (*cur)[prefix_len] == '=') {
-                snprintf(val, vallen, "%s", *cur + prefix_len + 1);
-                return 0;
-            }
-        }
-    }
-    return -1;
-}
-#endif
-
 int spur_mpi_pmix_version(void) {
     return SPUR_MPI_PLUGIN_API_VERSION;
 }
@@ -747,7 +916,6 @@ int spur_mpi_pmix_server_start(const spur_mpi_launch_plan_t *plan, char *errbuf,
             pthread_mutex_unlock(&g_session_lock);
             return -1;
         }
-        update_multinode_fence_hook(1);
     }
 
     spur_mpi_debug(
@@ -769,10 +937,10 @@ int spur_mpi_pmix_server_stop(const char *namespace_, char *errbuf, size_t errle
     pthread_mutex_lock(&g_session_lock);
     spur_pmix_session_t *session = find_session(namespace_);
     if (session != NULL) {
+        clear_local_fence(&session->local_fence, session->num_local_procs);
         if (session->modex != NULL) {
             spur_modex_session_destroy(session->modex);
             session->modex = NULL;
-            update_multinode_fence_hook(-1);
         }
 #if PMIX_VERSION_MAJOR >= 6
         pmix_status_t rc = PMIx_server_deregister_nspace(namespace_);
@@ -978,102 +1146,4 @@ int spur_mpi_pmix_setup_fork_env(
 
 void spur_mpi_pmix_setup_fork_env_free(char **env) {
     spur_free_env(env);
-}
-
-int spur_mpi_pmix_env(
-    const spur_mpi_launch_plan_t *plan,
-    uint32_t rank,
-    const char *key,
-    char *val,
-    size_t vallen
-) {
-    if (plan == NULL || key == NULL || val == NULL || vallen == 0) {
-        return -1;
-    }
-
-    if (strcmp(key, "PMIX_NAMESPACE") == 0) {
-        snprintf(val, vallen, "%s", plan->namespace_);
-        return 0;
-    }
-    if (strcmp(key, "PMIX_RANK") == 0) {
-        snprintf(val, vallen, "%u", rank);
-        return 0;
-    }
-    if (strcmp(key, "PMIX_SIZE") == 0 || strcmp(key, "PMIX_JOB_SIZE") == 0) {
-        snprintf(val, vallen, "%u", plan->universe_size);
-        return 0;
-    }
-    if (strcmp(key, "PMIX_SERVER_TMPDIR") == 0) {
-        snprintf(val, vallen, "%s", plan->tmpdir);
-        return 0;
-    }
-    /* Open MPI 4.x uses URI4/URI3; same aliases in mpi_plugin.rs and task_launch.rs. */
-    if (strcmp(key, "PMIX_SERVER_URI4") == 0 || strcmp(key, "PMIX_SERVER_URI3") == 0) {
-        key = "PMIX_SERVER_URI";
-    }
-
-    pmix_proc_t proc;
-    PMIX_LOAD_PROCID(&proc, plan->namespace_, rank);
-
-    int found = -1;
-#if PMIX_VERSION_MAJOR >= 6
-    pmix_info_t *info = NULL;
-    size_t ninfo = 0;
-    pmix_status_t rc = PMIx_server_setup_fork(&proc, &info, &ninfo);
-    if (!pmix_status_ok(rc)) {
-        spur_mpi_debug(
-            "spur_mpi_pmix: PMIx_server_setup_fork rank=%u key=%s failed: %s\n",
-            rank,
-            key,
-            PMIx_Error_string(rc)
-        );
-        return -1;
-    }
-
-    for (size_t i = 0; i < ninfo; i++) {
-        if (strcmp(info[i].key, key) == 0) {
-            if (info[i].value.type == PMIX_STRING && info[i].value.data.string != NULL) {
-                snprintf(val, vallen, "%s", info[i].value.data.string);
-                found = 0;
-            }
-            break;
-        }
-    }
-    PMIx_Info_release(info, ninfo);
-#else
-    char **env = NULL;
-    pmix_status_t rc = PMIx_server_setup_fork(&proc, &env);
-    if (!pmix_status_ok(rc)) {
-        spur_mpi_debug(
-            "spur_mpi_pmix: PMIx_server_setup_fork rank=%u key=%s failed: %s\n",
-            rank,
-            key,
-            PMIx_Error_string(rc)
-        );
-        return -1;
-    }
-
-    size_t key_len = strlen(key);
-    if (strcmp(key, "PMIX_SERVER_URI") == 0) {
-        found = spur_copy_server_uri(env, val, vallen);
-    } else {
-        for (char **cur = env; cur != NULL && *cur != NULL; cur++) {
-            if (strncmp(*cur, key, key_len) == 0 && (*cur)[key_len] == '=') {
-                snprintf(val, vallen, "%s", *cur + key_len + 1);
-                found = 0;
-                break;
-            }
-        }
-    }
-    spur_free_env(env);
-#endif
-
-    if (found != 0) {
-        spur_mpi_debug(
-            "spur_mpi_pmix: PMIx env key %s not found for rank=%u\n",
-            key,
-            rank
-        );
-    }
-    return found;
 }

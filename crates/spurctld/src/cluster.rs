@@ -7210,8 +7210,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn submit_pmix_rejects_multi_node() {
-        // I5: -N4 -n4 --mpi=pmix stays multi-node and is rejected.
+    async fn submit_pmix_accepts_multi_node_on_native_hosts() {
+        // Multi-node --mpi=pmix is allowed on native hosts (K8s agents reject at dispatch).
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
@@ -7219,7 +7219,7 @@ mod tests {
         spec.num_nodes = 4;
         spec.num_tasks = 4;
         spec.mpi = Some(spur_core::mpi::MPI_PMIX.into());
-        assert!(cm.submit_job(spec).is_err());
+        assert!(cm.submit_job(spec).is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

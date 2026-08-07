@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use tracing::{debug, error, info, warn};
 
-use spur_core::mpi::MPI_PMIX;
 use spur_core::node::{Node, NodeSource};
 use spur_core::partition::requested_partition_names;
+use spur_core::task_launch::batch_dispatched_multi_node_pmix;
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
@@ -1338,8 +1338,11 @@ async fn confirm_dispatch_on_nodes(
     let modex_fence_timeout_secs = cluster.config().mpi.modex_fence_timeout_secs;
     let modex_verify_timeout_secs = cluster.config().mpi.modex_verify_timeout_secs;
 
-    let mpi = spec.mpi.as_deref().unwrap_or("");
-    let needs_pmix_prepare = mpi == MPI_PMIX && spec.num_nodes > 1;
+    let needs_pmix_prepare = batch_dispatched_multi_node_pmix(
+        spec.mpi.as_deref(),
+        spec.num_nodes,
+        spec.script.as_deref(),
+    );
 
     let mut peer_hosts: Vec<String> = Vec::new();
     let mut node_agents: Vec<(String, String)> = Vec::new();
@@ -1371,6 +1374,8 @@ async fn confirm_dispatch_on_nodes(
         peer_hosts.push(comm_host);
         node_agents.push((node_name.clone(), agent_addr));
     }
+
+    let mut pmix_prepare_guard = None;
 
     if needs_pmix_prepare {
         if failures > 0 || node_agents.len() != dispatch_nodes.len() {
@@ -1454,6 +1459,11 @@ async fn confirm_dispatch_on_nodes(
                 format!("PMIx prepare failed: {detail}"),
             );
         }
+        let agent_addrs: Vec<String> = node_agents.iter().map(|(_, addr)| addr.clone()).collect();
+        pmix_prepare_guard = Some(pmix_dispatch::PmixPreparedReleaseGuard::new(
+            job_id,
+            agent_addrs,
+        ));
     }
 
     let mut set = tokio::task::JoinSet::new();
@@ -1521,6 +1531,9 @@ async fn confirm_dispatch_on_nodes(
     }
 
     if failures == 0 {
+        if let Some(guard) = pmix_prepare_guard.as_mut() {
+            guard.disarm();
+        }
         if let Some(outcome) = primary_outcome {
             cluster.set_job_output_paths(job_id, outcome.stdout_path, outcome.stderr_path);
         }
@@ -1534,6 +1547,9 @@ async fn confirm_dispatch_on_nodes(
     );
 
     if needs_pmix_prepare {
+        if let Some(guard) = pmix_prepare_guard.as_mut() {
+            guard.disarm();
+        }
         let agent_addrs: Vec<String> = node_agents.iter().map(|(_, addr)| addr.clone()).collect();
         pmix_dispatch::release_pmix_on_agents(&agent_addrs, job_id).await;
     }
@@ -1907,6 +1923,83 @@ pub async fn cancel_job_on_nodes(
         set.spawn(cancel_one_agent(agent_addr, job_id, signal));
     }
     while set.join_next().await.is_some() {}
+}
+
+/// Cancel an in-flight srun step on the given nodes without tearing down the
+/// allocation job process (batch script / companion hold).
+pub async fn cancel_step_on_nodes(
+    cluster: &Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    step_id: u32,
+    node_names: &[String],
+    signal: i32,
+) {
+    let mut set = tokio::task::JoinSet::new();
+    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
+        set.spawn(cancel_one_step_agent(agent_addr, job_id, step_id, signal));
+    }
+    while set.join_next().await.is_some() {}
+}
+
+/// Deliver one CancelStep RPC, bounded by `CANCEL_RPC_TIMEOUT`.
+async fn cancel_one_step_agent(
+    agent_addr: String,
+    job_id: spur_core::job::JobId,
+    step_id: u32,
+    signal: i32,
+) {
+    use spur_proto::proto::CancelStepRequest;
+
+    let attempt = async {
+        match SlurmAgentClient::connect(agent_addr.clone())
+            .await
+            .map(|c| {
+                c.max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+                    .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE)
+            }) {
+            Ok(mut client) => {
+                if let Err(e) = client
+                    .cancel_step(CancelStepRequest {
+                        job_id,
+                        step_id,
+                        signal,
+                    })
+                    .await
+                {
+                    warn!(
+                        job_id,
+                        step_id,
+                        signal,
+                        agent = %agent_addr,
+                        error = %e,
+                        "CancelStep RPC failed"
+                    );
+                } else {
+                    info!(job_id, step_id, signal, agent = %agent_addr, "sent CancelStep");
+                }
+            }
+            Err(e) => {
+                warn!(
+                    job_id,
+                    step_id,
+                    agent = %agent_addr,
+                    error = %e,
+                    "failed to connect to agent for step cancel"
+                );
+            }
+        }
+    };
+    if tokio::time::timeout(CANCEL_RPC_TIMEOUT, attempt)
+        .await
+        .is_err()
+    {
+        warn!(
+            job_id,
+            step_id,
+            agent = %agent_addr,
+            "CancelStep RPC timed out"
+        );
+    }
 }
 
 /// Resolve `node_names` to agent URLs, logging and skipping any node whose
@@ -2505,6 +2598,13 @@ mod tests {
             ) -> Result<tonic::Response<spur_proto::proto::RunCommandResponse>, tonic::Status>
             {
                 Ok(tonic::Response::new(Default::default()))
+            }
+
+            async fn cancel_step(
+                &self,
+                _request: tonic::Request<spur_proto::proto::CancelStepRequest>,
+            ) -> Result<tonic::Response<()>, tonic::Status> {
+                Ok(tonic::Response::new(()))
             }
 
             async fn register_job_allocation(
@@ -3195,7 +3295,7 @@ mod tests {
                 num_tasks: 2,
                 cpus_per_task: 1,
                 work_dir: "/tmp".into(),
-                mpi: Some(MPI_PMIX.into()),
+                mpi: Some(spur_core::mpi::MPI_PMIX.into()),
                 ..Default::default()
             };
             let job_id = submit_and_wait(&cm, spec.clone());

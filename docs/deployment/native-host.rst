@@ -326,10 +326,10 @@ Spur supports Open MPI jobs via ``--mpi=pmix`` on **single-node and multi-node**
 allocations. The controller and CLI do not link libpmix; each compute node loads
 ``spur_mpi_pmix.so`` from ``[mpi].plugin_dir`` when a PMIx job starts.
 
+.. _mpi-pmix-install:
+
 Install Spur with the MPI plugin
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. _mpi-pmix-install:
 
 **Use published tarballs** (GitHub nightly releases or your internal artifactory
 mirror of the same artifact). Do **not** copy ``cargo build`` artifacts from a

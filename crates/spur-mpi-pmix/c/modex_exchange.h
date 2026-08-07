@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #define SPUR_MODEX_MAX_NODES 64
+#define SPUR_MODEX_MAX_BLOB (16u * 1024u * 1024u)
 #define SPUR_MODEX_PORT_BASE 16819
 #define SPUR_MODEX_PORT_SPAN 8000
 

@@ -626,6 +626,15 @@ impl SlurmAgent for VirtualAgent {
         ))
     }
 
+    async fn cancel_step(
+        &self,
+        _request: Request<CancelStepRequest>,
+    ) -> Result<Response<()>, Status> {
+        Err(Status::unimplemented(
+            "CancelStep is not yet supported by the K8s virtual agent",
+        ))
+    }
+
     async fn register_job_allocation(
         &self,
         _request: Request<RegisterJobAllocationRequest>,

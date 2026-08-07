@@ -6,9 +6,88 @@
 //! Used by batch `launch_job` and srun step dispatch on agents.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
+use regex::Regex;
+
+use crate::mpi::MPI_PMIX;
 use crate::spur_env::SpurEnv;
 use crate::step::{distribute_tasks, CpuBind, GpuBind, TaskDistribution};
+
+static STEP_LAUNCH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[\s;&|])(?:/.*/)?(srun|mpirun|mpiexec)\b").expect("valid step-launch regex")
+});
+
+/// True when a batch script delegates rank fan-out to an inner step launcher.
+pub fn batch_script_uses_step_launch(script: &str) -> bool {
+    for line in script.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if STEP_LAUNCH_RE.is_match(trimmed) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether batch `launch_job` should fan out the user script into per-rank
+/// wrappers on this node.
+///
+/// Batch scripts normally run once per node; multi-rank MPI is the script's
+/// job via an internal `srun`. Spur additionally fans out when `--mpi=pmix`
+/// is set so direct batch launches (no inner `srun`) spawn one rank per task on
+/// the node. Standalone `srun` routed through the batch path uses `task_fanout`
+/// for the same effect with non-PMIx commands.
+pub fn use_multi_task_launch(
+    tasks_per_node: u32,
+    task_fanout: bool,
+    mpi: &str,
+    script: &str,
+) -> bool {
+    if tasks_per_node <= 1 {
+        return false;
+    }
+    if task_fanout {
+        return true;
+    }
+    mpi == MPI_PMIX && !batch_script_uses_step_launch(script)
+}
+
+/// True when batch dispatch already ran multi-node PMIx prepare for this job.
+///
+/// Direct `#SBATCH --mpi=pmix` on multiple nodes prepares PMIx before launch.
+/// Batch scripts with an inner `srun` skip batch prepare; their steps prepare
+/// independently. Must stay aligned with `confirm_dispatch_on_nodes`.
+pub fn batch_dispatched_multi_node_pmix(
+    job_mpi: Option<&str>,
+    num_allocated_nodes: u32,
+    script: Option<&str>,
+) -> bool {
+    job_mpi == Some(MPI_PMIX)
+        && num_allocated_nodes > 1
+        && !script.is_some_and(batch_script_uses_step_launch)
+}
+
+/// Whether a multi-node PMIx step needs controller-side `PreparePmix` before
+/// fan-out to agents.
+pub fn step_needs_pmix_prepare(
+    step_num_nodes: u32,
+    job_mpi: Option<&str>,
+    num_allocated_nodes: u32,
+    script: Option<&str>,
+) -> bool {
+    step_num_nodes > 1 && !batch_dispatched_multi_node_pmix(job_mpi, num_allocated_nodes, script)
+}
+
+/// Bash body for non-primary batch nodes when the user script uses `srun`.
+///
+/// The batch script runs only on the first allocated node; companions hold
+/// their slice of the allocation until the controller tears them down.
+pub fn batch_companion_hold_script() -> &'static str {
+    "#!/bin/bash\nwhile true; do sleep 60; done\n"
+}
 
 /// Per-node task launch parameters derived from a step's task distribution.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,7 +400,7 @@ fn mpi_launch_preamble() -> &'static str {
 }
 
 /// Legacy mpirun wrapper kept for unit tests; Spur PMIx jobs use direct per-rank
-/// launch (Slurm ``mpi_p_slurmstepd_task`` parity) via [`build_multi_task_pmix_wrapper`].
+/// launch via [`build_multi_task_pmix_wrapper`].
 pub fn build_mpi_mpirun_wrapper(user_script_path: &str, tasks_on_node: u32) -> String {
     let quoted = bash_single_quote(user_script_path);
     format!(
@@ -348,6 +427,12 @@ pub fn build_mpi_mpirun_wrapper(user_script_path: &str, tasks_on_node: u32) -> S
 fn mpi_direct_task_preamble(indent: &str) -> String {
     format!(
         concat!(
+            "{indent}unset PMI_RANK PMI_SIZE PMI_FD PMI_PORT PMI_PROCESS_KVS_ID 2>/dev/null || true\n",
+            "{indent}unset OMPI_MCA_ess OMPI_MCA_ess_base_env 2>/dev/null || true\n",
+            "{indent}unset SLURM_PROCID SLURM_LOCALID SLURM_NODEID SLURM_TASKS_PER_NODE 2>/dev/null || true\n",
+            "{indent}export SLURM_STEP_ID=${{SLURM_STEP_ID:-0}}\n",
+            "{indent}export SLURM_STEPID=${{SLURM_STEPID:-0}}\n",
+            "{indent}export OMPI_MCA_ess='^singleton,^slurm,^srun'\n",
             "{indent}if [ -f \"${{HOME}}/spur/mpi/env.sh\" ]; then . \"${{HOME}}/spur/mpi/env.sh\"; fi\n",
             "{indent}export PMIX_SERVER_URI4=${{PMIX_SERVER_URI4:-$PMIX_SERVER_URI}}\n",
             "{indent}export PMIX_SERVER_URI3=${{PMIX_SERVER_URI3:-$PMIX_SERVER_URI}}\n",
@@ -364,8 +449,7 @@ fn bash_export_block(env: &HashMap<String, String>, indent: &str) -> String {
         .collect()
 }
 
-/// Fork one process per local rank, injecting per-rank `PMIx_server_setup_fork` env
-/// (Slurm `mpi_p_slurmstepd_task` parity).
+/// Fork one process per local rank, injecting per-rank `PMIx_server_setup_fork` env.
 pub fn build_multi_task_pmix_wrapper(
     user_script_path: &str,
     tasks_on_node: u32,
@@ -597,6 +681,88 @@ mod tests {
     }
 
     #[test]
+    fn use_multi_task_launch_batch_pmix_fans_out() {
+        assert!(use_multi_task_launch(4, false, MPI_PMIX, "/tmp/hello_mpi"));
+        assert!(!use_multi_task_launch(1, false, MPI_PMIX, "/tmp/hello_mpi"));
+        assert!(!use_multi_task_launch(4, false, "none", "echo hi"));
+        assert!(use_multi_task_launch(4, true, "none", "hostname"));
+        assert!(!use_multi_task_launch(1, true, "none", "hostname"));
+    }
+
+    #[test]
+    fn use_multi_task_launch_batch_pmix_skips_inner_srun() {
+        let direct = "#!/bin/bash\n#SBATCH --mpi=pmix\n/tmp/hello_mpi\n";
+        assert!(use_multi_task_launch(2, false, MPI_PMIX, direct));
+
+        let inner_srun = "#!/bin/bash\n#SBATCH --mpi=pmix\nsrun --mpi=pmix /tmp/hello_mpi\n";
+        assert!(!use_multi_task_launch(2, false, MPI_PMIX, inner_srun));
+
+        let commented = "#!/bin/bash\n# srun should not match\n/tmp/hello_mpi\n";
+        assert!(use_multi_task_launch(2, false, MPI_PMIX, commented));
+    }
+
+    #[test]
+    fn batch_script_uses_step_launch_detects_launchers() {
+        assert!(batch_script_uses_step_launch("srun --mpi=pmix /tmp/a\n"));
+        assert!(batch_script_uses_step_launch("mpirun -np 4 /tmp/a\n"));
+        assert!(batch_script_uses_step_launch("mpiexec -n 4 /tmp/a\n"));
+        assert!(batch_script_uses_step_launch("&& srun hostname\n"));
+        assert!(!batch_script_uses_step_launch(
+            "#SBATCH --mpi=pmix\n/tmp/a\n"
+        ));
+        assert!(!batch_script_uses_step_launch("# srun hidden in comment\n"));
+    }
+
+    #[test]
+    fn batch_dispatched_multi_node_pmix_direct_batch() {
+        assert!(batch_dispatched_multi_node_pmix(
+            Some(MPI_PMIX),
+            2,
+            Some("#!/bin/bash\n/tmp/hello_mpi\n"),
+        ));
+    }
+
+    #[test]
+    fn batch_dispatched_multi_node_pmix_skips_inner_srun() {
+        assert!(!batch_dispatched_multi_node_pmix(
+            Some(MPI_PMIX),
+            2,
+            Some("#!/bin/bash\nsrun --mpi=pmix /tmp/hello_mpi\n"),
+        ));
+    }
+
+    #[test]
+    fn batch_dispatched_multi_node_pmix_requires_multi_node() {
+        assert!(!batch_dispatched_multi_node_pmix(
+            Some(MPI_PMIX),
+            1,
+            Some("#!/bin/bash\n/tmp/hello_mpi\n"),
+        ));
+    }
+
+    #[test]
+    fn step_needs_pmix_prepare_inner_srun_batch() {
+        let script = "#!/bin/bash\nsrun --mpi=pmix /tmp/hello_mpi\n";
+        assert!(step_needs_pmix_prepare(2, Some(MPI_PMIX), 2, Some(script),));
+    }
+
+    #[test]
+    fn step_needs_pmix_prepare_skips_after_direct_batch_pmix() {
+        let script = "#!/bin/bash\n/tmp/hello_mpi\n";
+        assert!(!step_needs_pmix_prepare(2, Some(MPI_PMIX), 2, Some(script),));
+    }
+
+    #[test]
+    fn step_needs_pmix_prepare_hold_allocation_without_batch_mpi() {
+        assert!(step_needs_pmix_prepare(
+            2,
+            None,
+            2,
+            Some("#!/bin/bash\nsleep 60\n")
+        ));
+    }
+
+    #[test]
     fn multi_task_wrapper_honors_spur_label_env() {
         let script = build_multi_task_wrapper("/tmp/work.sh", 1, None);
         assert!(script.contains("SPUR_LABEL"));
@@ -645,6 +811,8 @@ mod tests {
         assert!(script.contains("export PMIX_RANK='1'"));
         assert!(script.contains("for LOCAL_RANK in"));
         assert!(!script.contains("mpirun"));
+        assert!(script.contains("export SLURM_STEP_ID=${SLURM_STEP_ID:-0}"));
+        assert!(script.contains("OMPI_MCA_ess='^singleton,^slurm,^srun'"));
     }
 
     #[test]
