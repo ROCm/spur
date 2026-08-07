@@ -86,9 +86,13 @@ class TestSbatchEnvDefaults:
 
     def test_timelimit_env_applies(self, cluster):
         job_id = self._submit(cluster, {"SPUR_TIMELIMIT": "00:07:00"})
-        show = cluster.scontrol("show", "job", str(job_id))
-        assert "7" in _show_field(show, "TimeLimit"), (
-            f"SPUR_TIMELIMIT must set the job time limit:\n{show}"
+        # `scontrol show job` does not render a time limit, so squeue's %l is
+        # the only place the applied value is observable.
+        shown = cluster.cli(
+            ["squeue", "-h", "-o", "%l", "-j", str(job_id)]
+        ).strip()
+        assert shown == "7:00", (
+            f"SPUR_TIMELIMIT must set the job time limit, squeue %l shows {shown!r}"
         )
         wait_job(cluster, job_id, timeout=90)
 

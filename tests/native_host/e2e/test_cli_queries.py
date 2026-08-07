@@ -61,21 +61,22 @@ class TestSqueueSorting:
 
 class TestSinfoFiltering:
     def test_state_filter_selects_idle_nodes(self, cluster):
-        out = cluster.cli(["sinfo", "-t", "idle"])
-        for name in cluster.node_names:
-            assert name in out, f"idle node {name} missing from `sinfo -t idle`:\n{out}"
+        shown = cluster.sinfo_node_names(["-t", "idle"])
+        assert shown == set(cluster.node_names), (
+            f"`sinfo -t idle` should list every idle node, got {sorted(shown)}"
+        )
 
     def test_state_filter_excludes_non_matching_states(self, cluster):
-        out = cluster.cli(["sinfo", "-t", "down"])
-        for name in cluster.node_names:
-            assert name not in out, (
-                f"idle node {name} must not appear under `sinfo -t down`:\n{out}"
-            )
+        shown = cluster.sinfo_node_names(["-t", "down"])
+        assert shown.isdisjoint(cluster.node_names), (
+            f"no idle node may appear under `sinfo -t down`, got {sorted(shown)}"
+        )
 
     def test_state_filter_all_disables_filtering(self, cluster):
-        out = cluster.cli(["sinfo", "-t", "all"])
-        for name in cluster.node_names:
-            assert name in out, f"node {name} missing from `sinfo -t all`:\n{out}"
+        shown = cluster.sinfo_node_names(["-t", "all"])
+        assert shown == set(cluster.node_names), (
+            f"`sinfo -t all` should list every node, got {sorted(shown)}"
+        )
 
     def test_invalid_state_is_rejected(self, cluster):
         out = cluster.cli_allow_fail(["sinfo", "-t", "notastate"])
@@ -90,7 +91,7 @@ class TestSinfoFiltering:
         try:
             deadline = time.time() + 30
             while time.time() < deadline:
-                if node in cluster.cli(["sinfo", "-t", "drain"]):
+                if node in cluster.sinfo_node_names(["-t", "drain"]):
                     break
                 time.sleep(2)
             else:
@@ -98,7 +99,7 @@ class TestSinfoFiltering:
                     f"drained node {node} never appeared under `sinfo -t drain`:\n"
                     f"{cluster.sinfo()}"
                 )
-            assert node not in cluster.cli(["sinfo", "-t", "idle"]), (
+            assert node not in cluster.sinfo_node_names(["-t", "idle"]), (
                 f"drained node {node} must leave the idle filter:\n{cluster.sinfo()}"
             )
         finally:

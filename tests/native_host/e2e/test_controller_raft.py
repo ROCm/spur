@@ -17,6 +17,24 @@ import pytest
 from cluster import parse_job_id, wait_job, wait_job_state
 
 
+@pytest.fixture(autouse=True)
+def _restore_quorum(raft_cluster):
+    """Return the cluster to three live controllers after every test.
+
+    raft_cluster is module-scoped, so a test that fails between killing a
+    controller and restarting it would leave every later test running against
+    a degraded quorum. Healing here keeps that failure local to one test.
+    """
+    yield
+    for i in raft_cluster.controller_indices:
+        if raft_cluster.raft_role(i) is None:
+            # Kill first: a wedged process still holding the port would make
+            # the replacement exit immediately on bind.
+            raft_cluster.stop_controller_node(i)
+            raft_cluster.start_controller_node(i)
+    raft_cluster.wait_raft_leader(timeout=120)
+
+
 def _job_visible(cluster, job_id: int, node_index: int) -> bool:
     out = cluster.cli_allow_fail(
         ["squeue", "-t", "all", "-j", str(job_id), "-h"],
@@ -34,27 +52,14 @@ class TestLeaderElection:
             f"expected one leader and two replicas, got {roles}"
         )
 
-    def test_node_id_is_derived_from_peer_position(self, raft_cluster):
-        """Peers are listed by hostname, so each controller must pick its id
-        from its own position rather than needing an explicit node_id."""
-        for i in raft_cluster.controller_indices:
-            log = raft_cluster.spurctld_log(i)
-            assert "position in controller.peers" in log, (
-                f"controller {i} did not derive its node_id from the peer list:\n{log}"
-            )
-            assert f"node_id={i + 1}" in log.replace('"', ""), (
-                f"controller {i} should be node_id {i + 1}:\n{log}"
-            )
-
     def test_every_controller_serves_the_same_node_view(self, raft_cluster):
         for i in raft_cluster.controller_indices:
-            out = raft_cluster.cli(
-                ["sinfo"], controller_addr=raft_cluster.controller_addr_for(i)
+            shown = raft_cluster.sinfo_node_names(
+                controller_addr=raft_cluster.controller_addr_for(i)
             )
-            for name in raft_cluster.node_names:
-                assert name in out, (
-                    f"controller {i} is missing node {name}:\n{out}"
-                )
+            assert shown == set(raft_cluster.node_names), (
+                f"controller {i} does not see every node, got {sorted(shown)}"
+            )
 
 
 class TestWriteForwarding:
@@ -209,14 +214,13 @@ class TestLeaderlessReads:
                     break
                 time.sleep(3)
 
-            out = raft_cluster.cli_allow_fail(
-                ["sinfo"],
+            shown = raft_cluster.sinfo_node_names(
                 controller_addr=raft_cluster.controller_addr_for(survivor),
+                allow_fail=True,
             )
-            for name in raft_cluster.node_names:
-                assert name in out, (
-                    f"a leaderless controller must still serve sinfo:\n{out}"
-                )
+            assert shown == set(raft_cluster.node_names), (
+                f"a leaderless controller must still serve sinfo, got {sorted(shown)}"
+            )
             assert _job_visible(raft_cluster, job_id, survivor), (
                 f"a leaderless controller must still serve squeue for {job_id}"
             )

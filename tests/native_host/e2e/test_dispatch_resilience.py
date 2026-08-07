@@ -12,8 +12,6 @@ observable invariants rather than internal timing.
 import re
 import time
 
-import pytest
-
 from cluster import job_state, parse_job_id, wait_job, wait_job_state
 
 
@@ -117,54 +115,10 @@ class TestLaunchFailureBackoff:
             cluster.cli_allow_fail(["scancel", str(job_id)])
 
 
-class TestRequeueDoesNotFinalizeNewRun:
-    def test_requeued_job_completes_its_second_run(self, cluster):
-        """A completion report from the first run must not finalize the second.
-
-        Requeue restarts the job under a new run attempt; the abandoned run's
-        completion report arrives late and must be discarded rather than
-        marking the fresh run terminal.
-        """
-        marker_dir = f"{cluster.remote_dir}/requeue-runs"
-        script = cluster.write_file(
-            "requeue-run.sh",
-            "#!/bin/bash\n"
-            f"mkdir -p {marker_dir}\n"
-            f"date +%s%N > {marker_dir}/run-$(date +%s%N)\n"
-            "sleep 20\n",
-        )
-        job_id = parse_job_id(
-            cluster.sbatch(["-J", "requeue-run", "--requeue", script])
-        )
-        assert job_id is not None
-        wait_job_state(cluster, job_id, "R", timeout=60)
-
-        out = cluster.cli_allow_fail(["scontrol", "requeue", str(job_id)])
-        if "not supported" in out.lower() or "unknown" in out.lower():
-            pytest.skip(f"scontrol requeue unavailable: {out.strip()}")
-
-        try:
-            wait_job_state(cluster, job_id, "R", timeout=120)
-            # The second run must survive its full duration rather than being
-            # finalized by the first run's late completion report.
-            time.sleep(10)
-            state = job_state(cluster.squeue_all(), job_id)
-            assert state == "R", (
-                f"the requeued run was finalized early (state {state})\n"
-                f"{cluster.debug_job(job_id)}"
-            )
-
-            assert wait_job(cluster, job_id, timeout=90) == "CD", (
-                cluster.debug_job(job_id)
-            )
-            runs = cluster.nodes[0].exec_allow_fail(
-                f"ls {marker_dir} 2>/dev/null | wc -l"
-            ).strip()
-            assert runs.isdigit() and int(runs) >= 2, (
-                f"expected the script to have run twice, saw {runs} run marker(s)"
-            )
-        finally:
-            cluster.cli_allow_fail(["scancel", str(job_id)])
+# A late completion report finalizing a *newer* run attempt would need a job to
+# run twice. `scontrol requeue` only cancels today (see TestRequeue in
+# test_job_control.py), so there is no second attempt to race against and the
+# scenario cannot be built from the outside yet.
 
 
 class TestGpuReleaseOnLaunchFailure:
