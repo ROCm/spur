@@ -570,7 +570,10 @@ class SpurCluster:
         and *executable=False* for non-script files.
         """
         path = f"{self.remote_dir}/{name}"
-        mode = 0o755 if executable else None
+        # Even non-executable files get an explicit mode, not the remote umask:
+        # the job_submit hook refuses a group/world-writable file, so an umask
+        # of 002 would otherwise stop the controller from starting.
+        mode = 0o755 if executable else 0o644
         targets = self.nodes if all_nodes else self.nodes[:1]
         parent = path.rsplit("/", 1)[0]
         for node in targets:
