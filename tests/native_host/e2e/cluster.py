@@ -8,6 +8,7 @@ Handles SSH connections, binary deployment, cluster startup/teardown,
 and CLI wrappers for interacting with the running cluster.
 """
 
+import copy
 import os
 import re
 import shlex
@@ -24,16 +25,78 @@ import tomli_w
 logger = logging.getLogger(__name__)
 
 BINARIES = ["spurctld", "spurd", "spur"]
-CLI_SYMLINKS = ["sbatch", "srun", "squeue", "scancel", "sinfo", "scontrol"]
+CLI_SYMLINKS = [
+    "sbatch", "srun", "salloc", "squeue", "scancel", "sinfo", "scontrol",
+    "sattach", "sprio", "sstat", "sdiag", "smd",
+]
 ACCOUNTING_SYMLINKS = ["sacct", "sacctmgr", "sshare", "sreport"]
+FFI_LIB_NAME = "libspur_compat.so"
 
 CONTROLLER_PORT = int(os.environ.get("SPUR_TEST_CONTROLLER_PORT", "6817"))
 AGENT_PORT = int(os.environ.get("SPUR_TEST_AGENT_PORT", "6818"))
+REST_PORT = int(os.environ.get("SPUR_TEST_REST_PORT", "6820"))
+RAFT_PORT = int(os.environ.get("SPUR_TEST_RAFT_PORT", "6821"))
+METRICS_PORT = int(os.environ.get("SPUR_TEST_METRICS_PORT", "6822"))
+
+# curl writes the status code after the body; a sentinel keeps the split
+# unambiguous for payloads that themselves end in digits or newlines.
+_HTTP_STATUS_SENTINEL = "__SPUR_HTTP_STATUS__"
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
 
 
 def make_remote_dir() -> str:
     """Generate a unique remote working directory path."""
     return f"/tmp/spur-e2e-{os.getpid()}-{time.time_ns()}"
+
+
+def expand_hostlist(spec: str) -> list[str]:
+    """Expand a Slurm-style hostlist into individual node names.
+
+    Every node-facing surface (``squeue`` NODELIST, ``scontrol show job``,
+    ``sinfo``) renders node sets in bracket form -- ``node[1-3,7]`` -- so
+    splitting on commas yields fragments like ``node[1`` rather than names.
+    """
+    names: list[str] = []
+    for item in _split_hostlist(spec):
+        match = re.fullmatch(r"(.*?)\[([^\]]+)\](.*)", item)
+        if not match:
+            names.append(item)
+            continue
+        prefix, body, suffix = match.groups()
+        for part in body.split(","):
+            low, _, high = part.partition("-")
+            if not high:
+                names.append(f"{prefix}{low}{suffix}")
+                continue
+            # A range keeps the zero padding of its lower bound: node[08-10].
+            width = len(low)
+            for number in range(int(low), int(high) + 1):
+                names.append(f"{prefix}{number:0{width}d}{suffix}")
+    return names
+
+
+def _split_hostlist(spec: str) -> list[str]:
+    """Split a hostlist on its top-level commas, ignoring bracketed ones."""
+    items: list[str] = []
+    current = ""
+    depth = 0
+    for char in spec:
+        if char == "," and depth == 0:
+            items.append(current)
+            current = ""
+            continue
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+        current += char
+    items.append(current)
+    return [item.strip() for item in items if item.strip()]
 
 
 def deep_merge(base: dict, overrides: dict) -> dict:
@@ -204,10 +267,16 @@ class SpurCluster:
         self.log_dir = f"{remote_dir}/log"
         self.controller_addr = f"http://{nodes[0].host}:{CONTROLLER_PORT}"
         self.config_overrides: dict = {}
+        # Per-node config, merged over config_overrides for that node only.
+        # Raft needs it: node_id differs per controller.
+        self.node_config_overrides: dict[int, dict] = {}
         self.agent_as_root: bool = False
         self.agent_labels: dict[int, dict[str, str]] = {}
         self.agent_token: str | None = None
         self.accounting_enabled: bool = False
+        self.controller_indices: list[int] = [0]
+        self.raft_peer_style: str = "ip"
+        self.agent_env: dict[str, str] = {}
         self._pg_container = f"spur-e2e-pg-{os.getpid()}-{time.time_ns()}"
         self._pg_port = int(os.environ.get("SPUR_TEST_PG_PORT", "55432"))
         self._db_url = (
@@ -259,6 +328,10 @@ class SpurCluster:
         if self.accounting_enabled:
             self._start_postgres()
         self.start_controller(config_overrides, kill_stale=False)
+        # Agents register through the leader, so wait for the election to
+        # settle before they start retrying against a leaderless cluster.
+        if len(self.controller_indices) > 1:
+            self.wait_raft_leader()
         self.start_agents(kill_stale=False)
         self.wait_ready()
         logger.info(
@@ -308,9 +381,113 @@ class SpurCluster:
             raise RuntimeError("docker not usable on node 0; cannot run accounting")
         self.accounting_enabled = True
 
+    def enable_raft(self, replicas: int = 3, peer_style: str = "ip"):
+        """Run spurctld on the first *replicas* nodes as Raft peers.
+
+        Clients get the full endpoint list so they keep working across a
+        leader change. Call before provision()/start().
+
+        *peer_style* selects how peers address each other. ``"ip"`` (default)
+        pairs IP peers with an explicit per-node ``node_id``, which works on
+        any set of hosts. ``"hostname"`` lets each controller derive its
+        node_id from its position in the peer list, but only works where every
+        node can resolve every peer's hostname -- use
+        :meth:`peer_resolution_preflight` to gate it.
+        """
+        if replicas > len(self.nodes):
+            raise RuntimeError(
+                f"raft needs {replicas} nodes, cluster has {len(self.nodes)}"
+            )
+        if replicas % 2 == 0:
+            raise RuntimeError("raft replica count must be odd for a quorum")
+        if peer_style not in ("ip", "hostname"):
+            raise RuntimeError(f"unknown raft peer_style {peer_style!r}")
+        self.controller_indices = list(range(replicas))
+        self.raft_peer_style = peer_style
+        self.controller_addr = ",".join(
+            f"http://{self.nodes[i].host}:{CONTROLLER_PORT}"
+            for i in self.controller_indices
+        )
+
+    def controller_addr_for(self, node_index: int) -> str:
+        """Single-endpoint address for one controller, bypassing failover."""
+        return f"http://{self.nodes[node_index].host}:{CONTROLLER_PORT}"
+
+    def raft_role(self, node_index: int) -> str | None:
+        """Raft role of one controller: 'primary', 'replica', or None if down.
+
+        REST /ping reports the role directly, which avoids parsing Raft
+        internals out of the controller log.
+        """
+        status, body = self.http_get("/api/v1/ping", node_index=node_index)
+        if status != 200:
+            return None
+        match = re.search(r'"mode"\s*:\s*"(\w+)"', body)
+        return match.group(1) if match else None
+
+    def raft_leader_index(self) -> int | None:
+        for i in self.controller_indices:
+            if self.raft_role(i) == "primary":
+                return i
+        return None
+
+    def wait_raft_leader(self, timeout: int = 90, exclude: set[int] | None = None) -> int:
+        """Poll until exactly one controller reports itself leader."""
+        excluded = exclude or set()
+        deadline = time.time() + timeout
+        roles: dict[int, str | None] = {}
+        while time.time() < deadline:
+            roles = {i: self.raft_role(i) for i in self.controller_indices}
+            leaders = [
+                i for i, role in roles.items()
+                if role == "primary" and i not in excluded
+            ]
+            if len(leaders) == 1:
+                return leaders[0]
+            time.sleep(2)
+        raise TimeoutError(
+            f"no single Raft leader within {timeout}s (roles: {roles})\n"
+            f"{self.raft_diagnostics()}"
+        )
+
+    def raft_diagnostics(self, log_lines: int = 40) -> str:
+        """Per-controller log tail, for reporting a failed election.
+
+        A leaderless cluster is almost always explained by the controller's
+        own startup log (node_id resolution, bind failure, peer refused), and
+        that log is unreachable once the fixture has torn the cluster down.
+        """
+        parts = []
+        for i in self.controller_indices:
+            name = self.node_names[i] if self.node_names else self.nodes[i].host
+            tail = self.nodes[i].exec_allow_fail(
+                f"tail -{log_lines} '{self.log_dir}/spurctld.log' 2>&1"
+            )
+            listening = self.nodes[i].exec_allow_fail(
+                f"(ss -lntp 2>/dev/null || netstat -lntp 2>/dev/null) "
+                f"| grep -E ':({CONTROLLER_PORT}|{RAFT_PORT}|{REST_PORT})' || echo '(no listener)'"
+            )
+            parts.append(
+                f"--- controller {i} ({name}) ---\n"
+                f"listeners:\n{listening.strip()}\n"
+                f"spurctld.log (last {log_lines}):\n{_strip_ansi(tail)}"
+            )
+        return "\n".join(parts)
+
     def stop_controller(self):
         """Kill spurctld only."""
         self._kill_controller()
+
+    def stop_controller_node(self, node_index: int):
+        """Kill spurctld on one node, leaving the other peers running."""
+        self._kill_controller(node_index)
+
+    def start_controller_node(self, node_index: int):
+        """Restart spurctld on one node against the existing config."""
+        self._start_controller(node_index)
+
+    def spurctld_log(self, node_index: int = 0) -> str:
+        return _strip_ansi(self.nodes[node_index].read_file(f"{self.log_dir}/spurctld.log"))
 
     def stop_agents(self):
         """Kill spurd on all nodes only."""
@@ -395,12 +572,81 @@ class SpurCluster:
             f"'{self.bin_dir}/{args[0]}'",
         ]
         cmd_parts.extend(f"'{a}'" for a in args[1:])
-        _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
+        return self._exec_with_code(self.nodes[0], " ".join(cmd_parts))
+    
+    def cli_with_env(
+        self,
+        args: list[str],
+        env: dict[str, str],
+        controller_addr: str | None = None,
+    ) -> tuple[int, str]:
+        """Run a CLI command with extra environment variables set.
+
+        Returns (exit_code, stdout+stderr). Submit-time defaults such as
+        ``SPUR_PARTITION`` / ``SBATCH_ACCOUNT`` / ``SALLOC_QOS`` are read from
+        the CLI's own environment, which is what this controls — distinct from
+        ``--export``, which shapes the *job's* environment.
+        """
+        cmd_parts = [
+            f"SPUR_CONTROLLER_ADDR={shlex.quote(controller_addr or self.controller_addr)}",
+            f"PATH={shlex.quote(self.bin_dir)}:$PATH",
+        ]
+        cmd_parts.extend(f"{k}={shlex.quote(v)}" for k, v in env.items())
+        cmd_parts.append(shlex.quote(f"{self.bin_dir}/{args[0]}"))
+        cmd_parts.extend(shlex.quote(a) for a in args[1:])
+        return self._exec_with_code(self.nodes[0], " ".join(cmd_parts))
+
+    def _exec_with_code(self, node: SshNode, cmd: str) -> tuple[int, str]:
+        _, stdout, stderr = node.client.exec_command(cmd)
         code = stdout.channel.recv_exit_status()
         return code, stdout.read().decode() + stderr.read().decode()
 
     def sbatch(self, args: list[str]) -> str:
         return self.cli(["sbatch"] + args)
+
+    def sbatch_with_exit(self, args: list[str]) -> tuple[int, str]:
+        return self.cli_with_env(["sbatch"] + args, {})
+
+    def salloc_with_exit(self, args: list[str]) -> tuple[int, str]:
+        """Run salloc and return (exit_code, combined stdout+stderr).
+
+        salloc runs a command inside the allocation and exits, so it blocks
+        for the lifetime of that command.
+        """
+        return self.cli_with_env(["salloc"] + args, {})
+
+    def salloc(self, args: list[str]) -> str:
+        _, out = self.salloc_with_exit(args)
+        return out
+
+    def sattach(self, job_step: str, args: list[str] | None = None) -> tuple[int, str]:
+        return self.cli_with_env(["sattach", job_step] + (args or []), {})
+
+    def spur_exec(self, job_id: int, command: list[str]) -> tuple[int, str]:
+        return self.cli_with_env(["spur", "exec", str(job_id)] + command, {})
+
+    def sprio(self, args: list[str] | None = None) -> str:
+        return self.cli(["sprio"] + (args or []))
+
+    def sshare(self, args: list[str] | None = None) -> str:
+        return self.cli(["sshare"] + (args or []))
+
+    def sstat(self, args: list[str]) -> str:
+        return self.cli(["sstat"] + args)
+
+    def sdiag(self, args: list[str] | None = None) -> str:
+        return self.cli(["sdiag"] + (args or []))
+
+    def sreport(self, args: list[str]) -> str:
+        return self.cli(["sreport"] + args)
+
+    def smd(self, args: list[str] | None = None) -> str:
+        """Run smd, returning the report and its trailing health summary.
+
+        smd prints the table on stdout but the summary line on stderr, so the
+        merged capture is the only view that carries both.
+        """
+        return self.cli_allow_fail(["smd"] + (args or []))
 
     def srun_with_exit(self, args: list[str]) -> tuple[int, str]:
         """Run srun and return (exit_code, combined stdout+stderr)."""
@@ -431,7 +677,14 @@ class SpurCluster:
         return self.cli(["squeue"] + args)
 
     def squeue_all(self) -> str:
-        return self.cli(["squeue", "-t", "all"])
+        """`squeue -t all` with a state column wide enough for every code.
+
+        Slurm's default format clips ST to two characters, which renders the
+        only three-character code, OOM, as a state that does not exist.
+        """
+        return self.cli(
+            ["squeue", "-t", "all", "-o", "%.18i %.9P %.8j %.8u %.4t %10M %6D %R"]
+        )
 
     def running_job_ids_by_name(self, name: str) -> list[int]:
         """Return running job IDs matching *name* (uses server-side name filter)."""
@@ -548,6 +801,58 @@ class SpurCluster:
                 return len(members)
         return 0
 
+    # --- HTTP wrappers (REST API, metrics) ---
+
+    def _curl(self, url: str, extra: list[str], node_index: int) -> tuple[int, str]:
+        """Run curl on a cluster node. Returns (http_status, body).
+
+        Status 0 means curl could not complete the request at all (connection
+        refused, DNS failure), which is distinct from an HTTP error response.
+        Requests go through the existing SSH channel so tests do not depend on
+        the pytest runner having network access to the cluster's HTTP ports.
+        """
+        parts = ["curl", "-sS", "-m", "20", "-w", f"{_HTTP_STATUS_SENTINEL}%{{http_code}}"]
+        parts.extend(extra)
+        parts.append(url)
+        cmd = " ".join(shlex.quote(p) for p in parts)
+        out = self.nodes[node_index].exec_allow_fail(cmd)
+        if _HTTP_STATUS_SENTINEL not in out:
+            return 0, out
+        body, _, status = out.rpartition(_HTTP_STATUS_SENTINEL)
+        try:
+            return int(status.strip()), body
+        except ValueError:
+            return 0, out
+
+    def http_get(
+        self, path: str, port: int = REST_PORT, node_index: int = 0
+    ) -> tuple[int, str]:
+        url = f"http://127.0.0.1:{port}{path}"
+        return self._curl(url, [], node_index)
+
+    def http_post(
+        self, path: str, body: str, port: int = REST_PORT, node_index: int = 0
+    ) -> tuple[int, str]:
+        url = f"http://127.0.0.1:{port}{path}"
+        return self._curl(
+            url, ["-X", "POST", "-H", "Content-Type: application/json", "-d", body],
+            node_index,
+        )
+
+    def http_delete(
+        self, path: str, port: int = REST_PORT, node_index: int = 0
+    ) -> tuple[int, str]:
+        url = f"http://127.0.0.1:{port}{path}"
+        return self._curl(url, ["-X", "DELETE"], node_index)
+
+    def curl_preflight(self, node_index: int = 0):
+        """Skip the test unless curl is available on the target node."""
+        probe = self.nodes[node_index].exec_allow_fail(
+            "command -v curl >/dev/null && echo OK || echo MISSING"
+        )
+        if "OK" not in probe:
+            pytest.skip(f"curl not found on {self.node_names[node_index]}")
+
     def sacct(self, args: list[str]) -> str:
         return self.cli(["sacct"] + args)
 
@@ -657,6 +962,100 @@ class SpurCluster:
                     f"(set SPUR_TEST_SSH_PASSWORD or configure NOPASSWD sudo)"
                 )
 
+    def sudo_cli(self, args: list[str], node_index: int = 0) -> tuple[int, str]:
+        """Run a spur CLI command as root. Returns (exit_code, output).
+
+        `spur net` writes /etc/wireguard and drives `wg-quick`, so it is only
+        meaningful with root.
+        """
+        parts = [self._sudo_prefix(), "env", f"PATH={shlex.quote(self.bin_dir)}:$PATH"]
+        parts.append(shlex.quote(f"{self.bin_dir}/{args[0]}"))
+        parts.extend(shlex.quote(a) for a in args[1:])
+        return self._exec_with_code(self.nodes[node_index], " ".join(parts))
+
+    def image_preflight(self, node_index: int = 0):
+        """Skip unless the node can build squashfs images."""
+        probe = self.nodes[node_index].exec_allow_fail(
+            "command -v mksquashfs >/dev/null && echo OK || echo MISSING"
+        )
+        if "OK" not in probe:
+            pytest.skip(
+                f"mksquashfs not found on {self.node_names[node_index]} "
+                f"(apt install squashfs-tools)"
+            )
+
+    def docker_preflight(self, node_index: int = 0):
+        probe = self.nodes[node_index].exec_allow_fail(
+            "docker info >/dev/null 2>&1 && echo OK || echo MISSING"
+        )
+        if "OK" not in probe:
+            pytest.skip(f"docker not usable on {self.node_names[node_index]}")
+
+    def wireguard_preflight(self, node_index: int = 0):
+        """Skip unless wireguard-tools is installed on the node."""
+        probe = self.nodes[node_index].exec_allow_fail(
+            "command -v wg >/dev/null && command -v wg-quick >/dev/null "
+            "&& echo OK || echo MISSING"
+        )
+        if "OK" not in probe:
+            pytest.skip(
+                f"wireguard-tools not found on {self.node_names[node_index]} "
+                f"(apt install wireguard-tools)"
+            )
+
+    def sinfo_node_names(
+        self,
+        extra_args: list[str] | None = None,
+        controller_addr: str | None = None,
+        allow_fail: bool = False,
+    ) -> set[str]:
+        """Node names reported by sinfo, one per node.
+
+        The default sinfo view collapses names into a hostlist range such as
+        ``spur-node[1-3]``, which no per-name check can match, so ask for the
+        node-oriented view and just the name field.
+        """
+        args = ["sinfo", "-N", "-h", "-o", "%n"] + list(extra_args or [])
+        run = self.cli_allow_fail if allow_fail else self.cli
+        out = run(args, controller_addr=controller_addr)
+        return {line.strip() for line in out.splitlines() if line.strip()}
+
+    def peer_resolution_preflight(self):
+        """Skip unless every controller node resolves every peer's hostname.
+
+        Deriving a Raft node_id from a hostname peer list only works where
+        name resolution is set up between the nodes; a stock host only has its
+        own name in /etc/hosts. Probing beats a 90s leaderless timeout.
+        """
+        for i in self.controller_indices:
+            for j in self.controller_indices:
+                name = self.node_names[j]
+                probe = self.nodes[i].exec_allow_fail(
+                    f"getent hosts {shlex.quote(name)} >/dev/null && echo OK || echo MISSING"
+                )
+                if "OK" not in probe:
+                    pytest.skip(
+                        f"{self.node_names[i]} cannot resolve peer {name!r}; "
+                        f"hostname-derived Raft node_id needs DNS or /etc/hosts "
+                        f"entries for every peer"
+                    )
+
+    def agent_resolution_preflight(self):
+        """Skip unless the client node resolves every node's hostname.
+
+        `sattach` builds its endpoint as ``http://<name>:6818`` from the job's
+        NodeList, so probing turns an opaque "dns error" into a stated skip.
+        """
+        for name in self.node_names:
+            probe = self.nodes[0].exec_allow_fail(
+                f"getent hosts {shlex.quote(name)} >/dev/null && echo OK || echo MISSING"
+            )
+            if "OK" not in probe:
+                pytest.skip(
+                    f"{self.node_names[0]} cannot resolve {name!r}; attaching to "
+                    f"an agent needs DNS or /etc/hosts entries for every node"
+                )
+
     def require_nodes(self, min_nodes: int):
         """Skip the test if fewer than min_nodes are configured."""
         if len(self.nodes) < min_nodes:
@@ -746,6 +1145,77 @@ class SpurCluster:
                 pytest.skip(f"hipcc could not build {hip_filename} on {node.host}")
         return remote_bin
 
+    def compile_c_fixture(
+        self,
+        source_name: str,
+        *,
+        output_name: str | None = None,
+        extra_flags: list[str] | None = None,
+        all_nodes: bool = True,
+    ) -> str:
+        """Ship and compile a C fixture with cc. Returns the remote output path.
+
+        Skips the test if cc is missing or the build fails, matching how the
+        HIP and MPI fixtures degrade on under-provisioned nodes.
+        """
+        self.ship_fixture(source_name)
+        out_name = output_name or source_name.rsplit(".", 1)[0]
+        remote_src = f"{self.remote_dir}/{source_name}"
+        remote_out = f"{self.remote_dir}/{out_name}"
+        flags = " ".join(shlex.quote(f) for f in (extra_flags or []))
+        targets = self.nodes if all_nodes else self.nodes[:1]
+
+        for i, node in enumerate(targets):
+            if "OK" not in node.exec_allow_fail(
+                "command -v cc >/dev/null && echo OK || echo MISSING"
+            ):
+                pytest.skip(f"cc not found on {self.node_names[i]}")
+            build = node.exec_allow_fail(
+                f"cc -o {shlex.quote(remote_out)} {shlex.quote(remote_src)} {flags} 2>&1"
+            )
+            if not node.exec_allow_fail(f"test -e '{remote_out}' && echo OK").strip():
+                pytest.skip(
+                    f"cc could not build {source_name} on {self.node_names[i]}:\n{build}"
+                )
+        return remote_out
+
+    def ship_ffi_library(self, all_nodes: bool = False) -> str:
+        """Upload libspur_compat.so and return its remote path.
+
+        Skips the test when the library has not been built, matching how the
+        MPI plugin degrades on an unbuilt tree.
+        """
+        local = os.environ.get("SPUR_TEST_FFI_LIB", "").strip()
+        if not local:
+            binaries_dir = os.environ.get(
+                "SPUR_TEST_BINARIES_DIR",
+                str(Path(__file__).resolve().parents[3] / "target" / "release"),
+            )
+            local = str(Path(binaries_dir) / FFI_LIB_NAME)
+        if not Path(local).is_file():
+            pytest.skip(
+                f"{FFI_LIB_NAME} not found at {local}\n"
+                "Build with: cargo build --release -p spur-ffi\n"
+                "Or set SPUR_TEST_FFI_LIB"
+            )
+        remote = f"{self.remote_dir}/{FFI_LIB_NAME}"
+        for node in self.nodes if all_nodes else self.nodes[:1]:
+            node.upload(local, remote)
+        return remote
+
+    def write_plugstack(self, entries: list[str]) -> str:
+        """Write plugstack.conf on all nodes and point spurd at it.
+
+        Each entry is a full ``required|optional <path> [args]`` line. Takes
+        effect on the next agent start, so call before start()/restart_agent().
+        """
+        path = f"{self.etc_dir}/plugstack.conf"
+        body = "\n".join(entries) + "\n"
+        for node in self.nodes:
+            node.write_file(path, body)
+        self.agent_env["SPUR_PLUGSTACK"] = path
+        return path
+
     def mpi_preflight(self, min_nodes: int = 1):
         """Skip unless MPI plugin, libpmix, and mpicc are available."""
         missing = []
@@ -806,6 +1276,14 @@ class SpurCluster:
     def mpi_plugin_dir(self) -> str:
         return str(Path(self.bin_dir).parent / "lib" / "spur")
 
+    def stop_agent(self, node_index: int = 0):
+        """Kill spurd on one node without touching the controller."""
+        self._pkill(
+            self.nodes[node_index],
+            f"{self.bin_dir}/spurd",
+            use_sudo=self.agent_as_root,
+        )
+
     def restart_agent(self, node_index: int = 0):
         """Restart spurd on one node without touching the controller."""
         node = self.nodes[node_index]
@@ -814,14 +1292,14 @@ class SpurCluster:
         node.exec(self._spurd_start_cmd(node_index))
         time.sleep(5)
 
-    def restart_controller(self):
+    def restart_controller(self, node_index: int = 0):
         """Restart spurctld without touching the agents. State is recovered
         from the Raft log on the existing state-dir. Waits for the controller
         to answer queries again (does not require nodes to be idle, since a
         suspended job keeps its allocation)."""
-        self._pkill(self.nodes[0], f"{self.bin_dir}/spurctld", use_sudo=False)
+        self._pkill(self.nodes[node_index], f"{self.bin_dir}/spurctld", use_sudo=False)
         time.sleep(1)
-        self._start_controller()
+        self._start_controller(node_index)
         deadline = time.time() + 60
         while time.time() < deadline:
             try:
@@ -965,26 +1443,96 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
                 "database_url": self._db_url,
                 "fairshare_refresh_secs": 10,
             }
+        if len(self.controller_indices) > 1:
+            if self.raft_peer_style == "hostname":
+                hosts = [self.node_names[i] for i in self.controller_indices]
+            else:
+                hosts = [self.nodes[i].host for i in self.controller_indices]
+            cfg["controller"] = {
+                "peers": [f"{h}:{RAFT_PORT}" for h in hosts],
+                "raft_listen_addr": f"[::]:{RAFT_PORT}",
+            }
         return cfg
 
     def _write_config(self):
-        cfg = self._default_config()
-        deep_merge(cfg, self.config_overrides)
-        config = tomli_w.dumps(cfg)
+        base = self._default_config()
+        deep_merge(base, self.config_overrides)
 
-        for node in self.nodes:
-            node.write_file(f"{self.etc_dir}/spur.conf", config)
+        for i, node in enumerate(self.nodes):
+            cfg = copy.deepcopy(base)
+            # IP peers give a controller no hostname to match itself against,
+            # so it needs to be told which peer it is.
+            if len(self.controller_indices) > 1 and self.raft_peer_style == "ip":
+                if i in self.controller_indices:
+                    cfg["controller"]["node_id"] = self.controller_indices.index(i) + 1
+            deep_merge(cfg, self.node_config_overrides.get(i, {}))
+            node.write_file(f"{self.etc_dir}/spur.conf", tomli_w.dumps(cfg))
 
-    def _start_controller(self):
+    def _start_controller(self, node_index: int | None = None):
         listen = f"[::]:{CONTROLLER_PORT}"
-        cmd = (
-            f"nohup '{self.bin_dir}/spurctld' "
-            f"-f '{self.etc_dir}/spur.conf' "
-            f"--listen '{listen}' --state-dir '{self.state_dir}' --log-level info -D "
-            f"> '{self.log_dir}/spurctld.log' 2>&1 & echo $!"
+        targets = self.controller_indices if node_index is None else [node_index]
+        for i in targets:
+            cmd = (
+                f"nohup '{self.bin_dir}/spurctld' "
+                f"-f '{self.etc_dir}/spur.conf' "
+                f"--listen '{listen}' --state-dir '{self.state_dir}' --log-level info -D "
+                f"> '{self.log_dir}/spurctld.log' 2>&1 & echo $!"
+            )
+            pid = self.nodes[i].exec(cmd).strip()
+            self._verify_controller_started(i, pid)
+            logger.info("spurctld started on %s (pid %s)", self.node_names[i], pid)
+
+    def _verify_controller_started(self, node_index: int, pid: str, timeout: int = 30):
+        """Fail loudly unless *our* spurctld owns the controller port.
+
+        Without this a bind failure is silent: the daemon exits and whatever
+        already held the port answers instead, so tests fail far away from the
+        cause with errors like "not the Raft leader".
+        """
+        node = self.nodes[node_index]
+        name = self.node_names[node_index]
+        if "YES" not in node.exec_allow_fail(
+            "command -v ss >/dev/null 2>&1 && echo YES || echo NO"
+        ):
+            # Without ss we can only tell whether the process stayed up.
+            time.sleep(2)
+            if "ALIVE" not in node.exec_allow_fail(
+                f"kill -0 {pid} 2>/dev/null && echo ALIVE || echo DEAD"
+            ):
+                raise RuntimeError(
+                    f"spurctld did not come up on {name}:\n"
+                    f"{self.spurctld_log(node_index)[-2000:]}"
+                )
+            return
+
+        deadline = time.time() + timeout
+        foreign = ""
+        while time.time() < deadline:
+            alive = "ALIVE" in node.exec_allow_fail(
+                f"kill -0 {pid} 2>/dev/null && echo ALIVE || echo DEAD"
+            )
+            if not alive:
+                break
+            listeners = node.exec_allow_fail(
+                f"ss -ltnp 2>/dev/null | grep ':{CONTROLLER_PORT} ' || true"
+            ).strip()
+            if f"pid={pid}," in listeners:
+                return
+            # A previous controller may still be releasing the port, so keep
+            # the holder around and only report it if it outlives the timeout.
+            foreign = listeners
+            time.sleep(0.5)
+
+        if foreign:
+            raise RuntimeError(
+                f"spurctld on {name} never acquired port {CONTROLLER_PORT}; it "
+                f"is held by another process:\n{foreign}\n"
+                f"Kill the stale daemon before running the e2e suite."
+            )
+        raise RuntimeError(
+            f"spurctld did not come up on {name}:\n"
+            f"{self.spurctld_log(node_index)[-2000:]}"
         )
-        pid = self.nodes[0].exec(cmd).strip()
-        logger.info("spurctld started on %s (pid %s)", self.node_names[0], pid)
 
     def _start_postgres(self):
         """Bring up Postgres (Docker) on node 0. Accounting runs inside spurctld."""
@@ -1025,8 +1573,10 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
         prefix = self._sudo_prefix() if use_sudo else ""
         node.exec_allow_fail(f"{prefix}pkill -f '{pattern}' 2>/dev/null || true")
 
-    def _kill_controller(self):
-        self._pkill(self.nodes[0], f"{self.bin_dir}/spurctld")
+    def _kill_controller(self, node_index: int | None = None):
+        targets = self.controller_indices if node_index is None else [node_index]
+        for i in targets:
+            self._pkill(self.nodes[i], f"{self.bin_dir}/spurctld")
 
     def _kill_agents(self, use_sudo: bool = False, broad: bool = False):
         for node in self.nodes:
@@ -1044,10 +1594,18 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
         hostname = self.node_names[node_index]
         address = node.host
         agent_listen = f"0.0.0.0:{AGENT_PORT}"
+        # `env` must sit between sudo and the binary so the vars survive the
+        # privilege drop; `nohup VAR=x cmd` would try to exec "VAR=x".
+        env_prefix = ""
+        if self.agent_env:
+            assignments = " ".join(
+                f"{k}={shlex.quote(v)}" for k, v in self.agent_env.items()
+            )
+            env_prefix = f"env {assignments} "
         spurd_bin = (
-            f"{self._sudo_prefix()}'{self.bin_dir}/spurd'"
+            f"{self._sudo_prefix()}{env_prefix}'{self.bin_dir}/spurd'"
             if self.agent_as_root
-            else f"'{self.bin_dir}/spurd'"
+            else f"{env_prefix}'{self.bin_dir}/spurd'"
         )
         label_args = ""
         labels = self.agent_labels.get(node_index, {})
@@ -1120,8 +1678,14 @@ def parse_job_id(sbatch_output: str) -> int | None:
 
 
 def job_state(squeue_output: str, job_id: int) -> str | None:
-    """Parse job state from squeue -t all output."""
-    valid_states = {"PD", "R", "CD", "CG", "F", "CA", "TO", "NF", "PR", "S"}
+    """Parse job state from squeue -t all output.
+
+    Must list every code JobState::code() can emit: an unlisted state reads as
+    "no state yet" and turns a correct result into a polling timeout.
+    """
+    valid_states = {
+        "PD", "R", "CG", "CD", "F", "CA", "TO", "NF", "PR", "S", "DL", "OOM",
+    }
     id_str = str(job_id)
     for line in squeue_output.splitlines()[1:]:
         fields = line.split()
@@ -1148,6 +1712,12 @@ def wait_job_state(
     )
 
 
+# Mirrors JobState::is_terminal(); Preempted is excluded there because it may
+# still requeue. A code missing here does not just slow the poll -- the job is
+# purged from the queue and its last transient state is returned instead.
+TERMINAL_STATES = {"CD", "F", "CA", "TO", "NF", "DL", "OOM"}
+
+
 def wait_job(cluster: SpurCluster, job_id: int, timeout: int = 120) -> str:
     """
     Wait for a job to reach a terminal state. Returns the final state string.
@@ -1160,7 +1730,7 @@ def wait_job(cluster: SpurCluster, job_id: int, timeout: int = 120) -> str:
     while time.time() < deadline:
         sq = cluster.squeue_all()
         state = job_state(sq, job_id)
-        if state in ("CD", "F", "CA", "TO"):
+        if state in TERMINAL_STATES:
             return state
         if state is None:
             if seen:
