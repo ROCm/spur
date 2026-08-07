@@ -14,7 +14,7 @@ import time
 
 import pytest
 
-from cluster import parse_job_id, wait_job, wait_job_state
+from cluster import expand_hostlist, parse_job_id, wait_job, wait_job_state
 
 CGROUP_ROOT = "/sys/fs/cgroup/spur"
 
@@ -23,35 +23,64 @@ CGROUP_ROOT = "/sys/fs/cgroup/spur"
 MEMORY_HOG = "#!/bin/bash\nhead -c 512M /dev/zero | tail -c 512M > /dev/null\n"
 
 
-@pytest.fixture
-def rootful_cluster(unstarted_cluster):
-    """A cluster whose agents run as root, so cgroup limits are applied."""
-    cluster = unstarted_cluster
+def _start_rootful(cluster, **start_kwargs):
+    """Start *cluster* with root agents, so cgroup limits are applied."""
     cluster.root_agent_preflight()
     probe = cluster.nodes[0].exec_allow_fail(
         "test -f /sys/fs/cgroup/cgroup.controllers && echo V2 || echo NO"
     )
     if "V2" not in probe:
         pytest.skip("cgroup v2 unified hierarchy is not mounted")
-    cluster.start(agent_as_root=True)
+    # Job ids restart at 1 for every cluster while cgroup paths are global to
+    # the host, so a leftover job_N from an earlier test reads as this one's.
+    for node in cluster.nodes:
+        node.exec_allow_fail(
+            f"{cluster._sudo_prefix()}bash -c 'for cg in {CGROUP_ROOT}/job_*; do "
+            f'[ -d "$cg" ] || continue; echo 1 > "$cg/cgroup.kill" 2>/dev/null; '
+            f"rmdir \"$cg\" 2>/dev/null; done'"
+        )
+    cluster.start(agent_as_root=True, **start_kwargs)
     return cluster
 
 
-def _read_cgroup(cluster, job_id: int, name: str) -> str:
-    """Read a cgroup file for a job from whichever node is running it."""
+@pytest.fixture
+def rootful_cluster(unstarted_cluster):
+    return _start_rootful(unstarted_cluster)
+
+
+@pytest.fixture
+def swap_constrained_cluster(unstarted_cluster):
+    """A rootful cluster that also caps swap."""
+    return _start_rootful(
+        unstarted_cluster,
+        config_overrides={"cgroup": {"constrain_swap_space": True}},
+    )
+
+
+def _job_node(cluster, job_id: int):
+    """The node running *job_id*.
+
+    Reading whichever node happens to hold job_N's cgroup picks up an earlier
+    test's leftovers as readily as this job's own.
+    """
+    show = cluster.scontrol("show", "job", str(job_id))
+    match = re.search(r"NodeList=(\S+)", show)
+    assert match, f"job {job_id} has no NodeList:\n{show}"
+    names = expand_hostlist(match.group(1))
+    assert names, f"job {job_id} has an empty NodeList:\n{show}"
+    return cluster.nodes[cluster.node_names.index(names[0])]
+
+
+def _read_cgroup(cluster, node, job_id: int, name: str) -> str:
     path = f"{CGROUP_ROOT}/job_{job_id}/{name}"
-    sudo = cluster._sudo_prefix()
-    for node in cluster.nodes:
-        out = node.exec_allow_fail(f"{sudo}cat '{path}' 2>/dev/null")
-        if out.strip():
-            return out.strip()
-    return ""
+    out = node.exec_allow_fail(f"{cluster._sudo_prefix()}cat '{path}' 2>/dev/null")
+    return out.strip()
 
 
-def _wait_cgroup(cluster, job_id: int, name: str, timeout: int = 30) -> str:
+def _wait_cgroup(cluster, node, job_id: int, name: str, timeout: int = 30) -> str:
     deadline = time.time() + timeout
     while time.time() < deadline:
-        value = _read_cgroup(cluster, job_id, name)
+        value = _read_cgroup(cluster, node, job_id, name)
         if value:
             return value
         time.sleep(1)
@@ -64,7 +93,7 @@ def _run_and_read_cgroup(cluster, name: str, args: list[str], cgroup_file: str) 
     assert job_id is not None, f"{name} was not submitted"
     wait_job_state(cluster, job_id, "R", timeout=90)
     try:
-        return _wait_cgroup(cluster, job_id, cgroup_file)
+        return _wait_cgroup(cluster, _job_node(cluster, job_id), job_id, cgroup_file)
     finally:
         cluster.cli_allow_fail(["scancel", str(job_id)])
 
@@ -111,62 +140,103 @@ class TestCgroupLimits:
             f"expected an unset memory.max for a --mem-per-cpu job, got {value}"
         )
 
+    def test_swap_is_left_alone_by_default(self, rootful_cluster):
+        """Capping swap kills jobs that used to survive on a swap-backed node,
+        so it stays opt-in."""
+        value = _run_and_read_cgroup(
+            rootful_cluster, "cg-swap-off", ["--mem", "512M"], "memory.swap.max"
+        )
+        assert value == "max", (
+            f"expected an untouched memory.swap.max without "
+            f"cgroup.constrain_swap_space, got {value}"
+        )
+
+    def test_constrain_swap_space_denies_swap(self, swap_constrained_cluster):
+        value = _run_and_read_cgroup(
+            swap_constrained_cluster, "cg-swap-on", ["--mem", "512M"], "memory.swap.max"
+        )
+        assert int(value) == 0, (
+            f"constrain_swap_space with the default allowance should deny swap "
+            f"outright, got {value}"
+        )
+
+    def test_allowed_swap_space_scales_with_the_allocation(self, unstarted_cluster):
+        cluster = _start_rootful(
+            unstarted_cluster,
+            config_overrides={
+                "cgroup": {"constrain_swap_space": True, "allowed_swap_space": 50}
+            },
+        )
+        value = _run_and_read_cgroup(
+            cluster, "cg-swap-pct", ["--mem", "512M"], "memory.swap.max"
+        )
+        assert int(value) == 256 * 1024 * 1024, (
+            f"memory.swap.max should be 50% of --mem, got {value}"
+        )
+
     def test_cgroup_is_removed_after_the_job_ends(self, rootful_cluster):
         script = rootful_cluster.write_file("cg-clean.sh", "#!/bin/bash\nsleep 5\n")
         job_id = parse_job_id(
             rootful_cluster.sbatch(["-J", "cg-clean", "--mem", "256M", script])
         )
         assert job_id is not None
+        wait_job_state(rootful_cluster, job_id, "R", timeout=90)
+        node = _job_node(rootful_cluster, job_id)
         wait_job(rootful_cluster, job_id, timeout=90)
 
-        sudo = rootful_cluster._sudo_prefix()
-        for node in rootful_cluster.nodes:
-            left = node.exec_allow_fail(
-                f"{sudo}test -d '{CGROUP_ROOT}/job_{job_id}' && echo LEFT || echo GONE"
-            )
-            assert "LEFT" not in left, (
-                f"cgroup for job {job_id} outlived the job on {node.host}"
-            )
+        left = node.exec_allow_fail(
+            f"{rootful_cluster._sudo_prefix()}test -d '{CGROUP_ROOT}/job_{job_id}' "
+            f"&& echo LEFT || echo GONE"
+        )
+        assert "LEFT" not in left, (
+            f"cgroup for job {job_id} outlived the job on {node.host}"
+        )
 
 
 class TestOomDetection:
-    def test_memory_hog_is_reported_out_of_memory(self, rootful_cluster):
+    """OOM only happens once swap is capped: with swap available the kernel
+    pages the overflow out and the job runs to completion over its --mem."""
+
+    def test_memory_hog_is_reported_out_of_memory(self, swap_constrained_cluster):
         """A job that blows past --mem must land in OOM, not a generic failure
         -- users triage on that state."""
-        script = rootful_cluster.write_file("oom.sh", MEMORY_HOG)
-        job_id = parse_job_id(
-            rootful_cluster.sbatch(["-J", "oom", "--mem", "64M", script])
-        )
+        cluster = swap_constrained_cluster
+        script = cluster.write_file("oom.sh", MEMORY_HOG)
+        job_id = parse_job_id(cluster.sbatch(["-J", "oom", "--mem", "64M", script]))
         assert job_id is not None
 
-        state = wait_job(rootful_cluster, job_id, timeout=180)
+        state = wait_job(cluster, job_id, timeout=180)
         assert state == "OOM", (
             f"expected OOM, got {state}:\n"
-            f"{rootful_cluster.scontrol('show', 'job', str(job_id))}"
+            f"{cluster.scontrol('show', 'job', str(job_id))}"
         )
 
-    def test_oom_reason_is_surfaced_in_scontrol(self, rootful_cluster):
-        script = rootful_cluster.write_file("oom-reason.sh", MEMORY_HOG)
+    def test_oom_reason_is_surfaced_in_scontrol(self, swap_constrained_cluster):
+        cluster = swap_constrained_cluster
+        script = cluster.write_file("oom-reason.sh", MEMORY_HOG)
         job_id = parse_job_id(
-            rootful_cluster.sbatch(["-J", "oom-reason", "--mem", "64M", script])
+            cluster.sbatch(["-J", "oom-reason", "--mem", "64M", script])
         )
         assert job_id is not None
-        wait_job(rootful_cluster, job_id, timeout=180)
+        wait_job(cluster, job_id, timeout=180)
 
-        detail = rootful_cluster.scontrol("show", "job", str(job_id))
+        detail = cluster.scontrol("show", "job", str(job_id))
         assert "OUT_OF_MEMORY" in detail or "OutOfMemory" in detail, (
             f"scontrol must explain the OOM:\n{detail}"
         )
 
-    def test_the_same_job_completes_under_a_generous_limit(self, rootful_cluster):
+    def test_the_same_job_completes_under_a_generous_limit(
+        self, swap_constrained_cluster
+    ):
         """Guards the OOM tests against a false positive: the workload itself
         is fine, it is the limit that kills it."""
-        script = rootful_cluster.write_file("under-limit.sh", MEMORY_HOG)
+        cluster = swap_constrained_cluster
+        script = cluster.write_file("under-limit.sh", MEMORY_HOG)
         job_id = parse_job_id(
-            rootful_cluster.sbatch(["-J", "under-limit", "--mem", "2048M", script])
+            cluster.sbatch(["-J", "under-limit", "--mem", "2048M", script])
         )
         assert job_id is not None
-        assert wait_job(rootful_cluster, job_id, timeout=180) in ("CD", "GONE")
+        assert wait_job(cluster, job_id, timeout=180) in ("CD", "GONE")
 
 
 class TestCpuEnvironment:

@@ -13,7 +13,7 @@ import re
 
 import pytest
 
-from cluster import parse_job_id, wait_job, wait_job_state
+from cluster import expand_hostlist, parse_job_id, wait_job, wait_job_state
 
 
 def switches_for(cluster) -> list[dict]:
@@ -40,11 +40,11 @@ def tree_cluster(unstarted_cluster):
     return unstarted_cluster
 
 
-def job_nodelist(cluster, job_id: int) -> str:
+def job_nodes(cluster, job_id: int) -> set[str]:
     out = cluster.scontrol("show", "job", str(job_id))
     match = re.search(r"NodeList=(\S+)", out)
     assert match, f"scontrol reported no NodeList for job {job_id}:\n{out}"
-    return match.group(1)
+    return set(expand_hostlist(match.group(1)))
 
 
 def submit_multinode(cluster, name: str, nodes: int, extra: list[str]) -> int:
@@ -92,11 +92,11 @@ class TestPlacement:
         job_id = submit_multinode(tree_cluster, "topo-pack", 2, ["--topology=tree"])
         try:
             wait_job_state(tree_cluster, job_id, "R", timeout=90)
-            nodelist = job_nodelist(tree_cluster, job_id)
             rack1 = set(tree_cluster.node_names[1:])
-            placed = set(re.split(r"[,\s]+", nodelist))
+            placed = job_nodes(tree_cluster, job_id)
             assert placed <= rack1, (
-                f"a 2-node job must land inside rack1 {sorted(rack1)}, got {nodelist}"
+                f"a 2-node job must land inside rack1 {sorted(rack1)}, "
+                f"got {sorted(placed)}"
             )
         finally:
             tree_cluster.cli_allow_fail(["scancel", str(job_id)])
@@ -105,7 +105,7 @@ class TestPlacement:
         job_id = submit_multinode(tree_cluster, "topo-block", 2, ["--topology=block"])
         try:
             wait_job_state(tree_cluster, job_id, "R", timeout=90)
-            placed = set(re.split(r"[,\s]+", job_nodelist(tree_cluster, job_id)))
+            placed = job_nodes(tree_cluster, job_id)
             assert placed <= set(tree_cluster.node_names[1:]), (
                 f"--topology=block must pack like tree, got {sorted(placed)}"
             )
@@ -119,8 +119,7 @@ class TestPlacement:
         job_id = submit_multinode(tree_cluster, "topo-span", count, ["--topology=tree"])
         try:
             wait_job_state(tree_cluster, job_id, "R", timeout=120)
-            placed = set(re.split(r"[,\s]+", job_nodelist(tree_cluster, job_id)))
-            assert placed == set(tree_cluster.node_names)
+            assert job_nodes(tree_cluster, job_id) == set(tree_cluster.node_names)
         finally:
             tree_cluster.cli_allow_fail(["scancel", str(job_id)])
 
@@ -133,7 +132,7 @@ class TestPlacement:
         )
         try:
             wait_job_state(tree_cluster, job_id, "R", timeout=90)
-            assert target in job_nodelist(tree_cluster, job_id)
+            assert job_nodes(tree_cluster, job_id) == {target}
         finally:
             tree_cluster.cli_allow_fail(["scancel", str(job_id)])
 
@@ -157,7 +156,7 @@ class TestPlacement:
         job_id = submit_multinode(tree_cluster, "topo-optout", 2, [])
         try:
             wait_job_state(tree_cluster, job_id, "R", timeout=90)
-            placed = set(re.split(r"[,\s]+", job_nodelist(tree_cluster, job_id)))
+            placed = job_nodes(tree_cluster, job_id)
             assert len(placed) == 2
             assert placed <= set(tree_cluster.node_names)
         finally:

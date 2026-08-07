@@ -10,14 +10,14 @@ how equal-weight jobs distribute across idle nodes.
 import re
 import time
 
-from cluster import parse_job_id, wait_job, wait_job_state
+from cluster import expand_hostlist, parse_job_id, wait_job, wait_job_state
 
 
 def _job_nodes(cluster, job_id: int) -> list[str]:
     show = cluster.scontrol("show", "job", str(job_id))
     match = re.search(r"NodeList=(\S+)", show)
     assert match, f"job {job_id} has no NodeList:\n{show}"
-    return [n for n in match.group(1).split(",") if n]
+    return expand_hostlist(match.group(1))
 
 
 def _split_partitions(cluster) -> dict:

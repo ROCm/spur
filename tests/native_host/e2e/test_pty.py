@@ -55,6 +55,7 @@ class TestSrunPty:
 
 class TestSattach:
     def test_output_only_streams_running_job(self, cluster):
+        cluster.agent_resolution_preflight()
         job_id = _start_long_job(
             cluster,
             "sattach-stream",
