@@ -3303,6 +3303,49 @@ impl ClusterManager {
         }
     }
 
+    /// Evict finished jobs whose end_time is older than the retention window,
+    /// bounding controller memory. No-op when nothing has aged out.
+    pub fn evict_expired_terminal_jobs(&self) {
+        // Floor above the reconcile interval so a job survives at least one
+        // accounting reconcile pass before it can be evicted (retention 0 included).
+        let retention = self
+            .config()
+            .controller
+            .terminal_job_retention_secs
+            .max(crate::accounting::RECONCILE_INTERVAL_SECS);
+        let before = Utc::now() - chrono::Duration::seconds(retention as i64);
+        let jobs = self.jobs.read();
+        // Spare a target still referenced by a live job's dependency: dropping it
+        // makes resolve_target_state return None, which cancels/early-releases dependents.
+        let mut referenced: HashSet<JobId> = HashSet::new();
+        for j in jobs.values().filter(|j| !j.state.is_finalized()) {
+            for dep in spur_core::dependency::parse_dependencies(&j.spec.dependency) {
+                if let Some(id) = dep.target_job_id() {
+                    referenced.insert(id);
+                }
+            }
+        }
+        // is_finalized is load-bearing, not redundant: end_time survives a
+        // requeue, so a re-dispatched job's stale end_time alone would reap it.
+        let job_ids: Vec<JobId> = jobs
+            .iter()
+            .filter(|(id, j)| {
+                j.state.is_finalized()
+                    && j.end_time.is_some_and(|t| t < before)
+                    && !referenced.contains(id)
+                    && j.spec.array_job_id.is_none_or(|p| !referenced.contains(&p))
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        drop(jobs);
+        if job_ids.is_empty() {
+            return;
+        }
+        if let Err(e) = self.propose(WalOperation::EvictTerminalJobs { job_ids }) {
+            warn!(error = %e, "failed to evict expired terminal jobs");
+        }
+    }
+
     /// Cancel running jobs whose reservation window has ended (after optional grace).
     pub fn enforce_reservation_end_times(&self) {
         let now = Utc::now();
@@ -4845,6 +4888,21 @@ impl ClusterManager {
                 }
                 k0s.reset_requested = *reset_requested;
             }
+            WalOperation::EvictTerminalJobs { job_ids } => {
+                // Re-check finalized: spare an id requeued between propose and
+                // apply. Deterministic — every replica applies in the same order.
+                let evicted: HashSet<JobId> = job_ids
+                    .iter()
+                    .filter(|id| jobs.get(id).is_some_and(|j| j.state.is_finalized()))
+                    .copied()
+                    .collect();
+                if !evicted.is_empty() {
+                    jobs.retain(|id, _| !evicted.contains(id));
+                    self.steps
+                        .write()
+                        .retain(|_, s| !evicted.contains(&s.job_id));
+                }
+            }
         }
         self.next_job_id.store(next_id, Ordering::Relaxed);
         response
@@ -4882,6 +4940,10 @@ struct ClusterSnapshot {
     /// restored (see restore_from_snapshot).
     #[serde(default)]
     k0s: spur_core::k0s::K0sClusterState,
+    /// Job-id high-water mark. Eviction removes the high-id tail, so restoring
+    /// from survivors alone would reissue used ids; restore takes max(rebuilt, this).
+    #[serde(default)]
+    next_job_id: JobId,
 }
 
 impl ClusterManager {
@@ -4947,6 +5009,7 @@ impl StateMachineApply for ClusterManager {
             tokens: self.tokens.read().values().cloned().collect(),
             burst_buffer_total_gb: *self.burst_buffer_total_gb.read(),
             k0s: self.k0s.read().clone(),
+            next_job_id: self.next_job_id.load(Ordering::Relaxed),
         };
         serde_json::to_vec(&snap).map_err(Into::into)
     }
@@ -4954,7 +5017,9 @@ impl StateMachineApply for ClusterManager {
     fn restore_from_snapshot(&self, data: &[u8]) -> Result<(), anyhow::Error> {
         let snap = serde_json::from_slice::<ClusterSnapshot>(data)?;
 
-        let mut next_id = self.config().controller.first_job_id;
+        // Fold in the persisted high-water mark so evicting the high-id tail
+        // can't lower next_job_id and reissue used ids (absent → 0, harmless).
+        let mut next_id = self.config().controller.first_job_id.max(snap.next_job_id);
         let mut jobs = self.jobs.write();
         jobs.clear();
         for job in snap.jobs {
@@ -6259,6 +6324,324 @@ mod tests {
         let node = cm.get_node("node1").unwrap();
         assert_eq!(node.alloc_resources.cpus, 0);
         assert_eq!(node.alloc_resources.memory_mb, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_terminal_jobs_drops_only_aged_terminal_jobs() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("done")),
+        });
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Cancelled,
+        });
+        assert!(
+            cm.get_job(1).unwrap().state.is_terminal(),
+            "job 1 is terminal"
+        );
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 2,
+            spec: Box::new(basic_spec("running")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            2,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 3,
+            spec: Box::new(basic_spec("pending")),
+        });
+        // A job stranded in Preempted (a rare requeue-strand): finalized with an
+        // end_time, so it must be reapable even though it isn't is_terminal().
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 4,
+            spec: Box::new(basic_spec("preempted")),
+        });
+        {
+            let mut jobs = cm.jobs.write();
+            let j = jobs.get_mut(&4).unwrap();
+            j.state = JobState::Preempted;
+            j.end_time = Some(chrono::Utc::now());
+        }
+        assert!(!cm.get_job(4).unwrap().state.is_terminal());
+        assert!(cm.get_job(4).unwrap().state.is_finalized());
+
+        // A step on each of the terminal (1) and live (2) jobs: eviction must
+        // drop the evicted job's step and keep the live one's.
+        let step = |job_id: JobId| JobStep {
+            job_id,
+            step_id: 0,
+            name: "s".into(),
+            state: StepState::Running,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            resources: scalar_alloc(1, 0),
+            nodes: vec!["node1".into()],
+            distribution: spur_core::step::TaskDistribution::Block,
+            start_time: None,
+            end_time: None,
+            exit_code: None,
+        };
+        cm.steps.write().insert((1, 0), step(1));
+        cm.steps.write().insert((2, 0), step(2));
+
+        // Apply removes only ids still finalized; live ids 2 and 3 are no-ops
+        // even when named (a job requeued between propose and apply).
+        cm.apply_operation(&WalOperation::EvictTerminalJobs {
+            job_ids: vec![1, 2, 3, 4],
+        });
+        assert!(
+            cm.get_job(1).is_none(),
+            "named terminal job must be evicted"
+        );
+        assert!(cm.get_job(2).is_some(), "running job must be spared");
+        assert!(cm.get_job(3).is_some(), "pending job must be spared");
+        assert!(
+            cm.get_job(4).is_none(),
+            "named finalized (Preempted) job must be evicted"
+        );
+        assert!(
+            cm.steps.read().get(&(1, 0)).is_none(),
+            "evicted job's step must be removed"
+        );
+        assert!(
+            cm.steps.read().get(&(2, 0)).is_some(),
+            "live job's step must be kept"
+        );
+    }
+
+    // Apply-time state, not per-replica end_time, decides eviction: a replica
+    // where the id requeued before apply spares it; skew never changes the set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_terminal_jobs_is_replica_deterministic() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let cm_a = test_cluster(&dir_a).await;
+        let cm_b = test_cluster(&dir_b).await;
+
+        for cm in [&cm_a, &cm_b] {
+            cm.apply_operation(&WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(basic_spec("done")),
+            });
+            cm.apply_operation(&WalOperation::JobComplete {
+                job_id: 1,
+                exit_code: 0,
+                state: JobState::Cancelled,
+            });
+        }
+        // Divergent local end_times: skew must not change the outcome, since the
+        // apply guard reads state, not end_time.
+        cm_a.jobs.write().get_mut(&1).unwrap().end_time =
+            Some(chrono::Utc::now() - chrono::Duration::hours(2));
+        cm_b.jobs.write().get_mut(&1).unwrap().end_time =
+            Some(chrono::Utc::now() + chrono::Duration::hours(2));
+
+        let entry = WalOperation::EvictTerminalJobs { job_ids: vec![1] };
+        cm_a.apply_operation(&entry);
+        cm_b.apply_operation(&entry);
+        assert!(cm_a.get_job(1).is_none(), "finalized id is evicted");
+        assert!(
+            cm_b.get_job(1).is_none(),
+            "end_time skew must not change the evicted set",
+        );
+
+        // A replica where the id left the finalized set before apply spares it:
+        // the guard is what makes eviction converge with real state, not the id.
+        let dir_c = TempDir::new().unwrap();
+        let cm_c = test_cluster(&dir_c).await;
+        cm_c.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("requeued")),
+        });
+        cm_c.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm_c.apply_operation(&entry);
+        assert!(
+            cm_c.get_job(1).is_some(),
+            "an id no longer finalized at apply is spared",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_expired_terminal_jobs_honors_retention_window() {
+        // A large retention window spares a fresh terminal job: guards against a
+        // producer that proposes everything regardless of age.
+        let dir2 = TempDir::new().unwrap();
+        let mut cfg2 = test_config();
+        cfg2.controller.terminal_job_retention_secs = 86_400;
+        let cm2 = test_cluster_with_config(&dir2, cfg2).await;
+        cm2.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("fresh")),
+        });
+        cm2.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Cancelled,
+        });
+        cm2.evict_expired_terminal_jobs();
+        assert!(
+            cm2.get_job(1).is_some(),
+            "a fresh terminal job within the retention window is spared"
+        );
+
+        // An aged job (end_time well past the window) is evicted.
+        cm2.jobs.write().get_mut(&1).unwrap().end_time =
+            Some(chrono::Utc::now() - chrono::Duration::days(2));
+        cm2.evict_expired_terminal_jobs();
+        assert!(
+            cm2.get_job(1).is_none(),
+            "a terminal job older than the retention window is evicted"
+        );
+    }
+
+    // retention below the reconcile interval is floored so a job survives at
+    // least one reconcile pass, else its DB row strands as RUNNING in sacct.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_floors_retention_to_reconcile_interval() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.controller.terminal_job_retention_secs = 0;
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("done")),
+        });
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Cancelled,
+        });
+
+        // Just completed: within the floored window, so retention 0 does not
+        // evict on the next tick.
+        cm.evict_expired_terminal_jobs();
+        assert!(
+            cm.get_job(1).is_some(),
+            "retention 0 must be floored above the reconcile interval, not evict immediately"
+        );
+
+        // Older than the floor: now evictable.
+        cm.jobs.write().get_mut(&1).unwrap().end_time = Some(
+            chrono::Utc::now()
+                - chrono::Duration::seconds(crate::accounting::RECONCILE_INTERVAL_SECS as i64 + 1),
+        );
+        cm.evict_expired_terminal_jobs();
+        assert!(
+            cm.get_job(1).is_none(),
+            "a job past the floored window is evicted"
+        );
+    }
+
+    // A target referenced by a pending job's dependency must not be evicted:
+    // dropping it would cancel the afterok dependent before its trigger fires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_spares_jobs_referenced_by_pending_dependency() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.controller.terminal_job_retention_secs = 0;
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        // Target runs, completes, and ages out of the window.
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 100,
+            spec: Box::new(basic_spec("target")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            100,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 100,
+            exit_code: 0,
+            state: JobState::Completed,
+        });
+        cm.jobs.write().get_mut(&100).unwrap().end_time =
+            Some(chrono::Utc::now() - chrono::Duration::days(1));
+
+        // Pending child depends on it (begin-time hold, not a scheduling hold).
+        let mut child = basic_spec("child");
+        child.dependency = vec!["afterok:100".into()];
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 101,
+            spec: Box::new(child),
+        });
+
+        cm.evict_expired_terminal_jobs();
+        assert!(
+            cm.get_job(100).is_some(),
+            "a target referenced by a pending afterok dependent must be spared"
+        );
+
+        // Once the child is gone, the target is evictable.
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 101,
+            exit_code: 0,
+            state: JobState::Cancelled,
+        });
+        cm.jobs.write().get_mut(&101).unwrap().end_time =
+            Some(chrono::Utc::now() - chrono::Duration::days(1));
+        cm.evict_expired_terminal_jobs();
+        assert!(
+            cm.get_job(100).is_none(),
+            "with no live dependent, the aged target is evicted"
+        );
+    }
+
+    // Eviction removes the high-id tail; a snapshot+restore must not lower
+    // next_job_id and reissue a used id (which would clobber the sacct row).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_restore_preserves_next_job_id_after_eviction() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        // Allocate ids 1 and 2. id1 survives; the high-id tail (id2) completes
+        // and is evicted, so rebuild-from-survivors alone would yield id1+1.
+        let id1 = cm.next_job_id.fetch_add(1, Ordering::SeqCst);
+        let id2 = cm.next_job_id.fetch_add(1, Ordering::SeqCst);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: id1,
+            spec: Box::new(basic_spec("survivor")),
+        });
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: id2,
+            spec: Box::new(basic_spec("high")),
+        });
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: id2,
+            exit_code: 0,
+            state: JobState::Cancelled,
+        });
+        let next_before = cm.next_job_id.load(Ordering::Relaxed);
+        cm.apply_operation(&WalOperation::EvictTerminalJobs { job_ids: vec![id2] });
+        assert!(cm.get_job(id2).is_none(), "high-id job evicted");
+
+        // Snapshot AFTER eviction: id2's JobSubmit is compacted away, so the map
+        // no longer contains the high id.
+        let snap = cm.snapshot_state().unwrap();
+
+        // Restore into a fresh controller: surviving jobs alone would rebuild
+        // next_job_id below next_before, reissuing id2.
+        let dir2 = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dir2).await;
+        cm2.restore_from_snapshot(&snap).unwrap();
+        assert!(
+            cm2.next_job_id.load(Ordering::Relaxed) >= next_before,
+            "next_job_id must not regress below {next_before} after evicting id {id2} (was {}), id {id1} survives",
+            cm2.next_job_id.load(Ordering::Relaxed)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14975,6 +15358,7 @@ mod tests {
             tokens: Vec::new(),
             burst_buffer_total_gb: 0,
             k0s: spur_core::k0s::K0sClusterState::default(),
+            next_job_id: 0,
         };
         let bytes = serde_json::to_vec(&snap).unwrap();
         cm.restore_from_snapshot(&bytes).unwrap();

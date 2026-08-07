@@ -262,6 +262,12 @@ pub enum WalOperation {
     NodeK0sClear {
         name: String,
     },
+
+    /// Evict the named terminal jobs to bound controller memory. The leader
+    /// resolves the aged-out set so every replica evicts identically.
+    EvictTerminalJobs {
+        job_ids: Vec<JobId>,
+    },
 }
 
 impl WalOperation {
@@ -821,6 +827,22 @@ mod deregistration_wal_tests {
             WalOperation::NodeRemove { name, reason } => {
                 assert_eq!(name, "n0");
                 assert!(reason.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // Frozen on-wire shape; a new field without #[serde(default)] fails here
+    // instead of crashing a controller replaying this entry after upgrade.
+    #[test]
+    fn evict_terminal_jobs_frozen_payload_still_deserializes() {
+        const EVICT: &str = r#"{"EvictTerminalJobs":{"job_ids":[7,42]}}"#;
+        let op: WalOperation = serde_json::from_str(EVICT).expect(
+            "frozen EvictTerminalJobs must deserialize; a new field needs #[serde(default)]",
+        );
+        match op {
+            WalOperation::EvictTerminalJobs { job_ids } => {
+                assert_eq!(job_ids, vec![7, 42]);
             }
             _ => panic!("wrong variant"),
         }

@@ -16,6 +16,10 @@ use crate::raft::RaftHandle;
 
 use super::db::{self, AccountingRowState};
 
+/// How often the reconcile pass runs. Terminal-job eviction floors its
+/// effective retention above this so a job's DB row can always be repaired first.
+pub const RECONCILE_INTERVAL_SECS: u64 = 120;
+
 /// Periodically re-issue accounting writes for jobs whose accounting DB
 /// record is missing or stale relative to the in-memory job store. Closes
 /// the gap left by a `notify_job_start`/`notify_job_end` write that

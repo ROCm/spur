@@ -320,10 +320,21 @@ pub struct ControllerConfig {
     /// the inverse `SchedulerParameters=nohold_on_prolog_fail`.
     #[serde(default = "default_hold_on_prolog_fail")]
     pub hold_on_prolog_fail: bool,
+
+    /// Seconds a terminal job stays in controller memory before eviction (default
+    /// 3600). `sacct` history is unaffected but `scontrol show job` stops finding
+    /// it after the window; runs once per `scheduler.interval_secs` and is floored
+    /// to the accounting reconcile interval so a job's DB row can be repaired first.
+    #[serde(default = "default_terminal_job_retention_secs")]
+    pub terminal_job_retention_secs: u64,
 }
 
 fn default_max_batch_requeue() -> u32 {
     5
+}
+
+fn default_terminal_job_retention_secs() -> u64 {
+    3600
 }
 
 fn default_hold_on_prolog_fail() -> bool {
@@ -338,6 +349,10 @@ fn default_max_launch_backoff_secs() -> u64 {
 /// day is not a retry policy, and larger values push the computed hold instant
 /// out of chrono's representable range.
 pub const MAX_LAUNCH_BACKOFF_SECS: u64 = 86_400;
+
+/// Upper bound for `terminal_job_retention_secs` (one year). Operational
+/// guardrail: retaining terminal jobs longer defeats the memory bound.
+pub const MAX_TERMINAL_JOB_RETENTION_SECS: u64 = 366 * 24 * 60 * 60;
 
 fn default_listen_addr() -> String {
     "[::]:6817".into()
@@ -374,6 +389,7 @@ impl Default for ControllerConfig {
             max_batch_requeue: default_max_batch_requeue(),
             max_launch_backoff_secs: default_max_launch_backoff_secs(),
             hold_on_prolog_fail: default_hold_on_prolog_fail(),
+            terminal_job_retention_secs: default_terminal_job_retention_secs(),
         }
     }
 }
@@ -1143,6 +1159,16 @@ impl SlurmConfig {
                 value: format!(
                     "{} (must be between 1 and {})",
                     self.controller.max_launch_backoff_secs, MAX_LAUNCH_BACKOFF_SECS
+                ),
+            });
+        }
+        // Guardrail: retention beyond the cap defeats the memory bound.
+        if self.controller.terminal_job_retention_secs > MAX_TERMINAL_JOB_RETENTION_SECS {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.terminal_job_retention_secs".into(),
+                value: format!(
+                    "{} (must be at most {})",
+                    self.controller.terminal_job_retention_secs, MAX_TERMINAL_JOB_RETENTION_SECS
                 ),
             });
         }
@@ -1920,6 +1946,43 @@ max_launch_backoff_secs = 0
         assert!(
             err.to_string().contains("max_launch_backoff_secs"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn controller_config_rejects_out_of_range_terminal_job_retention_secs() {
+        // Beyond the guardrail, load must reject up front rather than silently
+        // retaining terminal jobs long enough to defeat the memory bound.
+        let toml = format!(
+            r#"
+cluster_name = "test"
+
+[controller]
+terminal_job_retention_secs = {}
+"#,
+            MAX_TERMINAL_JOB_RETENTION_SECS + 1
+        );
+        let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("terminal_job_retention_secs"),
+            "unexpected error: {err}"
+        );
+
+        let ok = format!(
+            r#"
+cluster_name = "test"
+
+[controller]
+terminal_job_retention_secs = {MAX_TERMINAL_JOB_RETENTION_SECS}
+"#
+        );
+        assert_eq!(
+            SlurmConfig::load_from_str(&ok)
+                .unwrap()
+                .controller
+                .terminal_job_retention_secs,
+            MAX_TERMINAL_JOB_RETENTION_SECS,
+            "the bound itself must be accepted"
         );
     }
 
