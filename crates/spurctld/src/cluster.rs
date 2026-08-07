@@ -3303,7 +3303,7 @@ impl ClusterManager {
         }
     }
 
-    /// Evict terminal jobs whose end_time is older than the retention window,
+    /// Evict finished jobs whose end_time is older than the retention window,
     /// bounding controller memory. No-op when nothing has aged out.
     pub fn evict_expired_terminal_jobs(&self) {
         let retention = self.config().controller.terminal_job_retention_secs;
@@ -3312,7 +3312,7 @@ impl ClusterManager {
             .jobs
             .read()
             .iter()
-            .filter(|(_, j)| j.state.is_terminal() && j.end_time.is_some_and(|t| t < before))
+            .filter(|(_, j)| j.state.is_finalized() && j.end_time.is_some_and(|t| t < before))
             .map(|(&id, _)| id)
             .collect();
         if job_ids.is_empty() {
@@ -4868,7 +4868,7 @@ impl ClusterManager {
             WalOperation::EvictTerminalJobs { job_ids } => {
                 let evicted: HashSet<JobId> = job_ids
                     .iter()
-                    .filter(|id| jobs.get(id).is_some_and(|j| j.state.is_terminal()))
+                    .filter(|id| jobs.get(id).is_some_and(|j| j.state.is_finalized()))
                     .copied()
                     .collect();
                 if !evicted.is_empty() {
@@ -6325,6 +6325,20 @@ mod tests {
             job_id: 3,
             spec: Box::new(basic_spec("pending")),
         });
+        // A job stranded in Preempted (a rare requeue-strand): finalized with an
+        // end_time, so it must be reapable even though it isn't is_terminal().
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 4,
+            spec: Box::new(basic_spec("preempted")),
+        });
+        {
+            let mut jobs = cm.jobs.write();
+            let j = jobs.get_mut(&4).unwrap();
+            j.state = JobState::Preempted;
+            j.end_time = Some(chrono::Utc::now());
+        }
+        assert!(!cm.get_job(4).unwrap().state.is_terminal());
+        assert!(cm.get_job(4).unwrap().state.is_finalized());
 
         // A step on each of the terminal (1) and live (2) jobs: eviction must
         // drop the evicted job's step and keep the live one's.
@@ -6345,10 +6359,10 @@ mod tests {
         cm.steps.write().insert((1, 0), step(1));
         cm.steps.write().insert((2, 0), step(2));
 
-        // Apply removes only ids still terminal; live ids 2 and 3 are no-ops
+        // Apply removes only ids still finalized; live ids 2 and 3 are no-ops
         // even when named (a job requeued between propose and apply).
         cm.apply_operation(&WalOperation::EvictTerminalJobs {
-            job_ids: vec![1, 2, 3],
+            job_ids: vec![1, 2, 3, 4],
         });
         assert!(
             cm.get_job(1).is_none(),
@@ -6356,6 +6370,10 @@ mod tests {
         );
         assert!(cm.get_job(2).is_some(), "running job must be spared");
         assert!(cm.get_job(3).is_some(), "pending job must be spared");
+        assert!(
+            cm.get_job(4).is_none(),
+            "named finalized (Preempted) job must be evicted"
+        );
         assert!(
             cm.steps.read().get(&(1, 0)).is_none(),
             "evicted job's step must be removed"
