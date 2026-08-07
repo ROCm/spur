@@ -631,7 +631,7 @@ fn extract_tar(reader: impl Read, dest: &Path) -> anyhow::Result<()> {
                 // (skip for now — complex to handle)
                 continue;
             } else {
-                let real_name = filename.strip_prefix(".wh.").unwrap();
+                let real_name = filename.strip_prefix(".wh.").unwrap_or(filename);
                 dest.join(path.parent().unwrap_or(Path::new("")))
                     .join(real_name)
             };
@@ -745,6 +745,28 @@ mod tests {
             std::fs::read(rootfs.path().join("zstd.txt")).unwrap(),
             b"zstd layer"
         );
+    }
+
+    #[test]
+    fn extract_layer_applies_whiteout() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let removed = rootfs.path().join("nested/removed.txt");
+        let retained = rootfs.path().join("nested/retained.txt");
+        std::fs::create_dir_all(removed.parent().unwrap()).unwrap();
+        std::fs::write(&removed, b"remove me").unwrap();
+        std::fs::write(&retained, b"keep me").unwrap();
+        let layer = tar_layer("nested/.wh.removed.txt", b"");
+
+        extract_layer(
+            &layer,
+            Some("application/vnd.oci.image.layer.v1.tar"),
+            rootfs.path(),
+        )
+        .unwrap();
+
+        assert!(!removed.exists());
+        assert_eq!(std::fs::read(retained).unwrap(), b"keep me");
+        assert!(!rootfs.path().join("nested/.wh.removed.txt").exists());
     }
 
     #[test]
