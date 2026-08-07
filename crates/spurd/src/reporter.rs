@@ -18,7 +18,7 @@ pub trait HeldJobs: Send + Sync {
     fn held_job_ids(&self) -> Vec<u32>;
 }
 
-impl<T: Send + Sync> HeldJobs for Mutex<HashMap<u32, T>> {
+impl<T: Send> HeldJobs for Mutex<HashMap<u32, T>> {
     fn held_job_ids(&self) -> Vec<u32> {
         match self.try_lock() {
             Ok(jobs) => jobs.keys().copied().collect(),
@@ -574,5 +574,13 @@ mod tests {
             "node token required"
         )));
         assert!(!should_reregister(&tonic::Status::internal("boom")));
+    }
+
+    #[test]
+    fn held_job_ids_accepts_send_but_not_sync_values() {
+        // Cell is Send but !Sync; this fails to compile if the bound re-tightens to Sync.
+        let map: Mutex<HashMap<u32, std::cell::Cell<u8>>> =
+            Mutex::new(HashMap::from([(7, std::cell::Cell::new(0))]));
+        assert_eq!(map.held_job_ids(), vec![7]);
     }
 }
