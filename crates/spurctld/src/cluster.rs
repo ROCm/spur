@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use spur_core::account_limits::{check_account_limits, AccountCheckResult};
 use spur_core::accounting::{Qos, TresRecord, TresType};
 use spur_core::burst_buffer::BbStageState;
-use spur_core::config::SlurmConfig;
+use spur_core::config::{EnforcePartLimits, SlurmConfig};
 use spur_core::job::{
     effective_gpus, effective_memory_mb, Job, JobId, JobSpec, JobState, NodeCompleteError,
     PendingReason, TransitionOutcome, DEFAULT_PRIORITY,
@@ -417,10 +417,14 @@ impl ClusterManager {
     /// Submit a new job. If it has an array spec, expand into individual tasks.
     pub fn submit_job(&self, mut spec: JobSpec) -> Result<SubmitOutcome, SubmitError> {
         apply_default_partition(&mut spec, &self.partitions.read());
-        apply_default_time_limit(&mut spec, &self.partitions.read());
+        let config = self.config();
+        apply_default_time_limit(
+            &mut spec,
+            &self.partitions.read(),
+            config.scheduler.default_time_limit_minutes,
+        );
         apply_default_account(&mut spec, &self.association_cache);
         validate_user_account(&spec, &self.association_cache)?;
-        let config = self.config();
         // Default QoS must resolve before the partition ACL, or `allow_qos` sees
         // an empty QoS and wrongly rejects a user's inherited default.
         apply_default_qos(
@@ -460,6 +464,10 @@ impl ClusterManager {
         // Reject a node count outside the partition's bounds at submit, matching
         // Slurm, instead of accepting a job that would pend forever.
         self.validate_partition_node_bounds(&spec)?;
+
+        // Reject an over-MaxTime wall-time at submit when EnforcePartLimits is on
+        // (default off keeps Slurm's admit-and-pend behavior).
+        self.validate_partition_time_limit(&spec)?;
 
         let mpi = spec.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
         spur_core::mpi::validate_single_node_pmix(mpi, spec.num_nodes)
@@ -542,6 +550,56 @@ impl ClusterManager {
         Err(SubmitError::invalid(format!(
             "requested node count {nodes} is outside partition '{}' limits (min {}, max {})",
             part.name, part.min_nodes, max
+        )))
+    }
+
+    /// Reject a job whose wall-time exceeds the requested partition's `MaxTime`,
+    /// gated on `EnforcePartLimits` (Slurm semantics). When disabled (the
+    /// default), over-limit jobs are admitted and pend with `PartitionTimeLimit`.
+    fn validate_partition_time_limit(&self, spec: &JobSpec) -> Result<(), SubmitError> {
+        let mode = self.config().scheduler.enforce_part_limits;
+        if mode == EnforcePartLimits::No {
+            return Ok(());
+        }
+        let Some(time_limit) = spec.time_limit.as_ref() else {
+            return Ok(());
+        };
+        let Some(partition_spec) = spec.partition.as_deref().filter(|p| !p.is_empty()) else {
+            return Ok(());
+        };
+
+        let partitions = self.partitions.read();
+        let requested: Vec<&Partition> = requested_partition_names(Some(partition_spec))
+            .filter_map(|name| partitions.iter().find(|part| part.name == name))
+            .collect();
+        // Existence was already checked in validate_partition.
+        if requested.is_empty() {
+            return Ok(());
+        }
+
+        let allows = |part: &&Partition| partition_time_allows(part, Some(time_limit));
+        let satisfied = match mode {
+            // ALL: the job must fit every requested partition.
+            EnforcePartLimits::All => requested.iter().all(allows),
+            // ANY: the job must fit at least one requested partition.
+            EnforcePartLimits::Any => requested.iter().any(allows),
+            EnforcePartLimits::No => true,
+        };
+        if satisfied {
+            return Ok(());
+        }
+
+        let offending = requested
+            .iter()
+            .find(|p| !allows(p))
+            .unwrap_or(&requested[0]);
+        let requested_str =
+            spur_core::config::format_time(Some(time_limit.num_minutes().max(0) as u32));
+        let max_str = spur_core::config::format_time(offending.max_time_minutes);
+        Err(SubmitError::invalid(format!(
+            "Requested time limit is invalid (missing or exceeds some limit): \
+             {requested_str} exceeds MaxTime {max_str} of partition '{}'",
+            offending.name
         )))
     }
 
@@ -5326,38 +5384,54 @@ fn partition_block(job: &Job, partitions: &[Partition]) -> Option<spur_core::job
     }
 
     let mut has_up_partition = false;
+    let mut block_reason: Option<PendingReason> = None;
     for part in requested {
         if part.state != PartitionState::Up {
             continue;
         }
         has_up_partition = true;
-        if partition_limits_allow(job, part) {
-            return None;
+        match partition_limit_block(job, part) {
+            None => return None,
+            Some(reason) => {
+                block_reason.get_or_insert(reason);
+            }
         }
     }
 
     Some(if has_up_partition {
-        PendingReason::PartitionConfig
+        block_reason.unwrap_or(PendingReason::PartitionConfig)
     } else {
         PendingReason::PartitionInactive
     })
 }
 
-fn partition_limits_allow(job: &Job, part: &Partition) -> bool {
+/// True when a job's wall-time fits the partition's `MaxTime`. `None` `MaxTime`
+/// (UNLIMITED) or `None` time limit always fits. Compared at second precision so
+/// a request just over the cap is not truncated down to an allowed minute.
+fn partition_time_allows(part: &Partition, time_limit: Option<&chrono::Duration>) -> bool {
+    match (part.max_time_minutes, time_limit) {
+        (Some(max_mins), Some(tl)) => tl.num_seconds() <= i64::from(max_mins) * 60,
+        _ => true,
+    }
+}
+
+/// The reason a partition cannot ever schedule this job (static limits), or
+/// `None` if it can. Node-count violations report `PartitionConfig`; wall-time
+/// violations report the more specific `PartitionTimeLimit` (Slurm parity).
+fn partition_limit_block(job: &Job, part: &Partition) -> Option<spur_core::job::PendingReason> {
+    use spur_core::job::PendingReason;
     if let Some(max) = part.max_nodes {
         if job.spec.num_nodes > max {
-            return false;
+            return Some(PendingReason::PartitionConfig);
         }
     }
     if part.min_nodes > 0 && job.spec.num_nodes < part.min_nodes {
-        return false;
+        return Some(PendingReason::PartitionConfig);
     }
-    if let (Some(max_mins), Some(tl)) = (part.max_time_minutes, &job.spec.time_limit) {
-        if tl.num_minutes() > i64::from(max_mins) {
-            return false;
-        }
+    if !partition_time_allows(part, job.spec.time_limit.as_ref()) {
+        return Some(PendingReason::PartitionTimeLimit);
     }
-    true
+    None
 }
 
 fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> TresRecord {
@@ -5604,19 +5678,45 @@ fn apply_default_partition(spec: &mut JobSpec, partitions: &[Partition]) {
     }
 }
 
-fn apply_default_time_limit(spec: &mut JobSpec, partitions: &[Partition]) {
+/// Fill in a job's wall-time when none was requested.
+///
+/// Partition `DefaultTime` always applies (prior behavior). Beyond that, the
+/// `DefaultTime -> MaxTime -> cluster default` fallback is opt-in and bounds
+/// otherwise-unlimited jobs only when `scheduler.default_time_limit_minutes`
+/// is set (> 0). With the default of 0 the fallback is disabled, so behavior
+/// is unchanged on upgrade: a job with no `-t` on a partition with no
+/// `DefaultTime` stays unbounded.
+fn apply_default_time_limit(
+    spec: &mut JobSpec,
+    partitions: &[Partition],
+    cluster_default_minutes: u32,
+) {
     if spec.time_limit.is_some() {
         return;
     }
+    // Resolve against the first *requested* partition (a job may list several,
+    // e.g. "gpu,cpu"); fall back to the default/first partition when unset.
     let partition = spec
         .partition
         .as_deref()
+        .and_then(|spec| requested_partition_names(Some(spec)).next())
         .and_then(|name| partitions.iter().find(|p| p.name == name))
         .or_else(|| partitions.iter().find(|p| p.is_default))
         .or_else(|| partitions.first());
+
     if let Some(minutes) = partition.and_then(|p| p.default_time_minutes) {
         spec.time_limit = Some(chrono::Duration::minutes(minutes as i64));
+        return;
     }
+
+    // Opt-in reclamation: only bound the job when a cluster fallback is set.
+    if cluster_default_minutes == 0 {
+        return;
+    }
+    let minutes = partition
+        .and_then(|p| p.max_time_minutes)
+        .unwrap_or(cluster_default_minutes);
+    spec.time_limit = Some(chrono::Duration::minutes(minutes as i64));
 }
 
 /// Resolve the submitting user's default account from the association cache
@@ -9139,16 +9239,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tag_blocked_sets_partition_config_for_time_and_min_nodes() {
-        // max_time and min_nodes are independent PartitionConfig triggers.
+    async fn tag_blocked_sets_time_limit_and_config_reasons() {
+        // A max_time violation reports the specific PartitionTimeLimit reason;
+        // a min_nodes violation reports the generic PartitionConfig reason.
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.partitions[0].max_time = Some("00:10:00".into()); // 10 min cap
         config.partitions[0].min_nodes = 2;
         let cm = test_cluster_with_config(&dir, config).await;
 
-        // Meets min_nodes but exceeds max_time: the time cap is not a
-        // submit-time bound, so this is admitted and pends with PartitionConfig.
+        // Meets min_nodes but exceeds max_time: with EnforcePartLimits off
+        // (the default) the time cap is not a submit-time bound, so this is
+        // admitted and pends with the specific PartitionTimeLimit reason.
         let mut over_time = basic_spec("overtime");
         over_time.partition = Some("default".into());
         over_time.num_nodes = 2;
@@ -9171,8 +9273,8 @@ mod tests {
         cm.tag_blocked_pending_reasons();
         assert_eq!(
             cm.get_job(t_id).unwrap().pending_reason,
-            PendingReason::PartitionConfig,
-            "time_limit over partition max_time -> PartitionConfig"
+            PendingReason::PartitionTimeLimit,
+            "time_limit over partition max_time -> PartitionTimeLimit"
         );
         assert_eq!(
             cm.get_job(n_id).unwrap().pending_reason,
@@ -9319,6 +9421,118 @@ mod tests {
             .insert_default_account("testuser", "research");
 
         let spec = basic_spec("defaultacct");
+        assert!(cm.submit_job(spec).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_admits_over_maxtime_when_enforcement_off() {
+        // Default EnforcePartLimits=No: an over-MaxTime job is admitted (and
+        // will pend with PartitionTimeLimit), not rejected at submit.
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.partitions[0].max_time = Some("00:10:00".into());
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        let mut spec = basic_spec("overtime");
+        spec.time_limit = Some(chrono::Duration::hours(1));
+        assert!(cm.submit_job(spec).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_rejects_over_maxtime_when_enforcement_all() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.partitions[0].max_time = Some("00:10:00".into());
+        cfg.scheduler.enforce_part_limits = EnforcePartLimits::All;
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        let mut spec = basic_spec("overtime");
+        spec.time_limit = Some(chrono::Duration::hours(1));
+        let err = cm.submit_job(spec).unwrap_err();
+        let SubmitError::InvalidArgument(msg) = err else {
+            panic!("expected InvalidArgument, got {err:?}");
+        };
+        assert!(
+            msg.contains("Requested time limit is invalid"),
+            "expected Slurm-style message, got: {msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_accepts_within_maxtime_when_enforcement_all() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.partitions[0].max_time = Some("01:00:00".into());
+        cfg.scheduler.enforce_part_limits = EnforcePartLimits::All;
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        let mut spec = basic_spec("withintime");
+        spec.time_limit = Some(chrono::Duration::minutes(30));
+        assert!(cm.submit_job(spec).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_unlimited_partition_accepts_any_time_under_enforcement() {
+        // UNLIMITED MaxTime imposes no cap even with enforcement on (Slurm parity).
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.partitions[0].max_time = Some("UNLIMITED".into());
+        cfg.scheduler.enforce_part_limits = EnforcePartLimits::All;
+        // Disable the cluster fallback so the huge request survives to submit.
+        cfg.scheduler.default_time_limit_minutes = 0;
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        let mut spec = basic_spec("yearlong");
+        spec.time_limit = Some(chrono::Duration::days(365));
+        assert!(cm.submit_job(spec).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_enforcement_any_rejects_when_no_partition_fits() {
+        // ANY rejects only when the request fits none of the requested
+        // partitions; the error names the offending partition.
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.partitions[0].max_time = Some("00:10:00".into());
+        let mut other = cfg.partitions[0].clone();
+        other.name = "other".into();
+        other.default = false;
+        other.max_time = Some("00:20:00".into());
+        cfg.partitions.push(other);
+        cfg.scheduler.enforce_part_limits = EnforcePartLimits::Any;
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        let mut spec = basic_spec("toolong");
+        spec.partition = Some("default,other".into());
+        spec.time_limit = Some(chrono::Duration::hours(1));
+        let err = cm.submit_job(spec).unwrap_err();
+        let SubmitError::InvalidArgument(msg) = err else {
+            panic!("expected InvalidArgument, got {err:?}");
+        };
+        assert!(
+            msg.contains("Requested time limit is invalid") && msg.contains("partition"),
+            "error must name the offending partition: {msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_enforcement_any_accepts_if_one_partition_fits() {
+        // Two partitions: one 10-min cap, one 2-hour cap. A 1-hour job fits the
+        // second, so ANY admits it; ALL would reject it.
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.partitions[0].max_time = Some("00:10:00".into());
+        let mut roomy = cfg.partitions[0].clone();
+        roomy.name = "roomy".into();
+        roomy.default = false;
+        roomy.max_time = Some("02:00:00".into());
+        cfg.partitions.push(roomy);
+        cfg.scheduler.enforce_part_limits = EnforcePartLimits::Any;
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        let mut spec = basic_spec("multi");
+        spec.partition = Some("default,roomy".into());
+        spec.time_limit = Some(chrono::Duration::hours(1));
         assert!(cm.submit_job(spec).is_ok());
     }
 
@@ -13567,7 +13781,7 @@ mod tests {
             default_time_minutes: Some(30),
             ..Default::default()
         }];
-        super::apply_default_time_limit(&mut spec, &partitions);
+        super::apply_default_time_limit(&mut spec, &partitions, 0);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(30)));
     }
 
@@ -13580,7 +13794,7 @@ mod tests {
             default_time_minutes: Some(30),
             ..Default::default()
         }];
-        super::apply_default_time_limit(&mut spec, &partitions);
+        super::apply_default_time_limit(&mut spec, &partitions, 0);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(5)));
     }
 
@@ -13594,7 +13808,57 @@ mod tests {
             default_time_minutes: None,
             ..Default::default()
         }];
-        super::apply_default_time_limit(&mut spec, &partitions);
+        super::apply_default_time_limit(&mut spec, &partitions, 0);
+        assert!(spec.time_limit.is_none());
+    }
+
+    #[test]
+    fn apply_default_time_limit_falls_back_to_partition_max_time() {
+        // No DefaultTime but a finite MaxTime: Slurm uses MaxTime as the default.
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: None,
+            max_time_minutes: Some(120),
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions, 60);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(120)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_falls_back_to_cluster_default_on_unlimited() {
+        // UNLIMITED partition (no DefaultTime, no MaxTime): the cluster-wide
+        // default bounds the job so it cannot run forever.
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: None,
+            max_time_minutes: None,
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions, 60);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(60)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_unlimited_when_cluster_default_disabled() {
+        // cluster default 0 = disabled: an UNLIMITED partition leaves the job
+        // with no wall-time (opt-out escape hatch).
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: None,
+            max_time_minutes: None,
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions, 0);
         assert!(spec.time_limit.is_none());
     }
 
