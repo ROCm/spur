@@ -518,15 +518,11 @@ async fn spawn_job_process(
     };
     let work_dir = effective_work_dir.as_str();
 
-    // Wrap script with burst buffer stage-in/stage-out if configured
-    let script = if let Ok(bb) = std::env::var("SPUR_BURST_BUFFER") {
-        if !bb.is_empty() {
-            wrap_with_burst_buffer(script, &bb)
-        } else {
-            script.to_string()
-        }
-    } else {
-        script.to_string()
+    // The directive is per job, so it comes from the job's environment. Reading
+    // the daemon's own env instead would only ever see a cluster-wide value.
+    let script = match environment.get("SPUR_BURST_BUFFER") {
+        Some(bb) if !bb.is_empty() => wrap_with_burst_buffer(script, bb),
+        _ => script.to_string(),
     };
     let script = script.as_str();
 

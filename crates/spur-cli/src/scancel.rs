@@ -64,7 +64,7 @@ pub async fn main() -> Result<()> {
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = ScancelArgs::try_parse_from(&args)?;
 
-    if args.job_ids.is_empty() && args.user.is_none() && args.name.is_none() {
+    if !has_selection(&args) {
         bail!("scancel: no job IDs or filters specified");
     }
 
@@ -161,6 +161,16 @@ fn is_cancellable(proto_state: i32) -> bool {
     }
 }
 
+/// Whether the caller named anything to cancel. `--state` alone does not
+/// count: it narrows a selection rather than making one.
+fn has_selection(args: &ScancelArgs) -> bool {
+    !args.job_ids.is_empty()
+        || args.user.is_some()
+        || args.name.is_some()
+        || args.partition.is_some()
+        || args.account.is_some()
+}
+
 fn filter_states(state: Option<&str>) -> Result<Vec<i32>> {
     let Some(states) = state else {
         return Ok(cancellable_states());
@@ -223,6 +233,38 @@ fn parse_state(s: &str) -> Option<spur_proto::proto::JobState> {
 mod tests {
     use super::*;
     use spur_proto::proto::JobState;
+
+    fn parse(args: &[&str]) -> ScancelArgs {
+        let mut argv = vec!["scancel"];
+        argv.extend_from_slice(args);
+        ScancelArgs::try_parse_from(argv).expect("args should parse")
+    }
+
+    #[test]
+    fn every_selection_flag_counts_as_a_selection() {
+        for args in [
+            vec!["123"],
+            vec!["-u", "alice"],
+            vec!["-n", "myjob"],
+            vec!["-p", "default"],
+            vec!["-A", "acct"],
+        ] {
+            assert!(
+                has_selection(&parse(&args)),
+                "{args:?} should select jobs to cancel"
+            );
+        }
+    }
+
+    #[test]
+    fn no_arguments_selects_nothing() {
+        assert!(!has_selection(&parse(&[])));
+    }
+
+    #[test]
+    fn state_alone_selects_nothing() {
+        assert!(!has_selection(&parse(&["-t", "RUNNING"])));
+    }
 
     #[test]
     fn active_states_are_cancellable() {
