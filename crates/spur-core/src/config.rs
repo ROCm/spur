@@ -472,6 +472,11 @@ pub struct SchedulerConfig {
     /// Grace minutes after a reservation ends before cancelling its running jobs.
     #[serde(default)]
     pub resv_overrun_minutes: u32,
+    /// Reap an interactive allocation (salloc/srun) whose client has sent no
+    /// keepalive for this many seconds. `0` (the default) disables reaping, so
+    /// abandoned allocations behave as before. Mirrors Slurm's `InactiveLimit`.
+    #[serde(default)]
+    pub inactive_limit_secs: u32,
 }
 
 fn default_scheduler_plugin() -> String {
@@ -500,6 +505,7 @@ impl Default for SchedulerConfig {
             default_time_limit_minutes: 60,
             complete_wait_secs: 300,
             resv_overrun_minutes: 0,
+            inactive_limit_secs: 0,
         }
     }
 }

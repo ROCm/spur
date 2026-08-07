@@ -310,6 +310,8 @@ service SlurmController {
   rpc CancelJob(CancelJobRequest) returns (google.protobuf.Empty);
   // Finish a standalone srun allocation after its step completes.
   rpc CompleteJob(CompleteJobRequest) returns (google.protobuf.Empty);
+  // Keepalive from an interactive client so an abandoned allocation can be reaped.
+  rpc JobKeepalive(JobKeepaliveRequest) returns (JobKeepaliveResponse);
   rpc SuspendJob(SuspendJobRequest) returns (google.protobuf.Empty);
   rpc ResumeJob(ResumeJobRequest) returns (google.protobuf.Empty);
   rpc UpdateJob(UpdateJobRequest) returns (google.protobuf.Empty);
@@ -495,6 +497,15 @@ message CompleteJobRequest {
   int32 exit_code = 2;
   string user = 3;   // For authorization
 }
+
+// Liveness ping from an interactive client (salloc/srun) so the controller
+// knows the allocation is still attended. Absence past InactiveLimit reaps it.
+message JobKeepaliveRequest {
+  uint32 job_id = 1;
+  string user = 2;   // For authorization (owner or root required).
+}
+
+message JobKeepaliveResponse {}
 
 message SuspendJobRequest {
   uint32 job_id = 1;

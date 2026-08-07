@@ -243,6 +243,12 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - integer
      - ``300``
      - Maximum seconds a job may sit in COMPLETING before it is force-finished.
+   * - ``inactive_limit_secs``
+     - integer
+     - ``0``
+     - Reap an interactive allocation (``salloc``/``srun``) whose client has sent
+       no keepalive for this many seconds, freeing the nodes. ``0`` disables
+       reaping. Mirrors Slurm's ``InactiveLimit``.
    * - ``resv_overrun_minutes``
      - integer
      - ``0``
