@@ -16,13 +16,18 @@ import pytest
 from cluster import parse_job_id, wait_job_state
 
 
+# root is an administrative override in check_job_owner, so a denial test has
+# to run as an ordinary account instead.
+NON_OWNER = "nobody"
+
+
 def _require_second_identity(cluster) -> str:
     """Skip unless the environment can run the CLI as a second UNIX user."""
     submit_user = cluster.nodes[0].user
-    if submit_user == "root":
-        pytest.skip("need a non-root SSH user to test non-owner rejection")
+    if submit_user == NON_OWNER:
+        pytest.skip(f"SSH user is {NON_OWNER}; need a different account to submit as")
 
-    probe = cluster.cli_as_user("root", ["squeue", "-h"])
+    probe = cluster.cli_as_user(NON_OWNER, ["squeue", "-h"])
     if "sudo" in probe.lower() and (
         "password" in probe.lower() or "not allowed" in probe.lower()
     ):
@@ -39,8 +44,18 @@ def _start_long_job(cluster, name: str) -> int:
 
 
 def _denied(output: str) -> bool:
+    """Whether the controller refused the caller.
+
+    "job owned by" is how AuthError::NotJobOwner renders; the other spellings
+    cover refusals raised before the owner check.
+    """
     lowered = output.lower()
-    return "permission" in lowered or "denied" in lowered or "not authorized" in lowered
+    return (
+        "job owned by" in lowered
+        or "permission" in lowered
+        or "denied" in lowered
+        or "not authorized" in lowered
+    )
 
 
 class TestJobOwnership:
@@ -49,10 +64,10 @@ class TestJobOwnership:
         job_id = _start_long_job(cluster, "own-exec")
         try:
             out = cluster.cli_as_user(
-                "root", ["spur", "exec", str(job_id), "whoami"]
+                NON_OWNER, ["spur", "exec", str(job_id), "whoami"]
             )
-            # root is a distinct identity from the submitting SSH user, so the
-            # controller's owner check must reject it.
+            # A distinct, unprivileged identity, so the controller's owner
+            # check must reject it.
             assert _denied(out), (
                 f"a non-owner must be denied exec into job {job_id}, got:\n{out}"
             )
@@ -63,7 +78,7 @@ class TestJobOwnership:
         _require_second_identity(cluster)
         job_id = _start_long_job(cluster, "own-attach")
         try:
-            out = cluster.cli_as_user("root", ["sattach", str(job_id)])
+            out = cluster.cli_as_user(NON_OWNER, ["sattach", str(job_id)])
             assert _denied(out), (
                 f"a non-owner must be denied attach to job {job_id}, got:\n{out}"
             )
@@ -75,7 +90,7 @@ class TestJobOwnership:
         job_id = _start_long_job(cluster, "own-stream")
         try:
             out = cluster.cli_as_user(
-                "root", ["sattach", str(job_id), "--output-only"]
+                NON_OWNER, ["sattach", str(job_id), "--output-only"]
             )
             assert _denied(out), (
                 f"a non-owner must be denied output streaming for job {job_id}, "

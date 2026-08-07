@@ -151,18 +151,37 @@ class TestStaging:
     def test_a_failing_stage_in_fails_the_job(self, bb_cluster):
         """Running the script against half-staged data would corrupt results,
         so stage-in is fail-fast."""
+        marker = f"{bb_cluster.remote_dir}/bb-badin-ran.txt"
         job_id = submit_bb(
-            bb_cluster, "bb-badin", "stage_in:exit 7", "echo unreachable"
+            bb_cluster,
+            "bb-badin",
+            "stage_in:cp /nonexistent/src /nonexistent/dst",
+            f"echo ran > {marker}",
         )
         assert wait_job(bb_cluster, job_id, timeout=120) == "F", (
             bb_cluster.debug_job(job_id)
+        )
+        ran_on = [
+            name
+            for name, node in zip(bb_cluster.node_names, bb_cluster.nodes)
+            if "RAN" in node.exec_allow_fail(
+                f"test -e '{marker}' && echo RAN || echo ABSENT"
+            )
+        ]
+        assert not ran_on, (
+            f"stage-in is fail-fast, but the script still ran on {ran_on}"
         )
 
     def test_a_failing_stage_out_does_not_fail_the_job(self, bb_cluster):
         """Stage-out is best-effort: the job's real work is already done, so a
         copy failure must not retroactively mark it failed."""
+        # A command that exits non-zero, not `exit`, which would terminate the
+        # wrapper itself and prove nothing about stage-out being best-effort.
         job_id = submit_bb(
-            bb_cluster, "bb-badout", "stage_out:exit 7", "echo BB_OUT_OK"
+            bb_cluster,
+            "bb-badout",
+            "stage_out:cp /nonexistent/src /nonexistent/dst",
+            "echo BB_OUT_OK",
         )
         assert wait_job(bb_cluster, job_id, timeout=120) in ("CD", "GONE"), (
             bb_cluster.debug_job(job_id)

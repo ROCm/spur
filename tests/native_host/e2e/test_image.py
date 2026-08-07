@@ -11,9 +11,17 @@ Registry pulls are not exercised — they need outbound network access that a
 test cluster cannot be assumed to have.
 """
 
+import time
+
 import pytest
 
 from cluster import wait_job, parse_job_id
+
+IMAGE_NAME = "demo"
+# Images are stored under the canonical OCI reference, so a bare name lands as
+# docker.io/library/<name>:latest with `/` and `:` folded to `+`. The CLI is
+# still driven with the bare name, which is what a user types.
+IMAGE_STEM = "docker.io+library+demo+latest"
 
 
 @pytest.fixture
@@ -39,20 +47,20 @@ class TestListing:
     def test_an_imported_image_is_listed(self, cluster, image_dir, tmp_path):
         """`import` is not the only way an image lands in the directory, and
         `list` has to reflect whatever is actually there."""
-        _place_image(cluster, image_dir, "demo", tmp_path)
+        _place_image(cluster, image_dir, tmp_path)
         code, out = image_cli(cluster, image_dir, ["list"])
         assert code == 0, out
-        assert "demo" in out, out
+        assert IMAGE_NAME in out, out
 
     def test_the_listing_has_a_header(self, cluster, image_dir, tmp_path):
-        _place_image(cluster, image_dir, "demo", tmp_path)
+        _place_image(cluster, image_dir, tmp_path)
         _, out = image_cli(cluster, image_dir, ["list"])
         assert "IMAGE" in out and "SIZE" in out, out
 
     def test_the_listing_reports_a_size(self, cluster, image_dir, tmp_path):
-        _place_image(cluster, image_dir, "demo", tmp_path)
+        _place_image(cluster, image_dir, tmp_path)
         _, out = image_cli(cluster, image_dir, ["list"])
-        row = next((ln for ln in out.splitlines() if "demo" in ln), "")
+        row = next((ln for ln in out.splitlines() if IMAGE_NAME in ln), "")
         assert "MB" in row or "GB" in row, f"no size on the image row: {out}"
 
 
@@ -63,8 +71,8 @@ class TestRemoval:
         assert "not found" in out, out
 
     def test_removing_an_image_deletes_it(self, cluster, image_dir, tmp_path):
-        _place_image(cluster, image_dir, "demo", tmp_path)
-        code, out = image_cli(cluster, image_dir, ["remove", "demo"])
+        _place_image(cluster, image_dir, tmp_path)
+        code, out = image_cli(cluster, image_dir, ["remove", IMAGE_NAME])
         assert code == 0, out
         assert "Removed" in out, out
 
@@ -72,9 +80,9 @@ class TestRemoval:
         assert "No images imported yet." in listing, listing
 
     def test_removing_twice_fails_the_second_time(self, cluster, image_dir, tmp_path):
-        _place_image(cluster, image_dir, "demo", tmp_path)
-        assert image_cli(cluster, image_dir, ["remove", "demo"])[0] == 0
-        code, out = image_cli(cluster, image_dir, ["remove", "demo"])
+        _place_image(cluster, image_dir, tmp_path)
+        assert image_cli(cluster, image_dir, ["remove", IMAGE_NAME])[0] == 0
+        code, out = image_cli(cluster, image_dir, ["remove", IMAGE_NAME])
         assert code != 0, out
         assert "not found" in out, out
 
@@ -96,7 +104,7 @@ class TestImageDirectorySelection:
         other = f"{cluster.remote_dir}/images-other"
         cluster.nodes[0].exec(f"mkdir -p '{other}'")
         try:
-            _place_image(cluster, image_dir, "demo", tmp_path)
+            _place_image(cluster, image_dir, tmp_path)
             _, listing = image_cli(cluster, other, ["list"])
             assert "No images imported yet." in listing, listing
         finally:
@@ -132,7 +140,11 @@ class TestJobIntegration:
         )
         assert "IMAGE_JOB_OK" in cluster.read_output_on_any_node(out_path)
 
-    def test_an_unknown_image_fails_the_job(self, cluster):
+    def test_an_unknown_image_keeps_the_job_out_of_running(self, cluster):
+        """A missing image is not terminal: the launch fails, the job returns
+        to pending as JobLaunchFailure and is retried. What must hold is that
+        it never runs and that the reason says why.
+        """
         script = cluster.write_file("image-missing.sh", "#!/bin/bash\ntrue\n")
         job_id = parse_job_id(
             cluster.sbatch(
@@ -145,13 +157,27 @@ class TestJobIntegration:
             )
         )
         assert job_id is not None
-        assert wait_job(cluster, job_id, timeout=120) in ("F", "NF"), (
-            cluster.debug_job(job_id)
-        )
+        try:
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                detail = cluster.scontrol("show", "job", str(job_id))
+                if "Reason=JobLaunchFailure" in detail:
+                    break
+                assert "JobState=RUNNING" not in detail, (
+                    f"a job with a missing image must not run:\n{detail}"
+                )
+                time.sleep(3)
+            else:
+                raise AssertionError(
+                    f"job {job_id} never reported a launch failure:\n"
+                    f"{cluster.scontrol('show', 'job', str(job_id))}"
+                )
+        finally:
+            cluster.cli_allow_fail(["scancel", str(job_id)])
 
 
-def _place_image(cluster, image_dir: str, name: str, tmp_path) -> str:
-    """Put a real squashfs image in *image_dir* under *name*.
+def _place_image(cluster, image_dir: str, tmp_path) -> str:
+    """Put a real squashfs image in *image_dir* under IMAGE_STEM.
 
     `spur image import` needs a container runtime or a registry, neither of
     which a test cluster is guaranteed to have, so the file is built the same
@@ -159,6 +185,6 @@ def _place_image(cluster, image_dir: str, name: str, tmp_path) -> str:
     """
     cluster.container_preflight()
     built = cluster.build_container_image(tmp_path)
-    target = f"{image_dir}/{name}.sqsh"
+    target = f"{image_dir}/{IMAGE_STEM}.sqsh"
     cluster.nodes[0].exec(f"cp '{built}' '{target}'")
     return target

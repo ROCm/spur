@@ -316,19 +316,35 @@ class TestOpenMode:
 
 
 class TestStdinRedirection:
-    def test_srun_input_file_is_piped_to_the_task(self, cluster):
+    """`srun` launches its command as a step, and the step path ignores
+    ``--input``. JobSpec, the proto and the agent all carry a stdin path, but
+    no CLI reaches it: sbatch has no ``-i`` at all. These pin the behaviour
+    users actually get so the gap is visible rather than assumed working.
+    """
+
+    def test_srun_warns_that_input_is_ignored(self, cluster):
         in_path = cluster.write_file(
             "stdin-input.txt", "STDIN_PAYLOAD\n", all_nodes=True, executable=False
         )
         code, out = cluster.srun_with_exit(["-N", "1", "-i", in_path, "cat"])
-        assert code == 0, f"srun -i failed:\n{out}"
-        assert "STDIN_PAYLOAD" in out, f"stdin was not forwarded:\n{out}"
-
-    def test_srun_rejects_an_unreadable_input_file(self, cluster):
-        code, out = cluster.srun_with_exit(
-            ["-N", "1", "-i", f"{cluster.remote_dir}/no-such-input.txt", "cat"]
+        assert code == 0, f"srun -i should still run the command:\n{out}"
+        assert "--input is not supported" in out, (
+            f"srun must say it is discarding --input:\n{out}"
         )
-        assert code != 0, f"a missing stdin file must fail:\n{out}"
+        assert "STDIN_PAYLOAD" not in out, (
+            f"srun claims to ignore --input but forwarded it anyway:\n{out}"
+        )
+
+    def test_srun_ignores_a_missing_input_file_too(self, cluster):
+        """Ignoring is unconditional: an unreadable path is not an error
+        either, since the flag never reaches the agent."""
+        code, out = cluster.srun_with_exit(
+            ["-N", "1", "-i", f"{cluster.remote_dir}/no-such-input.txt", "true"]
+        )
+        assert code == 0, f"a discarded --input must not fail the job:\n{out}"
+        assert "--input is not supported" in out, (
+            f"srun must say it is discarding --input:\n{out}"
+        )
 
 
 class TestConstraints:
