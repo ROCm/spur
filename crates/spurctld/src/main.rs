@@ -6,6 +6,7 @@ mod association_cache;
 mod cluster;
 mod cluster_k8s;
 mod fairshare_cache;
+mod hooks;
 mod limits_cache;
 mod metrics_proto;
 mod metrics_server;
@@ -97,6 +98,10 @@ async fn main() -> anyhow::Result<()> {
             ..default_config()
         }
     };
+
+    // Fail fast on a broken submit hook (missing, non-executable, or a Lua that
+    // won't compile) instead of deferring the error to the first user submission.
+    hooks::validate_submit_hooks(&config.hooks)?;
 
     // CLI --listen overrides config file; otherwise use config's listen_addr.
     let listen_addr = args
