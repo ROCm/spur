@@ -5,6 +5,7 @@ backfilling
 CDI
 CIDR
 Cargo
+cgroup
 config
 cron
 crontab

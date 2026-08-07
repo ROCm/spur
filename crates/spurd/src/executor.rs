@@ -14,7 +14,7 @@ use nix::unistd::Pid;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
-use spur_core::config::MemlockLimit;
+use spur_core::config::{MemlockLimit, SwapLimit};
 use spur_core::job::JobId;
 use spur_spank::{SpankContext, SpankHandle, SpankHost};
 
@@ -161,6 +161,8 @@ pub struct JobLaunchConfig {
     pub host_device_plan: Option<spur_devices::inject::HostInjectionPlan>,
     /// RLIMIT_MEMLOCK to apply before exec (while still privileged).
     pub memlock: MemlockLimit,
+    /// Swap budget for the job's cgroup.
+    pub swap_limit: SwapLimit,
     /// I/O mode for the job.
     pub io_mode: LaunchIo,
     /// Direct multi-rank PMIx launch via a wrapper script (batch `--mpi=pmix`).
@@ -502,7 +504,7 @@ async fn spawn_job_process(
     info!(job_id, work_dir, "launching job");
 
     // Set up cgroup for isolation
-    let cgroup_path = setup_cgroup(job_id, cpus, memory_mb, cpu_ids)?;
+    let cgroup_path = setup_cgroup(job_id, cpus, memory_mb, cpu_ids, cfg.swap_limit)?;
 
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
     // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
@@ -873,6 +875,7 @@ fn setup_cgroup(
     cpus: u32,
     memory_mb: u64,
     cpu_ids: &[u32],
+    swap_limit: SwapLimit,
 ) -> anyhow::Result<Option<PathBuf>> {
     let cgroup_root = PathBuf::from(CGROUP_ROOT);
     let cgroup_path = cgroup_root.join(format!("job_{}", job_id));
@@ -918,6 +921,16 @@ fn setup_cgroup(
         let memory_bytes = memory_mb * 1024 * 1024;
         if let Err(e) = std::fs::write(cgroup_path.join("memory.max"), memory_bytes.to_string()) {
             warn!(job_id, error = %e, "failed to set memory.max");
+        }
+        // memory.max bounds resident memory only: with swap available the
+        // kernel pages the overflow out instead of OOM-killing. Opt-in, since
+        // capping swap starts killing jobs that used to survive.
+        if let Some(swap_bytes) = swap_limit.bytes_for(memory_bytes) {
+            if let Err(e) =
+                std::fs::write(cgroup_path.join("memory.swap.max"), swap_bytes.to_string())
+            {
+                warn!(job_id, error = %e, "failed to set memory.swap.max");
+            }
         }
     }
 
@@ -1407,7 +1420,13 @@ async fn launch_container_job(
     job_io: JobIo,
 ) -> anyhow::Result<(RunningJob, Option<OwnedFd>)> {
     let job_id = cfg.job_id;
-    let cgroup_path = setup_cgroup(job_id, cfg.cpus, cfg.memory_mb, &cfg.cpu_ids)?;
+    let cgroup_path = setup_cgroup(
+        job_id,
+        cfg.cpus,
+        cfg.memory_mb,
+        &cfg.cpu_ids,
+        cfg.swap_limit,
+    )?;
 
     // Sync pipe: child writes status, parent reads.
     let (pipe_r, pipe_w) = nix::unistd::pipe().context("create sync pipe")?;
@@ -2149,6 +2168,7 @@ mod tests {
             nodelist: String::new(),
             host_device_plan: None,
             memlock: MemlockLimit::Unlimited,
+            swap_limit: SwapLimit::Unconstrained,
             io_mode: LaunchIo::File,
             pmix_multi_task: false,
         }

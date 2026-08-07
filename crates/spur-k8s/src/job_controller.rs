@@ -108,22 +108,41 @@ fn should_submit(status: &SpurJobStatus) -> bool {
     status.spur_job_id.is_none()
 }
 
+/// Whether a failed submit is worth another attempt. Only "no controller
+/// answered" codes qualify; anything else faults the spec itself and would be
+/// rejected identically forever. Matches the agent's controller-RPC rule.
+fn submit_is_retryable(status: &tonic::Status) -> bool {
+    use tonic::Code;
+    matches!(
+        status.code(),
+        Code::Unavailable | Code::Internal | Code::DeadlineExceeded | Code::Unknown
+    )
+}
+
+/// Result of the submit phase.
+enum SubmitOutcome {
+    Submitted,
+    /// A prior reconcile already submitted this SpurJob.
+    AlreadySubmitted,
+    /// The controller refused the spec; the SpurJob is now Failed.
+    Rejected,
+}
+
 /// Submit to spurctld, apply job-id label, and patch CRD status.
 /// Re-reads from the API server first to guard against stale informer cache.
-/// Returns `Ok(None)` if a prior reconcile already submitted.
 async fn submit_to_controller(
     api: &Api<SpurJob>,
     ctx: &JobControllerCtx,
     name: &str,
     ns: &str,
     job: &SpurJob,
-) -> Result<Option<u32>, ReconcileError> {
+) -> Result<SubmitOutcome, ReconcileError> {
     // Fresh read from API server — informer cache may be stale after finalizer patch
     let fresh = api.get(name).await.map_err(ReconcileError::Kube)?;
     let fresh_status = fresh.status.clone().unwrap_or_default();
     if !should_submit(&fresh_status) {
         debug!(spurjob = %name, "already submitted by prior reconcile");
-        return Ok(None);
+        return Ok(SubmitOutcome::AlreadySubmitted);
     }
 
     let user = job
@@ -145,9 +164,19 @@ async fn submit_to_controller(
         .await
     {
         Ok(resp) => resp.into_inner().job_id,
-        Err(e) => {
+        Err(e) if submit_is_retryable(&e) => {
             error!(spurjob = %name, error = %e, "failed to submit SpurJob");
             return Err(ReconcileError::Grpc(e));
+        }
+        Err(e) => {
+            error!(spurjob = %name, error = %e, "SpurJob rejected by the controller");
+            let new_status = SpurJobStatus {
+                state: "Failed".into(),
+                message: Some(format!("rejected by spurctld: {}", e.message())),
+                ..fresh_status.clone()
+            };
+            patch_status(api, name, &new_status).await;
+            return Ok(SubmitOutcome::Rejected);
         }
     };
     drop(ctrl);
@@ -166,7 +195,7 @@ async fn submit_to_controller(
     };
     patch_status(api, name, &new_status).await;
 
-    Ok(Some(job_id))
+    Ok(SubmitOutcome::Submitted)
 }
 
 /// State-machine dispatcher: submit if no job_id, otherwise poll spurctld.
@@ -190,8 +219,9 @@ async fn handle_job(
     // Phase 1: Submit (no spur_job_id yet)
     if should_submit(&status) {
         return match submit_to_controller(api, ctx, &name, &ns, &job).await? {
-            Some(_job_id) => Ok(Action::requeue(Duration::from_secs(5))),
-            None => Ok(Action::requeue(Duration::from_secs(2))),
+            SubmitOutcome::Submitted => Ok(Action::requeue(Duration::from_secs(5))),
+            SubmitOutcome::AlreadySubmitted => Ok(Action::requeue(Duration::from_secs(2))),
+            SubmitOutcome::Rejected => Ok(Action::await_change()),
         };
     }
 
@@ -888,6 +918,33 @@ mod tests {
         assert!(!is_terminal("Suspended"));
         assert!(!is_terminal("Unknown"));
         assert!(!is_terminal(""));
+    }
+
+    // --- submit_is_retryable ---
+
+    #[test]
+    fn a_spec_rejection_is_not_retried() {
+        // What spurctld returns for an unknown partition or a denied account.
+        assert!(!submit_is_retryable(&tonic::Status::invalid_argument(
+            "partition 'gpu' not found"
+        )));
+        assert!(!submit_is_retryable(&tonic::Status::permission_denied(
+            "account denied"
+        )));
+    }
+
+    #[test]
+    fn a_controller_that_did_not_answer_is_retried() {
+        // "not the Raft leader" and a failed Raft propose are both transient.
+        assert!(submit_is_retryable(&tonic::Status::unavailable(
+            "not the Raft leader"
+        )));
+        assert!(submit_is_retryable(&tonic::Status::internal(
+            "raft propose failed"
+        )));
+        assert!(submit_is_retryable(&tonic::Status::deadline_exceeded(
+            "timed out"
+        )));
     }
 
     // --- resolve_reporting_node ---
