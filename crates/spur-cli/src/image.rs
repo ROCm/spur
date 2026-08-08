@@ -132,12 +132,10 @@ async fn cmd_import_dockerd(image: &str) -> Result<()> {
     let rootfs_str = rootfs.to_string_lossy();
     let output_path_str = output_path.to_string_lossy();
 
-    // Extract the docker save tar, then extract each layer
-    extract_docker_save_tar(&output.stdout, &rootfs_str)?;
-
-    // Pack into squashfs
-    pack_squashfs(&rootfs_str, &output_path_str)?;
+    let import_result = extract_docker_save_tar(&output.stdout, &rootfs_str)
+        .and_then(|()| pack_squashfs(&rootfs_str, &output_path_str));
     let _ = std::fs::remove_dir_all(&tmp_dir);
+    import_result?;
 
     let size = std::fs::metadata(&output_path)
         .map(|m| m.len())
@@ -184,9 +182,10 @@ async fn cmd_import_podman(image: &str) -> Result<()> {
     let rootfs_str = rootfs.to_string_lossy();
     let output_path_str = output_path.to_string_lossy();
 
-    extract_docker_save_tar(&output.stdout, &rootfs_str)?;
-    pack_squashfs(&rootfs_str, &output_path_str)?;
+    let import_result = extract_docker_save_tar(&output.stdout, &rootfs_str)
+        .and_then(|()| pack_squashfs(&rootfs_str, &output_path_str));
     let _ = std::fs::remove_dir_all(&tmp_dir);
+    import_result?;
 
     let size = std::fs::metadata(&output_path)
         .map(|m| m.len())
@@ -202,61 +201,49 @@ async fn cmd_import_podman(image: &str) -> Result<()> {
 /// Extract a `docker save` tar archive into a rootfs.
 /// The tar contains a manifest.json listing layer tarballs.
 fn extract_docker_save_tar(tar_data: &[u8], rootfs: &str) -> Result<()> {
-    use flate2::read::GzDecoder;
-
     let dest = std::path::Path::new(rootfs);
-    let mut archive = tar::Archive::new(tar_data);
-    let tmp = format!("{}/.docker_save", rootfs);
+    let tmp = dest.join(".docker_save");
     std::fs::create_dir_all(&tmp)?;
 
-    // First pass: extract all files from the docker save tar
-    archive.set_overwrite(true);
-    archive
-        .unpack(&tmp)
-        .context("failed to extract docker save archive")?;
+    let result = (|| {
+        let mut archive = tar::Archive::new(tar_data);
+        archive.set_overwrite(true);
+        archive
+            .unpack(&tmp)
+            .context("failed to extract docker save archive")?;
 
-    // Parse manifest.json to find layer order
-    let manifest_path = format!("{}/manifest.json", tmp);
-    let manifest_str =
-        std::fs::read_to_string(&manifest_path).context("no manifest.json in docker save")?;
-    let manifest: Vec<serde_json::Value> =
-        serde_json::from_str(&manifest_str).context("invalid manifest.json")?;
+        let manifest_str = std::fs::read_to_string(tmp.join("manifest.json"))
+            .context("no manifest.json in docker save")?;
+        let manifest: Vec<serde_json::Value> =
+            serde_json::from_str(&manifest_str).context("invalid manifest.json")?;
 
-    let layers = manifest
-        .first()
-        .and_then(|m| m.get("Layers"))
-        .and_then(|l| l.as_array())
-        .ok_or_else(|| anyhow::anyhow!("no layers in manifest.json"))?;
+        let layers = manifest
+            .first()
+            .and_then(|manifest| manifest.get("Layers"))
+            .and_then(|layers| layers.as_array())
+            .ok_or_else(|| anyhow::anyhow!("no layers in manifest.json"))?;
 
-    // Extract each layer in order
-    for layer_path in layers {
-        let layer_file = layer_path
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("invalid layer path"))?;
-        let full_path = format!("{}/{}", tmp, layer_file);
-        let data = std::fs::read(&full_path)
-            .with_context(|| format!("failed to read layer {}", layer_file))?;
+        for layer_path in layers {
+            let layer_file = layer_path
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("invalid layer path"))?;
+            let data = std::fs::read(tmp.join(layer_file))
+                .with_context(|| format!("failed to read layer {}", layer_file))?;
 
-        // Try gzip decompress, fall back to plain tar
-        let result = if data.starts_with(&[0x1f, 0x8b]) {
-            let decoder = GzDecoder::new(data.as_slice());
-            let mut archive = tar::Archive::new(decoder);
+            let reader = spur_net::image_layer::decode(&data, None)
+                .with_context(|| format!("failed to decode layer {}", layer_file))?;
+            let mut archive = tar::Archive::new(reader);
             archive.set_overwrite(true);
-            archive.unpack(dest)
-        } else {
-            let mut archive = tar::Archive::new(data.as_slice());
-            archive.set_overwrite(true);
-            archive.unpack(dest)
-        };
-
-        if let Err(e) = result {
-            eprintln!("Warning: layer {} extraction had errors: {}", layer_file, e);
+            archive
+                .unpack(dest)
+                .with_context(|| format!("failed to extract layer {}", layer_file))?;
         }
-    }
 
-    // Clean up docker save temp files
+        Ok(())
+    })();
+
     let _ = std::fs::remove_dir_all(&tmp);
-    Ok(())
+    result
 }
 
 /// Pack a directory into a squashfs file.
@@ -420,5 +407,110 @@ fn is_dir_writable(path: &std::path::Path) -> bool {
         path.parent()
             .map(|p| p.exists() && is_dir_writable(p))
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use flate2::{write::GzEncoder, Compression};
+
+    use super::*;
+
+    fn tar_files(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut data = Vec::new();
+        let mut archive = tar::Builder::new(&mut data);
+        for (path, contents) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, path, *contents).unwrap();
+        }
+        archive.finish().unwrap();
+        drop(archive);
+        data
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn docker_save(layers: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let layer_names: Vec<&str> = layers.iter().map(|(name, _)| *name).collect();
+        let manifest = serde_json::to_vec(&serde_json::json!([{
+            "Config": "config.json",
+            "RepoTags": ["fixture:latest"],
+            "Layers": layer_names,
+        }]))
+        .unwrap();
+
+        let mut data = Vec::new();
+        let mut archive = tar::Builder::new(&mut data);
+        for (path, contents) in std::iter::once(("manifest.json", manifest.as_slice())).chain(
+            layers
+                .iter()
+                .map(|(path, contents)| (*path, contents.as_slice())),
+        ) {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, path, contents).unwrap();
+        }
+        archive.finish().unwrap();
+        drop(archive);
+        data
+    }
+
+    #[test]
+    fn docker_save_import_supports_mixed_layer_compression() {
+        let gzip = gzip(&tar_files(&[("gzip.txt", b"gzip"), ("order.txt", b"gzip")]));
+        let zstd = zstd::stream::encode_all(
+            tar_files(&[("zstd.txt", b"zstd"), ("order.txt", b"zstd")]).as_slice(),
+            0,
+        )
+        .unwrap();
+        let plain = tar_files(&[("plain.txt", b"plain"), ("order.txt", b"plain")]);
+        let archive = docker_save(&[
+            ("gzip/layer.tar", gzip),
+            ("zstd/layer.tar", zstd),
+            ("plain/layer.tar", plain),
+        ]);
+        let rootfs = tempfile::tempdir().unwrap();
+
+        extract_docker_save_tar(&archive, rootfs.path().to_str().unwrap()).unwrap();
+
+        assert_eq!(
+            std::fs::read(rootfs.path().join("plain.txt")).unwrap(),
+            b"plain"
+        );
+        assert_eq!(
+            std::fs::read(rootfs.path().join("gzip.txt")).unwrap(),
+            b"gzip"
+        );
+        assert_eq!(
+            std::fs::read(rootfs.path().join("zstd.txt")).unwrap(),
+            b"zstd"
+        );
+        assert_eq!(
+            std::fs::read(rootfs.path().join("order.txt")).unwrap(),
+            b"plain"
+        );
+    }
+
+    #[test]
+    fn docker_save_import_cleans_up_after_invalid_layer() {
+        let archive =
+            docker_save(&[("broken/layer.tar", vec![0x28, 0xb5, 0x2f, 0xfd, 0, 0, 0, 0])]);
+        let rootfs = tempfile::tempdir().unwrap();
+
+        let error = extract_docker_save_tar(&archive, rootfs.path().to_str().unwrap()).unwrap_err();
+
+        assert!(error.to_string().contains("broken/layer.tar"));
+        assert!(!rootfs.path().join(".docker_save").exists());
     }
 }
