@@ -15,6 +15,15 @@ use spur_proto::proto::{
 use std::collections::HashMap;
 use std::io::Write as _;
 
+const NODE_COUNT_ENV_NAMES: &[&str] = &[
+    "SPUR_JOB_NUM_NODES",
+    "SPUR_NNODES",
+    "SLURM_JOB_NUM_NODES",
+    "SLURM_NNODES",
+];
+const TASK_COUNT_ENV_NAMES: &[&str] =
+    &["SPUR_NTASKS", "SPUR_NPROCS", "SLURM_NTASKS", "SLURM_NPROCS"];
+
 /// Run a parallel job (interactive or allocation-based).
 #[derive(Parser, Debug)]
 #[command(name = "srun", about = "Run a parallel job")]
@@ -212,6 +221,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let mut args = SrunArgs::from_arg_matches(&matches)?;
     resolve_srun_env(&matches, &mut args)?;
     args.nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
+    let step_layout = resolve_step_layout(&matches, &args);
 
     // --jobid --overlap: exec into a running job (interactive PTY session)
     if let Some(job_id) = args.jobid {
@@ -268,7 +278,15 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     // Step mode: if running inside an allocation, create a step instead of a new job
     if let Ok(parent_job_id) = std::env::var("SPUR_JOB_ID") {
         if let Ok(job_id) = parent_job_id.parse::<u32>() {
-            return run_as_step(&args, job_id, &hooks, &work_dir, &resolved_mpi).await;
+            return run_as_step(
+                &args,
+                job_id,
+                &hooks,
+                &work_dir,
+                &resolved_mpi,
+                &step_layout,
+            )
+            .await;
         }
     }
 
@@ -293,6 +311,10 @@ fn resolve_srun_mpi(args: &SrunArgs, matches: &ArgMatches, step_mode: bool) -> R
 /// allocation's output vars), a few read genuine `SRUN_*`, and each also
 /// accepts its `SPUR_*` native twin. CLI always overrides env.
 fn resolve_srun_env(matches: &ArgMatches, args: &mut SrunArgs) -> Result<()> {
+    let nodes_from_env = !was_cli_set(matches, "nodes")
+        && crate::env_defaults::env_first(NODE_COUNT_ENV_NAMES).is_some();
+    let ntasks_from_env = !was_cli_set(matches, "ntasks")
+        && crate::env_defaults::env_first(TASK_COUNT_ENV_NAMES).is_some();
     apply_str(
         matches,
         "job_name",
@@ -327,23 +349,8 @@ fn resolve_srun_env(matches: &ArgMatches, args: &mut SrunArgs) -> Result<()> {
         &["SPUR_QOS", "SPUR_JOB_QOS", "SLURM_QOS", "SLURM_JOB_QOS"],
         &mut args.qos,
     );
-    apply_num(
-        matches,
-        "nodes",
-        &[
-            "SPUR_NNODES",
-            "SPUR_JOB_NUM_NODES",
-            "SLURM_NNODES",
-            "SLURM_JOB_NUM_NODES",
-        ],
-        &mut args.nodes,
-    )?;
-    apply_num_opt(
-        matches,
-        "ntasks",
-        &["SPUR_NTASKS", "SPUR_NPROCS", "SLURM_NTASKS", "SLURM_NPROCS"],
-        &mut args.ntasks,
-    )?;
+    apply_num(matches, "nodes", NODE_COUNT_ENV_NAMES, &mut args.nodes)?;
+    apply_num_opt(matches, "ntasks", TASK_COUNT_ENV_NAMES, &mut args.ntasks)?;
     apply_num(
         matches,
         "cpus_per_task",
@@ -470,6 +477,10 @@ fn resolve_srun_env(matches: &ArgMatches, args: &mut SrunArgs) -> Result<()> {
         &mut args.epilog,
     );
 
+    if args.ntasks_per_node.is_some_and(|tasks| tasks > 0) && ntasks_from_env && !nodes_from_env {
+        args.ntasks = None;
+    }
+
     Ok(())
 }
 
@@ -501,6 +512,23 @@ fn resolve_io_paths(args: &SrunArgs) -> ResolvedIoPaths {
 #[derive(Debug)]
 struct StepDispatchResult {
     exit_code: i32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StepLayout {
+    num_tasks: u32,
+    num_nodes: Option<u32>,
+    node: String,
+}
+
+fn resolve_step_layout(matches: &ArgMatches, args: &SrunArgs) -> StepLayout {
+    let node_count_requested = was_cli_set(matches, "nodes")
+        || crate::env_defaults::env_first(NODE_COUNT_ENV_NAMES).is_some();
+    StepLayout {
+        num_tasks: crate::sbatch::effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
+        num_nodes: node_count_requested.then_some(args.nodes),
+        node: args.nodelist.clone().unwrap_or_default(),
+    }
 }
 
 fn srun_dispatch_environment(args: &SrunArgs) -> HashMap<String, String> {
@@ -701,6 +729,7 @@ async fn emit_step_output(
 
 struct StepDispatchParams<'a> {
     args: &'a SrunArgs,
+    layout: &'a StepLayout,
     work_dir: &'a str,
     io: &'a ResolvedIoPaths,
     mpi: &'a str,
@@ -715,8 +744,8 @@ async fn dispatch_step(
     let work_dir = params.work_dir;
     let io = params.io;
     let step_mpi = params.mpi;
-    let ntasks = crate::sbatch::effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes);
-    let step_id = client
+    let ntasks = params.layout.num_tasks;
+    let step = client
         .create_job_step(CreateJobStepRequest {
             job_id,
             command: args.command.clone(),
@@ -725,13 +754,17 @@ async fn dispatch_step(
             overlap: false,
             pty: false,
             winsize: None,
-            node: String::new(),
+            node: params.layout.node.clone(),
             user: crate::interactive::current_user(),
+            num_nodes: params.layout.num_nodes,
         })
         .await
         .context("failed to create job step")?
-        .into_inner()
-        .step_id;
+        .into_inner();
+    for warning in &step.warnings {
+        eprintln!("srun: warning: {warning}");
+    }
+    let step_id = step.step_id;
 
     if args.input.is_some() {
         eprintln!("srun: warning: --input is not supported in step mode, ignoring");
@@ -885,8 +918,14 @@ async fn run_standalone_srun(
         .into_inner();
 
     if job.srun_step_dispatch {
+        let allocation_layout = StepLayout {
+            num_tasks: job.num_tasks.max(1),
+            num_nodes: None,
+            node: String::new(),
+        };
         let step_params = StepDispatchParams {
             args,
+            layout: &allocation_layout,
             work_dir,
             io: &io,
             mpi,
@@ -1225,6 +1264,7 @@ async fn run_interactive_pty(
                     winsize: Some(winsize),
                     node: node.clone(),
                     user: crate::interactive::current_user(),
+                    num_nodes: None,
                 })
                 .await
             {
@@ -1296,6 +1336,7 @@ async fn run_as_step(
     hooks: &HooksConfig,
     work_dir: &str,
     step_mpi: &str,
+    step_layout: &StepLayout,
 ) -> Result<()> {
     let channel = spur_client::connect_channel(&args.controller)
         .await
@@ -1310,6 +1351,7 @@ async fn run_as_step(
 
     let step_params = StepDispatchParams {
         args,
+        layout: step_layout,
         work_dir,
         io: &io,
         mpi: step_mpi,
@@ -1842,9 +1884,9 @@ mod tests {
         env.set("SLURM_JOB_NUM_NODES", "3");
         assert_eq!(resolve_from(&["srun", "hostname"]).nodes, 3);
 
-        // SLURM_NNODES is listed before SLURM_JOB_NUM_NODES, so it wins.
+        // The allocation-scoped name wins over the legacy step-scoped alias.
         env.set("SLURM_NNODES", "5");
-        assert_eq!(resolve_from(&["srun", "hostname"]).nodes, 5);
+        assert_eq!(resolve_from(&["srun", "hostname"]).nodes, 3);
     }
 
     #[test]
@@ -2057,8 +2099,8 @@ mod tests {
             3
         );
 
-        // An inherited allocation task count is a direct request, so it wins
-        // over the per-node derivation.
+        // Slurm discards an inherited task count when an explicit node count
+        // and tasks-per-node together fully size the step.
         env.set("SLURM_NTASKS", "5");
         let inherited = resolve_from(&["srun", "-N", "4", "--ntasks-per-node=8", "hostname"]);
         assert_eq!(
@@ -2066,6 +2108,18 @@ mod tests {
                 inherited.ntasks,
                 inherited.ntasks_per_node,
                 inherited.nodes
+            ),
+            32
+        );
+
+        // An inherited node count keeps the inherited task count authoritative.
+        env.set("SLURM_JOB_NUM_NODES", "4");
+        let inherited_both = resolve_from(&["srun", "--ntasks-per-node=8", "hostname"]);
+        assert_eq!(
+            crate::sbatch::effective_ntasks(
+                inherited_both.ntasks,
+                inherited_both.ntasks_per_node,
+                inherited_both.nodes
             ),
             5
         );
@@ -2106,10 +2160,17 @@ mod tests {
         client: &mut SlurmControllerClient<tonic::transport::Channel>,
         cli: &[&str],
     ) -> Result<StepDispatchResult> {
-        let args = SrunArgs::try_parse_from(cli).expect("parse failed");
+        let matches = SrunArgs::command()
+            .try_get_matches_from(cli)
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        resolve_srun_env(&matches, &mut args).expect("resolve failed");
+        args.nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
+        let layout = resolve_step_layout(&matches, &args);
         let io = empty_io();
         let params = StepDispatchParams {
             args: &args,
+            layout: &layout,
             work_dir: "/tmp",
             io: &io,
             mpi: spur_core::mpi::MPI_NONE,
@@ -2130,6 +2191,7 @@ mod tests {
             .expect("dispatch should succeed");
 
         assert_eq!(capture.create_step_num_tasks(), 3);
+        assert_eq!(capture.create_step_num_nodes(), Some(3));
         assert_eq!(capture.run_step_calls(), 1);
         assert_eq!(
             capture.run_step_step_id(),
@@ -2151,6 +2213,56 @@ mod tests {
             .expect("dispatch should succeed");
 
         assert_eq!(capture.create_step_num_tasks(), 2);
+        assert_eq!(capture.create_step_num_nodes(), Some(3));
+    }
+
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn dispatch_step_keeps_inherited_tasks_when_nodes_are_overridden() {
+        let env = EnvGuard::new();
+        env.set("SPUR_NTASKS", "2");
+        env.set("SPUR_JOB_NUM_NODES", "2");
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        dispatch_with(&mut client, &["srun", "-N", "1", "hostname"])
+            .await
+            .expect("dispatch should succeed");
+
+        assert_eq!(capture.create_step_num_tasks(), 2);
+        assert_eq!(capture.create_step_num_nodes(), Some(1));
+    }
+
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn dispatch_step_forwards_requested_nodelist() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        dispatch_with(
+            &mut client,
+            &["srun", "-N", "2", "-w", "node[002-003]", "hostname"],
+        )
+        .await
+        .expect("dispatch should succeed");
+
+        assert_eq!(capture.create_step_num_nodes(), Some(2));
+        assert_eq!(capture.create_step_node(), "node[002-003]");
+    }
+
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn dispatch_step_leaves_unspecified_node_count_unset() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        dispatch_with(&mut client, &["srun", "hostname"])
+            .await
+            .expect("dispatch should succeed");
+
+        assert_eq!(capture.create_step_num_nodes(), None);
     }
 
     /// The per-node default feeds cpu-bind validation, so a `map_cpu` list

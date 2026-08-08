@@ -1454,16 +1454,26 @@ impl SlurmController for ControllerService {
             )));
         }
 
-        let target_node =
-            select_step_node(&job.allocated_nodes, &req.node).map_err(Status::invalid_argument)?;
+        let selection = select_step_nodes(
+            &job.allocated_nodes,
+            req.num_nodes,
+            &req.node,
+            req.num_tasks,
+        )
+        .map_err(Status::invalid_argument)?;
+        let target_node = selection
+            .nodes
+            .first()
+            .ok_or_else(|| Status::internal("step node selection returned no nodes"))?
+            .clone();
 
         // Resolve the target agent address BEFORE creating the step: an unregistered node returns a
         // retryable Unavailable and the client retries the whole call, so resolving first keeps a
         // failed attempt from leaking a step per retry.
-        let node = self.cluster.get_node(target_node).ok_or_else(|| {
+        let node = self.cluster.get_node(&target_node).ok_or_else(|| {
             Status::unavailable(format!("node {target_node} is not currently registered"))
         })?;
-        let node_addr = node_comm_socket(&node, target_node)?;
+        let node_addr = node_comm_socket(&node, &target_node)?;
 
         let existing_steps = self.cluster.get_steps(job_id);
         let step_id = existing_steps
@@ -1479,7 +1489,7 @@ impl SlurmController for ControllerService {
             num_tasks: req.num_tasks.max(1),
             cpus_per_task: req.cpus_per_task.max(1),
             resources: spur_core::resource::ResourceAllocations::default(),
-            nodes: job.allocated_nodes.clone(),
+            nodes: selection.nodes,
             distribution: spur_core::step::TaskDistribution::Block,
             start_time: Some(chrono::Utc::now()),
             end_time: None,
@@ -1490,7 +1500,11 @@ impl SlurmController for ControllerService {
             .create_step(step)
             .map_err(|e| Status::internal(format!("failed to create job step: {e}")))?;
 
-        Ok(Response::new(CreateJobStepResponse { step_id, node_addr }))
+        Ok(Response::new(CreateJobStepResponse {
+            step_id,
+            node_addr,
+            warnings: selection.warnings,
+        }))
     }
 
     async fn create_partition(
@@ -2014,7 +2028,14 @@ impl SlurmController for ControllerService {
                 Status::not_found(format!("step {} not found for job {}", req.step_id, job_id))
             })?;
 
-        let num_nodes = job.allocated_nodes.len() as u32;
+        if step.nodes.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "step {} for job {} has no allocated nodes",
+                req.step_id, job_id
+            )));
+        }
+
+        let num_nodes = step.nodes.len() as u32;
         let plan = build_step_task_plan(step.num_tasks, num_nodes, step.distribution);
         if plan.is_empty() {
             return Err(Status::failed_precondition(format!(
@@ -2024,6 +2045,7 @@ impl SlurmController for ControllerService {
         }
 
         let step_num_tasks = step.num_tasks;
+        let step_nodelist = step.nodes.join(",");
         let command = req.command.clone();
         let work_dir = req.work_dir.clone();
         let environment = req.environment.clone();
@@ -2047,14 +2069,15 @@ impl SlurmController for ControllerService {
         let mut dispatch_errors = Vec::new();
 
         for node_tasks in plan {
-            let node_name = match job.allocated_nodes.get(node_tasks.node_index as usize) {
+            let node_name = match step.nodes.get(node_tasks.node_index as usize) {
                 Some(name) => name.clone(),
                 None => {
                     dispatch_errors.push(format!(
-                        "step plan references node index {} but job {} has {} nodes",
+                        "step plan references node index {} but step {} for job {} has {} nodes",
                         node_tasks.node_index,
+                        req.step_id,
                         job_id,
-                        job.allocated_nodes.len()
+                        step.nodes.len()
                     ));
                     continue;
                 }
@@ -2087,6 +2110,7 @@ impl SlurmController for ControllerService {
             let environment = environment.clone();
             let pmix_tmpdir = pmix_tmpdir.clone();
             let step_mpi = mpi.clone();
+            let step_nodelist = step_nodelist.clone();
             let pmix_plan = spur_core::mpi::maybe_local_pmix_plan(
                 step_mpi.as_str(),
                 spur_core::mpi::PmixLocalDispatch {
@@ -2124,6 +2148,7 @@ impl SlurmController for ControllerService {
                         label,
                         pmix_plan,
                         mpi: step_mpi,
+                        step_nodelist,
                     })
                     .await
                     .map_err(|e| {
@@ -2439,20 +2464,102 @@ pub async fn serve(
     Ok(())
 }
 
-/// Resolve the target node for a job step. Empty = first allocated (legacy
-/// default); a named node must be one the job holds, else it targets outside it.
-fn select_step_node<'a>(allocated: &'a [String], requested: &str) -> Result<&'a str, String> {
-    if requested.is_empty() {
-        return allocated
-            .first()
-            .map(String::as_str)
-            .ok_or_else(|| "job has no allocated nodes".to_string());
+#[derive(Debug, PartialEq, Eq)]
+struct StepNodeSelection {
+    nodes: Vec<String>,
+    warnings: Vec<String>,
+}
+
+fn select_step_nodes(
+    allocated: &[String],
+    requested_count: Option<u32>,
+    requested_hostlist: &str,
+    num_tasks: u32,
+) -> Result<StepNodeSelection, String> {
+    if allocated.is_empty() {
+        return Err("job has no allocated nodes".to_string());
     }
-    allocated
+
+    let mut listed = Vec::new();
+    let mut seen = HashSet::new();
+    if !requested_hostlist.trim().is_empty() {
+        for node in spur_sched::node_match::expand_hostlist_or_split(requested_hostlist) {
+            if seen.insert(node.clone()) {
+                listed.push(node);
+            }
+        }
+    }
+
+    let requested_limit = requested_count.map(|count| count.max(1) as usize);
+    if let Some(limit) = requested_limit {
+        if listed.len() > limit {
+            return Err(format!(
+                "requested node list contains {} nodes but -N allows at most {limit}",
+                listed.len()
+            ));
+        }
+    }
+
+    let default_nodes = if listed.is_empty() {
+        allocated.len()
+    } else {
+        listed.len()
+    };
+    let requested_nodes = requested_limit.unwrap_or(default_nodes);
+    let task_count = num_tasks.max(1) as usize;
+    let effective_count = requested_nodes.min(task_count);
+
+    if effective_count > allocated.len() {
+        return Err(format!(
+            "requested {effective_count} nodes but job allocation contains only {}",
+            allocated.len()
+        ));
+    }
+    if requested_count.is_some() && listed.len() > effective_count {
+        return Err(format!(
+            "requested node list contains {} nodes but the step can use at most {effective_count}",
+            listed.len()
+        ));
+    }
+    if requested_count.is_none() {
+        listed.truncate(effective_count);
+    }
+    for node in &listed {
+        if !allocated.contains(node) {
+            return Err(format!("node {node} is not allocated to this job"));
+        }
+    }
+
+    let mut warnings = Vec::new();
+    if requested_nodes > effective_count
+        && (requested_count.is_some() || !requested_hostlist.trim().is_empty())
+    {
+        warnings.push(format!(
+            "can't run {task_count} processes on {requested_nodes} nodes, \
+             setting nnodes to {effective_count}"
+        ));
+    }
+
+    let mut selected = listed;
+    if selected.len() < effective_count {
+        selected.extend(
+            allocated
+                .iter()
+                .filter(|node| !seen.contains(node.as_str()))
+                .take(effective_count - selected.len())
+                .cloned(),
+        );
+    } else {
+        selected.truncate(effective_count);
+    }
+    let selected: HashSet<_> = selected.into_iter().collect();
+    let nodes = allocated
         .iter()
-        .find(|n| n.as_str() == requested)
-        .map(String::as_str)
-        .ok_or_else(|| format!("node {requested} is not allocated to this job"))
+        .filter(|node| selected.contains(node.as_str()))
+        .cloned()
+        .collect();
+
+    Ok(StepNodeSelection { nodes, warnings })
 }
 
 // ---- Proto conversion helpers ----
@@ -3079,6 +3186,7 @@ mod tests {
     use chrono::Duration;
     use spur_core::job::{JobState, NodeCompleteError};
     use spur_core::reservation::ReservationFlags;
+    use std::collections::HashMap;
     use tonic::Code;
 
     #[test]
@@ -3586,6 +3694,267 @@ mod tests {
         }
     }
 
+    struct StepAgent {
+        requests: Arc<std::sync::Mutex<Vec<RunCommandRequest>>>,
+    }
+
+    #[tonic::async_trait]
+    impl spur_proto::proto::slurm_agent_server::SlurmAgent for StepAgent {
+        type StreamJobOutputStream = tonic::codegen::BoxStream<StreamJobOutputChunk>;
+        type InteractiveSessionStream = tonic::codegen::BoxStream<InteractiveOutput>;
+
+        async fn launch_job(
+            &self,
+            _request: Request<LaunchJobRequest>,
+        ) -> Result<Response<LaunchJobResponse>, Status> {
+            Err(Status::unimplemented("not used in step tests"))
+        }
+
+        async fn cancel_job(
+            &self,
+            _request: Request<AgentCancelJobRequest>,
+        ) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented("not used in step tests"))
+        }
+
+        async fn suspend_job(
+            &self,
+            _request: Request<AgentSuspendJobRequest>,
+        ) -> Result<Response<()>, Status> {
+            Err(Status::unimplemented("not used in step tests"))
+        }
+
+        async fn get_node_resources(
+            &self,
+            _request: Request<()>,
+        ) -> Result<Response<NodeResourcesResponse>, Status> {
+            Err(Status::unimplemented("not used in step tests"))
+        }
+
+        async fn exec_in_job(
+            &self,
+            _request: Request<ExecInJobRequest>,
+        ) -> Result<Response<ExecInJobResponse>, Status> {
+            Err(Status::unimplemented("not used in step tests"))
+        }
+
+        async fn run_command(
+            &self,
+            request: Request<RunCommandRequest>,
+        ) -> Result<Response<RunCommandResponse>, Status> {
+            self.requests.lock().unwrap().push(request.into_inner());
+            Ok(Response::new(RunCommandResponse::default()))
+        }
+
+        async fn register_job_allocation(
+            &self,
+            _request: Request<RegisterJobAllocationRequest>,
+        ) -> Result<Response<RegisterJobAllocationResponse>, Status> {
+            Err(Status::unimplemented("not used in step tests"))
+        }
+
+        async fn stream_job_output(
+            &self,
+            _request: Request<StreamJobOutputRequest>,
+        ) -> Result<Response<Self::StreamJobOutputStream>, Status> {
+            Err(Status::unimplemented("not used in step tests"))
+        }
+
+        async fn interactive_session(
+            &self,
+            _request: Request<tonic::Streaming<InteractiveInput>>,
+        ) -> Result<Response<Self::InteractiveSessionStream>, Status> {
+            Err(Status::unimplemented("not used in step tests"))
+        }
+
+        async fn start_cluster_component(
+            &self,
+            _request: Request<StartClusterComponentRequest>,
+        ) -> Result<Response<StartClusterComponentResponse>, Status> {
+            Err(Status::unimplemented("not used in step tests"))
+        }
+
+        async fn stop_cluster_component(
+            &self,
+            _request: Request<StopClusterComponentRequest>,
+        ) -> Result<Response<StopClusterComponentResponse>, Status> {
+            Err(Status::unimplemented("not used in step tests"))
+        }
+
+        async fn get_cluster_component_status(
+            &self,
+            _request: Request<GetClusterComponentStatusRequest>,
+        ) -> Result<Response<GetClusterComponentStatusResponse>, Status> {
+            Err(Status::unimplemented("not used in step tests"))
+        }
+
+        async fn create_k0s_join_token(
+            &self,
+            _request: Request<CreateK0sJoinTokenRequest>,
+        ) -> Result<Response<CreateK0sJoinTokenResponse>, Status> {
+            Err(Status::unimplemented("not used in step tests"))
+        }
+
+        async fn get_kubeconfig(
+            &self,
+            _request: Request<GetKubeconfigRequest>,
+        ) -> Result<Response<GetKubeconfigResponse>, Status> {
+            Err(Status::unimplemented("not used in step tests"))
+        }
+
+        async fn apply_mesh(
+            &self,
+            _request: Request<MeshMembership>,
+        ) -> Result<Response<ApplyMeshResponse>, Status> {
+            Err(Status::unimplemented("not used in step tests"))
+        }
+    }
+
+    async fn spawn_step_agent() -> (
+        std::net::SocketAddr,
+        Arc<std::sync::Mutex<Vec<RunCommandRequest>>>,
+    ) {
+        use tonic::transport::server::TcpIncoming;
+
+        let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = incoming.local_addr().unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = StepAgent {
+            requests: requests.clone(),
+        };
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent))
+                .serve_with_incoming(incoming)
+                .await;
+        });
+        (addr, requests)
+    }
+
+    async fn running_two_node_job(
+        svc: &ControllerService,
+        first_port: u16,
+        second_port: u16,
+    ) -> u32 {
+        use spur_core::resource::{ResourceAllocations, ResourceSet};
+
+        for (name, port) in [("n1", first_port), ("n2", second_port)] {
+            svc.cluster
+                .register_node(
+                    name.into(),
+                    name.into(),
+                    ResourceSet {
+                        cpus: 8,
+                        memory_mb: 16000,
+                        ..Default::default()
+                    },
+                    "127.0.0.1".into(),
+                    port,
+                    String::new(),
+                    String::new(),
+                    spur_core::node::NodeSource::NativeHost,
+                    HashMap::new(),
+                )
+                .unwrap();
+        }
+        for _ in 0..200 {
+            if svc.cluster.get_node("n1").is_some() && svc.cluster.get_node("n2").is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let job_id = svc
+            .cluster
+            .submit_job(spur_core::job::JobSpec {
+                name: "step-subset".into(),
+                user: "u".into(),
+                num_nodes: 2,
+                num_tasks: 2,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                srun_job: true,
+                ..Default::default()
+            })
+            .unwrap()
+            .job_id;
+        let resources = ResourceAllocations::with_scalar(2, 4000);
+        let per_node = [
+            ("n1".to_string(), resources.clone()),
+            ("n2".to_string(), resources.clone()),
+        ]
+        .into_iter()
+        .collect();
+        svc.cluster
+            .start_job(job_id, vec!["n1".into(), "n2".into()], resources, per_node)
+            .unwrap();
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).map(|job| job.state) == Some(JobState::Running) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        job_id
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_dispatches_only_to_the_selected_nodes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (first_addr, first_requests) = spawn_step_agent().await;
+        let (second_addr, second_requests) = spawn_step_agent().await;
+        let job_id = running_two_node_job(&svc, first_addr.port(), second_addr.port()).await;
+
+        let created = svc
+            .create_job_step(Request::new(CreateJobStepRequest {
+                job_id,
+                command: vec!["hostname".into()],
+                num_tasks: 2,
+                cpus_per_task: 1,
+                overlap: false,
+                pty: false,
+                winsize: None,
+                node: "n2".into(),
+                user: "u".into(),
+                num_nodes: Some(1),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let stored_step = svc
+            .cluster
+            .get_steps(job_id)
+            .into_iter()
+            .find(|step| step.step_id == created.step_id)
+            .unwrap();
+        assert_eq!(stored_step.nodes, ["n2"]);
+
+        let response = svc
+            .run_step(Request::new(RunStepRequest {
+                job_id,
+                command: vec!["hostname".into()],
+                uid: 0,
+                gid: 0,
+                work_dir: "/tmp".into(),
+                environment: HashMap::new(),
+                step_id: created.step_id,
+                label: false,
+                mpi: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.node, "n2");
+        assert!(first_requests.lock().unwrap().is_empty());
+        let requests = second_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].num_tasks, 2);
+        assert_eq!(requests[0].step_num_tasks, 2);
+        assert_eq!(requests[0].step_nodelist, "n2");
+    }
+
     // A step must NOT be created when the target node is allocated but unregistered: address
     // resolution runs first and returns a retryable Unavailable, so the client's retries can't
     // each leak a step.
@@ -3663,6 +4032,7 @@ mod tests {
                     winsize: None,
                     node: "ghost".into(),
                     user: "u".into(),
+                    num_nodes: None,
                 }))
                 .await
                 .expect_err("unregistered target must fail");
@@ -3737,6 +4107,7 @@ mod tests {
                 pty: false,
                 winsize: None,
                 node: String::new(),
+                num_nodes: None,
             }))
             .await
             .expect_err("a still-Pending job must not accept a new step");
@@ -3854,6 +4225,7 @@ mod tests {
                 winsize: None,
                 node: String::new(),
                 user: "rsikande".into(),
+                num_nodes: None,
             }))
             .await
             .expect_err("a non-owner must not attach to another user's job");
@@ -3883,6 +4255,7 @@ mod tests {
                 winsize: None,
                 node: String::new(),
                 user: "ubuntu".into(),
+                num_nodes: None,
             }))
             .await
             .expect("the owner must be allowed to attach");
@@ -4142,35 +4515,153 @@ mod tests {
     }
 
     #[test]
-    fn select_step_node_empty_request_uses_first_allocated() {
+    fn select_step_nodes_honors_explicit_count_below_task_count() {
         let allocated = vec!["node001".to_string(), "node002".to_string()];
-        assert_eq!(select_step_node(&allocated, ""), Ok("node001"));
+        let selection = select_step_nodes(&allocated, Some(1), "", 2).unwrap();
+        assert_eq!(selection.nodes, ["node001"]);
+        assert!(selection.warnings.is_empty());
     }
 
     #[test]
-    fn select_step_node_named_request_targets_that_node() {
-        let allocated = vec!["node001".to_string(), "node002".to_string()];
-        assert_eq!(select_step_node(&allocated, "node002"), Ok("node002"));
+    fn select_step_nodes_keeps_listed_nodes_and_fills_from_allocation() {
+        let allocated = vec![
+            "node001".to_string(),
+            "node002".to_string(),
+            "node003".to_string(),
+        ];
+        let selection = select_step_nodes(&allocated, Some(2), "node003", 2).unwrap();
+        assert_eq!(selection.nodes, ["node001", "node003"]);
+        assert!(selection.warnings.is_empty());
     }
 
     #[test]
-    fn select_step_node_rejects_node_outside_allocation() {
+    fn select_step_nodes_rejects_node_outside_allocation() {
         let allocated = vec!["node001".to_string(), "node002".to_string()];
-        let err = select_step_node(&allocated, "node999").unwrap_err();
+        let err = select_step_nodes(&allocated, Some(1), "node999", 1).unwrap_err();
         assert!(err.contains("node999"));
         assert!(err.contains("not allocated"));
     }
 
     #[test]
-    fn select_step_node_empty_request_no_nodes_errors() {
-        let allocated: Vec<String> = Vec::new();
-        assert!(select_step_node(&allocated, "").is_err());
+    fn select_step_nodes_caps_at_task_count_with_warning() {
+        let allocated = vec![
+            "node001".to_string(),
+            "node002".to_string(),
+            "node003".to_string(),
+        ];
+        let selection = select_step_nodes(&allocated, Some(3), "", 2).unwrap();
+        assert_eq!(selection.nodes, ["node001", "node002"]);
+        assert_eq!(selection.warnings.len(), 1);
+        assert!(selection.warnings[0].contains("can't run 2 processes on 3 nodes"));
+        assert!(selection.warnings[0].contains("setting nnodes to 2"));
     }
 
     #[test]
-    fn select_step_node_rejects_comma_joined_request() {
+    fn select_step_nodes_rejects_count_larger_than_allocation() {
         let allocated = vec!["node001".to_string(), "node002".to_string()];
-        assert!(select_step_node(&allocated, "node001,node002").is_err());
+        let err = select_step_nodes(&allocated, Some(3), "", 3).unwrap_err();
+        assert!(err.contains("requested 3 nodes"));
+        assert!(err.contains("only 2"));
+    }
+
+    #[test]
+    fn select_step_nodes_rejects_list_larger_than_explicit_count() {
+        let allocated = vec![
+            "node001".to_string(),
+            "node002".to_string(),
+            "node003".to_string(),
+        ];
+        let err = select_step_nodes(&allocated, Some(2), "node[001-003]", 3).unwrap_err();
+        assert!(err.contains("contains 3 nodes"));
+        assert!(err.contains("at most 2"));
+    }
+
+    #[test]
+    fn select_step_nodes_rejects_explicit_list_after_task_cap() {
+        let allocated = vec![
+            "node001".to_string(),
+            "node002".to_string(),
+            "node003".to_string(),
+        ];
+        let err = select_step_nodes(&allocated, Some(3), "node[003,002,001]", 2).unwrap_err();
+        assert!(err.contains("contains 3 nodes"));
+        assert!(err.contains("at most 2"));
+    }
+
+    #[test]
+    fn select_step_nodes_truncates_unbounded_list_after_task_cap() {
+        let allocated = vec![
+            "node001".to_string(),
+            "node002".to_string(),
+            "node003".to_string(),
+        ];
+        let selection = select_step_nodes(&allocated, None, "node[003,002,001]", 2).unwrap();
+        assert_eq!(selection.nodes, ["node002", "node003"]);
+        assert_eq!(selection.warnings.len(), 1);
+    }
+
+    #[test]
+    fn select_step_nodes_ignores_unbounded_hosts_beyond_task_cap() {
+        let allocated = vec!["node001".to_string(), "node002".to_string()];
+        let selection = select_step_nodes(&allocated, None, "node001,node002,node999", 2).unwrap();
+        assert_eq!(selection.nodes, ["node001", "node002"]);
+        assert_eq!(selection.warnings.len(), 1);
+    }
+
+    #[test]
+    fn select_step_nodes_uses_allocation_order_for_named_nodes() {
+        let allocated = vec![
+            "node001".to_string(),
+            "node002".to_string(),
+            "node003".to_string(),
+        ];
+        let selection = select_step_nodes(&allocated, Some(2), "node003,node001", 2).unwrap();
+        assert_eq!(selection.nodes, ["node001", "node003"]);
+    }
+
+    #[test]
+    fn select_step_nodes_without_explicit_count_uses_allocation_capped_by_tasks() {
+        let allocated = vec![
+            "node001".to_string(),
+            "node002".to_string(),
+            "node003".to_string(),
+        ];
+        let selection = select_step_nodes(&allocated, None, "", 2).unwrap();
+        assert_eq!(selection.nodes, ["node001", "node002"]);
+        assert!(selection.warnings.is_empty());
+    }
+
+    #[test]
+    fn select_step_nodes_without_explicit_count_does_not_exceed_allocation() {
+        let allocated = vec!["node001".to_string(), "node002".to_string()];
+        let selection = select_step_nodes(&allocated, None, "", 4).unwrap();
+        assert_eq!(selection.nodes, ["node001", "node002"]);
+        assert!(selection.warnings.is_empty());
+    }
+
+    #[test]
+    fn select_step_nodes_without_count_uses_hostlist_cardinality() {
+        let allocated = vec![
+            "node001".to_string(),
+            "node002".to_string(),
+            "node003".to_string(),
+        ];
+        let selection = select_step_nodes(&allocated, None, "node003", 2).unwrap();
+        assert_eq!(selection.nodes, ["node003"]);
+        assert!(selection.warnings.is_empty());
+    }
+
+    #[test]
+    fn select_step_nodes_normalizes_zero_count_to_one() {
+        let allocated = vec!["node001".to_string(), "node002".to_string()];
+        let selection = select_step_nodes(&allocated, Some(0), "", 2).unwrap();
+        assert_eq!(selection.nodes, ["node001"]);
+        assert!(selection.warnings.is_empty());
+    }
+
+    #[test]
+    fn select_step_nodes_rejects_empty_allocation() {
+        assert!(select_step_nodes(&[], Some(1), "", 1).is_err());
     }
 
     #[test]

@@ -31,6 +31,8 @@ pub(crate) const MOCK_EXIT_CODE: i32 = 7;
 #[derive(Clone, Default)]
 pub(crate) struct StepCapture {
     create_step_num_tasks: Arc<AtomicU32>,
+    create_step_num_nodes: Arc<Mutex<Option<u32>>>,
+    create_step_node: Arc<Mutex<String>>,
     run_step_step_id: Arc<AtomicU32>,
     run_step_calls: Arc<AtomicU32>,
     update_node_names: Arc<Mutex<Vec<String>>>,
@@ -42,6 +44,14 @@ impl StepCapture {
     /// Task count carried by the most recent `CreateJobStep`.
     pub(crate) fn create_step_num_tasks(&self) -> u32 {
         self.create_step_num_tasks.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn create_step_num_nodes(&self) -> Option<u32> {
+        *self.create_step_num_nodes.lock().unwrap()
+    }
+
+    pub(crate) fn create_step_node(&self) -> String {
+        self.create_step_node.lock().unwrap().clone()
     }
 
     /// Step id carried by the most recent `RunStep`.
@@ -97,12 +107,16 @@ mock_controller_impl! {
             &self,
             request: tonic::Request<proto::CreateJobStepRequest>,
         ) -> Result<tonic::Response<proto::CreateJobStepResponse>, tonic::Status> {
+            let request = request.into_inner();
             self.capture
                 .create_step_num_tasks
-                .store(request.into_inner().num_tasks, Ordering::SeqCst);
+                .store(request.num_tasks, Ordering::SeqCst);
+            *self.capture.create_step_num_nodes.lock().unwrap() = request.num_nodes;
+            *self.capture.create_step_node.lock().unwrap() = request.node;
             Ok(tonic::Response::new(proto::CreateJobStepResponse {
                 step_id: MOCK_STEP_ID,
                 node_addr: String::new(),
+                warnings: Vec::new(),
             }))
         }
 
