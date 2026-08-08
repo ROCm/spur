@@ -1684,7 +1684,7 @@ impl SlurmAgent for AgentService {
         // node already confirmed via LaunchJob (confirm_dispatch_on_nodes) — so a
         // miss is a wrong job/node pairing, not a launch race. The one uncovered
         // case is a spurd restart mid-job, which starts `running` empty.
-        let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi) = {
+        let (gpu_devices, partition, cpus, memory_mb, job_nodelist, job_mpi) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
                 Status::not_found(format!("job {} not running on this node", job_id))
@@ -1706,9 +1706,19 @@ impl SlurmAgent for AgentService {
             )
         };
 
+        let step_nodelist = if req.step_nodelist.is_empty() {
+            job_nodelist.clone()
+        } else {
+            req.step_nodelist.clone()
+        };
         let agent_hostname = self.reporter.hostname.clone();
-        let node_names: Vec<&str> = nodelist.split(',').filter(|s| !s.is_empty()).collect();
+        let node_names: Vec<&str> = step_nodelist.split(',').filter(|s| !s.is_empty()).collect();
         let num_nodes = node_names.len().max(1) as u32;
+        let job_num_nodes = job_nodelist
+            .split(',')
+            .filter(|node| !node.is_empty())
+            .count()
+            .max(1) as u32;
         let node_id = node_names
             .iter()
             .position(|n| *n == agent_hostname)
@@ -1733,8 +1743,9 @@ impl SlurmAgent for AgentService {
         senv.set_with_slurm_twin("SPUR_JOB_ID", job_id);
         senv.set_with_slurm_twin("SPUR_JOBID", job_id);
         senv.set_with_slurm_twin("SPUR_JOB_PARTITION", &partition);
-        senv.set_with_slurm_twin("SPUR_NODELIST", &nodelist);
-        senv.set_with_slurm_twin("SPUR_JOB_NODELIST", &nodelist);
+        senv.set_with_slurm_twin("SPUR_NODELIST", &job_nodelist);
+        senv.set_with_slurm_twin("SPUR_STEP_NODELIST", &step_nodelist);
+        senv.set_with_slurm_twin("SPUR_JOB_NODELIST", &job_nodelist);
         senv.set_with_slurm_twin("SPUR_CPUS_ON_NODE", cpus);
         senv.extend(&gpu_env);
         let mut bind_env = HashMap::new();
@@ -1761,6 +1772,7 @@ impl SlurmAgent for AgentService {
             step_num_tasks,
             node_id,
             num_nodes,
+            job_num_nodes,
         );
         if req.label {
             senv.set("SPUR_LABEL", "1");
@@ -1847,7 +1859,7 @@ impl SlurmAgent for AgentService {
                 uid: req.uid,
                 gid: req.gid,
                 partition: partition.clone(),
-                nodelist: nodelist.clone(),
+                nodelist: job_nodelist.clone(),
                 script_context: "prolog_task".into(),
                 gpu_devices: gpu_devices.clone(),
                 cpus,
@@ -1917,7 +1929,7 @@ impl SlurmAgent for AgentService {
                 uid: req.uid,
                 gid: req.gid,
                 partition,
-                nodelist,
+                nodelist: job_nodelist,
                 script_context: "epilog_task".into(),
                 gpu_devices,
                 cpus,
@@ -3334,6 +3346,97 @@ mod tests {
         let resp = svc.run_command(req).await.unwrap().into_inner();
         assert_eq!(resp.exit_code, 0);
         assert_eq!(resp.stdout.trim(), "step-dispatched");
+    }
+
+    #[tokio::test]
+    async fn run_command_scopes_node_environment_to_the_step() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 101;
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.nodelist = "node-a,test-node,node-c".into();
+        svc.insert_test_job(job_id, tracked).await;
+
+        let req = Request::new(RunCommandRequest {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                concat!(
+                    "printf '%s\\n' \"",
+                    "$SPUR_NODELIST|$SLURM_NODELIST|",
+                    "$SPUR_STEP_NODELIST|$SLURM_STEP_NODELIST|",
+                    "$SPUR_JOB_NODELIST|$SLURM_JOB_NODELIST|",
+                    "$SPUR_NNODES|$SLURM_NNODES|",
+                    "$SPUR_STEP_NUM_NODES|$SLURM_STEP_NUM_NODES|",
+                    "$SPUR_JOB_NUM_NODES|$SLURM_JOB_NUM_NODES|",
+                    "$SPUR_NODEID|$SLURM_NODEID\"",
+                )
+                .into(),
+            ],
+            uid: 0,
+            gid: 0,
+            work_dir: String::new(),
+            environment: HashMap::new(),
+            job_id,
+            step_nodelist: "node-a,test-node".into(),
+            ..Default::default()
+        });
+
+        let resp = svc.run_command(req).await.unwrap().into_inner();
+        assert_eq!(resp.exit_code, 0);
+        assert_eq!(
+            resp.stdout.trim(),
+            concat!(
+                "node-a,test-node,node-c|node-a,test-node,node-c|",
+                "node-a,test-node|node-a,test-node|",
+                "node-a,test-node,node-c|node-a,test-node,node-c|",
+                "2|2|2|2|3|3|1|1"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_without_step_nodelist_uses_the_allocation() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 102;
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.nodelist = "node-a,test-node,node-c".into();
+        svc.insert_test_job(job_id, tracked).await;
+
+        let req = Request::new(RunCommandRequest {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                concat!(
+                    "printf '%s\\n' \"",
+                    "$SPUR_NODELIST|$SPUR_JOB_NODELIST|",
+                    "$SPUR_NNODES|$SPUR_JOB_NUM_NODES|$SPUR_NODEID\""
+                )
+                .into(),
+            ],
+            uid: 0,
+            gid: 0,
+            work_dir: String::new(),
+            environment: HashMap::new(),
+            job_id,
+            ..Default::default()
+        });
+
+        let resp = svc.run_command(req).await.unwrap().into_inner();
+        assert_eq!(resp.exit_code, 0);
+        assert_eq!(
+            resp.stdout.trim(),
+            "node-a,test-node,node-c|node-a,test-node,node-c|3|3|1"
+        );
     }
 
     #[tokio::test]
