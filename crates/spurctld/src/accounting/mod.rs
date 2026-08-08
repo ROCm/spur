@@ -7,7 +7,7 @@ mod grpc;
 mod notifier;
 mod reconcile;
 
-pub use grpc::accounting_server;
+pub(crate) use grpc::{accounting_server, AccountingService};
 pub use notifier::{AccountingNotifier, JobStartRecord};
 pub use reconcile::spawn_loop as spawn_reconcile_loop;
 pub use reconcile::RECONCILE_INTERVAL_SECS;

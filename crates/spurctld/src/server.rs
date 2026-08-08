@@ -2394,7 +2394,7 @@ pub async fn serve(
     raft_handle: Arc<RaftHandle>,
     rpc_stats: Arc<RpcStatsCollector>,
     sched_stats: Arc<SchedStatsCollector>,
-    accounting_pool: Option<sqlx::PgPool>,
+    accounting_service: Option<crate::accounting::AccountingService>,
     control_plane_replicas: u32,
 ) -> anyhow::Result<()> {
     let client_addrs: BTreeMap<u64, String> = raft_handle
@@ -2430,8 +2430,8 @@ pub async fn serve(
     let mut builder = tonic::transport::Server::builder().layer(stats_layer);
 
     let mut router = builder.add_service(spur_proto::controller_server(service));
-    if let Some(pool) = accounting_pool {
-        router = router.add_service(crate::accounting::accounting_server(pool));
+    if let Some(service) = accounting_service {
+        router = router.add_service(crate::accounting::accounting_server(service));
     }
 
     router.serve(addr).await?;
