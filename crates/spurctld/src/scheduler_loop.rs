@@ -39,9 +39,8 @@ fn node_comm_http_url(node: &Node) -> Option<String> {
     Some(spur_net::format_comm_http_url(host, node.port))
 }
 
-/// Inflate each node's `alloc_resources` by any pending-kill amount for it, so
-/// the scheduler doesn't place a new job on a resource whose prior occupant's
-/// kill hasn't been confirmed released yet.
+/// Inflate each node's `alloc_resources` by its pending-kill amount, so a
+/// resource whose prior occupant's kill isn't confirmed released stays out.
 fn apply_pending_kill_reservations(
     nodes: &mut [Node],
     pending_kill: &std::collections::HashMap<String, spur_core::resource::ResourceAllocations>,
@@ -146,8 +145,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         cluster.enforce_reservation_end_times();
         cluster.evict_expired_terminal_jobs();
 
-        // Pruned on every read regardless of whether this cycle schedules
-        // anything, so an idle cluster doesn't accumulate expired entries.
+        // Pruned on every read so an idle cluster doesn't accumulate expired entries.
         let pending_kill = cluster.pending_kill_reservations();
 
         // Classify once, apply reasons, and stage only candidates admitted by
@@ -168,9 +166,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             continue;
         }
 
-        // Keep a resource excluded from placement until the agent confirms it
-        // released a cancelled/evicted job, even though the controller's own
-        // alloc_resources already counts it free — a kill RPC can be lost.
+        // A kill RPC can be lost, so don't trust alloc_resources alone here.
         apply_pending_kill_reservations(&mut nodes, &pending_kill);
 
         let cycle_start = Instant::now();
@@ -4354,9 +4350,7 @@ mod tests {
             );
         }
 
-        // A node with a pending-kill reservation must not look free to the
-        // scheduler even though `alloc_resources` itself already shows it as
-        // free — the whole point of the confirm-before-free gate.
+        // A pending-kill reservation must not look free to the scheduler.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn pending_kill_reservation_inflates_node_alloc_resources() {
             let dir = TempDir::new().unwrap();

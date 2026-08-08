@@ -334,10 +334,7 @@ pub struct ControllerConfig {
     pub dispatch_reject_cooldown_secs: u64,
 
     /// Seconds a resource freed by cancel/evict stays excluded from new
-    /// dispatch on that node until the agent confirms it released the job
-    /// (default 60 — the agent's SIGTERM→5s→SIGKILL escalation plus one
-    /// heartbeat period, with margin). Guards against double-booking a
-    /// resource whose kill RPC was lost.
+    /// dispatch until the agent confirms release (default 60).
     #[serde(default = "default_pending_kill_ttl_secs")]
     pub pending_kill_ttl_secs: u64,
 }

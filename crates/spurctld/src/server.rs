@@ -228,16 +228,8 @@ impl ControllerService {
         Err(self.not_leader_status())
     }
 
-    /// Reconcile `node`'s heartbeat-reported held jobs against the controller's
-    /// own record. Kills a reported job the controller considers terminal, has
-    /// no record of, or has running/suspended/completing elsewhere without
-    /// this node bound to it — never fabricating a binding. Separately, evicts
-    /// a single-node job the controller still believes is allocated on `node`
-    /// if the node's report has omitted it for several consecutive heartbeats
-    /// (a multi-node job is left alone here: `evict_job` fails the whole job,
-    /// so acting on one node's phantom would tear it down on every node,
-    /// including ones reporting it fine). Spawned, best-effort; called only
-    /// from the heartbeat handler, which is already leader-gated.
+    /// Reconcile `node`'s reported held jobs against the controller's record.
+    /// Spawned, best-effort; called from the (leader-gated) heartbeat handler.
     fn reconcile_reported_allocations(&self, node: &str, reported: &[RunningJobStatus]) {
         let kill = reported
             .iter()
@@ -274,10 +266,8 @@ impl ControllerService {
 
         let reported_ids: HashSet<u32> = reported.iter().map(|r| r.job_id).collect();
         let active = self.cluster.active_jobs_on_node(node);
-        // Sweep any miss-streak entries for jobs that left this node's active
-        // set by some other path (completed, cancelled, reattached) — the
-        // only other removal is a later heartbeat re-reporting the job, so
-        // without this a job that never gets re-reported leaks its entry.
+        // Sweep entries for jobs that left the active set by another path,
+        // else one that's never re-reported leaks its streak entry.
         let active_ids: HashSet<spur_core::job::JobId> = active.iter().map(|j| j.job_id).collect();
         self.cluster.prune_phantom_streaks_not_in(node, &active_ids);
 
@@ -285,7 +275,7 @@ impl ControllerService {
         for job in active {
             if reported_ids.contains(&job.job_id) {
                 self.cluster.note_node_reported_job(job.job_id, node);
-            } else if job.allocated_nodes.len() == 1
+            } else if job.allocated_nodes.len() == 1 // evict_job fails the whole job
                 && self.cluster.note_node_omitted_job(job.job_id, node)
             {
                 phantom.push(job);
@@ -296,12 +286,8 @@ impl ControllerService {
             let node_owned = node.to_string();
             tokio::spawn(async move {
                 for job in phantom {
-                    // Re-fetch and re-check the epoch: the snapshot above may
-                    // be stale by the time this runs — a NodeFail->Pending
-                    // ->Running requeue on a fresh run_attempt must not be
-                    // force-failed by a phantom detected against the earlier
-                    // run, and the (possibly stale) snapshot must not be used
-                    // for the kill that follows.
+                    // Re-fetch: the snapshot may be stale by now — a fresh
+                    // run_attempt means a legitimate requeue, not a phantom.
                     let Some(fresh) = cluster.get_job(job.job_id) else {
                         continue;
                     };
@@ -313,9 +299,7 @@ impl ControllerService {
                         node = %node_owned,
                         "node's heartbeat repeatedly omitted a job the controller binds here — evicting"
                     );
-                    // Reserve before freeing: evict_job's WAL apply frees the
-                    // resources immediately, so the reservation must already
-                    // be in place before that happens, not after.
+                    // Reserve before evict_job frees the resources, not after.
                     note_pending_kill_for_job(&cluster, &fresh);
                     match cluster.evict_job(fresh.job_id) {
                         Ok(finalized) => {
@@ -452,15 +436,8 @@ fn is_k0s_admin(cache: &crate::association_cache::AssociationCache, caller: &str
     caller.is_empty() || caller == "root" || cache.is_admin(caller)
 }
 
-/// Whether a job `node` reports holding should be killed there: the controller
-/// has no record of it, considers it terminal, or is Running/Suspended
-/// /Completing but not bound to `node` — never fabricating a binding to
-/// justify sparing it. Those three states carry the "should already be bound
-/// to specific nodes" expectation (a suspend/completing transition doesn't
-/// touch `allocated_nodes`); Pending (register-before-persist: the agent can
-/// hold an allocation before the controller's own dispatch-confirmation WAL
-/// write lands) and Preempted (never an observable persisted state — it
-/// transitions to Pending atomically within one WAL apply) are always spared.
+/// Whether a job `node` reports holding should be killed there: unknown,
+/// terminal, or Running/Suspended/Completing but unbound — never fabricating.
 fn should_kill_reported_job(cluster: &ClusterManager, job_id: u32, node: &str) -> bool {
     use spur_core::job::JobState;
     match cluster.job_state(job_id) {
@@ -475,9 +452,7 @@ fn should_kill_reported_job(cluster: &ClusterManager, job_id: u32, node: &str) -
     }
 }
 
-/// Record a pending-kill reservation for each of `job`'s allocated nodes, so
-/// new dispatch avoids those resources until the agent confirms it released
-/// them or the reservation's TTL expires. Call right before sending the kill.
+/// Reserve `job`'s resources on each allocated node. Call before sending the kill.
 fn note_pending_kill_for_job(cluster: &ClusterManager, job: &spur_core::job::Job) {
     for node in &job.allocated_nodes {
         let resources = job.per_node_alloc.get(node).cloned().unwrap_or_default();
@@ -616,10 +591,7 @@ impl SlurmController for ControllerService {
         let req = request.into_inner();
         let job_id = req.job_id;
 
-        // Snapshot the job before cancelling so we have allocated_nodes, and
-        // reserve the pending-kill hold before cancel_job's WAL apply frees
-        // the resources — reserving after would leave a window where the
-        // scheduler could see them free with no reservation in place yet.
+        // Snapshot for allocated_nodes and reserve before cancel_job frees them.
         let job = self.cluster.get_job(job_id);
         if let Some(ref job) = job {
             note_pending_kill_for_job(&self.cluster, job);
@@ -3559,9 +3531,7 @@ mod tests {
         assert_eq!(status.message(), "partition 'gpu' not found");
     }
 
-    /// Terminal and unknown ids are killed. Pending (mid-dispatch) and the
-    /// other active states are always spared; a Running job bound to the
-    /// reporting node is spared too.
+    /// Terminal and unknown ids are killed; Pending and a bound Running job are spared.
     #[tokio::test]
     async fn should_kill_reported_job_selects_only_terminal_or_unbound() {
         use crate::raft::StateMachineApply;
@@ -3840,9 +3810,7 @@ mod tests {
         }
     }
 
-    // D1 phantom eviction is job-scoped (`evict_job` fails the whole job), so
-    // it must never fire for a multi-node job on just one node's phantom
-    // report — that would tear down nodes that are reporting the job fine.
+    // evict_job is job-scoped, so one node's phantom must spare a multi-node job.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconcile_spares_a_multi_node_job_on_one_nodes_phantom_report() {
         use crate::raft::StateMachineApply;

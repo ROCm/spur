@@ -179,9 +179,8 @@ pub struct SubmitOutcome {
 /// oversized batch scripts.
 const MAX_JOB_SPEC_SIZE: usize = 4 * 1024 * 1024;
 
-/// Consecutive heartbeats a node's report must omit a job the controller
-/// believes is allocated there before the binding is treated as a phantom
-/// and evicted, guarding against a single suspicious heartbeat.
+/// Consecutive heartbeat omissions before a binding is treated as a phantom
+/// and evicted — guards against a single suspicious heartbeat.
 const PHANTOM_MISS_THRESHOLD: u32 = 2;
 
 /// A `std::io::Write` that only tallies byte counts and discards the data. Used
@@ -350,14 +349,11 @@ pub struct ClusterManager {
     /// Nodes skipped for new dispatch until the given instant after a
     /// resources-unavailable reject. Leader-local and transient, never persisted.
     node_dispatch_cooldowns: RwLock<HashMap<String, std::time::Instant>>,
-    /// Consecutive heartbeats a node's report has omitted a job the controller
-    /// still considers allocated there. Leader-local and transient, never
-    /// persisted; reset to zero (removed) as soon as a report includes the job.
+    /// Consecutive heartbeats a node's report has omitted a job it's bound
+    /// to. Leader-local and transient, never persisted.
     phantom_miss_streaks: RwLock<HashMap<(JobId, String), u32>>,
-    /// Resources still counted free in `Node.alloc_resources` (the job's
-    /// terminal transition already committed) but not yet confirmed released
-    /// by the agent — kept out of new dispatch until confirmed or the entry
-    /// expires. Leader-local and transient, never persisted.
+    /// Resources freed in controller state but not yet confirmed released by
+    /// the agent. Leader-local and transient, never persisted.
     pending_kill: RwLock<HashMap<(JobId, String), (ResourceAllocations, std::time::Instant)>>,
 }
 
@@ -468,8 +464,7 @@ impl ClusterManager {
     }
 
     /// Record that `node`'s heartbeat omitted `job_id`, returning whether the
-    /// consecutive-miss streak has crossed [`PHANTOM_MISS_THRESHOLD`]. Call
-    /// [`Self::note_node_reported_job`] instead once a report includes the job.
+    /// miss streak has crossed [`PHANTOM_MISS_THRESHOLD`].
     pub(crate) fn note_node_omitted_job(&self, job_id: JobId, node: &str) -> bool {
         let mut streaks = self.phantom_miss_streaks.write();
         let count = streaks.entry((job_id, node.to_string())).or_insert(0);
@@ -485,20 +480,16 @@ impl ClusterManager {
             .remove(&(job_id, node.to_string()));
     }
 
-    /// Remove `node`'s miss-streak entries for jobs no longer in
-    /// `active_job_ids` — a job can leave the active set by a path other than
-    /// a later heartbeat re-reporting it (completed, cancelled, evicted),
-    /// which `note_node_reported_job` alone would never observe.
+    /// Remove `node`'s miss-streak entries for jobs no longer active there
+    /// (completed, cancelled, evicted by another path).
     pub(crate) fn prune_phantom_streaks_not_in(&self, node: &str, active_job_ids: &HashSet<JobId>) {
         self.phantom_miss_streaks
             .write()
             .retain(|(job_id, n), _| n != node || active_job_ids.contains(job_id));
     }
 
-    /// Record that `job_id`'s hold on `node` was just released in controller
-    /// state (cancel/evict) but not yet confirmed by the agent, so new
-    /// dispatch avoids `resources` there until it expires. Refreshes the TTL
-    /// if already present (e.g. a re-sent kill).
+    /// Reserve `resources` on `node` until the agent confirms `job_id`'s
+    /// release or the TTL expires. Refreshes the TTL if already present.
     pub(crate) fn note_pending_kill(
         &self,
         job_id: JobId,
@@ -1225,11 +1216,8 @@ impl ClusterManager {
             if job.state.is_terminal() {
                 return Ok(NodeCompleteResult::AlreadyTerminal);
             }
-            // Drop a report from a superseded run (older epoch); e.g. the
-            // delayed SIGKILL of a preemption-requeued process. A reported
-            // epoch of 0 is the sentinel for "predates run_attempt fencing"
-            // (an in-flight allocation from before this guard existed, or an
-            // older agent binary) and is trusted rather than treated as stale.
+            // Drop a report from a superseded run (older epoch). Reported
+            // epoch 0 predates fencing (legacy job or agent) and is trusted.
             if run_attempt != 0 && run_attempt < job.run_attempt {
                 return Ok(NodeCompleteResult::StaleReport);
             }
@@ -1641,24 +1629,8 @@ impl ClusterManager {
         job.spec.begin_time.map_or(hold, |user| user.max(hold))
     }
 
-    /// Evict a running job to NodeFail: frees allocations and feeds the
-    /// existing auto-requeue path in `notify_job_finished`, same as the
-    /// health-check path (`evict_jobs_on_node`) that runs when an entire
-    /// node goes Down, but scoped to a single job. Unlike the health-check
-    /// path, this does not by itself cancel the job on nodes that *did*
-    /// launch it — a caller evicting a job with launched-but-unconfirmed
-    /// nodes is responsible for sending the cancel RPC once eviction
-    /// succeeds.
-    ///
-    /// No longer called from `scheduler_loop`'s original dispatch-confirmation
-    /// trigger: batch dispatch is now confirmed on every assigned node
-    /// *before* a job is allowed to become Running, so a job can no longer
-    /// reach Running with only some of its nodes actually launched. Now used
-    /// by the heartbeat reconciler to fail a job whose binding to a node has
-    /// gone silent (see `reconcile_reported_allocations` in `server.rs`) —
-    /// callers must also cancel on the job's still-allocated nodes and
-    /// complete its steps (`complete_evicted_steps`) afterward, since this
-    /// only updates controller state.
+    /// Evict a single job to NodeFail. Only updates controller state —
+    /// callers must also cancel on its nodes and complete its steps.
     pub fn evict_job(&self, job_id: JobId) -> anyhow::Result<Vec<JobFinalized>> {
         self.evict_job_with_detail(job_id, None)
     }
@@ -6249,9 +6221,7 @@ mod tests {
         assert!(cm0.nodes_on_dispatch_cooldown().is_empty());
     }
 
-    // The D1 "phantom" building blocks: a node omitting a job it's bound to
-    // must accumulate misses and only cross PHANTOM_MISS_THRESHOLD on the
-    // Nth consecutive miss; any report that includes the job resets it.
+    // Only the Nth consecutive miss crosses the threshold; a report resets it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn phantom_miss_streak_crosses_threshold_only_after_consecutive_misses() {
         let dir = TempDir::new().unwrap();
@@ -8298,10 +8268,7 @@ mod tests {
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Failed);
     }
 
-    // A reported epoch of 0 is the "predates run_attempt fencing" sentinel
-    // (an in-flight allocation from before the guard existed, or an older
-    // agent binary) and must be trusted even though the job's own epoch has
-    // since advanced — it must not be dropped as a stale report.
+    // Reported epoch 0 (legacy sentinel) must be trusted, not dropped as stale.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn node_complete_trusts_legacy_zero_epoch_report() {
         let dir = TempDir::new().unwrap();

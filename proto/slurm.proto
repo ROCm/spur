@@ -740,9 +740,7 @@ message LaunchJobRequest {
   bool task_fanout = 11;
   // When true, PMIx was prepared via PreparePmix; LaunchJob must not re-init the server.
   bool pmix_prepared = 12;
-  // Raft term of the controller issuing this dispatch. The agent rejects any
-  // of LaunchJob/AgentCancelJob/RegisterJobAllocation carrying a term lower
-  // than the highest it has already seen, fencing out a demoted leader.
+  // Controller's Raft term; the agent rejects a lower one, fencing a demoted leader.
   uint64 term = 13;
 }
 

@@ -208,9 +208,7 @@ pub struct AgentService {
     k0s: Arc<crate::cluster::K0sAgent>,
     /// In-flight srun steps keyed by `(job_id, step_id)`.
     active_steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
-    /// Highest Raft term seen on LaunchJob/CancelJob/RegisterJobAllocation, so
-    /// a demoted former leader's request (carrying an older term) is rejected
-    /// instead of acted on.
+    /// Highest Raft term seen, so a demoted leader's request is rejected.
     highest_term_seen: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -313,9 +311,7 @@ impl AgentService {
         }
     }
 
-    /// Reject a request carrying a Raft term older than the highest already
-    /// seen (a demoted former leader), else record it as the new high-water
-    /// mark. Term 0 is a legacy/unset sentinel and is always accepted.
+    /// Reject a term older than the highest seen; 0 (legacy/unset) always passes.
     fn check_term(&self, term: u64) -> Result<(), Status> {
         use std::sync::atomic::Ordering;
         if term == 0 {
@@ -4524,9 +4520,7 @@ mod tests {
         assert_eq!(tracked.run_attempt, 3);
     }
 
-    // A request carrying a Raft term below the highest already seen is a
-    // demoted former leader and must be rejected; a higher term raises the
-    // high-water mark; term 0 (legacy/unset) is always accepted.
+    // A term below the highest seen is a demoted leader and must be rejected.
     #[test]
     fn check_term_rejects_stale_and_accepts_legacy_zero() {
         let svc = AgentService::new(
