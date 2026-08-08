@@ -5,6 +5,7 @@
 //! Receives job launch/cancel requests from spurctld.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -313,7 +314,6 @@ impl AgentService {
 
     /// Reject a term older than the highest seen; 0 (legacy/unset) always passes.
     fn check_term(&self, term: u64) -> Result<(), Status> {
-        use std::sync::atomic::Ordering;
         if term == 0 {
             return Ok(());
         }

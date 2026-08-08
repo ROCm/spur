@@ -17,6 +17,10 @@ fn default_port() -> u16 {
     6818
 }
 
+fn default_job_evict_reason() -> PendingReason {
+    PendingReason::JobLaunchFailure
+}
+
 /// All state-mutating operations that get logged to the Raft log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalOperation {
@@ -138,11 +142,12 @@ pub enum WalOperation {
         at: chrono::DateTime<chrono::Utc>,
     },
     /// Evict a single job to NodeFail: same effect as a node health-check
-    /// failure (frees allocations, feeds the auto-requeue path), but scoped
-    /// to one job instead of every job on a node. Used when a subset of a
-    /// job's assigned nodes never received the launch dispatch.
+    /// failure, but scoped to one job. `reason` drives the requeue path
+    /// (e.g. `JobLaunchFailure` backs off, `NodeDown` retries immediately).
     JobEvict {
         job_id: JobId,
+        #[serde(default = "default_job_evict_reason")]
+        reason: PendingReason,
         /// Human-readable bootstrap failure (shown via scontrol / logs).
         #[serde(default)]
         detail: Option<String>,
@@ -979,13 +984,19 @@ mod evict_wal_tests {
     fn job_evict_op_round_trips() {
         let op = WalOperation::JobEvict {
             job_id: 9,
+            reason: PendingReason::NodeDown,
             detail: Some("PMIx prepare failed".into()),
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
-            WalOperation::JobEvict { job_id, detail } => {
+            WalOperation::JobEvict {
+                job_id,
+                reason,
+                detail,
+            } => {
                 assert_eq!(job_id, 9);
+                assert_eq!(reason, PendingReason::NodeDown);
                 assert_eq!(detail.as_deref(), Some("PMIx prepare failed"));
             }
             _ => panic!("wrong variant"),
@@ -1001,6 +1012,24 @@ mod evict_wal_tests {
             WalOperation::JobLaunchFailureDetail { job_id, detail } => {
                 assert_eq!(job_id, 42);
                 assert_eq!(detail, "PMIx prepare failed: n1: connect failed");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn job_evict_op_deserializes_frozen_pre_reason_and_detail_payload() {
+        let frozen = r#"{"JobEvict":{"job_id":9}}"#;
+        let op: WalOperation = serde_json::from_str(frozen).unwrap();
+        match op {
+            WalOperation::JobEvict {
+                job_id,
+                reason,
+                detail,
+            } => {
+                assert_eq!(job_id, 9);
+                assert_eq!(reason, PendingReason::JobLaunchFailure);
+                assert_eq!(detail, None);
             }
             _ => panic!("wrong variant"),
         }

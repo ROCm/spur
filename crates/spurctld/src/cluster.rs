@@ -1631,13 +1631,18 @@ impl ClusterManager {
 
     /// Evict a single job to NodeFail. Only updates controller state —
     /// callers must also cancel on its nodes and complete its steps.
-    pub fn evict_job(&self, job_id: JobId) -> anyhow::Result<Vec<JobFinalized>> {
-        self.evict_job_with_detail(job_id, None)
+    pub fn evict_job(
+        &self,
+        job_id: JobId,
+        reason: PendingReason,
+    ) -> anyhow::Result<Vec<JobFinalized>> {
+        self.evict_job_with_detail(job_id, reason, None)
     }
 
     pub fn evict_job_with_detail(
         &self,
         job_id: JobId,
+        reason: PendingReason,
         detail: Option<String>,
     ) -> anyhow::Result<Vec<JobFinalized>> {
         {
@@ -1649,9 +1654,13 @@ impl ClusterManager {
                 return Ok(Vec::new());
             }
         }
-        let resp = self.propose(WalOperation::JobEvict { job_id, detail })?;
+        let resp = self.propose(WalOperation::JobEvict {
+            job_id,
+            reason,
+            detail,
+        })?;
         self.run_all_finalized_side_effects(&resp);
-        Ok(resp.jobs_finalized.clone())
+        Ok(resp.jobs_finalized)
     }
 
     /// Register a node agent.
@@ -4300,7 +4309,11 @@ impl ClusterManager {
                     }
                 }
             }
-            WalOperation::JobEvict { job_id, detail } => {
+            WalOperation::JobEvict {
+                job_id,
+                reason,
+                detail,
+            } => {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.launch_failure_detail = detail.clone();
                 }
@@ -4309,7 +4322,7 @@ impl ClusterManager {
                     &mut jobs,
                     &mut nodes,
                     timestamp,
-                    PendingReason::JobLaunchFailure,
+                    reason.clone(),
                 ) {
                     response.jobs_finalized.push(fin);
                 }
@@ -11381,7 +11394,8 @@ mod tests {
         .unwrap();
         settle(&cm, job_id, JobState::Running);
 
-        cm.evict_job(job_id).unwrap();
+        cm.evict_job(job_id, PendingReason::JobLaunchFailure)
+            .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
         let job = cm.get_job(job_id).unwrap();
@@ -13958,7 +13972,7 @@ mod tests {
         settle(&cm, id, JobState::Running);
 
         // n1's dispatch succeeded, n2's never reached the agent.
-        cm.evict_job(id).unwrap();
+        cm.evict_job(id, PendingReason::JobLaunchFailure).unwrap();
         settle(&cm, id, JobState::NodeFail);
 
         let job = cm.get_job(id).unwrap();
@@ -14039,7 +14053,7 @@ mod tests {
              leaving only B's 3 cpus"
         );
 
-        cm.evict_job(job_a).unwrap();
+        cm.evict_job(job_a, PendingReason::NodeDown).unwrap();
         settle(&cm, job_a, JobState::NodeFail);
 
         assert_eq!(

@@ -299,10 +299,9 @@ impl ControllerService {
                         node = %node_owned,
                         "node's heartbeat repeatedly omitted a job the controller binds here — evicting"
                     );
-                    // Reserve before evict_job frees the resources, not after.
-                    note_pending_kill_for_job(&cluster, &fresh);
-                    match cluster.evict_job(fresh.job_id) {
+                    match cluster.evict_job(fresh.job_id, spur_core::job::PendingReason::NodeDown) {
                         Ok(finalized) => {
+                            note_pending_kill_for_job(&cluster, &fresh);
                             cluster.complete_evicted_steps(&finalized);
                             crate::scheduler_loop::send_cancel_to_agents(&cluster, &fresh, 9).await;
                         }
@@ -591,11 +590,8 @@ impl SlurmController for ControllerService {
         let req = request.into_inner();
         let job_id = req.job_id;
 
-        // Snapshot for allocated_nodes and reserve before cancel_job frees them.
+        // Snapshot before cancelling so we still have allocated_nodes after.
         let job = self.cluster.get_job(job_id);
-        if let Some(ref job) = job {
-            note_pending_kill_for_job(&self.cluster, job);
-        }
 
         self.cluster
             .cancel_job(job_id, &req.user)
@@ -603,6 +599,7 @@ impl SlurmController for ControllerService {
 
         // Send cancel signal to agents so the process is actually killed
         if let Some(job) = job {
+            note_pending_kill_for_job(&self.cluster, &job);
             let cluster = self.cluster.clone();
             tokio::spawn(async move {
                 crate::scheduler_loop::send_cancel_to_agents(&cluster, &job, 0).await;
@@ -3624,6 +3621,18 @@ mod tests {
             stale,
             vec![12, 999],
             "terminal and unknown ids are reclaimed; Pending/Running (bound)/Completing/Suspended/Preempted are spared"
+        );
+
+        // Same jobs, queried against a node NONE of them are bound to: Running/
+        // Completing/Suspended must now be killed (unbound), Pending/Preempted spared.
+        let unbound: Vec<u32> = [10, 11, 13, 14, 15]
+            .into_iter()
+            .filter(|&job_id| should_kill_reported_job(&cluster, job_id, "n2"))
+            .collect();
+        assert_eq!(
+            unbound,
+            vec![11, 13, 14],
+            "Running/Completing/Suspended are killed when reported by a node they aren't bound to"
         );
     }
 
