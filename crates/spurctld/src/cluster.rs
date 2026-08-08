@@ -354,6 +354,11 @@ pub struct ClusterManager {
     /// still considers allocated there. Leader-local and transient, never
     /// persisted; reset to zero (removed) as soon as a report includes the job.
     phantom_miss_streaks: RwLock<HashMap<(JobId, String), u32>>,
+    /// Resources still counted free in `Node.alloc_resources` (the job's
+    /// terminal transition already committed) but not yet confirmed released
+    /// by the agent — kept out of new dispatch until confirmed or the entry
+    /// expires. Leader-local and transient, never persisted.
+    pending_kill: RwLock<HashMap<(JobId, String), (ResourceAllocations, std::time::Instant)>>,
 }
 
 struct PendingJobClassification {
@@ -415,6 +420,7 @@ impl ClusterManager {
             sched_stats: OnceLock::new(),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
             phantom_miss_streaks: RwLock::new(HashMap::new()),
+            pending_kill: RwLock::new(HashMap::new()),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -477,6 +483,39 @@ impl ClusterManager {
         self.phantom_miss_streaks
             .write()
             .remove(&(job_id, node.to_string()));
+    }
+
+    /// Record that `job_id`'s hold on `node` was just released in controller
+    /// state (cancel/evict) but not yet confirmed by the agent, so new
+    /// dispatch avoids `resources` there until it expires. Refreshes the TTL
+    /// if already present (e.g. a re-sent kill).
+    pub(crate) fn note_pending_kill(
+        &self,
+        job_id: JobId,
+        node: &str,
+        resources: ResourceAllocations,
+    ) {
+        let ttl = self.config().controller.pending_kill_ttl_secs;
+        if ttl == 0 {
+            return;
+        }
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(ttl);
+        self.pending_kill
+            .write()
+            .insert((job_id, node.to_string()), (resources, until));
+    }
+
+    /// Per-node resources still held out of new dispatch pending kill
+    /// confirmation, pruning any entry whose TTL has expired.
+    pub(crate) fn pending_kill_reservations(&self) -> HashMap<String, ResourceAllocations> {
+        let now = std::time::Instant::now();
+        let mut pending = self.pending_kill.write();
+        pending.retain(|_, (_, until)| *until > now);
+        let mut by_node: HashMap<String, ResourceAllocations> = HashMap::new();
+        for ((_, node), (resources, _)) in pending.iter() {
+            by_node.entry(node.clone()).or_default().add(resources);
+        }
+        by_node
     }
 
     /// Submit a new job. If it has an array spec, expand into individual tasks.
@@ -3845,6 +3884,16 @@ impl ClusterManager {
         *self.raft.write() = Some(raft);
     }
 
+    /// Current Raft term, used as a fencing generation on outgoing agent RPCs.
+    /// 0 before Raft is wired up (never actually dispatches at that point).
+    pub fn current_term(&self) -> u64 {
+        self.raft
+            .read()
+            .as_ref()
+            .map(|r| r.metrics().borrow().current_term)
+            .unwrap_or(0)
+    }
+
     pub fn set_accounting(&self, notifier: AccountingNotifier) {
         *self.accounting.write() = Some(notifier);
     }
@@ -6234,6 +6283,47 @@ mod tests {
             !cm.note_node_omitted_job(1, "n1"),
             "streak must restart from zero after a report reset it"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_kill_reservations_aggregate_prune_and_respect_disable() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        assert!(cm.pending_kill_reservations().is_empty());
+        cm.note_pending_kill(1, "n1", scalar_alloc(2, 4000));
+        cm.note_pending_kill(2, "n1", scalar_alloc(3, 6000));
+        cm.note_pending_kill(3, "n2", scalar_alloc(1, 1000));
+
+        let reserved = cm.pending_kill_reservations();
+        assert_eq!(
+            reserved.get("n1").unwrap().cpus,
+            5,
+            "multiple pending kills on the same node sum"
+        );
+        assert_eq!(reserved.get("n2").unwrap().cpus, 1);
+
+        // A past instant is pruned on read, so an expired entry clears.
+        cm.pending_kill.write().insert(
+            (1, "n1".into()),
+            (
+                scalar_alloc(2, 4000),
+                std::time::Instant::now() - std::time::Duration::from_secs(1),
+            ),
+        );
+        let reserved = cm.pending_kill_reservations();
+        assert_eq!(
+            reserved.get("n1").unwrap().cpus,
+            3,
+            "the expired entry no longer contributes, the live one still does"
+        );
+
+        // Disabled (0s): note_pending_kill is a no-op.
+        let mut cfg = test_config();
+        cfg.controller.pending_kill_ttl_secs = 0;
+        let cm0 = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
+        cm0.note_pending_kill(9, "n1", scalar_alloc(1, 1000));
+        assert!(cm0.pending_kill_reservations().is_empty());
     }
 
     /// Consumer-driven: `maybe_requeue` must honor the new `max_batch_requeue`

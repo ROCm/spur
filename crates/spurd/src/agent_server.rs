@@ -208,6 +208,10 @@ pub struct AgentService {
     k0s: Arc<crate::cluster::K0sAgent>,
     /// In-flight srun steps keyed by `(job_id, step_id)`.
     active_steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
+    /// Highest Raft term seen on LaunchJob/CancelJob/RegisterJobAllocation, so
+    /// a demoted former leader's request (carrying an older term) is rejected
+    /// instead of acted on.
+    highest_term_seen: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AgentService {
@@ -305,7 +309,25 @@ impl AgentService {
             device_registry,
             k0s: Arc::new(crate::cluster::K0sAgent::from_config(cluster)),
             active_steps: Arc::new(Mutex::new(HashMap::new())),
+            highest_term_seen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Reject a request carrying a Raft term older than the highest already
+    /// seen (a demoted former leader), else record it as the new high-water
+    /// mark. Term 0 is a legacy/unset sentinel and is always accepted.
+    fn check_term(&self, term: u64) -> Result<(), Status> {
+        use std::sync::atomic::Ordering;
+        if term == 0 {
+            return Ok(());
+        }
+        let prev = self.highest_term_seen.fetch_max(term, Ordering::AcqRel);
+        if term < prev {
+            return Err(Status::failed_precondition(format!(
+                "stale controller term {term} (highest seen {prev}); a newer leader has taken over"
+            )));
+        }
+        Ok(())
     }
 
     /// Handle to the RPC-driven k0s component owner. spurd `main()` spawns its supervise loop.
@@ -942,6 +964,7 @@ impl SlurmAgent for AgentService {
         request: Request<LaunchJobRequest>,
     ) -> Result<Response<LaunchJobResponse>, Status> {
         let req = request.into_inner();
+        self.check_term(req.term)?;
         let job_id = req.job_id;
         let peer_nodes = req.peer_nodes;
         let task_offset = req.task_offset;
@@ -1535,6 +1558,7 @@ impl SlurmAgent for AgentService {
         request: Request<AgentCancelJobRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
+        self.check_term(req.term)?;
         let job_id = req.job_id;
 
         if req.signal > 0 {
@@ -1687,6 +1711,7 @@ impl SlurmAgent for AgentService {
         request: Request<RegisterJobAllocationRequest>,
     ) -> Result<Response<RegisterJobAllocationResponse>, Status> {
         let req = request.into_inner();
+        self.check_term(req.term)?;
         if req.job_id == 0 {
             return Err(Status::invalid_argument("job_id is required"));
         }
@@ -4499,6 +4524,29 @@ mod tests {
         assert_eq!(tracked.run_attempt, 3);
     }
 
+    // A request carrying a Raft term below the highest already seen is a
+    // demoted former leader and must be rejected; a higher term raises the
+    // high-water mark; term 0 (legacy/unset) is always accepted.
+    #[test]
+    fn check_term_rejects_stale_and_accepts_legacy_zero() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        svc.check_term(5).expect("first real term is accepted");
+        let err = svc.check_term(3).expect_err("stale term must be rejected");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        svc.check_term(7).expect("a higher term is accepted");
+        assert!(
+            svc.check_term(5).is_err(),
+            "term below the new high-water mark is still rejected"
+        );
+        svc.check_term(0).expect("legacy zero is always accepted");
+    }
+
     // The heartbeat's held-job source must report an allocation-only (srun/salloc)
     // job so the controller can reconcile it — the strand this fix addresses.
     #[tokio::test]
@@ -4585,6 +4633,7 @@ mod tests {
         svc.cancel_job(Request::new(AgentCancelJobRequest {
             job_id: 7,
             signal: 9,
+            term: 0,
         }))
         .await
         .expect("cancel_job");

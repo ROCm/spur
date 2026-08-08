@@ -292,6 +292,7 @@ impl ControllerService {
                         warn!(job_id = job.job_id, error = %e, "failed to evict phantom binding");
                         continue;
                     }
+                    note_pending_kill_for_job(&cluster, &job);
                     crate::scheduler_loop::send_cancel_to_agents(&cluster, &job, 9).await;
                 }
             });
@@ -437,6 +438,16 @@ fn should_kill_reported_job(cluster: &ClusterManager, job_id: u32, node: &str) -
     }
 }
 
+/// Record a pending-kill reservation for each of `job`'s allocated nodes, so
+/// new dispatch avoids those resources until the agent confirms it released
+/// them or the reservation's TTL expires. Call right before sending the kill.
+fn note_pending_kill_for_job(cluster: &ClusterManager, job: &spur_core::job::Job) {
+    for node in &job.allocated_nodes {
+        let resources = job.per_node_alloc.get(node).cloned().unwrap_or_default();
+        cluster.note_pending_kill(job.job_id, node, resources);
+    }
+}
+
 #[tonic::async_trait]
 impl SlurmController for ControllerService {
     async fn submit_job(
@@ -577,6 +588,7 @@ impl SlurmController for ControllerService {
 
         // Send cancel signal to agents so the process is actually killed
         if let Some(job) = job {
+            note_pending_kill_for_job(&self.cluster, &job);
             let cluster = self.cluster.clone();
             tokio::spawn(async move {
                 crate::scheduler_loop::send_cancel_to_agents(&cluster, &job, 0).await;

@@ -740,6 +740,10 @@ message LaunchJobRequest {
   bool task_fanout = 11;
   // When true, PMIx was prepared via PreparePmix; LaunchJob must not re-init the server.
   bool pmix_prepared = 12;
+  // Raft term of the controller issuing this dispatch. The agent rejects any
+  // of LaunchJob/AgentCancelJob/RegisterJobAllocation carrying a term lower
+  // than the highest it has already seen, fencing out a demoted leader.
+  uint64 term = 13;
 }
 
 // Why a launch was rejected, when the controller's response depends on it.
@@ -781,6 +785,8 @@ message LaunchJobResponse {
 message AgentCancelJobRequest {
   uint32 job_id = 1;
   int32 signal = 2;
+  // See LaunchJobRequest.term.
+  uint64 term = 3;
 }
 
 message AgentSuspendJobRequest {
@@ -1000,6 +1006,8 @@ message RegisterJobAllocationRequest {
   // Run epoch for this allocation; mirrors LaunchJobRequest.run_attempt so
   // interactive jobs get the same stale-report fencing as batch dispatch.
   uint32 run_attempt = 13;
+  // See LaunchJobRequest.term.
+  uint64 term = 14;
 }
 
 message RegisterJobAllocationResponse {}

@@ -39,6 +39,23 @@ fn node_comm_http_url(node: &Node) -> Option<String> {
     Some(spur_net::format_comm_http_url(host, node.port))
 }
 
+/// Inflate each node's `alloc_resources` by any pending-kill amount for it, so
+/// the scheduler doesn't place a new job on a resource whose prior occupant's
+/// kill hasn't been confirmed released yet.
+fn apply_pending_kill_reservations(
+    nodes: &mut [Node],
+    pending_kill: &std::collections::HashMap<String, spur_core::resource::ResourceAllocations>,
+) {
+    if pending_kill.is_empty() {
+        return;
+    }
+    for node in nodes {
+        if let Some(resources) = pending_kill.get(&node.name) {
+            node.alloc_resources.add(resources);
+        }
+    }
+}
+
 /// Spawn the time-limit enforcement watchdog and power manager alongside the scheduler loop.
 pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     let enforcer_cluster = cluster.clone();
@@ -138,7 +155,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         }
         let hit_depth_limit = pending.len() > max_jobs;
 
-        let nodes = cluster.schedulable_nodes();
+        let mut nodes = cluster.schedulable_nodes();
         let partitions = cluster.get_partitions();
         let reservations = cluster.get_reservations();
 
@@ -146,6 +163,11 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             debug!("no nodes registered, skipping scheduling cycle");
             continue;
         }
+
+        // Keep a resource excluded from placement until the agent confirms it
+        // released a cancelled/evicted job, even though the controller's own
+        // alloc_resources already counts it free — a kill RPC can be lost.
+        apply_pending_kill_reservations(&mut nodes, &cluster.pending_kill_reservations());
 
         let cycle_start = Instant::now();
 
@@ -841,6 +863,7 @@ struct AgentDispatchParams<'a> {
     allocated: &'a spur_core::resource::ResourceAllocations,
     allocated_nodelist: &'a str,
     run_attempt: u32,
+    term: u64,
     pmix_tmpdir: &'a str,
     /// See `LaunchJobRequest.task_fanout` in slurm.proto: true only for a
     /// standalone `srun` request routed through this batch dispatch path
@@ -1030,6 +1053,7 @@ async fn dispatch_to_agent(
             pmix_plan,
             task_fanout: params.task_fanout,
             pmix_prepared: params.pmix_prepared,
+            term: params.term,
         })
         .await
         .map_err(|s| match s.code() {
@@ -1107,6 +1131,7 @@ struct AllocationRegisterParams {
     allocated: spur_core::resource::ResourceAllocations,
     work_dir: String,
     run_attempt: u32,
+    term: u64,
 }
 
 /// Register a srun-only allocation on a node agent without launching a batch process.
@@ -1139,6 +1164,7 @@ async fn register_allocation_to_agent(
             work_dir: params.work_dir.clone(),
             user: params.user.clone(),
             run_attempt: params.run_attempt,
+            term: params.term,
         })
         .await?;
 
@@ -1165,6 +1191,7 @@ async fn register_allocation_on_nodes(
     let mut failures = 0u32;
     let mut succeeded_nodes: Vec<String> = Vec::new();
     let total = dispatch_nodes.len() as u32;
+    let term = cluster.current_term();
 
     let mut set = tokio::task::JoinSet::new();
     for node_name in &dispatch_nodes {
@@ -1205,6 +1232,7 @@ async fn register_allocation_on_nodes(
             allocated_nodelist: allocated_nodelist.clone(),
             allocated,
             work_dir: spec.work_dir.clone(),
+            term,
             run_attempt,
         };
         set.spawn(async move {
@@ -1355,6 +1383,7 @@ async fn confirm_dispatch_on_nodes(
     let modex_connect_timeout_secs = cluster.config().mpi.modex_connect_timeout_secs;
     let modex_fence_timeout_secs = cluster.config().mpi.modex_fence_timeout_secs;
     let modex_verify_timeout_secs = cluster.config().mpi.modex_verify_timeout_secs;
+    let term = cluster.current_term();
 
     let needs_pmix_prepare = batch_dispatched_multi_node_pmix(
         spec.mpi.as_deref(),
@@ -1512,6 +1541,7 @@ async fn confirm_dispatch_on_nodes(
                     allocated: &allocated,
                     allocated_nodelist: &allocated_nodelist,
                     run_attempt,
+                    term,
                     pmix_tmpdir: &pmix_tmpdir,
                     task_fanout,
                     modex_connect_timeout_secs,
@@ -1925,8 +1955,9 @@ pub async fn send_cancel_to_nodes(
     node_names: &[String],
     signal: i32,
 ) {
+    let term = cluster.current_term();
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
-        tokio::spawn(cancel_one_agent(agent_addr, job_id, signal));
+        tokio::spawn(cancel_one_agent(agent_addr, job_id, signal, term));
     }
 }
 
@@ -1940,9 +1971,10 @@ pub async fn cancel_job_on_nodes(
     node_names: &[String],
     signal: i32,
 ) {
+    let term = cluster.current_term();
     let mut set = tokio::task::JoinSet::new();
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
-        set.spawn(cancel_one_agent(agent_addr, job_id, signal));
+        set.spawn(cancel_one_agent(agent_addr, job_id, signal, term));
     }
     while set.join_next().await.is_some() {}
 }
@@ -2060,7 +2092,12 @@ fn cancel_agent_addrs(
 /// Deliver one CancelJob RPC, bounded by `CANCEL_RPC_TIMEOUT`. Errors and
 /// timeouts are logged, never propagated: a cancel is best-effort cleanup and
 /// must not block the caller past the timeout.
-async fn cancel_one_agent(agent_addr: String, job_id: spur_core::job::JobId, signal: i32) {
+async fn cancel_one_agent(
+    agent_addr: String,
+    job_id: spur_core::job::JobId,
+    signal: i32,
+    term: u64,
+) {
     let attempt = async {
         match SlurmAgentClient::connect(agent_addr.clone())
             .await
@@ -2070,7 +2107,11 @@ async fn cancel_one_agent(agent_addr: String, job_id: spur_core::job::JobId, sig
             }) {
             Ok(mut client) => {
                 if let Err(e) = client
-                    .cancel_job(AgentCancelJobRequest { job_id, signal })
+                    .cancel_job(AgentCancelJobRequest {
+                        job_id,
+                        signal,
+                        term,
+                    })
                     .await
                 {
                     warn!(
@@ -4306,6 +4347,37 @@ mod tests {
             assert!(
                 cm.nodes_on_dispatch_cooldown().contains("n1"),
                 "a resources-unavailable reject must put the node on cooldown"
+            );
+        }
+
+        // A node with a pending-kill reservation must not look free to the
+        // scheduler even though `alloc_resources` itself already shows it as
+        // free — the whole point of the confirm-before-free gate.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn pending_kill_reservation_inflates_node_alloc_resources() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            register_node_at(&cm, "n1", unreachable_addr().await);
+            register_node_at(&cm, "n2", unreachable_addr().await);
+
+            let mut nodes: Vec<_> = ["n1", "n2"]
+                .iter()
+                .map(|n| cm.get_node(n).unwrap())
+                .collect();
+            assert_eq!(nodes[0].alloc_resources.cpus, 0);
+
+            let mut pending_kill = std::collections::HashMap::new();
+            pending_kill.insert("n1".to_string(), ResourceAllocations::with_scalar(2, 4000));
+
+            apply_pending_kill_reservations(&mut nodes, &pending_kill);
+
+            assert_eq!(
+                nodes[0].alloc_resources.cpus, 2,
+                "n1 inflated by its pending-kill reservation"
+            );
+            assert_eq!(
+                nodes[1].alloc_resources.cpus, 0,
+                "n2 has no pending-kill entry, untouched"
             );
         }
     }
