@@ -135,6 +135,9 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
     if k.is_empty() {
         return Err(format!("empty selector key in {s}"));
     }
+    if v.is_empty() {
+        return Err(format!("empty selector value in {s}"));
+    }
     Ok((k.to_string(), v.to_string()))
 }
 
@@ -234,10 +237,14 @@ async fn cmd_status(controller: &str) -> Result<()> {
     } else if !resp.control_plane_node.is_empty() {
         println!("control-plane: {}", resp.control_plane_node);
     }
-    if resp.member_nodes.is_empty() {
-        println!("members: all nodes");
-    } else {
-        println!("members: {}", resp.member_nodes.join(", "));
+    // Teardown clears the recorded scope immediately, before node roles finish draining; showing
+    // "all nodes" here would misrepresent a cluster that's mid-teardown, not freshly scoped.
+    if resp.phase != "down" {
+        if resp.member_nodes.is_empty() {
+            println!("members: all nodes");
+        } else {
+            println!("members: {}", resp.member_nodes.join(", "));
+        }
     }
     for n in resp.nodes {
         println!(
@@ -325,6 +332,11 @@ mod tests {
     #[test]
     fn selector_without_equals_is_rejected() {
         assert!(K8sArgs::try_parse_from(["k8s", "up", "--selector", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn selector_with_empty_value_is_rejected() {
+        assert!(K8sArgs::try_parse_from(["k8s", "up", "--selector", "gpu="]).is_err());
     }
 
     #[test]

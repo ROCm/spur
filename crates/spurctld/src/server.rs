@@ -2163,7 +2163,8 @@ impl SlurmController for ControllerService {
         // re-up in that window so it can't reuse the emptied scope and silently enroll every node.
         if state.phase == spur_core::k0s::K0sPhase::Down && assigned {
             return Err(Status::failed_precondition(
-                "cluster teardown is in progress; wait for it to finish before bringing it back up",
+                "cluster teardown is in progress; re-up is safe once no nodes show a k0s role \
+                 in `spur k8s status`",
             ));
         }
 
@@ -2235,6 +2236,13 @@ impl SlurmController for ControllerService {
                      (spur k8s down --reset) before changing the node scope",
                 ));
             }
+            // Neither the control plane nor the scope changed: a bare or identically-scoped re-up
+            // is a true no-op, so skip writing a redundant WAL entry.
+            return Ok(Response::new(ClusterUpResponse {
+                accepted: true,
+                message: "k0s cluster already up with this control plane and scope".to_string(),
+                nodes: crate::cluster_k8s::node_statuses(&self.cluster),
+            }));
         }
 
         let bootstrap = cp_set.first().cloned();
@@ -3937,6 +3945,28 @@ mod tests {
             .expect("bare re-up accepted")
             .into_inner();
         assert!(resp.accepted);
+        assert_eq!(
+            svc.cluster.k0s_state().member_nodes,
+            vec!["node-a", "node-b"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_with_identical_scope_is_a_noop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        scoped_assigned_cluster(&svc).await;
+        // Same scope expressed again (not a bare re-up) must not rewrite the recorded state.
+        let resp = svc
+            .cluster_up(Request::new(ClusterUpRequest {
+                nodes: "node-a,node-b".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect("re-up with identical scope must succeed")
+            .into_inner();
+        assert!(resp.accepted);
+        assert!(resp.message.contains("already up"), "got: {}", resp.message);
         assert_eq!(
             svc.cluster.k0s_state().member_nodes,
             vec!["node-a", "node-b"]

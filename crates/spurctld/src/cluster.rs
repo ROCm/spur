@@ -4762,21 +4762,24 @@ impl ClusterManager {
             } => {
                 let mut k0s = self.k0s.write();
                 k0s.phase = *phase;
-                if control_plane_node.is_some() {
-                    k0s.control_plane_node = control_plane_node.clone();
-                }
-                if !control_plane_nodes.is_empty() {
-                    k0s.control_plane_nodes = control_plane_nodes.clone();
-                }
-                if !member_nodes.is_empty() {
-                    k0s.member_nodes = member_nodes.clone();
-                }
                 k0s.reset_requested = *reset_requested;
-                // Teardown resets cluster identity so the next `up` starts clean (no stale scope/CP).
+                // Teardown resets cluster identity so the next `up` starts clean (no stale scope/CP);
+                // the branches are exclusive so a non-empty field passed alongside Down can't be set
+                // then immediately wiped.
                 if *phase == spur_core::k0s::K0sPhase::Down {
                     k0s.member_nodes.clear();
                     k0s.control_plane_node = None;
                     k0s.control_plane_nodes.clear();
+                } else {
+                    if control_plane_node.is_some() {
+                        k0s.control_plane_node = control_plane_node.clone();
+                    }
+                    if !control_plane_nodes.is_empty() {
+                        k0s.control_plane_nodes = control_plane_nodes.clone();
+                    }
+                    if !member_nodes.is_empty() {
+                        k0s.member_nodes = member_nodes.clone();
+                    }
                 }
             }
         }
@@ -12184,6 +12187,29 @@ mod tests {
         cm.set_k0s_phase(K0sPhase::Down, None, Vec::new(), Vec::new(), false)
             .unwrap();
         wait_for("state cleared on down", || {
+            let s = cm.k0s_state();
+            s.member_nodes.is_empty()
+                && s.control_plane_node.is_none()
+                && s.controllers().is_empty()
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn down_clears_even_if_wal_op_carries_stale_fields() {
+        use spur_core::k0s::K0sPhase;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        // No production caller passes non-empty fields alongside Down, but the WAL apply must not
+        // depend on that: it should clear unconditionally rather than set-then-clear.
+        cm.set_k0s_phase(
+            K0sPhase::Down,
+            Some("stale-cp".into()),
+            vec!["stale-cp".into()],
+            vec!["stale-a".into(), "stale-b".into()],
+            false,
+        )
+        .unwrap();
+        wait_for("state cleared despite non-empty op fields", || {
             let s = cm.k0s_state();
             s.member_nodes.is_empty()
                 && s.control_plane_node.is_none()

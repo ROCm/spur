@@ -807,6 +807,7 @@ message ClusterUpRequest {
   string caller = 5;   // For authorization (cluster admin required).
   // Scope the cluster to a subset of the inventory: UNION of a nodes hostlist (e.g. "gpu[01-08]"),
   // a partition's members, and a label selector (all key=val match). Empty = whole inventory.
+  // Resolved once at up time and persisted; not re-evaluated as inventory changes.
   string nodes = 6;
   string partition = 7;
   map<string, string> selector = 8;
