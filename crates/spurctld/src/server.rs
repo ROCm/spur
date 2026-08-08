@@ -228,38 +228,74 @@ impl ControllerService {
         Err(self.not_leader_status())
     }
 
-    /// Re-send a terminal-job cancel to a node still reporting it on heartbeat,
-    /// freeing an allocation whose terminal cancel never landed. Spawned, best-effort.
-    fn reclaim_stale_agent_jobs(&self, node: &str, reported: &[RunningJobStatus]) {
-        let stale = stale_reported_jobs(&self.cluster, reported);
-        if stale.is_empty() {
-            return;
-        }
-        let cluster = self.cluster.clone();
-        let node = node.to_string();
-        tokio::spawn(async move {
-            for job_id in stale {
-                // Re-check: a requeue since the snapshot above would otherwise
-                // send an unguarded cancel into the job's new run.
-                if !is_still_terminal(&cluster, job_id) {
-                    continue;
+    /// Reconcile `node`'s heartbeat-reported held jobs against the controller's
+    /// own record. Kills a reported job the controller considers terminal, has
+    /// no record of, or has running elsewhere without this node bound to it —
+    /// never fabricating a binding. Separately, evicts a job the controller
+    /// still believes is allocated on `node` if the node's report has omitted
+    /// it for several consecutive heartbeats. Spawned, best-effort; called only
+    /// from the heartbeat handler, which is already leader-gated.
+    fn reconcile_reported_allocations(&self, node: &str, reported: &[RunningJobStatus]) {
+        let kill = reported
+            .iter()
+            .filter(|r| should_kill_reported_job(&self.cluster, r.job_id, node))
+            .map(|r| r.job_id)
+            .collect::<Vec<_>>();
+        if !kill.is_empty() {
+            let cluster = self.cluster.clone();
+            let node_owned = node.to_string();
+            tokio::spawn(async move {
+                for job_id in kill {
+                    // Re-check: a requeue or reattach since the snapshot above
+                    // would otherwise send an unguarded cancel into a live job.
+                    if !should_kill_reported_job(&cluster, job_id, &node_owned) {
+                        continue;
+                    }
+                    warn!(
+                        job_id,
+                        node = %node_owned,
+                        "agent holds a job the controller doesn't bind here — reclaiming its allocation"
+                    );
+                    // Signal 0 = graceful release, no-op on an unknown id. Not
+                    // epoch-gated — a requeue racing this send is still possible.
+                    crate::scheduler_loop::cancel_job_on_nodes(
+                        &cluster,
+                        job_id,
+                        std::slice::from_ref(&node_owned),
+                        0,
+                    )
+                    .await;
                 }
-                warn!(
-                    job_id,
-                    node = %node,
-                    "agent still holds a terminal job — re-sending cancel to reclaim its allocation"
-                );
-                // Signal 0 = graceful release, no-op on an unknown id. Not
-                // epoch-gated — a requeue racing this send is still possible.
-                crate::scheduler_loop::cancel_job_on_nodes(
-                    &cluster,
-                    job_id,
-                    std::slice::from_ref(&node),
-                    0,
-                )
-                .await;
+            });
+        }
+
+        let reported_ids: HashSet<u32> = reported.iter().map(|r| r.job_id).collect();
+        let mut phantom = Vec::new();
+        for job in self.cluster.active_jobs_on_node(node) {
+            if reported_ids.contains(&job.job_id) {
+                self.cluster.note_node_reported_job(job.job_id, node);
+            } else if self.cluster.note_node_omitted_job(job.job_id, node) {
+                phantom.push(job);
             }
-        });
+        }
+        if !phantom.is_empty() {
+            let cluster = self.cluster.clone();
+            let node_owned = node.to_string();
+            tokio::spawn(async move {
+                for job in phantom {
+                    warn!(
+                        job_id = job.job_id,
+                        node = %node_owned,
+                        "node's heartbeat repeatedly omitted a job the controller binds here — evicting"
+                    );
+                    if let Err(e) = cluster.evict_job(job.job_id) {
+                        warn!(job_id = job.job_id, error = %e, "failed to evict phantom binding");
+                        continue;
+                    }
+                    crate::scheduler_loop::send_cancel_to_agents(&cluster, &job, 9).await;
+                }
+            });
+        }
     }
 
     /// Reads never require the leader (every node applies the committed log),
@@ -383,19 +419,22 @@ fn is_k0s_admin(cache: &crate::association_cache::AssociationCache, caller: &str
     caller.is_empty() || caller == "root" || cache.is_admin(caller)
 }
 
-/// Whether the controller still considers `job_id` terminal right now — guards
-/// the spawned reclaim loop against a requeue landing after its stale snapshot.
-fn is_still_terminal(cluster: &ClusterManager, job_id: u32) -> bool {
-    cluster.job_state(job_id).is_some_and(|s| s.is_terminal())
-}
-
-/// Reported ids the controller's own record marks terminal. Non-terminal (incl.
-/// Pending mid-dispatch) and unknown ids are spared, so no live job is reclaimed.
-fn stale_reported_jobs(cluster: &ClusterManager, reported: &[RunningJobStatus]) -> Vec<u32> {
-    reported
-        .iter()
-        .filter_map(|r| is_still_terminal(cluster, r.job_id).then_some(r.job_id))
-        .collect()
+/// Whether a job `node` reports holding should be killed there: the controller
+/// has no record of it, considers it terminal, or is Running but not bound to
+/// `node` — never fabricating a binding to justify sparing it. Only `Running`
+/// carries the "should already be bound to specific nodes" expectation;
+/// Pending (register-before-persist: the agent can hold an allocation before
+/// the controller's own dispatch-confirmation WAL write lands) and the other
+/// active states (Completing/Suspended/Preempted) are always spared.
+fn should_kill_reported_job(cluster: &ClusterManager, job_id: u32, node: &str) -> bool {
+    match cluster.job_state(job_id) {
+        None => true,
+        Some(state) if state.is_terminal() => true,
+        Some(spur_core::job::JobState::Running) => !cluster
+            .get_job(job_id)
+            .is_some_and(|j| j.allocated_nodes.iter().any(|n| n == node)),
+        Some(_) => false,
+    }
 }
 
 #[tonic::async_trait]
@@ -1331,7 +1370,7 @@ impl SlurmController for ControllerService {
             {
                 info!(node = %req.hostname, "learned updated WireGuard mesh key from heartbeat");
             }
-            self.reclaim_stale_agent_jobs(&req.hostname, &req.running_jobs);
+            self.reconcile_reported_allocations(&req.hostname, &req.running_jobs);
             Ok(Response::new(HeartbeatResponse {}))
         } else {
             Err(Status::not_found(format!(
@@ -3466,10 +3505,11 @@ mod tests {
         assert_eq!(status.message(), "partition 'gpu' not found");
     }
 
-    /// Only a controller-terminal job is stale; Pending (mid-dispatch), Running,
-    /// and unknown ids are all spared.
+    /// Terminal and unknown ids are killed. Pending (mid-dispatch) and the
+    /// other active states are always spared; a Running job bound to the
+    /// reporting node is spared too.
     #[tokio::test]
-    async fn stale_reported_jobs_selects_only_terminal_jobs() {
+    async fn should_kill_reported_job_selects_only_terminal_or_unbound() {
         use crate::raft::StateMachineApply;
         use spur_core::job::{JobSpec, JobState};
         use spur_core::wal::WalOperation;
@@ -3552,26 +3592,21 @@ mod tests {
         assert_eq!(cluster.job_state(14), Some(JobState::Suspended));
         assert_eq!(cluster.job_state(15), Some(JobState::Preempted));
 
-        let reported: Vec<RunningJobStatus> = [10, 11, 12, 13, 14, 15, 999]
+        let stale: Vec<u32> = [10, 11, 12, 13, 14, 15, 999]
             .into_iter()
-            .map(|job_id| RunningJobStatus {
-                job_id,
-                ..Default::default()
-            })
+            .filter(|&job_id| should_kill_reported_job(&cluster, job_id, "n1"))
             .collect();
-
-        let stale = stale_reported_jobs(&cluster, &reported);
         assert_eq!(
             stale,
-            vec![12],
-            "only the terminal job is reclaimed; Pending/Running/Completing/Suspended/Preempted/unknown are spared"
+            vec![12, 999],
+            "terminal and unknown ids are reclaimed; Pending/Running (bound)/Completing/Suspended/Preempted are spared"
         );
     }
 
     /// GATE: a job requeued (Timeout -> Pending) between the reclaim snapshot
     /// and the spawned loop's send must fail the re-check, not just the snapshot.
     #[tokio::test]
-    async fn is_still_terminal_false_after_requeue_race() {
+    async fn should_kill_reported_job_false_after_requeue_race() {
         use crate::raft::StateMachineApply;
         use spur_core::job::{JobSpec, JobState};
         use spur_core::wal::WalOperation;
@@ -3622,7 +3657,10 @@ mod tests {
             JobState::Running,
             JobState::Timeout,
         ));
-        assert!(is_still_terminal(&cluster, 77), "snapshot sees Timeout");
+        assert!(
+            should_kill_reported_job(&cluster, 77, "n1"),
+            "snapshot sees Timeout"
+        );
 
         // Concurrent requeue lands before the reclaim loop's re-check.
         apply(&WalOperation::job_state_change(
@@ -3632,7 +3670,7 @@ mod tests {
         ));
 
         assert!(
-            !is_still_terminal(&cluster, 77),
+            !should_kill_reported_job(&cluster, 77, "n1"),
             "re-check must skip a job requeued since the snapshot"
         );
     }

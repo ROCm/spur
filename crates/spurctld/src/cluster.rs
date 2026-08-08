@@ -179,6 +179,11 @@ pub struct SubmitOutcome {
 /// oversized batch scripts.
 const MAX_JOB_SPEC_SIZE: usize = 4 * 1024 * 1024;
 
+/// Consecutive heartbeats a node's report must omit a job the controller
+/// believes is allocated there before the binding is treated as a phantom
+/// and evicted, guarding against a single suspicious heartbeat.
+const PHANTOM_MISS_THRESHOLD: u32 = 2;
+
 /// A `std::io::Write` that only tallies byte counts and discards the data. Used
 /// to measure a value's serialized size without allocating the serialized bytes.
 #[derive(Default)]
@@ -345,6 +350,10 @@ pub struct ClusterManager {
     /// Nodes skipped for new dispatch until the given instant after a
     /// resources-unavailable reject. Leader-local and transient, never persisted.
     node_dispatch_cooldowns: RwLock<HashMap<String, std::time::Instant>>,
+    /// Consecutive heartbeats a node's report has omitted a job the controller
+    /// still considers allocated there. Leader-local and transient, never
+    /// persisted; reset to zero (removed) as soon as a report includes the job.
+    phantom_miss_streaks: RwLock<HashMap<(JobId, String), u32>>,
 }
 
 struct PendingJobClassification {
@@ -405,6 +414,7 @@ impl ClusterManager {
             scheduler_notify: Arc::new(Notify::new()),
             sched_stats: OnceLock::new(),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
+            phantom_miss_streaks: RwLock::new(HashMap::new()),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -438,6 +448,35 @@ impl ClusterManager {
         let mut cooldowns = self.node_dispatch_cooldowns.write();
         cooldowns.retain(|_, &mut until| until > now);
         cooldowns.keys().cloned().collect()
+    }
+
+    /// Active (non-terminal) jobs the controller currently believes are
+    /// allocated on `node`, for reconciling against what the node reports.
+    pub(crate) fn active_jobs_on_node(&self, node: &str) -> Vec<Job> {
+        self.jobs
+            .read()
+            .values()
+            .filter(|j| !j.state.is_terminal() && j.allocated_nodes.iter().any(|n| n == node))
+            .cloned()
+            .collect()
+    }
+
+    /// Record that `node`'s heartbeat omitted `job_id`, returning whether the
+    /// consecutive-miss streak has crossed [`PHANTOM_MISS_THRESHOLD`]. Call
+    /// [`Self::note_node_reported_job`] instead once a report includes the job.
+    pub(crate) fn note_node_omitted_job(&self, job_id: JobId, node: &str) -> bool {
+        let mut streaks = self.phantom_miss_streaks.write();
+        let count = streaks.entry((job_id, node.to_string())).or_insert(0);
+        *count += 1;
+        *count >= PHANTOM_MISS_THRESHOLD
+    }
+
+    /// Clear any miss-streak for `job_id` on `node` — its heartbeat report
+    /// included the job again, or the job/binding no longer needs tracking.
+    pub(crate) fn note_node_reported_job(&self, job_id: JobId, node: &str) {
+        self.phantom_miss_streaks
+            .write()
+            .remove(&(job_id, node.to_string()));
     }
 
     /// Submit a new job. If it has an array spec, expand into individual tasks.
@@ -1562,15 +1601,14 @@ impl ClusterManager {
     /// nodes is responsible for sending the cancel RPC once eviction
     /// succeeds.
     ///
-    /// No longer called from `scheduler_loop`: batch dispatch is now
-    /// confirmed on every assigned node *before* a job is allowed to become
-    /// Running (see `confirm_dispatch_on_nodes`), so a job can no longer
-    /// reach Running with only some of its nodes actually launched — this
-    /// function's original trigger. Kept as a public primitive, with its
-    /// back-off/requeue contract still exercised directly by this module's
-    /// tests, for any other caller that needs to evict an already-Running
-    /// job (e.g. a future admin-initiated NodeFail).
-    #[allow(dead_code)]
+    /// No longer called from `scheduler_loop`'s original dispatch-confirmation
+    /// trigger: batch dispatch is now confirmed on every assigned node
+    /// *before* a job is allowed to become Running, so a job can no longer
+    /// reach Running with only some of its nodes actually launched. Now used
+    /// by the heartbeat reconciler to fail a job whose binding to a node has
+    /// gone silent (see `reconcile_reported_allocations` in `server.rs`) —
+    /// callers must also cancel on the job's still-allocated nodes afterward,
+    /// since this only updates controller state.
     pub fn evict_job(&self, job_id: JobId) -> anyhow::Result<()> {
         self.evict_job_with_detail(job_id, None)
     }
@@ -6149,6 +6187,53 @@ mod tests {
         let cm0 = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
         cm0.cool_down_node("worker1");
         assert!(cm0.nodes_on_dispatch_cooldown().is_empty());
+    }
+
+    // The D1 "phantom" building blocks: a node omitting a job it's bound to
+    // must accumulate misses and only cross PHANTOM_MISS_THRESHOLD on the
+    // Nth consecutive miss; any report that includes the job resets it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn phantom_miss_streak_crosses_threshold_only_after_consecutive_misses() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("phantom-job")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: scalar_alloc(6, 12000),
+            per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+            srun_step_dispatch: false,
+            run_attempt: 1,
+        });
+
+        let bound = cm.active_jobs_on_node("n1");
+        assert_eq!(bound.len(), 1, "job 1 is bound to n1");
+
+        assert!(
+            !cm.note_node_omitted_job(1, "n1"),
+            "first miss must not cross the threshold"
+        );
+        assert!(
+            cm.note_node_omitted_job(1, "n1"),
+            "second consecutive miss crosses PHANTOM_MISS_THRESHOLD"
+        );
+
+        // A report that includes the job resets the streak.
+        cm.note_node_reported_job(1, "n1");
+        assert!(
+            !cm.note_node_omitted_job(1, "n1"),
+            "streak must restart from zero after a report reset it"
+        );
     }
 
     /// Consumer-driven: `maybe_requeue` must honor the new `max_batch_requeue`
