@@ -54,6 +54,11 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     tokio::spawn(async move {
         manage_power(power_cluster, power_raft).await;
     });
+    let inactive_cluster = cluster.clone();
+    let inactive_raft = raft.clone();
+    tokio::spawn(async move {
+        enforce_inactive_limits(inactive_cluster, inactive_raft).await;
+    });
     // Captured once at loop start: the tick interval, per-cycle job cap, and
     // topology tree are baked into loop-local state and are NOT picked up by
     // `scontrol reconfigure` — changing them needs a controller restart.
@@ -1532,6 +1537,60 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
             if let Err(e) = cluster.complete_job(job.job_id, -1, spur_core::job::JobState::Timeout)
             {
                 warn!(job_id = job.job_id, error = %e, "failed to mark job as timed out");
+                continue;
+            }
+
+            send_cancel_to_agents(&cluster, job, 9).await; // SIGKILL
+        }
+    }
+}
+
+/// Reap interactive allocations (salloc/srun) whose client stopped sending
+/// keepalives, mirroring Slurm's `InactiveLimit`. Finalizes via the same
+/// TIMEOUT path as wall-time expiry. Disabled when `inactive_limit_secs == 0`
+/// (the reaper still runs, only to prune the keepalive map).
+async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+
+    loop {
+        interval.tick().await;
+
+        if !raft.is_leader() {
+            continue;
+        }
+
+        let limit_secs = cluster.config().scheduler.inactive_limit_secs;
+        let now = Utc::now();
+
+        let running: Vec<_> = cluster
+            .get_jobs(
+                &[spur_core::job::JobState::Running],
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
+            .into_iter()
+            .filter(|j| j.spec.interactive || j.spec.srun_job)
+            .collect();
+        let ids: Vec<spur_core::job::JobId> = running.iter().map(|j| j.job_id).collect();
+
+        // Prunes the keepalive map every tick; returns candidates only when
+        // the limit is enabled.
+        let stale = cluster.interactive_reap_candidates(&ids, now, limit_secs);
+        for job_id in stale {
+            let Some(job) = running.iter().find(|j| j.job_id == job_id) else {
+                continue;
+            };
+
+            info!(
+                job_id,
+                limit_secs, "interactive allocation idle past InactiveLimit — reaping"
+            );
+
+            if let Err(e) = cluster.complete_job(job_id, -1, spur_core::job::JobState::Timeout) {
+                warn!(job_id, error = %e, "failed to reap inactive allocation");
                 continue;
             }
 

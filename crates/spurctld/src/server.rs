@@ -599,6 +599,38 @@ impl SlurmController for ControllerService {
         Ok(Response::new(()))
     }
 
+    async fn job_keepalive(
+        &self,
+        request: Request<JobKeepaliveRequest>,
+    ) -> Result<Response<JobKeepaliveResponse>, Status> {
+        // Recorded only on the leader, where the reaper reads it.
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.job_keepalive(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward job_keepalive to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+
+        let req = request.into_inner();
+        let job = self
+            .cluster
+            .get_job(req.job_id)
+            .ok_or_else(|| Status::not_found(format!("job {} not found", req.job_id)))?;
+        spur_core::auth::check_job_owner(&req.user, &job.spec.user, "send keepalive for")
+            .map_err(|e| Status::permission_denied(e.to_string()))?;
+
+        self.cluster.record_job_keepalive(req.job_id);
+        Ok(Response::new(JobKeepaliveResponse {}))
+    }
+
     async fn suspend_job(
         &self,
         request: Request<SuspendJobRequest>,
