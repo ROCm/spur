@@ -40,6 +40,7 @@ struct spur_modex_blob {
     char *data;
     size_t len;
     bool present;
+    uint32_t fence_seq;
 };
 
 struct spur_modex_session {
@@ -58,6 +59,7 @@ struct spur_modex_session {
     spur_modex_timeouts_t timeouts;
     pthread_mutex_t lock;
     pthread_cond_t progress;
+    _Atomic int refs;
 };
 
 const char *spur_modex_strerror(int code) {
@@ -173,15 +175,22 @@ static int send_blob(int fd, const spur_modex_hdr_t *hdr, const char *payload) {
     return SPUR_MODEX_OK;
 }
 
-static void reset_remote_blobs(spur_modex_session_t *session) {
+static void reset_remote_blobs(spur_modex_session_t *session, uint32_t keep_fence_seq) {
     for (uint32_t i = 0; i < session->num_nodes; i++) {
         if (i == session->node_index) {
+            continue;
+        }
+        if (keep_fence_seq != SPUR_MODEX_NO_ROUND
+            && session->remote[i].present
+            && session->remote[i].fence_seq == keep_fence_seq)
+        {
             continue;
         }
         free(session->remote[i].data);
         session->remote[i].data = NULL;
         session->remote[i].len = 0;
         session->remote[i].present = false;
+        session->remote[i].fence_seq = SPUR_MODEX_NO_ROUND;
     }
 }
 
@@ -204,7 +213,14 @@ static void store_remote_blob(
         return;
     }
     pthread_mutex_lock(&session->lock);
-    if (session->active_round_seq == SPUR_MODEX_NO_ROUND || fence_seq != session->active_round_seq) {
+    if (session->active_round_seq == SPUR_MODEX_NO_ROUND) {
+        if (fence_seq != session->fence_seq) {
+            pthread_mutex_unlock(&session->lock);
+            free(data);
+            return;
+        }
+        session->active_round_seq = fence_seq;
+    } else if (fence_seq != session->active_round_seq) {
         pthread_mutex_unlock(&session->lock);
         free(data);
         return;
@@ -215,6 +231,7 @@ static void store_remote_blob(
     session->remote[node_index].data = data;
     session->remote[node_index].len = len;
     session->remote[node_index].present = (data != NULL) || len == 0;
+    session->remote[node_index].fence_seq = fence_seq;
     pthread_cond_broadcast(&session->progress);
     pthread_mutex_unlock(&session->lock);
 }
@@ -310,7 +327,46 @@ spur_modex_session_t *spur_modex_session_create(
     }
     pthread_mutex_init(&session->lock, NULL);
     pthread_cond_init(&session->progress, NULL);
+    atomic_store(&session->refs, 1);
     return session;
+}
+
+void spur_modex_session_retain(spur_modex_session_t *session) {
+    if (session != NULL) {
+        atomic_fetch_add(&session->refs, 1);
+    }
+}
+
+static void spur_modex_session_free(spur_modex_session_t *session) {
+    if (session == NULL) {
+        return;
+    }
+    if (atomic_load(&session->accept_running)) {
+        atomic_store(&session->accept_running, false);
+        if (session->listen_fd >= 0) {
+            shutdown(session->listen_fd, SHUT_RDWR);
+            close(session->listen_fd);
+            session->listen_fd = -1;
+        }
+        pthread_join(session->accept_thread, NULL);
+    } else if (session->listen_fd >= 0) {
+        close(session->listen_fd);
+    }
+    for (uint32_t i = 0; i < SPUR_MODEX_MAX_NODES; i++) {
+        free(session->remote[i].data);
+    }
+    pthread_mutex_destroy(&session->lock);
+    pthread_cond_destroy(&session->progress);
+    free(session);
+}
+
+void spur_modex_session_release(spur_modex_session_t *session) {
+    if (session == NULL) {
+        return;
+    }
+    if (atomic_fetch_sub(&session->refs, 1) == 1) {
+        spur_modex_session_free(session);
+    }
 }
 
 int spur_modex_session_start(spur_modex_session_t *session) {
@@ -349,26 +405,7 @@ int spur_modex_session_start(spur_modex_session_t *session) {
 }
 
 void spur_modex_session_destroy(spur_modex_session_t *session) {
-    if (session == NULL) {
-        return;
-    }
-    if (atomic_load(&session->accept_running)) {
-        atomic_store(&session->accept_running, false);
-        if (session->listen_fd >= 0) {
-            shutdown(session->listen_fd, SHUT_RDWR);
-            close(session->listen_fd);
-            session->listen_fd = -1;
-        }
-        pthread_join(session->accept_thread, NULL);
-    } else if (session->listen_fd >= 0) {
-        close(session->listen_fd);
-    }
-    for (uint32_t i = 0; i < SPUR_MODEX_MAX_NODES; i++) {
-        free(session->remote[i].data);
-    }
-    pthread_mutex_destroy(&session->lock);
-    pthread_cond_destroy(&session->progress);
-    free(session);
+    spur_modex_session_release(session);
 }
 
 static int try_connect_addr(const struct sockaddr *addr, socklen_t addrlen, int timeout_sec) {
@@ -626,7 +663,7 @@ int spur_modex_fence_collect(
 
     pthread_mutex_lock(&session->lock);
     uint32_t round_seq = session->fence_seq;
-    reset_remote_blobs(session);
+    reset_remote_blobs(session, round_seq);
     session->aborted = false;
     session->active_round_seq = round_seq;
     pthread_mutex_unlock(&session->lock);

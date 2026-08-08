@@ -50,6 +50,10 @@ spur_modex_session_t *spur_modex_session_create(
 
 void spur_modex_session_destroy(spur_modex_session_t *session);
 
+void spur_modex_session_retain(spur_modex_session_t *session);
+
+void spur_modex_session_release(spur_modex_session_t *session);
+
 int spur_modex_session_start(spur_modex_session_t *session);
 
 int spur_modex_verify_peers(spur_modex_session_t *session);

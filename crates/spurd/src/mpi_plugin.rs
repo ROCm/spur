@@ -694,13 +694,30 @@ fn normalize_pmix_fork_env(env: &mut HashMap<String, String>, plan: &PmixLaunchP
 
     let size = plan.universe_size.to_string();
     env.insert("PMIX_SIZE".into(), size.clone());
-    env.insert("PMIX_JOB_SIZE".into(), size);
+    env.insert("PMIX_JOB_SIZE".into(), size.clone());
+    env.insert("PMIX_APP_SIZE".into(), size);
 
     env.entry("PMIX_NAMESPACE".into())
         .or_insert_with(|| plan.namespace.clone());
     env.insert("PMIX_RANK".into(), rank.to_string());
     env.entry("PMIX_SERVER_TMPDIR".into())
         .or_insert_with(|| plan.tmpdir.clone());
+
+    if plan.num_nodes > 1 {
+        let local_size = plan.local_procs.len().to_string();
+        env.insert("PMIX_LOCAL_SIZE".into(), local_size.clone());
+        if let Some(tasks_per_node) = plan.universe_size.checked_div(plan.num_nodes) {
+            env.insert("PMIX_NODE_SIZE".into(), tasks_per_node.to_string());
+        }
+        if let Some(host) = plan.peer_hosts.get(plan.node_index as usize) {
+            env.insert("PMIX_HOSTNAME".into(), host.clone());
+        }
+        env.insert("PMIX_GDS_MODULE".into(), "hash".into());
+        env.insert("PMIX_NODEID".into(), plan.node_index.to_string());
+        // Open MPI defaults to async modex (on-demand dmodex). Spur's embedded PMIx
+        // server implements fence-based exchange only, not direct modex fetch.
+        env.insert("OMPI_MCA_pmix_base_async_modex".into(), "0".into());
+    }
 }
 
 /// Merge per-rank setup_fork env into task env before exec.
@@ -1054,6 +1071,41 @@ mod tests {
         assert_eq!(
             env.get("PMIX_SERVER_URI3").map(String::as_str),
             Some("pmix://host:1234")
+        );
+    }
+
+    #[test]
+    fn normalize_pmix_fork_env_aligns_multi_node_hostname_and_sizes() {
+        let plan = PmixLaunchPlan::local_tasks(
+            9,
+            4,
+            2,
+            2,
+            "/tmp/pmix",
+            0,
+            0,
+            2,
+            1,
+            vec!["node-a.example.com".into(), "node-b.example.com".into()],
+        );
+        let mut env = HashMap::from([
+            ("PMIX_HOSTNAME".into(), "node-b".into()),
+            ("PMIX_APP_SIZE".into(), "2".into()),
+            ("PMIX_GDS_MODULE".into(), "shmem,hash".into()),
+        ]);
+        normalize_pmix_fork_env(&mut env, &plan, 2);
+        assert_eq!(
+            env.get("PMIX_HOSTNAME").map(String::as_str),
+            Some("node-b.example.com")
+        );
+        assert_eq!(env.get("PMIX_APP_SIZE").map(String::as_str), Some("4"));
+        assert_eq!(env.get("PMIX_NODE_SIZE").map(String::as_str), Some("2"));
+        assert_eq!(env.get("PMIX_GDS_MODULE").map(String::as_str), Some("hash"));
+        assert_eq!(env.get("PMIX_NODEID").map(String::as_str), Some("1"));
+        assert_eq!(
+            env.get("OMPI_MCA_pmix_base_async_modex")
+                .map(String::as_str),
+            Some("0")
         );
     }
 
