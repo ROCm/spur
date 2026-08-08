@@ -485,6 +485,16 @@ impl ClusterManager {
             .remove(&(job_id, node.to_string()));
     }
 
+    /// Remove `node`'s miss-streak entries for jobs no longer in
+    /// `active_job_ids` — a job can leave the active set by a path other than
+    /// a later heartbeat re-reporting it (completed, cancelled, evicted),
+    /// which `note_node_reported_job` alone would never observe.
+    pub(crate) fn prune_phantom_streaks_not_in(&self, node: &str, active_job_ids: &HashSet<JobId>) {
+        self.phantom_miss_streaks
+            .write()
+            .retain(|(job_id, n), _| n != node || active_job_ids.contains(job_id));
+    }
+
     /// Record that `job_id`'s hold on `node` was just released in controller
     /// state (cancel/evict) but not yet confirmed by the agent, so new
     /// dispatch avoids `resources` there until it expires. Refreshes the TTL
@@ -1646,9 +1656,10 @@ impl ClusterManager {
     /// reach Running with only some of its nodes actually launched. Now used
     /// by the heartbeat reconciler to fail a job whose binding to a node has
     /// gone silent (see `reconcile_reported_allocations` in `server.rs`) —
-    /// callers must also cancel on the job's still-allocated nodes afterward,
-    /// since this only updates controller state.
-    pub fn evict_job(&self, job_id: JobId) -> anyhow::Result<()> {
+    /// callers must also cancel on the job's still-allocated nodes and
+    /// complete its steps (`complete_evicted_steps`) afterward, since this
+    /// only updates controller state.
+    pub fn evict_job(&self, job_id: JobId) -> anyhow::Result<Vec<JobFinalized>> {
         self.evict_job_with_detail(job_id, None)
     }
 
@@ -1656,19 +1667,19 @@ impl ClusterManager {
         &self,
         job_id: JobId,
         detail: Option<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<JobFinalized>> {
         {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
                 .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
             if job.state.is_terminal() {
-                return Ok(());
+                return Ok(Vec::new());
             }
         }
         let resp = self.propose(WalOperation::JobEvict { job_id, detail })?;
         self.run_all_finalized_side_effects(&resp);
-        Ok(())
+        Ok(resp.jobs_finalized.clone())
     }
 
     /// Register a node agent.

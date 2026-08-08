@@ -146,6 +146,10 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         cluster.enforce_reservation_end_times();
         cluster.evict_expired_terminal_jobs();
 
+        // Pruned on every read regardless of whether this cycle schedules
+        // anything, so an idle cluster doesn't accumulate expired entries.
+        let pending_kill = cluster.pending_kill_reservations();
+
         // Classify once, apply reasons, and stage only candidates admitted by
         // that classification. Run before the empty-check so reasons stay fresh
         // even with nothing schedulable.
@@ -167,7 +171,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // Keep a resource excluded from placement until the agent confirms it
         // released a cancelled/evicted job, even though the controller's own
         // alloc_resources already counts it free — a kill RPC can be lost.
-        apply_pending_kill_reservations(&mut nodes, &cluster.pending_kill_reservations());
+        apply_pending_kill_reservations(&mut nodes, &pending_kill);
 
         let cycle_start = Instant::now();
 

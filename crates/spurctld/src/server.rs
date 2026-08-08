@@ -230,10 +230,13 @@ impl ControllerService {
 
     /// Reconcile `node`'s heartbeat-reported held jobs against the controller's
     /// own record. Kills a reported job the controller considers terminal, has
-    /// no record of, or has running elsewhere without this node bound to it —
-    /// never fabricating a binding. Separately, evicts a job the controller
-    /// still believes is allocated on `node` if the node's report has omitted
-    /// it for several consecutive heartbeats. Spawned, best-effort; called only
+    /// no record of, or has running/suspended/completing elsewhere without
+    /// this node bound to it — never fabricating a binding. Separately, evicts
+    /// a single-node job the controller still believes is allocated on `node`
+    /// if the node's report has omitted it for several consecutive heartbeats
+    /// (a multi-node job is left alone here: `evict_job` fails the whole job,
+    /// so acting on one node's phantom would tear it down on every node,
+    /// including ones reporting it fine). Spawned, best-effort; called only
     /// from the heartbeat handler, which is already leader-gated.
     fn reconcile_reported_allocations(&self, node: &str, reported: &[RunningJobStatus]) {
         let kill = reported
@@ -270,11 +273,21 @@ impl ControllerService {
         }
 
         let reported_ids: HashSet<u32> = reported.iter().map(|r| r.job_id).collect();
+        let active = self.cluster.active_jobs_on_node(node);
+        // Sweep any miss-streak entries for jobs that left this node's active
+        // set by some other path (completed, cancelled, reattached) — the
+        // only other removal is a later heartbeat re-reporting the job, so
+        // without this a job that never gets re-reported leaks its entry.
+        let active_ids: HashSet<spur_core::job::JobId> = active.iter().map(|j| j.job_id).collect();
+        self.cluster.prune_phantom_streaks_not_in(node, &active_ids);
+
         let mut phantom = Vec::new();
-        for job in self.cluster.active_jobs_on_node(node) {
+        for job in active {
             if reported_ids.contains(&job.job_id) {
                 self.cluster.note_node_reported_job(job.job_id, node);
-            } else if self.cluster.note_node_omitted_job(job.job_id, node) {
+            } else if job.allocated_nodes.len() == 1
+                && self.cluster.note_node_omitted_job(job.job_id, node)
+            {
                 phantom.push(job);
             }
         }
@@ -283,17 +296,36 @@ impl ControllerService {
             let node_owned = node.to_string();
             tokio::spawn(async move {
                 for job in phantom {
+                    // Re-fetch and re-check the epoch: the snapshot above may
+                    // be stale by the time this runs — a NodeFail->Pending
+                    // ->Running requeue on a fresh run_attempt must not be
+                    // force-failed by a phantom detected against the earlier
+                    // run, and the (possibly stale) snapshot must not be used
+                    // for the kill that follows.
+                    let Some(fresh) = cluster.get_job(job.job_id) else {
+                        continue;
+                    };
+                    if fresh.state.is_terminal() || fresh.run_attempt != job.run_attempt {
+                        continue;
+                    }
                     warn!(
-                        job_id = job.job_id,
+                        job_id = fresh.job_id,
                         node = %node_owned,
                         "node's heartbeat repeatedly omitted a job the controller binds here — evicting"
                     );
-                    if let Err(e) = cluster.evict_job(job.job_id) {
-                        warn!(job_id = job.job_id, error = %e, "failed to evict phantom binding");
-                        continue;
+                    // Reserve before freeing: evict_job's WAL apply frees the
+                    // resources immediately, so the reservation must already
+                    // be in place before that happens, not after.
+                    note_pending_kill_for_job(&cluster, &fresh);
+                    match cluster.evict_job(fresh.job_id) {
+                        Ok(finalized) => {
+                            cluster.complete_evicted_steps(&finalized);
+                            crate::scheduler_loop::send_cancel_to_agents(&cluster, &fresh, 9).await;
+                        }
+                        Err(e) => {
+                            warn!(job_id = fresh.job_id, error = %e, "failed to evict phantom binding");
+                        }
                     }
-                    note_pending_kill_for_job(&cluster, &job);
-                    crate::scheduler_loop::send_cancel_to_agents(&cluster, &job, 9).await;
                 }
             });
         }
@@ -421,19 +453,24 @@ fn is_k0s_admin(cache: &crate::association_cache::AssociationCache, caller: &str
 }
 
 /// Whether a job `node` reports holding should be killed there: the controller
-/// has no record of it, considers it terminal, or is Running but not bound to
-/// `node` — never fabricating a binding to justify sparing it. Only `Running`
-/// carries the "should already be bound to specific nodes" expectation;
-/// Pending (register-before-persist: the agent can hold an allocation before
-/// the controller's own dispatch-confirmation WAL write lands) and the other
-/// active states (Completing/Suspended/Preempted) are always spared.
+/// has no record of it, considers it terminal, or is Running/Suspended
+/// /Completing but not bound to `node` — never fabricating a binding to
+/// justify sparing it. Those three states carry the "should already be bound
+/// to specific nodes" expectation (a suspend/completing transition doesn't
+/// touch `allocated_nodes`); Pending (register-before-persist: the agent can
+/// hold an allocation before the controller's own dispatch-confirmation WAL
+/// write lands) and Preempted (never an observable persisted state — it
+/// transitions to Pending atomically within one WAL apply) are always spared.
 fn should_kill_reported_job(cluster: &ClusterManager, job_id: u32, node: &str) -> bool {
+    use spur_core::job::JobState;
     match cluster.job_state(job_id) {
         None => true,
         Some(state) if state.is_terminal() => true,
-        Some(spur_core::job::JobState::Running) => !cluster
-            .get_job(job_id)
-            .is_some_and(|j| j.allocated_nodes.iter().any(|n| n == node)),
+        Some(JobState::Running) | Some(JobState::Suspended) | Some(JobState::Completing) => {
+            !cluster
+                .get_job(job_id)
+                .is_some_and(|j| j.allocated_nodes.iter().any(|n| n == node))
+        }
         Some(_) => false,
     }
 }
@@ -579,8 +616,14 @@ impl SlurmController for ControllerService {
         let req = request.into_inner();
         let job_id = req.job_id;
 
-        // Snapshot the job before cancelling so we have allocated_nodes
+        // Snapshot the job before cancelling so we have allocated_nodes, and
+        // reserve the pending-kill hold before cancel_job's WAL apply frees
+        // the resources — reserving after would leave a window where the
+        // scheduler could see them free with no reservation in place yet.
         let job = self.cluster.get_job(job_id);
+        if let Some(ref job) = job {
+            note_pending_kill_for_job(&self.cluster, job);
+        }
 
         self.cluster
             .cancel_job(job_id, &req.user)
@@ -588,7 +631,6 @@ impl SlurmController for ControllerService {
 
         // Send cancel signal to agents so the process is actually killed
         if let Some(job) = job {
-            note_pending_kill_for_job(&self.cluster, &job);
             let cluster = self.cluster.clone();
             tokio::spawn(async move {
                 crate::scheduler_loop::send_cancel_to_agents(&cluster, &job, 0).await;
@@ -3796,6 +3838,132 @@ mod tests {
             control_plane_replicas: 1,
             jwt_key: String::new(),
         }
+    }
+
+    // D1 phantom eviction is job-scoped (`evict_job` fails the whole job), so
+    // it must never fire for a multi-node job on just one node's phantom
+    // report — that would tear down nodes that are reporting the job fine.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_spares_a_multi_node_job_on_one_nodes_phantom_report() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState};
+        use spur_core::resource::ResourceAllocations;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                &svc.cluster,
+                op,
+            );
+        };
+
+        apply(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(JobSpec {
+                name: "multi-node".into(),
+                user: "alice".into(),
+                num_nodes: 2,
+                num_tasks: 2,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            }),
+        });
+        apply(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let res = ResourceAllocations::with_scalar(1, 1000);
+        let per_node: std::collections::HashMap<_, _> =
+            [("n1".to_string(), res.clone()), ("n2".to_string(), res)].into();
+        apply(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into(), "n2".into()],
+            resources: ResourceAllocations::with_scalar(2, 2000),
+            per_node_alloc: per_node,
+            srun_step_dispatch: false,
+            run_attempt: 1,
+        });
+
+        // n1's heartbeat never reports job 1; cross the phantom threshold.
+        for _ in 0..3 {
+            svc.reconcile_reported_allocations("n1", &[]);
+        }
+        // Give the (would-be) spawned eviction a chance to run.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(
+            svc.cluster.get_job(1).unwrap().state,
+            JobState::Running,
+            "a multi-node job must not be evicted over one node's phantom report"
+        );
+    }
+
+    // The single-node counterpart: a persistent phantom report must still
+    // evict the job (this is the case D1 exists to fix).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_evicts_a_single_node_job_after_persistent_phantom_report() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState};
+        use spur_core::resource::ResourceAllocations;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                &svc.cluster,
+                op,
+            );
+        };
+
+        apply(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(JobSpec {
+                name: "single-node".into(),
+                user: "alice".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            }),
+        });
+        apply(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let res = ResourceAllocations::with_scalar(1, 1000);
+        let per_node: std::collections::HashMap<_, _> = [("n1".to_string(), res)].into();
+        apply(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: ResourceAllocations::with_scalar(1, 1000),
+            per_node_alloc: per_node,
+            srun_step_dispatch: false,
+            run_attempt: 1,
+        });
+
+        for _ in 0..3 {
+            svc.reconcile_reported_allocations("n1", &[]);
+        }
+
+        let mut evicted = false;
+        for _ in 0..200 {
+            if svc.cluster.get_job(1).unwrap().state.is_terminal() {
+                evicted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            evicted,
+            "a single-node job's persistent phantom report must evict it"
+        );
     }
 
     // A step must NOT be created when the target node is allocated but unregistered: address
