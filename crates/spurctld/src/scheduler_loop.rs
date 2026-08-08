@@ -307,6 +307,9 @@ async fn process_assignment(
     }
 
     if spec.srun_job && srun_step_dispatch {
+        // Same one-shot read as the batch path below: this iteration is the
+        // only place that can advance a Pending job's run_attempt.
+        let prospective_run_attempt = job.run_attempt.saturating_add(1);
         match register_allocation_on_nodes(
             cluster.clone(),
             job_id,
@@ -314,6 +317,7 @@ async fn process_assignment(
             &spec,
             per_node_allocs.clone(),
             allocated_nodelist.clone(),
+            prospective_run_attempt,
         )
         .await
         {
@@ -1102,6 +1106,7 @@ struct AllocationRegisterParams {
     allocated_nodelist: String,
     allocated: spur_core::resource::ResourceAllocations,
     work_dir: String,
+    run_attempt: u32,
 }
 
 /// Register a srun-only allocation on a node agent without launching a batch process.
@@ -1133,6 +1138,7 @@ async fn register_allocation_to_agent(
             mpi: params.mpi.clone(),
             work_dir: params.work_dir.clone(),
             user: params.user.clone(),
+            run_attempt: params.run_attempt,
         })
         .await?;
 
@@ -1153,6 +1159,7 @@ async fn register_allocation_on_nodes(
     spec: &spur_core::job::JobSpec,
     per_node_allocs: std::collections::HashMap<String, spur_core::resource::ResourceAllocations>,
     allocated_nodelist: String,
+    run_attempt: u32,
 ) -> AllocationRegisterOutcome {
     let mut successes = 0u32;
     let mut failures = 0u32;
@@ -1198,6 +1205,7 @@ async fn register_allocation_on_nodes(
             allocated_nodelist: allocated_nodelist.clone(),
             allocated,
             work_dir: spec.work_dir.clone(),
+            run_attempt,
         };
         set.spawn(async move {
             let result = register_allocation_to_agent(&agent_addr, &params).await;

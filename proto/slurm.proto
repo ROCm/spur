@@ -997,6 +997,9 @@ message RegisterJobAllocationRequest {
   string mpi = 10;
   string work_dir = 11;
   string user = 12;  // Job owner; the agent gates exec/attach on it
+  // Run epoch for this allocation; mirrors LaunchJobRequest.run_attempt so
+  // interactive jobs get the same stale-report fencing as batch dispatch.
+  uint32 run_attempt = 13;
 }
 
 message RegisterJobAllocationResponse {}

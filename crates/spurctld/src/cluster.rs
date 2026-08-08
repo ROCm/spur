@@ -1138,9 +1138,11 @@ impl ClusterManager {
                 return Ok(NodeCompleteResult::AlreadyTerminal);
             }
             // Drop a report from a superseded run (older epoch); e.g. the
-            // delayed SIGKILL of a preemption-requeued process. Epoch 0 on
-            // either side (legacy) disables the check.
-            if run_attempt != 0 && job.run_attempt != 0 && run_attempt < job.run_attempt {
+            // delayed SIGKILL of a preemption-requeued process. A reported
+            // epoch of 0 is the sentinel for "predates run_attempt fencing"
+            // (an in-flight allocation from before this guard existed, or an
+            // older agent binary) and is trusted rather than treated as stale.
+            if run_attempt != 0 && run_attempt < job.run_attempt {
                 return Ok(NodeCompleteResult::StaleReport);
             }
             if !job.allocated_nodes.iter().any(|n| n == node_name) {
@@ -8108,6 +8110,39 @@ mod tests {
         // Current-epoch report is applied normally.
         cm.node_complete(1, "n1", 0, 9, 2).unwrap();
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Failed);
+    }
+
+    // A reported epoch of 0 is the "predates run_attempt fencing" sentinel
+    // (an in-flight allocation from before the guard existed, or an older
+    // agent binary) and must be trusted even though the job's own epoch has
+    // since advanced — it must not be dropped as a stale report.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_complete_trusts_legacy_zero_epoch_report() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("legacy-epoch-job")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: scalar_alloc(6, 12000),
+            per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+            srun_step_dispatch: false,
+            run_attempt: 2,
+        });
+
+        let res = cm.node_complete(1, "n1", 0, 0, 0).unwrap();
+        assert!(!matches!(res, NodeCompleteResult::StaleReport));
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Completed);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

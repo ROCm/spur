@@ -1762,9 +1762,7 @@ impl SlurmAgent for AgentService {
                 memory_mb,
                 nodelist: req.nodelist,
                 mpi: req.mpi,
-                // srun allocation-only jobs use their own cancel lifecycle;
-                // epoch 0 leaves the stale-report guard disabled for them.
-                run_attempt: 0,
+                run_attempt: req.run_attempt,
             },
         );
         drop(jobs);
@@ -4474,6 +4472,31 @@ mod tests {
             0,
             "committed+tracked allocation must survive reconcile"
         );
+    }
+
+    // Interactive (srun/salloc) allocations must carry the controller's real
+    // run_attempt, not a hardcoded 0 that disables the stale-report guard.
+    #[tokio::test]
+    async fn register_job_allocation_stores_requested_run_attempt() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            job_id: 91,
+            cpus: 1,
+            run_attempt: 3,
+            ..Default::default()
+        }))
+        .await
+        .expect("register");
+
+        let running = svc.running.lock().await;
+        let tracked = running.get(&91).expect("job tracked");
+        assert_eq!(tracked.run_attempt, 3);
     }
 
     // The heartbeat's held-job source must report an allocation-only (srun/salloc)
