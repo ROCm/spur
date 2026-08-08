@@ -808,6 +808,12 @@ message ClusterUpRequest {
   // Explicit control-plane node names (1, 3, or 5). First is the etcd bootstrap node.
   repeated string control_plane_nodes = 4;
   string caller = 5;   // For authorization (cluster admin required).
+  // Scope the cluster to a subset of the inventory: UNION of a nodes hostlist (e.g. "gpu[01-08]"),
+  // a partition's members, and a label selector (all key=val match). Empty = whole inventory.
+  // Resolved once at up time and persisted; not re-evaluated as inventory changes.
+  string nodes = 6;
+  string partition = 7;
+  map<string, string> selector = 8;
 }
 message ClusterUpResponse {
   bool accepted = 1;
@@ -833,6 +839,8 @@ message ClusterStatusResponse {
   repeated ClusterNodeStatus nodes = 3;
   // All control-plane nodes (HA). Bootstrap node first; empty pre-multi-CP (see control_plane_node).
   repeated string control_plane_nodes = 4;
+  // Member nodes the cluster is scoped to. Empty = the whole inventory is enrolled.
+  repeated string member_nodes = 5;
 }
 
 message ClusterNodeStatus {
