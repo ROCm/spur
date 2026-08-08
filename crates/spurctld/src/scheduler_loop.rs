@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 
 use spur_core::node::{Node, NodeSource};
 use spur_core::partition::requested_partition_names;
+use spur_core::task_launch::batch_dispatched_multi_node_pmix;
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
@@ -20,6 +21,7 @@ use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::traits::{ClusterState, Scheduler};
 
 use crate::cluster::ClusterManager;
+use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
 
 /// Upper bound on a single CancelJob RPC (connect + call) when the caller
@@ -828,6 +830,8 @@ struct AgentDispatchParams<'a> {
     job_id: u32,
     spec: &'a spur_core::job::JobSpec,
     peer_nodes: &'a [String],
+    peer_hosts: &'a [String],
+    node_index: u32,
     task_offset: u32,
     target_node: &'a str,
     allocated: &'a spur_core::resource::ResourceAllocations,
@@ -839,6 +843,10 @@ struct AgentDispatchParams<'a> {
     /// (e.g. a Kubernetes-inclusive allocation), where the dispatched
     /// "script" is the literal command `srun` was asked to fan out.
     task_fanout: bool,
+    modex_connect_timeout_secs: u32,
+    modex_fence_timeout_secs: u32,
+    modex_verify_timeout_secs: u32,
+    pmix_prepared: bool,
 }
 
 /// Resolved output paths reported by an agent after a successful launch.
@@ -910,20 +918,8 @@ async fn dispatch_to_agent(
     } else {
         (spec.num_tasks / spec.num_nodes.max(1)).max(1)
     };
-    let mpi = spec.mpi.clone().unwrap_or_default();
-    let pmix_plan = spur_core::mpi::maybe_local_pmix_plan(
-        &mpi,
-        spur_core::mpi::PmixLocalDispatch {
-            job_id: params.job_id,
-            universe_size: spec.num_tasks,
-            task_offset: params.task_offset,
-            local_count: tasks_per_node,
-            tmpdir: params.pmix_tmpdir.to_string(),
-            job_uid: spec.uid,
-            job_gid: spec.gid,
-        },
-    )
-    .map(spur_core::mpi::plan_to_proto);
+    let pmix_plan = build_pmix_plan_proto(params, spec, tasks_per_node)
+        .map_err(|e| anyhow::anyhow!("invalid PMIx launch plan: {e}"))?;
     let proto_spec = ProtoJobSpec {
         name: spec.name.clone(),
         partition: spec.partition.clone().unwrap_or_default(),
@@ -1023,6 +1019,7 @@ async fn dispatch_to_agent(
             run_attempt: params.run_attempt,
             pmix_plan,
             task_fanout: params.task_fanout,
+            pmix_prepared: params.pmix_prepared,
         })
         .await?;
 
@@ -1049,6 +1046,32 @@ async fn dispatch_to_agent(
         stdout_path: inner.stdout_path,
         stderr_path: inner.stderr_path,
     })
+}
+
+fn build_pmix_plan_proto(
+    params: &AgentDispatchParams<'_>,
+    spec: &spur_core::job::JobSpec,
+    tasks_per_node: u32,
+) -> Result<Option<spur_proto::proto::PmixLaunchPlan>, String> {
+    let mpi = spec.mpi.as_deref().unwrap_or("");
+    spur_core::mpi::build_validated_pmix_plan_proto(
+        mpi,
+        spur_core::mpi::PmixLocalDispatch {
+            job_id: params.job_id,
+            universe_size: spec.num_tasks,
+            task_offset: params.task_offset,
+            local_count: tasks_per_node,
+            tmpdir: params.pmix_tmpdir.to_string(),
+            job_uid: spec.uid,
+            job_gid: spec.gid,
+            num_nodes: spec.num_nodes,
+            node_index: params.node_index,
+            peer_hosts: params.peer_hosts.to_vec(),
+            modex_connect_timeout_secs: params.modex_connect_timeout_secs,
+            modex_fence_timeout_secs: params.modex_fence_timeout_secs,
+            modex_verify_timeout_secs: params.modex_verify_timeout_secs,
+        },
+    )
 }
 
 /// Outcome of parallel RegisterJobAllocation RPCs for a standalone srun job.
@@ -1225,6 +1248,18 @@ enum DispatchConfirmOutcome {
     Aborted,
 }
 
+fn abort_pending_pmix_dispatch(
+    cluster: &ClusterManager,
+    job_id: spur_core::job::JobId,
+    detail: String,
+) -> DispatchConfirmOutcome {
+    let _ = cluster.set_job_launch_failure_detail(job_id, detail);
+    if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
+        error!(job_id, error = %e, "failed to back off after PMIx dispatch failure");
+    }
+    DispatchConfirmOutcome::Aborted
+}
+
 /// Dispatch a batch job to every assigned node and *wait* for every LaunchJob
 /// RPC to resolve before returning anything the caller can use to flip the
 /// job to Running.
@@ -1299,13 +1334,24 @@ async fn confirm_dispatch_on_nodes(
     let mut primary_outcome: Option<LaunchOutcome> = None;
 
     let pmix_tmpdir = cluster.config().mpi.pmix_tmpdir.clone();
-    let mut set = tokio::task::JoinSet::new();
-    for (node_idx, node_name) in dispatch_nodes.iter().enumerate() {
+    let modex_connect_timeout_secs = cluster.config().mpi.modex_connect_timeout_secs;
+    let modex_fence_timeout_secs = cluster.config().mpi.modex_fence_timeout_secs;
+    let modex_verify_timeout_secs = cluster.config().mpi.modex_verify_timeout_secs;
+
+    let needs_pmix_prepare = batch_dispatched_multi_node_pmix(
+        spec.mpi.as_deref(),
+        spec.num_nodes,
+        spec.script.as_deref(),
+    );
+
+    let mut peer_hosts: Vec<String> = Vec::new();
+    let mut node_agents: Vec<(String, String)> = Vec::new();
+    for node_name in dispatch_nodes.iter() {
         let node_info = cluster.get_node(node_name);
-        let agent_addr = match node_info {
-            Some(ref n) => match node_comm_http_url(n) {
-                Some(url) => url,
-                None => {
+        let (comm_host, agent_addr) = match node_info {
+            Some(ref n) => match (n.comm_addr(), node_comm_http_url(n)) {
+                (Some(host), Some(url)) => (host.to_string(), url),
+                _ => {
                     warn!(
                         job_id,
                         node = %node_name,
@@ -1315,7 +1361,7 @@ async fn confirm_dispatch_on_nodes(
                     continue;
                 }
             },
-            _ => {
+            None => {
                 warn!(
                     job_id,
                     node = %node_name,
@@ -1325,16 +1371,115 @@ async fn confirm_dispatch_on_nodes(
                 continue;
             }
         };
+        peer_hosts.push(comm_host);
+        node_agents.push((node_name.clone(), agent_addr));
+    }
 
+    let mut pmix_prepare_guard = None;
+
+    if needs_pmix_prepare {
+        if failures > 0 || node_agents.len() != dispatch_nodes.len() {
+            error!(
+                job_id,
+                failures,
+                agents = node_agents.len(),
+                expected = dispatch_nodes.len(),
+                "incomplete agent set for multi-node PMIx — aborting dispatch"
+            );
+            let detail = format!(
+                "incomplete PMIx agent set: {} of {} nodes reachable",
+                node_agents.len(),
+                dispatch_nodes.len()
+            );
+            return abort_pending_pmix_dispatch(&cluster, job_id, detail);
+        }
+
+        if let Some(detail) = pmix_dispatch::multi_node_pmix_unsupported(
+            dispatch_nodes
+                .iter()
+                .filter_map(|name| cluster.get_node(name).map(|node| node.source.clone())),
+        ) {
+            error!(job_id, "{detail}");
+            let _ = cluster.set_job_launch_failure_detail(job_id, detail.clone());
+            if let Err(e) = cluster.hold_job_for_launch_failure(job_id, Some(&detail)) {
+                error!(job_id, error = %e, "failed to hold job for unsupported multi-node PMIx");
+            }
+            return DispatchConfirmOutcome::Aborted;
+        }
+
+        let mut prepare_nodes = Vec::with_capacity(node_agents.len());
+        for (node_idx, (node_name, agent_addr)) in node_agents.iter().enumerate() {
+            let task_offset = node_idx as u32 * tasks_per_node;
+            let allocated = per_node_allocs.get(node_name).cloned().unwrap_or_default();
+            let params = AgentDispatchParams {
+                job_id,
+                spec: &spec,
+                peer_nodes: &peer_addrs,
+                peer_hosts: &peer_hosts,
+                node_index: node_idx as u32,
+                task_offset,
+                target_node: node_name,
+                allocated: &allocated,
+                allocated_nodelist: &allocated_nodelist,
+                run_attempt,
+                pmix_tmpdir: &pmix_tmpdir,
+                task_fanout,
+                modex_connect_timeout_secs,
+                modex_fence_timeout_secs,
+                modex_verify_timeout_secs,
+                pmix_prepared: false,
+            };
+            let pmix_plan = match build_pmix_plan_proto(&params, &spec, tasks_per_node) {
+                Ok(Some(plan)) => plan,
+                Ok(None) => {
+                    let detail = format!("job is not configured for PMIx on node {node_name}");
+                    error!(job_id, node = %node_name, "{detail}");
+                    return abort_pending_pmix_dispatch(&cluster, job_id, detail);
+                }
+                Err(detail) => {
+                    let detail = format!("invalid PMIx launch plan for node {node_name}: {detail}");
+                    error!(job_id, node = %node_name, "{detail}");
+                    return abort_pending_pmix_dispatch(&cluster, job_id, detail);
+                }
+            };
+            prepare_nodes.push(PmixPrepareNode {
+                node_name: node_name.clone(),
+                agent_addr: agent_addr.clone(),
+                pmix_plan,
+            });
+        }
+
+        if let Err(detail) =
+            pmix_dispatch::prepare_pmix_on_nodes(job_id, run_attempt, prepare_nodes).await
+        {
+            error!(job_id, error = %detail, "PMIx prepare failed — aborting dispatch");
+            return abort_pending_pmix_dispatch(
+                &cluster,
+                job_id,
+                format!("PMIx prepare failed: {detail}"),
+            );
+        }
+        let agent_addrs: Vec<String> = node_agents.iter().map(|(_, addr)| addr.clone()).collect();
+        pmix_prepare_guard = Some(pmix_dispatch::PmixPreparedReleaseGuard::new(
+            job_id,
+            agent_addrs,
+        ));
+    }
+
+    let mut set = tokio::task::JoinSet::new();
+    for (node_idx, (node_name, agent_addr)) in node_agents.iter().enumerate() {
         let spec = spec.clone();
         let peer_addrs = peer_addrs.clone();
+        let peer_hosts = peer_hosts.clone();
         let task_offset = node_idx as u32 * tasks_per_node;
+        let node_index = node_idx as u32;
         let is_primary = task_offset == 0;
         let target_node = node_name.clone();
         let result_node = node_name.clone();
         let allocated = per_node_allocs.get(node_name).cloned().unwrap_or_default();
         let allocated_nodelist = allocated_nodelist.clone();
         let pmix_tmpdir = pmix_tmpdir.clone();
+        let agent_addr = agent_addr.clone();
         set.spawn(async move {
             let result = dispatch_to_agent(
                 &agent_addr,
@@ -1342,6 +1487,8 @@ async fn confirm_dispatch_on_nodes(
                     job_id,
                     spec: &spec,
                     peer_nodes: &peer_addrs,
+                    peer_hosts: &peer_hosts,
+                    node_index,
                     task_offset,
                     target_node: &target_node,
                     allocated: &allocated,
@@ -1349,6 +1496,10 @@ async fn confirm_dispatch_on_nodes(
                     run_attempt,
                     pmix_tmpdir: &pmix_tmpdir,
                     task_fanout,
+                    modex_connect_timeout_secs,
+                    modex_fence_timeout_secs,
+                    modex_verify_timeout_secs,
+                    pmix_prepared: needs_pmix_prepare,
                 },
             )
             .await;
@@ -1380,6 +1531,9 @@ async fn confirm_dispatch_on_nodes(
     }
 
     if failures == 0 {
+        if let Some(guard) = pmix_prepare_guard.as_mut() {
+            guard.disarm();
+        }
         if let Some(outcome) = primary_outcome {
             cluster.set_job_output_paths(job_id, outcome.stdout_path, outcome.stderr_path);
         }
@@ -1391,6 +1545,21 @@ async fn confirm_dispatch_on_nodes(
         successes, failures, total,
         "one or more nodes failed to confirm dispatch — aborting admission instead of partially running"
     );
+
+    if needs_pmix_prepare {
+        if let Some(guard) = pmix_prepare_guard.as_mut() {
+            guard.disarm();
+        }
+        let agent_addrs: Vec<String> = node_agents.iter().map(|(_, addr)| addr.clone()).collect();
+        pmix_dispatch::release_pmix_on_agents(&agent_addrs, job_id).await;
+    }
+
+    let confirmation_detail = if needs_pmix_prepare {
+        format!("PMIx dispatch confirmation failed: {successes} of {total} nodes confirmed")
+    } else {
+        format!("dispatch confirmation failed: {successes} of {total} nodes confirmed")
+    };
+    let _ = cluster.set_job_launch_failure_detail(job_id, confirmation_detail.clone());
 
     // Stop whatever DID launch before the job settles anywhere: a node that
     // never confirmed will never report completion, and letting it keep
@@ -1416,7 +1585,9 @@ async fn confirm_dispatch_on_nodes(
             if let Err(e) = cluster.cancel_job(job_id, &spec.user) {
                 error!(job_id, error = %e, "failed to cancel interactive job after prolog failure");
             }
-        } else if let Err(e) = cluster.hold_job_for_launch_failure(job_id) {
+        } else if let Err(e) =
+            cluster.hold_job_for_launch_failure(job_id, Some(&confirmation_detail))
+        {
             error!(job_id, error = %e, "failed to hold job after prolog failure");
         }
     } else if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
@@ -1752,6 +1923,83 @@ pub async fn cancel_job_on_nodes(
         set.spawn(cancel_one_agent(agent_addr, job_id, signal));
     }
     while set.join_next().await.is_some() {}
+}
+
+/// Cancel an in-flight srun step on the given nodes without tearing down the
+/// allocation job process (batch script / companion hold).
+pub async fn cancel_step_on_nodes(
+    cluster: &Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    step_id: u32,
+    node_names: &[String],
+    signal: i32,
+) {
+    let mut set = tokio::task::JoinSet::new();
+    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
+        set.spawn(cancel_one_step_agent(agent_addr, job_id, step_id, signal));
+    }
+    while set.join_next().await.is_some() {}
+}
+
+/// Deliver one CancelStep RPC, bounded by `CANCEL_RPC_TIMEOUT`.
+async fn cancel_one_step_agent(
+    agent_addr: String,
+    job_id: spur_core::job::JobId,
+    step_id: u32,
+    signal: i32,
+) {
+    use spur_proto::proto::CancelStepRequest;
+
+    let attempt = async {
+        match SlurmAgentClient::connect(agent_addr.clone())
+            .await
+            .map(|c| {
+                c.max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+                    .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE)
+            }) {
+            Ok(mut client) => {
+                if let Err(e) = client
+                    .cancel_step(CancelStepRequest {
+                        job_id,
+                        step_id,
+                        signal,
+                    })
+                    .await
+                {
+                    warn!(
+                        job_id,
+                        step_id,
+                        signal,
+                        agent = %agent_addr,
+                        error = %e,
+                        "CancelStep RPC failed"
+                    );
+                } else {
+                    info!(job_id, step_id, signal, agent = %agent_addr, "sent CancelStep");
+                }
+            }
+            Err(e) => {
+                warn!(
+                    job_id,
+                    step_id,
+                    agent = %agent_addr,
+                    error = %e,
+                    "failed to connect to agent for step cancel"
+                );
+            }
+        }
+    };
+    if tokio::time::timeout(CANCEL_RPC_TIMEOUT, attempt)
+        .await
+        .is_err()
+    {
+        warn!(
+            job_id,
+            step_id,
+            agent = %agent_addr,
+            "CancelStep RPC timed out"
+        );
+    }
 }
 
 /// Resolve `node_names` to agent URLs, logging and skipping any node whose
@@ -2241,6 +2489,7 @@ mod tests {
         /// under a synthetic per-node launch cost rather than estimating it.
         struct MockAgent {
             cancel_calls: Arc<AtomicU32>,
+            release_pmix_calls: Arc<AtomicU32>,
             reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
             launch_delay: Duration,
             /// Records each `LaunchJobRequest.task_fanout` this agent receives,
@@ -2288,6 +2537,30 @@ mod tests {
                 }))
             }
 
+            async fn prepare_pmix(
+                &self,
+                _request: tonic::Request<spur_proto::proto::PreparePmixRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::PreparePmixResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(
+                    spur_proto::proto::PreparePmixResponse {
+                        success: true,
+                        error: String::new(),
+                    },
+                ))
+            }
+
+            async fn release_pmix(
+                &self,
+                _request: tonic::Request<spur_proto::proto::ReleasePmixRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::ReleasePmixResponse>, tonic::Status>
+            {
+                self.release_pmix_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(tonic::Response::new(
+                    spur_proto::proto::ReleasePmixResponse {},
+                ))
+            }
+
             async fn cancel_job(
                 &self,
                 _request: tonic::Request<spur_proto::proto::AgentCancelJobRequest>,
@@ -2325,6 +2598,13 @@ mod tests {
             ) -> Result<tonic::Response<spur_proto::proto::RunCommandResponse>, tonic::Status>
             {
                 Ok(tonic::Response::new(Default::default()))
+            }
+
+            async fn cancel_step(
+                &self,
+                _request: tonic::Request<spur_proto::proto::CancelStepRequest>,
+            ) -> Result<tonic::Response<()>, tonic::Status> {
+                Ok(tonic::Response::new(()))
             }
 
             async fn register_job_allocation(
@@ -2434,7 +2714,7 @@ mod tests {
             reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
             launch_delay: Duration,
         ) -> (std::net::SocketAddr, Arc<AtomicU32>) {
-            let (addr, cancel_calls, _) =
+            let (addr, cancel_calls, _, _) =
                 spawn_mock_agent_capturing_fanout(reject_launch_as, launch_delay, false).await;
             (addr, cancel_calls)
         }
@@ -2451,14 +2731,17 @@ mod tests {
         ) -> (
             std::net::SocketAddr,
             Arc<AtomicU32>,
+            Arc<AtomicU32>,
             Arc<std::sync::Mutex<Vec<bool>>>,
         ) {
             let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
             let addr = incoming.local_addr().unwrap();
             let cancel_calls = Arc::new(AtomicU32::new(0));
+            let release_pmix_calls = Arc::new(AtomicU32::new(0));
             let fanout_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
             let agent = MockAgent {
                 cancel_calls: cancel_calls.clone(),
+                release_pmix_calls: release_pmix_calls.clone(),
                 reject_launch_as,
                 launch_delay,
                 fanout_calls: capture.then(|| fanout_calls.clone()),
@@ -2471,7 +2754,7 @@ mod tests {
                     .serve_with_incoming(incoming)
                     .await;
             });
-            (addr, cancel_calls, fanout_calls)
+            (addr, cancel_calls, release_pmix_calls, fanout_calls)
         }
 
         /// Reserve a localhost port with nothing listening on it, so a
@@ -2610,6 +2893,7 @@ mod tests {
                 wg_pubkey: String::new(),
                 version: String::new(),
                 labels: HashMap::new(),
+                source: NodeSource::NativeHost,
             });
             let n = name.to_string();
             wait_for(
@@ -2988,6 +3272,73 @@ mod tests {
             assert!(job.actual_stderr_path.is_none());
         }
 
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn partial_multinode_pmix_dispatch_releases_on_all_agents() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (good_addr, cancel_calls, release_pmix_good, _) =
+                spawn_mock_agent_capturing_fanout(None, Duration::ZERO, false).await;
+            let (bad_addr, _, release_pmix_bad, _) = spawn_mock_agent_capturing_fanout(
+                Some(spur_proto::proto::LaunchFailureKind::LaunchFailureUnspecified),
+                Duration::ZERO,
+                false,
+            )
+            .await;
+            register_node_at(&cm, "n1", good_addr);
+            register_node_at(&cm, "n2", bad_addr);
+
+            let spec = JobSpec {
+                name: "pmix-partial-dispatch".into(),
+                user: "testuser".into(),
+                num_nodes: 2,
+                num_tasks: 2,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                mpi: Some(spur_core::mpi::MPI_PMIX.into()),
+                ..Default::default()
+            };
+            let job_id = submit_and_wait(&cm, spec.clone());
+            let spec = cm.get_job(job_id).unwrap().spec;
+
+            let nodes = vec!["n1".to_string(), "n2".to_string()];
+            let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
+                .iter()
+                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+
+            let outcome = confirm_dispatch_on_nodes(
+                cm.clone(),
+                job_id,
+                nodes,
+                spec,
+                Vec::new(),
+                per_node_allocs,
+                "n1,n2".into(),
+                1,
+                1,
+                false,
+            )
+            .await;
+
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert_eq!(
+                cancel_calls.load(Ordering::SeqCst),
+                1,
+                "n1 launched the job, so it must be stopped before the job settles"
+            );
+            assert_eq!(
+                release_pmix_good.load(Ordering::SeqCst),
+                1,
+                "PMIx must be released on every agent that participated in prepare, including the one that launched"
+            );
+            assert_eq!(
+                release_pmix_bad.load(Ordering::SeqCst),
+                1,
+                "PMIx must be released on every agent that participated in prepare, including the one whose launch failed"
+            );
+        }
+
         // ── prolog failure: drain the node, hold the job ──
         //
         // All of these confirm dispatch on a still-Pending job (never
@@ -3082,14 +3433,19 @@ mod tests {
             // never reached Running, so this hold is applied directly on the
             // still-Pending job (`hold_job_for_launch_failure`) rather than
             // via the old Running->Failed->Held detour — same end state
-            // (Pending, priority 0, Held, identical description).
+            // (Pending, priority 0, Held) with the dispatch failure detail
+            // surfaced in state_reason_display.
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(job.state, JobState::Pending);
             assert_eq!(job.pending_reason, PendingReason::Held);
             assert_eq!(job.priority, 0);
             assert_eq!(
                 job.state_reason_display(),
-                crate::cluster::LAUNCH_FAILURE_HELD_DESC
+                "dispatch confirmation failed: 0 of 1 nodes confirmed"
+            );
+            assert_eq!(
+                job.state_reason(),
+                "dispatch confirmation failed: 0 of 1 nodes confirmed"
             );
             assert!(
                 !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
@@ -3555,7 +3911,7 @@ mod tests {
         async fn process_assignment_dispatches_a_plain_batch_job_with_task_fanout_false() {
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
-            let (addr, _, fanout_calls) =
+            let (addr, _, _, fanout_calls) =
                 spawn_mock_agent_capturing_fanout(None, Duration::ZERO, true).await;
             register_node_at(&cm, "n1", addr);
 
@@ -3576,7 +3932,7 @@ mod tests {
         async fn process_assignment_dispatches_srun_batch_fallback_with_task_fanout_true() {
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
-            let (addr, _, fanout_calls) =
+            let (addr, _, _, fanout_calls) =
                 spawn_mock_agent_capturing_fanout(None, Duration::ZERO, true).await;
             register_k8s_node_at(&cm, "k1", addr);
 

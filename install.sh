@@ -157,12 +157,20 @@ log "Extracting..."
 tar xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}"
 
 # --- Install ---
+INSTALL_DIR="${INSTALL_DIR%/}"
 mkdir -p "${INSTALL_DIR}"
 # Find the extracted directory (name varies for nightly)
 EXTRACTED=$(find "${TMPDIR}" -maxdepth 1 -type d -name 'spur-*' | head -1)
 [ -n "${EXTRACTED}" ] || err "Could not find extracted directory"
 cp -f "${EXTRACTED}"/bin/* "${INSTALL_DIR}/"
 chmod +x "${INSTALL_DIR}/spur" "${INSTALL_DIR}/spurctld" "${INSTALL_DIR}/spurd"
+
+PLUGIN_DIR="$(dirname "${INSTALL_DIR}")/lib/spur"
+if [ -f "${EXTRACTED}/lib/spur/spur_mpi_pmix.so" ]; then
+    mkdir -p "${PLUGIN_DIR}"
+    cp -f "${EXTRACTED}/lib/spur/spur_mpi_pmix.so" "${PLUGIN_DIR}/"
+    log "Installed MPI plugin to ${PLUGIN_DIR}/spur_mpi_pmix.so"
+fi
 
 # --- Verify ---
 if ! "${INSTALL_DIR}/spur" --version >/dev/null 2>&1; then

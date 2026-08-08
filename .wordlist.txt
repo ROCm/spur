@@ -53,6 +53,7 @@ reconfigure
 requeue
 requeued
 requeues
+rollout
 rlimit
 rlimits
 ROCm
@@ -85,6 +86,7 @@ squashfs
 squeue
 sreport
 srun
+SCP
 sshare
 sstat
 strigger
@@ -130,6 +132,7 @@ env
 ExitCode
 failover
 filesystem
+forks
 gapped
 GiB
 GPUs
@@ -146,6 +149,7 @@ jobid
 JobID
 JOBID
 JobName
+LaunchJob
 kubectl
 kuberouter
 glibc
@@ -165,6 +169,7 @@ Postgres
 pre
 Pre
 Preflight
+PreparePmix
 prepends
 protobuf
 provisioner
@@ -176,6 +181,8 @@ quickstart
 Quickstart
 RBAC
 reinit
+reachability
+ReleasePmix
 repo
 RESources
 RHEL
@@ -227,7 +234,9 @@ OpenPMIx
 loopback
 modex
 routable
+unlaunched
 unsets
+Unimplemented
 memlock
 Prometheus
 Grafana
@@ -236,4 +245,5 @@ cAdvisor
 CoreDNS
 etcd
 apiserver
+artifactory
 TLS

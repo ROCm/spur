@@ -531,6 +531,14 @@ mod tests {
     // ── T50.50–52: Heterogeneous job fields ────────────────────
 
     #[test]
+    fn t50_49b_mpi_list_lines() {
+        let lines = spur_core::mpi::mpi_list_lines("/usr/lib/spur");
+        assert!(lines.iter().any(|l| l == "none"));
+        assert!(lines.iter().any(|l| l == "pmix"));
+        assert!(lines.iter().any(|l| l.contains("plugin_dir=/usr/lib/spur")));
+    }
+
+    #[test]
     fn t50_50_het_job_fields_default_none() {
         let job = make_job("het-test");
         assert!(job.het_job_id.is_none());

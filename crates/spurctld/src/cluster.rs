@@ -35,6 +35,7 @@ use crate::accounting::{AccountingNotifier, JobStartRecord};
 use crate::association_cache::{qos_permitted, AccountMembership, AssociationCache};
 use crate::fairshare_cache::FairshareCache;
 use crate::limits_cache::QosCache;
+use crate::pmix_dispatch;
 use crate::raft::{ClientResponse, JobFinalized, SpurRaft, StateMachineApply};
 use crate::sched_stats::SchedStatsCollector;
 
@@ -462,8 +463,13 @@ impl ClusterManager {
         self.validate_partition_node_bounds(&spec)?;
 
         let mpi = spec.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
-        spur_core::mpi::validate_single_node_pmix(mpi, spec.num_nodes)
-            .map_err(SubmitError::invalid)?;
+        pmix_dispatch::validate_multi_node_pmix_nodelist(
+            mpi,
+            spec.num_nodes,
+            spec.nodelist.as_deref(),
+            |name| self.nodes.read().get(name).map(|node| node.source.clone()),
+        )
+        .map_err(SubmitError::invalid)?;
 
         // Checked after defaults are applied so we measure the final spec.
         // Array expansion only adds bounded integer metadata per task, so a
@@ -1539,6 +1545,14 @@ impl ClusterManager {
     /// job (e.g. a future admin-initiated NodeFail).
     #[allow(dead_code)]
     pub fn evict_job(&self, job_id: JobId) -> anyhow::Result<()> {
+        self.evict_job_with_detail(job_id, None)
+    }
+
+    pub fn evict_job_with_detail(
+        &self,
+        job_id: JobId,
+        detail: Option<String>,
+    ) -> anyhow::Result<()> {
         {
             let jobs = self.jobs.read();
             let job = jobs
@@ -1548,7 +1562,7 @@ impl ClusterManager {
                 return Ok(());
             }
         }
-        let resp = self.propose(WalOperation::JobEvict { job_id })?;
+        let resp = self.propose(WalOperation::JobEvict { job_id, detail })?;
         self.run_all_finalized_side_effects(&resp);
         Ok(())
     }
@@ -1598,8 +1612,14 @@ impl ClusterManager {
                             port,
                             wg_pubkey,
                             version,
+                            source: source.clone(),
                         })?;
                         info!(node = %name, "node comm address or metadata updated");
+                    }
+                    if existing.source != source {
+                        if let Some(node) = self.nodes.write().get_mut(&name) {
+                            node.source = source;
+                        }
                     }
                 }
             }
@@ -1612,6 +1632,7 @@ impl ClusterManager {
                     port,
                     wg_pubkey,
                     version,
+                    source: source.clone(),
                 })?;
                 self.sync_node_labels(&name, labels)?;
                 if let Some(node) = self.nodes.write().get_mut(&name) {
@@ -1629,6 +1650,7 @@ impl ClusterManager {
                     wg_pubkey,
                     version,
                     labels,
+                    source: source.clone(),
                 })?;
                 if let Some(node) = self.nodes.write().get_mut(&name) {
                     node.source = source;
@@ -1785,7 +1807,11 @@ impl ClusterManager {
     /// launch-failure description so it reads the same as the pre-fix path
     /// that reached this via a Running→Failed→Held detour: the job here never
     /// actually left Pending, so that detour isn't available.
-    pub(crate) fn hold_job_for_launch_failure(&self, job_id: JobId) -> anyhow::Result<()> {
+    pub(crate) fn hold_job_for_launch_failure(
+        &self,
+        job_id: JobId,
+        reason_desc: Option<&str>,
+    ) -> anyhow::Result<()> {
         let old_priority = {
             let jobs = self.jobs.read();
             let job = jobs
@@ -1806,7 +1832,7 @@ impl ClusterManager {
             old_priority,
             new_priority: 0,
             pending_reason: Some(PendingReason::Held),
-            pending_reason_desc: Some(LAUNCH_FAILURE_HELD_DESC.to_string()),
+            pending_reason_desc: Some(reason_desc.unwrap_or(LAUNCH_FAILURE_HELD_DESC).to_string()),
             reset_requeue_count: false,
             clear_reservation: false,
         })?;
@@ -3858,10 +3884,20 @@ impl ClusterManager {
         job.allocated_resources = None;
         job.per_node_alloc.clear();
         job.time_limit_signaled_at = None;
-        job.set_pending_reason(PendingReason::None);
+        job.pending_reason = PendingReason::None;
+        job.pending_reason_desc = None;
         // Stale after requeue (points at nodes the job left); next dispatch resets it.
         job.actual_stdout_path = None;
         job.actual_stderr_path = None;
+    }
+
+    pub fn set_job_launch_failure_detail(
+        &self,
+        job_id: JobId,
+        detail: String,
+    ) -> anyhow::Result<()> {
+        self.propose(WalOperation::JobLaunchFailureDetail { job_id, detail })?;
+        Ok(())
     }
 
     /// Requeue after a dispatch failure or Timeout/NodeFail: counts against
@@ -4155,7 +4191,10 @@ impl ClusterManager {
                     }
                 }
             }
-            WalOperation::JobEvict { job_id } => {
+            WalOperation::JobEvict { job_id, detail } => {
+                if let Some(job) = jobs.get_mut(job_id) {
+                    job.launch_failure_detail = detail.clone();
+                }
                 if let Some(fin) = Self::evict_job_locked(
                     *job_id,
                     &mut jobs,
@@ -4164,6 +4203,11 @@ impl ClusterManager {
                     PendingReason::JobLaunchFailure,
                 ) {
                     response.jobs_finalized.push(fin);
+                }
+            }
+            WalOperation::JobLaunchFailureDetail { job_id, detail } => {
+                if let Some(job) = jobs.get_mut(job_id) {
+                    job.launch_failure_detail = Some(detail.clone());
                 }
             }
             WalOperation::JobStart {
@@ -4182,6 +4226,7 @@ impl ClusterManager {
                     job.set_pending_reason(PendingReason::None);
                     job.srun_step_dispatch = *srun_step_dispatch;
                     job.run_attempt = *run_attempt;
+                    job.launch_failure_detail = None;
                 }
                 let node_count = node_names.len().max(1) as u32;
                 for name in node_names {
@@ -4496,6 +4541,7 @@ impl ClusterManager {
                 wg_pubkey,
                 version,
                 labels,
+                source,
             } => {
                 let mut node = Node::new(name.clone(), resources.clone());
                 node.hostname = if hostname.is_empty() {
@@ -4515,6 +4561,7 @@ impl ClusterManager {
                 if !version.is_empty() {
                     node.version = Some(version.clone());
                 }
+                node.source = spur_core::node::resolve_wal_node_source(source, version, labels);
                 node.last_heartbeat = Some(Utc::now());
                 node.state = node
                     .state
@@ -4551,6 +4598,7 @@ impl ClusterManager {
                 port,
                 wg_pubkey,
                 version,
+                source,
             } => {
                 if let Some(node) = nodes.get_mut(name) {
                     node.total_resources = resources.clone();
@@ -4567,6 +4615,8 @@ impl ClusterManager {
                     if !version.is_empty() {
                         node.version = Some(version.clone());
                     }
+                    node.source =
+                        spur_core::node::resolve_wal_node_source(source, version, &node.labels);
                     node.last_heartbeat = Some(Utc::now());
                 }
             }
@@ -6941,6 +6991,7 @@ mod tests {
             wg_pubkey: String::new(),
             version: "1.0".into(),
             labels: HashMap::new(),
+            source: NodeSource::default(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -7159,8 +7210,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn submit_pmix_rejects_multi_node() {
-        // I5: -N4 -n4 --mpi=pmix stays multi-node and is rejected.
+    async fn submit_pmix_accepts_multi_node_on_native_hosts() {
+        // Multi-node --mpi=pmix is allowed on native hosts (K8s agents reject at dispatch).
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
@@ -7168,7 +7219,7 @@ mod tests {
         spec.num_nodes = 4;
         spec.num_tasks = 4;
         spec.mpi = Some(spur_core::mpi::MPI_PMIX.into());
-        assert!(cm.submit_job(spec).is_err());
+        assert!(cm.submit_job(spec).is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -12987,7 +13038,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
         let id = submit_and_wait(&cm, basic_spec("prolog-hold"));
 
-        cm.hold_job_for_launch_failure(id).unwrap();
+        cm.hold_job_for_launch_failure(id, None).unwrap();
         wait_for("hold applied", || {
             cm.get_job(id).is_some_and(|j| j.priority == 0)
         });
@@ -13029,7 +13080,7 @@ mod tests {
         .unwrap();
         settle(&cm, id, JobState::Running);
 
-        assert!(cm.hold_job_for_launch_failure(id).is_err());
+        assert!(cm.hold_job_for_launch_failure(id, None).is_err());
     }
 
     // backoff_pending_job_after_dispatch_failure is confirm_dispatch_on_nodes's
@@ -13073,6 +13124,63 @@ mod tests {
         assert_eq!(job.state, JobState::Pending);
         assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
         assert!(job.spec.begin_time.is_some_and(|t| t > Utc::now()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_dispatch_backoff_preserves_launch_failure_detail() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("backoff-detail"));
+        cm.set_job_launch_failure_detail(id, "PMIx prepare failed: n2: timeout".into())
+            .unwrap();
+
+        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        wait_for("backoff applied", || {
+            cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+        assert_eq!(
+            job.launch_failure_detail.as_deref(),
+            Some("PMIx prepare failed: n2: timeout")
+        );
+        assert_eq!(
+            job.state_reason(),
+            "JobLaunchFailure (PMIx prepare failed: n2: timeout)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn second_dispatch_backoff_preserves_launch_failure_detail() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("backoff-detail-twice"));
+
+        cm.set_job_launch_failure_detail(id, "PMIx prepare failed: n1: timeout".into())
+            .unwrap();
+        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        wait_for("first backoff applied", || {
+            cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
+        });
+
+        cm.set_job_launch_failure_detail(id, "PMIx prepare failed: n2: timeout".into())
+            .unwrap();
+        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        wait_for("second backoff applied", || {
+            cm.get_job(id).is_some_and(|j| j.requeue_count == 2)
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+        assert_eq!(
+            job.launch_failure_detail.as_deref(),
+            Some("PMIx prepare failed: n2: timeout")
+        );
+        assert_eq!(
+            job.state_reason(),
+            "JobLaunchFailure (PMIx prepare failed: n2: timeout)"
+        );
     }
 
     // The apply-level checks mirror the public method's, guarding against a
@@ -15186,6 +15294,7 @@ mod tests {
             wg_pubkey: String::new(),
             version: String::new(),
             labels: HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
         });
 
         assert_eq!(
@@ -15224,6 +15333,7 @@ mod tests {
             wg_pubkey: String::new(),
             version: String::new(),
             labels: HashMap::new(),
+            source: NodeSource::default(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -15270,6 +15380,7 @@ mod tests {
             wg_pubkey: String::new(),
             version: String::new(),
             labels: HashMap::from([("gpu".into(), "mi300x".into())]),
+            source: NodeSource::default(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -15316,6 +15427,7 @@ mod tests {
             wg_pubkey: String::new(),
             version: String::new(),
             labels: HashMap::from([("gpu".into(), "mi250".into())]),
+            source: NodeSource::default(),
         });
 
         let node = cm.get_node("cpu-node").unwrap();

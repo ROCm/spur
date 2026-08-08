@@ -66,6 +66,7 @@ jobs:
           build-args: |
             SPUR_GIT_SHA=${{ steps.meta.outputs.short_sha }}
             SPUR_GIT_DIRTY=false
+            BUILD_MPI_PLUGIN=1
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -80,6 +81,11 @@ jobs:
           for bin in spur spurctld spurd; do
             cp "dist/bin/${bin}" "${DIST}/bin/"
           done
+
+          if [ -f "dist/lib/spur/spur_mpi_pmix.so" ]; then
+            mkdir -p "${DIST}/lib/spur"
+            cp "dist/lib/spur/spur_mpi_pmix.so" "${DIST}/lib/spur/"
+          fi
 
           cd "${DIST}/bin"
           for cmd in sbatch srun squeue scancel sinfo sacct scontrol; do

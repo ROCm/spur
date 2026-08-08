@@ -1032,6 +1032,12 @@ pub struct MpiConfig {
     pub pmix_tmpdir: String,
     #[serde(default = "default_pmix_min_version")]
     pub pmix_min_version: String,
+    #[serde(default = "default_modex_connect_timeout_secs")]
+    pub modex_connect_timeout_secs: u32,
+    #[serde(default = "default_modex_fence_timeout_secs")]
+    pub modex_fence_timeout_secs: u32,
+    #[serde(default = "default_modex_verify_timeout_secs")]
+    pub modex_verify_timeout_secs: u32,
 }
 
 fn default_mpi_plugin_dir() -> String {
@@ -1046,6 +1052,18 @@ fn default_pmix_min_version() -> String {
     "4.1.0".into()
 }
 
+fn default_modex_connect_timeout_secs() -> u32 {
+    5
+}
+
+fn default_modex_fence_timeout_secs() -> u32 {
+    120
+}
+
+fn default_modex_verify_timeout_secs() -> u32 {
+    30
+}
+
 impl Default for MpiConfig {
     fn default() -> Self {
         Self {
@@ -1053,6 +1071,9 @@ impl Default for MpiConfig {
             pmix_plugin: String::new(),
             pmix_tmpdir: default_pmix_tmpdir(),
             pmix_min_version: default_pmix_min_version(),
+            modex_connect_timeout_secs: default_modex_connect_timeout_secs(),
+            modex_fence_timeout_secs: default_modex_fence_timeout_secs(),
+            modex_verify_timeout_secs: default_modex_verify_timeout_secs(),
         }
     }
 }
