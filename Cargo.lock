@@ -3569,6 +3569,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tracing-subscriber",
  "whoami",
 ]
 
@@ -3694,6 +3695,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tar",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
