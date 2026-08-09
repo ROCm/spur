@@ -73,6 +73,7 @@ impl SpurEnv {
         step_num_tasks: u32,
         node_id: u32,
         num_nodes: u32,
+        job_num_nodes: u32,
     ) {
         senv.set_with_slurm_twin("SPUR_STEP_ID", step_id);
         senv.set_with_slurm_twin("SPUR_STEPID", step_id);
@@ -81,7 +82,8 @@ impl SpurEnv {
         senv.set_with_slurm_twin("SPUR_NPROCS", step_num_tasks);
         senv.set_with_slurm_twin("SPUR_NODEID", node_id);
         senv.set_with_slurm_twin("SPUR_NNODES", num_nodes);
-        senv.set_with_slurm_twin("SPUR_JOB_NUM_NODES", num_nodes);
+        senv.set_with_slurm_twin("SPUR_STEP_NUM_NODES", num_nodes);
+        senv.set_with_slurm_twin("SPUR_JOB_NUM_NODES", job_num_nodes);
         senv.set_with_slurm_twin("SPUR_JOB_ID", job_id);
         senv.set_with_slurm_twin("SPUR_JOBID", job_id);
     }
@@ -219,7 +221,7 @@ mod tests {
     #[test]
     fn apply_step_scope_sets_step_id_twins() {
         let mut env = SpurEnv::new();
-        SpurEnv::apply_step_scope(&mut env, 42, 3, 8, 1, 2);
+        SpurEnv::apply_step_scope(&mut env, 42, 3, 8, 1, 2, 4);
         let map = env.into_map();
         assert_eq!(map["SPUR_STEP_ID"], "3");
         assert_eq!(map["SLURM_STEP_ID"], "3");
@@ -227,5 +229,7 @@ mod tests {
         assert_eq!(map["SLURM_NTASKS"], "8");
         assert_eq!(map["SPUR_NODEID"], "1");
         assert_eq!(map["SPUR_NNODES"], "2");
+        assert_eq!(map["SPUR_STEP_NUM_NODES"], "2");
+        assert_eq!(map["SPUR_JOB_NUM_NODES"], "4");
     }
 }

@@ -7,7 +7,7 @@ import re
 import shlex
 import time
 
-from cluster import job_state, parse_job_id, wait_job, wait_job_state
+from cluster import parse_job_id, wait_job, wait_job_state
 
 
 class TestStandaloneSrun:
@@ -34,6 +34,26 @@ class TestStandaloneSrun:
 
         ranks = {ln.split("rank=")[1].strip() for ln in lines}
         assert ranks == {"0", "1"}, f"expected ranks 0 and 1, got {ranks}:\n{out}"
+
+    def test_srun_candidate_nodelist_is_not_reapplied_to_the_step(
+        self, multi_node_cluster
+    ):
+        cluster = multi_node_cluster
+        candidates = ",".join(cluster.node_names)
+        code, out = cluster.srun_with_exit(
+            [
+                "-n",
+                "1",
+                "-w",
+                candidates,
+                "bash",
+                "-c",
+                'echo "candidate_host=$(hostname)"',
+            ]
+        )
+        assert code == 0, f"srun failed (exit {code}):\n{out}"
+        lines = [ln for ln in out.splitlines() if ln.startswith("candidate_host=")]
+        assert len(lines) == 1, f"expected one task line, got {len(lines)}:\n{out}"
 
     def test_srun_holds_allocation_until_step_finishes(self, multi_node_cluster):
         cluster = multi_node_cluster
@@ -104,11 +124,127 @@ class TestSrunInBatch:
             "#!/bin/bash\n"
             "srun -n 2 bash -c 'echo host=$(hostname) rank=${SPUR_PROCID}'\n",
         )
-        sb = cluster.sbatch(["-J", "srun-step", "-N", "2", "-n", "2", "-o", out_path, script])
+        sb = cluster.sbatch(
+            ["-J", "srun-step", "-N", "2", "-n", "2", "-o", out_path, script]
+        )
         job_id = parse_job_id(sb)
         assert job_id is not None
 
         wait_job(cluster, job_id, timeout=90)
         content = cluster.read_output_on_any_node(out_path)
         lines = sorted({ln for ln in content.splitlines() if ln.startswith("host=")})
-        assert len(lines) == 2, f"expected 2 step task lines in batch output:\n{content}"
+        assert len(lines) == 2, (
+            f"expected 2 step task lines in batch output:\n{content}"
+        )
+
+    def test_explicit_node_count_keeps_inherited_tasks_on_one_node(
+        self, multi_node_cluster
+    ):
+        cluster = multi_node_cluster
+        out_path = f"{cluster.remote_dir}/srun-step-one-node.out"
+        script = cluster.write_file(
+            "srun-step-one-node.sh",
+            "#!/bin/bash\n"
+            "srun -N 1 bash -c "
+            "'echo subset_host=$(hostname) rank=${SPUR_PROCID}'\n",
+        )
+        sb = cluster.sbatch(
+            ["-J", "srun-step-one-node", "-N", "2", "-n", "2", "-o", out_path, script]
+        )
+        job_id = parse_job_id(sb)
+        assert job_id is not None
+
+        wait_job(cluster, job_id, timeout=90)
+        content = cluster.read_output_on_any_node(out_path)
+        lines = [ln for ln in content.splitlines() if ln.startswith("subset_host=")]
+        assert len(lines) == 2, f"expected both inherited tasks to run:\n{content}"
+
+        hosts = {ln.split("subset_host=")[1].split()[0] for ln in lines}
+        assert len(hosts) == 1, (
+            f"expected both tasks on one node, got {hosts}:\n{content}"
+        )
+
+        ranks = {ln.split("rank=")[1].strip() for ln in lines}
+        assert ranks == {"0", "1"}, f"expected ranks 0 and 1, got {ranks}:\n{content}"
+
+    def test_step_nodelist_targets_requested_allocated_node(self, multi_node_cluster):
+        cluster = multi_node_cluster
+        target = cluster.node_names[1]
+        expected_hostname = cluster.nodes[1].exec("hostname").strip()
+        out_path = f"{cluster.remote_dir}/srun-step-nodelist.out"
+        script = cluster.write_file(
+            "srun-step-nodelist.sh",
+            "#!/bin/bash\n"
+            f"srun -n 1 -w {shlex.quote(target)} bash -c "
+            "'echo targeted_host=$(hostname)'\n",
+        )
+        sb = cluster.sbatch(
+            ["-J", "srun-step-nodelist", "-N", "2", "-n", "2", "-o", out_path, script]
+        )
+        job_id = parse_job_id(sb)
+        assert job_id is not None
+
+        wait_job(cluster, job_id, timeout=90)
+        content = cluster.read_output_on_any_node(out_path)
+        lines = [ln for ln in content.splitlines() if ln.startswith("targeted_host=")]
+        assert lines == [f"targeted_host={expected_hostname}"], (
+            f"expected step to run only on {target}, got:\n{content}"
+        )
+
+    def test_step_reduces_nodes_to_inherited_task_count_with_warning(
+        self, multi_node_cluster
+    ):
+        cluster = multi_node_cluster
+        out_path = f"{cluster.remote_dir}/srun-step-reduced-nodes.out"
+        script = cluster.write_file(
+            "srun-step-reduced-nodes.sh",
+            "#!/bin/bash\n"
+            "srun -N 3 bash -c "
+            "'echo reduced_host=$(hostname) rank=${SPUR_PROCID}'\n",
+        )
+        sb = cluster.sbatch(
+            ["-J", "srun-step-reduced", "-N", "2", "-n", "2", "-o", out_path, script]
+        )
+        job_id = parse_job_id(sb)
+        assert job_id is not None
+
+        wait_job(cluster, job_id, timeout=90)
+        content = cluster.read_output_on_any_node(out_path)
+        assert (
+            "srun: warning: can't run 2 processes on 3 nodes, setting nnodes to 2"
+            in content
+        )
+
+        lines = [ln for ln in content.splitlines() if ln.startswith("reduced_host=")]
+        assert len(lines) == 2, f"expected both inherited tasks to run:\n{content}"
+        hosts = {ln.split("reduced_host=")[1].split()[0] for ln in lines}
+        assert len(hosts) == 2, f"expected one task on each allocated node:\n{content}"
+
+        ranks = {ln.split("rank=")[1].strip() for ln in lines}
+        assert ranks == {"0", "1"}, f"expected ranks 0 and 1, got {ranks}:\n{content}"
+
+    def test_step_rejects_more_nodes_than_allocation(self, multi_node_cluster):
+        cluster = multi_node_cluster
+        out_path = f"{cluster.remote_dir}/srun-step-too-many-nodes.out"
+        script = cluster.write_file(
+            "srun-step-too-many-nodes.sh",
+            "#!/bin/bash\n"
+            "srun -N 3 -n 3 bash -c 'echo impossible_step_ran=$(hostname)'\n"
+            "echo impossible_step_status=$?\n",
+        )
+        sb = cluster.sbatch(
+            ["-J", "srun-step-too-many", "-N", "2", "-n", "2", "-o", out_path, script]
+        )
+        job_id = parse_job_id(sb)
+        assert job_id is not None
+
+        wait_job(cluster, job_id, timeout=90)
+        content = cluster.read_output_on_any_node(out_path)
+        status = re.search(r"^impossible_step_status=(\d+)$", content, re.MULTILINE)
+        assert status is not None, f"missing nested srun exit status:\n{content}"
+        assert int(status.group(1)) != 0, (
+            f"impossible step unexpectedly succeeded:\n{content}"
+        )
+        assert "impossible_step_ran=" not in content, (
+            f"command ran despite requesting more nodes than allocated:\n{content}"
+        )

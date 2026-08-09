@@ -947,6 +947,7 @@ message RunCommandRequest {
   bool label = 11;             // Prefix output with [rank] inside wrapper
   PmixLaunchPlan pmix_plan = 12;
   string mpi = 13;             // Resolved step MPI type: "none" or "pmix"
+  string step_nodelist = 14;   // Nodes participating in this step
 }
 
 // Register a srun-only allocation on an agent without starting a batch process.
@@ -1269,13 +1270,15 @@ message CreateJobStepRequest {
   bool overlap = 5;           // Share resources with existing step (--overlap)
   bool pty = 6;               // Allocate a PTY for the step
   WindowSize winsize = 7;     // Initial terminal dimensions
-  string node = 8;            // Target node (-w); empty = first allocated node
+  string node = 8;            // Target node list (-w); empty = controller-selected nodes
   string user = 9;            // Requesting user; must own the job (empty/root bypasses)
+  optional uint32 num_nodes = 10; // Requested step node count (-N); unset = derive from tasks/allocation
 }
 
 message CreateJobStepResponse {
   uint32 step_id = 1;
   string node_addr = 2;        // Address of the selected node (-w target, else first allocated); host:port for agent
+  repeated string warnings = 3;
 }
 
 // ============================================================
