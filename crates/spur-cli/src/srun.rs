@@ -522,8 +522,7 @@ struct StepLayout {
 }
 
 fn resolve_step_layout(matches: &ArgMatches, args: &SrunArgs) -> StepLayout {
-    let node_count_requested = was_cli_set(matches, "nodes")
-        || crate::env_defaults::env_first(NODE_COUNT_ENV_NAMES).is_some();
+    let node_count_requested = was_cli_set(matches, "nodes");
     StepLayout {
         num_tasks: crate::sbatch::effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
         num_nodes: node_count_requested.then_some(args.nodes),
