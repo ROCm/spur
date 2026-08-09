@@ -350,6 +350,8 @@ def mpi_multi_node_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     yield c
     c.teardown()
 
+
+@pytest.fixture
 def metrics_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     """
     Per-test fixture with the metrics server reachable off-loopback.

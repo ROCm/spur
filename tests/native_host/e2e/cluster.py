@@ -267,8 +267,8 @@ class SpurCluster:
         self.log_dir = f"{remote_dir}/log"
         self.controller_addr = f"http://{nodes[0].host}:{CONTROLLER_PORT}"
         self.config_overrides: dict = {}
-        # Per-node config, merged over config_overrides for that node only.
-        # Raft needs it: node_id differs per controller.
+        # Merged over config_overrides for one node alone; Raft needs it,
+        # since node_id differs per controller.
         self.node_config_overrides: dict[int, dict] = {}
         self.agent_as_root: bool = False
         self.agent_labels: dict[int, dict[str, str]] = {}

@@ -115,6 +115,30 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+  e2e-fixtures:
+    name: E2E fixture resolution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install E2E test dependencies
+        run: pip install -r tests/requirements.txt
+
+      # --setup-plan resolves every fixture without running one, so a missing or
+      # misnamed fixture fails here rather than an hour into E2E. The env vars
+      # only satisfy pytest_ignore_collect; nothing connects anywhere.
+      - name: Check every E2E fixture resolves
+        run: pytest --setup-plan -q
+        working-directory: tests
+        env:
+          SPUR_TEST_NODES: 192.0.2.1
+          SPUR_TEST_SSH_USER: nobody
+          KUBECONFIG: /dev/null
+
   test-db:
     name: DB tests (accounting)
     runs-on: ubuntu-latest

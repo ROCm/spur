@@ -18,9 +18,23 @@ from cluster import job_node_indices, parse_job_id, wait_job, wait_job_state
 
 CGROUP_ROOT = "/sys/fs/cgroup/spur"
 
-# `tail` buffers its whole input before writing, so this allocates ~512 MiB of
-# anonymous memory using only coreutils.
-MEMORY_HOG = "#!/bin/bash\nhead -c 512M /dev/zero | tail -c 512M > /dev/null\n"
+HOG_BYTES = 128 * 1024 * 1024
+
+# Grows a shell string past HOG_BYTES. Bash keeps the allocation independent of
+# how any external tool buffers, and reporting the cgroup + memory.max it ran
+# under is the only trace left once the job exits and its cgroup is gone.
+MEMORY_HOG = f"""#!/bin/bash
+report() {{
+  cg=$(awk -F: '/^0::/ {{print $3}}' /proc/self/cgroup)
+  echo "$1 cgroup=$cg memory.max=$(cat "/sys/fs/cgroup$cg/memory.max" 2>/dev/null || echo unreadable)"
+}}
+report pre-move
+sleep 1
+report post-move
+s=x
+while [ ${{#s}} -lt {HOG_BYTES} ]; do s=$s$s; done
+echo "allocated=${{#s}}"
+"""
 
 
 def _memory_controller_preflight(cluster):
@@ -79,6 +93,32 @@ def swap_constrained_cluster(unstarted_cluster):
     return _start_rootful(
         unstarted_cluster,
         config_overrides={"cgroup": {"constrain_swap_space": True}},
+    )
+
+
+def _enforcement_diagnosis(cluster, job_id: int, out_path: str) -> str:
+    """Why a job over its --mem might have survived.
+
+    Pins down which link broke: the job reports the cgroup it ran under (was it
+    moved out of the session scope?) and that cgroup's memory.max (did the limit
+    take?), alongside every spurd warning about applying one.
+    """
+    node = cluster.nodes[job_node_indices(cluster, job_id)[0]]
+    swap = node.exec_allow_fail("grep SwapTotal /proc/meminfo").strip()
+    warnings = [
+        line
+        for line in cluster.spurd_log_all_nodes().splitlines()
+        if any(
+            m in line
+            for m in ("cgroup", "isolation", "delegate", "memory.max", "memory.swap")
+        )
+        and ("WARN" in line or "ERROR" in line or "failed" in line)
+    ]
+    output = cluster.read_output_on_any_node(out_path).strip()
+    return (
+        f"job output: {output or '(empty)'}\n"
+        f"{swap or 'SwapTotal: unknown'}\n"
+        f"spurd cgroup warnings: {warnings or 'none'}"
     )
 
 
@@ -222,41 +262,58 @@ class TestOomDetection:
         -- users triage on that state."""
         cluster = swap_constrained_cluster
         script = cluster.write_file("oom.sh", MEMORY_HOG)
-        job_id = parse_job_id(cluster.sbatch(["-J", "oom", "--mem", "64M", script]))
+        out_path = f"{cluster.remote_dir}/oom.out"
+        job_id = parse_job_id(
+            cluster.sbatch(["-J", "oom", "--mem", "64M", "-o", out_path, script])
+        )
         assert job_id is not None
 
         state = wait_job(cluster, job_id, timeout=180)
         assert state == "OOM", (
             f"expected OOM, got {state}:\n"
-            f"{cluster.scontrol('show', 'job', str(job_id))}"
+            f"{cluster.scontrol('show', 'job', str(job_id))}\n"
+            f"{_enforcement_diagnosis(cluster, job_id, out_path)}"
         )
 
     def test_oom_reason_is_surfaced_in_scontrol(self, swap_constrained_cluster):
         cluster = swap_constrained_cluster
         script = cluster.write_file("oom-reason.sh", MEMORY_HOG)
+        out_path = f"{cluster.remote_dir}/oom-reason.out"
         job_id = parse_job_id(
-            cluster.sbatch(["-J", "oom-reason", "--mem", "64M", script])
+            cluster.sbatch(["-J", "oom-reason", "--mem", "64M", "-o", out_path, script])
         )
         assert job_id is not None
         wait_job(cluster, job_id, timeout=180)
 
         detail = cluster.scontrol("show", "job", str(job_id))
         assert "OUT_OF_MEMORY" in detail or "OutOfMemory" in detail, (
-            f"scontrol must explain the OOM:\n{detail}"
+            f"scontrol must explain the OOM:\n{detail}\n"
+            f"{_enforcement_diagnosis(cluster, job_id, out_path)}"
         )
 
     def test_the_same_job_completes_under_a_generous_limit(
         self, swap_constrained_cluster
     ):
         """Guards the OOM tests against a false positive: the workload itself
-        is fine, it is the limit that kills it."""
+        is fine, it is the limit that kills it. Asserting the byte count matters
+        -- a hog that quietly allocated nothing would also complete here."""
         cluster = swap_constrained_cluster
         script = cluster.write_file("under-limit.sh", MEMORY_HOG)
+        out_path = f"{cluster.remote_dir}/under-limit.out"
         job_id = parse_job_id(
-            cluster.sbatch(["-J", "under-limit", "--mem", "2048M", script])
+            cluster.sbatch(
+                ["-J", "under-limit", "--mem", "2048M", "-o", out_path, script]
+            )
         )
         assert job_id is not None
         assert wait_job(cluster, job_id, timeout=180) in ("CD", "GONE")
+
+        output = cluster.read_output_on_any_node(out_path)
+        match = re.search(r"allocated=(\d+)", output)
+        assert match, f"hog never reported an allocation:\n{output}"
+        assert int(match.group(1)) >= HOG_BYTES, (
+            f"hog allocated {match.group(1)} bytes, expected at least {HOG_BYTES}"
+        )
 
 
 class TestCpuEnvironment:

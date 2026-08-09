@@ -121,10 +121,8 @@ class TestLaunchFailureBackoff:
             cluster.cli_allow_fail(["scancel", str(job_id)])
 
 
-# A late completion report finalizing a *newer* run attempt would need a job to
-# run twice. `scontrol requeue` only cancels today (see TestRequeue in
-# test_job_control.py), so there is no second attempt to race against and the
-# scenario cannot be built from the outside yet.
+# A late report finalizing a *newer* run attempt needs a job to run twice, which
+# no CLI path produces today, so that race cannot be built from the outside.
 
 
 class TestGpuReleaseOnLaunchFailure:

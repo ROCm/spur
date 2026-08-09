@@ -29,6 +29,26 @@ def assert_all_pods_ready(namespace: str, count: int) -> None:
     )
 
 
+def wait_for_spur_job_id(cluster, name: str) -> int:
+    """Block until the operator records a spurJobId, then return it.
+
+    Reports the SpurJob's own status on timeout: a rejected submit leaves the
+    reason there, which a bare "no job ID" message would hide.
+    """
+
+    def has_id() -> bool:
+        return (cluster.get_spurjob(name).get("status") or {}).get("spurJobId") is not None
+
+    try:
+        assert_eventually(
+            DEFAULT_TIMEOUT, WAIT_INTERVAL, f"{name} never got a spurJobId", has_id
+        )
+    except AssertionError as exc:
+        status = cluster.get_spurjob(name).get("status") or {}
+        raise AssertionError(f"{exc}; status={status}") from exc
+    return (cluster.get_spurjob(name).get("status") or {})["spurJobId"]
+
+
 def find_leader_pod(namespace: str) -> str | None:
     for i in range(3):
         pod_name = f"spurctld-{i}"
@@ -111,16 +131,7 @@ class TestRaftHA:
             ["sh", "-c", "echo FAILOVER_STATE_OK && sleep 5"],
         )
         ha_cluster.create_spurjob(job)
-
-        def job_has_id() -> bool:
-            job_obj = ha_cluster.get_spurjob("it-failover-state")
-            return (job_obj.get("status") or {}).get("spurJobId") is not None
-
-        assert_eventually(
-            DEFAULT_TIMEOUT, WAIT_INTERVAL, "no job ID assigned before failover", job_has_id
-        )
-        job_before = ha_cluster.get_spurjob("it-failover-state")
-        job_id_before = (job_before.get("status") or {}).get("spurJobId")
+        job_id_before = wait_for_spur_job_id(ha_cluster, "it-failover-state")
 
         leader = find_leader_pod(ns) or "spurctld-0"
         delete_pod(ns, leader)
@@ -145,17 +156,7 @@ class TestRaftHA:
             ["sh", "-c", "echo PRE_FAILOVER && sleep 5"],
         )
         ha_cluster.create_spurjob(pre_job)
-
-        def pre_has_id() -> bool:
-            job_obj = ha_cluster.get_spurjob("it-pre-failover")
-            return (job_obj.get("status") or {}).get("spurJobId") is not None
-
-        assert_eventually(
-            DEFAULT_TIMEOUT, WAIT_INTERVAL, "pre-failover job not accepted", pre_has_id
-        )
-        job_id_before = (ha_cluster.get_spurjob("it-pre-failover").get("status") or {}).get(
-            "spurJobId"
-        )
+        job_id_before = wait_for_spur_job_id(ha_cluster, "it-pre-failover")
 
         leader = find_leader_pod(ns) or "spurctld-0"
         delete_pod(ns, leader)
@@ -168,17 +169,7 @@ class TestRaftHA:
             ["sh", "-c", "echo POST_FAILOVER && sleep 2"],
         )
         ha_cluster.create_spurjob(post_job)
-
-        def post_has_id() -> bool:
-            job_obj = ha_cluster.get_spurjob("it-post-failover")
-            return (job_obj.get("status") or {}).get("spurJobId") is not None
-
-        assert_eventually(
-            DEFAULT_TIMEOUT, WAIT_INTERVAL, "new job not accepted after failover", post_has_id
-        )
-        post_job_id = (ha_cluster.get_spurjob("it-post-failover").get("status") or {}).get(
-            "spurJobId"
-        )
+        post_job_id = wait_for_spur_job_id(ha_cluster, "it-post-failover")
         assert post_job_id > job_id_before, (
             f"job ID sequence broken: {post_job_id} <= {job_id_before}"
         )
