@@ -158,10 +158,10 @@ pub async fn cancel_job(
         crate::server::note_pending_kill_for_job(&state.cluster, job);
     }
 
-    state
-        .cluster
-        .cancel_job(job_id, "")
-        .map_err(|e| error_response(&format!("cancel failed: {e}")))?;
+    if let Err(e) = state.cluster.cancel_job(job_id, "") {
+        state.cluster.clear_pending_kill_for_job(job_id);
+        return Err(error_response(&format!("cancel failed: {e}")));
+    }
 
     if let Some(job) = job {
         let cluster = state.cluster.clone();

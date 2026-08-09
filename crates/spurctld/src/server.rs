@@ -625,9 +625,10 @@ impl SlurmController for ControllerService {
             note_pending_kill_for_job(&self.cluster, job);
         }
 
-        self.cluster
-            .cancel_job(job_id, &req.user)
-            .map_err(cluster_err_to_status)?;
+        if let Err(e) = self.cluster.cancel_job(job_id, &req.user) {
+            self.cluster.clear_pending_kill_for_job(job_id);
+            return Err(cluster_err_to_status(e));
+        }
 
         // Send cancel signal to agents so the process is actually killed
         if let Some(job) = job {

@@ -1574,28 +1574,13 @@ impl SlurmAgent for AgentService {
         self.check_term(req.term)?;
         let job_id = req.job_id;
 
-        // 0 = no tracked run to compare against (unknown/terminal id at the
-        // sender); otherwise a mismatch means this targets a superseded run.
-        if req.run_attempt != 0 {
-            let tracked = self
-                .running
-                .lock()
-                .await
-                .get(&job_id)
-                .map(|t| t.run_attempt);
-            if tracked.is_some_and(|current| current != req.run_attempt) {
-                info!(
-                    job_id,
-                    req.run_attempt, "cancel targets a superseded run, ignoring"
-                );
-                return Ok(Response::new(()));
-            }
-        }
-
+        // run_attempt (0 = unfenced) is checked inside the signal call itself,
+        // under the same lock that selects the tracked job.
         if req.signal > 0 {
-            self.send_explicit_signal(job_id, req.signal).await;
+            self.send_explicit_signal(job_id, req.signal, req.run_attempt)
+                .await;
         } else {
-            self.graceful_cancel(job_id).await;
+            self.graceful_cancel(job_id, req.run_attempt).await;
         }
 
         // The signal paths only act on a running job; release a still-launching
@@ -2630,21 +2615,31 @@ impl AgentService {
     }
 
     /// Send a user-specified signal to a running job.
-    async fn send_explicit_signal(&self, job_id: u32, signal: i32) {
+    async fn send_explicit_signal(&self, job_id: u32, signal: i32, expected_run_attempt: u32) {
         let is_allocation_only = {
             let jobs = self.running.lock().await;
-            jobs.get(&job_id)
-                .is_some_and(|tracked| tracked.job.is_allocation_only())
+            let Some(tracked) = jobs.get(&job_id) else {
+                return;
+            };
+            if expected_run_attempt != 0 && tracked.run_attempt != expected_run_attempt {
+                return;
+            }
+            tracked.job.is_allocation_only()
         };
         if is_allocation_only {
             self.drop_tracked_job(job_id).await;
             return;
         }
 
+        // Re-checked: a newer run could have replaced the tracked job between
+        // the lock above and this one.
         let jobs = self.running.lock().await;
         let Some(tracked) = jobs.get(&job_id) else {
             return;
         };
+        if expected_run_attempt != 0 && tracked.run_attempt != expected_run_attempt {
+            return;
+        }
         let sig =
             nix::sys::signal::Signal::try_from(signal).unwrap_or(nix::sys::signal::Signal::SIGTERM);
         info!(job_id, signal, "sending explicit signal to job");
@@ -2667,24 +2662,32 @@ impl AgentService {
     }
 
     /// SIGTERM now, escalate to SIGKILL after a 5-second grace period.
-    async fn graceful_cancel(&self, job_id: u32) {
+    async fn graceful_cancel(&self, job_id: u32, expected_run_attempt: u32) {
         let is_allocation_only = {
             let jobs = self.running.lock().await;
-            jobs.get(&job_id)
-                .is_some_and(|tracked| tracked.job.is_allocation_only())
+            let Some(tracked) = jobs.get(&job_id) else {
+                return;
+            };
+            if expected_run_attempt != 0 && tracked.run_attempt != expected_run_attempt {
+                return;
+            }
+            tracked.job.is_allocation_only()
         };
         if is_allocation_only {
             self.drop_tracked_job(job_id).await;
             return;
         }
 
-        // Epoch of the run we're cancelling; the delayed SIGKILL below must not
-        // touch a newer run that reused this job_id after a requeue.
+        // Re-checked here (the tracked job may have changed since the lock
+        // above); reused below so the delayed SIGKILL is fenced the same way.
         let cancel_attempt = {
             let jobs = self.running.lock().await;
             let Some(tracked) = jobs.get(&job_id) else {
                 return;
             };
+            if expected_run_attempt != 0 && tracked.run_attempt != expected_run_attempt {
+                return;
+            }
             info!(job_id, "graceful cancel: SIGTERM → 5s grace → SIGKILL");
             let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGTERM);
             tracked.run_attempt
@@ -5006,7 +5009,7 @@ mod tests {
         let job_id = 900;
         svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
 
-        svc.graceful_cancel(job_id).await;
+        svc.graceful_cancel(job_id, 0).await;
 
         assert!(
             wait_job_reaped(&svc, job_id, 5_000).await,
@@ -5061,7 +5064,7 @@ mod tests {
         };
         svc.insert_test_job(job_id, tracked).await;
 
-        svc.graceful_cancel(job_id).await;
+        svc.graceful_cancel(job_id, 0).await;
 
         // 5s grace + up to 2s monitor tick + buffer
         assert!(
@@ -5126,7 +5129,7 @@ mod tests {
         svc.insert_test_job(job_id, run1).await;
 
         // Cancel epoch 1 (SIGTERM; trapped, survives) and spawn the grace timer.
-        svc.graceful_cancel(job_id).await;
+        svc.graceful_cancel(job_id, 0).await;
 
         // Simulate requeue + re-dispatch: same job_id, newer epoch.
         let (run2, pid2) = spawn_trap(2);
@@ -5242,7 +5245,7 @@ mod tests {
             "process should run after SIGCONT, got {state}"
         );
 
-        svc.send_explicit_signal(job_id, 9).await; // cleanup
+        svc.send_explicit_signal(job_id, 9, 0).await; // cleanup
     }
 
     #[tokio::test]
@@ -5258,7 +5261,7 @@ mod tests {
         let job_id = 902;
         svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
 
-        svc.send_explicit_signal(job_id, 9).await; // SIGKILL
+        svc.send_explicit_signal(job_id, 9, 0).await; // SIGKILL
 
         assert!(
             wait_job_reaped(&svc, job_id, 5_000).await,

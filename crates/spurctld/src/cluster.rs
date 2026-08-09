@@ -514,6 +514,12 @@ impl ClusterManager {
             .retain(|(job_id, n), _| n != node || reported.contains(job_id));
     }
 
+    /// Undo a reservation planted ahead of a cancel/evict that then failed —
+    /// callers pre-reserve before the mutation, so a failure must roll back.
+    pub(crate) fn clear_pending_kill_for_job(&self, job_id: JobId) {
+        self.pending_kill.write().retain(|(id, _), _| *id != job_id);
+    }
+
     /// Per-node resources still held out of new dispatch, pruning any
     /// entry whose TTL has expired.
     pub(crate) fn pending_kill_reservations(&self) -> HashMap<String, ResourceAllocations> {
@@ -6339,6 +6345,23 @@ mod tests {
         let cm0 = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
         cm0.note_pending_kill(9, "n1", scalar_alloc(1, 1000));
         assert!(cm0.pending_kill_reservations().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_pending_kill_for_job_removes_only_that_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.note_pending_kill(1, "n1", scalar_alloc(2, 4000));
+        cm.note_pending_kill(2, "n1", scalar_alloc(3, 6000));
+
+        cm.clear_pending_kill_for_job(1);
+
+        let reserved = cm.pending_kill_reservations();
+        assert_eq!(
+            reserved.get("n1").unwrap().cpus,
+            3,
+            "only job 1's reservation must be rolled back"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
