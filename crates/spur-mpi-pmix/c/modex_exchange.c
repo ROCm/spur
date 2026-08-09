@@ -691,3 +691,19 @@ int spur_modex_fence_collect(
     pthread_mutex_unlock(&session->lock);
     return merge_rc;
 }
+
+#ifdef SPUR_MODEX_TESTING
+int spur_modex_session_refs_for_testing(spur_modex_session_t *session) {
+    if (session == NULL) {
+        return -1;
+    }
+    return atomic_load(&session->refs);
+}
+
+bool spur_modex_session_accept_running_for_testing(spur_modex_session_t *session) {
+    if (session == NULL) {
+        return false;
+    }
+    return atomic_load(&session->accept_running);
+}
+#endif

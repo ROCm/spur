@@ -1012,7 +1012,6 @@ int spur_mpi_pmix_server_stop(const char *namespace_, char *errbuf, size_t errle
         if (session->modex != NULL) {
             spur_modex_session_t *modex = session->modex;
             session->modex = NULL;
-            spur_modex_session_retain(modex);
             spur_modex_session_abort(modex);
             spur_modex_session_release(modex);
         }

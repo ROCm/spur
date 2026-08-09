@@ -6,6 +6,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 #define SPUR_MODEX_MAX_NODES 64
 #define SPUR_MODEX_MAX_BLOB (16u * 1024u * 1024u)
@@ -67,5 +68,11 @@ int spur_modex_fence_collect(
     char **out_merged,
     size_t *out_merged_len
 );
+
+#ifdef SPUR_MODEX_TESTING
+int spur_modex_session_refs_for_testing(spur_modex_session_t *session);
+
+bool spur_modex_session_accept_running_for_testing(spur_modex_session_t *session);
+#endif
 
 #endif

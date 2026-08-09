@@ -76,13 +76,33 @@ fn copy_plugin(
     }
 }
 
+fn build_modex_exchange_test(out_dir: &Path) {
+    let out = out_dir.join("modex_exchange_test");
+    let mut cmd = cc::Build::new().get_compiler().to_command();
+    cmd.arg("-o")
+        .arg(&out)
+        .arg("-DSPUR_MODEX_TESTING")
+        .arg("c/modex_exchange.c")
+        .arg("c/modex_exchange_test.c")
+        .arg("-pthread");
+    if !cmd
+        .status()
+        .unwrap_or_else(|e| panic!("failed to launch C compiler for modex_exchange_test: {e}"))
+        .success()
+    {
+        panic!("failed to build modex_exchange_test at {out:?}");
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=c/pmix_server.c");
     println!("cargo:rerun-if-changed=c/modex_exchange.c");
+    println!("cargo:rerun-if-changed=c/modex_exchange_test.c");
     println!("cargo:rerun-if-changed=c/stub_server.c");
     println!("cargo:rerun-if-changed=include/spur_mpi_plugin.h");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    build_modex_exchange_test(&out_dir);
 
     let mut build = cc::Build::new();
     build.pic(true);
