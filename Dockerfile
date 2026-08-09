@@ -57,9 +57,11 @@ RUN cargo build --release --locked \
 RUN if [ "$BUILD_MPI_PLUGIN" = "1" ]; then \
         dnf install -y dnf-plugins-core && \
         dnf config-manager --set-enabled powertools && \
-        dnf install -y gcc-c++ flex bison python3 libevent-devel hwloc-devel && \
+        dnf install -y gcc-c++ flex bison python3 tar pkgconf-pkg-config libevent-devel hwloc-devel && \
         curl -fsSL "https://github.com/openpmix/openpmix/releases/download/v${OPENPMIX_VERSION}/pmix-${OPENPMIX_VERSION}.tar.gz" \
-            | tar xz -C /tmp && \
+            -o "/tmp/pmix-${OPENPMIX_VERSION}.tar.gz" && \
+        tar xzf "/tmp/pmix-${OPENPMIX_VERSION}.tar.gz" -C /tmp && \
+        rm -f "/tmp/pmix-${OPENPMIX_VERSION}.tar.gz" && \
         cd "/tmp/pmix-${OPENPMIX_VERSION}" && \
         ./configure --prefix=/usr/local && \
         make -j"$(nproc)" && make install && \
