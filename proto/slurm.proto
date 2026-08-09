@@ -785,6 +785,8 @@ message AgentCancelJobRequest {
   int32 signal = 2;
   // See LaunchJobRequest.term.
   uint64 term = 3;
+  // 0 = unfenced (unknown/terminal id, no tracked run to compare against).
+  uint32 run_attempt = 4;
 }
 
 message AgentSuspendJobRequest {

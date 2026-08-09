@@ -251,13 +251,15 @@ impl ControllerService {
                         node = %node_owned,
                         "agent holds a job the controller doesn't bind here — reclaiming its allocation"
                     );
-                    // Signal 0 = graceful release, no-op on an unknown id. Not
-                    // epoch-gated — a requeue racing this send is still possible.
+                    // Signal 0 = graceful release, no-op on an unknown id. 0 for
+                    // an unknown/terminal id too — nothing to fence against.
+                    let run_attempt = cluster.get_job(job_id).map_or(0, |j| j.run_attempt);
                     crate::scheduler_loop::cancel_job_on_nodes(
                         &cluster,
                         job_id,
                         std::slice::from_ref(&node_owned),
                         0,
+                        run_attempt,
                     )
                     .await;
                 }
@@ -610,11 +612,15 @@ impl SlurmController for ControllerService {
         let req = request.into_inner();
         let job_id = req.job_id;
 
+        self.cluster
+            .check_cancel_allowed(job_id, &req.user)
+            .map_err(cluster_err_to_status)?;
+
         // Snapshot before cancelling so we still have allocated_nodes after.
         let job = self.cluster.get_job(job_id);
 
-        // Reserve before the free lands, so the scheduler never sees a window
-        // where the resources look free but the agent hasn't been told yet.
+        // Reserve before the free lands (the check above already gated this
+        // on the request being authorized against a live job).
         if let Some(job) = &job {
             note_pending_kill_for_job(&self.cluster, job);
         }
@@ -3997,6 +4003,67 @@ mod tests {
             1,
             "job 1's reservation must clear once the heartbeat confirms it's gone"
         );
+    }
+
+    // An unauthorized cancel must not plant a reservation against a job it
+    // never touched — that would let anyone withhold another job's resources.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unauthorized_cancel_reserves_nothing() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState};
+        use spur_core::resource::ResourceAllocations;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                &svc.cluster,
+                op,
+            );
+        };
+
+        apply(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(JobSpec {
+                name: "owned-by-alice".into(),
+                user: "alice".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            }),
+        });
+        apply(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let per_node: std::collections::HashMap<_, _> =
+            [("n1".to_string(), ResourceAllocations::with_scalar(2, 4000))].into();
+        apply(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: ResourceAllocations::with_scalar(2, 4000),
+            per_node_alloc: per_node,
+            srun_step_dispatch: false,
+            run_attempt: 1,
+        });
+
+        let result = svc
+            .cancel_job(Request::new(CancelJobRequest {
+                job_id: 1,
+                signal: 0,
+                user: "mallory".into(),
+            }))
+            .await;
+        assert!(result.is_err(), "an unauthorized cancel must be rejected");
+        assert!(
+            svc.cluster.pending_kill_reservations().is_empty(),
+            "the rejected cancel must not have reserved n1's resources"
+        );
+        assert_eq!(svc.cluster.get_job(1).unwrap().state, JobState::Running);
     }
 
     // A step must NOT be created when the target node is allocated but unregistered: address

@@ -350,7 +350,14 @@ async fn process_assignment(
                 return false;
             }
             AllocationRegisterOutcome::PartialFailed { succeeded_nodes } => {
-                cancel_job_on_nodes(&cluster, job_id, &succeeded_nodes, 9).await;
+                cancel_job_on_nodes(
+                    &cluster,
+                    job_id,
+                    &succeeded_nodes,
+                    9,
+                    prospective_run_attempt,
+                )
+                .await;
                 if let Err(e) = cluster.requeue_job(job_id) {
                     error!(job_id, error = %e, "failed to requeue after partial registration");
                 }
@@ -473,7 +480,14 @@ async fn process_assignment(
         // start_job failure here (e.g. the job was cancelled out from
         // under us between assignment and this point) doesn't leave
         // orphans.
-        cancel_job_on_nodes(&cluster, job_id, &dispatch_nodes, 0).await;
+        cancel_job_on_nodes(
+            &cluster,
+            job_id,
+            &dispatch_nodes,
+            0,
+            job.run_attempt.saturating_add(1),
+        )
+        .await;
         debug!(
             job_id = assignment.job_id,
             error = %e,
@@ -1629,7 +1643,7 @@ async fn confirm_dispatch_on_nodes(
     // never confirmed will never report completion, and letting it keep
     // running while the job as a whole is aborted back to Pending would
     // orphan it.
-    cancel_job_on_nodes(&cluster, job_id, &succeeded_nodes, 9).await;
+    cancel_job_on_nodes(&cluster, job_id, &succeeded_nodes, 9, run_attempt).await;
 
     // Drain before deciding the job's fate, so the failing node is already out
     // of the candidate set on the next scheduling attempt. The drain is issued
@@ -1847,7 +1861,7 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
     }
 
     if !missing.is_empty() {
-        cancel_job_on_nodes(cluster, job.job_id, &missing, 9).await;
+        cancel_job_on_nodes(cluster, job.job_id, &missing, 9, job.run_attempt).await;
     }
 
     info!(
@@ -1952,27 +1966,34 @@ pub async fn send_cancel_to_agents(
     job: &spur_core::job::Job,
     signal: i32,
 ) {
-    send_cancel_to_nodes(cluster, job.job_id, &job.allocated_nodes, signal).await;
+    send_cancel_to_nodes(
+        cluster,
+        job.job_id,
+        &job.allocated_nodes,
+        signal,
+        job.run_attempt,
+    )
+    .await;
 }
 
-/// Send CancelJob RPC to an explicit set of nodes for a job with a specific
-/// signal. Callers that already know which nodes ran the job (e.g. a dispatch
-/// loop) should use this instead of `send_cancel_to_agents` so the cancel
-/// isn't at the mercy of `job.allocated_nodes` having been mutated in the
-/// meantime (e.g. cleared by a requeue-on-eviction side effect).
-///
-/// Fire-and-forget: each node's cancel runs on its own task and this returns
-/// immediately. Use `cancel_job_on_nodes` when the cancel must be delivered
-/// before subsequent work (e.g. a requeue that could re-dispatch the job).
+/// Send CancelJob RPC to explicit nodes; `run_attempt` (0 = unfenced) stops it
+/// from killing a later run of the same job_id. Fire-and-forget.
 pub async fn send_cancel_to_nodes(
     cluster: &Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
     node_names: &[String],
     signal: i32,
+    run_attempt: u32,
 ) {
     let term = cluster.current_term();
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
-        tokio::spawn(cancel_one_agent(agent_addr, job_id, signal, term));
+        tokio::spawn(cancel_one_agent(
+            agent_addr,
+            job_id,
+            signal,
+            term,
+            run_attempt,
+        ));
     }
 }
 
@@ -1985,11 +2006,18 @@ pub async fn cancel_job_on_nodes(
     job_id: spur_core::job::JobId,
     node_names: &[String],
     signal: i32,
+    run_attempt: u32,
 ) {
     let term = cluster.current_term();
     let mut set = tokio::task::JoinSet::new();
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
-        set.spawn(cancel_one_agent(agent_addr, job_id, signal, term));
+        set.spawn(cancel_one_agent(
+            agent_addr,
+            job_id,
+            signal,
+            term,
+            run_attempt,
+        ));
     }
     while set.join_next().await.is_some() {}
 }
@@ -2112,6 +2140,7 @@ async fn cancel_one_agent(
     job_id: spur_core::job::JobId,
     signal: i32,
     term: u64,
+    run_attempt: u32,
 ) {
     let attempt = async {
         match SlurmAgentClient::connect(agent_addr.clone())
@@ -2126,6 +2155,7 @@ async fn cancel_one_agent(
                         job_id,
                         signal,
                         term,
+                        run_attempt,
                     })
                     .await
                 {

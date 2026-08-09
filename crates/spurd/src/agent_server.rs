@@ -1574,6 +1574,24 @@ impl SlurmAgent for AgentService {
         self.check_term(req.term)?;
         let job_id = req.job_id;
 
+        // 0 = no tracked run to compare against (unknown/terminal id at the
+        // sender); otherwise a mismatch means this targets a superseded run.
+        if req.run_attempt != 0 {
+            let tracked = self
+                .running
+                .lock()
+                .await
+                .get(&job_id)
+                .map(|t| t.run_attempt);
+            if tracked.is_some_and(|current| current != req.run_attempt) {
+                info!(
+                    job_id,
+                    req.run_attempt, "cancel targets a superseded run, ignoring"
+                );
+                return Ok(Response::new(()));
+            }
+        }
+
         if req.signal > 0 {
             self.send_explicit_signal(job_id, req.signal).await;
         } else {
@@ -4664,7 +4682,7 @@ mod tests {
         );
 
         assert!(
-            reporter.held_job_ids().is_empty(),
+            reporter.held_job_ids().await.is_empty(),
             "reporter sees no jobs before registration"
         );
 
@@ -4682,7 +4700,7 @@ mod tests {
         .expect("register");
 
         assert_eq!(
-            reporter.held_job_ids(),
+            reporter.held_job_ids().await,
             vec![77],
             "reporter's heartbeat must observe the agent-registered allocation-only job"
         );
@@ -4714,6 +4732,7 @@ mod tests {
             job_id: 7,
             signal: 9,
             term: 0,
+            run_attempt: 0,
         }))
         .await
         .expect("cancel_job");
@@ -4722,6 +4741,94 @@ mod tests {
             svc.free_gpu_count().await,
             1,
             "cancel must release a launching (never-committed) reservation"
+        );
+    }
+
+    // A cancel meant for an old run must not kill the job_id's re-dispatched
+    // replacement, even for the very first signal (not just the grace escalation).
+    #[tokio::test]
+    async fn cancel_job_ignores_a_request_for_a_superseded_run() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        svc.start_monitor("http://127.0.0.1:1".into());
+
+        fn spawn_sleeper(run_attempt: u32) -> (TrackedJob, i32) {
+            let child = tokio::process::Command::new("/bin/sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .process_group(0)
+                .spawn()
+                .expect("spawn sleep process");
+            let pid = child.id().expect("pid") as i32;
+            let t = TrackedJob {
+                job: executor::RunningJob::Managed {
+                    child,
+                    cgroup_path: None,
+                },
+                rootfs_mode: crate::container::RootfsMode::Extracted,
+                stdout_path: "/dev/null".into(),
+                stderr_path: "/dev/null".into(),
+                has_pid_namespace: false,
+                has_user_namespace: false,
+                has_mount_namespace: false,
+                _pty_master: None,
+                work_dir: "/tmp".into(),
+                uid: 0,
+                gid: 0,
+                user: "testuser".into(),
+                partition: String::new(),
+                gpu_devices: Vec::new(),
+                cpus: 1,
+                memory_mb: 0,
+                nodelist: String::new(),
+                mpi: String::new(),
+                run_attempt,
+            };
+            (t, pid)
+        }
+
+        let job_id = 903;
+        let (run2, pid2) = spawn_sleeper(2);
+        svc.insert_test_job(job_id, run2).await;
+
+        // A stray cancel for old run 1 must not touch live run 2; wait out a
+        // real (unguarded) kill before asserting the process survived.
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id,
+            signal: 9,
+            term: 0,
+            run_attempt: 1,
+        }))
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            svc.running.lock().await.contains_key(&job_id),
+            "a cancel for a superseded run must not reap the current run"
+        );
+        assert!(
+            matches!(proc_state(pid2), 'S' | 'R' | 'D'),
+            "a cancel for a superseded run must not kill the current run"
+        );
+
+        // A cancel for the current run must still work.
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id,
+            signal: 9,
+            term: 0,
+            run_attempt: 2,
+        }))
+        .await
+        .unwrap();
+        assert!(
+            wait_job_reaped(&svc, job_id, 2_000).await,
+            "a cancel matching the current run must still kill it"
         );
     }
 

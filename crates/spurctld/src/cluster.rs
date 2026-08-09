@@ -964,19 +964,23 @@ impl ClusterManager {
         spur_core::auth::check_job_owner(user, owner, action).map_err(Into::into)
     }
 
+    /// Check without cancelling — callers that pre-reserve resources on the
+    /// expected cancel must check this first, before planting a reservation.
+    pub fn check_cancel_allowed(&self, job_id: JobId, user: &str) -> anyhow::Result<()> {
+        let jobs = self.jobs.read();
+        let job = jobs
+            .get(&job_id)
+            .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+        if job.state.is_terminal() {
+            anyhow::bail!("job {} is already {:?}", job_id, job.state);
+        }
+        Self::check_job_owner(user, &job.spec.user, "cancel")
+    }
+
     /// Cancel a job. The requesting `user` must be the job owner, root, or
     /// empty (trusted internal/daemon calls).
     pub fn cancel_job(&self, job_id: JobId, user: &str) -> anyhow::Result<()> {
-        {
-            let jobs = self.jobs.read();
-            let job = jobs
-                .get(&job_id)
-                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
-            if job.state.is_terminal() {
-                anyhow::bail!("job {} is already {:?}", job_id, job.state);
-            }
-            Self::check_job_owner(user, &job.spec.user, "cancel")?;
-        }
+        self.check_cancel_allowed(job_id, user)?;
 
         // Use JobComplete (not JobStateChange) so that resource deallocation
         // fires for any allocated nodes. For pending jobs, allocated_nodes is empty

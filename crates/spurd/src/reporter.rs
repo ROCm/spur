@@ -14,16 +14,17 @@ use tracing::{debug, info, warn};
 
 /// Source of the job ids this node currently holds. The controller decides from
 /// its own authoritative state whether any reported id is stale.
+#[tonic::async_trait]
 pub trait HeldJobs: Send + Sync {
-    fn held_job_ids(&self) -> Vec<u32>;
+    async fn held_job_ids(&self) -> Vec<u32>;
 }
 
+#[tonic::async_trait]
 impl<T: Send> HeldJobs for Mutex<HashMap<u32, T>> {
-    fn held_job_ids(&self) -> Vec<u32> {
-        match self.try_lock() {
-            Ok(jobs) => jobs.keys().copied().collect(),
-            Err(_) => Vec::new(),
-        }
+    // Awaits the lock rather than try_lock(): an empty result must mean "holds
+    // nothing", never "couldn't check" — the controller treats it as confirmed release.
+    async fn held_job_ids(&self) -> Vec<u32> {
+        self.lock().await.keys().copied().collect()
     }
 }
 
@@ -81,8 +82,8 @@ impl NodeReporter {
     }
 
     /// Job ids this heartbeat would report, from the shared running map.
-    pub fn held_job_ids(&self) -> Vec<u32> {
-        self.held_jobs.held_job_ids()
+    pub async fn held_job_ids(&self) -> Vec<u32> {
+        self.held_jobs.held_job_ids().await
     }
 
     /// Register with the controller.
@@ -153,6 +154,7 @@ impl NodeReporter {
             let current_token = self.node_token.read().unwrap().clone();
             let running_jobs: Vec<RunningJobStatus> = self
                 .held_job_ids()
+                .await
                 .into_iter()
                 .map(|job_id| RunningJobStatus {
                     job_id,
@@ -576,11 +578,24 @@ mod tests {
         assert!(!should_reregister(&tonic::Status::internal("boom")));
     }
 
-    #[test]
-    fn held_job_ids_accepts_send_but_not_sync_values() {
+    #[tokio::test]
+    async fn held_job_ids_accepts_send_but_not_sync_values() {
         // Cell is Send but !Sync; this fails to compile if the bound re-tightens to Sync.
         let map: Mutex<HashMap<u32, std::cell::Cell<u8>>> =
             Mutex::new(HashMap::from([(7, std::cell::Cell::new(0))]));
-        assert_eq!(map.held_job_ids(), vec![7]);
+        assert_eq!(map.held_job_ids().await, vec![7]);
+    }
+
+    // A brief lock hold (e.g. a concurrent launch/cancel) must not read as
+    // "holds nothing" — the controller treats an empty report as confirmed release.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn held_job_ids_waits_out_contention_instead_of_reporting_empty() {
+        let map: Arc<Mutex<HashMap<u32, u8>>> = Arc::new(Mutex::new(HashMap::from([(7, 0)])));
+        let held = map.clone();
+        let guard = held.lock().await;
+        let reader = tokio::spawn(async move { map.held_job_ids().await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(guard);
+        assert_eq!(reader.await.unwrap(), vec![7]);
     }
 }
