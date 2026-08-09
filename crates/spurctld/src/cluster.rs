@@ -488,8 +488,8 @@ impl ClusterManager {
             .retain(|(job_id, n), _| n != node || active_job_ids.contains(job_id));
     }
 
-    /// Reserve `resources` on `node` until the agent confirms `job_id`'s
-    /// release or the TTL expires. Refreshes the TTL if already present.
+    /// Reserve `resources` on `node` until the TTL expires. Refreshes the
+    /// TTL if already present.
     pub(crate) fn note_pending_kill(
         &self,
         job_id: JobId,
@@ -506,8 +506,8 @@ impl ClusterManager {
             .insert((job_id, node.to_string()), (resources, until));
     }
 
-    /// Per-node resources still held out of new dispatch pending kill
-    /// confirmation, pruning any entry whose TTL has expired.
+    /// Per-node resources still held out of new dispatch, pruning any
+    /// entry whose TTL has expired.
     pub(crate) fn pending_kill_reservations(&self) -> HashMap<String, ResourceAllocations> {
         let now = std::time::Instant::now();
         let mut pending = self.pending_kill.write();
@@ -1629,20 +1629,22 @@ impl ClusterManager {
         job.spec.begin_time.map_or(hold, |user| user.max(hold))
     }
 
-    /// Evict a single job to NodeFail. Only updates controller state —
-    /// callers must also cancel on its nodes and complete its steps.
+    /// Evict a single job to NodeFail; an empty result means it wasn't.
+    /// Only updates controller state — callers cancel on nodes/complete steps.
     pub fn evict_job(
         &self,
         job_id: JobId,
         reason: PendingReason,
+        run_attempt: u32,
     ) -> anyhow::Result<Vec<JobFinalized>> {
-        self.evict_job_with_detail(job_id, reason, None)
+        self.evict_job_with_detail(job_id, reason, run_attempt, None)
     }
 
     pub fn evict_job_with_detail(
         &self,
         job_id: JobId,
         reason: PendingReason,
+        run_attempt: u32,
         detail: Option<String>,
     ) -> anyhow::Result<Vec<JobFinalized>> {
         {
@@ -1658,6 +1660,7 @@ impl ClusterManager {
             job_id,
             reason,
             detail,
+            run_attempt,
         })?;
         self.run_all_finalized_side_effects(&resp);
         Ok(resp.jobs_finalized)
@@ -4044,8 +4047,12 @@ impl ClusterManager {
         nodes: &mut HashMap<String, Node>,
         timestamp: chrono::DateTime<Utc>,
         reason: PendingReason,
+        run_attempt: u32,
     ) -> Option<JobFinalized> {
         let job = jobs.get_mut(&job_id)?;
+        if run_attempt != 0 && run_attempt != job.run_attempt {
+            return None;
+        }
 
         if let Some(since) = job.suspended_at.take() {
             job.suspended_secs += (timestamp - since).num_seconds().max(0);
@@ -4119,7 +4126,7 @@ impl ClusterManager {
 
         for jid in affected {
             if let Some(fin) =
-                Self::evict_job_locked(jid, jobs, nodes, timestamp, PendingReason::NodeDown)
+                Self::evict_job_locked(jid, jobs, nodes, timestamp, PendingReason::NodeDown, 0)
             {
                 response.jobs_finalized.push(fin);
             }
@@ -4313,17 +4320,19 @@ impl ClusterManager {
                 job_id,
                 reason,
                 detail,
+                run_attempt,
             } => {
-                if let Some(job) = jobs.get_mut(job_id) {
-                    job.launch_failure_detail = detail.clone();
-                }
                 if let Some(fin) = Self::evict_job_locked(
                     *job_id,
                     &mut jobs,
                     &mut nodes,
                     timestamp,
                     reason.clone(),
+                    *run_attempt,
                 ) {
+                    if let Some(job) = jobs.get_mut(job_id) {
+                        job.launch_failure_detail = detail.clone();
+                    }
                     response.jobs_finalized.push(fin);
                 }
             }
@@ -6318,6 +6327,22 @@ mod tests {
         let cm0 = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
         cm0.note_pending_kill(9, "n1", scalar_alloc(1, 1000));
         assert!(cm0.pending_kill_reservations().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn note_pending_kill_for_job_falls_back_to_an_even_split_without_per_node_alloc() {
+        // A job replayed from a pre-per_node_alloc WAL entry has an empty map;
+        // the reservation must still protect its real allocation, not zero.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let mut job = make_running_job(1, &["n1", "n2"], 2);
+        job.per_node_alloc.clear();
+
+        crate::server::note_pending_kill_for_job(&cm, &job);
+
+        let reserved = cm.pending_kill_reservations();
+        assert_eq!(reserved.get("n1").unwrap().cpus, 2);
+        assert_eq!(reserved.get("n2").unwrap().cpus, 2);
     }
 
     /// Consumer-driven: `maybe_requeue` must honor the new `max_batch_requeue`
@@ -11394,7 +11419,7 @@ mod tests {
         .unwrap();
         settle(&cm, job_id, JobState::Running);
 
-        cm.evict_job(job_id, PendingReason::JobLaunchFailure)
+        cm.evict_job(job_id, PendingReason::JobLaunchFailure, 0)
             .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
@@ -13972,7 +13997,8 @@ mod tests {
         settle(&cm, id, JobState::Running);
 
         // n1's dispatch succeeded, n2's never reached the agent.
-        cm.evict_job(id, PendingReason::JobLaunchFailure).unwrap();
+        cm.evict_job(id, PendingReason::JobLaunchFailure, 0)
+            .unwrap();
         settle(&cm, id, JobState::NodeFail);
 
         let job = cm.get_job(id).unwrap();
@@ -13995,6 +14021,23 @@ mod tests {
                 "allocation on {name} must be freed on eviction"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_job_returns_empty_for_a_job_that_never_started() {
+        // A Pending job can't reach NodeFail; must report empty like a terminal job.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let spec = basic_spec("evict-never-started");
+        let id = submit_and_wait(&cm, spec);
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Pending);
+
+        let finalized = cm.evict_job(id, PendingReason::NodeDown, 0).unwrap();
+        assert!(
+            finalized.is_empty(),
+            "evicting a job that can't reach NodeFail must no-op"
+        );
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Pending);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14053,7 +14096,7 @@ mod tests {
              leaving only B's 3 cpus"
         );
 
-        cm.evict_job(job_a, PendingReason::NodeDown).unwrap();
+        cm.evict_job(job_a, PendingReason::NodeDown, 0).unwrap();
         settle(&cm, job_a, JobState::NodeFail);
 
         assert_eq!(
@@ -16104,6 +16147,40 @@ mod tests {
     }
 
     #[test]
+    fn evict_job_locked_rejects_stale_run_attempt() {
+        let mut jobs = HashMap::new();
+        let mut nodes = HashMap::new();
+        let mut job = make_running_job(1, &["n1"], 2);
+        job.run_attempt = 5;
+        jobs.insert(1, job);
+        nodes.insert("n1".into(), make_test_node("n1", 4, 2));
+
+        let result = ClusterManager::evict_job_locked(
+            1,
+            &mut jobs,
+            &mut nodes,
+            Utc::now(),
+            PendingReason::NodeDown,
+            3,
+        );
+        assert!(
+            result.is_none(),
+            "eviction targeting a superseded run must no-op"
+        );
+        assert_eq!(jobs[&1].state, JobState::Running, "job must be untouched");
+
+        let result = ClusterManager::evict_job_locked(
+            1,
+            &mut jobs,
+            &mut nodes,
+            Utc::now(),
+            PendingReason::NodeDown,
+            5,
+        );
+        assert!(result.is_some(), "a matching run_attempt must still evict");
+    }
+
+    #[test]
     fn evict_job_returns_none_for_missing_job() {
         let mut jobs = HashMap::new();
         let mut nodes = HashMap::new();
@@ -16113,6 +16190,7 @@ mod tests {
             &mut nodes,
             Utc::now(),
             PendingReason::NodeDown,
+            0,
         );
         assert!(result.is_none());
     }
@@ -16130,6 +16208,7 @@ mod tests {
             &mut nodes,
             Utc::now(),
             PendingReason::NodeDown,
+            0,
         )
         .unwrap();
         assert_eq!(fin.job_id, 1);
@@ -16157,6 +16236,7 @@ mod tests {
             &mut nodes,
             Utc::now(),
             PendingReason::NodeDown,
+            0,
         );
 
         assert_eq!(nodes["n1"].alloc_resources.cpus, 0);
@@ -16178,6 +16258,7 @@ mod tests {
             &mut nodes,
             Utc::now(),
             PendingReason::NodeDown,
+            0,
         );
         assert!(result.is_none());
     }
@@ -16200,6 +16281,7 @@ mod tests {
             &mut nodes,
             Utc::now(),
             PendingReason::NodeDown,
+            0,
         );
 
         let job = &jobs[&1];
@@ -16222,6 +16304,7 @@ mod tests {
             &mut nodes,
             Utc::now(),
             PendingReason::NodeDown,
+            0,
         )
         .unwrap();
         assert_eq!(fin.state, JobState::NodeFail);
@@ -16244,6 +16327,7 @@ mod tests {
             &mut nodes,
             Utc::now(),
             PendingReason::NodeDown,
+            0,
         );
 
         assert_eq!(nodes["n1"].state, NodeState::Drain);

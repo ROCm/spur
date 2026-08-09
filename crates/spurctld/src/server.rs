@@ -299,7 +299,12 @@ impl ControllerService {
                         node = %node_owned,
                         "node's heartbeat repeatedly omitted a job the controller binds here — evicting"
                     );
-                    match cluster.evict_job(fresh.job_id, spur_core::job::PendingReason::NodeDown) {
+                    match cluster.evict_job(
+                        fresh.job_id,
+                        spur_core::job::PendingReason::NodeDown,
+                        fresh.run_attempt,
+                    ) {
+                        Ok(finalized) if finalized.is_empty() => {}
                         Ok(finalized) => {
                             note_pending_kill_for_job(&cluster, &fresh);
                             cluster.complete_evicted_steps(&finalized);
@@ -452,9 +457,20 @@ fn should_kill_reported_job(cluster: &ClusterManager, job_id: u32, node: &str) -
 }
 
 /// Reserve `job`'s resources on each allocated node. Call before sending the kill.
-fn note_pending_kill_for_job(cluster: &ClusterManager, job: &spur_core::job::Job) {
+pub(crate) fn note_pending_kill_for_job(cluster: &ClusterManager, job: &spur_core::job::Job) {
+    let node_count = job.allocated_nodes.len().max(1) as u32;
     for node in &job.allocated_nodes {
-        let resources = job.per_node_alloc.get(node).cloned().unwrap_or_default();
+        let resources = job.per_node_alloc.get(node).cloned().unwrap_or_else(|| {
+            job.allocated_resources.as_ref().map_or_else(
+                spur_core::resource::ResourceAllocations::default,
+                |total| {
+                    spur_core::resource::ResourceAllocations::with_scalar(
+                        total.cpus / node_count,
+                        total.memory_mb / node_count as u64,
+                    )
+                },
+            )
+        });
         cluster.note_pending_kill(job.job_id, node, resources);
     }
 }

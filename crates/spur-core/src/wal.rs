@@ -151,6 +151,10 @@ pub enum WalOperation {
         /// Human-readable bootstrap failure (shown via scontrol / logs).
         #[serde(default)]
         detail: Option<String>,
+        /// Caller's observed epoch; 0 (legacy/unfenced) always applies.
+        /// A mismatch at apply time means the job already moved on.
+        #[serde(default)]
+        run_attempt: u32,
     },
     /// Record why a requeued job is back in Pending (survives controller restart).
     JobLaunchFailureDetail {
@@ -986,6 +990,7 @@ mod evict_wal_tests {
             job_id: 9,
             reason: PendingReason::NodeDown,
             detail: Some("PMIx prepare failed".into()),
+            run_attempt: 3,
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -994,10 +999,12 @@ mod evict_wal_tests {
                 job_id,
                 reason,
                 detail,
+                run_attempt,
             } => {
                 assert_eq!(job_id, 9);
                 assert_eq!(reason, PendingReason::NodeDown);
                 assert_eq!(detail.as_deref(), Some("PMIx prepare failed"));
+                assert_eq!(run_attempt, 3);
             }
             _ => panic!("wrong variant"),
         }
@@ -1026,10 +1033,12 @@ mod evict_wal_tests {
                 job_id,
                 reason,
                 detail,
+                run_attempt,
             } => {
                 assert_eq!(job_id, 9);
                 assert_eq!(reason, PendingReason::JobLaunchFailure);
                 assert_eq!(detail, None);
+                assert_eq!(run_attempt, 0);
             }
             _ => panic!("wrong variant"),
         }

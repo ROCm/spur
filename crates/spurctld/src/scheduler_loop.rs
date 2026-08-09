@@ -640,6 +640,7 @@ pub(crate) async fn try_preempt(
             );
             match cluster.preempt_job(candidate.job_id, mode) {
                 Ok(PreemptOutcome::Killed) => {
+                    crate::server::note_pending_kill_for_job(cluster, candidate);
                     // Signal 0 = graceful cancel (SIGTERM then SIGKILL).
                     send_cancel_to_agents(cluster, candidate, 0).await;
                 }
@@ -1138,7 +1139,7 @@ struct AllocationRegisterParams {
 async fn register_allocation_to_agent(
     agent_addr: &str,
     params: &AllocationRegisterParams,
-) -> anyhow::Result<()> {
+) -> Result<(), DispatchError> {
     let mut client = SlurmAgentClient::connect(agent_addr.to_string())
         .await?
         .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
@@ -1166,7 +1167,11 @@ async fn register_allocation_to_agent(
             run_attempt: params.run_attempt,
             term: params.term,
         })
-        .await?;
+        .await
+        .map_err(|s| match s.code() {
+            tonic::Code::ResourceExhausted => DispatchError::ResourcesUnavailable,
+            _ => DispatchError::Other(s.into()),
+        })?;
 
     info!(
         job_id = params.job_id,
@@ -1254,6 +1259,9 @@ async fn register_allocation_on_nodes(
                     error = %e,
                     "allocation registration on agent failed"
                 );
+                if matches!(e, DispatchError::ResourcesUnavailable) {
+                    cluster.cool_down_node(&node_name);
+                }
                 failures += 1;
             }
             Err(e) => {
@@ -1758,6 +1766,7 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
                 continue;
             }
 
+            crate::server::note_pending_kill_for_job(&cluster, job);
             send_cancel_to_agents(&cluster, job, 9).await; // SIGKILL
         }
     }
@@ -2153,6 +2162,7 @@ pub async fn send_suspend_to_agents(
     job: &spur_core::job::Job,
     resume: bool,
 ) {
+    let term = cluster.current_term();
     for node_name in &job.allocated_nodes {
         let node_info = cluster.get_node(node_name);
         let agent_addr = match node_info {
@@ -2180,7 +2190,11 @@ pub async fn send_suspend_to_agents(
                 }) {
                 Ok(mut client) => {
                     if let Err(e) = client
-                        .suspend_job(AgentSuspendJobRequest { job_id, resume })
+                        .suspend_job(AgentSuspendJobRequest {
+                            job_id,
+                            resume,
+                            term,
+                        })
                         .await
                     {
                         warn!(job_id, resume, agent = %agent_addr, error = %e, "SuspendJob RPC failed");
@@ -2558,6 +2572,9 @@ mod tests {
             /// launch_job returns a ResourceExhausted status, standing in for a
             /// node whose local allocation table already holds the GPUs.
             reject_resources: bool,
+            /// register_job_allocation returns a ResourceExhausted status,
+            /// the srun/salloc equivalent of `reject_resources`.
+            reject_registration: bool,
             /// Records each `LaunchJobRequest.task_fanout` this agent receives,
             /// so tests can assert on it without a real spurd behind the RPC.
             fanout_calls: Option<Arc<std::sync::Mutex<Vec<bool>>>>,
@@ -2685,6 +2702,11 @@ mod tests {
                 tonic::Response<spur_proto::proto::RegisterJobAllocationResponse>,
                 tonic::Status,
             > {
+                if self.reject_registration {
+                    return Err(tonic::Status::resource_exhausted(
+                        "controller-allocated resources unavailable on this node",
+                    ));
+                }
                 Ok(tonic::Response::new(Default::default()))
             }
 
@@ -2816,6 +2838,7 @@ mod tests {
                 reject_launch_as,
                 launch_delay,
                 reject_resources: false,
+                reject_registration: false,
                 fanout_calls: capture.then(|| fanout_calls.clone()),
             };
             tokio::spawn(async move {
@@ -2838,6 +2861,30 @@ mod tests {
                 reject_launch_as: None,
                 launch_delay: Duration::ZERO,
                 reject_resources: true,
+                reject_registration: false,
+                fanout_calls: None,
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            addr
+        }
+
+        /// Mock agent whose register_job_allocation always rejects with ResourceExhausted.
+        async fn spawn_mock_agent_rejecting_registration() -> std::net::SocketAddr {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let agent = MockAgent {
+                cancel_calls: Arc::new(AtomicU32::new(0)),
+                reject_launch_as: None,
+                launch_delay: Duration::ZERO,
+                reject_resources: false,
+                reject_registration: true,
                 fanout_calls: None,
             };
             tokio::spawn(async move {
@@ -4347,6 +4394,36 @@ mod tests {
             assert!(
                 cm.nodes_on_dispatch_cooldown().contains("n1"),
                 "a resources-unavailable reject must put the node on cooldown"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn interactive_registration_resources_unavailable_cools_down_the_node() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let addr = spawn_mock_agent_rejecting_registration().await;
+            register_node_at(&cm, "n1", addr);
+
+            let mut spec = batch_spec("srun-resource-reject", 1);
+            spec.srun_job = true;
+            let job_id = submit_and_wait(&cm, spec.clone());
+
+            assert!(cm.nodes_on_dispatch_cooldown().is_empty());
+            let outcome = register_allocation_on_nodes(
+                cm.clone(),
+                job_id,
+                vec!["n1".into()],
+                &spec,
+                HashMap::from([("n1".into(), ResourceAllocations::with_scalar(4, 8000))]),
+                "n1".into(),
+                0,
+            )
+            .await;
+            assert!(matches!(outcome, AllocationRegisterOutcome::AllFailed));
+            assert!(
+                cm.nodes_on_dispatch_cooldown().contains("n1"),
+                "a resources-unavailable reject on the srun registration path must cool the node too"
             );
         }
 

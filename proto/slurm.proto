@@ -790,6 +790,8 @@ message AgentCancelJobRequest {
 message AgentSuspendJobRequest {
   uint32 job_id = 1;
   bool resume = 2;   // false = SIGSTOP (suspend), true = SIGCONT (resume)
+  // See LaunchJobRequest.term.
+  uint64 term = 3;
 }
 
 message NodeResourcesResponse {

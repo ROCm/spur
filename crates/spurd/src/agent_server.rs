@@ -1612,6 +1612,7 @@ impl SlurmAgent for AgentService {
         request: Request<AgentSuspendJobRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
+        self.check_term(req.term)?;
         self.suspend_signal(req.job_id, req.resume).await;
         Ok(Response::new(()))
     }
@@ -4637,6 +4638,36 @@ mod tests {
             1,
             "cancel must release a launching (never-committed) reservation"
         );
+    }
+
+    // A demoted leader's stale SuspendJob must be rejected like LaunchJob/CancelJob/
+    // RegisterJobAllocation already are.
+    #[tokio::test]
+    async fn suspend_job_rejects_a_stale_term() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        svc.suspend_job(Request::new(AgentSuspendJobRequest {
+            job_id: 1,
+            resume: false,
+            term: 5,
+        }))
+        .await
+        .expect("first real term is accepted");
+
+        let err = svc
+            .suspend_job(Request::new(AgentSuspendJobRequest {
+                job_id: 1,
+                resume: false,
+                term: 3,
+            }))
+            .await
+            .expect_err("a stale term must be rejected");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }
 
     // A launch that aborts before entering `running` must tear down its PMI
