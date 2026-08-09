@@ -201,7 +201,7 @@ class TestFailureSemantics:
         assert wait_job(spank_cluster, job_id, timeout=90) in ("CD", "GONE")
         assert "RAN_ANYWAY" in spank_cluster.read_output_on_any_node(out_path)
 
-        log = spank_cluster.spurd_log()
+        log = spank_cluster.spurd_log_all_nodes()
         assert "SPANK hook returned error" in log, (
             f"a failing hook must be logged:\n{log}"
         )

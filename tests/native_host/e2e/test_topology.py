@@ -9,11 +9,9 @@ multi-node jobs that opt in with `--topology` are reordered; everything else
 must be unaffected, which is what most of these tests pin down.
 """
 
-import re
-
 import pytest
 
-from cluster import expand_hostlist, parse_job_id, wait_job, wait_job_state
+from cluster import job_node_names, parse_job_id, wait_job, wait_job_state
 
 
 def switches_for(cluster) -> list[dict]:
@@ -41,10 +39,7 @@ def tree_cluster(unstarted_cluster):
 
 
 def job_nodes(cluster, job_id: int) -> set[str]:
-    out = cluster.scontrol("show", "job", str(job_id))
-    match = re.search(r"NodeList=(\S+)", out)
-    assert match, f"scontrol reported no NodeList for job {job_id}:\n{out}"
-    return set(expand_hostlist(match.group(1)))
+    return set(job_node_names(cluster, job_id))
 
 
 def submit_multinode(cluster, name: str, nodes: int, extra: list[str]) -> int:

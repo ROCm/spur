@@ -14,13 +14,37 @@ import time
 
 import pytest
 
-from cluster import expand_hostlist, parse_job_id, wait_job, wait_job_state
+from cluster import job_node_indices, parse_job_id, wait_job, wait_job_state
 
 CGROUP_ROOT = "/sys/fs/cgroup/spur"
 
 # `tail` buffers its whole input before writing, so this allocates ~512 MiB of
 # anonymous memory using only coreutils.
 MEMORY_HOG = "#!/bin/bash\nhead -c 512M /dev/zero | tail -c 512M > /dev/null\n"
+
+
+def _memory_controller_preflight(cluster):
+    """Skip unless a job cgroup would really get a memory limit.
+
+    spurd enables the controller on its own cgroup root, which only takes
+    effect if the parent delegated `memory` down to it. Containerised hosts
+    frequently have not, and spurd then logs a warning and runs the job with no
+    limit at all -- so a --mem test would quietly measure nothing.
+    """
+    probe = f"{CGROUP_ROOT}/e2e-memory-probe"
+    for i, node in enumerate(cluster.nodes):
+        out = node.exec_allow_fail(
+            f"{cluster._sudo_prefix()}bash -c 'mkdir -p {CGROUP_ROOT} && "
+            f"echo +memory > {CGROUP_ROOT}/cgroup.subtree_control 2>/dev/null; "
+            f"mkdir -p {probe} && test -f {probe}/memory.max && echo ENFORCED; "
+            f"rmdir {probe} 2>/dev/null'"
+        )
+        if "ENFORCED" not in out:
+            pytest.skip(
+                f"cgroup v2 memory controller is not delegated to "
+                f"{CGROUP_ROOT} on {cluster.node_names[i]}, so --mem cannot "
+                f"be enforced there"
+            )
 
 
 def _start_rootful(cluster, **start_kwargs):
@@ -31,6 +55,7 @@ def _start_rootful(cluster, **start_kwargs):
     )
     if "V2" not in probe:
         pytest.skip("cgroup v2 unified hierarchy is not mounted")
+    _memory_controller_preflight(cluster)
     # Job ids restart at 1 for every cluster while cgroup paths are global to
     # the host, so a leftover job_N from an earlier test reads as this one's.
     for node in cluster.nodes:
@@ -63,12 +88,7 @@ def _job_node(cluster, job_id: int):
     Reading whichever node happens to hold job_N's cgroup picks up an earlier
     test's leftovers as readily as this job's own.
     """
-    show = cluster.scontrol("show", "job", str(job_id))
-    match = re.search(r"NodeList=(\S+)", show)
-    assert match, f"job {job_id} has no NodeList:\n{show}"
-    names = expand_hostlist(match.group(1))
-    assert names, f"job {job_id} has an empty NodeList:\n{show}"
-    return cluster.nodes[cluster.node_names.index(names[0])]
+    return cluster.nodes[job_node_indices(cluster, job_id)[0]]
 
 
 def _read_cgroup(cluster, node, job_id: int, name: str) -> str:

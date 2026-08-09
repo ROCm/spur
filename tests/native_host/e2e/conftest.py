@@ -9,7 +9,6 @@ See docs/developer/building.rst for full environment variable reference.
 
 import contextlib
 import os
-import time
 from pathlib import Path
 
 import pytest

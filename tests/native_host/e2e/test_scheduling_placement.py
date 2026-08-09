@@ -7,17 +7,13 @@ Covers partition OR-lists, the additive form of --nodelist, --nodefile, and
 how equal-weight jobs distribute across idle nodes.
 """
 
-import re
 import time
 
-from cluster import expand_hostlist, parse_job_id, wait_job, wait_job_state
+from cluster import job_node_names, parse_job_id, wait_job, wait_job_state
 
 
 def _job_nodes(cluster, job_id: int) -> list[str]:
-    show = cluster.scontrol("show", "job", str(job_id))
-    match = re.search(r"NodeList=(\S+)", show)
-    assert match, f"job {job_id} has no NodeList:\n{show}"
-    return expand_hostlist(match.group(1))
+    return job_node_names(cluster, job_id)
 
 
 def _split_partitions(cluster) -> dict:

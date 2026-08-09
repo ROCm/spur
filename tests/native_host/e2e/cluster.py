@@ -1074,6 +1074,14 @@ class SpurCluster:
         raw = self.nodes[node_index].read_file(f"{self.log_dir}/spurd.log")
         return re.sub(r"\x1b\[[0-9;]*m", "", raw)
 
+    def spurd_log_all_nodes(self) -> str:
+        """Every agent's log joined together.
+
+        Job-scoped lines are only written by the node the scheduler picked, so
+        reading a fixed node asserts against a log that never saw the job.
+        """
+        return "\n".join(self.spurd_log(i) for i in range(len(self.nodes)))
+
     def spurd_registry_gpu_count(self, node_index: int = 0) -> int | None:
         """Parse cdi_devices count from spurd startup log."""
         log = self.spurd_log(node_index)
@@ -1695,6 +1703,25 @@ def job_state(squeue_output: str, job_id: int) -> str | None:
             if field in valid_states:
                 return field
     return None
+
+
+def job_node_names(cluster: SpurCluster, job_id: int) -> list[str]:
+    """Nodes allocated to *job_id*, from the controller's own view.
+
+    The scheduler is free to place a job on any node that fits, so a test that
+    hardcodes an index asserts against a node that may never have seen it.
+    """
+    show = cluster.scontrol("show", "job", str(job_id))
+    match = re.search(r"NodeList=(\S+)", show)
+    assert match, f"job {job_id} has no NodeList:\n{show}"
+    names = expand_hostlist(match.group(1))
+    assert names, f"job {job_id} has an empty NodeList:\n{show}"
+    return names
+
+
+def job_node_indices(cluster: SpurCluster, job_id: int) -> list[int]:
+    """Positions in ``cluster.nodes`` of the nodes allocated to *job_id*."""
+    return [cluster.node_names.index(name) for name in job_node_names(cluster, job_id)]
 
 
 def wait_job_state(

@@ -12,7 +12,13 @@ observable invariants rather than internal timing.
 import re
 import time
 
-from cluster import job_state, parse_job_id, wait_job, wait_job_state
+from cluster import (
+    job_node_indices,
+    job_state,
+    parse_job_id,
+    wait_job,
+    wait_job_state,
+)
 
 
 def _launched_job_ids(cluster, node_index: int) -> set[int]:
@@ -47,7 +53,7 @@ class TestAllNodeDispatchConfirmation:
             wait_job_state(cluster, job_id, "R", timeout=90)
             missing = [
                 cluster.node_names[i]
-                for i in range(2)
+                for i in job_node_indices(cluster, job_id)
                 if job_id not in _launched_job_ids(cluster, i)
             ]
             assert not missing, (

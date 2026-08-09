@@ -4511,7 +4511,7 @@ mod tests {
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
             &spur_core::config::ClusterConfig::default(),
-            spur_core::config::MemlockLimit::Unlimited,
+            spur_core::config::JobLimits::default(),
             MpiConfig::default(),
             running,
         );
