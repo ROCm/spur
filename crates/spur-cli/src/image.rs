@@ -3,6 +3,7 @@
 
 //! `spur image` subcommands for container image management.
 
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
@@ -201,7 +202,7 @@ async fn cmd_import_podman(image: &str) -> Result<()> {
 /// Extract a `docker save` tar archive into a rootfs.
 /// The tar contains a manifest.json listing layer tarballs.
 fn extract_docker_save_tar(tar_data: &[u8], rootfs: &str) -> Result<()> {
-    let dest = std::path::Path::new(rootfs);
+    let dest = Path::new(rootfs);
     let tmp = dest.join(".docker_save");
     std::fs::create_dir_all(&tmp)?;
 
@@ -212,8 +213,13 @@ fn extract_docker_save_tar(tar_data: &[u8], rootfs: &str) -> Result<()> {
             .unpack(&tmp)
             .context("failed to extract docker save archive")?;
 
-        let manifest_str = std::fs::read_to_string(tmp.join("manifest.json"))
+        let archive_root = tmp
+            .canonicalize()
+            .context("failed to resolve docker save directory")?;
+        let manifest_path = resolve_docker_save_file(&archive_root, "manifest.json")
             .context("no manifest.json in docker save")?;
+        let manifest_str =
+            std::fs::read_to_string(manifest_path).context("no manifest.json in docker save")?;
         let manifest: Vec<serde_json::Value> =
             serde_json::from_str(&manifest_str).context("invalid manifest.json")?;
 
@@ -227,7 +233,8 @@ fn extract_docker_save_tar(tar_data: &[u8], rootfs: &str) -> Result<()> {
             let layer_file = layer_path
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("invalid layer path"))?;
-            let data = std::fs::read(tmp.join(layer_file))
+            let layer_path = resolve_docker_save_file(&archive_root, layer_file)?;
+            let data = std::fs::read(layer_path)
                 .with_context(|| format!("failed to read layer {}", layer_file))?;
 
             let reader = spur_net::image_layer::decode(&data, None)
@@ -244,6 +251,30 @@ fn extract_docker_save_tar(tar_data: &[u8], rootfs: &str) -> Result<()> {
 
     let _ = std::fs::remove_dir_all(&tmp);
     result
+}
+
+fn resolve_docker_save_file(archive_root: &Path, entry: &str) -> Result<PathBuf> {
+    let relative = Path::new(entry);
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("invalid docker save path: {entry}");
+    }
+
+    let resolved = archive_root
+        .join(relative)
+        .canonicalize()
+        .with_context(|| format!("failed to resolve docker save path {entry}"))?;
+    if !resolved.starts_with(archive_root) {
+        bail!("docker save path escapes archive: {entry}");
+    }
+    if !resolved.is_file() {
+        bail!("docker save path is not a regular file: {entry}");
+    }
+
+    Ok(resolved)
 }
 
 /// Pack a directory into a squashfs file.
@@ -439,15 +470,17 @@ mod tests {
         encoder.finish().unwrap()
     }
 
-    fn docker_save(layers: &[(&str, Vec<u8>)]) -> Vec<u8> {
-        let layer_names: Vec<&str> = layers.iter().map(|(name, _)| *name).collect();
-        let manifest = serde_json::to_vec(&serde_json::json!([{
+    fn docker_manifest(layer_names: &[&str]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!([{
             "Config": "config.json",
             "RepoTags": ["fixture:latest"],
             "Layers": layer_names,
         }]))
-        .unwrap();
+        .unwrap()
+    }
 
+    fn docker_save_with_manifest(layer_names: &[&str], layers: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let manifest = docker_manifest(layer_names);
         let mut data = Vec::new();
         let mut archive = tar::Builder::new(&mut data);
         for (path, contents) in std::iter::once(("manifest.json", manifest.as_slice())).chain(
@@ -461,6 +494,38 @@ mod tests {
             header.set_cksum();
             archive.append_data(&mut header, path, contents).unwrap();
         }
+        archive.finish().unwrap();
+        drop(archive);
+        data
+    }
+
+    fn docker_save(layers: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let layer_names: Vec<&str> = layers.iter().map(|(name, _)| *name).collect();
+        docker_save_with_manifest(&layer_names, layers)
+    }
+
+    #[cfg(unix)]
+    fn docker_save_with_symlink_layer(layer_name: &str, target: &Path) -> Vec<u8> {
+        let manifest = docker_manifest(&[layer_name]);
+        let mut data = Vec::new();
+        let mut archive = tar::Builder::new(&mut data);
+
+        let mut manifest_header = tar::Header::new_gnu();
+        manifest_header.set_size(manifest.len() as u64);
+        manifest_header.set_mode(0o644);
+        manifest_header.set_cksum();
+        archive
+            .append_data(&mut manifest_header, "manifest.json", manifest.as_slice())
+            .unwrap();
+
+        let mut link_header = tar::Header::new_gnu();
+        link_header.set_entry_type(tar::EntryType::Symlink);
+        link_header.set_size(0);
+        link_header.set_mode(0o777);
+        archive
+            .append_link(&mut link_header, layer_name, target)
+            .unwrap();
+
         archive.finish().unwrap();
         drop(archive);
         data
@@ -512,5 +577,59 @@ mod tests {
 
         assert!(error.to_string().contains("broken/layer.tar"));
         assert!(!rootfs.path().join(".docker_save").exists());
+    }
+
+    #[test]
+    fn docker_save_import_rejects_absolute_layer_path() {
+        let base = tempfile::tempdir().unwrap();
+        let rootfs = base.path().join("rootfs");
+        let outside_layer = base.path().join("outside-layer.tar");
+        let layer_data = tar_files(&[("escaped.txt", b"escaped")]);
+        std::fs::write(&outside_layer, &layer_data).unwrap();
+        let layer_name = outside_layer.to_str().unwrap();
+        let archive = docker_save_with_manifest(&[layer_name], &[]);
+
+        let error = extract_docker_save_tar(&archive, rootfs.to_str().unwrap()).unwrap_err();
+
+        assert!(error.to_string().contains("invalid docker save path"));
+        assert!(!rootfs.join("escaped.txt").exists());
+        assert_eq!(std::fs::read(&outside_layer).unwrap(), layer_data);
+        assert!(!rootfs.join(".docker_save").exists());
+    }
+
+    #[test]
+    fn docker_save_import_rejects_parent_layer_path() {
+        let base = tempfile::tempdir().unwrap();
+        let rootfs = base.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        let outside_layer = rootfs.join("outside-layer.tar");
+        let layer_data = tar_files(&[("escaped.txt", b"escaped")]);
+        std::fs::write(&outside_layer, &layer_data).unwrap();
+        let archive = docker_save_with_manifest(&["../outside-layer.tar"], &[]);
+
+        let error = extract_docker_save_tar(&archive, rootfs.to_str().unwrap()).unwrap_err();
+
+        assert!(error.to_string().contains("invalid docker save path"));
+        assert!(!rootfs.join("escaped.txt").exists());
+        assert_eq!(std::fs::read(&outside_layer).unwrap(), layer_data);
+        assert!(!rootfs.join(".docker_save").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_save_import_rejects_symlinked_layer_path() {
+        let base = tempfile::tempdir().unwrap();
+        let rootfs = base.path().join("rootfs");
+        let outside_layer = base.path().join("outside-layer.tar");
+        let layer_data = tar_files(&[("escaped.txt", b"escaped")]);
+        std::fs::write(&outside_layer, &layer_data).unwrap();
+        let archive = docker_save_with_symlink_layer("layers/escape.tar", &outside_layer);
+
+        let error = extract_docker_save_tar(&archive, rootfs.to_str().unwrap()).unwrap_err();
+
+        assert!(error.to_string().contains("escapes archive"));
+        assert!(!rootfs.join("escaped.txt").exists());
+        assert_eq!(std::fs::read(&outside_layer).unwrap(), layer_data);
+        assert!(!rootfs.join(".docker_save").exists());
     }
 }
