@@ -135,6 +135,11 @@ pub async fn run(
                         wg_pubkey: String::new(),
                         labels: std::collections::HashMap::new(),
                         join_token: String::new(),
+                        agent_session_id: String::new(),
+                        node_boot_id: String::new(),
+                        allocation_inventory: Vec::new(),
+                        recovery_complete: true,
+                        supports_command_polling: false,
                     };
 
                     match ctrl_client.register_agent(req.clone()).await {

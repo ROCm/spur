@@ -52,7 +52,7 @@ pub struct JobControllerCtx {
     pub client: Client,
     pub ctrl_client: Mutex<SlurmControllerClient<Channel>>,
     /// Track multi-pod completion: job_id → (expected_count, completed_count, any_failed)
-    pub(crate) pod_tracker: Mutex<HashMap<u32, PodTracker>>,
+    pub(crate) pod_tracker: Mutex<HashMap<(u32, u32), PodTracker>>,
 }
 
 pub(crate) struct PodTracker {
@@ -257,6 +257,7 @@ async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action
                     job_id,
                     signal: 0,
                     user: String::new(),
+                    run_attempt: 0,
                 })
                 .await;
         }
@@ -368,6 +369,11 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                 Ok(id) => id,
                 Err(_) => continue,
             };
+            let run_attempt = labels
+                .and_then(|labels| labels.get("spur.amd.com/run-attempt"))
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let allocation_key = (job_id, run_attempt);
 
             let phase = pod
                 .status
@@ -417,7 +423,7 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
             // Multi-pod tracking: check if all pods for this job are done.
             let should_report = {
                 let mut tracker = ctx.pod_tracker.lock().await;
-                let entry = tracker.entry(job_id).or_insert_with(|| {
+                let entry = tracker.entry(allocation_key).or_insert_with(|| {
                     // We don't know the expected count here, so we'll report
                     // on first failure or let the pod watcher handle it
                     PodTracker {
@@ -451,20 +457,20 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                 let final_exit_code = {
                     let tracker = ctx.pod_tracker.lock().await;
                     tracker
-                        .get(&job_id)
+                        .get(&allocation_key)
                         .map(|t| if t.failed { t.exit_code } else { exit_code })
                         .unwrap_or(exit_code)
                 };
 
                 let final_oom = {
                     let tracker = ctx.pod_tracker.lock().await;
-                    tracker.get(&job_id).map(|t| t.oom).unwrap_or(oom)
+                    tracker.get(&allocation_key).map(|t| t.oom).unwrap_or(oom)
                 };
 
                 let final_message = {
                     let tracker = ctx.pod_tracker.lock().await;
                     tracker
-                        .get(&job_id)
+                        .get(&allocation_key)
                         .map(|t| {
                             if t.failed && !t.message.is_empty() {
                                 t.message.clone()
@@ -524,14 +530,15 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                     drain_node: false,
                     drain_reason: String::new(),
                     reporting_node,
-                    // K8s operator doesn't track run epochs; 0 disables the
-                    // controller-side staleness check for this report.
-                    run_attempt: 0,
+                    run_attempt,
+                    agent_session_id: String::new(),
+                    node_boot_id: String::new(),
+                    node_token: String::new(),
                 };
                 if let Err(e) = ctrl.report_job_status(req).await {
                     error!(job_id, error = %e, "failed to report job status");
                 } else if report_state.is_terminal() {
-                    ctx.pod_tracker.lock().await.remove(&job_id);
+                    ctx.pod_tracker.lock().await.remove(&allocation_key);
                 }
             }
         }

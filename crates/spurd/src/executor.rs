@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -11,6 +12,7 @@ use std::process::Stdio;
 use anyhow::{bail, Context};
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use nix::unistd::Pid;
+use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
@@ -111,6 +113,17 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup/spur";
 /// wrapper). Deliberately off the user's work_dir so these root-side writes
 /// never hit an NFS root_squash mount. Mirrors Slurm's SlurmdSpoolDir.
 const SPOOL_ROOT: &str = "/var/spool/spur";
+const RECOVERY_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RecoveryManifest {
+    schema_version: u32,
+    job_id: JobId,
+    run_attempt: u32,
+    pid: i32,
+    start_time: u64,
+    cgroup_path: Option<PathBuf>,
+}
 
 pub struct ContainerLaunchConfig {
     pub config: ContainerConfig,
@@ -440,6 +453,15 @@ impl RunningJob {
         match self {
             RunningJob::Managed { cgroup_path, .. } => cgroup_path.take(),
             RunningJob::Forked { cgroup_path, .. } => cgroup_path.take(),
+            RunningJob::AllocationOnly => None,
+        }
+    }
+
+    fn cgroup_path(&self) -> Option<&Path> {
+        match self {
+            RunningJob::Managed { cgroup_path, .. } | RunningJob::Forked { cgroup_path, .. } => {
+                cgroup_path.as_deref()
+            }
             RunningJob::AllocationOnly => None,
         }
     }
@@ -961,6 +983,14 @@ fn setup_cgroup(
     Ok(Some(cgroup_path))
 }
 
+pub fn setup_step_cgroup(
+    job_id: JobId,
+    cpus: u32,
+    memory_mb: u64,
+) -> anyhow::Result<Option<PathBuf>> {
+    setup_cgroup(job_id, cpus, memory_mb, &[])
+}
+
 /// Move a process into a cgroup. Returns true if successful.
 fn move_to_cgroup(cgroup_path: &Path, pid: u32) -> bool {
     let procs_file = cgroup_path.join("cgroup.procs");
@@ -974,6 +1004,10 @@ fn move_to_cgroup(cgroup_path: &Path, pid: u32) -> bool {
     } else {
         true
     }
+}
+
+pub fn attach_process_to_cgroup(cgroup_path: &Path, pid: u32) -> bool {
+    move_to_cgroup(cgroup_path, pid)
 }
 
 /// Whether the job's cgroup recorded an OOM kill (cgroup-v2 `memory.events`).
@@ -1003,6 +1037,336 @@ pub fn cleanup_cgroup(cgroup_path: &Path) {
     if let Err(e) = std::fs::remove_dir(cgroup_path) {
         warn!(error = %e, path = %cgroup_path.display(), "failed to remove cgroup");
     }
+}
+
+pub fn cleanup_job_cgroup(job_id: JobId) {
+    let path = Path::new(CGROUP_ROOT).join(format!("job_{job_id}"));
+    if path.exists() {
+        cleanup_cgroup(&path);
+    }
+}
+
+fn recovery_manifests_for_allocation(
+    root: &Path,
+    job_id: JobId,
+    run_attempt: u32,
+) -> anyhow::Result<Vec<(PathBuf, RecoveryManifest)>> {
+    let mut manifests = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if entry
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("json")
+        {
+            continue;
+        }
+        let bytes = std::fs::read(entry.path())?;
+        let manifest: RecoveryManifest = serde_json::from_slice(&bytes)?;
+        if manifest.schema_version != RECOVERY_SCHEMA_VERSION {
+            anyhow::bail!(
+                "unsupported recovery manifest schema {}",
+                manifest.schema_version
+            );
+        }
+        if manifest.job_id == job_id && (run_attempt == 0 || manifest.run_attempt == run_attempt) {
+            manifests.push((entry.path(), manifest));
+        }
+    }
+    Ok(manifests)
+}
+
+fn signal_residual_cgroup(cgroup: &Path) -> anyhow::Result<()> {
+    if !cgroup.exists() {
+        return Ok(());
+    }
+    let kill = cgroup.join("cgroup.kill");
+    if kill.exists() {
+        std::fs::write(&kill, "1")
+            .with_context(|| format!("kill residual cgroup {}", cgroup.display()))?;
+        return Ok(());
+    }
+    let pids = std::fs::read_to_string(cgroup.join("cgroup.procs"))
+        .with_context(|| format!("read residual cgroup {}", cgroup.display()))?;
+    for pid in pids.lines().filter_map(|value| value.trim().parse().ok()) {
+        kill_process_tree(pid, Signal::SIGKILL);
+    }
+    Ok(())
+}
+
+fn cgroup_is_empty(cgroup: &Path) -> anyhow::Result<bool> {
+    if !cgroup.exists() {
+        return Ok(true);
+    }
+    let processes = std::fs::read_to_string(cgroup.join("cgroup.procs"))
+        .with_context(|| format!("read residual cgroup {}", cgroup.display()))?;
+    Ok(processes.trim().is_empty())
+}
+
+pub async fn terminate_residual_allocation(job_id: JobId, run_attempt: u32) -> anyhow::Result<()> {
+    let root = prepare_recovery_root()?;
+    let manifests = recovery_manifests_for_allocation(&root, job_id, run_attempt)?;
+    let cgroup = Path::new(CGROUP_ROOT).join(format!("job_{job_id}"));
+
+    for _ in 0..100 {
+        signal_residual_cgroup(&cgroup)?;
+        for (_, manifest) in &manifests {
+            if process_identity_is_live(manifest.pid, manifest.start_time) {
+                kill_process_tree(manifest.pid, Signal::SIGKILL);
+            }
+        }
+
+        let processes_gone = manifests
+            .iter()
+            .all(|(_, manifest)| !process_identity_is_live(manifest.pid, manifest.start_time));
+        if processes_gone && cgroup_is_empty(&cgroup)? {
+            if cgroup.exists() {
+                std::fs::remove_dir(&cgroup)
+                    .with_context(|| format!("remove residual cgroup {}", cgroup.display()))?;
+            }
+            cleanup_job_spool_files(job_id);
+            for (path, _) in manifests {
+                let _ = std::fs::remove_file(path);
+            }
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    anyhow::bail!("residual processes for job {job_id} attempt {run_attempt} are still present")
+}
+
+pub fn recover_residual_job_cgroups() -> anyhow::Result<usize> {
+    let root = Path::new(CGROUP_ROOT);
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error).context("scan Spur job cgroups"),
+    };
+
+    let mut recovered = 0;
+    for entry in entries {
+        let entry = entry.context("read Spur cgroup entry")?;
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("job_") {
+            continue;
+        }
+        let path = entry.path();
+        if path.join("cgroup.kill").exists() {
+            std::fs::write(path.join("cgroup.kill"), "1")
+                .with_context(|| format!("kill residual cgroup {}", path.display()))?;
+        } else {
+            cleanup_cgroup(&path);
+        }
+        let remaining = std::fs::read_to_string(path.join("cgroup.procs")).unwrap_or_default();
+        if !remaining.trim().is_empty() {
+            anyhow::bail!("residual cgroup {} still has processes", path.display());
+        }
+        if path.exists() {
+            std::fs::remove_dir(&path)
+                .with_context(|| format!("remove residual cgroup {}", path.display()))?;
+        }
+        recovered += 1;
+    }
+    Ok(recovered)
+}
+
+fn recovery_root() -> PathBuf {
+    if nix::unistd::geteuid().is_root() {
+        PathBuf::from(SPOOL_ROOT).join("recovery")
+    } else {
+        std::env::temp_dir().join(format!("spur-recovery-{}", nix::unistd::geteuid().as_raw()))
+    }
+}
+
+fn prepare_recovery_root() -> anyhow::Result<PathBuf> {
+    let root = recovery_root();
+    prepare_recovery_root_at(&root)?;
+    Ok(root)
+}
+
+fn prepare_recovery_root_at(root: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(root)
+        .with_context(|| format!("create recovery spool {}", root.display()))?;
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+    let metadata = std::fs::symlink_metadata(root)?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || metadata.mode() & 0o077 != 0
+    {
+        anyhow::bail!("recovery spool {} is not private to spurd", root.display());
+    }
+    Ok(())
+}
+
+fn proc_start_time(pid: i32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_name = stat.rsplit_once(") ")?.1;
+    after_name.split_whitespace().nth(19)?.parse().ok()
+}
+
+fn process_identity_is_live(pid: i32, start_time: u64) -> bool {
+    let Some(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok() else {
+        return false;
+    };
+    let Some(after_name) = stat.rsplit_once(") ").map(|(_, fields)| fields) else {
+        return false;
+    };
+    let fields: Vec<_> = after_name.split_whitespace().collect();
+    fields.first() != Some(&"Z")
+        && fields.get(19).and_then(|value| value.parse::<u64>().ok()) == Some(start_time)
+}
+
+pub fn write_recovery_manifest(
+    job_id: JobId,
+    run_attempt: u32,
+    job: &RunningJob,
+) -> anyhow::Result<()> {
+    let Some(pid) = job.pid().map(|pid| pid as i32) else {
+        return Ok(());
+    };
+    write_process_recovery_manifest(job_id, run_attempt, pid, job.cgroup_path())
+}
+
+#[cfg(test)]
+fn write_recovery_manifest_at(
+    root: &Path,
+    job_id: JobId,
+    run_attempt: u32,
+    job: &RunningJob,
+) -> anyhow::Result<()> {
+    let Some(pid) = job.pid().map(|pid| pid as i32) else {
+        return Ok(());
+    };
+    write_process_recovery_manifest_at(root, job_id, run_attempt, pid, job.cgroup_path())
+}
+
+pub fn write_process_recovery_manifest(
+    job_id: JobId,
+    run_attempt: u32,
+    pid: i32,
+    cgroup_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let root = prepare_recovery_root()?;
+    write_process_recovery_manifest_at(&root, job_id, run_attempt, pid, cgroup_path)
+}
+
+fn recovery_manifest_path(root: &Path, job_id: JobId, run_attempt: u32, pid: i32) -> PathBuf {
+    root.join(format!("job_{job_id}_{run_attempt}_{pid}.json"))
+}
+
+fn write_process_recovery_manifest_at(
+    root: &Path,
+    job_id: JobId,
+    run_attempt: u32,
+    pid: i32,
+    cgroup_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let start_time = proc_start_time(pid)
+        .ok_or_else(|| anyhow::anyhow!("job process {pid} disappeared before it was recorded"))?;
+    prepare_recovery_root_at(root)?;
+    let path = recovery_manifest_path(root, job_id, run_attempt, pid);
+    let temporary = root.join(format!(".job_{job_id}_{run_attempt}_{pid}.tmp"));
+    let manifest = RecoveryManifest {
+        schema_version: RECOVERY_SCHEMA_VERSION,
+        job_id,
+        run_attempt,
+        pid,
+        start_time,
+        cgroup_path: cgroup_path.map(Path::to_path_buf),
+    };
+    let bytes = serde_json::to_vec(&manifest)?;
+    std::fs::write(&temporary, bytes)
+        .with_context(|| format!("write recovery manifest {}", temporary.display()))?;
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&temporary, &path)
+        .with_context(|| format!("install recovery manifest {}", path.display()))?;
+    Ok(())
+}
+
+pub fn remove_process_recovery_manifest(job_id: JobId, run_attempt: u32, pid: i32) {
+    let _ = std::fs::remove_file(recovery_manifest_path(
+        &recovery_root(),
+        job_id,
+        run_attempt,
+        pid,
+    ));
+}
+
+fn remove_recovery_manifests(job_id: JobId) {
+    let root = recovery_root();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(entry.path()) else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_slice::<RecoveryManifest>(&bytes) else {
+            continue;
+        };
+        if manifest.job_id == job_id {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+pub fn recover_residual_allocations() -> anyhow::Result<usize> {
+    let mut recovered = recover_residual_job_cgroups()?;
+    let root = prepare_recovery_root()?;
+    recovered += recover_manifests_at(&root)?;
+    Ok(recovered)
+}
+
+fn recover_manifests_at(root: &Path) -> anyhow::Result<usize> {
+    prepare_recovery_root_at(root)?;
+    let mut recovered = 0;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if entry
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("json")
+        {
+            continue;
+        }
+        let bytes = std::fs::read(entry.path())?;
+        let manifest: RecoveryManifest = serde_json::from_slice(&bytes)?;
+        if manifest.schema_version != RECOVERY_SCHEMA_VERSION {
+            anyhow::bail!(
+                "unsupported recovery manifest schema {}",
+                manifest.schema_version
+            );
+        }
+        if let Some(cgroup) = &manifest.cgroup_path {
+            let expected = Path::new(CGROUP_ROOT).join(format!("job_{}", manifest.job_id));
+            if cgroup != &expected {
+                anyhow::bail!("recovery manifest has an invalid cgroup path");
+            }
+            if cgroup.exists() {
+                cleanup_cgroup(cgroup);
+            }
+        }
+        if process_identity_is_live(manifest.pid, manifest.start_time) {
+            kill_process_tree(manifest.pid, Signal::SIGKILL);
+        }
+        if process_identity_is_live(manifest.pid, manifest.start_time) {
+            anyhow::bail!(
+                "residual process {} for job {} is still alive",
+                manifest.pid,
+                manifest.job_id
+            );
+        }
+        cleanup_job_spool_files(manifest.job_id);
+        let _ = std::fs::remove_file(entry.path());
+        recovered += 1;
+    }
+    Ok(recovered)
 }
 
 /// Recursively signal a process and all its descendants (children first).
@@ -1373,6 +1737,11 @@ pub(crate) fn write_job_scratch(
 /// batchdir after completion. Tries both candidate roots since the fallback
 /// location isn't recorded.
 pub fn cleanup_job_spool(job_id: JobId) {
+    cleanup_job_spool_files(job_id);
+    remove_recovery_manifests(job_id);
+}
+
+fn cleanup_job_spool_files(job_id: JobId) {
     for base in [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")] {
         let _ = std::fs::remove_dir_all(base.join(format!("job{}", job_id)));
     }
@@ -2070,6 +2439,127 @@ mod tests {
         write_job_scratch(&dir.join("spur_job.sh"), "x", uid, gid).unwrap();
         cleanup_job_spool(job_id);
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn recovery_manifest_records_exact_process_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = RunningJob::Forked {
+            pid: std::process::id() as i32,
+            _pidfd: None,
+            cgroup_path: None,
+            reaped: false,
+        };
+        write_recovery_manifest_at(dir.path(), 41, 3, &job).unwrap();
+
+        let path = recovery_manifest_path(dir.path(), 41, 3, std::process::id() as i32);
+        let bytes = std::fs::read(path).unwrap();
+        let manifest: RecoveryManifest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(manifest.job_id, 41);
+        assert_eq!(manifest.run_attempt, 3);
+        assert_eq!(manifest.pid, std::process::id() as i32);
+        assert_eq!(manifest.start_time, proc_start_time(manifest.pid).unwrap());
+    }
+
+    #[test]
+    fn recovery_manifest_kills_the_recorded_process_before_clearing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("recovery_manifest_child_process")
+            .arg("--ignored")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let job = RunningJob::Forked {
+            pid: child.id() as i32,
+            _pidfd: None,
+            cgroup_path: None,
+            reaped: false,
+        };
+        write_recovery_manifest_at(dir.path(), 42, 4, &job).unwrap();
+        let manifest_path = recovery_manifest_path(dir.path(), 42, 4, child.id() as i32);
+
+        let first_recovery = recover_manifests_at(dir.path());
+        let status = child.wait().unwrap();
+        let recovered = match first_recovery {
+            Ok(recovered) => recovered,
+            Err(_) => recover_manifests_at(dir.path()).unwrap(),
+        };
+
+        assert_eq!(recovered, 1);
+        assert!(!status.success());
+        assert!(!manifest_path.exists());
+    }
+
+    #[test]
+    fn recovery_processes_every_manifest_for_one_job() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare_recovery_root_at(dir.path()).unwrap();
+        let current_pid = std::process::id() as i32;
+        let manifests = [
+            RecoveryManifest {
+                schema_version: RECOVERY_SCHEMA_VERSION,
+                job_id: 44,
+                run_attempt: 6,
+                pid: current_pid,
+                start_time: proc_start_time(current_pid).unwrap() + 1,
+                cgroup_path: None,
+            },
+            RecoveryManifest {
+                schema_version: RECOVERY_SCHEMA_VERSION,
+                job_id: 44,
+                run_attempt: 6,
+                pid: i32::MAX,
+                start_time: 1,
+                cgroup_path: None,
+            },
+        ];
+        for manifest in &manifests {
+            let path = recovery_manifest_path(
+                dir.path(),
+                manifest.job_id,
+                manifest.run_attempt,
+                manifest.pid,
+            );
+            std::fs::write(path, serde_json::to_vec(manifest).unwrap()).unwrap();
+        }
+
+        assert_eq!(recover_manifests_at(dir.path()).unwrap(), 2);
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn recovery_manifest_does_not_signal_a_reused_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare_recovery_root_at(dir.path()).unwrap();
+        let pid = std::process::id() as i32;
+        let manifest = RecoveryManifest {
+            schema_version: RECOVERY_SCHEMA_VERSION,
+            job_id: 43,
+            run_attempt: 5,
+            pid,
+            start_time: proc_start_time(pid).unwrap() + 1,
+            cgroup_path: None,
+        };
+        std::fs::write(
+            dir.path().join("job_43.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(recover_manifests_at(dir.path()).unwrap(), 1);
+        assert!(proc_start_time(pid).is_some());
+        assert!(!dir.path().join("job_43.json").exists());
+    }
+
+    #[test]
+    #[ignore]
+    fn recovery_manifest_child_process() {
+        loop {
+            std::thread::park();
+        }
     }
 
     // send_fds/recv_fds are process-agnostic: they pass fds over any Unix

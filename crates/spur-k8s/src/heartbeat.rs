@@ -63,6 +63,11 @@ impl HeartbeatManager {
                             running_jobs: vec![],
                             node_token: String::new(),
                             wg_pubkey: String::new(), // virtual agents are not on the mesh
+                            agent_session_id: String::new(),
+                            node_boot_id: String::new(),
+                            allocation_inventory: Vec::new(),
+                            recovery_complete: true,
+                            supports_command_polling: false,
                         };
                         match client.heartbeat(req).await {
                             Ok(_) => debug!(node = %name, "heartbeat sent"),
@@ -102,6 +107,11 @@ mod tests {
             wg_pubkey: String::new(),
             labels: std::collections::HashMap::new(),
             join_token: String::new(),
+            agent_session_id: String::new(),
+            node_boot_id: String::new(),
+            allocation_inventory: Vec::new(),
+            recovery_complete: true,
+            supports_command_polling: false,
         }
     }
 

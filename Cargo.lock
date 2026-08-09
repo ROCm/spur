@@ -3786,6 +3786,7 @@ dependencies = [
  "http-body-util",
  "openraft",
  "parking_lot",
+ "prost",
  "prost-types",
  "serde",
  "serde_json",
@@ -3817,6 +3818,7 @@ dependencies = [
  "libc",
  "libloading",
  "nix",
+ "prost",
  "prost-types",
  "serde",
  "serde_json",
@@ -3835,6 +3837,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

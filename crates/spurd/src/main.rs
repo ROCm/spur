@@ -285,17 +285,6 @@ async fn main() -> anyhow::Result<()> {
         running_jobs.clone(),
     ));
 
-    // Register with controller
-    reporter.register().await?;
-
-    // Start heartbeat loop
-    let hb_reporter = reporter.clone();
-    tokio::spawn(async move {
-        hb_reporter.heartbeat_loop().await;
-    });
-
-    // Start agent gRPC server (receives job launches + cluster-component RPCs from spurctld).
-    // Pass the [cluster] config so the K0sAgent uses the operator's k0s version + install path.
     let memlock = match config.as_ref() {
         Some(c) => c.rlimits.memlock_limit()?,
         None => spur_core::config::MemlockLimit::Unlimited,
@@ -316,6 +305,50 @@ async fn main() -> anyhow::Result<()> {
         running_jobs,
     );
 
+    match executor::recover_residual_allocations() {
+        Ok(recovered) => {
+            if recovered > 0 {
+                warn!(
+                    recovered,
+                    "removed residual job cgroups before registration"
+                );
+            }
+            reporter.mark_recovery_complete();
+        }
+        Err(error) => {
+            warn!(error = %error, "node remains unschedulable while residual jobs are cleaned");
+            let recovery_reporter = reporter.clone();
+            tokio::spawn(async move {
+                let mut retry = tokio::time::interval(std::time::Duration::from_secs(2));
+                loop {
+                    retry.tick().await;
+                    match executor::recover_residual_allocations() {
+                        Ok(_) => {
+                            recovery_reporter.mark_recovery_complete();
+                            if let Err(error) = recovery_reporter.register().await {
+                                warn!(error = %error, "failed to publish completed node recovery");
+                                continue;
+                            }
+                            break;
+                        }
+                        Err(error) => {
+                            warn!(error = %error, "residual job cleanup still incomplete");
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    // Register with controller
+    reporter.register().await?;
+
+    // Start heartbeat loop
+    let hb_reporter = reporter.clone();
+    tokio::spawn(async move {
+        hb_reporter.heartbeat_loop().await;
+    });
+
     // the RPC-driven k0s component owner is idle until the controller sends
     // StartClusterComponent; k0s then runs under its OWN systemd unit — never as a spurd job/child —
     // so it survives spurd restart and stays out of the executor/monitor/time-limit job path. The
@@ -327,10 +360,15 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(k0s.supervise());
 
     agent_service.start_monitor(args.controller.clone());
+    let command_service = agent_service.clone();
+    tokio::spawn(async move {
+        command_service.command_loop().await;
+    });
 
     let addr = args.listen.parse()?;
     info!(%addr, "agent gRPC server listening");
 
+    let shutdown_service = agent_service.clone();
     let server_future = tonic::transport::Server::builder()
         .add_service(spur_proto::agent_server(agent_service))
         .serve(addr);
@@ -340,17 +378,27 @@ async fn main() -> anyhow::Result<()> {
     tokio::select! {
         result = server_future => { result?; }
         _ = sigterm.recv() => {
-            info!("received SIGTERM, deregistering from controller");
-            let dereg_reporter = reporter.clone();
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                dereg_reporter.deregister("agent shutdown"),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!(error = %e, "deregistration failed"),
-                Err(_) => warn!("deregistration timed out"),
+            info!("received SIGTERM, cleaning local jobs before deregistration");
+            match shutdown_service.shutdown_jobs().await {
+                Ok(()) => {
+                    let dereg_reporter = reporter.clone();
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        dereg_reporter.deregister("agent shutdown"),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => warn!(error = %e, "deregistration failed"),
+                        Err(_) => warn!("deregistration timed out"),
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "skipping deregistration because local cleanup is incomplete"
+                    );
+                }
             }
         }
     }

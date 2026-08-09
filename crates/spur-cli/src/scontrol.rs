@@ -341,6 +341,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                     job_id,
                     signal: 0,
                     user: whoami::username().unwrap_or_else(|_| "unknown".into()),
+                    run_attempt: 0,
                 })
                 .await
                 .context("requeue failed")?;

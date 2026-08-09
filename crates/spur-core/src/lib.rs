@@ -4,6 +4,7 @@
 pub mod account_limits;
 pub mod accounting;
 pub mod admission;
+pub mod allocation;
 pub mod array;
 pub mod auth;
 pub mod burst_buffer;

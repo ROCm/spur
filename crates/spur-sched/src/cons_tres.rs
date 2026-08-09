@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use spur_core::resource::{GpuResource, ResourceSet};
+use spur_core::resource::{AllocatedDevice, GpuResource, ResourceAllocations, ResourceSet};
 
 /// Why a reservation could not be made. Distinguished so the caller can map
 /// each to the right gRPC status instead of reporting every failure as GPU
@@ -22,6 +22,17 @@ pub enum AllocError {
     /// still mid-launch, not yet committed or released). A second concurrent
     /// launch would double-count resources, so it is rejected.
     DuplicateJob,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalAllocation {
+    pub job_id: u32,
+    pub run_attempt: u32,
+    pub resources: AllocationResult,
+    pub exact_resources: ResourceAllocations,
+    pub last_command_id: u64,
+    pub launching: bool,
+    pub releasing: bool,
 }
 
 /// Per-node resource allocation state.
@@ -48,9 +59,12 @@ pub struct NodeAllocation {
     /// Run epoch of each owner. A job id may be reused after requeue, so a
     /// delayed cleanup must not release a replacement run's allocation.
     owner_attempts: HashMap<u32, u32>,
+    owner_exact_resources: HashMap<u32, ResourceAllocations>,
+    owner_last_command_ids: HashMap<u32, u64>,
     /// Reserved but not yet committed, with reserve time. Reconcile spares
     /// these until they exceed a TTL so a dropped launch can't pin resources.
     launching: HashMap<u32, Instant>,
+    releasing: HashSet<u32>,
 }
 
 impl NodeAllocation {
@@ -66,7 +80,10 @@ impl NodeAllocation {
             gpus: resources.gpus.clone(),
             owners: HashMap::new(),
             owner_attempts: HashMap::new(),
+            owner_exact_resources: HashMap::new(),
+            owner_last_command_ids: HashMap::new(),
             launching: HashMap::new(),
+            releasing: HashSet::new(),
         }
     }
 
@@ -89,6 +106,64 @@ impl NodeAllocation {
             .filter(|(_, &a)| a)
             .filter_map(|(i, _)| self.gpus.get(i).map(|g| g.device_id))
             .collect()
+    }
+
+    pub fn owned_allocations(&self) -> Vec<LocalAllocation> {
+        self.owners
+            .iter()
+            .map(|(&job_id, resources)| LocalAllocation {
+                job_id,
+                run_attempt: self.owner_attempts.get(&job_id).copied().unwrap_or(0),
+                resources: resources.clone(),
+                exact_resources: self
+                    .owner_exact_resources
+                    .get(&job_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                last_command_id: self
+                    .owner_last_command_ids
+                    .get(&job_id)
+                    .copied()
+                    .unwrap_or(0),
+                launching: self.launching.contains_key(&job_id),
+                releasing: self.releasing.contains(&job_id),
+            })
+            .collect()
+    }
+
+    pub fn owns_attempt(&self, job_id: u32, run_attempt: u32) -> bool {
+        self.owners.contains_key(&job_id)
+            && (run_attempt == 0 || self.owner_attempts.get(&job_id) == Some(&run_attempt))
+    }
+
+    pub fn set_exact_resources(
+        &mut self,
+        job_id: u32,
+        run_attempt: u32,
+        resources: ResourceAllocations,
+    ) -> bool {
+        if !self.owns_attempt(job_id, run_attempt) {
+            return false;
+        }
+        self.owner_exact_resources.insert(job_id, resources);
+        true
+    }
+
+    pub fn set_last_command_id(&mut self, job_id: u32, run_attempt: u32, command_id: u64) -> bool {
+        if !self.owns_attempt(job_id, run_attempt) {
+            return false;
+        }
+        self.owner_last_command_ids.insert(job_id, command_id);
+        true
+    }
+
+    pub fn begin_release(&mut self, job_id: u32, run_attempt: u32) -> bool {
+        if !self.owns_attempt(job_id, run_attempt) {
+            return false;
+        }
+        self.launching.remove(&job_id);
+        self.releasing.insert(job_id);
+        true
     }
 
     /// Job ids owning any of `device_ids`, excluding mid-launch owners (a launch
@@ -172,13 +247,9 @@ impl NodeAllocation {
         if self.launching.contains_key(&job_id) {
             return Err(AllocError::DuplicateJob);
         }
-        // A committed reservation still owned here means a prior run's teardown
-        // has not released yet (e.g. a preempted-then-requeued job re-dispatched
-        // under the same id before the agent reaped the killed process). The
-        // controller only re-issues LaunchJob after freeing the job, so this
-        // reservation is stale — supersede it rather than reject, releasing it
-        // first so CPU/memory stay symmetric and the owner entry is not orphaned.
-        self.release_job(job_id);
+        if self.owners.contains_key(&job_id) {
+            return Err(AllocError::DuplicateJob);
+        }
 
         let mut gpu_indices = Vec::with_capacity(gpu_device_ids.len());
         for &id in gpu_device_ids {
@@ -211,8 +282,19 @@ impl NodeAllocation {
             gpu_ids: gpu_device_ids.to_vec(),
             memory_mb,
         };
+        let mut exact_resources = ResourceAllocations::with_scalar(cpus, memory_mb);
+        exact_resources.devices.insert(
+            "gpu".into(),
+            gpu_device_ids
+                .iter()
+                .copied()
+                .map(AllocatedDevice::injectable)
+                .collect(),
+        );
         self.owners.insert(job_id, result.clone());
         self.owner_attempts.insert(job_id, run_attempt);
+        self.owner_exact_resources.insert(job_id, exact_resources);
+        self.owner_last_command_ids.insert(job_id, 0);
         self.launching.insert(job_id, Instant::now());
         Ok(result)
     }
@@ -223,6 +305,7 @@ impl NodeAllocation {
     /// so the caller must not treat the job as backed by an allocation.
     pub fn commit_job(&mut self, job_id: u32) -> bool {
         self.launching.remove(&job_id);
+        self.releasing.remove(&job_id);
         self.owners.contains_key(&job_id)
     }
 
@@ -231,6 +314,8 @@ impl NodeAllocation {
     pub fn release_job(&mut self, job_id: u32) -> bool {
         self.launching.remove(&job_id);
         self.owner_attempts.remove(&job_id);
+        self.owner_exact_resources.remove(&job_id);
+        self.owner_last_command_ids.remove(&job_id);
         let Some(alloc) = self.owners.remove(&job_id) else {
             return false;
         };
@@ -262,6 +347,9 @@ impl NodeAllocation {
             .copied()
             .filter(|id| {
                 if live.contains(id) {
+                    return false;
+                }
+                if self.releasing.contains(id) {
                     return false;
                 }
                 match self.launching.get(id) {
@@ -456,30 +544,20 @@ mod tests {
     }
 
     #[test]
-    fn test_allocate_for_job_supersedes_stale_committed_reservation() {
-        // A committed reservation whose teardown has not released yet (e.g. a
-        // preempted-then-requeued job re-dispatched under the same id before the
-        // agent reaped the killed process) must be superseded, not rejected —
-        // otherwise the legitimate re-launch fails and the job never runs. The
-        // stale reservation is released first, so resources are not double-counted.
+    fn test_allocate_for_job_rejects_committed_owner_until_release() {
         let mut node = make_node(64, 256_000, 0, "");
         node.allocate_for_job(7, 8, 16_000, &[]).unwrap();
-        node.commit_job(7); // prior run committed, then preempted (not released).
+        node.commit_job(7);
         assert_eq!(node.free_cpus(), 56);
 
-        // Re-dispatch under the same id succeeds and does not double-count.
-        let alloc = node
-            .allocate_for_job(7, 8, 16_000, &[])
-            .expect("re-dispatch of a stale committed job id must succeed");
-        assert_eq!(alloc.cpu_ids.len(), 8);
-        assert_eq!(node.free_cpus(), 56);
-        assert_eq!(node.free_memory_mb(), 240_000);
-        // Exactly one owner entry remains, and the fresh reservation is again
-        // treated as in-flight until it commits or releases.
         assert_eq!(
             node.allocate_for_job(7, 8, 16_000, &[]),
             Err(AllocError::DuplicateJob)
         );
+        assert_eq!(node.free_cpus(), 56);
+        assert_eq!(node.free_memory_mb(), 240_000);
+        assert!(node.release_job(7));
+        assert!(node.allocate_for_job(7, 8, 16_000, &[]).is_ok());
     }
 
     #[test]
@@ -538,6 +616,22 @@ mod tests {
         assert!(node.release_job(1));
         assert!(node.release_job(3));
         assert_eq!(node.free_gpus(None), 4);
+    }
+
+    #[test]
+    fn test_reconcile_spares_release_until_controller_acknowledgement() {
+        let mut node = make_node(8, 16000, 0, "");
+        node.allocate_for_job_with_attempt(7, 2, 4000, &[], 3)
+            .unwrap();
+        node.commit_job(7);
+        assert!(node.begin_release(7, 3));
+
+        let reclaimed = node.reconcile(&HashSet::new(), Instant::now(), Duration::ZERO);
+        assert!(reclaimed.is_empty());
+        assert!(node.owns_attempt(7, 3));
+        assert!(node.owned_allocations()[0].releasing);
+        assert!(node.release_job_if_attempt(7, 3));
+        assert_eq!(node.free_cpus(), 8);
     }
 
     #[test]

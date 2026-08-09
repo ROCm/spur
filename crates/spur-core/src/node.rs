@@ -302,6 +302,14 @@ pub struct Node {
     pub last_busy: Option<DateTime<Utc>>,
     pub agent_start_time: Option<DateTime<Utc>>,
     pub last_heartbeat: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub agent_session_id: String,
+    #[serde(default)]
+    pub node_boot_id: String,
+    #[serde(default = "default_recovery_complete")]
+    pub recovery_complete: bool,
+    #[serde(default)]
+    pub supports_command_polling: bool,
 
     /// Routable comm address for agent gRPC and inter-node TCP (NodeAddr).
     pub address: Option<String>,
@@ -332,6 +340,10 @@ fn default_weight() -> u32 {
     Node::DEFAULT_WEIGHT
 }
 
+fn default_recovery_complete() -> bool {
+    true
+}
+
 impl Node {
     /// Default scheduling weight for a node with no matching `NodeConfig`.
     pub const DEFAULT_WEIGHT: u32 = 1;
@@ -357,6 +369,10 @@ impl Node {
             last_busy: None,
             agent_start_time: None,
             last_heartbeat: None,
+            agent_session_id: String::new(),
+            node_boot_id: String::new(),
+            recovery_complete: true,
+            supports_command_polling: false,
             address: None,
             port: 6818,
             wg_pubkey: None,

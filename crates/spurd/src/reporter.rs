@@ -1,14 +1,18 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
 use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
 use spur_devices::{resolve_link_type, DeviceRegistry, LinkType};
-use spur_proto::proto::{RegisterAgentRequest, ResourceSet as ProtoResourceSet, RunningJobStatus};
+use spur_proto::proto::{
+    AgentAllocationPhase, AgentAllocationStatus, RegisterAgentRequest,
+    ResourceSet as ProtoResourceSet, RunningJobStatus,
+};
+use spur_sched::cons_tres::NodeAllocation;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -21,8 +25,8 @@ pub trait HeldJobs: Send + Sync {
 
 #[tonic::async_trait]
 impl<T: Send> HeldJobs for Mutex<HashMap<u32, T>> {
-    // Awaits the lock rather than try_lock(): an empty result must mean "holds
-    // nothing", never "couldn't check" — the controller treats it as confirmed release.
+    // Awaiting the lock keeps inventory internally consistent with concurrent
+    // launch and release mutations.
     async fn held_job_ids(&self) -> Vec<u32> {
         self.lock().await.keys().copied().collect()
     }
@@ -46,6 +50,10 @@ pub struct NodeReporter {
     /// Job ids this node holds, reported each heartbeat so the controller can
     /// reclaim allocations it no longer tracks. Shares the agent's running map.
     held_jobs: Arc<dyn HeldJobs>,
+    allocation_source: RwLock<Option<Arc<Mutex<NodeAllocation>>>>,
+    agent_session_id: String,
+    node_boot_id: String,
+    recovery_complete: AtomicBool,
 }
 
 impl NodeReporter {
@@ -72,7 +80,66 @@ impl NodeReporter {
             wg_iface,
             node_token: RwLock::new(String::new()),
             held_jobs,
+            allocation_source: RwLock::new(None),
+            agent_session_id: uuid::Uuid::new_v4().to_string(),
+            node_boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .map(|value| value.trim().to_string())
+                .unwrap_or_default(),
+            recovery_complete: AtomicBool::new(false),
         }
+    }
+
+    pub fn set_allocation_source(&self, source: Arc<Mutex<NodeAllocation>>) {
+        *self.allocation_source.write().unwrap() = Some(source);
+    }
+
+    pub fn mark_recovery_complete(&self) {
+        self.recovery_complete.store(true, Ordering::Release);
+    }
+
+    pub fn agent_session_id(&self) -> &str {
+        &self.agent_session_id
+    }
+
+    pub fn node_boot_id(&self) -> &str {
+        &self.node_boot_id
+    }
+
+    pub fn node_token(&self) -> String {
+        self.node_token.read().unwrap().clone()
+    }
+
+    async fn allocation_inventory(&self) -> Vec<AgentAllocationStatus> {
+        let held: HashSet<u32> = self.held_job_ids().await.into_iter().collect();
+        let source = self.allocation_source.read().unwrap().clone();
+        let Some(source) = source else {
+            return Vec::new();
+        };
+        let allocations = source.lock().await.owned_allocations();
+        allocations
+            .into_iter()
+            .map(|allocation| {
+                let process_present = held.contains(&allocation.job_id);
+                let phase = if allocation.releasing {
+                    AgentAllocationPhase::Releasing
+                } else if allocation.launching {
+                    AgentAllocationPhase::Launching
+                } else if process_present {
+                    AgentAllocationPhase::Active
+                } else {
+                    AgentAllocationPhase::Releasing
+                };
+                AgentAllocationStatus {
+                    job_id: allocation.job_id,
+                    run_attempt: allocation.run_attempt,
+                    phase: phase as i32,
+                    resources: Some(allocations_to_proto(&allocation.exact_resources)),
+                    last_command_id: allocation.last_command_id,
+                    process_present,
+                    cgroup_present: process_present,
+                }
+            })
+            .collect()
     }
 
     /// This node's current WireGuard mesh public key (empty if the interface has no key / no mesh).
@@ -93,6 +160,7 @@ impl NodeReporter {
             .context("failed to connect to spurctld for registration")?;
         let mut client = spur_proto::controller_client(channel);
 
+        let allocation_inventory = self.allocation_inventory().await;
         let resp = client
             .register_agent(RegisterAgentRequest {
                 hostname: self.hostname.clone(),
@@ -103,6 +171,11 @@ impl NodeReporter {
                 wg_pubkey: self.wg_pubkey(),
                 labels: self.labels.clone(),
                 join_token: self.join_token.clone(),
+                agent_session_id: self.agent_session_id.clone(),
+                node_boot_id: self.node_boot_id.clone(),
+                allocation_inventory,
+                recovery_complete: self.recovery_complete.load(Ordering::Acquire),
+                supports_command_polling: true,
             })
             .await
             .context("registration failed")?;
@@ -133,6 +206,8 @@ impl NodeReporter {
                 hostname: self.hostname.clone(),
                 node_token: current_token,
                 reason: reason.to_string(),
+                agent_session_id: self.agent_session_id.clone(),
+                node_boot_id: self.node_boot_id.clone(),
             })
             .await
             .context("deregistration RPC failed")?;
@@ -161,6 +236,7 @@ impl NodeReporter {
                     ..Default::default()
                 })
                 .collect();
+            let allocation_inventory = self.allocation_inventory().await;
 
             match spur_client::connect_channel(&self.controller_addr).await {
                 Ok(channel) => {
@@ -173,6 +249,11 @@ impl NodeReporter {
                             running_jobs,
                             node_token: current_token,
                             wg_pubkey: self.wg_pubkey(),
+                            agent_session_id: self.agent_session_id.clone(),
+                            node_boot_id: self.node_boot_id.clone(),
+                            allocation_inventory,
+                            recovery_complete: self.recovery_complete.load(Ordering::Acquire),
+                            supports_command_polling: true,
                         })
                         .await
                     {
@@ -586,8 +667,7 @@ mod tests {
         assert_eq!(map.held_job_ids().await, vec![7]);
     }
 
-    // A brief lock hold (e.g. a concurrent launch/cancel) must not read as
-    // "holds nothing" — the controller treats an empty report as confirmed release.
+    // A brief lock hold must not turn a present local allocation into a false omission.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn held_job_ids_waits_out_contention_instead_of_reporting_empty() {
         let map: Arc<Mutex<HashMap<u32, u8>>> = Arc::new(Mutex::new(HashMap::from([(7, 0)])));

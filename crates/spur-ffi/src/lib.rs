@@ -304,6 +304,7 @@ pub extern "C" fn slurm_kill_job(job_id: c_uint, signal: u16, _flags: u16) -> c_
                 job_id,
                 signal: signal as i32,
                 user: String::new(),
+                run_attempt: 0,
             })
             .await
             .ok()?;

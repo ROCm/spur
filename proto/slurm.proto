@@ -242,6 +242,7 @@ message JobInfo {
   // "gpu:2/task".
   uint32 req_gpus = 55;
   string req_gpus_detail = 56;
+  uint32 run_attempt = 57;
 }
 
 message NodeInfo {
@@ -348,6 +349,8 @@ service SlurmController {
   // Agent registration
   rpc RegisterAgent(RegisterAgentRequest) returns (RegisterAgentResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc PollAgentCommands(PollAgentCommandsRequest) returns (PollAgentCommandsResponse);
+  rpc AcknowledgeAgentCommand(AcknowledgeAgentCommandRequest) returns (google.protobuf.Empty);
 
   // Admission token management
   rpc CreateToken(CreateTokenRequest) returns (CreateTokenResponse);
@@ -488,12 +491,14 @@ message CancelJobRequest {
   uint32 job_id = 1;
   int32 signal = 2;  // 0 = cancel, else signal number
   string user = 3;   // For authorization
+  uint32 run_attempt = 4; // 0 = target the current run (legacy/user-directed cancel)
 }
 
 message CompleteJobRequest {
   uint32 job_id = 1;
   int32 exit_code = 2;
   string user = 3;   // For authorization
+  uint32 run_attempt = 4; // 0 = legacy client without run fencing
 }
 
 message SuspendJobRequest {
@@ -563,6 +568,8 @@ message DeregisterAgentRequest {
   string hostname = 1;
   string node_token = 2;
   string reason = 3;
+  string agent_session_id = 4;
+  string node_boot_id = 5;
 }
 
 message GetPartitionsRequest {
@@ -660,6 +667,11 @@ message RegisterAgentRequest {
   string wg_pubkey = 6;      // WireGuard public key (for mesh setup)
   map<string, string> labels = 7;  // Node labels for partition routing (pool, rack, etc.)
   string join_token = 8;     // Admission token for token-based admission
+  string agent_session_id = 9;
+  string node_boot_id = 10;
+  repeated AgentAllocationStatus allocation_inventory = 11;
+  bool recovery_complete = 12;
+  bool supports_command_polling = 13;
 }
 
 message RegisterAgentResponse {
@@ -678,12 +690,75 @@ message HeartbeatRequest {
   // learns a key that appears/changes after registration (late mesh, spur0 recreated) and can
   // include the node in ApplyMesh without a spurd restart. Empty when the node has no mesh key.
   string wg_pubkey = 6;
+  string agent_session_id = 7;
+  string node_boot_id = 8;
+  repeated AgentAllocationStatus allocation_inventory = 9;
+  bool recovery_complete = 10;
+  bool supports_command_polling = 11;
 }
 
 message RunningJobStatus {
   uint32 job_id = 1;
   JobState state = 2;
   int32 exit_code = 3;
+}
+
+enum AgentAllocationPhase {
+  AGENT_ALLOCATION_PHASE_UNSPECIFIED = 0;
+  AGENT_ALLOCATION_PHASE_LAUNCHING = 1;
+  AGENT_ALLOCATION_PHASE_ACTIVE = 2;
+  AGENT_ALLOCATION_PHASE_RELEASING = 3;
+}
+
+message AgentAllocationStatus {
+  uint32 job_id = 1;
+  uint32 run_attempt = 2;
+  AgentAllocationPhase phase = 3;
+  ResourceAllocations resources = 4;
+  uint64 last_command_id = 5;
+  bool process_present = 6;
+  bool cgroup_present = 7;
+}
+
+enum AgentCommandKind {
+  AGENT_COMMAND_KIND_UNSPECIFIED = 0;
+  AGENT_COMMAND_KIND_LAUNCH = 1;
+  AGENT_COMMAND_KIND_REGISTER = 2;
+  AGENT_COMMAND_KIND_RELEASE = 3;
+}
+
+message AgentCommand {
+  uint64 command_id = 1;
+  uint32 job_id = 2;
+  uint32 run_attempt = 3;
+  string node = 4;
+  AgentCommandKind kind = 5;
+  bytes payload = 6;
+  int32 signal = 7;
+}
+
+message PollAgentCommandsRequest {
+  string hostname = 1;
+  string node_token = 2;
+  string agent_session_id = 3;
+  string node_boot_id = 4;
+}
+
+message PollAgentCommandsResponse {
+  repeated AgentCommand commands = 1;
+}
+
+message AcknowledgeAgentCommandRequest {
+  string hostname = 1;
+  string node_token = 2;
+  string agent_session_id = 3;
+  string node_boot_id = 4;
+  uint64 command_id = 5;
+  uint32 job_id = 6;
+  uint32 run_attempt = 7;
+  bool success = 8;
+  bytes response_payload = 9;
+  string error = 10;
 }
 
 message HeartbeatResponse {}
@@ -1162,6 +1237,9 @@ message ReportJobStatusRequest {
   // Echoed from LaunchJobRequest.run_attempt; controller drops this report if
   // older than the job's current epoch. 0 = unset (legacy), check off.
   uint32 run_attempt = 9;
+  string agent_session_id = 10;
+  string node_boot_id = 11;
+  string node_token = 12;
 }
 
 // ============================================================

@@ -152,6 +152,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                     job_id,
                     signal: 2, // SIGINT
                     user: cancel_user,
+                    run_attempt: 0,
                 })
                 .await;
             std::process::exit(130); // Standard SIGINT exit code
@@ -176,6 +177,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                     job_id,
                     signal: 0,
                     user: whoami::username().unwrap_or_default(),
+                    run_attempt: 0,
                 })
                 .await;
             std::process::exit(1);
@@ -250,6 +252,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             job_id,
             signal: 0,
             user,
+            run_attempt: 0,
         })
         .await;
 

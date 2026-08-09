@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -228,8 +228,26 @@ impl ControllerService {
         Err(self.not_leader_status())
     }
 
-    /// Reconcile `node`'s reported held jobs against the controller's record.
-    /// Spawned, best-effort; called from the (leader-gated) heartbeat handler.
+    fn validate_agent_identity(&self, hostname: &str, node_token: &str) -> Result<(), Status> {
+        if !matches!(
+            self.cluster.config().admission.mode,
+            spur_core::config::AdmissionMode::Token
+        ) {
+            return Ok(());
+        }
+        if node_token.is_empty() {
+            return Err(Status::unauthenticated("node token required"));
+        }
+        let identity = spur_core::admission::verify_node_token(node_token, self.jwt_key.as_bytes())
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+        if identity.hostname != hostname {
+            return Err(Status::permission_denied("node token hostname mismatch"));
+        }
+        Ok(())
+    }
+
+    /// Legacy agents report job ids only. Unknown jobs may be killed, but an
+    /// omission is never interpreted as proof that an allocation was released.
     fn reconcile_reported_allocations(&self, node: &str, reported: &[RunningJobStatus]) {
         let kill = reported
             .iter()
@@ -268,69 +286,110 @@ impl ControllerService {
                 }
             });
         }
+    }
 
-        let reported_ids: HashSet<u32> = reported.iter().map(|r| r.job_id).collect();
-        {
-            let cluster = self.cluster.clone();
-            let node_owned = node.to_string();
-            let reported_ids = reported_ids.clone();
-            tokio::spawn(async move {
-                if let Err(e) = cluster.clear_confirmed_pending_kills(&node_owned, &reported_ids) {
-                    warn!(node = %node_owned, error = %e, "failed to persist pending-kill release confirmation");
-                }
-            });
-        }
-        let active = self.cluster.active_jobs_on_node(node);
-        // Sweep entries for jobs that left the active set by another path,
-        // else one that's never re-reported leaks its streak entry.
-        let active_ids: HashSet<spur_core::job::JobId> = active.iter().map(|j| j.job_id).collect();
-        self.cluster.prune_phantom_streaks_not_in(node, &active_ids);
+    fn reconcile_allocation_inventory(
+        &self,
+        node: &str,
+        agent_session_id: &str,
+        node_boot_id: &str,
+        agent_recovery_complete: bool,
+        supports_command_polling: bool,
+        inventory: Vec<AgentAllocationStatus>,
+    ) -> Result<(), Status> {
+        use spur_core::allocation::{AllocationKey, AllocationPhase};
 
-        let mut phantom = Vec::new();
-        for job in active {
-            if reported_ids.contains(&job.job_id) {
-                self.cluster.note_node_reported_job(job.job_id, node);
-            } else if job.allocated_nodes.len() == 1 // evict_job fails the whole job
-                && self.cluster.note_node_omitted_job(job.job_id, node)
+        let mut reported = HashMap::new();
+        for status in inventory {
+            let key = AllocationKey::new(status.job_id, status.run_attempt, node);
+            let resources = status
+                .resources
+                .map(proto_to_allocations)
+                .unwrap_or_default();
+            if reported
+                .insert(
+                    key,
+                    (
+                        resources,
+                        status.process_present || status.cgroup_present,
+                        status.last_command_id,
+                        AgentAllocationPhase::try_from(status.phase).ok(),
+                    ),
+                )
+                .is_some()
             {
-                phantom.push(job);
+                return Err(Status::invalid_argument(
+                    "allocation inventory contains a duplicate key",
+                ));
             }
         }
-        if !phantom.is_empty() {
-            let cluster = self.cluster.clone();
-            let node_owned = node.to_string();
-            tokio::spawn(async move {
-                for job in phantom {
-                    // Re-fetch: the snapshot may be stale by now — a fresh
-                    // run_attempt means a legitimate requeue, not a phantom.
-                    let Some(fresh) = cluster.get_job(job.job_id) else {
-                        continue;
-                    };
-                    if fresh.state.is_terminal() || fresh.run_attempt != job.run_attempt {
-                        continue;
-                    }
-                    warn!(
-                        job_id = fresh.job_id,
-                        node = %node_owned,
-                        "node's heartbeat repeatedly omitted a job the controller binds here — evicting"
-                    );
-                    match cluster.evict_job(
-                        fresh.job_id,
-                        spur_core::job::PendingReason::NodeDown,
-                        fresh.run_attempt,
-                    ) {
-                        Ok(finalized) if finalized.is_empty() => {}
-                        Ok(finalized) => {
-                            cluster.complete_evicted_steps(&finalized);
-                            crate::scheduler_loop::send_cancel_to_agents(&cluster, &fresh, 9).await;
-                        }
-                        Err(e) => {
-                            warn!(job_id = fresh.job_id, error = %e, "failed to evict phantom binding");
-                        }
+
+        let expected = self.cluster.allocation_records_on_node(node);
+        let expected_keys: HashSet<_> = expected.iter().map(|record| record.key.clone()).collect();
+        let mut evict = HashSet::new();
+        let mut cleanup = Vec::new();
+        let mut reconciled = agent_recovery_complete;
+
+        for record in expected {
+            if record.phase == AllocationPhase::Releasing {
+                reconciled = false;
+                cleanup.push(record.key.clone());
+                continue;
+            }
+            match reported.get(&record.key) {
+                Some((resources, present, command_id, _))
+                    if resources == &record.resources
+                        && *present
+                        && (record.phase == AllocationPhase::Launching
+                            || *command_id == record.last_command_id
+                            || record.agent_session_id.is_none()) => {}
+                None if matches!(
+                    record.phase,
+                    AllocationPhase::Prepared | AllocationPhase::Launching
+                ) => {}
+                _ => {
+                    reconciled = false;
+                    cleanup.push(record.key.clone());
+                    if record.phase == AllocationPhase::Active {
+                        evict.insert((record.key.job_id, record.key.run_attempt));
                     }
                 }
-            });
+            }
         }
+
+        for key in reported.keys() {
+            if !expected_keys.contains(key) {
+                reconciled = false;
+                cleanup.push(key.clone());
+            }
+        }
+
+        for (job_id, run_attempt) in evict {
+            warn!(
+                job_id,
+                run_attempt,
+                node,
+                "agent inventory cannot prove the controller allocation; evicting the run"
+            );
+            let finalized = self
+                .cluster
+                .evict_job(job_id, spur_core::job::PendingReason::NodeDown, run_attempt)
+                .map_err(|error| Status::internal(error.to_string()))?;
+            self.cluster.complete_evicted_steps(&finalized);
+        }
+        self.cluster
+            .enqueue_recovery_releases(cleanup)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        self.cluster
+            .update_agent_recovery(
+                node,
+                agent_session_id,
+                node_boot_id,
+                reconciled,
+                supports_command_polling,
+            )
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(())
     }
 
     /// Reads never require the leader (every node applies the committed log),
@@ -602,6 +661,18 @@ impl SlurmController for ControllerService {
         let req = request.into_inner();
         let job_id = req.job_id;
 
+        if req.run_attempt != 0
+            && self
+                .cluster
+                .get_job(job_id)
+                .is_some_and(|job| job.run_attempt != req.run_attempt)
+        {
+            return Err(Status::failed_precondition(format!(
+                "job {job_id} run attempt {} is no longer current",
+                req.run_attempt
+            )));
+        }
+
         self.cluster
             .check_cancel_allowed(job_id, &req.user)
             .map_err(cluster_err_to_status)?;
@@ -646,7 +717,7 @@ impl SlurmController for ControllerService {
         let req = request.into_inner();
         let job = self
             .cluster
-            .finish_srun_job(req.job_id, req.exit_code, &req.user)
+            .finish_srun_job(req.job_id, req.exit_code, &req.user, req.run_attempt)
             .map_err(|e| match e {
                 crate::cluster::SrunCompleteError::NotFound(id) => {
                     Status::not_found(format!("job {id} not found"))
@@ -659,6 +730,13 @@ impl SlurmController for ControllerService {
                         "job {id} does not use native step dispatch"
                     ))
                 }
+                crate::cluster::SrunCompleteError::StaleRun {
+                    job_id,
+                    expected,
+                    actual,
+                } => Status::failed_precondition(format!(
+                    "job {job_id} run attempt {expected} was superseded by attempt {actual}"
+                )),
                 crate::cluster::SrunCompleteError::AlreadyTerminal { job_id, state } => {
                     Status::failed_precondition(format!("job {job_id} is already {state:?}"))
                 }
@@ -1019,6 +1097,15 @@ impl SlurmController for ControllerService {
         if self.cluster.get_node(&req.hostname).is_none() {
             return Ok(Response::new(()));
         }
+        if !self.cluster.agent_session_matches(
+            &req.hostname,
+            &req.agent_session_id,
+            &req.node_boot_id,
+        ) {
+            return Err(Status::failed_precondition(
+                "agent session does not match the registered node",
+            ));
+        }
         let evicted = self
             .cluster
             .remove_node(
@@ -1203,6 +1290,11 @@ impl SlurmController for ControllerService {
 
         let req = request.into_inner();
         let resources = req.resources.map(proto_to_resource_set).unwrap_or_default();
+        let legacy_agent = req.agent_session_id.is_empty();
+        let recovery_complete = req.recovery_complete;
+        let supports_command_polling = !legacy_agent && req.supports_command_polling;
+        let agent_session_id = req.agent_session_id.clone();
+        let node_boot_id = req.node_boot_id.clone();
 
         let reject_loopback = self.cluster.config().network.reject_loopback_comm_addr;
         let advertised = req.address.clone();
@@ -1218,7 +1310,7 @@ impl SlurmController for ControllerService {
 
         let source = spur_core::node::node_source_from_registration(&req.version, &req.labels);
         self.cluster
-            .register_node(
+            .register_node_with_session(
                 // NodeName and NodeHostname are the same until agents can supply both.
                 req.hostname.clone(),
                 req.hostname.clone(),
@@ -1229,8 +1321,23 @@ impl SlurmController for ControllerService {
                 req.version,
                 source,
                 req.labels,
+                req.agent_session_id,
+                req.node_boot_id,
+                legacy_agent,
+                supports_command_polling,
             )
             .map_err(|e| Status::internal(e.to_string()))?;
+
+        if !legacy_agent {
+            self.reconcile_allocation_inventory(
+                &req.hostname,
+                &agent_session_id,
+                &node_boot_id,
+                recovery_complete,
+                supports_command_polling,
+                req.allocation_inventory,
+            )?;
+        }
 
         Ok(Response::new(RegisterAgentResponse {
             accepted: true,
@@ -1259,6 +1366,29 @@ impl SlurmController for ControllerService {
         }
 
         let req = request.into_inner();
+        if !req.reporting_node.is_empty() {
+            let node = self.cluster.get_node(&req.reporting_node).ok_or_else(|| {
+                Status::not_found(format!("node {} not found", req.reporting_node))
+            })?;
+            if node.agent_session_id.is_empty() {
+                if !req.agent_session_id.is_empty() || !req.node_boot_id.is_empty() {
+                    return Err(Status::failed_precondition(
+                        "completion report session does not match the legacy node registration",
+                    ));
+                }
+            } else {
+                self.validate_agent_identity(&req.reporting_node, &req.node_token)?;
+                if !self.cluster.agent_session_matches(
+                    &req.reporting_node,
+                    &req.agent_session_id,
+                    &req.node_boot_id,
+                ) {
+                    return Err(Status::failed_precondition(
+                        "completion report session does not match the registered node",
+                    ));
+                }
+            }
+        }
         let state = spur_core::job::JobState::from_proto_i32(req.state)
             .ok_or_else(|| Status::invalid_argument("invalid job state"))?;
 
@@ -1321,7 +1451,11 @@ impl SlurmController for ControllerService {
                             let job_id = req.job_id;
                             tokio::spawn(async move {
                                 crate::scheduler_loop::cancel_job_on_nodes(
-                                    &cluster, job_id, &missing, 15,
+                                    &cluster,
+                                    job_id,
+                                    &missing,
+                                    15,
+                                    req.run_attempt,
                                 )
                                 .await;
                             });
@@ -1381,19 +1515,22 @@ impl SlurmController for ControllerService {
 
         let req = request.into_inner();
 
-        if matches!(
-            self.cluster.config().admission.mode,
-            spur_core::config::AdmissionMode::Token
+        self.validate_agent_identity(&req.hostname, &req.node_token)?;
+
+        if self.cluster.get_node(&req.hostname).is_none() {
+            return Err(Status::not_found(format!(
+                "node {} not found — is the node registered?",
+                req.hostname
+            )));
+        }
+        if !self.cluster.agent_session_matches(
+            &req.hostname,
+            &req.agent_session_id,
+            &req.node_boot_id,
         ) {
-            if req.node_token.is_empty() {
-                return Err(Status::unauthenticated("node token required"));
-            }
-            let identity =
-                spur_core::admission::verify_node_token(&req.node_token, self.jwt_key.as_bytes())
-                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
-            if identity.hostname != req.hostname {
-                return Err(Status::permission_denied("node token hostname mismatch"));
-            }
+            return Err(Status::failed_precondition(
+                "agent session does not match the registered node; re-register first",
+            ));
         }
 
         if self
@@ -1408,14 +1545,144 @@ impl SlurmController for ControllerService {
             {
                 info!(node = %req.hostname, "learned updated WireGuard mesh key from heartbeat");
             }
-            self.reconcile_reported_allocations(&req.hostname, &req.running_jobs);
+            if req.agent_session_id.is_empty() {
+                self.reconcile_reported_allocations(&req.hostname, &req.running_jobs);
+            } else {
+                self.reconcile_allocation_inventory(
+                    &req.hostname,
+                    &req.agent_session_id,
+                    &req.node_boot_id,
+                    req.recovery_complete,
+                    req.supports_command_polling,
+                    req.allocation_inventory,
+                )?;
+            }
             Ok(Response::new(HeartbeatResponse {}))
         } else {
             Err(Status::not_found(format!(
-                "node {} not found — is the node registered?",
+                "node {} disappeared",
                 req.hostname
             )))
         }
+    }
+
+    async fn poll_agent_commands(
+        &self,
+        request: Request<PollAgentCommandsRequest>,
+    ) -> Result<Response<PollAgentCommandsResponse>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            return match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut forwarded = Request::new(request.into_inner());
+                    *forwarded.metadata_mut() = Self::forwarded_metadata();
+                    client.poll_agent_commands(forwarded).await
+                }
+                Err(error) => {
+                    warn!(error = %error, "failed to forward agent command poll to leader");
+                    Err(status)
+                }
+            };
+        }
+        if !self.raft.ensure_leader().await {
+            return Err(Status::unavailable(
+                "controller could not confirm leadership with a quorum",
+            ));
+        }
+
+        let req = request.into_inner();
+        self.validate_agent_identity(&req.hostname, &req.node_token)?;
+        let mut commands = self
+            .cluster
+            .pending_agent_commands(&req.hostname, &req.agent_session_id, &req.node_boot_id)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if commands.is_empty() {
+            tokio::select! {
+                _ = self.cluster.wait_for_agent_command_update() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+            }
+            if !self.raft.ensure_leader().await {
+                return Err(Status::unavailable(
+                    "controller lost quorum while polling agent commands",
+                ));
+            }
+            commands = self
+                .cluster
+                .pending_agent_commands(&req.hostname, &req.agent_session_id, &req.node_boot_id)
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        }
+        let commands = commands
+            .into_iter()
+            .map(|command| {
+                let payload = if command.payload.is_empty()
+                    && command.kind != spur_core::allocation::AgentCommandKind::Release
+                {
+                    crate::scheduler_loop::durable_agent_command_payload(&self.cluster, &command)
+                        .map_err(|error| Status::internal(error.to_string()))?
+                } else {
+                    command.payload.clone()
+                };
+                Ok(AgentCommand {
+                    command_id: command.command_id,
+                    job_id: command.key.job_id,
+                    run_attempt: command.key.run_attempt,
+                    node: command.key.node,
+                    kind: match command.kind {
+                        spur_core::allocation::AgentCommandKind::Launch => {
+                            AgentCommandKind::Launch as i32
+                        }
+                        spur_core::allocation::AgentCommandKind::Register => {
+                            AgentCommandKind::Register as i32
+                        }
+                        spur_core::allocation::AgentCommandKind::Release => {
+                            AgentCommandKind::Release as i32
+                        }
+                    },
+                    payload,
+                    signal: command.signal,
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        Ok(Response::new(PollAgentCommandsResponse { commands }))
+    }
+
+    async fn acknowledge_agent_command(
+        &self,
+        request: Request<AcknowledgeAgentCommandRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            return match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut forwarded = Request::new(request.into_inner());
+                    *forwarded.metadata_mut() = Self::forwarded_metadata();
+                    client.acknowledge_agent_command(forwarded).await
+                }
+                Err(error) => {
+                    warn!(error = %error, "failed to forward agent command acknowledgement");
+                    Err(status)
+                }
+            };
+        }
+
+        let req = request.into_inner();
+        self.validate_agent_identity(&req.hostname, &req.node_token)?;
+        self.cluster
+            .acknowledge_agent_command(
+                req.command_id,
+                spur_core::allocation::AllocationKey::new(
+                    req.job_id,
+                    req.run_attempt,
+                    req.hostname,
+                ),
+                req.agent_session_id,
+                req.node_boot_id,
+                req.success,
+                req.response_payload,
+                req.error,
+            )
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(()))
     }
 
     async fn create_token(
@@ -3013,6 +3280,7 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         srun_step_dispatch: job.srun_step_dispatch,
         req_gpus: spur_core::job::effective_gpus(&job.spec, job.spec.num_nodes) as u32,
         req_gpus_detail: requested_gpus_detail(&job.spec),
+        run_attempt: job.run_attempt,
     }
 }
 
@@ -3845,9 +4113,8 @@ mod tests {
         }
     }
 
-    // evict_job is job-scoped, so one node's phantom must spare a multi-node job.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reconcile_spares_a_multi_node_job_on_one_nodes_phantom_report() {
+    async fn legacy_heartbeat_omission_does_not_evict_a_multi_node_job() {
         use crate::raft::StateMachineApply;
         use spur_core::job::{JobSpec, JobState};
         use spur_core::resource::ResourceAllocations;
@@ -3891,7 +4158,6 @@ mod tests {
             run_attempt: 1,
         });
 
-        // n1's heartbeat never reports job 1; cross the phantom threshold.
         for _ in 0..3 {
             svc.reconcile_reported_allocations("n1", &[]);
         }
@@ -3901,14 +4167,12 @@ mod tests {
         assert_eq!(
             svc.cluster.get_job(1).unwrap().state,
             JobState::Running,
-            "a multi-node job must not be evicted over one node's phantom report"
+            "job-id omission is not physical cleanup evidence"
         );
     }
 
-    // The single-node counterpart: a persistent phantom report must still
-    // evict the job (this is the case D1 exists to fix).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reconcile_evicts_a_single_node_job_after_persistent_phantom_report() {
+    async fn legacy_heartbeat_omission_does_not_evict_a_single_node_job() {
         use crate::raft::StateMachineApply;
         use spur_core::job::{JobSpec, JobState};
         use spur_core::resource::ResourceAllocations;
@@ -3955,23 +4219,15 @@ mod tests {
             svc.reconcile_reported_allocations("n1", &[]);
         }
 
-        let mut evicted = false;
-        for _ in 0..200 {
-            if svc.cluster.get_job(1).unwrap().state.is_terminal() {
-                evicted = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        assert!(
-            evicted,
-            "a single-node job's persistent phantom report must evict it"
+        assert_eq!(
+            svc.cluster.get_job(1).unwrap().state,
+            JobState::Running,
+            "job-id omission is not physical cleanup evidence"
         );
     }
 
-    // A heartbeat that stops reporting a job is the release confirmation.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reconcile_clears_pending_kill_once_heartbeat_confirms_release() {
+    async fn legacy_heartbeat_omission_does_not_release_capacity() {
         use spur_core::resource::ResourceAllocations;
 
         let dir = tempfile::TempDir::new().unwrap();
@@ -3983,7 +4239,6 @@ mod tests {
             .note_pending_kill(2, "n1", ResourceAllocations::with_scalar(1, 1000), 102);
         assert_eq!(svc.cluster.pending_kill_reservations()["n1"].cpus, 3);
 
-        // n1's heartbeat still reports job 2, but no longer job 1.
         svc.reconcile_reported_allocations(
             "n1",
             &[RunningJobStatus {
@@ -3992,19 +4247,271 @@ mod tests {
             }],
         );
 
-        // The release confirmation is spawned off the heartbeat's critical path.
-        let mut cpus = svc.cluster.pending_kill_reservations()["n1"].cpus;
-        for _ in 0..200 {
-            if cpus == 1 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            cpus = svc.cluster.pending_kill_reservations()["n1"].cpus;
-        }
         assert_eq!(
-            cpus, 1,
-            "job 1's reservation must clear once the heartbeat confirms it's gone"
+            svc.cluster.pending_kill_reservations()["n1"].cpus,
+            3,
+            "omission alone must keep both release holds charged"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_exact_inventory_recovers_through_eviction_cleanup_and_acknowledgement() {
+        use spur_core::allocation::{AgentCommandKind, AllocationKey, AllocationPhase};
+        use spur_core::job::{JobSpec, JobState};
+        use spur_core::node::{NodeSource, NodeState};
+        use spur_core::resource::{ResourceAllocations as CoreAllocations, ResourceSet};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .register_node_with_session(
+                "n1".into(),
+                "n1".into(),
+                ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                NodeSource::NativeHost,
+                HashMap::new(),
+                "session-1".into(),
+                "boot-1".into(),
+                true,
+                true,
+            )
+            .unwrap();
+        let job_id = svc
+            .cluster
+            .submit_job(JobSpec {
+                name: "restart-recovery".into(),
+                user: "alice".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 2,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            })
+            .unwrap()
+            .job_id;
+        let resources = CoreAllocations::with_scalar(2, 4000);
+        svc.cluster
+            .start_job(
+                job_id,
+                vec!["n1".into()],
+                resources.clone(),
+                HashMap::from([("n1".into(), resources.clone())]),
+            )
+            .unwrap();
+        let attempt = svc.cluster.get_job(job_id).unwrap().run_attempt;
+        let key = AllocationKey::new(job_id, attempt, "n1");
+
+        let unauthenticated = svc
+            .report_job_status(Request::new(ReportJobStatusRequest {
+                job_id,
+                state: JobState::Completed.to_proto_i32(),
+                exit_code: 0,
+                reporting_node: "n1".into(),
+                run_attempt: attempt,
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(unauthenticated.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            svc.cluster.allocation_records()[&key].phase,
+            AllocationPhase::Active
+        );
+
+        svc.reconcile_allocation_inventory(
+            "n1",
+            "session-1",
+            "boot-1",
+            true,
+            true,
+            vec![AgentAllocationStatus {
+                job_id,
+                run_attempt: attempt,
+                phase: AgentAllocationPhase::Active as i32,
+                resources: Some(allocations_to_proto(&resources)),
+                last_command_id: 0,
+                process_present: true,
+                cgroup_present: false,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().state,
+            JobState::Running
+        );
+
+        svc.reconcile_allocation_inventory("n1", "session-1", "boot-1", true, true, Vec::new())
+            .unwrap();
+
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().state,
+            JobState::NodeFail
+        );
+        assert_eq!(
+            svc.cluster.get_node("n1").unwrap().state,
+            NodeState::Unknown
+        );
+        let record = svc.cluster.allocation_records()[&key].clone();
+        assert_eq!(record.phase, AllocationPhase::Releasing);
+        assert_eq!(svc.cluster.get_node("n1").unwrap().alloc_resources.cpus, 2);
+        let commands = svc
+            .cluster
+            .pending_agent_commands("n1", "session-1", "boot-1")
+            .unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].kind, AgentCommandKind::Release);
+        assert_eq!(commands[0].key, key);
+
+        svc.cluster
+            .acknowledge_agent_command(
+                record.last_command_id,
+                key.clone(),
+                "session-1".into(),
+                "boot-1".into(),
+                false,
+                Vec::new(),
+                "process still present".into(),
+            )
+            .unwrap();
+        assert_eq!(
+            svc.cluster.allocation_records()[&key].phase,
+            AllocationPhase::Releasing
+        );
+
+        svc.reconcile_allocation_inventory("n1", "session-1", "boot-1", false, true, Vec::new())
+            .unwrap();
+        let replacement = svc
+            .cluster
+            .pending_agent_commands("n1", "session-1", "boot-1")
+            .unwrap();
+        assert_eq!(replacement.len(), 1);
+        assert!(replacement[0].command_id > record.last_command_id);
+        assert!(svc
+            .cluster
+            .agent_commands(&[record.last_command_id])
+            .is_empty());
+
+        svc.cluster
+            .acknowledge_agent_command(
+                replacement[0].command_id,
+                key.clone(),
+                "session-1".into(),
+                "boot-1".into(),
+                true,
+                Vec::new(),
+                String::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            svc.cluster.allocation_records()[&key].phase,
+            AllocationPhase::Released
+        );
+        assert_eq!(svc.cluster.get_node("n1").unwrap().alloc_resources.cpus, 0);
+
+        svc.reconcile_allocation_inventory("n1", "session-1", "boot-1", true, true, Vec::new())
+            .unwrap();
+        let node = svc.cluster.get_node("n1").unwrap();
+        assert!(node.recovery_complete);
+        assert_eq!(node.state, NodeState::Idle);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_heartbeat_cannot_replace_the_registered_agent_session() {
+        use spur_core::node::NodeSource;
+        use spur_core::resource::ResourceSet;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .register_node_with_session(
+                "n1".into(),
+                "n1".into(),
+                ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                NodeSource::NativeHost,
+                HashMap::new(),
+                "new-session".into(),
+                "boot-1".into(),
+                true,
+                true,
+            )
+            .unwrap();
+
+        let error = svc
+            .heartbeat(Request::new(HeartbeatRequest {
+                hostname: "n1".into(),
+                agent_session_id: "old-session".into(),
+                node_boot_id: "boot-1".into(),
+                recovery_complete: true,
+                supports_command_polling: true,
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        let node = svc.cluster.get_node("n1").unwrap();
+        assert_eq!(node.agent_session_id, "new-session");
+        assert_eq!(node.node_boot_id, "boot-1");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_agent_session_cannot_deregister_the_current_node() {
+        use spur_core::node::NodeSource;
+        use spur_core::resource::ResourceSet;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .register_node_with_session(
+                "n1".into(),
+                "n1".into(),
+                ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                NodeSource::NativeHost,
+                HashMap::new(),
+                "new-session".into(),
+                "boot-1".into(),
+                true,
+                true,
+            )
+            .unwrap();
+
+        let error = svc
+            .deregister_agent(Request::new(DeregisterAgentRequest {
+                hostname: "n1".into(),
+                node_token: String::new(),
+                reason: "old daemon stopped".into(),
+                agent_session_id: "old-session".into(),
+                node_boot_id: "boot-1".into(),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(svc.cluster.get_node("n1").is_some());
     }
 
     // An unauthorized cancel must not plant a reservation against a job it
@@ -4058,6 +4565,7 @@ mod tests {
                 job_id: 1,
                 signal: 0,
                 user: "mallory".into(),
+                run_attempt: 0,
             }))
             .await;
         assert!(result.is_err(), "an unauthorized cancel must be rejected");

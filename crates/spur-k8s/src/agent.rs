@@ -129,6 +129,7 @@ impl SlurmAgent for VirtualAgent {
         let req = request.into_inner();
         self.term_fence.check(req.term)?;
         let job_id = req.job_id;
+        let run_attempt = req.run_attempt;
         let ns = self.resolve_namespace(job_id).await?;
         let target_node = req.target_node.clone();
         let peer_nodes = &req.peer_nodes;
@@ -393,6 +394,10 @@ impl SlurmAgent for VirtualAgent {
         // Build labels
         let mut labels = BTreeMap::new();
         labels.insert("spur.amd.com/job-id".to_string(), job_id.to_string());
+        labels.insert(
+            "spur.amd.com/run-attempt".to_string(),
+            run_attempt.to_string(),
+        );
         labels.insert(
             "spur.amd.com/managed-by".to_string(),
             "spur-k8s-operator".to_string(),

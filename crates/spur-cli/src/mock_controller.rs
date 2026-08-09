@@ -162,6 +162,8 @@ mock_controller_impl! {
         get_sched_stats(()) -> proto::SchedStats;
         register_agent(proto::RegisterAgentRequest) -> proto::RegisterAgentResponse;
         heartbeat(proto::HeartbeatRequest) -> proto::HeartbeatResponse;
+        poll_agent_commands(proto::PollAgentCommandsRequest) -> proto::PollAgentCommandsResponse;
+        acknowledge_agent_command(proto::AcknowledgeAgentCommandRequest) -> ();
         create_token(proto::CreateTokenRequest) -> proto::CreateTokenResponse;
         list_tokens(proto::ListTokensRequest) -> proto::ListTokensResponse;
         revoke_token(proto::RevokeTokenRequest) -> proto::RevokeTokenResponse;

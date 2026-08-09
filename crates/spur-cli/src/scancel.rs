@@ -87,6 +87,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                     job_id: *job_id,
                     signal,
                     user: user.clone(),
+                    run_attempt: 0,
                 })
                 .await
             {
@@ -131,6 +132,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                     job_id: job.job_id,
                     signal,
                     user: user.clone(),
+                    run_attempt: 0,
                 })
                 .await
             {

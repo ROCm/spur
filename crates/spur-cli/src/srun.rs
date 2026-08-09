@@ -620,6 +620,7 @@ fn install_ctrl_c_cancel(
                     job_id,
                     signal: 2,
                     user,
+                    run_attempt: 0,
                 })
                 .await;
             std::process::exit(130);
@@ -776,12 +777,14 @@ async fn release_srun_allocation(
     job_id: u32,
     user: &str,
     exit_code: i32,
+    run_attempt: u32,
 ) {
     if let Err(e) = client
         .complete_job(CompleteJobRequest {
             job_id,
             exit_code,
             user: user.to_string(),
+            run_attempt,
         })
         .await
     {
@@ -794,6 +797,7 @@ async fn release_srun_allocation(
                 job_id,
                 signal: 2,
                 user: user.to_string(),
+                run_attempt,
             })
             .await
         {
@@ -873,6 +877,7 @@ async fn run_standalone_srun(
                 job_id,
                 signal: 0,
                 user: user.clone(),
+                run_attempt: 0,
             })
             .await;
         std::process::exit(result?);
@@ -897,7 +902,7 @@ async fn run_standalone_srun(
             Ok(result) => result.exit_code,
             Err(_) => 1,
         };
-        release_srun_allocation(&mut client, job_id, &user, exit_code).await;
+        release_srun_allocation(&mut client, job_id, &user, exit_code, job.run_attempt).await;
         let result = dispatch_result?;
         let state = if result.exit_code == 0 {
             JobState::JobCompleted

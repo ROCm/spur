@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::admission::AdmissionToken;
+use crate::allocation::{AgentCommandRecord, AllocationKey};
 use crate::job::{JobId, JobSpec, JobState, PendingReason};
 use crate::k0s::{K0sPhase, K0sRole};
 use crate::node::{NodeSource, NodeState};
@@ -41,9 +42,68 @@ fn default_job_evict_reason() -> PendingReason {
     PendingReason::JobLaunchFailure
 }
 
+fn default_recovery_complete() -> bool {
+    true
+}
+
 /// All state-mutating operations that get logged to the Raft log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalOperation {
+    AllocationPrepare {
+        job_id: JobId,
+        run_attempt: u32,
+        nodes: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: HashMap<String, ResourceAllocations>,
+        srun_step_dispatch: bool,
+    },
+    AllocationBeginLaunch {
+        job_id: JobId,
+        run_attempt: u32,
+        command_id: u64,
+        #[serde(default)]
+        created_at: Option<chrono::DateTime<chrono::Utc>>,
+        #[serde(default)]
+        commands: Vec<AgentCommandRecord>,
+    },
+    AllocationActivate {
+        job_id: JobId,
+        run_attempt: u32,
+    },
+    AllocationAbort {
+        job_id: JobId,
+        run_attempt: u32,
+        releasing_nodes: Vec<String>,
+        command_id: u64,
+        #[serde(default)]
+        commands: Vec<AgentCommandRecord>,
+    },
+    AllocationBeginRelease {
+        keys: Vec<AllocationKey>,
+        command_id: u64,
+        #[serde(default)]
+        commands: Vec<AgentCommandRecord>,
+    },
+    AllocationConfirmRelease {
+        key: AllocationKey,
+        command_id: u64,
+        agent_session_id: String,
+        node_boot_id: String,
+    },
+    AgentCommandAcknowledge {
+        command_id: u64,
+        key: AllocationKey,
+        agent_session_id: String,
+        node_boot_id: String,
+        success: bool,
+        #[serde(default)]
+        response_payload: Vec<u8>,
+        #[serde(default)]
+        error: String,
+    },
+    AgentCommandsEnqueue {
+        commands: Vec<AgentCommandRecord>,
+    },
     PendingKillReserve {
         reservations: Vec<PendingKillReservation>,
     },
@@ -106,6 +166,8 @@ pub enum WalOperation {
         node_name: String,
         exit_code: i32,
         signal: i32,
+        #[serde(default)]
+        run_attempt: u32,
     },
     /// The time-limit watchdog signalled a running job for exhausting its wall
     /// clock. Durable so the grace period survives a leadership change and so
@@ -219,6 +281,22 @@ pub enum WalOperation {
         labels: HashMap<String, String>,
         #[serde(default)]
         source: NodeSource,
+        #[serde(default)]
+        agent_session_id: String,
+        #[serde(default)]
+        node_boot_id: String,
+        #[serde(default = "default_recovery_complete")]
+        recovery_complete: bool,
+        #[serde(default)]
+        supports_command_polling: bool,
+    },
+    NodeAgentState {
+        name: String,
+        agent_session_id: String,
+        node_boot_id: String,
+        recovery_complete: bool,
+        #[serde(default)]
+        supports_command_polling: bool,
     },
     NodeUpdate {
         name: String,
@@ -775,6 +853,7 @@ mod tests {
             node_name: "n0".into(),
             exit_code: 0,
             signal: 9,
+            run_attempt: 3,
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -785,14 +864,27 @@ mod tests {
                 node_name,
                 exit_code,
                 signal,
+                run_attempt,
             } => {
                 assert_eq!(job_id, 1);
                 assert_eq!(node_name, "n0");
                 assert_eq!(exit_code, 0);
                 assert_eq!(signal, 9);
+                assert_eq!(run_attempt, 3);
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn old_job_node_complete_defaults_to_legacy_attempt() {
+        let frozen =
+            r#"{"JobNodeComplete":{"job_id":1,"node_name":"n0","exit_code":0,"signal":9}}"#;
+        let operation: WalOperation = serde_json::from_str(frozen).unwrap();
+        assert!(matches!(
+            operation,
+            WalOperation::JobNodeComplete { run_attempt: 0, .. }
+        ));
     }
 }
 
@@ -1113,5 +1205,62 @@ mod evict_wal_tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+}
+
+#[cfg(test)]
+mod allocation_wal_tests {
+    use super::*;
+
+    #[test]
+    fn frozen_allocation_lifecycle_variants_deserialize() {
+        let fixtures = [
+            r#"{"AllocationPrepare":{"job_id":7,"run_attempt":2,"nodes":["n1"],"resources":{"cpus":2,"memory_mb":4096,"devices":{}},"per_node_alloc":{"n1":{"cpus":2,"memory_mb":4096,"devices":{}}},"srun_step_dispatch":false}}"#,
+            r#"{"AllocationBeginLaunch":{"job_id":7,"run_attempt":2,"command_id":11}}"#,
+            r#"{"AllocationActivate":{"job_id":7,"run_attempt":2}}"#,
+            r#"{"AllocationAbort":{"job_id":7,"run_attempt":2,"releasing_nodes":["n1"],"command_id":12}}"#,
+            r#"{"AllocationBeginRelease":{"keys":[{"job_id":7,"run_attempt":2,"node":"n1"}],"command_id":13}}"#,
+            r#"{"AllocationConfirmRelease":{"key":{"job_id":7,"run_attempt":2,"node":"n1"},"command_id":13,"agent_session_id":"s1","node_boot_id":"b1"}}"#,
+            r#"{"AgentCommandAcknowledge":{"command_id":13,"key":{"job_id":7,"run_attempt":2,"node":"n1"},"agent_session_id":"s1","node_boot_id":"b1","success":true}}"#,
+            r#"{"AgentCommandsEnqueue":{"commands":[]}}"#,
+        ];
+
+        for fixture in fixtures {
+            serde_json::from_str::<WalOperation>(fixture).unwrap();
+        }
+    }
+
+    #[test]
+    fn old_launch_and_release_variants_default_to_no_outbox_commands() {
+        let launch: WalOperation = serde_json::from_str(
+            r#"{"AllocationBeginLaunch":{"job_id":7,"run_attempt":2,"command_id":11}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            launch,
+            WalOperation::AllocationBeginLaunch { commands, .. } if commands.is_empty()
+        ));
+
+        let release: WalOperation =
+            serde_json::from_str(r#"{"AllocationBeginRelease":{"keys":[],"command_id":12}}"#)
+                .unwrap();
+        assert!(matches!(
+            release,
+            WalOperation::AllocationBeginRelease { commands, .. } if commands.is_empty()
+        ));
+    }
+
+    #[test]
+    fn old_node_register_defaults_to_legacy_recovery_behavior() {
+        let frozen = r#"{"NodeRegister":{"name":"n1","resources":{"cpus":4,"memory_mb":8000,"gpus":[],"generic":{}},"address":"127.0.0.1"}}"#;
+        let operation: WalOperation = serde_json::from_str(frozen).unwrap();
+        assert!(matches!(
+            operation,
+            WalOperation::NodeRegister {
+                recovery_complete: true,
+                supports_command_polling: false,
+                ..
+            }
+        ));
     }
 }

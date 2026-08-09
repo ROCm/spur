@@ -277,6 +277,7 @@ impl SlurmAccounting for AccountingService {
                 srun_step_dispatch: false,
                 req_gpus: 0,
                 req_gpus_detail: String::new(),
+                run_attempt: 0,
             })
             .collect();
 

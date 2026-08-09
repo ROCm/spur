@@ -6,16 +6,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use prost::Message;
 use tracing::{debug, error, info, warn};
 
+use spur_core::allocation::{
+    AgentCommandKind as CoreAgentCommandKind, AgentCommandRecord, AgentCommandState, AllocationKey,
+};
 use spur_core::node::{Node, NodeSource};
 use spur_core::partition::requested_partition_names;
 use spur_core::task_launch::batch_dispatched_multi_node_pmix;
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
-    AgentCancelJobRequest, AgentSuspendJobRequest, JobSpec as ProtoJobSpec, LaunchJobRequest,
-    RegisterJobAllocationRequest, SubmitJobRequest,
+    AgentCancelJobRequest, AgentSuspendJobRequest, JobSpec as ProtoJobSpec, LaunchFailureKind,
+    LaunchJobRequest, LaunchJobResponse, RegisterJobAllocationRequest, SubmitJobRequest,
 };
 use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::traits::{ClusterState, Scheduler};
@@ -28,6 +32,8 @@ use crate::raft::RaftHandle;
 /// awaits delivery. Best-effort cleanup must not stall eviction on an
 /// unreachable agent.
 const CANCEL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const AGENT_COMMAND_ACK_TIMEOUT: Duration =
+    Duration::from_secs(crate::cluster::AGENT_COMMAND_ACK_TIMEOUT_SECS);
 
 fn node_comm_socket(node: &Node) -> Option<String> {
     let host = node.comm_addr()?;
@@ -37,22 +43,6 @@ fn node_comm_socket(node: &Node) -> Option<String> {
 fn node_comm_http_url(node: &Node) -> Option<String> {
     let host = node.comm_addr()?;
     Some(spur_net::format_comm_http_url(host, node.port))
-}
-
-/// Inflate each node's `alloc_resources` by its pending-kill amount, so a
-/// resource whose prior occupant's kill isn't confirmed released stays out.
-fn apply_pending_kill_reservations(
-    nodes: &mut [Node],
-    pending_kill: &std::collections::HashMap<String, spur_core::resource::ResourceAllocations>,
-) {
-    if pending_kill.is_empty() {
-        return;
-    }
-    for node in nodes {
-        if let Some(resources) = pending_kill.get(&node.name) {
-            node.alloc_resources.add(resources);
-        }
-    }
 }
 
 /// Spawn the time-limit enforcement watchdog and power manager alongside the scheduler loop.
@@ -136,6 +126,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // Finalize never-satisfiable deps before pending_jobs() so they drop
         // out of this cycle instead of sitting PENDING forever.
         cluster.cancel_unsatisfiable_dependency_jobs();
+        cluster.recover_incomplete_dispatches();
 
         // Free completed stage-in capacity before classification selects new
         // stage candidates. Real agent-side data movement is a follow-up;
@@ -147,9 +138,6 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         }
         cluster.evict_expired_terminal_jobs();
 
-        // Held out of scheduling until a heartbeat confirms release.
-        let pending_kill = cluster.pending_kill_reservations();
-
         // Classify once, apply reasons, and stage only candidates admitted by
         // that classification. Run before the empty-check so reasons stay fresh
         // even with nothing schedulable.
@@ -159,7 +147,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         }
         let hit_depth_limit = pending.len() > max_jobs;
 
-        let mut nodes = cluster.schedulable_nodes();
+        let nodes = cluster.schedulable_nodes();
         let partitions = cluster.get_partitions();
         let reservations = cluster.get_reservations();
 
@@ -167,9 +155,6 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             debug!("no nodes registered, skipping scheduling cycle");
             continue;
         }
-
-        // A kill RPC can be lost, so don't trust alloc_resources alone here.
-        apply_pending_kill_reservations(&mut nodes, &pending_kill);
 
         let cycle_start = Instant::now();
 
@@ -330,14 +315,19 @@ async fn process_assignment(
         }
     }
 
-    let dispatch_attempt = match cluster.begin_dispatch_attempt(job_id) {
+    let dispatch_attempt = match cluster.prepare_dispatch(
+        job_id,
+        assignment.nodes.clone(),
+        resources.clone(),
+        assignment.per_node_alloc.clone(),
+        srun_step_dispatch,
+    ) {
         Ok(attempt) => attempt,
         Err(e) => {
-            debug!(job_id, error = %e, "job left Pending before dispatch");
+            debug!(job_id, error = %e, "job could not prepare durable dispatch");
             return false;
         }
     };
-
     if spec.srun_job && srun_step_dispatch {
         match register_allocation_on_nodes(
             cluster.clone(),
@@ -350,33 +340,23 @@ async fn process_assignment(
         )
         .await
         {
-            AllocationRegisterOutcome::AllFailed => {
-                if let Err(e) = cluster.reserve_pending_dispatch(
-                    job_id,
-                    &dispatch_nodes,
-                    &per_node_allocs,
-                    dispatch_attempt,
-                ) {
+            AllocationRegisterOutcome::AllFailed { cleanup_nodes } => {
+                if let Err(e) = cluster.abort_dispatch(job_id, dispatch_attempt, &cleanup_nodes) {
                     error!(job_id, error = %e, "failed to reserve failed registration cleanup");
                     return false;
                 }
-                cancel_job_on_nodes(&cluster, job_id, &dispatch_nodes, 9, dispatch_attempt).await;
+                cancel_job_on_nodes(&cluster, job_id, &cleanup_nodes, 9, dispatch_attempt).await;
                 if let Err(e) = cluster.requeue_job(job_id) {
                     error!(job_id, error = %e, "failed to requeue after registration failure");
                 }
                 return false;
             }
-            AllocationRegisterOutcome::PartialFailed { succeeded_nodes } => {
-                if let Err(e) = cluster.reserve_pending_dispatch(
-                    job_id,
-                    &succeeded_nodes,
-                    &per_node_allocs,
-                    dispatch_attempt,
-                ) {
+            AllocationRegisterOutcome::PartialFailed { cleanup_nodes } => {
+                if let Err(e) = cluster.abort_dispatch(job_id, dispatch_attempt, &cleanup_nodes) {
                     error!(job_id, error = %e, "failed to reserve partial registration cleanup");
                     return false;
                 }
-                cancel_job_on_nodes(&cluster, job_id, &succeeded_nodes, 9, dispatch_attempt).await;
+                cancel_job_on_nodes(&cluster, job_id, &cleanup_nodes, 9, dispatch_attempt).await;
                 if let Err(e) = cluster.requeue_job(job_id) {
                     error!(job_id, error = %e, "failed to requeue after partial registration");
                 }
@@ -402,6 +382,9 @@ async fn process_assignment(
                     node = %name,
                     "node missing while building peer list"
                 );
+                if let Err(error) = cluster.abort_dispatch(job_id, dispatch_attempt, &[]) {
+                    error!(job_id, error = %error, "failed to abort unstarted dispatch");
+                }
                 return false;
             };
             let Some(addr) = node_comm_socket(&n) else {
@@ -410,6 +393,9 @@ async fn process_assignment(
                     node = %name,
                     "no comm address for peer list"
                 );
+                if let Err(error) = cluster.abort_dispatch(job_id, dispatch_attempt, &[]) {
+                    error!(job_id, error = %error, "failed to abort unstarted dispatch");
+                }
                 return false;
             };
             addrs.push(addr);
@@ -494,12 +480,7 @@ async fn process_assignment(
         // start_job failure here (e.g. the job was cancelled out from
         // under us between assignment and this point) doesn't leave
         // orphans.
-        if let Err(hold_err) = cluster.reserve_pending_dispatch(
-            job_id,
-            &dispatch_nodes,
-            &per_node_allocs,
-            dispatch_attempt,
-        ) {
+        if let Err(hold_err) = cluster.abort_dispatch(job_id, dispatch_attempt, &dispatch_nodes) {
             error!(job_id, error = %hold_err, "failed to reserve failed-dispatch cleanup");
             return false;
         }
@@ -922,6 +903,8 @@ enum DispatchError {
     /// The agent rejected the dispatch because the controller-allocated resources
     /// are already in use locally — the controller's view of this node is stale.
     ResourcesUnavailable,
+    /// The request may have reached the agent, but no definitive response arrived.
+    DeliveryUncertain(anyhow::Error),
     Other(anyhow::Error),
 }
 
@@ -932,9 +915,20 @@ impl std::fmt::Display for DispatchError {
             Self::ResourcesUnavailable => {
                 write!(f, "agent rejected job: allocated resources unavailable")
             }
+            Self::DeliveryUncertain(e) => write!(f, "agent delivery outcome is unknown: {e:#}"),
             Self::Other(e) => write!(f, "{e:#}"),
         }
     }
+}
+
+fn delivery_outcome_is_uncertain(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Cancelled
+            | tonic::Code::Unknown
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Unavailable
+    )
 }
 
 impl<E: Into<anyhow::Error>> From<E> for DispatchError {
@@ -943,16 +937,7 @@ impl<E: Into<anyhow::Error>> From<E> for DispatchError {
     }
 }
 
-/// Send a LaunchJob RPC to a node agent.
-async fn dispatch_to_agent(
-    agent_addr: &str,
-    params: &AgentDispatchParams<'_>,
-) -> Result<LaunchOutcome, DispatchError> {
-    let mut client = SlurmAgentClient::connect(agent_addr.to_string())
-        .await?
-        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
-
+fn build_launch_request(params: &AgentDispatchParams<'_>) -> anyhow::Result<LaunchJobRequest> {
     let spec = params.spec;
 
     // The scheduler distributes GPUs per node (a --gpus total may be uneven
@@ -1068,26 +1053,40 @@ async fn dispatch_to_agent(
         initial_winsize: None,
     };
 
+    Ok(LaunchJobRequest {
+        job_id: params.job_id,
+        spec: Some(proto_spec),
+        allocated: Some(crate::server::allocations_to_proto(params.allocated)),
+        peer_nodes: params.peer_nodes.to_vec(),
+        task_offset: params.task_offset,
+        target_node: params.target_node.to_string(),
+        array_job_id: spec.array_job_id.unwrap_or(0),
+        array_task_id: spec.array_task_id.unwrap_or(0),
+        run_attempt: params.run_attempt,
+        pmix_plan,
+        task_fanout: params.task_fanout,
+        pmix_prepared: params.pmix_prepared,
+        term: params.term,
+    })
+}
+
+/// Send a LaunchJob RPC to a node agent.
+async fn dispatch_to_agent(
+    agent_addr: &str,
+    params: &AgentDispatchParams<'_>,
+) -> Result<LaunchOutcome, DispatchError> {
+    let mut client = SlurmAgentClient::connect(agent_addr.to_string())
+        .await
+        .map_err(DispatchError::from)?
+        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
+
     let response = client
-        .launch_job(LaunchJobRequest {
-            job_id: params.job_id,
-            spec: Some(proto_spec),
-            allocated: Some(crate::server::allocations_to_proto(params.allocated)),
-            peer_nodes: params.peer_nodes.to_vec(),
-            task_offset: params.task_offset,
-            target_node: params.target_node.to_string(),
-            // Controller-assigned at array expansion; consumed agent-side.
-            array_job_id: spec.array_job_id.unwrap_or(0),
-            array_task_id: spec.array_task_id.unwrap_or(0),
-            run_attempt: params.run_attempt,
-            pmix_plan,
-            task_fanout: params.task_fanout,
-            pmix_prepared: params.pmix_prepared,
-            term: params.term,
-        })
+        .launch_job(build_launch_request(params)?)
         .await
         .map_err(|s| match s.code() {
             tonic::Code::ResourceExhausted => DispatchError::ResourcesUnavailable,
+            _ if delivery_outcome_is_uncertain(&s) => DispatchError::DeliveryUncertain(s.into()),
             _ => DispatchError::Other(s.into()),
         })?;
 
@@ -1145,8 +1144,8 @@ fn build_pmix_plan_proto(
 /// Outcome of parallel RegisterJobAllocation RPCs for a standalone srun job.
 pub(crate) enum AllocationRegisterOutcome {
     AllSucceeded,
-    AllFailed,
-    PartialFailed { succeeded_nodes: Vec<String> },
+    AllFailed { cleanup_nodes: Vec<String> },
+    PartialFailed { cleanup_nodes: Vec<String> },
 }
 
 /// Parameters for registering a srun-only allocation on a single node agent.
@@ -1164,6 +1163,132 @@ struct AllocationRegisterParams {
     term: u64,
 }
 
+fn build_register_allocation_request(
+    params: &AllocationRegisterParams,
+) -> RegisterJobAllocationRequest {
+    RegisterJobAllocationRequest {
+        job_id: params.job_id,
+        partition: params.partition.clone(),
+        nodelist: params.allocated_nodelist.clone(),
+        uid: params.uid,
+        gid: params.gid,
+        cpus: params.allocated.cpus,
+        memory_mb: params.allocated.memory_mb,
+        gpu_devices: params
+            .allocated
+            .device_ids("gpu")
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect(),
+        allocated: Some(crate::server::allocations_to_proto(&params.allocated)),
+        mpi: params.mpi.clone(),
+        work_dir: params.work_dir.clone(),
+        user: params.user.clone(),
+        run_attempt: params.run_attempt,
+        term: params.term,
+    }
+}
+
+pub(crate) fn durable_agent_command_payload(
+    cluster: &ClusterManager,
+    command: &AgentCommandRecord,
+) -> anyhow::Result<Vec<u8>> {
+    let job = cluster
+        .get_job(command.key.job_id)
+        .ok_or_else(|| anyhow::anyhow!("job {} no longer exists", command.key.job_id))?;
+    if job.run_attempt != command.key.run_attempt {
+        anyhow::bail!("agent command targets a superseded run");
+    }
+    let allocated = job
+        .per_node_alloc
+        .get(&command.key.node)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("command node has no allocation slice"))?;
+    let term = cluster.current_term();
+
+    match command.kind {
+        CoreAgentCommandKind::Launch => {
+            let node_index = job
+                .allocated_nodes
+                .iter()
+                .position(|node| node == &command.key.node)
+                .ok_or_else(|| anyhow::anyhow!("command node is not in the allocation"))?;
+            let peer_nodes = job
+                .allocated_nodes
+                .iter()
+                .map(|name| {
+                    cluster
+                        .get_node(name)
+                        .and_then(|node| node_comm_socket(&node))
+                        .ok_or_else(|| anyhow::anyhow!("node {name} has no communication address"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let peer_hosts = job
+                .allocated_nodes
+                .iter()
+                .map(|name| {
+                    cluster
+                        .get_node(name)
+                        .and_then(|node| node.comm_addr().map(str::to_string))
+                        .ok_or_else(|| anyhow::anyhow!("node {name} has no communication host"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let tasks_per_node = job
+                .spec
+                .tasks_per_node
+                .unwrap_or_else(|| (job.spec.num_tasks / job.spec.num_nodes.max(1)).max(1));
+            let mut spec = job.spec.clone();
+            let task_fanout = spec.srun_job;
+            if task_fanout {
+                spec.srun_job = false;
+            }
+            let config = cluster.config();
+            let pmix_prepared = batch_dispatched_multi_node_pmix(
+                spec.mpi.as_deref(),
+                spec.num_nodes,
+                spec.script.as_deref(),
+            );
+            let request = build_launch_request(&AgentDispatchParams {
+                job_id: job.job_id,
+                spec: &spec,
+                peer_nodes: &peer_nodes,
+                peer_hosts: &peer_hosts,
+                node_index: node_index as u32,
+                task_offset: node_index as u32 * tasks_per_node,
+                target_node: &command.key.node,
+                allocated: &allocated,
+                allocated_nodelist: &job.allocated_nodes.join(","),
+                run_attempt: job.run_attempt,
+                term,
+                pmix_tmpdir: &config.mpi.pmix_tmpdir,
+                task_fanout,
+                modex_connect_timeout_secs: config.mpi.modex_connect_timeout_secs,
+                modex_fence_timeout_secs: config.mpi.modex_fence_timeout_secs,
+                modex_verify_timeout_secs: config.mpi.modex_verify_timeout_secs,
+                pmix_prepared,
+            })?;
+            Ok(request.encode_to_vec())
+        }
+        CoreAgentCommandKind::Register => {
+            let request = build_register_allocation_request(&AllocationRegisterParams {
+                job_id: job.job_id,
+                partition: job.spec.partition.clone().unwrap_or_default(),
+                uid: job.spec.uid,
+                gid: job.spec.gid,
+                user: job.spec.user.clone(),
+                mpi: job.spec.mpi.clone().unwrap_or_default(),
+                allocated_nodelist: job.allocated_nodes.join(","),
+                allocated,
+                work_dir: job.spec.work_dir.clone(),
+                run_attempt: job.run_attempt,
+                term,
+            });
+            Ok(request.encode_to_vec())
+        }
+        CoreAgentCommandKind::Release => Ok(Vec::new()),
+    }
+}
+
 /// Register a srun-only allocation on a node agent without launching a batch process.
 async fn register_allocation_to_agent(
     agent_addr: &str,
@@ -1175,30 +1300,11 @@ async fn register_allocation_to_agent(
         .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
 
     client
-        .register_job_allocation(RegisterJobAllocationRequest {
-            job_id: params.job_id,
-            partition: params.partition.clone(),
-            nodelist: params.allocated_nodelist.clone(),
-            uid: params.uid,
-            gid: params.gid,
-            cpus: params.allocated.cpus,
-            memory_mb: params.allocated.memory_mb,
-            gpu_devices: params
-                .allocated
-                .device_ids("gpu")
-                .into_iter()
-                .map(|id| id.to_string())
-                .collect(),
-            allocated: Some(crate::server::allocations_to_proto(&params.allocated)),
-            mpi: params.mpi.clone(),
-            work_dir: params.work_dir.clone(),
-            user: params.user.clone(),
-            run_attempt: params.run_attempt,
-            term: params.term,
-        })
+        .register_job_allocation(build_register_allocation_request(params))
         .await
         .map_err(|s| match s.code() {
             tonic::Code::ResourceExhausted => DispatchError::ResourcesUnavailable,
+            _ if delivery_outcome_is_uncertain(&s) => DispatchError::DeliveryUncertain(s.into()),
             _ => DispatchError::Other(s.into()),
         })?;
 
@@ -1208,6 +1314,31 @@ async fn register_allocation_to_agent(
     );
 
     Ok(())
+}
+
+async fn wait_for_agent_commands(
+    cluster: &ClusterManager,
+    command_ids: &[u64],
+) -> Option<Vec<spur_core::allocation::AgentCommandRecord>> {
+    let wait = async {
+        loop {
+            let commands = cluster.agent_commands(command_ids);
+            if commands.len() == command_ids.len()
+                && commands
+                    .iter()
+                    .all(|command| command.state != AgentCommandState::Pending)
+            {
+                return commands;
+            }
+            tokio::select! {
+                _ = cluster.wait_for_agent_command_update() => {}
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+    };
+    tokio::time::timeout(AGENT_COMMAND_ACK_TIMEOUT, wait)
+        .await
+        .ok()
 }
 
 /// Register a srun-only allocation on every assigned node.
@@ -1223,11 +1354,74 @@ async fn register_allocation_on_nodes(
 ) -> AllocationRegisterOutcome {
     let mut successes = 0u32;
     let mut failures = 0u32;
-    let mut succeeded_nodes: Vec<String> = Vec::new();
+    let mut cleanup_nodes: Vec<String> = Vec::new();
     let total = dispatch_nodes.len() as u32;
     let term = cluster.current_term();
 
+    if dispatch_nodes
+        .iter()
+        .all(|node| cluster.node_supports_command_polling(node))
+    {
+        let commands: Vec<_> = dispatch_nodes
+            .iter()
+            .map(|node_name| {
+                (
+                    AllocationKey::new(job_id, run_attempt, node_name.clone()),
+                    CoreAgentCommandKind::Register,
+                    Vec::new(),
+                )
+            })
+            .collect();
+        let committed = match cluster.begin_allocation_launch_commands(
+            job_id,
+            run_attempt,
+            commands,
+        ) {
+            Ok(commands) => commands,
+            Err(error) => {
+                error!(job_id, error = %error, "failed to commit allocation registration commands");
+                return AllocationRegisterOutcome::AllFailed {
+                    cleanup_nodes: Vec::new(),
+                };
+            }
+        };
+        let command_ids: Vec<_> = committed.iter().map(|command| command.command_id).collect();
+        let Some(results) = wait_for_agent_commands(&cluster, &command_ids).await else {
+            error!(
+                job_id,
+                "timed out waiting for allocation registration acknowledgements"
+            );
+            return AllocationRegisterOutcome::AllFailed {
+                cleanup_nodes: dispatch_nodes,
+            };
+        };
+        let succeeded_nodes: Vec<_> = results
+            .iter()
+            .filter(|command| command.state == AgentCommandState::Succeeded)
+            .map(|command| command.key.node.clone())
+            .collect();
+        if succeeded_nodes.len() == dispatch_nodes.len() {
+            return AllocationRegisterOutcome::AllSucceeded;
+        }
+        if succeeded_nodes.is_empty() {
+            return AllocationRegisterOutcome::AllFailed {
+                cleanup_nodes: Vec::new(),
+            };
+        }
+        return AllocationRegisterOutcome::PartialFailed {
+            cleanup_nodes: succeeded_nodes,
+        };
+    }
+
+    if let Err(error) = cluster.begin_allocation_launch(job_id, run_attempt) {
+        error!(job_id, error = %error, "failed to commit legacy allocation registration intent");
+        return AllocationRegisterOutcome::AllFailed {
+            cleanup_nodes: Vec::new(),
+        };
+    }
+
     let mut set = tokio::task::JoinSet::new();
+    let mut attempted_nodes = Vec::new();
     for node_name in &dispatch_nodes {
         let node_info = cluster.get_node(node_name);
         let agent_addr = match node_info {
@@ -1255,6 +1449,7 @@ async fn register_allocation_on_nodes(
         };
 
         let result_node = node_name.clone();
+        attempted_nodes.push(result_node.clone());
         let allocated = per_node_allocs.get(node_name).cloned().unwrap_or_default();
         let params = AllocationRegisterParams {
             job_id,
@@ -1279,7 +1474,7 @@ async fn register_allocation_on_nodes(
         match result {
             Ok((node_name, Ok(()))) => {
                 successes += 1;
-                succeeded_nodes.push(node_name);
+                cleanup_nodes.push(node_name);
             }
             Ok((node_name, Err(e))) => {
                 error!(
@@ -1288,13 +1483,17 @@ async fn register_allocation_on_nodes(
                     error = %e,
                     "allocation registration on agent failed"
                 );
-                if matches!(e, DispatchError::ResourcesUnavailable) {
+                if matches!(&e, DispatchError::ResourcesUnavailable) {
                     cluster.cool_down_node(&node_name);
+                }
+                if matches!(&e, DispatchError::DeliveryUncertain(_)) {
+                    cleanup_nodes.push(node_name);
                 }
                 failures += 1;
             }
             Err(e) => {
                 error!(job_id, error = %e, "allocation registration task panicked");
+                cleanup_nodes = attempted_nodes.clone();
                 failures += 1;
             }
         }
@@ -1302,13 +1501,13 @@ async fn register_allocation_on_nodes(
 
     if successes == 0 && total > 0 {
         error!(job_id, failures, "all allocation registrations failed");
-        AllocationRegisterOutcome::AllFailed
+        AllocationRegisterOutcome::AllFailed { cleanup_nodes }
     } else if failures > 0 {
         warn!(
             job_id,
             successes, failures, "partial allocation registration failure"
         );
-        AllocationRegisterOutcome::PartialFailed { succeeded_nodes }
+        AllocationRegisterOutcome::PartialFailed { cleanup_nodes }
     } else {
         AllocationRegisterOutcome::AllSucceeded
     }
@@ -1334,9 +1533,14 @@ enum DispatchConfirmOutcome {
 fn abort_pending_pmix_dispatch(
     cluster: &ClusterManager,
     job_id: spur_core::job::JobId,
+    run_attempt: u32,
     detail: String,
 ) -> DispatchConfirmOutcome {
     let _ = cluster.set_job_launch_failure_detail(job_id, detail);
+    if let Err(e) = cluster.abort_dispatch(job_id, run_attempt, &[]) {
+        error!(job_id, error = %e, "failed to abort PMIx dispatch");
+        return DispatchConfirmOutcome::Aborted;
+    }
     if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
         error!(job_id, error = %e, "failed to back off after PMIx dispatch failure");
     }
@@ -1407,7 +1611,7 @@ async fn confirm_dispatch_on_nodes(
 ) -> DispatchConfirmOutcome {
     let mut successes = 0u32;
     let mut failures = 0u32;
-    let mut succeeded_nodes: Vec<String> = Vec::new();
+    let mut cleanup_nodes: Vec<String> = Vec::new();
     let mut prolog_failed: Vec<(String, String)> = Vec::new();
     let total = dispatch_nodes.len() as u32;
 
@@ -1475,7 +1679,7 @@ async fn confirm_dispatch_on_nodes(
                 node_agents.len(),
                 dispatch_nodes.len()
             );
-            return abort_pending_pmix_dispatch(&cluster, job_id, detail);
+            return abort_pending_pmix_dispatch(&cluster, job_id, run_attempt, detail);
         }
 
         if let Some(detail) = pmix_dispatch::multi_node_pmix_unsupported(
@@ -1485,6 +1689,10 @@ async fn confirm_dispatch_on_nodes(
         ) {
             error!(job_id, "{detail}");
             let _ = cluster.set_job_launch_failure_detail(job_id, detail.clone());
+            if let Err(e) = cluster.abort_dispatch(job_id, run_attempt, &[]) {
+                error!(job_id, error = %e, "failed to abort unsupported PMIx dispatch");
+                return DispatchConfirmOutcome::Aborted;
+            }
             if let Err(e) = cluster.hold_job_for_launch_failure(job_id, Some(&detail)) {
                 error!(job_id, error = %e, "failed to hold job for unsupported multi-node PMIx");
             }
@@ -1506,6 +1714,7 @@ async fn confirm_dispatch_on_nodes(
                 allocated: &allocated,
                 allocated_nodelist: &allocated_nodelist,
                 run_attempt,
+                term,
                 pmix_tmpdir: &pmix_tmpdir,
                 task_fanout,
                 modex_connect_timeout_secs,
@@ -1518,12 +1727,12 @@ async fn confirm_dispatch_on_nodes(
                 Ok(None) => {
                     let detail = format!("job is not configured for PMIx on node {node_name}");
                     error!(job_id, node = %node_name, "{detail}");
-                    return abort_pending_pmix_dispatch(&cluster, job_id, detail);
+                    return abort_pending_pmix_dispatch(&cluster, job_id, run_attempt, detail);
                 }
                 Err(detail) => {
                     let detail = format!("invalid PMIx launch plan for node {node_name}: {detail}");
                     error!(job_id, node = %node_name, "{detail}");
-                    return abort_pending_pmix_dispatch(&cluster, job_id, detail);
+                    return abort_pending_pmix_dispatch(&cluster, job_id, run_attempt, detail);
                 }
             };
             prepare_nodes.push(PmixPrepareNode {
@@ -1540,6 +1749,7 @@ async fn confirm_dispatch_on_nodes(
             return abort_pending_pmix_dispatch(
                 &cluster,
                 job_id,
+                run_attempt,
                 format!("PMIx prepare failed: {detail}"),
             );
         }
@@ -1550,71 +1760,154 @@ async fn confirm_dispatch_on_nodes(
         ));
     }
 
-    let mut set = tokio::task::JoinSet::new();
-    for (node_idx, (node_name, agent_addr)) in node_agents.iter().enumerate() {
-        let spec = spec.clone();
-        let peer_addrs = peer_addrs.clone();
-        let peer_hosts = peer_hosts.clone();
-        let task_offset = node_idx as u32 * tasks_per_node;
-        let node_index = node_idx as u32;
-        let is_primary = task_offset == 0;
-        let target_node = node_name.clone();
-        let result_node = node_name.clone();
-        let allocated = per_node_allocs.get(node_name).cloned().unwrap_or_default();
-        let allocated_nodelist = allocated_nodelist.clone();
-        let pmix_tmpdir = pmix_tmpdir.clone();
-        let agent_addr = agent_addr.clone();
-        set.spawn(async move {
-            let result = dispatch_to_agent(
-                &agent_addr,
-                &AgentDispatchParams {
-                    job_id,
-                    spec: &spec,
-                    peer_nodes: &peer_addrs,
-                    peer_hosts: &peer_hosts,
-                    node_index,
-                    task_offset,
-                    target_node: &target_node,
-                    allocated: &allocated,
-                    allocated_nodelist: &allocated_nodelist,
-                    run_attempt,
-                    term,
-                    pmix_tmpdir: &pmix_tmpdir,
-                    task_fanout,
-                    modex_connect_timeout_secs,
-                    modex_fence_timeout_secs,
-                    modex_verify_timeout_secs,
-                    pmix_prepared: needs_pmix_prepare,
-                },
-            )
-            .await;
-            (result_node, is_primary, result)
-        });
-    }
-
-    while let Some(result) = set.join_next().await {
-        match result {
-            Ok((node_name, is_primary, Ok(outcome))) => {
-                successes += 1;
-                succeeded_nodes.push(node_name);
-                if is_primary {
-                    primary_outcome = Some(outcome);
-                }
-            }
-            Ok((node_name, _, Err(e))) => {
-                error!(job_id, node = %node_name, error = %e, "dispatch confirmation failed");
-                failures += 1;
-                match e {
-                    DispatchError::PrologFailed(reason) => {
-                        prolog_failed.push((node_name, reason));
+    let durable_delivery = failures == 0
+        && dispatch_nodes
+            .iter()
+            .all(|node| cluster.node_supports_command_polling(node));
+    if durable_delivery {
+        let commands: Vec<_> = dispatch_nodes
+            .iter()
+            .map(|node_name| {
+                (
+                    AllocationKey::new(job_id, run_attempt, node_name.clone()),
+                    CoreAgentCommandKind::Launch,
+                    Vec::new(),
+                )
+            })
+            .collect();
+        let committed =
+            match cluster.begin_allocation_launch_commands(job_id, run_attempt, commands) {
+                Ok(commands) => commands,
+                Err(error) => {
+                    error!(job_id, error = %error, "failed to commit launch commands");
+                    if let Err(abort_error) =
+                        cluster.abort_dispatch(job_id, run_attempt, &dispatch_nodes)
+                    {
+                        error!(job_id, error = %abort_error, "failed to abort uncertain dispatch");
                     }
-                    DispatchError::ResourcesUnavailable => cluster.cool_down_node(&node_name),
-                    DispatchError::Other(_) => {}
+                    return DispatchConfirmOutcome::Aborted;
+                }
+            };
+        let command_ids: Vec<_> = committed.iter().map(|command| command.command_id).collect();
+        let results = match wait_for_agent_commands(&cluster, &command_ids).await {
+            Some(results) => results,
+            None => {
+                warn!(
+                    job_id,
+                    "timed out waiting for durable launch acknowledgements"
+                );
+                cluster.agent_commands(&command_ids)
+            }
+        };
+        for result in results {
+            if result.state == AgentCommandState::Succeeded {
+                successes += 1;
+                cleanup_nodes.push(result.key.node.clone());
+                if result.key.node == dispatch_nodes[0] {
+                    if let Ok(response) =
+                        LaunchJobResponse::decode(result.response_payload.as_slice())
+                    {
+                        primary_outcome = Some(LaunchOutcome {
+                            stdout_path: response.stdout_path,
+                            stderr_path: response.stderr_path,
+                        });
+                    }
+                }
+                continue;
+            }
+
+            failures += 1;
+            if let Ok(response) = LaunchJobResponse::decode(result.response_payload.as_slice()) {
+                if response.failure_kind == LaunchFailureKind::LaunchFailureProlog as i32 {
+                    prolog_failed.push((result.key.node.clone(), response.error));
                 }
             }
-            Err(e) => {
-                error!(job_id, error = %e, "dispatch confirmation task panicked");
-                failures += 1;
+            error!(
+                job_id,
+                node = %result.key.node,
+                error = %result.error,
+                "durable dispatch command failed"
+            );
+        }
+        failures += total.saturating_sub(successes + failures);
+    } else {
+        if let Err(error) = cluster.begin_allocation_launch(job_id, run_attempt) {
+            error!(job_id, error = %error, "failed to commit legacy launch intent");
+            if let Err(abort_error) = cluster.abort_dispatch(job_id, run_attempt, &dispatch_nodes) {
+                error!(job_id, error = %abort_error, "failed to abort uncertain dispatch");
+            }
+            return DispatchConfirmOutcome::Aborted;
+        }
+        let mut set = tokio::task::JoinSet::new();
+        let mut attempted_nodes = Vec::new();
+        for (node_idx, (node_name, agent_addr)) in node_agents.iter().enumerate() {
+            let spec = spec.clone();
+            let peer_addrs = peer_addrs.clone();
+            let peer_hosts = peer_hosts.clone();
+            let task_offset = node_idx as u32 * tasks_per_node;
+            let node_index = node_idx as u32;
+            let is_primary = task_offset == 0;
+            let target_node = node_name.clone();
+            let result_node = node_name.clone();
+            attempted_nodes.push(result_node.clone());
+            let allocated = per_node_allocs.get(node_name).cloned().unwrap_or_default();
+            let allocated_nodelist = allocated_nodelist.clone();
+            let pmix_tmpdir = pmix_tmpdir.clone();
+            let agent_addr = agent_addr.clone();
+            set.spawn(async move {
+                let result = dispatch_to_agent(
+                    &agent_addr,
+                    &AgentDispatchParams {
+                        job_id,
+                        spec: &spec,
+                        peer_nodes: &peer_addrs,
+                        peer_hosts: &peer_hosts,
+                        node_index,
+                        task_offset,
+                        target_node: &target_node,
+                        allocated: &allocated,
+                        allocated_nodelist: &allocated_nodelist,
+                        run_attempt,
+                        term,
+                        pmix_tmpdir: &pmix_tmpdir,
+                        task_fanout,
+                        modex_connect_timeout_secs,
+                        modex_fence_timeout_secs,
+                        modex_verify_timeout_secs,
+                        pmix_prepared: needs_pmix_prepare,
+                    },
+                )
+                .await;
+                (result_node, is_primary, result)
+            });
+        }
+
+        while let Some(result) = set.join_next().await {
+            match result {
+                Ok((node_name, is_primary, Ok(outcome))) => {
+                    successes += 1;
+                    cleanup_nodes.push(node_name);
+                    if is_primary {
+                        primary_outcome = Some(outcome);
+                    }
+                }
+                Ok((node_name, _, Err(error))) => {
+                    error!(job_id, node = %node_name, error = %error, "dispatch confirmation failed");
+                    failures += 1;
+                    match error {
+                        DispatchError::PrologFailed(reason) => {
+                            prolog_failed.push((node_name, reason));
+                        }
+                        DispatchError::ResourcesUnavailable => cluster.cool_down_node(&node_name),
+                        DispatchError::DeliveryUncertain(_) => cleanup_nodes.push(node_name),
+                        DispatchError::Other(_) => {}
+                    }
+                }
+                Err(error) => {
+                    error!(job_id, error = %error, "dispatch confirmation task panicked");
+                    cleanup_nodes = attempted_nodes.clone();
+                    failures += 1;
+                }
             }
         }
     }
@@ -1650,15 +1943,17 @@ async fn confirm_dispatch_on_nodes(
     };
     let _ = cluster.set_job_launch_failure_detail(job_id, confirmation_detail.clone());
 
-    // Stop whatever DID launch (only succeeded_nodes hold anything) before the
-    // job settles back to Pending, or the launched process would be orphaned.
-    if let Err(e) =
-        cluster.reserve_pending_dispatch(job_id, &succeeded_nodes, &per_node_allocs, run_attempt)
-    {
+    if durable_delivery {
+        cleanup_nodes = dispatch_nodes.clone();
+    }
+
+    // A committed polled command or a direct RPC with a lost response may still
+    // mutate the agent after this decision, so both remain charged for cleanup.
+    if let Err(e) = cluster.abort_dispatch(job_id, run_attempt, &cleanup_nodes) {
         error!(job_id, error = %e, "failed to reserve aborted dispatch cleanup");
         return DispatchConfirmOutcome::Aborted;
     }
-    cancel_job_on_nodes(&cluster, job_id, &succeeded_nodes, 9, run_attempt).await;
+    cancel_job_on_nodes(&cluster, job_id, &cleanup_nodes, 9, run_attempt).await;
 
     // Drain before deciding the job's fate, so the failing node is already out
     // of the candidate set on the next scheduling attempt. The drain is issued
@@ -2121,6 +2416,11 @@ fn cancel_agent_addrs(
 ) -> Vec<String> {
     let mut addrs = Vec::with_capacity(node_names.len());
     for node_name in node_names {
+        if cluster.node_supports_command_polling(node_name)
+            && cluster.has_pending_kill(job_id, node_name)
+        {
+            continue;
+        }
         match cluster.get_node(node_name) {
             Some(ref n) => {
                 if let Some(url) = node_comm_http_url(n) {
@@ -2602,6 +2902,19 @@ mod tests {
         use spur_core::node::NodeSource;
         use std::sync::atomic::{AtomicU32, Ordering};
         use tempfile::TempDir;
+
+        #[test]
+        fn retryable_agent_status_has_an_uncertain_delivery_outcome() {
+            assert!(delivery_outcome_is_uncertain(&tonic::Status::unavailable(
+                "response lost"
+            )));
+            assert!(delivery_outcome_is_uncertain(
+                &tonic::Status::deadline_exceeded("response lost")
+            ));
+            assert!(!delivery_outcome_is_uncertain(
+                &tonic::Status::resource_exhausted("rejected")
+            ));
+        }
         use tonic::transport::server::TcpIncoming;
         use tonic::transport::Server;
 
@@ -2624,6 +2937,7 @@ mod tests {
             /// register_job_allocation returns a ResourceExhausted status,
             /// the srun/salloc equivalent of `reject_resources`.
             reject_registration: bool,
+            uncertain_registration: bool,
             /// Records each `LaunchJobRequest.task_fanout` this agent receives,
             /// so tests can assert on it without a real spurd behind the RPC.
             fanout_calls: Option<Arc<std::sync::Mutex<Vec<bool>>>>,
@@ -2755,6 +3069,9 @@ mod tests {
                     return Err(tonic::Status::resource_exhausted(
                         "controller-allocated resources unavailable on this node",
                     ));
+                }
+                if self.uncertain_registration {
+                    return Err(tonic::Status::unavailable("registration outcome lost"));
                 }
                 Ok(tonic::Response::new(Default::default()))
             }
@@ -2888,6 +3205,7 @@ mod tests {
                 launch_delay,
                 reject_resources: false,
                 reject_registration: false,
+                uncertain_registration: false,
                 fanout_calls: capture.then(|| fanout_calls.clone()),
             };
             tokio::spawn(async move {
@@ -2907,10 +3225,12 @@ mod tests {
             let addr = incoming.local_addr().unwrap();
             let agent = MockAgent {
                 cancel_calls: Arc::new(AtomicU32::new(0)),
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
                 reject_launch_as: None,
                 launch_delay: Duration::ZERO,
                 reject_resources: true,
                 reject_registration: false,
+                uncertain_registration: false,
                 fanout_calls: None,
             };
             tokio::spawn(async move {
@@ -2930,10 +3250,36 @@ mod tests {
             let addr = incoming.local_addr().unwrap();
             let agent = MockAgent {
                 cancel_calls: Arc::new(AtomicU32::new(0)),
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
                 reject_launch_as: None,
                 launch_delay: Duration::ZERO,
                 reject_resources: false,
                 reject_registration: true,
+                uncertain_registration: false,
+                fanout_calls: None,
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            addr
+        }
+
+        async fn spawn_mock_agent_with_uncertain_registration() -> std::net::SocketAddr {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let agent = MockAgent {
+                cancel_calls: Arc::new(AtomicU32::new(0)),
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
+                reject_launch_as: None,
+                launch_delay: Duration::ZERO,
+                reject_resources: false,
+                reject_registration: false,
+                uncertain_registration: true,
                 fanout_calls: None,
             };
             tokio::spawn(async move {
@@ -3084,6 +3430,10 @@ mod tests {
                 version: String::new(),
                 labels: HashMap::new(),
                 source: NodeSource::NativeHost,
+                agent_session_id: String::new(),
+                node_boot_id: String::new(),
+                recovery_complete: true,
+                supports_command_polling: false,
             });
             let n = name.to_string();
             wait_for(
@@ -3586,6 +3936,68 @@ mod tests {
             let job_id = submit_and_wait(&cm, batch_spec("no-comm-addr", 1));
             let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
             assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn pmix_prelaunch_failure_releases_prepared_allocation() {
+            use spur_core::allocation::AllocationPhase;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (addr, _) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr);
+            register_node_without_comm_addr(&cm, "n2");
+
+            let mut spec = batch_spec("pmix-prelaunch-fail", 2);
+            spec.mpi = Some(spur_core::mpi::MPI_PMIX.into());
+            let job_id = submit_and_wait(&cm, spec.clone());
+            let nodes = vec!["n1".to_string(), "n2".to_string()];
+            let per_node_allocs = HashMap::from([
+                ("n1".into(), ResourceAllocations::with_scalar(1, 0)),
+                ("n2".into(), ResourceAllocations::with_scalar(1, 0)),
+            ]);
+            let run_attempt = cm
+                .prepare_dispatch(
+                    job_id,
+                    nodes.clone(),
+                    ResourceAllocations::with_scalar(2, 0),
+                    per_node_allocs.clone(),
+                    false,
+                )
+                .unwrap();
+
+            assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 1);
+            assert_eq!(cm.get_node("n2").unwrap().alloc_resources.cpus, 1);
+
+            let outcome = confirm_dispatch_on_nodes(
+                cm.clone(),
+                job_id,
+                nodes,
+                spec,
+                Vec::new(),
+                per_node_allocs,
+                "n1,n2".into(),
+                1,
+                run_attempt,
+                false,
+            )
+            .await;
+
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            let records = cm.allocation_records();
+            assert!(records
+                .values()
+                .filter(|record| {
+                    record.key.job_id == job_id && record.key.run_attempt == run_attempt
+                })
+                .all(|record| record.phase == AllocationPhase::Released));
+            assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+            assert_eq!(cm.get_node("n2").unwrap().alloc_resources.cpus, 0);
+            let job = cm.get_job(job_id).unwrap();
+            assert!(job.allocated_nodes.is_empty());
+            assert!(job.allocated_resources.is_none());
+            assert!(job.per_node_alloc.is_empty());
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4220,8 +4632,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn process_assignment_cancels_dispatched_nodes_when_start_job_fails_after_confirmation(
-        ) {
+        async fn process_assignment_rejects_incomplete_allocation_before_dispatch() {
             use spur_core::job::JobState;
 
             let dir = TempDir::new().unwrap();
@@ -4233,15 +4644,6 @@ mod tests {
 
             let job_id = submit_and_wait(&cm, batch_spec("start-job-inconsistent", 2));
 
-            // A malformed assignment: confirm_dispatch_on_nodes tolerates a
-            // missing per_node_alloc entry (falls back to a default
-            // allocation), but start_job validates every assigned node has
-            // one and rejects the whole call otherwise. This is what a
-            // scheduler/assignment bug producing inconsistent data — or the
-            // job being touched by another path between assignment and this
-            // call — looks like from here: both nodes already launched real
-            // work by the time start_job is rejected, so both must be torn
-            // back down rather than left running under a job stuck Pending.
             let mut bad_assignment = assignment(job_id, &["n1", "n2"]);
             bad_assignment.per_node_alloc.remove("n2");
 
@@ -4254,15 +4656,17 @@ mod tests {
             assert_eq!(
                 cm.get_job(job_id).unwrap().state,
                 JobState::Pending,
-                "a start_job failure must not leave the job Running with no confirmed nodes"
+                "an invalid assignment must leave the job Pending"
             );
-            wait_for(
-                "n1 cancelled after start_job rejected the assignment",
-                || cancel1.load(Ordering::SeqCst) >= 1,
+            assert_eq!(
+                cancel1.load(Ordering::SeqCst),
+                0,
+                "validation must reject before mutating n1"
             );
-            wait_for(
-                "n2 cancelled after start_job rejected the assignment",
-                || cancel2.load(Ordering::SeqCst) >= 1,
+            assert_eq!(
+                cancel2.load(Ordering::SeqCst),
+                0,
+                "validation must reject before mutating n2"
             );
         }
 
@@ -4469,11 +4873,42 @@ mod tests {
                 0,
             )
             .await;
-            assert!(matches!(outcome, AllocationRegisterOutcome::AllFailed));
+            assert!(matches!(
+                outcome,
+                AllocationRegisterOutcome::AllFailed { .. }
+            ));
             assert!(
                 cm.nodes_on_dispatch_cooldown().contains("n1"),
                 "a resources-unavailable reject on the srun registration path must cool the node too"
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn uncertain_registration_remains_reserved_for_cleanup() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let addr = spawn_mock_agent_with_uncertain_registration().await;
+            register_node_at(&cm, "n1", addr);
+
+            let mut spec = batch_spec("srun-uncertain-registration", 1);
+            spec.srun_job = true;
+            let job_id = submit_and_wait(&cm, spec.clone());
+            let outcome = register_allocation_on_nodes(
+                cm,
+                job_id,
+                vec!["n1".into()],
+                &spec,
+                HashMap::from([("n1".into(), ResourceAllocations::with_scalar(4, 8000))]),
+                "n1".into(),
+                0,
+            )
+            .await;
+
+            let AllocationRegisterOutcome::AllFailed { cleanup_nodes } = outcome else {
+                panic!("expected AllFailed");
+            };
+            assert_eq!(cleanup_nodes, vec!["n1".to_string()]);
         }
 
         // A partial registration failure must report only the nodes that
@@ -4496,6 +4931,15 @@ mod tests {
                 ("n1".into(), ResourceAllocations::with_scalar(4, 8000)),
                 ("n2".into(), ResourceAllocations::with_scalar(4, 8000)),
             ]);
+            let run_attempt = cm
+                .prepare_dispatch(
+                    job_id,
+                    vec!["n1".into(), "n2".into()],
+                    ResourceAllocations::with_scalar(8, 16000),
+                    per_node_allocs.clone(),
+                    true,
+                )
+                .unwrap();
             let outcome = register_allocation_on_nodes(
                 cm.clone(),
                 job_id,
@@ -4503,15 +4947,15 @@ mod tests {
                 &spec,
                 per_node_allocs.clone(),
                 "n1,n2".into(),
-                0,
+                run_attempt,
             )
             .await;
-            let AllocationRegisterOutcome::PartialFailed { succeeded_nodes } = outcome else {
+            let AllocationRegisterOutcome::PartialFailed { cleanup_nodes } = outcome else {
                 panic!("expected PartialFailed");
             };
-            assert_eq!(succeeded_nodes, vec!["n1".to_string()]);
+            assert_eq!(cleanup_nodes, vec!["n1".to_string()]);
 
-            cm.reserve_pending_dispatch(job_id, &succeeded_nodes, &per_node_allocs, 0)
+            cm.abort_dispatch(job_id, run_attempt, &cleanup_nodes)
                 .unwrap();
             let reserved = cm.pending_kill_reservations();
             assert!(
@@ -4521,36 +4965,6 @@ mod tests {
             assert!(
                 !reserved.contains_key("n2"),
                 "a node that never registered anything must not be held"
-            );
-        }
-
-        // A pending-kill reservation must not look free to the scheduler.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn pending_kill_reservation_inflates_node_alloc_resources() {
-            let dir = TempDir::new().unwrap();
-            let cm = test_cluster(&dir).await;
-            let placeholder: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
-            register_node_at(&cm, "n1", placeholder);
-            register_node_at(&cm, "n2", placeholder);
-
-            let mut nodes: Vec<_> = ["n1", "n2"]
-                .iter()
-                .map(|n| cm.get_node(n).unwrap())
-                .collect();
-            assert_eq!(nodes[0].alloc_resources.cpus, 0);
-
-            let mut pending_kill = std::collections::HashMap::new();
-            pending_kill.insert("n1".to_string(), ResourceAllocations::with_scalar(2, 4000));
-
-            apply_pending_kill_reservations(&mut nodes, &pending_kill);
-
-            assert_eq!(
-                nodes[0].alloc_resources.cpus, 2,
-                "n1 inflated by its pending-kill reservation"
-            );
-            assert_eq!(
-                nodes[1].alloc_resources.cpus, 0,
-                "n2 has no pending-kill entry, untouched"
             );
         }
     }
