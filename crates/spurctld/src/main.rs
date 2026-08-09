@@ -178,8 +178,8 @@ async fn main() -> anyhow::Result<()> {
     let sched_stats = Arc::new(SchedStatsCollector::new(config.scheduler.plugin.clone()));
     cluster.set_sched_stats(sched_stats.clone());
 
-    // Build accounting PgPool (best-effort — scheduling works without it)
-    let accounting_pool = if config.accounting.database_url.is_empty() {
+    // Accounting stays best-effort so a database outage does not stop scheduling.
+    let accounting_service = if config.accounting.database_url.is_empty() {
         info!("accounting disabled (database_url not configured)");
         None
     } else {
@@ -191,8 +191,13 @@ async fn main() -> anyhow::Result<()> {
         {
             Ok(pool) => {
                 if let Err(e) = accounting::db::migrate(&pool).await {
-                    tracing::error!(error = %e, "accounting migration failed; disabling accounting");
-                    None
+                    tracing::error!(
+                        error = %e,
+                        "accounting migration failed; accounting service will report unavailable"
+                    );
+                    Some(accounting::AccountingService::unavailable(
+                        "database migration failed at startup",
+                    ))
                 } else {
                     info!("accounting database connected");
                     let notifier = accounting::AccountingNotifier::new(pool.clone());
@@ -221,15 +226,17 @@ async fn main() -> anyhow::Result<()> {
                         config.accounting.fairshare_refresh_secs as u64,
                     );
 
-                    Some(pool)
+                    Some(accounting::AccountingService::available(pool))
                 }
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "failed to connect to accounting database; job history will not be recorded"
+                    "failed to connect to accounting database; accounting service will report unavailable"
                 );
-                None
+                Some(accounting::AccountingService::unavailable(
+                    "database connection failed at startup",
+                ))
             }
         }
     };
@@ -328,7 +335,7 @@ async fn main() -> anyhow::Result<()> {
         raft_handle,
         rpc_stats,
         sched_stats,
-        accounting_pool,
+        accounting_service,
         config.cluster.control_plane_replicas,
     )
     .await?;
