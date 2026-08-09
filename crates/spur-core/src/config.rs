@@ -332,11 +332,6 @@ pub struct ControllerConfig {
     /// resources-unavailable, so it isn't re-picked every tick (default 30, 0 disables).
     #[serde(default = "default_dispatch_reject_cooldown_secs")]
     pub dispatch_reject_cooldown_secs: u64,
-
-    /// Max seconds a resource freed by cancel/evict stays excluded from new
-    /// dispatch if a heartbeat never confirms the kill landed (default 60).
-    #[serde(default = "default_pending_kill_ttl_secs")]
-    pub pending_kill_ttl_secs: u64,
 }
 
 fn default_max_batch_requeue() -> u32 {
@@ -349,10 +344,6 @@ fn default_terminal_job_retention_secs() -> u64 {
 
 fn default_dispatch_reject_cooldown_secs() -> u64 {
     30
-}
-
-fn default_pending_kill_ttl_secs() -> u64 {
-    60
 }
 
 fn default_hold_on_prolog_fail() -> bool {
@@ -409,7 +400,6 @@ impl Default for ControllerConfig {
             hold_on_prolog_fail: default_hold_on_prolog_fail(),
             terminal_job_retention_secs: default_terminal_job_retention_secs(),
             dispatch_reject_cooldown_secs: default_dispatch_reject_cooldown_secs(),
-            pending_kill_ttl_secs: default_pending_kill_ttl_secs(),
         }
     }
 }
@@ -1220,16 +1210,6 @@ impl SlurmConfig {
                 value: format!(
                     "{} (must be at most {})",
                     self.controller.dispatch_reject_cooldown_secs, MAX_LAUNCH_BACKOFF_SECS
-                ),
-            });
-        }
-        // Same overflow guardrail as dispatch_reject_cooldown_secs above.
-        if self.controller.pending_kill_ttl_secs > MAX_LAUNCH_BACKOFF_SECS {
-            return Err(ConfigError::InvalidValue {
-                field: "controller.pending_kill_ttl_secs".into(),
-                value: format!(
-                    "{} (must be at most {})",
-                    self.controller.pending_kill_ttl_secs, MAX_LAUNCH_BACKOFF_SECS
                 ),
             });
         }

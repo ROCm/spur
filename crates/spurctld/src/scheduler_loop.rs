@@ -142,10 +142,12 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // drive_bb_stage_in() is the controller-side seam only.
         cluster.drive_bb_stage_in();
         cluster.purge_expired_reservations();
-        cluster.enforce_reservation_end_times();
+        for job in cluster.enforce_reservation_end_times() {
+            send_cancel_to_agents(&cluster, &job, 0).await;
+        }
         cluster.evict_expired_terminal_jobs();
 
-        // Pruned on every read so an idle cluster doesn't accumulate expired entries.
+        // Held out of scheduling until a heartbeat confirms release.
         let pending_kill = cluster.pending_kill_reservations();
 
         // Classify once, apply reasons, and stage only candidates admitted by
@@ -328,10 +330,15 @@ async fn process_assignment(
         }
     }
 
+    let dispatch_attempt = match cluster.begin_dispatch_attempt(job_id) {
+        Ok(attempt) => attempt,
+        Err(e) => {
+            debug!(job_id, error = %e, "job left Pending before dispatch");
+            return false;
+        }
+    };
+
     if spec.srun_job && srun_step_dispatch {
-        // Same one-shot read as the batch path below: this iteration is the
-        // only place that can advance a Pending job's run_attempt.
-        let prospective_run_attempt = job.run_attempt.saturating_add(1);
         match register_allocation_on_nodes(
             cluster.clone(),
             job_id,
@@ -339,25 +346,37 @@ async fn process_assignment(
             &spec,
             per_node_allocs.clone(),
             allocated_nodelist.clone(),
-            prospective_run_attempt,
+            dispatch_attempt,
         )
         .await
         {
             AllocationRegisterOutcome::AllFailed => {
+                if let Err(e) = cluster.reserve_pending_dispatch(
+                    job_id,
+                    &dispatch_nodes,
+                    &per_node_allocs,
+                    dispatch_attempt,
+                ) {
+                    error!(job_id, error = %e, "failed to reserve failed registration cleanup");
+                    return false;
+                }
+                cancel_job_on_nodes(&cluster, job_id, &dispatch_nodes, 9, dispatch_attempt).await;
                 if let Err(e) = cluster.requeue_job(job_id) {
                     error!(job_id, error = %e, "failed to requeue after registration failure");
                 }
                 return false;
             }
             AllocationRegisterOutcome::PartialFailed { succeeded_nodes } => {
-                cancel_job_on_nodes(
-                    &cluster,
+                if let Err(e) = cluster.reserve_pending_dispatch(
                     job_id,
                     &succeeded_nodes,
-                    9,
-                    prospective_run_attempt,
-                )
-                .await;
+                    &per_node_allocs,
+                    dispatch_attempt,
+                ) {
+                    error!(job_id, error = %e, "failed to reserve partial registration cleanup");
+                    return false;
+                }
+                cancel_job_on_nodes(&cluster, job_id, &succeeded_nodes, 9, dispatch_attempt).await;
                 if let Err(e) = cluster.requeue_job(job_id) {
                     error!(job_id, error = %e, "failed to requeue after partial registration");
                 }
@@ -372,7 +391,9 @@ async fn process_assignment(
     // LaunchJob dispatch below, which — unlike the old fire-and-forget
     // spawn — now runs (and is awaited) *before* the job is allowed to
     // become visibly Running.
-    let peer_addrs: Vec<String> = {
+    let peer_addrs: Vec<String> = if srun_step_dispatch {
+        Vec::new()
+    } else {
         let mut addrs = Vec::with_capacity(all_nodes.len());
         for name in &all_nodes {
             let Some(n) = cluster.get_node(name) else {
@@ -429,13 +450,6 @@ async fn process_assignment(
     };
 
     if let Some(dspec) = dispatch_spec {
-        // The run epoch start_job_impl is about to persist for this
-        // dispatch. Safe to read ahead of that call: this iteration is
-        // the only place that can advance a Pending job's run_attempt,
-        // and nothing here yields back to another iteration for the
-        // same job in between.
-        let prospective_run_attempt = job.run_attempt.saturating_add(1);
-
         match confirm_dispatch_on_nodes(
             cluster.clone(),
             job_id,
@@ -445,7 +459,7 @@ async fn process_assignment(
             per_node_allocs.clone(),
             allocated_nodelist.clone(),
             tasks_per_node,
-            prospective_run_attempt,
+            dispatch_attempt,
             task_fanout,
         )
         .await
@@ -480,14 +494,16 @@ async fn process_assignment(
         // start_job failure here (e.g. the job was cancelled out from
         // under us between assignment and this point) doesn't leave
         // orphans.
-        cancel_job_on_nodes(
-            &cluster,
+        if let Err(hold_err) = cluster.reserve_pending_dispatch(
             job_id,
             &dispatch_nodes,
-            0,
-            job.run_attempt.saturating_add(1),
-        )
-        .await;
+            &per_node_allocs,
+            dispatch_attempt,
+        ) {
+            error!(job_id, error = %hold_err, "failed to reserve failed-dispatch cleanup");
+            return false;
+        }
+        cancel_job_on_nodes(&cluster, job_id, &dispatch_nodes, 0, dispatch_attempt).await;
         debug!(
             job_id = assignment.job_id,
             error = %e,
@@ -652,11 +668,6 @@ pub(crate) async fn try_preempt(
                 mode = ?mode,
                 "preempting lower-priority job"
             );
-            // Reserve before the free lands whenever this mode will kill, so the
-            // scheduler never sees a window where resources look free early.
-            if matches!(mode, PreemptMode::Cancel | PreemptMode::Requeue) {
-                crate::server::note_pending_kill_for_job(cluster, candidate);
-            }
             match cluster.preempt_job(candidate.job_id, mode) {
                 Ok(PreemptOutcome::Killed) => {
                     // Signal 0 = graceful cancel (SIGTERM then SIGKILL).
@@ -1639,10 +1650,14 @@ async fn confirm_dispatch_on_nodes(
     };
     let _ = cluster.set_job_launch_failure_detail(job_id, confirmation_detail.clone());
 
-    // Stop whatever DID launch before the job settles anywhere: a node that
-    // never confirmed will never report completion, and letting it keep
-    // running while the job as a whole is aborted back to Pending would
-    // orphan it.
+    // Stop whatever DID launch (only succeeded_nodes hold anything) before the
+    // job settles back to Pending, or the launched process would be orphaned.
+    if let Err(e) =
+        cluster.reserve_pending_dispatch(job_id, &succeeded_nodes, &per_node_allocs, run_attempt)
+    {
+        error!(job_id, error = %e, "failed to reserve aborted dispatch cleanup");
+        return DispatchConfirmOutcome::Aborted;
+    }
     cancel_job_on_nodes(&cluster, job_id, &succeeded_nodes, 9, run_attempt).await;
 
     // Drain before deciding the job's fate, so the failing node is already out
@@ -1778,10 +1793,8 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
                 "grace period expired — force-killing job"
             );
 
-            // Reserve before the free, so the scheduler never sees the gap
-            // where resources look free but the agent hasn't been told.
-            crate::server::note_pending_kill_for_job(&cluster, job);
-            if let Err(e) = cluster.complete_job(job.job_id, -1, spur_core::job::JobState::Timeout)
+            if let Err(e) =
+                cluster.complete_job_after_cancel(job.job_id, -1, spur_core::job::JobState::Timeout)
             {
                 warn!(job_id = job.job_id, error = %e, "failed to mark job as timed out");
                 continue;
@@ -1871,7 +1884,7 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
         "completing timeout expired — force-finishing job"
     );
 
-    if let Err(e) = cluster.complete_job(job.job_id, exit_code, state) {
+    if let Err(e) = cluster.complete_job_after_cancel(job.job_id, exit_code, state) {
         warn!(
             job_id = job.job_id,
             error = %e,
@@ -4460,6 +4473,54 @@ mod tests {
             assert!(
                 cm.nodes_on_dispatch_cooldown().contains("n1"),
                 "a resources-unavailable reject on the srun registration path must cool the node too"
+            );
+        }
+
+        // A partial registration failure must report only the nodes that
+        // actually succeeded, so cleanup never touches a node that has nothing.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn partial_registration_failure_reports_only_succeeded_nodes() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (good_addr, _) = spawn_mock_agent().await;
+            let bad_addr = spawn_mock_agent_rejecting_registration().await;
+            register_node_at(&cm, "n1", good_addr);
+            register_node_at(&cm, "n2", bad_addr);
+
+            let mut spec = batch_spec("srun-partial-fail", 2);
+            spec.srun_job = true;
+            let job_id = submit_and_wait(&cm, spec.clone());
+
+            let per_node_allocs = HashMap::from([
+                ("n1".into(), ResourceAllocations::with_scalar(4, 8000)),
+                ("n2".into(), ResourceAllocations::with_scalar(4, 8000)),
+            ]);
+            let outcome = register_allocation_on_nodes(
+                cm.clone(),
+                job_id,
+                vec!["n1".into(), "n2".into()],
+                &spec,
+                per_node_allocs.clone(),
+                "n1,n2".into(),
+                0,
+            )
+            .await;
+            let AllocationRegisterOutcome::PartialFailed { succeeded_nodes } = outcome else {
+                panic!("expected PartialFailed");
+            };
+            assert_eq!(succeeded_nodes, vec!["n1".to_string()]);
+
+            cm.reserve_pending_dispatch(job_id, &succeeded_nodes, &per_node_allocs, 0)
+                .unwrap();
+            let reserved = cm.pending_kill_reservations();
+            assert!(
+                reserved.contains_key("n1"),
+                "the node that actually registered must be held"
+            );
+            assert!(
+                !reserved.contains_key("n2"),
+                "a node that never registered anything must not be held"
             );
         }
 

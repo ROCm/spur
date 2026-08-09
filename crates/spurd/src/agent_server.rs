@@ -398,7 +398,10 @@ impl AgentService {
                     if let Some(ref cgroup) = c.cgroup {
                         crate::executor::cleanup_cgroup(cgroup);
                     }
-                    allocation.lock().await.release_job(c.job_id);
+                    allocation
+                        .lock()
+                        .await
+                        .release_job_if_attempt(c.job_id, c.run_attempt);
                     cleanup_completed_job_mpi(c.job_id, &c.mpi, &mpi_host).await;
                 }
 
@@ -522,14 +525,16 @@ fn reconcile_orphaned_allocations(
 struct LaunchReservationGuard {
     allocation: Arc<Mutex<NodeAllocation>>,
     job_id: u32,
+    run_attempt: u32,
     armed: bool,
 }
 
 impl LaunchReservationGuard {
-    fn new(allocation: Arc<Mutex<NodeAllocation>>, job_id: u32) -> Self {
+    fn new(allocation: Arc<Mutex<NodeAllocation>>, job_id: u32, run_attempt: u32) -> Self {
         Self {
             allocation,
             job_id,
+            run_attempt,
             armed: true,
         }
     }
@@ -545,12 +550,18 @@ impl Drop for LaunchReservationGuard {
             return;
         }
         let job_id = self.job_id;
+        let run_attempt = self.run_attempt;
+        // Drop can't await; try_lock succeeds inline on this uncontended path,
+        // else release off-thread so the reservation is never left stranded.
         if let Ok(mut alloc) = self.allocation.try_lock() {
-            alloc.release_job(job_id);
+            alloc.release_job_if_attempt(job_id, run_attempt);
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let allocation = self.allocation.clone();
             handle.spawn(async move {
-                allocation.lock().await.release_job(job_id);
+                allocation
+                    .lock()
+                    .await
+                    .release_job_if_attempt(job_id, run_attempt);
             });
         }
     }
@@ -1262,12 +1273,18 @@ impl SlurmAgent for AgentService {
             };
 
         let (alloc_result, allocated_device_ids) = self
-            .allocate_local_resources(job_id, &spec, req.allocated.as_ref())
+            .allocate_local_resources_for_attempt(
+                job_id,
+                &spec,
+                req.allocated.as_ref(),
+                run_attempt,
+            )
             .await?;
 
         // Release the reservation on any exit before commit, including a
         // cancelled launch future; disarmed once committed to `running`.
-        let mut reservation_guard = LaunchReservationGuard::new(self.allocation.clone(), job_id);
+        let mut reservation_guard =
+            LaunchReservationGuard::new(self.allocation.clone(), job_id, run_attempt);
 
         let injection = {
             let reg = self.device_registry.lock().await;
@@ -1402,7 +1419,10 @@ impl SlurmAgent for AgentService {
                 // in flight — committing now would resurrect a demoted leader's write.
                 let stale_term = self.check_term(req.term).is_err();
                 if stale_term {
-                    self.allocation.lock().await.release_job(job_id);
+                    self.allocation
+                        .lock()
+                        .await
+                        .release_job_if_attempt(job_id, run_attempt);
                 }
 
                 // Reservation reclaimed (launch exceeded the TTL) or term superseded:
@@ -1589,7 +1609,10 @@ impl SlurmAgent for AgentService {
         // commit order) so this can't free a job that just became running.
         let jobs = self.running.lock().await;
         if !jobs.contains_key(&job_id) {
-            self.allocation.lock().await.release_job(job_id);
+            self.allocation
+                .lock()
+                .await
+                .release_job_if_attempt(job_id, req.run_attempt);
         }
         drop(jobs);
 
@@ -1762,7 +1785,13 @@ impl SlurmAgent for AgentService {
         {
             let mut alloc = self.allocation.lock().await;
             alloc
-                .allocate_for_job(req.job_id, cpus, memory_mb, &controller_gpu_ids)
+                .allocate_for_job_with_attempt(
+                    req.job_id,
+                    cpus,
+                    memory_mb,
+                    &controller_gpu_ids,
+                    req.run_attempt,
+                )
                 .map_err(|e| match e {
                     AllocError::GpusUnavailable => Status::resource_exhausted(
                         "controller-allocated GPUs unavailable on this node",
@@ -2504,7 +2533,10 @@ impl AgentService {
             }
         };
         if dropped {
-            self.allocation.lock().await.release_job(job_id);
+            self.allocation
+                .lock()
+                .await
+                .release_job_if_attempt(job_id, expected_run_attempt);
             if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
                 warn!(job_id, error = %e, "PMIx stop failed on job drop");
             }
@@ -2512,11 +2544,23 @@ impl AgentService {
     }
 
     /// Record controller-allocated GPUs and allocate local CPU/memory resources.
+    #[cfg(test)]
     async fn allocate_local_resources(
         &self,
         job_id: u32,
         spec: &JobSpec,
         allocated: Option<&ResourceAllocations>,
+    ) -> Result<(AllocationResult, Vec<u32>), Status> {
+        self.allocate_local_resources_for_attempt(job_id, spec, allocated, 0)
+            .await
+    }
+
+    async fn allocate_local_resources_for_attempt(
+        &self,
+        job_id: u32,
+        spec: &JobSpec,
+        allocated: Option<&ResourceAllocations>,
+        run_attempt: u32,
     ) -> Result<(AllocationResult, Vec<u32>), Status> {
         let controller_gpu_ids: Vec<u32> = allocated
             .and_then(|a| a.devices.get("gpu"))
@@ -2545,11 +2589,12 @@ impl AgentService {
         } else {
             0
         };
-        let result = match alloc.allocate_for_job(
+        let result = match alloc.allocate_for_job_with_attempt(
             job_id,
             cpus,
             spec.memory_per_node_mb,
             &controller_gpu_ids,
+            run_attempt,
         ) {
             Ok(result) => result,
             Err(AllocError::GpusUnavailable) => {
@@ -2571,11 +2616,12 @@ impl AgentService {
                         alloc.release_job(*owner);
                     }
                 }
-                match alloc.allocate_for_job(
+                match alloc.allocate_for_job_with_attempt(
                     job_id,
                     cpus,
                     spec.memory_per_node_mb,
                     &controller_gpu_ids,
+                    run_attempt,
                 ) {
                     Ok(result) => result,
                     Err(_) => {
@@ -4761,6 +4807,53 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stale_cancel_keeps_a_newer_launch_reservation() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job_with_attempt(7, 1, 0, &[0], 2)
+                .unwrap();
+        }
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id: 7,
+            signal: 9,
+            term: 0,
+            run_attempt: 1,
+        }))
+        .await
+        .expect("stale cancel");
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "a stale cancel must not free a newer launch reservation"
+        );
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id: 7,
+            signal: 9,
+            term: 0,
+            run_attempt: 2,
+        }))
+        .await
+        .expect("current cancel");
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "the matching cancel must still release the launch reservation"
+        );
+    }
+
     // A cancel meant for an old run must not kill the job_id's re-dispatched
     // replacement, even for the very first signal (not just the grace escalation).
     #[tokio::test]
@@ -4955,7 +5048,7 @@ mod tests {
                 .await
                 .allocate_for_job(9, 1, 0, &[0])
                 .unwrap();
-            let guard = LaunchReservationGuard::new(svc.allocation.clone(), 9);
+            let guard = LaunchReservationGuard::new(svc.allocation.clone(), 9, 0);
             assert_eq!(svc.free_gpu_count().await, 0, "reserved under guard");
             drop(guard);
         }
@@ -4973,7 +5066,7 @@ mod tests {
                 .allocate_for_job(10, 1, 0, &[0])
                 .unwrap();
             svc.allocation.lock().await.commit_job(10);
-            let mut guard = LaunchReservationGuard::new(svc.allocation.clone(), 10);
+            let mut guard = LaunchReservationGuard::new(svc.allocation.clone(), 10, 0);
             guard.disarm();
             drop(guard);
         }

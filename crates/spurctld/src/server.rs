@@ -251,9 +251,12 @@ impl ControllerService {
                         node = %node_owned,
                         "agent holds a job the controller doesn't bind here — reclaiming its allocation"
                     );
-                    // Signal 0 = graceful release, no-op on an unknown id. 0 for
-                    // an unknown/terminal id too — nothing to fence against.
-                    let run_attempt = cluster.get_job(job_id).map_or(0, |j| j.run_attempt);
+                    // A requeue may have advanced the controller job to a newer
+                    // run while this node still holds the cancelled one.
+                    let run_attempt = cluster
+                        .pending_kill_run_attempt(job_id, &node_owned)
+                        .or_else(|| cluster.get_job(job_id).map(|j| j.run_attempt))
+                        .unwrap_or(0);
                     crate::scheduler_loop::cancel_job_on_nodes(
                         &cluster,
                         job_id,
@@ -267,8 +270,16 @@ impl ControllerService {
         }
 
         let reported_ids: HashSet<u32> = reported.iter().map(|r| r.job_id).collect();
-        self.cluster
-            .clear_confirmed_pending_kills(node, &reported_ids);
+        {
+            let cluster = self.cluster.clone();
+            let node_owned = node.to_string();
+            let reported_ids = reported_ids.clone();
+            tokio::spawn(async move {
+                if let Err(e) = cluster.clear_confirmed_pending_kills(&node_owned, &reported_ids) {
+                    warn!(node = %node_owned, error = %e, "failed to persist pending-kill release confirmation");
+                }
+            });
+        }
         let active = self.cluster.active_jobs_on_node(node);
         // Sweep entries for jobs that left the active set by another path,
         // else one that's never re-reported leaks its streak entry.
@@ -303,9 +314,6 @@ impl ControllerService {
                         node = %node_owned,
                         "node's heartbeat repeatedly omitted a job the controller binds here — evicting"
                     );
-                    // Reserve before the free; a no-op eviction below self-heals
-                    // once this node's next heartbeat stops reporting the job.
-                    note_pending_kill_for_job(&cluster, &fresh);
                     match cluster.evict_job(
                         fresh.job_id,
                         spur_core::job::PendingReason::NodeDown,
@@ -458,33 +466,9 @@ fn should_kill_reported_job(cluster: &ClusterManager, job_id: u32, node: &str) -
                 .get_job(job_id)
                 .is_some_and(|j| j.allocated_nodes.iter().any(|n| n == node))
         }
+        Some(JobState::Pending) => cluster.has_pending_kill(job_id, node),
         Some(_) => false,
     }
-}
-
-/// Reserve `job`'s resources on each node. Returns the attempt token, so a
-/// later failure can roll back only this reservation via `clear_pending_kill_for_job`.
-pub(crate) fn note_pending_kill_for_job(
-    cluster: &ClusterManager,
-    job: &spur_core::job::Job,
-) -> u64 {
-    let attempt = cluster.new_pending_kill_attempt();
-    let node_count = job.allocated_nodes.len().max(1) as u32;
-    for node in &job.allocated_nodes {
-        let resources = job.per_node_alloc.get(node).cloned().unwrap_or_else(|| {
-            job.allocated_resources.as_ref().map_or_else(
-                spur_core::resource::ResourceAllocations::default,
-                |total| {
-                    spur_core::resource::ResourceAllocations::with_scalar(
-                        total.cpus / node_count,
-                        total.memory_mb / node_count as u64,
-                    )
-                },
-            )
-        });
-        cluster.note_pending_kill(job.job_id, node, resources, attempt);
-    }
-    attempt
 }
 
 #[tonic::async_trait]
@@ -625,16 +609,7 @@ impl SlurmController for ControllerService {
         // Snapshot before cancelling so we still have allocated_nodes after.
         let job = self.cluster.get_job(job_id);
 
-        // Reserve before the free lands (the check above already gated this
-        // on the request being authorized against a live job).
-        let attempt = job
-            .as_ref()
-            .map(|job| note_pending_kill_for_job(&self.cluster, job));
-
         if let Err(e) = self.cluster.cancel_job(job_id, &req.user) {
-            if let Some(attempt) = attempt {
-                self.cluster.clear_pending_kill_for_job(job_id, attempt);
-            }
             return Err(cluster_err_to_status(e));
         }
 
@@ -3573,7 +3548,7 @@ mod tests {
     async fn should_kill_reported_job_selects_only_terminal_or_unbound() {
         use crate::raft::StateMachineApply;
         use spur_core::job::{JobSpec, JobState};
-        use spur_core::wal::WalOperation;
+        use spur_core::wal::{PendingKillReservation, WalOperation};
 
         let dir = tempfile::TempDir::new().unwrap();
         let cluster =
@@ -3653,18 +3628,29 @@ mod tests {
         assert_eq!(cluster.job_state(14), Some(JobState::Suspended));
         assert_eq!(cluster.job_state(15), Some(JobState::Preempted));
 
+        apply(&WalOperation::PendingKillReserve {
+            reservations: vec![PendingKillReservation {
+                job_id: 10,
+                node: "n1".into(),
+                resources: res.clone(),
+                attempt: 101,
+                run_attempt: 1,
+            }],
+        });
+
         let stale: Vec<u32> = [10, 11, 12, 13, 14, 15, 999]
             .into_iter()
             .filter(|&job_id| should_kill_reported_job(&cluster, job_id, "n1"))
             .collect();
         assert_eq!(
             stale,
-            vec![12, 999],
-            "terminal and unknown ids are reclaimed; Pending/Running (bound)/Completing/Suspended/Preempted are spared"
+            vec![10, 12, 999],
+            "a Pending job is reclaimed only while an unconfirmed prior-run hold exists"
         );
 
         // Same jobs, queried against a node NONE of them are bound to: Running/
-        // Completing/Suspended must now be killed (unbound), Pending/Preempted spared.
+        // Completing/Suspended must now be killed (unbound); the release hold
+        // is scoped to n1, so Pending remains spared on n2.
         let unbound: Vec<u32> = [10, 11, 13, 14, 15]
             .into_iter()
             .filter(|&job_id| should_kill_reported_job(&cluster, job_id, "n2"))
@@ -3983,8 +3969,7 @@ mod tests {
         );
     }
 
-    // A heartbeat that stops reporting a job is real confirmation of release —
-    // the pending-kill reservation must clear then, not wait out the full TTL.
+    // A heartbeat that stops reporting a job is the release confirmation.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconcile_clears_pending_kill_once_heartbeat_confirms_release() {
         use spur_core::resource::ResourceAllocations;
@@ -4007,9 +3992,17 @@ mod tests {
             }],
         );
 
+        // The release confirmation is spawned off the heartbeat's critical path.
+        let mut cpus = svc.cluster.pending_kill_reservations()["n1"].cpus;
+        for _ in 0..200 {
+            if cpus == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            cpus = svc.cluster.pending_kill_reservations()["n1"].cpus;
+        }
         assert_eq!(
-            svc.cluster.pending_kill_reservations()["n1"].cpus,
-            1,
+            cpus, 1,
             "job 1's reservation must clear once the heartbeat confirms it's gone"
         );
     }

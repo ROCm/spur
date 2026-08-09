@@ -13,6 +13,26 @@ use std::collections::HashMap;
 
 use crate::resource::{ResourceAllocations, ResourceSet};
 
+/// A controller-owned resource hold that remains in force after a cancel or
+/// eviction until the owning node confirms that it no longer holds the job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingKillReservation {
+    pub job_id: JobId,
+    pub node: String,
+    pub resources: ResourceAllocations,
+    pub attempt: u64,
+    #[serde(default)]
+    pub run_attempt: u32,
+}
+
+/// Identity of a pending-kill hold that a node heartbeat has confirmed released.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingKillRelease {
+    pub job_id: JobId,
+    pub node: String,
+    pub attempt: u64,
+}
+
 fn default_port() -> u16 {
     6818
 }
@@ -24,6 +44,20 @@ fn default_job_evict_reason() -> PendingReason {
 /// All state-mutating operations that get logged to the Raft log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalOperation {
+    PendingKillReserve {
+        reservations: Vec<PendingKillReservation>,
+    },
+    /// Applies a job lifecycle transition and its release holds in one Raft
+    /// entry, so a leader change cannot expose the freed allocation alone.
+    PendingKillTransition {
+        reservations: Vec<PendingKillReservation>,
+        operation: Box<WalOperation>,
+    },
+    /// A heartbeat established that these exact pending-kill holds are gone.
+    PendingKillRelease {
+        releases: Vec<PendingKillRelease>,
+    },
+
     // Job operations
     JobSubmit {
         job_id: JobId,
@@ -118,6 +152,12 @@ pub enum WalOperation {
     JobDispatchBackoff {
         job_id: JobId,
         begin_time: chrono::DateTime<chrono::Utc>,
+    },
+    /// Persist the epoch before dispatching any agent RPC so delayed requests
+    /// from an aborted dispatch cannot target its retry.
+    JobDispatchAttempt {
+        job_id: JobId,
+        run_attempt: u32,
     },
     /// Preempt a running job and requeue it in one atomic step: free its node
     /// allocation, end the prior run for accounting (as PREEMPTED), return it to

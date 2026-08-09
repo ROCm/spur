@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
@@ -25,7 +25,7 @@ use spur_core::qos::{check_qos_limits, qos_adjusted_priority, QosCheckResult};
 use spur_core::reservation::{self, normalize_node_list, running_jobs_overlap_start, Reservation};
 use spur_core::resource::{ResourceAllocations, ResourceSet};
 use spur_core::step::{JobStep, StepState, STEP_BATCH, STEP_RESERVED_MIN};
-use spur_core::wal::WalOperation;
+use spur_core::wal::{PendingKillRelease, PendingKillReservation, WalOperation};
 use spur_metrics::job::JobMetricsSnapshot;
 use spur_metrics::node::NodeMetricsSnapshot;
 use spur_metrics::partition::PartitionMetricsSnapshot;
@@ -289,9 +289,6 @@ pub enum PreemptOutcome {
     Suspended,
 }
 
-/// Resources, expiry, and owning attempt token for one pending-kill entry.
-type PendingKillEntry = (ResourceAllocations, std::time::Instant, u64);
-
 /// Central cluster state manager.
 ///
 /// Thread-safe via RwLock. The scheduler and gRPC server both access this.
@@ -355,10 +352,10 @@ pub struct ClusterManager {
     /// Consecutive heartbeats a node's report has omitted a job it's bound
     /// to. Leader-local and transient, never persisted.
     phantom_miss_streaks: RwLock<HashMap<(JobId, String), u32>>,
-    /// Resources freed but not yet confirmed released by the agent. The u64
-    /// scopes a rollback to the attempt that planted it, not a concurrent one.
-    pending_kill: RwLock<HashMap<(JobId, String), PendingKillEntry>>,
-    next_pending_kill_attempt: std::sync::atomic::AtomicU64,
+    /// Resources freed but not yet confirmed released by the agent; replicated
+    /// so a leadership change can't make an unconfirmed release schedulable.
+    pending_kill: RwLock<HashMap<(JobId, String), PendingKillReservation>>,
+    next_pending_kill_attempt: AtomicU64,
 }
 
 struct PendingJobClassification {
@@ -421,7 +418,7 @@ impl ClusterManager {
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
             phantom_miss_streaks: RwLock::new(HashMap::new()),
             pending_kill: RwLock::new(HashMap::new()),
-            next_pending_kill_attempt: std::sync::atomic::AtomicU64::new(1),
+            next_pending_kill_attempt: AtomicU64::new(1),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -493,15 +490,25 @@ impl ClusterManager {
             .retain(|(job_id, n), _| n != node || active_job_ids.contains(job_id));
     }
 
-    /// New token identifying one reserve-then-mutate attempt, so its rollback
-    /// can't clear a different, concurrent attempt's still-live reservation.
+    /// New token identifying one durable release hold.
     pub(crate) fn new_pending_kill_attempt(&self) -> u64 {
         self.next_pending_kill_attempt
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Reserve `resources` on `node` under `attempt` until a heartbeat confirms
-    /// release or the TTL expires, whichever comes first.
+    #[cfg(test)]
+    pub(crate) fn reserve_pending_kills(
+        &self,
+        reservations: Vec<PendingKillReservation>,
+    ) -> anyhow::Result<()> {
+        if reservations.is_empty() {
+            return Ok(());
+        }
+        self.propose(WalOperation::PendingKillReserve { reservations })?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn note_pending_kill(
         &self,
         job_id: JobId,
@@ -509,43 +516,154 @@ impl ClusterManager {
         resources: ResourceAllocations,
         attempt: u64,
     ) {
-        let ttl = self.config().controller.pending_kill_ttl_secs;
-        if ttl == 0 {
-            return;
+        self.reserve_pending_kills(vec![PendingKillReservation {
+            job_id,
+            node: node.into(),
+            resources,
+            attempt,
+            run_attempt: 0,
+        }])
+        .expect("test pending-kill reservation must commit");
+    }
+
+    pub(crate) fn pending_kills_for_job(&self, job: &Job) -> Vec<PendingKillReservation> {
+        let attempt = self.new_pending_kill_attempt();
+        let node_count = job.allocated_nodes.len().max(1) as u32;
+        job.allocated_nodes
+            .iter()
+            .map(|node| PendingKillReservation {
+                job_id: job.job_id,
+                node: node.clone(),
+                resources: job.per_node_alloc.get(node).cloned().unwrap_or_else(|| {
+                    job.allocated_resources.as_ref().map_or_else(
+                        ResourceAllocations::default,
+                        |total| {
+                            ResourceAllocations::with_scalar(
+                                total.cpus / node_count,
+                                total.memory_mb / node_count as u64,
+                            )
+                        },
+                    )
+                }),
+                attempt,
+                run_attempt: job.run_attempt,
+            })
+            .collect()
+    }
+
+    pub(crate) fn reserve_pending_dispatch(
+        &self,
+        job_id: JobId,
+        nodes: &[String],
+        per_node_alloc: &HashMap<String, ResourceAllocations>,
+        run_attempt: u32,
+    ) -> anyhow::Result<()> {
+        let attempt = self.new_pending_kill_attempt();
+        let reservations = nodes
+            .iter()
+            .filter_map(|node| {
+                per_node_alloc
+                    .get(node)
+                    .cloned()
+                    .map(|resources| PendingKillReservation {
+                        job_id,
+                        node: node.clone(),
+                        resources,
+                        attempt,
+                        run_attempt,
+                    })
+            })
+            .collect();
+        self.propose(WalOperation::PendingKillReserve { reservations })?;
+        Ok(())
+    }
+
+    pub fn begin_dispatch_attempt(&self, job_id: JobId) -> anyhow::Result<u32> {
+        let attempt = self
+            .jobs
+            .read()
+            .get(&job_id)
+            .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))
+            .and_then(|job| {
+                if job.state != JobState::Pending {
+                    anyhow::bail!("job {} is not pending", job_id);
+                }
+                Ok(job.run_attempt.saturating_add(1))
+            })?;
+        self.propose(WalOperation::JobDispatchAttempt {
+            job_id,
+            run_attempt: attempt,
+        })?;
+        Ok(attempt)
+    }
+
+    fn pending_kills_for_jobs(&self, jobs: &[Job]) -> Vec<PendingKillReservation> {
+        jobs.iter()
+            .flat_map(|job| self.pending_kills_for_job(job))
+            .collect()
+    }
+
+    pub(crate) fn propose_with_pending_kills(
+        &self,
+        reservations: Vec<PendingKillReservation>,
+        operation: WalOperation,
+    ) -> anyhow::Result<ClientResponse> {
+        if reservations.is_empty() {
+            return self.propose(operation);
         }
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(ttl);
-        self.pending_kill
-            .write()
-            .insert((job_id, node.to_string()), (resources, until, attempt));
+        self.propose(WalOperation::PendingKillTransition {
+            reservations,
+            operation: Box::new(operation),
+        })
     }
 
-    /// Clear `node`'s pending-kill entries for jobs a heartbeat no longer
-    /// reports — real confirmation of release, not just a TTL guess.
-    pub(crate) fn clear_confirmed_pending_kills(&self, node: &str, reported: &HashSet<JobId>) {
-        self.pending_kill
-            .write()
-            .retain(|(job_id, n), _| n != node || reported.contains(job_id));
+    /// Replicate the release confirmations established by one heartbeat.
+    pub(crate) fn clear_confirmed_pending_kills(
+        &self,
+        node: &str,
+        reported: &HashSet<JobId>,
+    ) -> anyhow::Result<()> {
+        let releases: Vec<PendingKillRelease> = self
+            .pending_kill
+            .read()
+            .values()
+            .filter(|hold| hold.node == node && !reported.contains(&hold.job_id))
+            .map(|hold| PendingKillRelease {
+                job_id: hold.job_id,
+                node: hold.node.clone(),
+                attempt: hold.attempt,
+            })
+            .collect();
+        if releases.is_empty() {
+            return Ok(());
+        }
+        self.propose(WalOperation::PendingKillRelease { releases })?;
+        Ok(())
     }
 
-    /// Undo `attempt`'s own reservation after its cancel/evict failed — never
-    /// a concurrent attempt's still-live one on the same job.
-    pub(crate) fn clear_pending_kill_for_job(&self, job_id: JobId, attempt: u64) {
-        self.pending_kill
-            .write()
-            .retain(|(id, _), (_, _, a)| *id != job_id || *a != attempt);
-    }
-
-    /// Per-node resources still held out of new dispatch, pruning any
-    /// entry whose TTL has expired.
+    /// Per-node resources still held out of new dispatch.
     pub(crate) fn pending_kill_reservations(&self) -> HashMap<String, ResourceAllocations> {
-        let now = std::time::Instant::now();
-        let mut pending = self.pending_kill.write();
-        pending.retain(|_, (_, until, _)| *until > now);
         let mut by_node: HashMap<String, ResourceAllocations> = HashMap::new();
-        for ((_, node), (resources, _, _)) in pending.iter() {
-            by_node.entry(node.clone()).or_default().add(resources);
+        for hold in self.pending_kill.read().values() {
+            by_node
+                .entry(hold.node.clone())
+                .or_default()
+                .add(&hold.resources);
         }
         by_node
+    }
+
+    pub(crate) fn has_pending_kill(&self, job_id: JobId, node: &str) -> bool {
+        self.pending_kill
+            .read()
+            .contains_key(&(job_id, node.to_string()))
+    }
+
+    pub(crate) fn pending_kill_run_attempt(&self, job_id: JobId, node: &str) -> Option<u32> {
+        self.pending_kill
+            .read()
+            .get(&(job_id, node.to_string()))
+            .map(|hold| hold.run_attempt)
     }
 
     /// Submit a new job. If it has an array spec, expand into individual tasks.
@@ -1003,15 +1121,7 @@ impl ClusterManager {
     pub fn cancel_job(&self, job_id: JobId, user: &str) -> anyhow::Result<()> {
         self.check_cancel_allowed(job_id, user)?;
 
-        // Use JobComplete (not JobStateChange) so that resource deallocation
-        // fires for any allocated nodes. For pending jobs, allocated_nodes is empty
-        // so the deallocation loop is a no-op.
-        let resp = self.propose(WalOperation::JobComplete {
-            job_id,
-            exit_code: -1,
-            state: JobState::Cancelled,
-        })?;
-        self.run_all_finalized_side_effects(&resp);
+        self.complete_job_after_cancel(job_id, -1, JobState::Cancelled)?;
 
         info!(job_id, "job cancelled");
         Ok(())
@@ -1055,13 +1165,14 @@ impl ClusterManager {
         } else {
             JobState::Failed
         };
-        self.complete_job(job_id, exit_code, state).map_err(|e| {
-            warn!(job_id, error = %e, "finish_srun_job: complete_job failed");
-            SrunCompleteError::Internal {
-                job_id,
-                message: e.to_string(),
-            }
-        })?;
+        self.complete_job_after_cancel(job_id, exit_code, state)
+            .map_err(|e| {
+                warn!(job_id, error = %e, "finish_srun_job: complete_job failed");
+                SrunCompleteError::Internal {
+                    job_id,
+                    message: e.to_string(),
+                }
+            })?;
         Ok(job)
     }
 
@@ -1151,8 +1262,7 @@ impl ClusterManager {
             old_state = job.state;
             spec_for_notify = job.spec.clone();
             submit_time_for_notify = job.submit_time;
-            // Next run epoch (first dispatch = 1), threaded to the agents.
-            run_attempt = job.run_attempt.saturating_add(1);
+            run_attempt = job.run_attempt.max(1);
             if job.state != JobState::Pending {
                 anyhow::bail!("job {} cannot start from state {:?}", job_id, job.state);
             }
@@ -1288,11 +1398,31 @@ impl ClusterManager {
     }
 
     /// Complete a job (controller-initiated or force-finish from COMPLETING timeout).
+    #[cfg(test)]
     pub fn complete_job(
         &self,
         job_id: JobId,
         exit_code: i32,
         state: JobState,
+    ) -> anyhow::Result<()> {
+        self.complete_job_inner(job_id, exit_code, state, false)
+    }
+
+    pub fn complete_job_after_cancel(
+        &self,
+        job_id: JobId,
+        exit_code: i32,
+        state: JobState,
+    ) -> anyhow::Result<()> {
+        self.complete_job_inner(job_id, exit_code, state, true)
+    }
+
+    fn complete_job_inner(
+        &self,
+        job_id: JobId,
+        exit_code: i32,
+        state: JobState,
+        hold_until_heartbeat: bool,
     ) -> anyhow::Result<()> {
         // A time-limit expiry has to win over the caller's outcome here, not
         // just in the per-node completion path. The marker is only ever set on
@@ -1302,7 +1432,7 @@ impl ClusterManager {
         // expiry that would otherwise be reported as an ordinary failure and
         // skip the Timeout requeue. Cancelled (user cancel, preemption) and an
         // already-correct Timeout pass through untouched.
-        let state = {
+        let (state, holds) = {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
@@ -1310,22 +1440,31 @@ impl ClusterManager {
             if job.state.is_terminal() {
                 anyhow::bail!("invalid transition from {:?} to {:?}", job.state, state);
             }
-            if job.time_limit_signaled_at.is_some()
+            let state = if job.time_limit_signaled_at.is_some()
                 && matches!(state, JobState::Failed | JobState::Completed)
             {
                 JobState::Timeout
             } else {
                 state
-            }
+            };
+            let holds = if hold_until_heartbeat {
+                self.pending_kills_for_job(job)
+            } else {
+                Vec::new()
+            };
+            (state, holds)
         };
 
         // propose() handles: state transition, exit_code, end_time,
         // resource deallocation, step completion, license return
-        let resp = self.propose(WalOperation::JobComplete {
-            job_id,
-            exit_code,
-            state,
-        })?;
+        let resp = self.propose_with_pending_kills(
+            holds,
+            WalOperation::JobComplete {
+                job_id,
+                exit_code,
+                state,
+            },
+        )?;
         self.run_all_finalized_side_effects(&resp);
 
         debug!(job_id, exit_code, "job completed");
@@ -1346,7 +1485,7 @@ impl ClusterManager {
     /// controller-side state change; the caller dispatches the signal named by
     /// the returned `PreemptOutcome`. `Off` is rejected.
     pub fn preempt_job(&self, job_id: JobId, mode: PreemptMode) -> anyhow::Result<PreemptOutcome> {
-        {
+        let job = {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
@@ -1354,7 +1493,8 @@ impl ClusterManager {
             if job.state != JobState::Running {
                 anyhow::bail!("job {} is not running (state {:?})", job_id, job.state);
             }
-        }
+            job.clone()
+        };
 
         match mode {
             PreemptMode::Off => anyhow::bail!("preemption disabled for job {}", job_id),
@@ -1364,7 +1504,7 @@ impl ClusterManager {
                 Ok(PreemptOutcome::Suspended)
             }
             PreemptMode::Cancel => {
-                self.complete_job(job_id, -1, JobState::Cancelled)?;
+                self.complete_job_after_cancel(job_id, -1, JobState::Cancelled)?;
                 info!(job_id, "job preempted (cancel)");
                 Ok(PreemptOutcome::Killed)
             }
@@ -1389,7 +1529,10 @@ impl ClusterManager {
                     .get(&job_id)
                     .and_then(|j| j.spec.begin_time)
                     .map_or(hold, |user_begin| user_begin.max(hold));
-                let resp = self.propose(WalOperation::JobPreemptRequeue { job_id, begin_time })?;
+                let resp = self.propose_with_pending_kills(
+                    self.pending_kills_for_job(&job),
+                    WalOperation::JobPreemptRequeue { job_id, begin_time },
+                )?;
                 self.run_all_finalized_side_effects(&resp);
                 info!(job_id, hold_secs, "job preempted (requeue)");
                 Ok(PreemptOutcome::Killed)
@@ -1582,13 +1725,7 @@ impl ClusterManager {
             (job.state, self.launch_backoff_until(job))
         };
 
-        // transition to Failed via JobComplete so node resources,
-        // licenses, and steps are properly cleaned up.
-        self.propose(WalOperation::JobComplete {
-            job_id,
-            exit_code: -1,
-            state: JobState::Failed,
-        })?;
+        self.complete_job_after_cancel(job_id, -1, JobState::Failed)?;
 
         if hold {
             self.propose(WalOperation::job_state_change_held_pending_desc(
@@ -1680,7 +1817,7 @@ impl ClusterManager {
         run_attempt: u32,
         detail: Option<String>,
     ) -> anyhow::Result<Vec<JobFinalized>> {
-        {
+        let job = {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
@@ -1688,13 +1825,17 @@ impl ClusterManager {
             if job.state.is_terminal() {
                 return Ok(Vec::new());
             }
-        }
-        let resp = self.propose(WalOperation::JobEvict {
-            job_id,
-            reason,
-            detail,
-            run_attempt,
-        })?;
+            job.clone()
+        };
+        let resp = self.propose_with_pending_kills(
+            self.pending_kills_for_job(&job),
+            WalOperation::JobEvict {
+                job_id,
+                reason,
+                detail,
+                run_attempt,
+            },
+        )?;
         self.run_all_finalized_side_effects(&resp);
         Ok(resp.jobs_finalized)
     }
@@ -1995,11 +2136,7 @@ impl ClusterManager {
         };
 
         if state == JobState::Running {
-            self.propose(WalOperation::JobComplete {
-                job_id,
-                exit_code: -1,
-                state: JobState::Failed,
-            })?;
+            self.complete_job_after_cancel(job_id, -1, JobState::Failed)?;
             state = JobState::Failed;
         }
 
@@ -2220,14 +2357,22 @@ impl ClusterManager {
         // locked so auto-recovery won't override the operator's intent.
         // Resuming to Idle clears the lock.
         let admin_locked = effective_state.is_admin_hold();
+        let holds = if effective_state == NodeState::Down {
+            self.pending_kills_for_jobs(&self.active_jobs_on_node(name))
+        } else {
+            Vec::new()
+        };
 
-        self.propose(WalOperation::NodeStateChange {
-            name: name.to_string(),
-            old_state,
-            new_state: effective_state,
-            reason,
-            admin_locked,
-        })?;
+        self.propose_with_pending_kills(
+            holds,
+            WalOperation::NodeStateChange {
+                name: name.to_string(),
+                old_state,
+                new_state: effective_state,
+                reason,
+                admin_locked,
+            },
+        )?;
         info!(node = %name, old = ?old_state, new = ?effective_state, "node state updated");
         Ok(())
     }
@@ -2340,13 +2485,16 @@ impl ClusterManager {
                     admin_locked,
                 } => {
                     warn!(node = %name, "node marked DOWN (heartbeat timeout)");
-                    match self.propose(WalOperation::NodeStateChange {
-                        name: name.clone(),
-                        old_state,
-                        new_state: NodeState::Down,
-                        reason: Some("Not responding".into()),
-                        admin_locked,
-                    }) {
+                    match self.propose_with_pending_kills(
+                        self.pending_kills_for_jobs(&self.active_jobs_on_node(&name)),
+                        WalOperation::NodeStateChange {
+                            name: name.clone(),
+                            old_state,
+                            new_state: NodeState::Down,
+                            reason: Some("Not responding".into()),
+                            admin_locked,
+                        },
+                    ) {
                         Ok(resp) => {
                             self.run_all_finalized_side_effects(&resp);
                             evicted.extend(resp.jobs_finalized);
@@ -2450,10 +2598,13 @@ impl ClusterManager {
             }
         }
 
-        let resp = self.propose(WalOperation::NodeRemove {
-            name: name.to_string(),
-            reason,
-        })?;
+        let resp = self.propose_with_pending_kills(
+            self.pending_kills_for_jobs(&self.active_jobs_on_node(name)),
+            WalOperation::NodeRemove {
+                name: name.to_string(),
+                reason,
+            },
+        )?;
         self.run_all_finalized_side_effects(&resp);
         Ok(resp.jobs_finalized)
     }
@@ -3522,7 +3673,7 @@ impl ClusterManager {
     }
 
     /// Cancel running jobs whose reservation window has ended (after optional grace).
-    pub fn enforce_reservation_end_times(&self) {
+    pub fn enforce_reservation_end_times(&self) -> Vec<Job> {
         let now = Utc::now();
         let grace = chrono::Duration::minutes(self.config().scheduler.resv_overrun_minutes as i64);
         let reservations: std::collections::HashMap<String, Reservation> = self
@@ -3530,7 +3681,7 @@ impl ClusterManager {
             .into_iter()
             .map(|r| (r.name.clone(), r))
             .collect();
-        let to_cancel: Vec<JobId> = self
+        let to_cancel: Vec<Job> = self
             .jobs
             .read()
             .values()
@@ -3544,17 +3695,21 @@ impl ClusterManager {
                 let res_name = job.spec.reservation.as_ref()?;
                 let res = reservations.get(res_name)?;
                 if now > res.end_time + grace {
-                    Some(job.job_id)
+                    Some(job.clone())
                 } else {
                     None
                 }
             })
             .collect();
-        for job_id in to_cancel {
-            if let Err(e) = self.complete_job(job_id, -1, JobState::Cancelled) {
-                warn!(job_id, error = %e, "failed to cancel job after reservation ended");
+        let mut cancelled = Vec::new();
+        for job in to_cancel {
+            if let Err(e) = self.complete_job_after_cancel(job.job_id, -1, JobState::Cancelled) {
+                warn!(job_id = job.job_id, error = %e, "failed to cancel job after reservation ended");
+            } else {
+                cancelled.push(job);
             }
         }
+        cancelled
     }
 
     fn validate_reservation_job_overlap(
@@ -4166,9 +4321,29 @@ impl ClusterManager {
         }
     }
 
+    fn apply_pending_kill_reservations(&self, reservations: &[PendingKillReservation]) {
+        let mut pending = self.pending_kill.write();
+        for hold in reservations {
+            // Raft applies are strictly ordered, so the newest reservation for a
+            // key is always the accurate one — never keep a stale prior attempt.
+            pending.insert((hold.job_id, hold.node.clone()), hold.clone());
+            self.next_pending_kill_attempt
+                .fetch_max(hold.attempt.saturating_add(1), Ordering::Relaxed);
+        }
+    }
+
     /// Apply a WalOperation to in-memory state.
     /// Called by Raft's `apply_to_state_machine` on commit.
     fn apply_operation(&self, op: &WalOperation) -> ClientResponse {
+        if let WalOperation::PendingKillTransition {
+            reservations,
+            operation,
+        } = op
+        {
+            self.apply_pending_kill_reservations(reservations);
+            return self.apply_operation(operation);
+        }
+
         let mut response = ClientResponse::default();
         let mut jobs = self.jobs.write();
         let mut nodes = self.nodes.write();
@@ -4176,6 +4351,22 @@ impl ClusterManager {
         let timestamp = Utc::now();
 
         match op {
+            WalOperation::PendingKillReserve { reservations } => {
+                self.apply_pending_kill_reservations(reservations);
+            }
+            WalOperation::PendingKillTransition { .. } => unreachable!("handled before locking"),
+            WalOperation::PendingKillRelease { releases } => {
+                let mut pending = self.pending_kill.write();
+                for release in releases {
+                    let key = (release.job_id, release.node.clone());
+                    if pending
+                        .get(&key)
+                        .is_some_and(|hold| hold.attempt == release.attempt)
+                    {
+                        pending.remove(&key);
+                    }
+                }
+            }
             WalOperation::JobSubmit { job_id, spec } => {
                 let mut job = Job::new(*job_id, (**spec).clone());
                 if let Some(het_group) = spec.het_group {
@@ -4247,6 +4438,16 @@ impl ClusterManager {
                 Self::reset_job_for_requeue(job);
                 job.spec.begin_time = Some(*begin_time);
                 job.set_pending_reason(PendingReason::JobLaunchFailure);
+            }
+            WalOperation::JobDispatchAttempt {
+                job_id,
+                run_attempt,
+            } => {
+                if let Some(job) = jobs.get_mut(job_id) {
+                    if job.state == JobState::Pending && *run_attempt > job.run_attempt {
+                        job.run_attempt = *run_attempt;
+                    }
+                }
             }
             WalOperation::JobPreemptRequeue { job_id, begin_time } => {
                 // Only a running job is preempted; on replay the job is already
@@ -4389,7 +4590,9 @@ impl ClusterManager {
                     job.per_node_alloc = per_node_alloc.clone();
                     job.set_pending_reason(PendingReason::None);
                     job.srun_step_dispatch = *srun_step_dispatch;
-                    job.run_attempt = *run_attempt;
+                    // Monotonic like JobDispatchAttempt's write: never let a
+                    // stale-snapshot start regress the epoch backward.
+                    job.run_attempt = job.run_attempt.max(*run_attempt);
                     job.launch_failure_detail = None;
                 }
                 let node_count = node_names.len().max(1) as u32;
@@ -4840,6 +5043,9 @@ impl ClusterManager {
                     }
                 }
                 nodes.remove(name);
+                // The node will never heartbeat again to confirm release, so any
+                // hold on it — including ones just planted above — must go now.
+                self.pending_kill.write().retain(|(_, n), _| n != name);
                 info!(
                     node = %name,
                     reason = reason.as_deref().unwrap_or(""),
@@ -5134,6 +5340,12 @@ impl ClusterManager {
 struct ClusterSnapshot {
     jobs: Vec<Job>,
     nodes: Vec<Node>,
+    /// Holds are part of the controller's allocation truth until the node
+    /// confirms release, including after a leader change or snapshot install.
+    #[serde(default)]
+    pending_kills: Vec<PendingKillReservation>,
+    #[serde(default)]
+    next_pending_kill_attempt: u64,
     reservations: Vec<Reservation>,
     /// The leader's authoritative partition table. `None` = pre-partition-support
     /// snapshot (field absent) → restore falls back to the config baseline.
@@ -5220,6 +5432,8 @@ impl StateMachineApply for ClusterManager {
         let snap = ClusterSnapshot {
             jobs: self.jobs.read().values().cloned().collect(),
             nodes: self.nodes.read().values().cloned().collect(),
+            pending_kills: self.pending_kill.read().values().cloned().collect(),
+            next_pending_kill_attempt: self.next_pending_kill_attempt.load(Ordering::Relaxed),
             reservations: self.reservations.read().clone(),
             partitions: Some(self.partitions.read().clone()),
             deleted_partition_names: self.deleted_partition_names.read().clone(),
@@ -5251,6 +5465,19 @@ impl StateMachineApply for ClusterManager {
         for node in snap.nodes {
             nodes.insert(node.name.clone(), node);
         }
+
+        let next_pending_attempt = snap
+            .pending_kills
+            .iter()
+            .map(|hold| hold.attempt.saturating_add(1))
+            .fold(snap.next_pending_kill_attempt.max(1), u64::max);
+        *self.pending_kill.write() = snap
+            .pending_kills
+            .into_iter()
+            .map(|hold| ((hold.job_id, hold.node.clone()), hold))
+            .collect();
+        self.next_pending_kill_attempt
+            .store(next_pending_attempt, Ordering::Relaxed);
 
         *self.reservations.write() = snap.reservations;
 
@@ -6276,6 +6503,40 @@ mod tests {
         assert!(cm0.nodes_on_dispatch_cooldown().is_empty());
     }
 
+    // JobStart's write must be monotonic like JobDispatchAttempt's, or a
+    // stale-snapshot start could regress the epoch backward.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_start_does_not_regress_run_attempt_below_a_later_dispatch_attempt() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("epoch-monotonic")),
+        });
+        cm.apply_operation(&WalOperation::JobDispatchAttempt {
+            job_id: 1,
+            run_attempt: 5,
+        });
+
+        // A stale JobStart snapshot from before the bump above must not win.
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: scalar_alloc(6, 12000),
+            per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+            srun_step_dispatch: false,
+            run_attempt: 3,
+        });
+
+        assert_eq!(
+            cm.get_job(1).unwrap().run_attempt,
+            5,
+            "JobStart must not regress run_attempt below a later dispatch attempt"
+        );
+    }
+
     // Only the Nth consecutive miss crosses the threshold; a report resets it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn phantom_miss_streak_crosses_threshold_only_after_consecutive_misses() {
@@ -6322,7 +6583,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pending_kill_reservations_aggregate_prune_and_respect_disable() {
+    async fn pending_kill_reservations_aggregate() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
@@ -6338,39 +6599,23 @@ mod tests {
             "multiple pending kills on the same node sum"
         );
         assert_eq!(reserved.get("n2").unwrap().cpus, 1);
-
-        // A past instant is pruned on read, so an expired entry clears.
-        cm.pending_kill.write().insert(
-            (1, "n1".into()),
-            (
-                scalar_alloc(2, 4000),
-                std::time::Instant::now() - std::time::Duration::from_secs(1),
-                101,
-            ),
-        );
-        let reserved = cm.pending_kill_reservations();
-        assert_eq!(
-            reserved.get("n1").unwrap().cpus,
-            3,
-            "the expired entry no longer contributes, the live one still does"
-        );
-
-        // Disabled (0s): note_pending_kill is a no-op.
-        let mut cfg = test_config();
-        cfg.controller.pending_kill_ttl_secs = 0;
-        let cm0 = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
-        cm0.note_pending_kill(9, "n1", scalar_alloc(1, 1000), 201);
-        assert!(cm0.pending_kill_reservations().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn clear_pending_kill_for_job_removes_only_that_job() {
+    async fn pending_kill_release_removes_only_the_confirmed_attempt() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         cm.note_pending_kill(1, "n1", scalar_alloc(2, 4000), 101);
         cm.note_pending_kill(2, "n1", scalar_alloc(3, 6000), 102);
 
-        cm.clear_pending_kill_for_job(1, 101);
+        cm.propose(WalOperation::PendingKillRelease {
+            releases: vec![PendingKillRelease {
+                job_id: 1,
+                node: "n1".into(),
+                attempt: 101,
+            }],
+        })
+        .unwrap();
 
         let reserved = cm.pending_kill_reservations();
         assert_eq!(
@@ -6380,19 +6625,27 @@ mod tests {
         );
     }
 
-    // A losing cancel's rollback must not clear a concurrent, still-live
-    // reservation planted for the same job by a winning cancel attempt.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn clear_pending_kill_for_job_spares_a_concurrent_attempts_reservation() {
+    async fn pending_kill_release_spares_a_newer_attempt() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
-        cm.note_pending_kill(1, "n1", scalar_alloc(2, 4000), 101);
-        // A second, winning attempt for the same job refreshes the entry
-        // under a new attempt token.
-        cm.note_pending_kill(1, "n1", scalar_alloc(2, 4000), 102);
+        cm.reserve_pending_kills(vec![PendingKillReservation {
+            job_id: 1,
+            node: "n1".into(),
+            resources: scalar_alloc(2, 4000),
+            attempt: 102,
+            run_attempt: 0,
+        }])
+        .unwrap();
 
-        // The losing (first) attempt's rollback must not touch it.
-        cm.clear_pending_kill_for_job(1, 101);
+        cm.propose(WalOperation::PendingKillRelease {
+            releases: vec![PendingKillRelease {
+                job_id: 1,
+                node: "n1".into(),
+                attempt: 101,
+            }],
+        })
+        .unwrap();
 
         assert_eq!(
             cm.pending_kill_reservations().get("n1").unwrap().cpus,
@@ -6401,8 +6654,88 @@ mod tests {
         );
     }
 
+    // A second reservation for an already-held key (e.g. redispatch to the
+    // same node) must replace it, not keep the stale attempt forever.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn note_pending_kill_for_job_falls_back_to_an_even_split_without_per_node_alloc() {
+    async fn pending_kill_reserve_overwrites_a_stale_entry_on_the_same_key() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.reserve_pending_kills(vec![PendingKillReservation {
+            job_id: 1,
+            node: "n1".into(),
+            resources: scalar_alloc(2, 4000),
+            attempt: 101,
+            run_attempt: 5,
+        }])
+        .unwrap();
+
+        cm.reserve_pending_kills(vec![PendingKillReservation {
+            job_id: 1,
+            node: "n1".into(),
+            resources: scalar_alloc(4, 8000),
+            attempt: 205,
+            run_attempt: 6,
+        }])
+        .unwrap();
+
+        assert_eq!(
+            cm.pending_kill_reservations().get("n1").unwrap().cpus,
+            4,
+            "the newer reservation's resources must replace the stale entry"
+        );
+        assert_eq!(
+            cm.pending_kill_run_attempt(1, "n1"),
+            Some(6),
+            "the newer reservation's run_attempt must replace the stale entry"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_kill_survives_snapshot_restore() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.reserve_pending_kills(vec![PendingKillReservation {
+            job_id: 9,
+            node: "n1".into(),
+            resources: scalar_alloc(2, 4000),
+            attempt: 101,
+            run_attempt: 0,
+        }])
+        .unwrap();
+
+        let snapshot = cm.snapshot_state().unwrap();
+        let restored_dir = TempDir::new().unwrap();
+        let restored = test_cluster(&restored_dir).await;
+        restored.restore_from_snapshot(&snapshot).unwrap();
+
+        assert_eq!(
+            restored.pending_kill_reservations()["n1"].cpus,
+            2,
+            "a new leader must retain an unconfirmed release hold"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn old_snapshot_without_pending_kills_restores() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&cm.snapshot_state().unwrap()).unwrap();
+        let object = snapshot.as_object_mut().unwrap();
+        object.remove("pending_kills");
+        object.remove("next_pending_kill_attempt");
+
+        let restored_dir = TempDir::new().unwrap();
+        let restored = test_cluster(&restored_dir).await;
+        restored
+            .restore_from_snapshot(&serde_json::to_vec(&snapshot).unwrap())
+            .unwrap();
+
+        assert!(restored.pending_kill_reservations().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_kills_for_job_falls_back_to_an_even_split_without_per_node_alloc() {
         // A job replayed from a pre-per_node_alloc WAL entry has an empty map;
         // the reservation must still protect its real allocation, not zero.
         let dir = TempDir::new().unwrap();
@@ -6410,7 +6743,8 @@ mod tests {
         let mut job = make_running_job(1, &["n1", "n2"], 2);
         job.per_node_alloc.clear();
 
-        crate::server::note_pending_kill_for_job(&cm, &job);
+        cm.reserve_pending_kills(cm.pending_kills_for_job(&job))
+            .unwrap();
 
         let reserved = cm.pending_kill_reservations();
         assert_eq!(reserved.get("n1").unwrap().cpus, 2);
@@ -8456,6 +8790,13 @@ mod tests {
         assert_eq!(job.state, JobState::Cancelled);
         assert_eq!(job.exit_code, Some(-1));
         assert!(job.node_completions.is_empty());
+        let pending = cm.pending_kill_reservations();
+        for name in ["n1", "n2", "n3"] {
+            assert_eq!(
+                pending[name].cpus, 2,
+                "node {name} must remain held until its heartbeat confirms release"
+            );
+        }
         for name in ["n1", "n2", "n3"] {
             assert_eq!(
                 cm.get_node(name).unwrap().alloc_resources.cpus,
@@ -15860,6 +16201,8 @@ mod tests {
         let snap = ClusterSnapshot {
             jobs: Vec::new(),
             nodes: vec![stale],
+            pending_kills: Vec::new(),
+            next_pending_kill_attempt: 1,
             reservations: Vec::new(),
             partitions: None,
             deleted_partition_names: HashSet::new(),
@@ -16050,6 +16393,49 @@ mod tests {
         assert_eq!(resp.jobs_finalized[0].state, JobState::NodeFail);
         assert_eq!(cm.get_job(id).unwrap().state, JobState::NodeFail);
         assert!(cm.get_node("n1").is_none());
+    }
+
+    // A removed node will never heartbeat again to confirm release, so any
+    // pending-kill hold on it — pre-existing or freshly planted — must go too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_remove_clears_its_pending_kill_holds() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        cm.reserve_pending_kills(vec![PendingKillReservation {
+            job_id: 1,
+            node: "n1".into(),
+            resources: scalar_alloc(2, 4000),
+            attempt: 101,
+            run_attempt: 1,
+        }])
+        .unwrap();
+        cm.reserve_pending_kills(vec![PendingKillReservation {
+            job_id: 2,
+            node: "n2".into(),
+            resources: scalar_alloc(1, 1000),
+            attempt: 102,
+            run_attempt: 1,
+        }])
+        .unwrap();
+
+        cm.apply_operation(&WalOperation::NodeRemove {
+            name: "n1".into(),
+            reason: None,
+        });
+
+        let reserved = cm.pending_kill_reservations();
+        assert!(
+            !reserved.contains_key("n1"),
+            "the removed node's hold must not linger forever"
+        );
+        assert_eq!(
+            reserved.get("n2").unwrap().cpus,
+            1,
+            "another node's hold must be untouched"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

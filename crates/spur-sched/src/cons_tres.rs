@@ -45,6 +45,9 @@ pub struct NodeAllocation {
     /// orphans reconciled. Source of truth; the bitmaps above are a derived
     /// index for fast free-count queries.
     owners: HashMap<u32, AllocationResult>,
+    /// Run epoch of each owner. A job id may be reused after requeue, so a
+    /// delayed cleanup must not release a replacement run's allocation.
+    owner_attempts: HashMap<u32, u32>,
     /// Reserved but not yet committed, with reserve time. Reconcile spares
     /// these until they exceed a TTL so a dropped launch can't pin resources.
     launching: HashMap<u32, Instant>,
@@ -62,6 +65,7 @@ impl NodeAllocation {
             gpu_allocated: vec![false; num_gpus],
             gpus: resources.gpus.clone(),
             owners: HashMap::new(),
+            owner_attempts: HashMap::new(),
             launching: HashMap::new(),
         }
     }
@@ -150,6 +154,19 @@ impl NodeAllocation {
         memory_mb: u64,
         gpu_device_ids: &[u32],
     ) -> Result<AllocationResult, AllocError> {
+        self.allocate_for_job_with_attempt(job_id, cpus, memory_mb, gpu_device_ids, 0)
+    }
+
+    /// Reserve resources for one run epoch of a job. Epoch zero preserves the
+    /// legacy unfenced behavior for controllers that do not send an epoch.
+    pub fn allocate_for_job_with_attempt(
+        &mut self,
+        job_id: u32,
+        cpus: u32,
+        memory_mb: u64,
+        gpu_device_ids: &[u32],
+        run_attempt: u32,
+    ) -> Result<AllocationResult, AllocError> {
         // A launch still in flight (reserved, not yet committed or released) is
         // a genuine concurrent duplicate: a second launch would double-count.
         if self.launching.contains_key(&job_id) {
@@ -195,6 +212,7 @@ impl NodeAllocation {
             memory_mb,
         };
         self.owners.insert(job_id, result.clone());
+        self.owner_attempts.insert(job_id, run_attempt);
         self.launching.insert(job_id, Instant::now());
         Ok(result)
     }
@@ -212,11 +230,21 @@ impl NodeAllocation {
     /// already-released job is a no-op returning false.
     pub fn release_job(&mut self, job_id: u32) -> bool {
         self.launching.remove(&job_id);
+        self.owner_attempts.remove(&job_id);
         let Some(alloc) = self.owners.remove(&job_id) else {
             return false;
         };
         self.release(&alloc);
         true
+    }
+
+    /// Release only when `run_attempt` still owns this job id. Zero is the
+    /// legacy unfenced value and deliberately releases whichever run is held.
+    pub fn release_job_if_attempt(&mut self, job_id: u32, run_attempt: u32) -> bool {
+        if run_attempt != 0 && self.owner_attempts.get(&job_id) != Some(&run_attempt) {
+            return false;
+        }
+        self.release_job(job_id)
     }
 
     /// Release owned allocations whose job is neither live nor launching within

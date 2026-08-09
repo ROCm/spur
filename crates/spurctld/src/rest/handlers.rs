@@ -152,16 +152,7 @@ pub async fn cancel_job(
 
     let job = state.cluster.get_job(job_id);
 
-    // Reserve before the free lands (the check above already gated this
-    // on the job being live).
-    let attempt = job
-        .as_ref()
-        .map(|job| crate::server::note_pending_kill_for_job(&state.cluster, job));
-
     if let Err(e) = state.cluster.cancel_job(job_id, "") {
-        if let Some(attempt) = attempt {
-            state.cluster.clear_pending_kill_for_job(job_id, attempt);
-        }
         return Err(error_response(&format!("cancel failed: {e}")));
     }
 
