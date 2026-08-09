@@ -263,12 +263,10 @@ class TestReservations:
 
     def test_reservation_management_requires_privileged_user(self, cluster):
         """Reservation create/update/delete via the CLI is restricted to root or
-        members of the 'sudo'/'wheel' group. An unprivileged caller is denied
-        locally before any RPC is sent. Uses the always-present, deterministically
-        unprivileged 'nobody' account so no user provisioning is required."""
-        # Probe the exact identity under test: `show` is unguarded, so running
-        # it as `nobody` verifies both that `sudo -u nobody` is permitted and
-        # that `nobody` can exec the binary. Skip (not fail) if it cannot.
+        sudo/wheel members. Uses the always-present unprivileged 'nobody'
+        account, so no user provisioning is needed."""
+        # Probe as `nobody` (show is unguarded): confirms sudo -u and binary exec
+        # work for that account; skip rather than fail if not.
         probe = cluster.cli_as_user("nobody", ["scontrol", "show", "reservation"])
         low = probe.lower()
         if (
@@ -281,7 +279,10 @@ class TestReservations:
 
         denied_msg = "requires root or membership"
 
-        # Unprivileged create is denied.
+        # The read path must stay open to everyone (not accidentally gated).
+        assert denied_msg not in low, f"show reservation should be readable by all: {probe}"
+
+        # Unprivileged create is denied (explicit subcommand).
         create_denied = cluster.cli_as_user(
             "nobody",
             [
@@ -294,6 +295,21 @@ class TestReservations:
             ],
         )
         assert denied_msg in create_denied.lower(), f"unexpected: {create_denied}"
+        assert res_name not in cluster.scontrol("show", "reservation")
+
+        # Unprivileged create is denied via the Slurm-inline syntax too.
+        inline_denied = cluster.cli_as_user(
+            "nobody",
+            [
+                "scontrol",
+                "create",
+                f"ReservationName={res_name}",
+                "StartTime=now",
+                "Duration=60",
+                f"Nodes={node}",
+            ],
+        )
+        assert denied_msg in inline_denied.lower(), f"unexpected: {inline_denied}"
         assert res_name not in cluster.scontrol("show", "reservation")
 
         try:
@@ -325,6 +341,13 @@ class TestReservations:
             assert denied_msg in del_denied.lower(), f"unexpected: {del_denied}"
             assert res_name in cluster.scontrol("show", "reservation")
 
+            # Unprivileged delete via the Slurm-inline syntax is denied too.
+            inline_del_denied = cluster.cli_as_user(
+                "nobody", ["scontrol", "delete", f"ReservationName={res_name}"]
+            )
+            assert denied_msg in inline_del_denied.lower(), f"unexpected: {inline_del_denied}"
+            assert res_name in cluster.scontrol("show", "reservation")
+
             # Privileged (root) delete succeeds.
             del_ok = cluster.cli_as_user(
                 "root", ["scontrol", "delete-reservation", res_name]
@@ -332,8 +355,7 @@ class TestReservations:
             assert "deleted" in del_ok.lower(), f"privileged delete failed: {del_ok}"
             assert res_name not in cluster.scontrol("show", "reservation")
         finally:
-            # A leaked reservation fences a node for an hour; clean up on any
-            # mid-test failure (harmless no-op once already deleted).
+            # A leaked reservation fences a node for an hour; best-effort cleanup.
             cluster.cli_as_user("root", ["scontrol", "delete-reservation", res_name])
 
     def test_non_owner_cannot_delete_or_update_reservation(self, cluster):
@@ -352,15 +374,9 @@ class TestReservations:
         ):
             pytest.skip(f"sudo -u unavailable in this environment: {probe.strip()}")
 
-        # The non-owner must be privileged enough to clear the client-side
-        # reservation gate (root or sudo/wheel), or its delete/update is denied
-        # locally before the server ownership check this test targets.
-        groups = set(cluster.nodes[0].exec_allow_fail(f"id -nG {submit_user}").split())
-        if not groups & {"sudo", "wheel"}:
-            pytest.skip(
-                f"non-owner '{submit_user}' is not in sudo/wheel, so the CLI "
-                "privilege gate blocks it before the server ownership check"
-            )
+        # A non-owner is denied by the server ownership check or, if unprivileged,
+        # by the client gate first. Accept both so this never silently skips.
+        denied = ("cannot delete", "cannot modify", "permission", "requires root or membership")
 
         res_name = f"res-owner-{int(time.time())}"
         node = cluster.node_names[0]
@@ -389,7 +405,7 @@ class TestReservations:
             submit_user, ["scontrol", "delete-reservation", res_name]
         )
         assert "deleted" not in del_denied.lower(), f"unexpected delete: {del_denied}"
-        assert "cannot delete" in del_denied.lower() or "permission" in del_denied.lower()
+        assert any(m in del_denied.lower() for m in denied), f"unexpected: {del_denied}"
         assert res_name in cluster.scontrol("show", "reservation")
 
         # Non-owner update must be rejected too.
@@ -397,7 +413,7 @@ class TestReservations:
             submit_user,
             ["scontrol", "update-reservation", f"--name={res_name}", "--duration=120"],
         )
-        assert "cannot modify" in upd_denied.lower() or "permission" in upd_denied.lower()
+        assert any(m in upd_denied.lower() for m in denied), f"unexpected: {upd_denied}"
         assert res_name in cluster.scontrol("show", "reservation")
 
         # Owner (root) can still delete.

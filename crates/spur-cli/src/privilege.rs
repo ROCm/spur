@@ -1,12 +1,10 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Local privilege gate for administrative CLI actions.
-//!
-//! This is a client-side guardrail, not a security boundary: the controller
-//! does not authenticate callers, so it only stops ordinary users from running
-//! privileged commands through the CLI. Real enforcement belongs server-side
-//! behind an authenticated identity (future RBAC work).
+//! Client-side privilege gate for privileged CLI actions; not a security
+//! boundary (the controller doesn't authenticate callers — real enforcement is
+//! future server-side RBAC). Allows root or `sudo`/`wheel` membership, not
+//! proof the caller actually elevated via `sudo`.
 
 use anyhow::{bail, Context, Result};
 
