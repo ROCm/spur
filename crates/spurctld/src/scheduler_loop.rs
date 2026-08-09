@@ -638,9 +638,13 @@ pub(crate) async fn try_preempt(
                 mode = ?mode,
                 "preempting lower-priority job"
             );
+            // Reserve before the free lands whenever this mode will kill, so the
+            // scheduler never sees a window where resources look free early.
+            if matches!(mode, PreemptMode::Cancel | PreemptMode::Requeue) {
+                crate::server::note_pending_kill_for_job(cluster, candidate);
+            }
             match cluster.preempt_job(candidate.job_id, mode) {
                 Ok(PreemptOutcome::Killed) => {
-                    crate::server::note_pending_kill_for_job(cluster, candidate);
                     // Signal 0 = graceful cancel (SIGTERM then SIGKILL).
                     send_cancel_to_agents(cluster, candidate, 0).await;
                 }
@@ -1760,13 +1764,15 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
                 "grace period expired — force-killing job"
             );
 
+            // Reserve before the free, so the scheduler never sees the gap
+            // where resources look free but the agent hasn't been told.
+            crate::server::note_pending_kill_for_job(&cluster, job);
             if let Err(e) = cluster.complete_job(job.job_id, -1, spur_core::job::JobState::Timeout)
             {
                 warn!(job_id = job.job_id, error = %e, "failed to mark job as timed out");
                 continue;
             }
 
-            crate::server::note_pending_kill_for_job(&cluster, job);
             send_cancel_to_agents(&cluster, job, 9).await; // SIGKILL
         }
     }
@@ -4432,8 +4438,9 @@ mod tests {
         async fn pending_kill_reservation_inflates_node_alloc_resources() {
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
-            register_node_at(&cm, "n1", unreachable_addr().await);
-            register_node_at(&cm, "n2", unreachable_addr().await);
+            let placeholder: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+            register_node_at(&cm, "n1", placeholder);
+            register_node_at(&cm, "n2", placeholder);
 
             let mut nodes: Vec<_> = ["n1", "n2"]
                 .iter()

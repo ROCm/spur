@@ -24,14 +24,48 @@ use spur_proto::proto::*;
 
 const NS_LOOKUP_BUDGET: Duration = Duration::from_secs(5);
 
+/// Rejects a term older than the highest seen. 0 (legacy/unset) passes only
+/// before any real term has been observed — once fencing starts, it can't stop.
+struct TermFence(std::sync::atomic::AtomicU64);
+
+impl TermFence {
+    fn new() -> Self {
+        Self(std::sync::atomic::AtomicU64::new(0))
+    }
+
+    fn check(&self, term: u64) -> Result<(), Status> {
+        use std::sync::atomic::Ordering;
+        if term == 0 {
+            return if self.0.load(Ordering::Acquire) == 0 {
+                Ok(())
+            } else {
+                Err(Status::failed_precondition(
+                    "unfenced request rejected after a real controller term was observed",
+                ))
+            };
+        }
+        let prev = self.0.fetch_max(term, Ordering::AcqRel);
+        if term < prev {
+            return Err(Status::failed_precondition(format!(
+                "stale controller term {term} (highest seen {prev}); a newer leader has taken over"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Virtual SlurmAgent that creates K8s Pods instead of fork/exec.
 pub struct VirtualAgent {
     client: Client,
+    term_fence: TermFence,
 }
 
 impl VirtualAgent {
     pub fn new(client: Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            term_fence: TermFence::new(),
+        }
     }
 
     /// Look up the namespace of the SpurJob labeled `spur.amd.com/job-id=<id>`.
@@ -93,6 +127,7 @@ impl SlurmAgent for VirtualAgent {
         request: Request<LaunchJobRequest>,
     ) -> Result<Response<LaunchJobResponse>, Status> {
         let req = request.into_inner();
+        self.term_fence.check(req.term)?;
         let job_id = req.job_id;
         let ns = self.resolve_namespace(job_id).await?;
         let target_node = req.target_node.clone();
@@ -484,6 +519,7 @@ impl SlurmAgent for VirtualAgent {
         request: Request<AgentCancelJobRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
+        self.term_fence.check(req.term)?;
         let job_id = req.job_id;
         let ns = self.resolve_namespace(job_id).await?;
 
@@ -927,6 +963,23 @@ pub fn gpu_request_to_gres(count: u32, gpu_type: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A demoted leader's stale LaunchJob/CancelJob must be rejected here too,
+    // not just on the native spurd backend.
+    #[test]
+    fn term_fence_rejects_stale_and_a_delayed_unfenced_request() {
+        let fence = TermFence::new();
+        fence
+            .check(0)
+            .expect("legacy zero passes before any term is seen");
+        fence.check(5).expect("first real term is accepted");
+        let err = fence.check(3).expect_err("stale term must be rejected");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            fence.check(0).is_err(),
+            "a delayed unfenced request must not bypass an established term"
+        );
+    }
 
     // --- gpu_request_to_gres ---
 

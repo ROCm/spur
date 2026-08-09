@@ -333,8 +333,8 @@ pub struct ControllerConfig {
     #[serde(default = "default_dispatch_reject_cooldown_secs")]
     pub dispatch_reject_cooldown_secs: u64,
 
-    /// Seconds a resource freed by cancel/evict stays excluded from new
-    /// dispatch, bridging the gap until the kill signal lands (default 60).
+    /// Max seconds a resource freed by cancel/evict stays excluded from new
+    /// dispatch if a heartbeat never confirms the kill landed (default 60).
     #[serde(default = "default_pending_kill_ttl_secs")]
     pub pending_kill_ttl_secs: u64,
 }

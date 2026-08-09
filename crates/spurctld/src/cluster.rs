@@ -488,8 +488,8 @@ impl ClusterManager {
             .retain(|(job_id, n), _| n != node || active_job_ids.contains(job_id));
     }
 
-    /// Reserve `resources` on `node` until the TTL expires. Refreshes the
-    /// TTL if already present.
+    /// Reserve `resources` on `node` until a heartbeat confirms release or
+    /// the TTL expires, whichever comes first. Refreshes the TTL if present.
     pub(crate) fn note_pending_kill(
         &self,
         job_id: JobId,
@@ -504,6 +504,14 @@ impl ClusterManager {
         self.pending_kill
             .write()
             .insert((job_id, node.to_string()), (resources, until));
+    }
+
+    /// Clear `node`'s pending-kill entries for jobs a heartbeat no longer
+    /// reports — real confirmation of release, not just a TTL guess.
+    pub(crate) fn clear_confirmed_pending_kills(&self, node: &str, reported: &HashSet<JobId>) {
+        self.pending_kill
+            .write()
+            .retain(|(job_id, n), _| n != node || reported.contains(job_id));
     }
 
     /// Per-node resources still held out of new dispatch, pruning any

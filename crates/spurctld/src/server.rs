@@ -265,6 +265,8 @@ impl ControllerService {
         }
 
         let reported_ids: HashSet<u32> = reported.iter().map(|r| r.job_id).collect();
+        self.cluster
+            .clear_confirmed_pending_kills(node, &reported_ids);
         let active = self.cluster.active_jobs_on_node(node);
         // Sweep entries for jobs that left the active set by another path,
         // else one that's never re-reported leaks its streak entry.
@@ -299,6 +301,9 @@ impl ControllerService {
                         node = %node_owned,
                         "node's heartbeat repeatedly omitted a job the controller binds here — evicting"
                     );
+                    // Reserve before the free; a no-op eviction below self-heals
+                    // once this node's next heartbeat stops reporting the job.
+                    note_pending_kill_for_job(&cluster, &fresh);
                     match cluster.evict_job(
                         fresh.job_id,
                         spur_core::job::PendingReason::NodeDown,
@@ -306,7 +311,6 @@ impl ControllerService {
                     ) {
                         Ok(finalized) if finalized.is_empty() => {}
                         Ok(finalized) => {
-                            note_pending_kill_for_job(&cluster, &fresh);
                             cluster.complete_evicted_steps(&finalized);
                             crate::scheduler_loop::send_cancel_to_agents(&cluster, &fresh, 9).await;
                         }
@@ -609,13 +613,18 @@ impl SlurmController for ControllerService {
         // Snapshot before cancelling so we still have allocated_nodes after.
         let job = self.cluster.get_job(job_id);
 
+        // Reserve before the free lands, so the scheduler never sees a window
+        // where the resources look free but the agent hasn't been told yet.
+        if let Some(job) = &job {
+            note_pending_kill_for_job(&self.cluster, job);
+        }
+
         self.cluster
             .cancel_job(job_id, &req.user)
             .map_err(cluster_err_to_status)?;
 
         // Send cancel signal to agents so the process is actually killed
         if let Some(job) = job {
-            note_pending_kill_for_job(&self.cluster, &job);
             let cluster = self.cluster.clone();
             tokio::spawn(async move {
                 crate::scheduler_loop::send_cancel_to_agents(&cluster, &job, 0).await;
@@ -3956,6 +3965,37 @@ mod tests {
         assert!(
             evicted,
             "a single-node job's persistent phantom report must evict it"
+        );
+    }
+
+    // A heartbeat that stops reporting a job is real confirmation of release —
+    // the pending-kill reservation must clear then, not wait out the full TTL.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_clears_pending_kill_once_heartbeat_confirms_release() {
+        use spur_core::resource::ResourceAllocations;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        svc.cluster
+            .note_pending_kill(1, "n1", ResourceAllocations::with_scalar(2, 4000));
+        svc.cluster
+            .note_pending_kill(2, "n1", ResourceAllocations::with_scalar(1, 1000));
+        assert_eq!(svc.cluster.pending_kill_reservations()["n1"].cpus, 3);
+
+        // n1's heartbeat still reports job 2, but no longer job 1.
+        svc.reconcile_reported_allocations(
+            "n1",
+            &[RunningJobStatus {
+                job_id: 2,
+                ..Default::default()
+            }],
+        );
+
+        assert_eq!(
+            svc.cluster.pending_kill_reservations()["n1"].cpus,
+            1,
+            "job 1's reservation must clear once the heartbeat confirms it's gone"
         );
     }
 

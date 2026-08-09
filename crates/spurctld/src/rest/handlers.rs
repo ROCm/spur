@@ -147,6 +147,12 @@ pub async fn cancel_job(
 
     let job = state.cluster.get_job(job_id);
 
+    // Reserve before the free lands, so the scheduler never sees a window
+    // where the resources look free but the agent hasn't been told yet.
+    if let Some(job) = &job {
+        crate::server::note_pending_kill_for_job(&state.cluster, job);
+    }
+
     state
         .cluster
         .cancel_job(job_id, "")

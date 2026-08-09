@@ -312,10 +312,17 @@ impl AgentService {
         }
     }
 
-    /// Reject a term older than the highest seen; 0 (legacy/unset) always passes.
+    /// Reject a term older than the highest seen. 0 (legacy/unset) passes only
+    /// before any real term has been observed — once fencing starts, it can't stop.
     fn check_term(&self, term: u64) -> Result<(), Status> {
         if term == 0 {
-            return Ok(());
+            return if self.highest_term_seen.load(Ordering::Acquire) == 0 {
+                Ok(())
+            } else {
+                Err(Status::failed_precondition(
+                    "unfenced request rejected after a real controller term was observed",
+                ))
+            };
         }
         let prev = self.highest_term_seen.fetch_max(term, Ordering::AcqRel);
         if term < prev {
@@ -1391,16 +1398,21 @@ impl SlurmAgent for AgentService {
                 let committed = self.allocation.lock().await.commit_job(job_id);
                 reservation_guard.disarm();
 
-                // reconcile reclaimed the reservation mid-launch (launch exceeded
-                // the TTL). Don't track a job with no backing allocation — kill,
-                // reap, and clean up its cgroup/rootfs/spool (mirroring the
-                // monitor loop's completion teardown, which never runs since the
-                // job never enters `running`), then fail the launch.
-                if !committed {
+                // A newer-term request raced past our check while this launch was
+                // in flight — committing now would resurrect a demoted leader's write.
+                let stale_term = self.check_term(req.term).is_err();
+                if stale_term {
+                    self.allocation.lock().await.release_job(job_id);
+                }
+
+                // Reservation reclaimed (launch exceeded the TTL) or term superseded:
+                // kill, reap, and clean up rather than track a job with no backing.
+                if !committed || stale_term {
                     drop(jobs);
                     warn!(
                         job_id,
-                        "reservation reclaimed during launch; aborting to avoid running unbacked"
+                        stale_term,
+                        "reservation reclaimed or superseded during launch; aborting to avoid running unbacked"
                     );
                     if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
                         warn!(job_id, error = %e, "PMIx stop failed after reclaimed reservation");
@@ -1424,9 +1436,14 @@ impl SlurmAgent for AgentService {
                             crate::executor::cleanup_cgroup(cg);
                         }
                     });
+                    let error = if stale_term {
+                        "controller term superseded during launch"
+                    } else {
+                        "reservation reclaimed during launch"
+                    };
                     return Ok(Response::new(LaunchJobResponse {
                         success: false,
-                        error: "reservation reclaimed during launch".into(),
+                        error: error.into(),
                         stdout_path: String::new(),
                         stderr_path: String::new(),
                         failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
@@ -3230,6 +3247,18 @@ mod tests {
         ))
     }
 
+    /// An executable script at a temp path that sleeps `millis` then exits 0,
+    /// widening the window for a concurrent term change during launch.
+    fn delayed_hook_script(millis: u64) -> tempfile::TempPath {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "#!/bin/bash\nsleep {}\nexit 0", millis as f64 / 1000.0).unwrap();
+        let path = f.into_temp_path();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
     /// An executable script at a temp path that exits with `code`.
     fn failing_hook_script(code: i32) -> tempfile::TempPath {
         use std::io::Write;
@@ -3330,6 +3359,57 @@ mod tests {
             resp.error.contains("No such file or directory"),
             "the cause chain must survive into the reported error, got {:?}",
             resp.error
+        );
+    }
+
+    // A newer-term request racing past our check while the launch is still in
+    // flight must abort the commit, not resurrect a demoted leader's write.
+    #[tokio::test]
+    async fn a_term_superseded_mid_launch_aborts_before_committing() {
+        let prolog = delayed_hook_script(200);
+        let svc = Arc::new(AgentService::new(
+            test_reporter(),
+            HooksConfig {
+                prolog: Some(prolog.to_str().unwrap().to_string()),
+                ..Default::default()
+            },
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        ));
+
+        let svc_launch = svc.clone();
+        let launch = tokio::spawn(async move {
+            svc_launch
+                .launch_job(Request::new(LaunchJobRequest {
+                    job_id: 42,
+                    term: 5,
+                    spec: Some(JobSpec {
+                        name: "term-race".into(),
+                        script: "#!/bin/bash\ntrue\n".into(),
+                        num_tasks: 1,
+                        num_nodes: 1,
+                        cpus_per_task: 1,
+                        work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        svc.check_term(6).expect("a higher term is accepted");
+
+        let resp = launch.await.unwrap();
+        assert!(
+            !resp.success,
+            "a superseded term must not commit the launch"
+        );
+        assert!(
+            !svc.running.lock().await.contains_key(&42),
+            "the job must never land in `running` under a stale term"
         );
     }
 
@@ -4531,6 +4611,8 @@ mod tests {
             spur_core::config::MemlockLimit::Unlimited,
         );
 
+        svc.check_term(0)
+            .expect("legacy zero passes before any real term is seen");
         svc.check_term(5).expect("first real term is accepted");
         let err = svc.check_term(3).expect_err("stale term must be rejected");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
@@ -4539,7 +4621,10 @@ mod tests {
             svc.check_term(5).is_err(),
             "term below the new high-water mark is still rejected"
         );
-        svc.check_term(0).expect("legacy zero is always accepted");
+        assert!(
+            svc.check_term(0).is_err(),
+            "a delayed unfenced request must not bypass an already-established term"
+        );
     }
 
     // The heartbeat's held-job source must report an allocation-only (srun/salloc)
