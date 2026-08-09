@@ -289,6 +289,9 @@ pub enum PreemptOutcome {
     Suspended,
 }
 
+/// Resources, expiry, and owning attempt token for one pending-kill entry.
+type PendingKillEntry = (ResourceAllocations, std::time::Instant, u64);
+
 /// Central cluster state manager.
 ///
 /// Thread-safe via RwLock. The scheduler and gRPC server both access this.
@@ -352,9 +355,10 @@ pub struct ClusterManager {
     /// Consecutive heartbeats a node's report has omitted a job it's bound
     /// to. Leader-local and transient, never persisted.
     phantom_miss_streaks: RwLock<HashMap<(JobId, String), u32>>,
-    /// Resources freed in controller state but not yet confirmed released by
-    /// the agent. Leader-local and transient, never persisted.
-    pending_kill: RwLock<HashMap<(JobId, String), (ResourceAllocations, std::time::Instant)>>,
+    /// Resources freed but not yet confirmed released by the agent. The u64
+    /// scopes a rollback to the attempt that planted it, not a concurrent one.
+    pending_kill: RwLock<HashMap<(JobId, String), PendingKillEntry>>,
+    next_pending_kill_attempt: std::sync::atomic::AtomicU64,
 }
 
 struct PendingJobClassification {
@@ -417,6 +421,7 @@ impl ClusterManager {
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
             phantom_miss_streaks: RwLock::new(HashMap::new()),
             pending_kill: RwLock::new(HashMap::new()),
+            next_pending_kill_attempt: std::sync::atomic::AtomicU64::new(1),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -488,13 +493,21 @@ impl ClusterManager {
             .retain(|(job_id, n), _| n != node || active_job_ids.contains(job_id));
     }
 
-    /// Reserve `resources` on `node` until a heartbeat confirms release or
-    /// the TTL expires, whichever comes first. Refreshes the TTL if present.
+    /// New token identifying one reserve-then-mutate attempt, so its rollback
+    /// can't clear a different, concurrent attempt's still-live reservation.
+    pub(crate) fn new_pending_kill_attempt(&self) -> u64 {
+        self.next_pending_kill_attempt
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reserve `resources` on `node` under `attempt` until a heartbeat confirms
+    /// release or the TTL expires, whichever comes first.
     pub(crate) fn note_pending_kill(
         &self,
         job_id: JobId,
         node: &str,
         resources: ResourceAllocations,
+        attempt: u64,
     ) {
         let ttl = self.config().controller.pending_kill_ttl_secs;
         if ttl == 0 {
@@ -503,7 +516,7 @@ impl ClusterManager {
         let until = std::time::Instant::now() + std::time::Duration::from_secs(ttl);
         self.pending_kill
             .write()
-            .insert((job_id, node.to_string()), (resources, until));
+            .insert((job_id, node.to_string()), (resources, until, attempt));
     }
 
     /// Clear `node`'s pending-kill entries for jobs a heartbeat no longer
@@ -514,10 +527,12 @@ impl ClusterManager {
             .retain(|(job_id, n), _| n != node || reported.contains(job_id));
     }
 
-    /// Undo a reservation planted ahead of a cancel/evict that then failed —
-    /// callers pre-reserve before the mutation, so a failure must roll back.
-    pub(crate) fn clear_pending_kill_for_job(&self, job_id: JobId) {
-        self.pending_kill.write().retain(|(id, _), _| *id != job_id);
+    /// Undo `attempt`'s own reservation after its cancel/evict failed — never
+    /// a concurrent attempt's still-live one on the same job.
+    pub(crate) fn clear_pending_kill_for_job(&self, job_id: JobId, attempt: u64) {
+        self.pending_kill
+            .write()
+            .retain(|(id, _), (_, _, a)| *id != job_id || *a != attempt);
     }
 
     /// Per-node resources still held out of new dispatch, pruning any
@@ -525,9 +540,9 @@ impl ClusterManager {
     pub(crate) fn pending_kill_reservations(&self) -> HashMap<String, ResourceAllocations> {
         let now = std::time::Instant::now();
         let mut pending = self.pending_kill.write();
-        pending.retain(|_, (_, until)| *until > now);
+        pending.retain(|_, (_, until, _)| *until > now);
         let mut by_node: HashMap<String, ResourceAllocations> = HashMap::new();
-        for ((_, node), (resources, _)) in pending.iter() {
+        for ((_, node), (resources, _, _)) in pending.iter() {
             by_node.entry(node.clone()).or_default().add(resources);
         }
         by_node
@@ -6312,9 +6327,9 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         assert!(cm.pending_kill_reservations().is_empty());
-        cm.note_pending_kill(1, "n1", scalar_alloc(2, 4000));
-        cm.note_pending_kill(2, "n1", scalar_alloc(3, 6000));
-        cm.note_pending_kill(3, "n2", scalar_alloc(1, 1000));
+        cm.note_pending_kill(1, "n1", scalar_alloc(2, 4000), 101);
+        cm.note_pending_kill(2, "n1", scalar_alloc(3, 6000), 102);
+        cm.note_pending_kill(3, "n2", scalar_alloc(1, 1000), 103);
 
         let reserved = cm.pending_kill_reservations();
         assert_eq!(
@@ -6330,6 +6345,7 @@ mod tests {
             (
                 scalar_alloc(2, 4000),
                 std::time::Instant::now() - std::time::Duration::from_secs(1),
+                101,
             ),
         );
         let reserved = cm.pending_kill_reservations();
@@ -6343,7 +6359,7 @@ mod tests {
         let mut cfg = test_config();
         cfg.controller.pending_kill_ttl_secs = 0;
         let cm0 = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
-        cm0.note_pending_kill(9, "n1", scalar_alloc(1, 1000));
+        cm0.note_pending_kill(9, "n1", scalar_alloc(1, 1000), 201);
         assert!(cm0.pending_kill_reservations().is_empty());
     }
 
@@ -6351,16 +6367,37 @@ mod tests {
     async fn clear_pending_kill_for_job_removes_only_that_job() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
-        cm.note_pending_kill(1, "n1", scalar_alloc(2, 4000));
-        cm.note_pending_kill(2, "n1", scalar_alloc(3, 6000));
+        cm.note_pending_kill(1, "n1", scalar_alloc(2, 4000), 101);
+        cm.note_pending_kill(2, "n1", scalar_alloc(3, 6000), 102);
 
-        cm.clear_pending_kill_for_job(1);
+        cm.clear_pending_kill_for_job(1, 101);
 
         let reserved = cm.pending_kill_reservations();
         assert_eq!(
             reserved.get("n1").unwrap().cpus,
             3,
             "only job 1's reservation must be rolled back"
+        );
+    }
+
+    // A losing cancel's rollback must not clear a concurrent, still-live
+    // reservation planted for the same job by a winning cancel attempt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_pending_kill_for_job_spares_a_concurrent_attempts_reservation() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.note_pending_kill(1, "n1", scalar_alloc(2, 4000), 101);
+        // A second, winning attempt for the same job refreshes the entry
+        // under a new attempt token.
+        cm.note_pending_kill(1, "n1", scalar_alloc(2, 4000), 102);
+
+        // The losing (first) attempt's rollback must not touch it.
+        cm.clear_pending_kill_for_job(1, 101);
+
+        assert_eq!(
+            cm.pending_kill_reservations().get("n1").unwrap().cpus,
+            2,
+            "the winning attempt's reservation must survive the loser's rollback"
         );
     }
 

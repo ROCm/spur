@@ -2488,8 +2488,22 @@ impl SlurmAgent for AgentService {
 }
 
 impl AgentService {
-    async fn drop_tracked_job(&self, job_id: u32) {
-        if self.running.lock().await.remove(&job_id).is_some() {
+    // expected_run_attempt (0 = unfenced) must still match at remove time — a
+    // newer run can replace the tracked entry between the caller's own check and here.
+    async fn drop_tracked_job(&self, job_id: u32, expected_run_attempt: u32) {
+        let dropped = {
+            let mut jobs = self.running.lock().await;
+            match jobs.entry(job_id) {
+                std::collections::hash_map::Entry::Occupied(e)
+                    if expected_run_attempt == 0 || e.get().run_attempt == expected_run_attempt =>
+                {
+                    e.remove();
+                    true
+                }
+                _ => false,
+            }
+        };
+        if dropped {
             self.allocation.lock().await.release_job(job_id);
             if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
                 warn!(job_id, error = %e, "PMIx stop failed on job drop");
@@ -2627,7 +2641,7 @@ impl AgentService {
             tracked.job.is_allocation_only()
         };
         if is_allocation_only {
-            self.drop_tracked_job(job_id).await;
+            self.drop_tracked_job(job_id, expected_run_attempt).await;
             return;
         }
 
@@ -2674,7 +2688,7 @@ impl AgentService {
             tracked.job.is_allocation_only()
         };
         if is_allocation_only {
-            self.drop_tracked_job(job_id).await;
+            self.drop_tracked_job(job_id, expected_run_attempt).await;
             return;
         }
 
@@ -4832,6 +4846,36 @@ mod tests {
         assert!(
             wait_job_reaped(&svc, job_id, 2_000).await,
             "a cancel matching the current run must still kill it"
+        );
+    }
+
+    // drop_tracked_job (the allocation-only cancel path) must not remove a
+    // replacement run inserted after the caller's own epoch check passed.
+    #[tokio::test]
+    async fn drop_tracked_job_ignores_a_request_for_a_superseded_run() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let job_id = 904;
+        let mut run2 = TrackedJob::dummy(0);
+        run2.job = executor::RunningJob::AllocationOnly;
+        run2.run_attempt = 2;
+        svc.insert_test_job(job_id, run2).await;
+
+        svc.drop_tracked_job(job_id, 1).await;
+        assert!(
+            svc.running.lock().await.contains_key(&job_id),
+            "a drop targeting a superseded run must not remove the current run"
+        );
+
+        svc.drop_tracked_job(job_id, 2).await;
+        assert!(
+            !svc.running.lock().await.contains_key(&job_id),
+            "a drop matching the current run must still remove it"
         );
     }
 

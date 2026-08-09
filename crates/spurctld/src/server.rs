@@ -462,8 +462,13 @@ fn should_kill_reported_job(cluster: &ClusterManager, job_id: u32, node: &str) -
     }
 }
 
-/// Reserve `job`'s resources on each allocated node. Call before sending the kill.
-pub(crate) fn note_pending_kill_for_job(cluster: &ClusterManager, job: &spur_core::job::Job) {
+/// Reserve `job`'s resources on each node. Returns the attempt token, so a
+/// later failure can roll back only this reservation via `clear_pending_kill_for_job`.
+pub(crate) fn note_pending_kill_for_job(
+    cluster: &ClusterManager,
+    job: &spur_core::job::Job,
+) -> u64 {
+    let attempt = cluster.new_pending_kill_attempt();
     let node_count = job.allocated_nodes.len().max(1) as u32;
     for node in &job.allocated_nodes {
         let resources = job.per_node_alloc.get(node).cloned().unwrap_or_else(|| {
@@ -477,8 +482,9 @@ pub(crate) fn note_pending_kill_for_job(cluster: &ClusterManager, job: &spur_cor
                 },
             )
         });
-        cluster.note_pending_kill(job.job_id, node, resources);
+        cluster.note_pending_kill(job.job_id, node, resources, attempt);
     }
+    attempt
 }
 
 #[tonic::async_trait]
@@ -621,12 +627,14 @@ impl SlurmController for ControllerService {
 
         // Reserve before the free lands (the check above already gated this
         // on the request being authorized against a live job).
-        if let Some(job) = &job {
-            note_pending_kill_for_job(&self.cluster, job);
-        }
+        let attempt = job
+            .as_ref()
+            .map(|job| note_pending_kill_for_job(&self.cluster, job));
 
         if let Err(e) = self.cluster.cancel_job(job_id, &req.user) {
-            self.cluster.clear_pending_kill_for_job(job_id);
+            if let Some(attempt) = attempt {
+                self.cluster.clear_pending_kill_for_job(job_id, attempt);
+            }
             return Err(cluster_err_to_status(e));
         }
 
@@ -3985,9 +3993,9 @@ mod tests {
         let svc = test_service(&dir).await;
 
         svc.cluster
-            .note_pending_kill(1, "n1", ResourceAllocations::with_scalar(2, 4000));
+            .note_pending_kill(1, "n1", ResourceAllocations::with_scalar(2, 4000), 101);
         svc.cluster
-            .note_pending_kill(2, "n1", ResourceAllocations::with_scalar(1, 1000));
+            .note_pending_kill(2, "n1", ResourceAllocations::with_scalar(1, 1000), 102);
         assert_eq!(svc.cluster.pending_kill_reservations()["n1"].cpus, 3);
 
         // n1's heartbeat still reports job 2, but no longer job 1.
