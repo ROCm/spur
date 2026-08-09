@@ -9,6 +9,7 @@ mod fairshare_cache;
 mod limits_cache;
 mod metrics_proto;
 mod metrics_server;
+mod pmix_dispatch;
 mod raft;
 mod raft_server;
 mod rest;

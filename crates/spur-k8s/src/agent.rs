@@ -463,6 +463,22 @@ impl SlurmAgent for VirtualAgent {
         }
     }
 
+    async fn prepare_pmix(
+        &self,
+        _request: Request<PreparePmixRequest>,
+    ) -> Result<Response<PreparePmixResponse>, Status> {
+        Err(Status::unimplemented(
+            "PMIx prepare is not supported on the K8s virtual agent",
+        ))
+    }
+
+    async fn release_pmix(
+        &self,
+        _request: Request<ReleasePmixRequest>,
+    ) -> Result<Response<ReleasePmixResponse>, Status> {
+        Ok(Response::new(ReleasePmixResponse {}))
+    }
+
     async fn cancel_job(
         &self,
         request: Request<AgentCancelJobRequest>,
@@ -607,6 +623,15 @@ impl SlurmAgent for VirtualAgent {
         // srun-in-allocation is not a common K8s workflow.
         Err(Status::unimplemented(
             "RunCommand is not yet supported by the K8s virtual agent",
+        ))
+    }
+
+    async fn cancel_step(
+        &self,
+        _request: Request<CancelStepRequest>,
+    ) -> Result<Response<()>, Status> {
+        Err(Status::unimplemented(
+            "CancelStep is not yet supported by the K8s virtual agent",
         ))
     }
 

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::admission::AdmissionToken;
 use crate::job::{JobId, JobSpec, JobState, PendingReason};
 use crate::k0s::{K0sPhase, K0sRole};
-use crate::node::NodeState;
+use crate::node::{NodeSource, NodeState};
 use crate::partition::Partition;
 use crate::reservation::Reservation;
 use std::collections::HashMap;
@@ -143,6 +143,14 @@ pub enum WalOperation {
     /// job's assigned nodes never received the launch dispatch.
     JobEvict {
         job_id: JobId,
+        /// Human-readable bootstrap failure (shown via scontrol / logs).
+        #[serde(default)]
+        detail: Option<String>,
+    },
+    /// Record why a requeued job is back in Pending (survives controller restart).
+    JobLaunchFailureDetail {
+        job_id: JobId,
+        detail: String,
     },
 
     // Node operations
@@ -160,6 +168,8 @@ pub enum WalOperation {
         version: String,
         #[serde(default)]
         labels: HashMap<String, String>,
+        #[serde(default)]
+        source: NodeSource,
     },
     NodeUpdate {
         name: String,
@@ -170,6 +180,8 @@ pub enum WalOperation {
         port: u16,
         wg_pubkey: String,
         version: String,
+        #[serde(default)]
+        source: NodeSource,
     },
     NodeStateChange {
         name: String,
@@ -684,6 +696,30 @@ mod tests {
     }
 
     #[test]
+    fn job_submit_mpi_pmix_round_trips() {
+        use crate::job::JobSpec;
+
+        let op = WalOperation::JobSubmit {
+            job_id: 99,
+            spec: Box::new(JobSpec {
+                name: "mpi-job".into(),
+                user: "alice".into(),
+                mpi: Some("pmix".into()),
+                ..Default::default()
+            }),
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobSubmit { job_id, spec } => {
+                assert_eq!(job_id, 99);
+                assert_eq!(spec.mpi.as_deref(), Some("pmix"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn job_node_complete_signal_round_trips() {
         let op = WalOperation::JobNodeComplete {
             job_id: 1,
@@ -941,11 +977,31 @@ mod evict_wal_tests {
 
     #[test]
     fn job_evict_op_round_trips() {
-        let op = WalOperation::JobEvict { job_id: 9 };
+        let op = WalOperation::JobEvict {
+            job_id: 9,
+            detail: Some("PMIx prepare failed".into()),
+        };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
-            WalOperation::JobEvict { job_id } => assert_eq!(job_id, 9),
+            WalOperation::JobEvict { job_id, detail } => {
+                assert_eq!(job_id, 9);
+                assert_eq!(detail.as_deref(), Some("PMIx prepare failed"));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let detail_op = WalOperation::JobLaunchFailureDetail {
+            job_id: 42,
+            detail: "PMIx prepare failed: n1: connect failed".into(),
+        };
+        let detail_json = serde_json::to_string(&detail_op).unwrap();
+        let detail_back: WalOperation = serde_json::from_str(&detail_json).unwrap();
+        match detail_back {
+            WalOperation::JobLaunchFailureDetail { job_id, detail } => {
+                assert_eq!(job_id, 42);
+                assert_eq!(detail, "PMIx prepare failed: n1: connect failed");
+            }
             _ => panic!("wrong variant"),
         }
     }

@@ -12,13 +12,17 @@ use tonic::{Code, Request, Response, Status};
 use tracing::{info, warn};
 
 use spur_core::job::NodeCompleteError;
+use spur_core::mpi::MPI_PMIX;
 use spur_core::reservation::Reservation;
-use spur_core::task_launch::build_step_task_plan;
+use spur_core::task_launch::{
+    batch_script_uses_step_launch, build_step_task_plan, step_needs_pmix_prepare,
+};
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::slurm_controller_server::SlurmController;
 use spur_proto::proto::*;
 
 use crate::cluster::{ClusterManager, PartitionError, ReservationError};
+use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
 use crate::rpc_middleware::RpcStatsLayer;
 use crate::rpc_stats::RpcStatsCollector;
@@ -29,9 +33,9 @@ const LEADER_HEADER: &str = "x-spur-leader";
 
 /// Resolve the comm address for an agent registration.
 ///
-/// Tries the advertised address first, then the gRPC peer IP (Slurm-style
-/// dynamic registration fallback). Loopback or link-local results are deferred
-/// when a routable candidate is also available.
+/// Tries the advertised address first, then the gRPC peer IP (dynamic registration
+/// fallback). Loopback or link-local results are deferred when a routable
+/// candidate is also available.
 fn resolve_registration_comm_addr(
     advertised: &str,
     remote_addr: &str,
@@ -1135,6 +1139,7 @@ impl SlurmController for ControllerService {
 
         let node_token_response = self.validate_admission(&req.join_token, &req.hostname)?;
 
+        let source = spur_core::node::node_source_from_registration(&req.version, &req.labels);
         self.cluster
             .register_node(
                 // NodeName and NodeHostname are the same until agents can supply both.
@@ -1145,7 +1150,7 @@ impl SlurmController for ControllerService {
                 agent_port,
                 req.wg_pubkey,
                 req.version,
-                spur_core::node::NodeSource::NativeHost,
+                source,
                 req.labels,
             )
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -1220,7 +1225,34 @@ impl SlurmController for ControllerService {
 
         match completion_result {
             Some(Ok(NodeCompleteResult::AllDone { .. })) => Ok(Response::new(())),
-            Some(Ok(NodeCompleteResult::Completing)) => Ok(Response::new(())),
+            Some(Ok(NodeCompleteResult::Completing)) => {
+                if let Some(job) = self.cluster.get_job(req.job_id) {
+                    if job
+                        .spec
+                        .script
+                        .as_deref()
+                        .is_some_and(batch_script_uses_step_launch)
+                    {
+                        let missing: Vec<String> = job
+                            .allocated_nodes
+                            .iter()
+                            .filter(|node| !job.node_completions.contains_key(*node))
+                            .cloned()
+                            .collect();
+                        if !missing.is_empty() {
+                            let cluster = self.cluster.clone();
+                            let job_id = req.job_id;
+                            tokio::spawn(async move {
+                                crate::scheduler_loop::cancel_job_on_nodes(
+                                    &cluster, job_id, &missing, 15,
+                                )
+                                .await;
+                            });
+                        }
+                    }
+                }
+                Ok(Response::new(()))
+            }
             Some(Ok(NodeCompleteResult::AlreadyTerminal)) => {
                 warn!(
                     job_id = req.job_id,
@@ -2033,9 +2065,10 @@ impl SlurmController for ControllerService {
         let label = req.label;
         let job_mpi = job.spec.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
         let mpi = spur_core::mpi::resolve_step_mpi(req.mpi.as_str(), job_mpi).to_string();
-        spur_core::mpi::validate_pmix_step_agents(mpi.as_str(), plan.len())
-            .map_err(Status::invalid_argument)?;
         let pmix_tmpdir = self.cluster.config().mpi.pmix_tmpdir.clone();
+        let modex_connect_timeout_secs = self.cluster.config().mpi.modex_connect_timeout_secs;
+        let modex_fence_timeout_secs = self.cluster.config().mpi.modex_fence_timeout_secs;
+        let modex_verify_timeout_secs = self.cluster.config().mpi.modex_verify_timeout_secs;
 
         struct NodeDispatch {
             node_name: String,
@@ -2077,29 +2110,125 @@ impl SlurmController for ControllerService {
             });
         }
 
+        if !dispatch_errors.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "srun step dispatch setup failed: {}",
+                dispatch_errors.join("; ")
+            )));
+        }
+
+        let pmix_peers = if mpi == MPI_PMIX {
+            Some(
+                spur_core::mpi::PmixStepPeers::from_participants(
+                    dispatches
+                        .iter()
+                        .map(|dispatch| dispatch.node_tasks.node_index)
+                        .collect(),
+                    |idx| {
+                        let name = job.allocated_nodes.get(idx as usize)?;
+                        self.cluster
+                            .get_node(name)
+                            .and_then(|n| n.comm_addr().map(str::to_string))
+                    },
+                )
+                .map_err(Status::failed_precondition)?,
+            )
+        } else {
+            None
+        };
+        let needs_pmix_prepare = pmix_peers.as_ref().is_some_and(|peers| {
+            step_needs_pmix_prepare(
+                peers.num_nodes,
+                job.spec.mpi.as_deref(),
+                job.allocated_nodes.len() as u32,
+                job.spec.script.as_deref(),
+            )
+        });
+        let run_attempt = job.run_attempt;
+
+        let dispatch_pmix_plans: Vec<Option<spur_proto::proto::PmixLaunchPlan>> =
+            if let Some(peers) = pmix_peers.as_ref() {
+                dispatches
+                    .iter()
+                    .map(|node_dispatch| {
+                        let local = spur_core::mpi::pmix_local_dispatch_for_step(
+                            peers,
+                            node_dispatch.node_tasks.node_index,
+                            job_id,
+                            step_num_tasks,
+                            node_dispatch.node_tasks.task_offset,
+                            node_dispatch.node_tasks.tasks_on_node,
+                            pmix_tmpdir.clone(),
+                            uid,
+                            gid,
+                            modex_connect_timeout_secs,
+                            modex_fence_timeout_secs,
+                            modex_verify_timeout_secs,
+                        )
+                        .map_err(Status::failed_precondition)?;
+                        spur_core::mpi::build_validated_pmix_plan_proto(mpi.as_str(), local)
+                            .map_err(Status::failed_precondition)?
+                            .ok_or_else(|| {
+                                Status::failed_precondition("job is not configured for PMIx")
+                            })
+                            .map(Some)
+                    })
+                    .collect::<Result<Vec<_>, Status>>()?
+            } else {
+                vec![None; dispatches.len()]
+            };
+
+        let mut pmix_prepare_guard = None;
+
+        if needs_pmix_prepare {
+            if let Some(detail) = pmix_dispatch::multi_node_pmix_unsupported(
+                dispatches.iter().filter_map(|dispatch| {
+                    self.cluster
+                        .get_node(&dispatch.node_name)
+                        .map(|node| node.source.clone())
+                }),
+            ) {
+                return Err(Status::failed_precondition(detail));
+            }
+
+            let prepare_nodes: Vec<PmixPrepareNode> = dispatches
+                .iter()
+                .zip(&dispatch_pmix_plans)
+                .map(|(node_dispatch, pmix_plan)| {
+                    Ok(PmixPrepareNode {
+                        node_name: node_dispatch.node_name.clone(),
+                        agent_addr: node_dispatch.agent_addr.clone(),
+                        pmix_plan: pmix_plan.clone().ok_or_else(|| {
+                            Status::failed_precondition("job is not configured for PMIx")
+                        })?,
+                    })
+                })
+                .collect::<Result<Vec<_>, Status>>()?;
+            if prepare_nodes.len() != dispatches.len() {
+                return Err(Status::failed_precondition(
+                    "multi-node PMIx step missing launch plan for one or more nodes",
+                ));
+            }
+            if let Err(detail) =
+                pmix_dispatch::prepare_pmix_on_nodes(job_id, run_attempt, prepare_nodes).await
+            {
+                return Err(Status::failed_precondition(format!(
+                    "PMIx prepare failed: {detail}"
+                )));
+            }
+            let addrs: Vec<String> = dispatches.iter().map(|d| d.agent_addr.clone()).collect();
+            pmix_prepare_guard = Some(pmix_dispatch::PmixPreparedReleaseGuard::new(job_id, addrs));
+        }
+
         let mut set = tokio::task::JoinSet::new();
-        for dispatch in dispatches {
-            let node_name = dispatch.node_name;
-            let agent_addr = dispatch.agent_addr;
-            let node_tasks = dispatch.node_tasks;
+        for (dispatch, pmix_plan) in dispatches.iter().zip(dispatch_pmix_plans) {
+            let node_name = dispatch.node_name.clone();
+            let agent_addr = dispatch.agent_addr.clone();
+            let node_tasks = dispatch.node_tasks.clone();
             let command = command.clone();
             let work_dir = work_dir.clone();
             let environment = environment.clone();
-            let pmix_tmpdir = pmix_tmpdir.clone();
             let step_mpi = mpi.clone();
-            let pmix_plan = spur_core::mpi::maybe_local_pmix_plan(
-                step_mpi.as_str(),
-                spur_core::mpi::PmixLocalDispatch {
-                    job_id,
-                    universe_size: step_num_tasks,
-                    task_offset: node_tasks.task_offset,
-                    local_count: node_tasks.tasks_on_node,
-                    tmpdir: pmix_tmpdir.clone(),
-                    job_uid: uid,
-                    job_gid: gid,
-                },
-            )
-            .map(spur_core::mpi::plan_to_proto);
             set.spawn(async move {
                 let mut agent = SlurmAgentClient::connect(agent_addr.clone())
                     .await
@@ -2123,7 +2252,8 @@ impl SlurmController for ControllerService {
                         step_num_tasks,
                         label,
                         pmix_plan,
-                        mpi: step_mpi,
+                        mpi: step_mpi.clone(),
+                        pmix_prepared: needs_pmix_prepare,
                     })
                     .await
                     .map_err(|e| {
@@ -2139,6 +2269,8 @@ impl SlurmController for ControllerService {
         let mut stdout = String::new();
         let mut stderr = String::new();
         let mut ran_nodes = Vec::new();
+        let step_node_names: Vec<String> = dispatches.iter().map(|d| d.node_name.clone()).collect();
+        let mut step_abort_sent = false;
 
         while let Some(result) = set.join_next().await {
             match result {
@@ -2152,11 +2284,33 @@ impl SlurmController for ControllerService {
                     warn!(job_id, step_id, error = %e, "step dispatch failed on one node");
                     dispatch_errors.push(e.to_string());
                     max_exit = max_exit.max(1);
+                    if !step_abort_sent {
+                        step_abort_sent = true;
+                        crate::scheduler_loop::cancel_step_on_nodes(
+                            &self.cluster,
+                            job_id,
+                            step_id,
+                            &step_node_names,
+                            15,
+                        )
+                        .await;
+                    }
                 }
                 Err(e) => {
                     warn!(job_id, step_id, error = %e, "step dispatch task panicked");
                     dispatch_errors.push(format!("step dispatch task panicked: {e}"));
                     max_exit = max_exit.max(1);
+                    if !step_abort_sent {
+                        step_abort_sent = true;
+                        crate::scheduler_loop::cancel_step_on_nodes(
+                            &self.cluster,
+                            job_id,
+                            step_id,
+                            &step_node_names,
+                            15,
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -2167,6 +2321,14 @@ impl SlurmController for ControllerService {
                 "srun step dispatch errors:\n{}\n",
                 dispatch_errors.join("\n")
             ));
+        }
+
+        if needs_pmix_prepare {
+            if let Some(guard) = pmix_prepare_guard.as_mut() {
+                guard.disarm();
+            }
+            let addrs: Vec<String> = dispatches.iter().map(|d| d.agent_addr.clone()).collect();
+            pmix_dispatch::release_pmix_on_agents(&addrs, job_id).await;
         }
 
         if let Err(e) = self.cluster.record_step_complete(job_id, step_id, max_exit) {
@@ -2720,7 +2882,7 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         partition: job.spec.partition.clone().unwrap_or_default(),
         account: job.spec.account.clone().unwrap_or_default(),
         state: job.state.to_proto_i32(),
-        state_reason: job.state_reason_display().to_string(),
+        state_reason: job.state_reason(),
         submit_time: Some(datetime_to_proto(job.submit_time)),
         start_time: job.start_time.map(datetime_to_proto),
         end_time: job.end_time.map(datetime_to_proto),

@@ -163,6 +163,8 @@ pub struct JobLaunchConfig {
     pub memlock: MemlockLimit,
     /// I/O mode for the job.
     pub io_mode: LaunchIo,
+    /// Direct multi-rank PMIx launch via a wrapper script (batch `--mpi=pmix`).
+    pub pmix_multi_task: bool,
 }
 
 pub struct LaunchResult {
@@ -264,6 +266,29 @@ impl JobIoRaw {
                 Ok(())
             }
             JobIoRaw::Pty { master, slave } => crate::pty::pty_pre_exec(slave, master),
+        }
+    }
+
+    /// Wire stdin only (stdout/stderr stay as inherited pipe fds).
+    ///
+    /// Used for batch `--mpi=pmix` multi-rank wrappers: Open MPI's PMIx client
+    /// initializes correctly when stdout is a pipe (srun parity) but falls back
+    /// to singleton worlds when stdout is dup2'd to a regular file.
+    ///
+    /// # Safety
+    /// Same constraints as [`Self::wire`].
+    pub(crate) unsafe fn wire_stdin_only(self) -> std::io::Result<()> {
+        match self {
+            JobIoRaw::File { stdin, .. } => {
+                if let Some(fd) = stdin {
+                    crate::pty::checked_dup2(fd, libc::STDIN_FILENO)?;
+                    if fd > 2 {
+                        libc::close(fd);
+                    }
+                }
+                Ok(())
+            }
+            JobIoRaw::Pty { .. } => self.wire(),
         }
     }
 }
@@ -589,6 +614,10 @@ async fn spawn_job_process(
 
     let mut env = environment.clone();
 
+    if cfg.pmix_multi_task {
+        crate::mpi_plugin::strip_launcher_mpi_env(&mut env);
+    }
+
     // GPU isolation via registry-based device injection plan.
     if let Some(ref plan) = cfg.host_device_plan {
         for (key, value) in &plan.env {
@@ -598,29 +627,33 @@ async fn spawn_job_process(
 
     // Environment-based CPU/thread limiting — works even without cgroups.
     // Well-behaved applications (OpenMP, MKL, PyTorch, etc.) read these.
-    env.insert("OMP_NUM_THREADS".into(), cpus.to_string());
-    env.insert("MKL_NUM_THREADS".into(), cpus.to_string());
-    env.insert("OPENBLAS_NUM_THREADS".into(), cpus.to_string());
-    env.insert("VECLIB_MAXIMUM_THREADS".into(), cpus.to_string());
-    env.insert("NUMEXPR_NUM_THREADS".into(), cpus.to_string());
+    if !cfg.pmix_multi_task {
+        env.insert("OMP_NUM_THREADS".into(), cpus.to_string());
+        env.insert("MKL_NUM_THREADS".into(), cpus.to_string());
+        env.insert("OPENBLAS_NUM_THREADS".into(), cpus.to_string());
+        env.insert("VECLIB_MAXIMUM_THREADS".into(), cpus.to_string());
+        env.insert("NUMEXPR_NUM_THREADS".into(), cpus.to_string());
+    }
 
     // Run SPANK Init/TaskInit against a handle seeded with the assembled env,
     // then fold plugin edits back so both the container and command paths pick
     // them up. Hooks run in the spurd (root) process, not the forked task.
     if let Some(spank) = spank {
-        let context = SpankContext {
-            job_id,
-            uid,
-            gid,
-            ..Default::default()
-        };
-        let mut handle = SpankHandle::new(context, env);
-        for hook in [spur_spank::SpankHook::Init, spur_spank::SpankHook::TaskInit] {
-            if let Err(e) = spank.invoke_hook(hook, &mut handle) {
-                warn!(job_id, error = %e, "SPANK hook failed");
+        if !cfg.pmix_multi_task {
+            let context = SpankContext {
+                job_id,
+                uid,
+                gid,
+                ..Default::default()
+            };
+            let mut handle = SpankHandle::new(context, env);
+            for hook in [spur_spank::SpankHook::Init, spur_spank::SpankHook::TaskInit] {
+                if let Err(e) = spank.invoke_hook(hook, &mut handle) {
+                    warn!(job_id, error = %e, "SPANK hook failed");
+                }
             }
+            env = handle.env;
         }
-        env = handle.env;
     }
 
     // Container jobs: use explicit fork() + container_init() instead of bash wrapper.
@@ -643,7 +676,10 @@ async fn spawn_job_process(
     // --- Non-container jobs: existing tokio::Command path ---
 
     // Issue #99: If root, wrap job with namespace isolation.
-    let use_namespaces = nix::unistd::geteuid().is_root();
+    // Batch `--mpi=pmix` multi-rank wrappers must stay in the host mount/PID
+    // namespace so Open MPI's PMIx client can reach spurd's embedded server
+    // (same as standalone `srun` via `run_command`, which never uses unshare).
+    let use_namespaces = nix::unistd::geteuid().is_root() && !cfg.pmix_multi_task;
     let (launch_cmd, launch_args) = if use_namespaces {
         let wrapper_path = spool_dir.join("spur_ns.sh");
         let visible_devices = cfg
@@ -673,14 +709,21 @@ async fn spawn_job_process(
     };
 
     // Launch the process
+    let piped_mpi_stdio = cfg.pmix_multi_task && cfg.io_mode == LaunchIo::File;
     let mut cmd = Command::new(&launch_cmd);
-    cmd.args(&launch_args)
-        .current_dir(work_dir)
-        .envs(&env)
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    cmd.args(&launch_args).current_dir(work_dir).envs(&env);
+    if !cfg.pmix_multi_task {
+        cmd.process_group(0);
+    }
+    if piped_mpi_stdio {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    }
 
     // Reset signal dispositions to default before exec. spurd is launched in the
     // background (SIGINT/SIGQUIT/SIGHUP set to SIG_IGN), and a child inherits that
@@ -770,11 +813,38 @@ async fn spawn_job_process(
 
     // Wire job I/O (file dup2 or PTY setsid+TIOCSCTTY+dup2) in the child.
     let raw_io = job_io.raw();
+    let wire_stdin_only = piped_mpi_stdio;
     unsafe {
-        cmd.pre_exec(move || raw_io.wire());
+        cmd.pre_exec(move || {
+            if wire_stdin_only {
+                raw_io.wire_stdin_only()
+            } else {
+                raw_io.wire()
+            }
+        });
     }
 
-    let child = cmd.spawn().context("failed to spawn job process")?;
+    let mut child = cmd.spawn().context("failed to spawn job process")?;
+
+    if piped_mpi_stdio {
+        let shared = stderr_resolved == stdout_resolved;
+        let use_append = open_mode
+            .as_deref()
+            .map(|m| m.eq_ignore_ascii_case("append"))
+            .unwrap_or(false);
+        spawn_mpi_stdio_drains(
+            child.stdout.take(),
+            child.stderr.take(),
+            MpiStdioDrainOpts {
+                uid,
+                gid,
+                stdout_path: &stdout_resolved,
+                stderr_path: &stderr_resolved,
+                shared,
+                use_append,
+            },
+        );
+    }
 
     // Drop the slave fd immediately so the master gets EOF when the child exits.
     let pty_master = job_io.into_master();
@@ -1009,6 +1079,73 @@ fn recv_fds(sock: RawFd) -> nix::Result<Vec<OwnedFd>> {
         }
     }
     Ok(fds)
+}
+
+/// Copy a PMIx batch wrapper's piped stdout/stderr into the job output files.
+///
+/// Open MPI's PMIx client path matches standalone `srun` when stdio is a pipe;
+/// dup2'ing stdout/stderr to regular files before `MPI_Init` yields singleton
+/// worlds even with correct per-rank `PMIX_*` exports in the wrapper.
+struct MpiStdioDrainOpts<'a> {
+    uid: u32,
+    gid: u32,
+    stdout_path: &'a str,
+    stderr_path: &'a str,
+    shared: bool,
+    use_append: bool,
+}
+
+fn spawn_mpi_stdio_drains(
+    stdout_pipe: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>,
+    stderr_pipe: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>,
+    opts: MpiStdioDrainOpts<'_>,
+) {
+    let MpiStdioDrainOpts {
+        uid,
+        gid,
+        stdout_path,
+        stderr_path,
+        shared,
+        use_append,
+    } = opts;
+    let Ok((out, err)) = open_job_output(uid, gid, use_append, stdout_path, stderr_path) else {
+        warn!(
+            stdout = stdout_path,
+            stderr = stderr_path,
+            "failed to open PMIx batch output files for pipe drain"
+        );
+        return;
+    };
+
+    if shared {
+        let sink = std::sync::Arc::new(tokio::sync::Mutex::new(tokio::fs::File::from_std(out)));
+        if let Some(pipe) = stdout_pipe {
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                let mut file = sink.lock().await;
+                let _ = tokio::io::copy(&mut tokio::io::BufReader::new(pipe), &mut *file).await;
+            });
+        }
+        if let Some(pipe) = stderr_pipe {
+            tokio::spawn(async move {
+                let mut file = sink.lock().await;
+                let _ = tokio::io::copy(&mut tokio::io::BufReader::new(pipe), &mut *file).await;
+            });
+        }
+    } else {
+        if let Some(pipe) = stdout_pipe {
+            let mut file = tokio::fs::File::from_std(out);
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut tokio::io::BufReader::new(pipe), &mut file).await;
+            });
+        }
+        if let Some(pipe) = stderr_pipe {
+            let mut file = tokio::fs::File::from_std(err);
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut tokio::io::BufReader::new(pipe), &mut file).await;
+            });
+        }
+    }
 }
 
 /// Open a job's stdout/stderr, creating parent directories.
@@ -2027,6 +2164,7 @@ mod tests {
             host_device_plan: None,
             memlock: MemlockLimit::Unlimited,
             io_mode: LaunchIo::File,
+            pmix_multi_task: false,
         }
     }
 

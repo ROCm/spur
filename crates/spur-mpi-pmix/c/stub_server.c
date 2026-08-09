@@ -29,6 +29,18 @@ int spur_mpi_pmix_server_start(const spur_mpi_launch_plan_t *plan, char *errbuf,
     return -1;
 }
 
+int spur_mpi_pmix_verify_peers(const spur_mpi_launch_plan_t *plan, char *errbuf, size_t errlen) {
+    (void)plan;
+    if (errbuf != NULL && errlen > 0) {
+        snprintf(
+            errbuf,
+            errlen,
+            "spur_mpi_pmix.so was built without libpmix; rebuild with libpmix development packages"
+        );
+    }
+    return -1;
+}
+
 int spur_mpi_pmix_server_stop(const char *namespace_, char *errbuf, size_t errlen) {
     (void)namespace_;
     if (errbuf != NULL && errlen > 0) {
@@ -37,18 +49,19 @@ int spur_mpi_pmix_server_stop(const char *namespace_, char *errbuf, size_t errle
     return 0;
 }
 
-int spur_mpi_pmix_env(
+int spur_mpi_pmix_setup_fork_env(
     const spur_mpi_launch_plan_t *plan,
     uint32_t rank,
-    const char *key,
-    char *val,
-    size_t vallen
+    char ***env_out
 ) {
     (void)plan;
     (void)rank;
-    (void)key;
-    if (val != NULL && vallen > 0) {
-        val[0] = '\0';
+    if (env_out != NULL) {
+        *env_out = NULL;
     }
     return -1;
+}
+
+void spur_mpi_pmix_setup_fork_env_free(char **env) {
+    (void)env;
 }

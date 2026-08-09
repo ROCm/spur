@@ -25,6 +25,9 @@ to ``~/.local/bin`` (no sudo required):
 This installs the three binaries — ``spur``, ``spurctld``, and ``spurd`` — and makes the
 CLI reachable under its Slurm-compatible names (``sbatch``, ``squeue``, ``sinfo``, …).
 
+For ``--mpi=pmix``, use a **nightly** tarball (includes ``spur_mpi_pmix.so``);
+see :ref:`mpi-pmix-install`.
+
 To build from source instead, install the Rust toolchain and ``protobuf-compiler``, then
 build the three binaries:
 
@@ -319,73 +322,221 @@ The default can be changed in ``spur.conf``:
 MPI (PMIx)
 ----------
 
-Spur supports **single-node** Open MPI jobs via ``--mpi=pmix``. The controller and
-CLI do not link libpmix; each compute node loads ``spur_mpi_pmix.so`` from
-``[mpi].plugin_dir`` when a PMIx job starts.
+Spur supports Open MPI jobs via ``--mpi=pmix`` on **single-node and multi-node**
+allocations. The controller and CLI do not link libpmix; each compute node loads
+``spur_mpi_pmix.so`` from ``[mpi].plugin_dir`` when a PMIx job starts.
+
+.. _mpi-pmix-install:
+
+Install Spur with the MPI plugin
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**Use published tarballs** (GitHub nightly releases or your internal artifactory
+mirror of the same artifact). Do **not** copy ``cargo build`` artifacts from a
+developer laptop unless you have verified glibc compatibility (see
+:doc:`/developer/building`).
+
+Nightly and **stable release** tarballs include ``lib/spur/spur_mpi_pmix.so``
+(``BUILD_MPI_PLUGIN=1`` in the release pipeline). After install, confirm the
+plugin is present:
+
+.. code-block:: bash
+
+   ls "${INSTALL_ROOT}/lib/spur/spur_mpi_pmix.so"
+
+where ``INSTALL_ROOT`` is the directory that contains ``bin/`` (see layout
+below).
+
+**On the controller and every compute agent:**
+
+.. code-block:: bash
+
+   # Example: install under ~/spur (binaries in ~/spur/bin)
+   mkdir -p ~/spur/bin ~/spur/etc
+   curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh \
+     | INSTALL_DIR="$HOME/spur/bin" bash -s -- nightly
+
+   # Or pin a specific nightly tag from GitHub / artifactory:
+   # ... bash -s -- nightly-YYYYMMDD-<sha>
+
+   export PATH="$HOME/spur/bin:$PATH"
+   spur --version
+   ls "$HOME/spur/lib/spur/spur_mpi_pmix.so"
+
+``install.sh`` layout (when ``INSTALL_DIR=$HOME/spur/bin``):
+
+.. list-table::
+   :header-rows: 1
+
+   * - Path
+     - Contents
+   * - ``~/spur/bin/``
+     - ``spur``, ``spurctld``, ``spurd``, Slurm-compat symlinks
+   * - ``~/spur/lib/spur/``
+     - ``spur_mpi_pmix.so`` (when shipped in the tarball)
+
+For a system-wide install (``INSTALL_DIR=/opt/spur/bin``), the plugin lands in
+``/opt/spur/lib/spur/``.
+
+**Agent OS prerequisites** (not bundled in the Spur tarball):
+
+- **OpenPMIx runtime** — ``libpmix.so`` on the agent (Spur's plugin links
+  against it at load time). Version must satisfy ``[mpi].pmix_min_version``.
+- **Open MPI** — libraries matching how application binaries were built
+  (``mpicc``, ``LD_LIBRARY_PATH``, ``OPAL_PREFIX``).
+
+Add ``[mpi]`` to ``spur.conf`` on **all** hosts (controller and agents), with
+``plugin_dir`` matching the install layout. Use an **absolute path** — TOML does
+not expand ``$HOME`` or other environment variables:
+
+.. code-block:: toml
+
+   [mpi]
+   plugin_dir = "/home/<user>/spur/lib/spur"   # e.g. when INSTALL_DIR=/home/<user>/spur/bin; or /opt/spur/lib/spur
+   pmix_tmpdir = "/tmp/spur-pmix"
+   pmix_min_version = "4.1.0"
+
+**Start or restart daemons** after install or upgrade (controller first, then
+agents). Example on an agent:
+
+.. code-block:: bash
+
+   pkill -x spurd || true
+   nohup spurd --listen=[::]:6818 --config=/etc/spur/spur.conf \
+     --controller http://controller.example:6817 >> /var/log/spurd.log 2>&1 &
+
+**Verify MPI wiring** from a host with CLI access:
+
+.. code-block:: bash
+
+   scontrol ping
+   sinfo                                    # all agents idle/ready
+   srun --mpi=list                          # expect: none, pmix
+   srun --mpi=pmix -n4 /path/to/hello_mpi   # single-node smoke test
+   srun --mpi=pmix -N2 -n4 /path/to/hello_mpi   # multi-node smoke test
+
+Multi-node ``--mpi=pmix`` requires a **uniform task layout**: ``-n`` must be
+evenly divisible by ``-N`` (same number of tasks on every node). For example,
+``-N2 -n4`` (two tasks per node) is valid; ``-N2 -n3`` is rejected at prepare
+time because ranks cannot be split evenly across nodes.
+
+For multi-node ``srun``, the command path and any binaries or scripts it
+``exec``\ s must exist at the **same path on every participating agent** (for
+example ``/tmp/hello_mpi`` on each node, not only on the submission host).
+
+Expected ``hello_mpi`` output for ``-n4``: four lines with ``rank=0`` …
+``rank=3`` and ``size=4`` on each.
+
+Upgrade / rollout
+~~~~~~~~~~~~~~~~~
+
+1. Pick the new nightly (or pinned) tarball on GitHub or artifactory.
+2. **Stop** ``spurctld`` and ``spurd`` on each host before replacing binaries
+   (SCP or ``install.sh`` fails with "text file busy" while daemons are running).
+   When copying manually, stage to ``/tmp`` then ``mv`` into ``~/spur/bin/``.
+3. Run ``install.sh`` with the **same** ``INSTALL_DIR`` on the controller and
+   **every** agent (replaces binaries and ``spur_mpi_pmix.so`` together).
+4. Restart ``spurctld`` on the controller, then ``spurd`` on each agent.
+5. Re-run the smoke tests above before returning the cluster to users.
+
+Keep ``spurctld``, ``spurd``, and ``spur_mpi_pmix.so`` on the **same build**
+across the cluster during an upgrade.
 
 Architecture
 ~~~~~~~~~~~~
 
 1. **``spurd``** loads ``spur_mpi_pmix.so`` and calls ``PMIx_server_init`` when a
    job with ``mpi = pmix`` is launched.
-2. The plugin registers a namespace (``spur.<job_id>``), job size, and local
-   client ranks, then serves PMIx to application processes.
-3. For ``-n > 1`` on one node, ``spurd`` wraps the user command in a bash script
-   that runs **``mpirun -np N``** once (not ``N`` independent forks). Open MPI
-   4.x otherwise creates a singleton ``MPI_COMM_WORLD`` (``size=1`` per rank).
-4. The wrapper exports ``PMIX_SERVER_URI4`` from ``PMIX_SERVER_URI``, unsets
-   ``SLURM_*`` twins (so Open MPI does not assume Slurm PMI), and resolves
-   ``mpirun`` from ``PATH`` or ``OPAL_PREFIX``.
+2. The plugin registers a namespace (``spur.<job_id>``) with Slurm-style
+   topology metadata (``PMIX_NODE_MAP``, ``PMIX_PROC_MAP``, job/local size
+   keys, ``PMIX_LOCAL_PEERS``, ``PMIX_LOCALLDR``, ``PMIX_TMPDIR``), then serves
+   PMIx to application processes.
+3. For ``-n > 1``, ``spurd`` wraps the user command in a bash script that
+   **forks one process per rank**. Each child receives a full
+   ``PMIx_server_setup_fork`` environment (Slurm ``mpi_p_slurmstepd_task``
+   parity) via ``spur_mpi_pmix_setup_fork_env`` in the plugin.
+4. The wrapper exports ``PMIX_SERVER_URI4`` / ``PMIX_SERVER_URI3`` aliases.
+   Slurm-compatible ``SLURM_*`` twins remain set (same as Slurm under
+   ``--mpi=pmix``).
 
-The embedded PMIx server must **not** override ``fence_nb`` / ``fence`` with a
-no-op: modex exchange is handled internally by OpenPMIx GDS on single-node jobs.
+The embedded PMIx server registers ``fence_nb`` once at ``PMIx_server_init``.
+Single-node jobs never call it (OpenPMIx GDS handles modex locally). Multi-node
+jobs use ``fence_nb`` to exchange modex blobs over TCP between agents (peer
+addresses come from the controller allocation). The plugin does **not**
+finalize/reinit PMIx when switching between single- and multi-node jobs on the
+same agent.
 
-Build and install the plugin
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Multi-node bootstrap uses a **two-phase** controller dispatch:
 
-On each **agent**, with libpmix development files (``pkg-config pmix`` or vendor
-headers + ``libpmix.so``):
+1. **PreparePmix** — each agent starts its PMIx server, binds the modex TCP
+   listener, and verifies peer reachability before any rank exec.
+2. **LaunchJob** with ``pmix_prepared=true`` — joins the prepared namespace and
+   starts user processes.
+
+If prepare fails on any node, the controller rolls back with **ReleasePmix** on
+agents that succeeded and evicts the job with a descriptive ``state_reason``.
+Partial launch failures also release prepared-but-unlaunched agents.
+
+Modex timeouts are configurable under ``[mpi]`` (seconds; ``0`` = built-in default):
+
+.. code-block:: toml
+
+   modex_connect_timeout_secs = 5
+   modex_fence_timeout_secs = 120
+   modex_verify_timeout_secs = 30
+
+Build the plugin from source (fallback)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use this only when the tarball plugin cannot load on your agents (missing
+``libpmix.so``, undefined PMIx symbols, or libpmix version skew). **Build on the
+same OS/glibc as the agent**, linking against the **agent's** ``libpmix.so``.
+
+With libpmix development files (``pkg-config pmix``):
 
 .. code-block:: bash
 
    cargo build --release -p spur-mpi-pmix
    sudo install -D target/release/spur_mpi_pmix.so /usr/lib/spur/spur_mpi_pmix.so
 
-.. important::
+If ``pkg-config pmix`` is unavailable, compile on the agent against **that
+node's** ``libpmix.so``. Include paths vary by site — common layouts:
 
-   Build on the **same OS/glibc** as the agent, or compile ``pmix_server.c``
-   directly on the node. Copying a plugin from a mismatched dev environment can
-   crash ``spurd`` at ``dlopen`` time.
+- ``/usr/lib/x86_64-linux-gnu/pmix2/include`` (Debian-style)
+- ``/usr/mpi/gcc/openmpi-*/include`` (Open MPI bundled PMIx headers, e.g. Crusoe)
 
-If ``pkg-config pmix`` is unavailable on the agent but system headers exist (e.g.
-``/usr/lib/x86_64-linux-gnu/pmix2/include``), compile the C plugin manually on the
-node:
+Example (adjust ``-I`` and ``libpmix`` paths for your agent):
 
 .. code-block:: bash
 
-   gcc -fPIC -Wall -O2 -shared -o spur_mpi_pmix.so pmix_server.c \
-     -Iinclude \
+   gcc -fPIC -Wall -O2 -shared -o spur_mpi_pmix.so \
+     c/pmix_server.c c/modex_exchange.c \
+     -Ic -Iinclude \
      -I/usr/lib/x86_64-linux-gnu/pmix2/include \
-     -L/usr/lib/x86_64-linux-gnu/pmix2/lib \
-     -Wl,-rpath,/usr/lib/x86_64-linux-gnu/pmix2/lib \
-     -lpmix -pthread
+     /usr/lib/x86_64-linux-gnu/pmix2/lib/libpmix.so.2 \
+     -pthread -Wl,-rpath,/usr/lib/x86_64-linux-gnu/pmix2/lib
    sudo install -D spur_mpi_pmix.so /usr/lib/spur/spur_mpi_pmix.so
+
+Copying a plugin built on a mismatched dev environment (wrong glibc or
+libpmix) can crash ``spurd`` at ``dlopen`` time.
 
 Runtime requirements
 ~~~~~~~~~~~~~~~~~~~~
 
-- **OpenPMIx** on the agent (plugin links ``libpmix``).
-- **Open MPI** with ``mpirun`` on the agent ``PATH`` (or set ``OPAL_PREFIX`` so
-  the wrapper finds ``$OPAL_PREFIX/bin/mpirun``).
+- **OpenPMIx** on the agent (plugin links ``libpmix`` at load time).
+- **Open MPI** runtime libraries matching the application build (``mpicc`` /
+  ``LD_LIBRARY_PATH`` / ``OPAL_PREFIX``). Spur does **not** invoke ``mpirun``
+  for ``--mpi=pmix`` (Slurm direct-launch parity).
 - Application binaries built against the **same** Open MPI install you use at
   runtime (consistent ``LD_LIBRARY_PATH`` / ``OPAL_PREFIX``).
 
-``spur.conf`` on agents (match ``plugin_dir`` to the install path):
+``plugin_dir`` must match where ``install.sh`` placed ``spur_mpi_pmix.so`` (see
+**Install Spur with the MPI plugin** above). Example for ``INSTALL_DIR=/opt/spur/bin``:
 
 .. code-block:: toml
 
    [mpi]
-   plugin_dir = "/usr/lib/spur"
+   plugin_dir = "/opt/spur/lib/spur"
    pmix_tmpdir = "/tmp/spur-pmix"
    pmix_min_version = "4.1.0"
 
@@ -395,6 +546,7 @@ Submit PMIx jobs
 .. code-block:: bash
 
    srun --mpi=pmix -n4 ./hello_mpi
+   srun --mpi=pmix -N2 -n4 ./hello_mpi
    sbatch --mpi=pmix -n4 batch.sh
 
 Inside an interactive allocation (``salloc``), enable PMIx per step:
@@ -424,7 +576,7 @@ Expected result for ``-n4``: four lines with ``rank=0`` … ``rank=3`` and
 
 Application scripts should **avoid**:
 
-- ``OMPI_MCA_ess=env`` when ``spurd`` already uses ``mpirun``.
+- ``OMPI_MCA_ess=env`` — conflicts with Spur's embedded PMIx server.
 - Forcing ``OMPI_MCA_pmix=ext3x`` on Open MPI 4.1 (use the default ``pmix3x``
   component, or omit the variable).
 - Mixing library paths from different Open MPI installations.
@@ -435,12 +587,22 @@ Operational notes
 - Set ``SPUR_MPI_DEBUG=1`` in ``spurd`` environment for plugin debug logs.
 - Each agent holds at most 64 active PMIx namespaces; additional concurrent
   ``--mpi=pmix`` jobs on the same node fail until a job finishes.
-- Multi-node PMIx coordination is not yet supported.
-- Multi-rank ``--mpi=pmix`` steps launch via a single ``mpirun -np N`` wrapper.
-  That path does not apply Spur's per-task CPU bind (``--cpu-bind``) or per-rank
-  GPU partitioning (``SPUR_JOB_GPUS``) the way the non-MPI fork wrapper does.
-  Use Open MPI binding options or set rank-local GPU env in the application script
-  until Spur adds MPI-aware bind support.
+- Single-node and multi-node PMIx jobs can run back-to-back on the same agent
+  (for example a single-node smoke test followed by a multi-node job). Single-node
+  jobs use local GDS modex; multi-node jobs use TCP modex via ``fence_nb``.
+- Multi-node ``--mpi=pmix`` is not supported on K8s virtual agents (the
+  ``spur-k8s`` in-cluster agent returns ``Unimplemented`` for ``PreparePmix``).
+- Multi-node ``--mpi=pmix`` requires agent addresses in the cluster registry to
+  be reachable from every node in the allocation. Hostnames and IPv4 literals
+  are resolved via DNS; modex TCP listens on port ``16819 + (job_id % 8000)``.
+  Only one active multi-node PMIx job should use a given port slot at a time:
+  concurrent jobs whose IDs differ by a multiple of 8000 can collide.
+- Modex timeouts travel with ``PreparePmix`` in ``PmixLaunchPlan`` (``0`` =
+  agent ``[mpi]`` defaults). Keep ``[mpi]`` modex timeout settings identical
+  across all agents when not passing explicit values.
+- Multi-rank ``--mpi=pmix`` steps use the same per-rank fork + ``setup_fork``
+  path as batch jobs. Spur CPU bind (``--cpu-bind``) and per-rank GPU
+  partitioning (``SPUR_JOB_GPUS``) apply through the fork wrapper.
 
 Submitting Jobs
 ---------------

@@ -21,10 +21,17 @@ All crates build in one invocation — no separate steps needed.
 MPI plugin (optional)
 ~~~~~~~~~~~~~~~~~~~~~
 
-Single-node Open MPI jobs use ``--mpi=pmix``, which loads ``spur_mpi_pmix.so`` on
-compute nodes at runtime (``spurd`` itself does not link libpmix). Build the
-plugin when libpmix development packages are installed (``pkg-config pmix`` must
-succeed):
+Open MPI jobs use ``--mpi=pmix``, which loads ``spur_mpi_pmix.so`` on compute
+nodes at runtime (``spurd`` itself does not link libpmix).
+
+**For production clusters**, use a **release or nightly tarball** from GitHub
+Releases (or your artifactory mirror). Both ship ``lib/spur/spur_mpi_pmix.so``
+when built with ``BUILD_MPI_PLUGIN=1`` (see ``.github/workflows/release.yml``
+and ``nightly.yml``). See :doc:`/deployment/native-host` for the full MPI deploy
+and upgrade steps.
+
+**For local development**, build the plugin when libpmix development packages are
+installed (``pkg-config pmix`` must succeed):
 
 .. code-block:: bash
 
@@ -33,16 +40,17 @@ succeed):
 
 Install the resulting ``spur_mpi_pmix.so`` on **every agent**, using the same
 glibc as the running ``spurd``. If ``pkg-config pmix`` is missing on agents but
-system PMIx headers exist, compile ``crates/spur-mpi-pmix/c/pmix_server.c`` on the
-node with ``gcc -fPIC -shared`` and the system PMIx ``-I`` / ``-L`` flags (see
-:doc:`/deployment/native-host`).
+system PMIx headers exist, compile on the agent with ``gcc -fPIC -shared`` and
+the system PMIx ``-I`` / ``libpmix.so`` path (see :doc:`/deployment/native-host`).
 
-``spurd`` launches multi-rank ``--mpi=pmix`` steps via ``mpirun -np N``; agents
-need ``mpirun`` on ``PATH`` (or ``OPAL_PREFIX`` pointing at an Open MPI install).
+``spurd`` launches multi-rank ``--mpi=pmix`` jobs via per-rank fork and
+``PMIx_server_setup_fork`` (see :doc:`/deployment/native-host`). Agents need
+Open MPI libraries matching the application build; ``mpirun`` is not used for
+bootstrap.
 
 Without libpmix, the crate still builds a stub plugin that fails at load time with
-an actionable error. Container images can include a functional plugin by building
-with ``BUILD_MPI_PLUGIN=1`` (see ``Dockerfile``).
+an actionable error. Container/nightly images include a functional plugin via
+``BUILD_MPI_PLUGIN=1`` (see ``Dockerfile`` and ``.github/workflows/nightly.yml``).
 
 Native-host MPI E2E tests (``pytest -m mpi``) additionally require ``mpicc`` on
 the test nodes and ``SPUR_TEST_MPI_PLUGIN`` (or the default plugin path under
