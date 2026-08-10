@@ -14,13 +14,17 @@ class TestReservations:
     def test_create_list_and_delete_reservation(self, cluster):
         res_name = f"res-e2e-{int(time.time())}"
         node = cluster.node_names[0]
-        create_out = cluster.scontrol(
-            "create-reservation",
-            f"--name={res_name}",
-            "--start-time=now",
-            "--duration=60",
-            f"--nodes={node}",
-            "--users=testuser",
+        create_out = cluster.cli_as_user(
+            "root",
+            [
+                "scontrol",
+                "create-reservation",
+                f"--name={res_name}",
+                "--start-time=now",
+                "--duration=60",
+                f"--nodes={node}",
+                "--users=testuser",
+            ],
         )
         assert "created" in create_out.lower()
 
@@ -37,14 +41,19 @@ class TestReservations:
         else:
             other_node = node
             overlap_flags = ["--flags=overlap"]
-        cluster.scontrol(
-            "create-reservation",
-            f"--name={other_name}",
-            "--start-time=now",
-            "--duration=60",
-            f"--nodes={other_node}",
-            *overlap_flags,
+        other_out = cluster.cli_as_user(
+            "root",
+            [
+                "scontrol",
+                "create-reservation",
+                f"--name={other_name}",
+                "--start-time=now",
+                "--duration=60",
+                f"--nodes={other_node}",
+                *overlap_flags,
+            ],
         )
+        assert "created" in other_out.lower()
 
         filtered = cluster.scontrol("show", "reservation", res_name)
         assert res_name in filtered
@@ -57,9 +66,11 @@ class TestReservations:
         assert code != 0
         assert "not found" in out.lower()
 
-        cluster.scontrol("delete-reservation", other_name)
+        cluster.cli_as_user("root", ["scontrol", "delete-reservation", other_name])
 
-        delete_out = cluster.scontrol("delete-reservation", res_name)
+        delete_out = cluster.cli_as_user(
+            "root", ["scontrol", "delete-reservation", res_name]
+        )
         assert "deleted" in delete_out.lower()
 
         show_after = cluster.scontrol("show", "reservation")
@@ -68,14 +79,19 @@ class TestReservations:
     def test_unauthorized_job_blocked_on_reserved_node(self, cluster):
         res_name = f"res-block-{int(time.time())}"
         node = cluster.node_names[0]
-        cluster.scontrol(
-            "create-reservation",
-            f"--name={res_name}",
-            "--start-time=now",
-            "--duration=30",
-            f"--nodes={node}",
-            "--users=resuser",
+        create_out = cluster.cli_as_user(
+            "root",
+            [
+                "scontrol",
+                "create-reservation",
+                f"--name={res_name}",
+                "--start-time=now",
+                "--duration=30",
+                f"--nodes={node}",
+                "--users=resuser",
+            ],
         )
+        assert "created" in create_out.lower()
 
         script = cluster.write_file("res-block.sh", "#!/bin/bash\nsleep 120\n")
         sb = cluster.sbatch(["-N", "1", "-w", node, "-t", "1", script])
@@ -88,14 +104,19 @@ class TestReservations:
         res_name = f"res-auth-{int(time.time())}"
         node = cluster.node_names[0]
         submit_user = cluster.nodes[0].user
-        cluster.scontrol(
-            "create-reservation",
-            f"--name={res_name}",
-            "--start-time=now",
-            "--duration=30",
-            f"--nodes={node}",
-            f"--users={submit_user}",
+        create_out = cluster.cli_as_user(
+            "root",
+            [
+                "scontrol",
+                "create-reservation",
+                f"--name={res_name}",
+                "--start-time=now",
+                "--duration=30",
+                f"--nodes={node}",
+                f"--users={submit_user}",
+            ],
         )
+        assert "created" in create_out.lower()
 
         script = cluster.write_file("res-auth.sh", "#!/bin/bash\necho RES_OK\n")
         out_path = f"{cluster.remote_dir}/res-auth.out"
@@ -125,14 +146,19 @@ class TestReservations:
     def test_hold_on_delete_and_release(self, cluster):
         res_name = f"res-hold-{int(time.time())}"
         node = cluster.node_names[0]
-        cluster.scontrol(
-            "create-reservation",
-            f"--name={res_name}",
-            "--start-time=now",
-            "--duration=60",
-            f"--nodes={node}",
-            "--users=testuser",
+        create_out = cluster.cli_as_user(
+            "root",
+            [
+                "scontrol",
+                "create-reservation",
+                f"--name={res_name}",
+                "--start-time=now",
+                "--duration=60",
+                f"--nodes={node}",
+                "--users=testuser",
+            ],
         )
+        assert "created" in create_out.lower()
 
         script = cluster.write_file("res-hold.sh", "#!/bin/bash\necho HOLD_RELEASE_OK\n")
         out_path = f"{cluster.remote_dir}/res-hold.out"
@@ -154,7 +180,7 @@ class TestReservations:
         assert job_id is not None
         wait_job_state(cluster, job_id, "PD", timeout=30)
 
-        cluster.scontrol("delete-reservation", res_name)
+        cluster.cli_as_user("root", ["scontrol", "delete-reservation", res_name])
 
         wait_job_state(cluster, job_id, "PD", timeout=30)
         held = cluster.squeue(["-j", str(job_id), "-o", "%t %r"])
@@ -171,15 +197,20 @@ class TestReservations:
     def test_no_hold_jobs_delete(self, cluster):
         res_name = f"res-nohold-{int(time.time())}"
         node = cluster.node_names[0]
-        cluster.scontrol(
-            "create-reservation",
-            f"--name={res_name}",
-            "--start-time=now",
-            "--duration=60",
-            f"--nodes={node}",
-            "--users=testuser",
-            "--flags=no_hold_jobs",
+        create_out = cluster.cli_as_user(
+            "root",
+            [
+                "scontrol",
+                "create-reservation",
+                f"--name={res_name}",
+                "--start-time=now",
+                "--duration=60",
+                f"--nodes={node}",
+                "--users=testuser",
+                "--flags=no_hold_jobs",
+            ],
         )
+        assert "created" in create_out.lower()
 
         script = cluster.write_file("res-nohold.sh", "#!/bin/bash\nsleep 120\n")
         sb = cluster.sbatch(
@@ -198,7 +229,7 @@ class TestReservations:
         assert job_id is not None
         wait_job_state(cluster, job_id, "PD", timeout=30)
 
-        cluster.scontrol("delete-reservation", res_name)
+        cluster.cli_as_user("root", ["scontrol", "delete-reservation", res_name])
 
         wait_job_state(cluster, job_id, "PD", timeout=30)
         show = cluster.squeue(["-j", str(job_id), "-o", "%t %r %v"])
@@ -216,7 +247,8 @@ class TestReservations:
         wait_job_state(cluster, job_id, "R", timeout=30)
 
         res_name = f"res-busy-{int(time.time())}"
-        out = cluster.cli_allow_fail(
+        out = cluster.cli_as_user(
+            "root",
             [
                 "scontrol",
                 "create-reservation",
@@ -224,10 +256,107 @@ class TestReservations:
                 "--start-time=now",
                 "--duration=10",
                 f"--nodes={node}",
-            ]
+            ],
         )
         msg = out.lower()
         assert "busy" in msg or "until after reservation start" in msg, f"unexpected: {out}"
+
+    def test_reservation_management_requires_privileged_user(self, cluster):
+        """Reservation create/update/delete via the CLI is restricted to root or
+        sudo/wheel members. Uses the always-present unprivileged 'nobody'
+        account, so no user provisioning is needed."""
+        # Probe as `nobody` (show is unguarded): confirms sudo -u and binary exec
+        # work for that account; skip rather than fail if not.
+        probe = cluster.cli_as_user("nobody", ["scontrol", "show", "reservation"])
+        low = probe.lower()
+        if (
+            "sudo" in low and ("password" in low or "not allowed" in low)
+        ) or "permission denied" in low:
+            pytest.skip(f"cannot run CLI as 'nobody' in this environment: {probe.strip()}")
+
+        res_name = f"res-priv-{int(time.time())}"
+        node = cluster.node_names[0]
+
+        denied_msg = "requires root or membership"
+
+        # The read path must stay open to everyone (not accidentally gated).
+        assert denied_msg not in low, f"show reservation should be readable by all: {probe}"
+
+        # Unprivileged create is denied (explicit subcommand).
+        create_denied = cluster.cli_as_user(
+            "nobody",
+            [
+                "scontrol",
+                "create-reservation",
+                f"--name={res_name}",
+                "--start-time=now",
+                "--duration=60",
+                f"--nodes={node}",
+            ],
+        )
+        assert denied_msg in create_denied.lower(), f"unexpected: {create_denied}"
+        assert res_name not in cluster.scontrol("show", "reservation")
+
+        # Unprivileged create is denied via the Slurm-inline syntax too.
+        inline_denied = cluster.cli_as_user(
+            "nobody",
+            [
+                "scontrol",
+                "create",
+                f"ReservationName={res_name}",
+                "StartTime=now",
+                "Duration=60",
+                f"Nodes={node}",
+            ],
+        )
+        assert denied_msg in inline_denied.lower(), f"unexpected: {inline_denied}"
+        assert res_name not in cluster.scontrol("show", "reservation")
+
+        try:
+            # Privileged (root) create succeeds.
+            create_ok = cluster.cli_as_user(
+                "root",
+                [
+                    "scontrol",
+                    "create-reservation",
+                    f"--name={res_name}",
+                    "--start-time=now",
+                    "--duration=60",
+                    f"--nodes={node}",
+                ],
+            )
+            assert "created" in create_ok.lower(), f"create failed: {create_ok}"
+            assert res_name in cluster.scontrol("show", "reservation")
+
+            # Unprivileged update and delete are denied.
+            upd_denied = cluster.cli_as_user(
+                "nobody",
+                ["scontrol", "update-reservation", f"--name={res_name}", "--duration=120"],
+            )
+            assert denied_msg in upd_denied.lower(), f"unexpected: {upd_denied}"
+
+            del_denied = cluster.cli_as_user(
+                "nobody", ["scontrol", "delete-reservation", res_name]
+            )
+            assert denied_msg in del_denied.lower(), f"unexpected: {del_denied}"
+            assert res_name in cluster.scontrol("show", "reservation")
+
+            # Unprivileged delete via the Slurm-inline syntax is denied too.
+            inline_del_denied = cluster.cli_as_user(
+                "nobody", ["scontrol", "delete", f"ReservationName={res_name}"]
+            )
+            assert denied_msg in inline_del_denied.lower(), f"unexpected: {inline_del_denied}"
+            assert res_name in cluster.scontrol("show", "reservation")
+
+            # Privileged (root) delete succeeds.
+            del_ok = cluster.cli_as_user(
+                "root", ["scontrol", "delete-reservation", res_name]
+            )
+            assert "deleted" in del_ok.lower(), f"privileged delete failed: {del_ok}"
+            assert res_name not in cluster.scontrol("show", "reservation")
+        finally:
+            # A leaked reservation fences a node for an hour; best-effort cleanup.
+            cluster.cli_as_user("root", ["scontrol", "delete-reservation", res_name])
 
     def test_non_owner_cannot_delete_or_update_reservation(self, cluster):
         """A reservation is owned by its creator; a different user must not be
@@ -244,6 +373,10 @@ class TestReservations:
             "password" in probe.lower() or "not allowed" in probe.lower()
         ):
             pytest.skip(f"sudo -u unavailable in this environment: {probe.strip()}")
+
+        # A non-owner is denied by the server ownership check or, if unprivileged,
+        # by the client gate first. Accept both so this never silently skips.
+        denied = ("cannot delete", "cannot modify", "permission", "requires root or membership")
 
         res_name = f"res-owner-{int(time.time())}"
         node = cluster.node_names[0]
@@ -272,7 +405,7 @@ class TestReservations:
             submit_user, ["scontrol", "delete-reservation", res_name]
         )
         assert "deleted" not in del_denied.lower(), f"unexpected delete: {del_denied}"
-        assert "cannot delete" in del_denied.lower() or "permission" in del_denied.lower()
+        assert any(m in del_denied.lower() for m in denied), f"unexpected: {del_denied}"
         assert res_name in cluster.scontrol("show", "reservation")
 
         # Non-owner update must be rejected too.
@@ -280,7 +413,7 @@ class TestReservations:
             submit_user,
             ["scontrol", "update-reservation", f"--name={res_name}", "--duration=120"],
         )
-        assert "cannot modify" in upd_denied.lower() or "permission" in upd_denied.lower()
+        assert any(m in upd_denied.lower() for m in denied), f"unexpected: {upd_denied}"
         assert res_name in cluster.scontrol("show", "reservation")
 
         # Owner (root) can still delete.
