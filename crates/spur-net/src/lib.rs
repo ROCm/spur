@@ -4,6 +4,7 @@
 pub mod address;
 pub mod comm_addr;
 pub mod detect;
+pub mod image_layer;
 pub mod mesh;
 pub mod oci;
 pub mod wireguard;
