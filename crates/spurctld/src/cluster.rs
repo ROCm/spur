@@ -6094,6 +6094,12 @@ mod tests {
         // allocation is no longer running) rather than reaped.
         cm.record_job_keepalive_at(1, t0);
         assert!(cm.interactive_reap_candidates(&[], t0, 0).is_empty());
+        // The prune actually happened: job 1's timer is gone, not just skipped
+        // by the disabled early return.
+        assert!(
+            cm.interactive_last_seen.read().is_empty(),
+            "pruning must drop entries for allocations no longer running"
+        );
 
         // Because the old entry was pruned, job 1 reappearing reseeds to `now`
         // and is not immediately reaped despite the original stale timestamp.

@@ -624,12 +624,25 @@ impl SlurmController for ControllerService {
         }
 
         let req = request.into_inner();
+        // A real keepalive always carries the caller's username. Reject an empty
+        // one explicitly: `check_job_owner` treats empty as authorized, which
+        // would let anyone hold any allocation open forever.
+        if req.user.is_empty() {
+            return Err(Status::permission_denied(
+                "keepalive requires a user".to_string(),
+            ));
+        }
         let job = self
             .cluster
             .get_job(req.job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", req.job_id)))?;
         spur_core::auth::check_job_owner(&req.user, &job.spec.user, "send keepalive for")
             .map_err(|e| Status::permission_denied(e.to_string()))?;
+
+        // Only interactive allocations are reaped, so only they need tracking.
+        if !(job.spec.interactive || job.spec.srun_job) {
+            return Ok(Response::new(JobKeepaliveResponse {}));
+        }
 
         self.cluster.record_job_keepalive(req.job_id);
         Ok(Response::new(JobKeepaliveResponse {}))
@@ -4026,6 +4039,56 @@ mod tests {
             }))
             .await
             .expect_err("empty-owner jobs run as root; non-root must be denied");
+
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_keepalive_rejects_unknown_job() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let err = svc
+            .job_keepalive(Request::new(JobKeepaliveRequest {
+                job_id: 999_999,
+                user: "ubuntu".into(),
+            }))
+            .await
+            .expect_err("keepalive for a nonexistent job must fail");
+
+        assert_eq!(err.code(), Code::NotFound);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_keepalive_denies_non_owner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let err = svc
+            .job_keepalive(Request::new(JobKeepaliveRequest {
+                job_id,
+                user: "rsikande".into(),
+            }))
+            .await
+            .expect_err("a non-owner must not keep another user's allocation alive");
+
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_keepalive_rejects_empty_user() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let err = svc
+            .job_keepalive(Request::new(JobKeepaliveRequest {
+                job_id,
+                user: String::new(),
+            }))
+            .await
+            .expect_err("an empty user must be rejected, not treated as authorized");
 
         assert_eq!(err.code(), Code::PermissionDenied);
     }

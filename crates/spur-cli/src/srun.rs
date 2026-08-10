@@ -10,8 +10,7 @@ use spur_core::config::HooksConfig;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
     CancelJobRequest, CompleteJobRequest, CreateJobStepRequest, GetJobRequest, GetNodeRequest,
-    JobKeepaliveRequest, JobSpec, JobState, RunStepRequest, StreamJobOutputRequest,
-    SubmitJobRequest,
+    JobSpec, JobState, RunStepRequest, StreamJobOutputRequest, SubmitJobRequest,
 };
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -628,32 +627,6 @@ fn install_ctrl_c_cancel(
     })
 }
 
-/// How often srun pings the controller to keep its allocation attended. A
-/// blocking `srun <cmd>` sends no other traffic for the command's duration, so
-/// without this the InactiveLimit reaper would reclaim a live allocation.
-const KEEPALIVE_INTERVAL_SECS: u64 = 30;
-
-fn install_keepalive(
-    client: SlurmControllerClient<tonic::transport::Channel>,
-    job_id: u32,
-    user: String,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut client = client;
-        let mut tick =
-            tokio::time::interval(tokio::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
-        loop {
-            tick.tick().await;
-            let _ = client
-                .job_keepalive(JobKeepaliveRequest {
-                    job_id,
-                    user: user.clone(),
-                })
-                .await;
-        }
-    })
-}
-
 async fn wait_for_job_running(
     client: &mut SlurmControllerClient<tonic::transport::Channel>,
     job_id: u32,
@@ -879,7 +852,9 @@ async fn run_standalone_srun(
     eprintln!("srun: Pending job allocation {}...", job_id);
 
     let ctrl_c_handle = install_ctrl_c_cancel(client.clone(), job_id, user.clone());
-    let keepalive = install_keepalive(client.clone(), job_id, user.clone());
+    // Guard drops (and stops pinging) on every return path, including `?`.
+    let _keepalive =
+        crate::interactive::spawn_keepalive(client.clone(), job_id, user.clone(), "srun");
 
     let nodelist = wait_for_job_running(&mut client, job_id).await?;
     if !nodelist.is_empty() {
@@ -959,7 +934,6 @@ async fn run_standalone_srun(
     )
     .await;
 
-    keepalive.abort();
     Ok(())
 }
 

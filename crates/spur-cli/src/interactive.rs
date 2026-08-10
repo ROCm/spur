@@ -3,10 +3,67 @@
 
 use anyhow::{Context, Result};
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
-use spur_proto::proto::{interactive_input, interactive_output, InitSession, InteractiveInput};
+use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
+use spur_proto::proto::{
+    interactive_input, interactive_output, InitSession, InteractiveInput, JobKeepaliveRequest,
+};
 use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal::unix::{signal, SignalKind};
+
+/// Keeps an interactive allocation attended by pinging the controller on a
+/// fixed interval, and stops the pings when dropped. Aborting on `Drop` means
+/// an early `?` return on the caller's path can't leak the task.
+pub struct KeepaliveGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for KeepaliveGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Spawn the keepalive loop for `job_id`. `tool` prefixes the warning printed
+/// when a ping fails (e.g. "salloc", "srun"). A blocking client sends no other
+/// traffic, so without these pings the controller's InactiveLimit reaper would
+/// reclaim a live allocation.
+pub fn spawn_keepalive(
+    client: SlurmControllerClient<tonic::transport::Channel>,
+    job_id: u32,
+    user: String,
+    tool: &'static str,
+) -> KeepaliveGuard {
+    let handle = tokio::spawn(async move {
+        let mut client = client;
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(
+            spur_core::config::KEEPALIVE_INTERVAL_SECS,
+        ));
+        // Warn once per failure streak: a persistent failure stays visible
+        // without printing a line every interval.
+        let mut warned = false;
+        loop {
+            tick.tick().await;
+            match client
+                .job_keepalive(JobKeepaliveRequest {
+                    job_id,
+                    user: user.clone(),
+                })
+                .await
+            {
+                Ok(_) => warned = false,
+                Err(e) if !warned => {
+                    eprintln!(
+                        "{tool}: warning: keepalive to controller failed ({}); \
+                         allocation may be reaped if this persists",
+                        e.message()
+                    );
+                    warned = true;
+                }
+                Err(_) => {}
+            }
+        }
+    });
+    KeepaliveGuard(handle)
+}
 
 /// Connect to a spurd agent, applying the standard gRPC size limits.
 pub async fn connect_agent(addr: &str) -> Result<SlurmAgentClient<tonic::transport::Channel>> {

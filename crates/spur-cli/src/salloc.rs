@@ -5,14 +5,8 @@ use crate::env_defaults::{apply_csv, apply_flag, apply_str, apply_string};
 use anyhow::{Context, Result};
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use spur_core::spur_env::SpurEnv;
-use spur_proto::proto::{
-    CancelJobRequest, GetJobRequest, JobKeepaliveRequest, JobSpec, SubmitJobRequest,
-};
+use spur_proto::proto::{CancelJobRequest, GetJobRequest, JobSpec, SubmitJobRequest};
 use std::collections::HashMap;
-
-/// How often an interactive client pings the controller to keep its allocation
-/// attended. Must stay well below any configured `inactive_limit_secs`.
-const KEEPALIVE_INTERVAL_SECS: u64 = 30;
 
 /// Allocate resources for an interactive job.
 #[derive(Parser, Debug)]
@@ -238,24 +232,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     // Keep the allocation attended while the shell is open: absence of these
     // pings past the controller's InactiveLimit is what lets it reap an
-    // abandoned allocation.
-    let keepalive = {
-        let mut client = client.clone();
-        let user = user.clone();
-        tokio::spawn(async move {
-            let mut tick =
-                tokio::time::interval(tokio::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
-            loop {
-                tick.tick().await;
-                let _ = client
-                    .job_keepalive(JobKeepaliveRequest {
-                        job_id,
-                        user: user.clone(),
-                    })
-                    .await;
-            }
-        })
-    };
+    // abandoned allocation. The guard stops the pings on drop.
+    let _keepalive =
+        crate::interactive::spawn_keepalive(client.clone(), job_id, user.clone(), "salloc");
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let mut cmd = tokio::process::Command::new(&shell);
@@ -270,7 +249,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .await
         .context("failed to spawn shell")?;
 
-    keepalive.abort();
+    drop(_keepalive);
 
     // Shell exited — cancel allocation
     eprintln!("salloc: Relinquishing job allocation {}", job_id);
