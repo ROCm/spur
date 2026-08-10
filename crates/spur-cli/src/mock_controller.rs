@@ -8,8 +8,8 @@
 //! ephemeral localhost port, serve a hand-written service on it, and hand the
 //! caller back the address plus a shared record of what the server observed.
 //! Only a handful of RPCs are implemented (`CreateJobStep`, `RunStep`,
-//! `UpdateNode`); every other RPC reports `unimplemented` so an unexpected call
-//! fails loudly instead of silently returning a default.
+//! `GetNodes`, `UpdateNode`); every other RPC reports `unimplemented` so an
+//! unexpected call fails loudly instead of silently returning a default.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -33,6 +33,7 @@ pub(crate) struct StepCapture {
     create_step_num_tasks: Arc<AtomicU32>,
     run_step_step_id: Arc<AtomicU32>,
     run_step_calls: Arc<AtomicU32>,
+    get_node_names: Arc<Mutex<Vec<String>>>,
     update_node_names: Arc<Mutex<Vec<String>>>,
     /// Node names that `update_node` should reject with `NotFound`.
     update_node_fail_names: Arc<Mutex<HashSet<String>>>,
@@ -52,6 +53,10 @@ impl StepCapture {
     /// Number of `RunStep` calls, so tests can assert dispatch stopped early.
     pub(crate) fn run_step_calls(&self) -> u32 {
         self.run_step_calls.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_get_node_names(&self, names: Vec<String>) {
+        *self.get_node_names.lock().unwrap() = names;
     }
 
     pub(crate) fn update_node_names(&self) -> Vec<String> {
@@ -133,6 +138,24 @@ mock_controller_impl! {
             }
             Ok(tonic::Response::new(()))
         }
+
+        async fn get_nodes(
+            &self,
+            _request: tonic::Request<proto::GetNodesRequest>,
+        ) -> Result<tonic::Response<proto::GetNodesResponse>, tonic::Status> {
+            let nodes = self
+                .capture
+                .get_node_names
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|name| proto::NodeInfo {
+                    name: name.clone(),
+                    ..Default::default()
+                })
+                .collect();
+            Ok(tonic::Response::new(proto::GetNodesResponse { nodes }))
+        }
     }
     unimplemented {
         submit_job(proto::SubmitJobRequest) -> proto::SubmitJobResponse;
@@ -145,7 +168,6 @@ mock_controller_impl! {
         resume_job(proto::ResumeJobRequest) -> ();
         update_job(proto::UpdateJobRequest) -> ();
         requeue_job(proto::RequeueJobRequest) -> proto::RequeueJobResponse;
-        get_nodes(proto::GetNodesRequest) -> proto::GetNodesResponse;
         get_node(proto::GetNodeRequest) -> proto::NodeInfo;
         drain_node(proto::DrainNodeRequest) -> proto::DrainNodeResponse;
         deregister_node(proto::DeregisterNodeRequest) -> proto::DeregisterNodeResponse;

@@ -3,6 +3,7 @@
 
 //! `spur node` subcommands for node lifecycle management.
 
+use crate::scontrol::{is_all_node_pattern, resolve_node_names};
 use std::collections::HashMap;
 
 use anyhow::{bail, Context, Result};
@@ -34,7 +35,7 @@ pub enum NodeCommand {
     /// Labels are key=value pairs used for partition routing.
     /// Append a trailing dash to remove a label (e.g., "pool-").
     Label {
-        /// Node names: comma-separated list and/or hostlist range (e.g. "n1,n2", "n[1-4]")
+        /// Node names: ALL, a comma-separated list, and/or a hostlist range (e.g. "n1,n2", "n[1-4]")
         node: String,
         /// Labels to set (key=value) or remove (key-)
         #[arg(required = true)]
@@ -42,15 +43,18 @@ pub enum NodeCommand {
     },
     /// Drain one or more nodes: stop scheduling new jobs while existing jobs finish.
     Drain {
-        /// Node names: comma-separated list and/or hostlist range (e.g. "n1,n2", "n[1-4]")
+        /// Node names: ALL, a comma-separated list, and/or a hostlist range (e.g. "n1,n2", "n[1-4]")
         node: String,
         /// Reason for draining
         #[arg(long)]
         reason: Option<String>,
     },
     /// Remove one or more nodes from the cluster entirely.
+    ///
+    /// ALL removes every registered node, and with --force this evicts jobs from
+    /// every node.
     Remove {
-        /// Node names: comma-separated list and/or hostlist range (e.g. "n1,n2", "n[1-4]")
+        /// Node names: ALL, a comma-separated list, and/or a hostlist range (e.g. "n1,n2", "n[1-4]")
         node: String,
         /// Force removal even if jobs are running (jobs will be failed with NODE_FAIL)
         #[arg(long)]
@@ -106,6 +110,11 @@ async fn cmd_label(controller: &str, node_pattern: String, label_args: Vec<Strin
     let (set_labels, remove_labels) = parse_label_args(&label_args)?;
     let nodes = expand_node_pattern(&node_pattern)?;
     let mut client = spur_proto::controller_client(crate::authclient::connect(controller).await?);
+    let nodes = if let Some(nodes) = nodes {
+        nodes
+    } else {
+        resolve_node_names(&mut client, &node_pattern).await?
+    };
 
     let mut failed: Vec<String> = Vec::new();
     for node in &nodes {
@@ -148,6 +157,11 @@ async fn cmd_label(controller: &str, node_pattern: String, label_args: Vec<Strin
 async fn cmd_drain(controller: &str, node_pattern: String, reason: Option<String>) -> Result<()> {
     let nodes = expand_node_pattern(&node_pattern)?;
     let mut client = spur_proto::controller_client(crate::authclient::connect(controller).await?);
+    let nodes = if let Some(nodes) = nodes {
+        nodes
+    } else {
+        resolve_node_names(&mut client, &node_pattern).await?
+    };
 
     let mut failed: Vec<String> = Vec::new();
     for node in &nodes {
@@ -198,6 +212,11 @@ async fn cmd_remove(
 ) -> Result<()> {
     let nodes = expand_node_pattern(&node_pattern)?;
     let mut client = spur_proto::controller_client(crate::authclient::connect(controller).await?);
+    let nodes = if let Some(nodes) = nodes {
+        nodes
+    } else {
+        resolve_node_names(&mut client, &node_pattern).await?
+    };
 
     let mut failed: Vec<String> = Vec::new();
     for node in &nodes {
@@ -245,8 +264,13 @@ async fn cmd_remove(
     Ok(())
 }
 
-fn expand_node_pattern(pattern: &str) -> Result<Vec<String>> {
-    spur_core::hostlist::expand(pattern).context("invalid node name pattern")
+fn expand_node_pattern(pattern: &str) -> Result<Option<Vec<String>>> {
+    if is_all_node_pattern(pattern) {
+        return Ok(None);
+    }
+    spur_core::hostlist::expand(pattern)
+        .map(Some)
+        .context("invalid node name pattern")
 }
 
 #[cfg(test)]
@@ -302,5 +326,78 @@ mod tests {
         let (set, remove) = parse_label_args(&args).unwrap();
         assert_eq!(set.get("env").unwrap(), "prod-");
         assert!(remove.is_empty());
+    }
+
+    #[tokio::test]
+    async fn label_all_resolves_registered_nodes_case_insensitively() {
+        for pattern in ["ALL", "all", "All"] {
+            let (addr, capture) = crate::mock_controller::spawn().await;
+            capture.set_get_node_names(vec!["n1".into(), "n2".into()]);
+
+            main_with_args(vec![
+                "node".into(),
+                "--controller".into(),
+                format!("http://{addr}"),
+                "label".into(),
+                pattern.into(),
+                "pool=gpu".into(),
+            ])
+            .await
+            .unwrap();
+
+            assert_eq!(capture.update_node_names(), vec!["n1", "n2"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn label_all_rejects_an_empty_cluster() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let err = main_with_args(vec![
+            "node".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "label".into(),
+            "ALL".into(),
+            "pool=gpu".into(),
+        ])
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("no nodes registered"));
+        assert!(capture.update_node_names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn label_hostlist_does_not_query_all_nodes() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        main_with_args(vec![
+            "node".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "label".into(),
+            "node[1-2]".into(),
+            "pool=gpu".into(),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(capture.update_node_names(), vec!["node1", "node2"]);
+    }
+
+    #[tokio::test]
+    async fn invalid_hostlist_is_rejected_before_connecting() {
+        let addr = crate::mock_controller::unreachable_addr().await;
+        let err = main_with_args(vec![
+            "node".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "label".into(),
+            "node[".into(),
+            "pool=gpu".into(),
+        ])
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("invalid node name pattern"));
     }
 }
