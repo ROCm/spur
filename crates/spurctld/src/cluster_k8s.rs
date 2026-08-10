@@ -102,7 +102,15 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>, net: Clust
         }
         last_mesh = mesh.nodes.clone();
 
-        reconcile_phase(&cluster, &net, &state, &mut join_tokens, timed_out).await;
+        let started = Instant::now();
+        let errored = reconcile_phase(&cluster, &net, &state, &mut join_tokens, timed_out).await;
+        let cluster_name = cluster.config().cluster_name.clone();
+        cluster
+            .k8s_metrics()
+            .observe_reconcile_duration(&cluster_name, started.elapsed().as_secs_f64());
+        if errored {
+            cluster.k8s_metrics().record_reconcile_error(&cluster_name);
+        }
     }
 }
 
@@ -136,12 +144,12 @@ pub(crate) async fn reconcile_phase(
     state: &K0sClusterState,
     join_tokens: &mut HashMap<String, String>,
     timed_out: bool,
-) {
+) -> bool {
     match state.phase {
         K0sPhase::Ready | K0sPhase::Provisioning => {
             if let Err(e) = provision_assignments(cluster, net, state) {
                 warn!(error = %e, "k0s provisioning assignment failed; will retry next tick");
-                return;
+                return true;
             }
             converge_provisioning(cluster, net, join_tokens).await;
             // converge may have flipped us to Ready this tick; only degrade a still-provisioning
@@ -149,9 +157,16 @@ pub(crate) async fn reconcile_phase(
             if timed_out && cluster.k0s_state().phase == K0sPhase::Provisioning {
                 degrade_stuck_cluster(cluster, net, join_tokens).await;
             }
+            false
         }
-        K0sPhase::Down => stop_all_components(cluster, state.reset_requested).await,
-        K0sPhase::Degraded => warn!("k0s cluster degraded"),
+        K0sPhase::Down => {
+            stop_all_components(cluster, state.reset_requested).await;
+            false
+        }
+        K0sPhase::Degraded => {
+            warn!("k0s cluster degraded");
+            false
+        }
     }
 }
 

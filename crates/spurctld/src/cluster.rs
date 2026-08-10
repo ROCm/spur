@@ -334,6 +334,8 @@ pub struct ClusterManager {
     tokens: RwLock<HashMap<String, spur_core::admission::AdmissionToken>>,
     /// Native k0s cluster state (phase, control-plane node, join-token metadata).
     k0s: RwLock<spur_core::k0s::K0sClusterState>,
+    /// Long-lived k0s lifecycle/node metric accumulator exported at `/metrics/k8s`.
+    k8s_metrics: Arc<spur_metrics::K8sMetrics>,
     raft: RwLock<Option<SpurRaft>>,
     accounting: RwLock<Option<AccountingNotifier>>,
     fairshare_cache: Arc<FairshareCache>,
@@ -394,6 +396,7 @@ impl ClusterManager {
             burst_buffer_total_gb: RwLock::new(burst_buffer_total_gb),
             tokens: RwLock::new(HashMap::new()),
             k0s: RwLock::new(spur_core::k0s::K0sClusterState::default()),
+            k8s_metrics: Arc::new(spur_metrics::K8sMetrics::new()),
             raft: RwLock::new(None),
             accounting: RwLock::new(None),
             fairshare_cache,
@@ -2176,6 +2179,8 @@ impl ClusterManager {
         member_nodes: Vec<String>,
         reset_requested: bool,
     ) -> anyhow::Result<()> {
+        use spur_core::k0s::K0sPhase;
+        let from = self.k0s.read().phase;
         self.propose(WalOperation::K0sSetPhase {
             phase,
             control_plane_node,
@@ -2183,6 +2188,17 @@ impl ClusterManager {
             member_nodes,
             reset_requested,
         })?;
+        if from != phase {
+            let cluster = self.config().cluster_name.clone();
+            self.k8s_metrics
+                .record_phase_transition(&cluster, from, phase);
+            if phase == K0sPhase::Provisioning && from != K0sPhase::Provisioning {
+                self.k8s_metrics.record_provision_attempt(&cluster);
+            }
+            if phase == K0sPhase::Degraded {
+                self.k8s_metrics.record_provision_failure(&cluster);
+            }
+        }
         info!(?phase, "k0s cluster phase set");
         Ok(())
     }
@@ -2190,6 +2206,29 @@ impl ClusterManager {
     /// snapshot of the current cluster-wide k0s state.
     pub fn k0s_state(&self) -> spur_core::k0s::K0sClusterState {
         self.k0s.read().clone()
+    }
+
+    /// The long-lived k0s lifecycle/node metric accumulator.
+    pub fn k8s_metrics(&self) -> Arc<spur_metrics::K8sMetrics> {
+        self.k8s_metrics.clone()
+    }
+
+    /// Current k0s cluster gauges, rebuilt from live state on each scrape.
+    pub fn k8s_cluster_metrics(&self) -> spur_metrics::K8sClusterMetricsSnapshot {
+        let config = self.config();
+        let phase = self.k0s.read().phase;
+        let roles = self
+            .nodes
+            .read()
+            .values()
+            .map(|n| n.k0s_role)
+            .collect::<Vec<_>>();
+        spur_metrics::K8sClusterMetricsSnapshot::collect(
+            config.cluster_name.clone(),
+            u64::from(config.cluster.control_plane_replicas),
+            phase,
+            roles,
+        )
     }
 
     /// Reconcile node liveness state with heartbeat data.

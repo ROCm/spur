@@ -22,8 +22,9 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use tokio::process::Command;
@@ -277,6 +278,18 @@ impl ClusterSupervisor {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
+    /// systemd `NRestarts` for the unit (cumulative auto-restarts); 0 when unknown/unavailable.
+    async fn unit_restart_count(&self) -> u64 {
+        let unit = self.unit_file_name();
+        Command::new("systemctl")
+            .args(["show", &unit, "-p", "NRestarts", "--value"])
+            .output()
+            .await
+            .ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+            .unwrap_or(0)
+    }
+
     fn role(&self) -> ClusterRole {
         self.cfg.role
     }
@@ -505,6 +518,58 @@ async fn remove_cdi_spec() {
     let _ = tokio::fs::remove_file(CDI_SPEC_PATH).await;
 }
 
+/// k0s node status this agent surfaces to the controller on each heartbeat, for `spur_k8s_node_*`
+/// metrics. `install_secs` is one-shot: `take_install_secs` returns it once after an install, then
+/// clears it, so the controller observes each install duration exactly once.
+#[derive(Debug, Default)]
+pub struct K0sNodeState {
+    unit_active: AtomicBool,
+    restart_count: AtomicU64,
+    /// Milliseconds; `u64::MAX` sentinel means "nothing to report".
+    install_ms: AtomicU64,
+}
+
+impl K0sNodeState {
+    const NO_INSTALL: u64 = u64::MAX;
+
+    pub fn new() -> Self {
+        Self {
+            unit_active: AtomicBool::new(false),
+            restart_count: AtomicU64::new(0),
+            install_ms: AtomicU64::new(Self::NO_INSTALL),
+        }
+    }
+
+    fn set_unit_active(&self, active: bool) {
+        self.unit_active.store(active, Ordering::Relaxed);
+    }
+
+    fn set_restart_count(&self, count: u64) {
+        self.restart_count.store(count, Ordering::Relaxed);
+    }
+
+    fn record_install(&self, dur: Duration) {
+        self.install_ms
+            .store(dur.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Current unit-active + cumulative restarts, plus any pending one-shot install duration in
+    /// seconds (0.0 once already drained). Called by the reporter per heartbeat.
+    pub fn take_for_heartbeat(&self) -> (bool, u64, f64) {
+        let install_ms = self.install_ms.swap(Self::NO_INSTALL, Ordering::Relaxed);
+        let install_secs = if install_ms == Self::NO_INSTALL {
+            0.0
+        } else {
+            install_ms as f64 / 1000.0
+        };
+        (
+            self.unit_active.load(Ordering::Relaxed),
+            self.restart_count.load(Ordering::Relaxed),
+            install_secs,
+        )
+    }
+}
+
 /// RPC-driven owner of this node's k0s component. The spurctld controller
 /// (`cluster_k8s`) drives it via the SlurmAgent Start/Stop/GetClusterComponentStatus RPCs. It
 /// holds the currently-desired `ClusterSupervisor` and heals its unit from a background loop.
@@ -522,6 +587,7 @@ pub struct K0sAgent {
     /// systemd/k0s — the documented contract for the flag ([`ClusterConfig::enabled`]).
     enabled: bool,
     active: Mutex<Option<ClusterSupervisor>>,
+    status: Arc<K0sNodeState>,
 }
 
 impl K0sAgent {
@@ -536,7 +602,13 @@ impl K0sAgent {
             local_path_dir: cfg.local_path_dir.clone(),
             enabled: cfg.enabled,
             active: Mutex::new(None),
+            status: Arc::new(K0sNodeState::new()),
         }
+    }
+
+    /// Shared node-status handle the reporter reads for `spur_k8s_node_*` heartbeat fields.
+    pub fn node_state(&self) -> Arc<K0sNodeState> {
+        self.status.clone()
     }
 
     /// Re-adopt an already-running spurd-owned k0s unit at startup. A spurd restart leaves the k0s
@@ -604,12 +676,16 @@ impl K0sAgent {
         // Make a fresh bare-metal node self-contained: install the pinned/configured k0s if the
         // binary is missing. No-op (no network) when it is already present. A failure here is fatal
         // to start — the systemd unit's ConditionFileIsExecutable would otherwise silently skip.
+        let install_started = Instant::now();
         match spur_update::k0s::ensure_k0s(&self.k0s_version, &self.k0s_binary).await {
-            Ok(Some(info)) => info!(
-                version = %info.version,
-                path = %info.path.display(),
-                "installed k0s"
-            ),
+            Ok(Some(info)) => {
+                self.status.record_install(install_started.elapsed());
+                info!(
+                    version = %info.version,
+                    path = %info.path.display(),
+                    "installed k0s"
+                );
+            }
             Ok(None) => {}
             Err(e) => anyhow::bail!(
                 "k0s not present at {} and auto-install (version {}) failed: {e}",
@@ -663,6 +739,9 @@ impl K0sAgent {
         let sup = ClusterSupervisor::new(cfg);
         sup.reconcile_once().await?;
         let state = sup.component_state().await;
+        self.status.set_unit_active(state == "active");
+        self.status
+            .set_restart_count(sup.unit_restart_count().await);
         *self.active.lock().await = Some(sup);
         info!(role = role.as_str(), state = %state, "k0s component started");
         Ok(state)
@@ -882,6 +961,10 @@ impl K0sAgent {
                 if let Err(e) = sup.reconcile_once().await {
                     warn!(error = %e, "k0s component reconcile failed");
                 }
+                self.status
+                    .set_unit_active(sup.unit_status_is(&["is-active"], "active").await);
+                self.status
+                    .set_restart_count(sup.unit_restart_count().await);
             }
         }
     }
@@ -890,6 +973,33 @@ impl K0sAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_state_install_duration_is_one_shot() {
+        let state = K0sNodeState::new();
+        state.set_unit_active(true);
+        state.set_restart_count(3);
+        state.record_install(Duration::from_millis(2500));
+
+        let (active, restarts, install) = state.take_for_heartbeat();
+        assert!(active);
+        assert_eq!(restarts, 3);
+        assert_eq!(install, 2.5);
+
+        // Drained: a second read reports 0 install seconds but retains active/restarts.
+        let (active2, restarts2, install2) = state.take_for_heartbeat();
+        assert!(active2);
+        assert_eq!(restarts2, 3);
+        assert_eq!(install2, 0.0);
+    }
+
+    #[test]
+    fn node_state_defaults_report_nothing_pending() {
+        let (active, restarts, install) = K0sNodeState::new().take_for_heartbeat();
+        assert!(!active);
+        assert_eq!(restarts, 0);
+        assert_eq!(install, 0.0);
+    }
 
     #[test]
     fn renders_controller_unit_with_validated_directives() {
