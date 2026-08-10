@@ -119,6 +119,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     let controller = args.controller.clone();
     let job_spec = build_salloc_job_spec(&args, nodelist)?;
+    let user = job_spec.user.clone();
 
     let channel = spur_client::connect_channel(&controller)
         .await
@@ -137,7 +138,6 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         eprintln!("salloc: warning: {warning}");
     }
     let job_id = response.job_id;
-    let user = whoami::username().unwrap_or_else(|_| "unknown".into());
     eprintln!("salloc: Pending job allocation {}...", job_id);
 
     // Set up Ctrl+C handler to cancel the job on interrupt
@@ -175,7 +175,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 .cancel_job(CancelJobRequest {
                     job_id,
                     signal: 0,
-                    user: whoami::username().unwrap_or_default(),
+                    user: user.clone(),
                 })
                 .await;
             std::process::exit(1);
@@ -289,7 +289,7 @@ fn build_salloc_job_spec(args: &SallocArgs, nodelist: Option<String>) -> Result<
         partition: args.partition.clone().unwrap_or_default(),
         account: args.account.clone().unwrap_or_default(),
         qos: args.qos.clone().unwrap_or_default(),
-        user: whoami::username().unwrap_or_else(|_| "unknown".into()),
+        user: crate::interactive::current_user()?,
         uid: nix::unistd::getuid().as_raw(),
         gid: nix::unistd::getgid().as_raw(),
         num_nodes: args.nodes,

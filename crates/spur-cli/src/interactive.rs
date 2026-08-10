@@ -18,11 +18,13 @@ pub async fn connect_agent(addr: &str) -> Result<SlurmAgentClient<tonic::transpo
         .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE))
 }
 
-/// Local username sent with exec/attach requests so the server can enforce job
-/// ownership. The fallback is deliberately not a legal UNIX username, so a
-/// lookup failure cannot collide with a real account and grant access.
-pub fn current_user() -> String {
-    whoami::username().unwrap_or_else(|_| "<lookup-failed>".into())
+/// Local username sent with authenticated job requests.
+///
+/// Refuse to continue when the operating system cannot resolve the caller:
+/// recording a sentinel can either collide with a real account or disagree
+/// with a later exec/attach request.
+pub fn current_user() -> Result<String> {
+    whoami::username().context("failed to determine current username")
 }
 
 pub fn get_terminal_size() -> spur_proto::proto::WindowSize {
@@ -51,6 +53,7 @@ pub async fn open_interactive_session(
     argv: Vec<String>,
     winsize: spur_proto::proto::WindowSize,
     overlap: bool,
+    user: &str,
 ) -> std::result::Result<InteractiveSessionHandle, tonic::Status> {
     let init = InteractiveInput {
         msg: Some(interactive_input::Msg::Init(InitSession {
@@ -61,7 +64,7 @@ pub async fn open_interactive_session(
             winsize: Some(winsize),
             argv,
             env: HashMap::new(),
-            user: current_user(),
+            user: user.to_string(),
         })),
     };
 
@@ -180,7 +183,8 @@ pub async fn run_interactive_session(
     winsize: spur_proto::proto::WindowSize,
     overlap: bool,
 ) -> Result<i32> {
-    let handle = open_interactive_session(agent, job_id, step_id, argv, winsize, overlap)
+    let user = current_user()?;
+    let handle = open_interactive_session(agent, job_id, step_id, argv, winsize, overlap, &user)
         .await
         .map_err(|status| anyhow::anyhow!("InteractiveSession RPC failed: {}", status.message()))?;
     drive_interactive_session(handle).await

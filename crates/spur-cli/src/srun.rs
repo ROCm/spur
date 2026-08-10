@@ -219,8 +219,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             anyhow::bail!("--jobid requires --overlap");
         }
         let node = first_node(args.nodelist.as_deref().unwrap_or_default());
+        let user = crate::interactive::current_user()?;
         let exit_code =
-            run_interactive_pty(&args.controller, job_id, args.command.clone(), node).await?;
+            run_interactive_pty(&args.controller, job_id, args.command.clone(), node, &user)
+                .await?;
         std::process::exit(exit_code);
     }
 
@@ -561,7 +563,7 @@ fn build_srun_job_spec(
         partition: args.partition.clone().unwrap_or_default(),
         account: args.account.clone().unwrap_or_default(),
         qos: args.qos.clone().unwrap_or_default(),
-        user: whoami::username().unwrap_or_else(|_| "unknown".into()),
+        user: crate::interactive::current_user()?,
         uid: nix::unistd::getuid().as_raw(),
         gid: nix::unistd::getgid().as_raw(),
         num_nodes: args.nodes,
@@ -704,6 +706,7 @@ struct StepDispatchParams<'a> {
     work_dir: &'a str,
     io: &'a ResolvedIoPaths,
     mpi: &'a str,
+    user: &'a str,
 }
 
 async fn dispatch_step(
@@ -726,7 +729,7 @@ async fn dispatch_step(
             pty: false,
             winsize: None,
             node: String::new(),
-            user: crate::interactive::current_user(),
+            user: params.user.to_string(),
         })
         .await
         .context("failed to create job step")?
@@ -834,9 +837,8 @@ async fn run_standalone_srun(
         .await
         .context("failed to connect to spurctld")?;
     let mut client = SlurmControllerClient::new(channel);
-    let user = whoami::username().unwrap_or_else(|_| "unknown".into());
-
     let job_spec = build_srun_job_spec(args, work_dir, &io, mpi)?;
+    let user = job_spec.user.clone();
     let submit_resp = client
         .submit_job(SubmitJobRequest {
             spec: Some(job_spec),
@@ -866,6 +868,7 @@ async fn run_standalone_srun(
             job_id,
             args.command.clone(),
             String::new(),
+            &user,
         )
         .await;
         let _ = client
@@ -890,6 +893,7 @@ async fn run_standalone_srun(
             work_dir,
             io: &io,
             mpi,
+            user: &user,
         };
         let dispatch_result =
             dispatch_step_cancellable(&mut client, job_id, &step_params, true).await;
@@ -917,7 +921,7 @@ async fn run_standalone_srun(
     }
 
     let output_streamed = if io.stdout.is_empty() {
-        try_stream_output(&mut client, &nodelist, job_id).await
+        try_stream_output(&mut client, &nodelist, job_id, &user).await
     } else {
         false
     };
@@ -984,6 +988,7 @@ async fn try_stream_output(
     controller: &mut SlurmControllerClient<tonic::transport::Channel>,
     nodelist: &str,
     job_id: u32,
+    user: &str,
 ) -> bool {
     let first_node = nodelist.split(',').next().unwrap_or_default().trim();
     if first_node.is_empty() {
@@ -1011,7 +1016,7 @@ async fn try_stream_output(
         .stream_job_output(StreamJobOutputRequest {
             job_id,
             stream: "stdout".into(),
-            user: crate::interactive::current_user(),
+            user: user.to_string(),
         })
         .await
     {
@@ -1195,6 +1200,7 @@ async fn run_interactive_pty(
     job_id: u32,
     command: Vec<String>,
     node: String,
+    user: &str,
 ) -> Result<i32> {
     let channel = spur_client::connect_channel(controller)
         .await
@@ -1224,7 +1230,7 @@ async fn run_interactive_pty(
                     pty: true,
                     winsize: Some(winsize),
                     node: node.clone(),
-                    user: crate::interactive::current_user(),
+                    user: user.to_string(),
                 })
                 .await
             {
@@ -1261,6 +1267,7 @@ async fn run_interactive_pty(
             command.clone(),
             winsize,
             true,
+            user,
         )
         .await
         {
@@ -1307,12 +1314,14 @@ async fn run_as_step(
     }
 
     let io = resolve_io_paths(args);
+    let user = crate::interactive::current_user()?;
 
     let step_params = StepDispatchParams {
         args,
         work_dir,
         io: &io,
         mpi: step_mpi,
+        user: &user,
     };
     let dispatch_result =
         dispatch_step_cancellable(&mut client, job_id, &step_params, false).await?;
@@ -2113,6 +2122,7 @@ mod tests {
             work_dir: "/tmp",
             io: &io,
             mpi: spur_core::mpi::MPI_NONE,
+            user: "tester",
         };
         dispatch_step(client, 1, &params).await
     }
