@@ -9,7 +9,7 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use std::sync::atomic::AtomicU64;
 
-use crate::export::encode_registered;
+use crate::export::{concat_encoded, encode_registered};
 use crate::k8s::{
     phase_label, role_label, BaseLabel, K8sClusterMetricsSnapshot, K8sMetrics, ALL_PHASES,
 };
@@ -103,12 +103,14 @@ pub fn register_k8s_cluster(registry: &mut Registry, snap: &K8sClusterMetricsSna
 }
 
 /// Encode `/metrics/k8s`: cluster gauges from `snap` plus the long-lived lifecycle/node metrics.
+/// The gauges are re-registered fresh each scrape (they reflect a point-in-time snapshot); the
+/// accumulator was registered once at construction (see `K8sMetrics::encode`) and is just read.
 pub fn encode_k8s_metrics(snap: &K8sClusterMetricsSnapshot, metrics: &K8sMetrics) -> String {
     metrics.ensure_series(&snap.cluster);
-    encode_registered(|registry| {
-        register_k8s_cluster(registry, snap);
-        metrics.register(registry);
-    })
+    concat_encoded([
+        encode_registered(|registry| register_k8s_cluster(registry, snap)),
+        metrics.encode(),
+    ])
 }
 
 /// Encode only the cluster gauges (used by tests and callers without a live accumulator).
@@ -187,6 +189,9 @@ mod tests {
         ));
         assert!(body.contains("spur_k8s_install_duration_seconds_count"));
         assert!(body.ends_with("# EOF\n"));
+        // The gauge and accumulator halves are encoded separately then merged; a strict
+        // OpenMetrics parser stops at the first `# EOF`, so exactly one may appear.
+        assert_eq!(body.matches("# EOF").count(), 1);
     }
 
     #[test]

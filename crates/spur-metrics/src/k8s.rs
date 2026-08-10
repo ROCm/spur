@@ -4,6 +4,7 @@
 //! Snapshot of k0s cluster + node state for `/metrics/k8s` gauge export, plus the long-lived
 //! `K8sMetrics` accumulator for lifecycle counters/histograms and heartbeat-fed node metrics.
 
+use prometheus_client::encoding::text::encode as encode_openmetrics;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
@@ -74,7 +75,8 @@ impl Default for K8sClusterMetricsSnapshot {
 
 impl K8sClusterMetricsSnapshot {
     /// Build a snapshot from the cluster name, replica count, phase, and the assigned roles of all
-    /// nodes that currently hold a k0s role (`None` roles are ignored).
+    /// nodes that currently hold a k0s role (`None` roles are ignored). Scans `node_roles` once;
+    /// prefer `from_role_counts` when the caller already maintains per-role counts.
     pub fn collect(
         cluster: impl Into<String>,
         control_plane_replicas: u64,
@@ -91,13 +93,31 @@ impl K8sClusterMetricsSnapshot {
                 K0sRole::Single => single += 1,
             }
         }
-        let nodes_total = controller + worker + single;
+        Self::from_role_counts(
+            cluster,
+            control_plane_replicas,
+            phase,
+            controller,
+            worker,
+            single,
+        )
+    }
+
+    /// Build a snapshot directly from already-known per-role node counts, skipping a node scan.
+    pub fn from_role_counts(
+        cluster: impl Into<String>,
+        control_plane_replicas: u64,
+        phase: K0sPhase,
+        controller: u64,
+        worker: u64,
+        single: u64,
+    ) -> Self {
         Self {
             cluster: cluster.into(),
             distribution: DEFAULT_DISTRIBUTION.into(),
             phase,
             control_plane_replicas,
-            nodes_total,
+            nodes_total: controller + worker + single,
             nodes_by_role: [
                 (K0sRole::Controller, controller),
                 (K0sRole::Worker, worker),
@@ -137,9 +157,11 @@ struct NodeBaseLabel {
 /// Long-lived accumulator for k0s lifecycle counters/histograms and heartbeat-fed node metrics.
 ///
 /// Cumulative and event-timed metrics cannot be rebuilt from a plain snapshot each scrape the way
-/// gauges are, so the controller holds one `Arc<K8sMetrics>` for the process lifetime and the
-/// `/metrics/k8s` handler registers clones (Arc-shared inner state) into the response registry.
-#[derive(Debug, Clone)]
+/// gauges are, so the controller holds one `Arc<K8sMetrics>` for the process lifetime. Its
+/// families are registered into `registry` once, at construction, rather than on every scrape:
+/// `Family` is `Arc`-backed, so the registered clones stay live and `encode()` always reads
+/// current values without repeating the registration bookkeeping per request.
+#[derive(Debug)]
 pub struct K8sMetrics {
     provision_attempts: Family<BaseLabel, Counter>,
     provision_failures: Family<BaseLabel, Counter>,
@@ -149,6 +171,7 @@ pub struct K8sMetrics {
     node_up: Family<NodeBaseLabel, Gauge>,
     node_restarts: Family<NodeBaseLabel, Counter>,
     node_install_duration: Family<NodeBaseLabel, Histogram>,
+    registry: Registry,
 }
 
 impl Default for K8sMetrics {
@@ -156,15 +179,69 @@ impl Default for K8sMetrics {
         // Reconcile loop and install both span sub-second to tens of seconds.
         let reconcile_buckets = || Histogram::new(exponential_buckets(0.005, 2.0, 12));
         let install_buckets = || Histogram::new(exponential_buckets(0.5, 2.0, 10));
+        let provision_attempts = Family::default();
+        let provision_failures = Family::default();
+        let phase_transitions = Family::default();
+        let reconcile_errors = Family::default();
+        let reconcile_duration: Family<BaseLabel, Histogram> =
+            Family::new_with_constructor(reconcile_buckets);
+        let node_up = Family::default();
+        let node_restarts = Family::default();
+        let node_install_duration: Family<NodeBaseLabel, Histogram> =
+            Family::new_with_constructor(install_buckets);
+
+        let mut registry = Registry::default();
+        registry.register(
+            "spur_k8s_provision_attempts",
+            "k0s provisioning attempts (Down to Provisioning transitions)",
+            provision_attempts.clone(),
+        );
+        registry.register(
+            "spur_k8s_provision_failures",
+            "k0s provisioning attempts that failed to reach Ready",
+            provision_failures.clone(),
+        );
+        registry.register(
+            "spur_k8s_phase_transitions",
+            "k0s cluster phase transitions labeled by source and destination",
+            phase_transitions.clone(),
+        );
+        registry.register(
+            "spur_k8s_reconcile_errors",
+            "Errors during a k0s reconcile-loop iteration",
+            reconcile_errors.clone(),
+        );
+        registry.register(
+            "spur_k8s_reconcile_duration_seconds",
+            "Wall time of each k0s reconcile-loop iteration",
+            reconcile_duration.clone(),
+        );
+        registry.register(
+            "spur_k8s_node_up",
+            "Whether a node's k0s systemd unit reports active (1) or not (0)",
+            node_up.clone(),
+        );
+        registry.register(
+            "spur_k8s_node_restart",
+            "Cumulative k0s unit restarts per node",
+            node_restarts.clone(),
+        );
+        registry.register(
+            "spur_k8s_install_duration_seconds",
+            "Time to install k0s and bring the unit active, per node",
+            node_install_duration.clone(),
+        );
+
         Self {
-            provision_attempts: Family::default(),
-            provision_failures: Family::default(),
-            phase_transitions: Family::default(),
-            reconcile_errors: Family::default(),
-            reconcile_duration: Family::new_with_constructor(reconcile_buckets),
-            node_up: Family::default(),
-            node_restarts: Family::default(),
-            node_install_duration: Family::new_with_constructor(install_buckets),
+            provision_attempts,
+            provision_failures,
+            phase_transitions,
+            reconcile_errors,
+            reconcile_duration,
+            node_up,
+            node_restarts,
+            node_install_duration,
+            registry,
         }
     }
 }
@@ -276,48 +353,12 @@ impl K8sMetrics {
         let _ = self.reconcile_duration.get_or_create(&base);
     }
 
-    /// Register the accumulator's metrics (Arc-shared clones) into a response registry.
-    pub fn register(&self, registry: &mut Registry) {
-        registry.register(
-            "spur_k8s_provision_attempts",
-            "k0s provisioning attempts (Down to Provisioning transitions)",
-            self.provision_attempts.clone(),
-        );
-        registry.register(
-            "spur_k8s_provision_failures",
-            "k0s provisioning attempts that failed to reach Ready",
-            self.provision_failures.clone(),
-        );
-        registry.register(
-            "spur_k8s_phase_transitions",
-            "k0s cluster phase transitions labeled by source and destination",
-            self.phase_transitions.clone(),
-        );
-        registry.register(
-            "spur_k8s_reconcile_errors",
-            "Errors during a k0s reconcile-loop iteration",
-            self.reconcile_errors.clone(),
-        );
-        registry.register(
-            "spur_k8s_reconcile_duration_seconds",
-            "Wall time of each k0s reconcile-loop iteration",
-            self.reconcile_duration.clone(),
-        );
-        registry.register(
-            "spur_k8s_node_up",
-            "Whether a node's k0s systemd unit reports active (1) or not (0)",
-            self.node_up.clone(),
-        );
-        registry.register(
-            "spur_k8s_node_restart",
-            "Cumulative k0s unit restarts per node",
-            self.node_restarts.clone(),
-        );
-        registry.register(
-            "spur_k8s_install_duration_seconds",
-            "Time to install k0s and bring the unit active, per node",
-            self.node_install_duration.clone(),
-        );
+    /// Encode the accumulator's families from the registry built once at construction — no
+    /// per-scrape registration, just a read of current values.
+    pub fn encode(&self) -> String {
+        let mut body = String::new();
+        encode_openmetrics(&mut body, &self.registry).expect("in-memory encode");
+        body
     }
 }
 
@@ -346,5 +387,20 @@ mod tests {
         let snap = K8sClusterMetricsSnapshot::collect("c1", 3, K0sPhase::Degraded, [None]);
         assert_eq!(snap.up(), 0);
         assert_eq!(snap.control_plane_replicas, 3);
+    }
+
+    #[test]
+    fn encode_reads_live_values_from_the_registry_built_at_construction() {
+        let metrics = K8sMetrics::new();
+        assert!(!metrics.encode().contains("node=\"a\""));
+
+        // The registry is built once in `new()`; a value set afterward must still show up,
+        // proving the registered families are the same live Arc-shared instances.
+        metrics.set_node_up("prod", "a", true);
+        let body = metrics.encode();
+        assert!(
+            body.contains("spur_k8s_node_up{distribution=\"k0s\",cluster=\"prod\",node=\"a\"} 1\n")
+        );
+        assert!(body.ends_with("# EOF\n"));
     }
 }

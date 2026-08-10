@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
@@ -285,6 +285,59 @@ pub enum PreemptOutcome {
     Suspended,
 }
 
+/// Per-role node counts backing `/metrics/k8s`'s `spur_k8s_nodes_by_role`. Kept in sync with
+/// `Node.k0s_role` incrementally in `apply()` (every replica, so a promoted follower is already
+/// correct); `recompute_from` is the only O(n) path, used once on snapshot restore/startup.
+#[derive(Default)]
+struct K0sRoleCounts {
+    controller: AtomicU64,
+    worker: AtomicU64,
+    single: AtomicU64,
+}
+
+impl K0sRoleCounts {
+    fn counter(&self, role: spur_core::k0s::K0sRole) -> &AtomicU64 {
+        use spur_core::k0s::K0sRole;
+        match role {
+            K0sRole::Controller => &self.controller,
+            K0sRole::Worker => &self.worker,
+            K0sRole::Single => &self.single,
+        }
+    }
+
+    fn inc(&self, role: spur_core::k0s::K0sRole) {
+        self.counter(role).fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn dec(&self, role: spur_core::k0s::K0sRole) {
+        self.counter(role).fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// (controller, worker, single).
+    fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.controller.load(Ordering::Relaxed),
+            self.worker.load(Ordering::Relaxed),
+            self.single.load(Ordering::Relaxed),
+        )
+    }
+
+    fn recompute_from(&self, roles: impl Iterator<Item = Option<spur_core::k0s::K0sRole>>) {
+        use spur_core::k0s::K0sRole;
+        let (mut controller, mut worker, mut single) = (0u64, 0u64, 0u64);
+        for role in roles.flatten() {
+            match role {
+                K0sRole::Controller => controller += 1,
+                K0sRole::Worker => worker += 1,
+                K0sRole::Single => single += 1,
+            }
+        }
+        self.controller.store(controller, Ordering::Relaxed);
+        self.worker.store(worker, Ordering::Relaxed);
+        self.single.store(single, Ordering::Relaxed);
+    }
+}
+
 /// Central cluster state manager.
 ///
 /// Thread-safe via RwLock. The scheduler and gRPC server both access this.
@@ -336,6 +389,8 @@ pub struct ClusterManager {
     k0s: RwLock<spur_core::k0s::K0sClusterState>,
     /// Long-lived k0s lifecycle/node metric accumulator exported at `/metrics/k8s`.
     k8s_metrics: Arc<spur_metrics::K8sMetrics>,
+    /// Per-role node counts for `/metrics/k8s`, avoiding a full node scan every scrape.
+    k0s_role_counts: K0sRoleCounts,
     /// Serializes k0s phase-transition accounting so concurrent `set_k0s_phase` callers can't both
     /// read the same prior phase and double-count the edge.
     k0s_phase_accounting: parking_lot::Mutex<()>,
@@ -400,6 +455,7 @@ impl ClusterManager {
             tokens: RwLock::new(HashMap::new()),
             k0s: RwLock::new(spur_core::k0s::K0sClusterState::default()),
             k8s_metrics: Arc::new(spur_metrics::K8sMetrics::new()),
+            k0s_role_counts: K0sRoleCounts::default(),
             k0s_phase_accounting: parking_lot::Mutex::new(()),
             raft: RwLock::new(None),
             accounting: RwLock::new(None),
@@ -2224,21 +2280,19 @@ impl ClusterManager {
         self.k8s_metrics.clone()
     }
 
-    /// Current k0s cluster gauges, rebuilt from live state on each scrape.
+    /// Current k0s cluster gauges. Role counts come from the incrementally-maintained
+    /// `k0s_role_counts` cache rather than a full node scan (see its doc comment).
     pub fn k8s_cluster_metrics(&self) -> spur_metrics::K8sClusterMetricsSnapshot {
         let config = self.config();
         let phase = self.k0s.read().phase;
-        let roles = self
-            .nodes
-            .read()
-            .values()
-            .map(|n| n.k0s_role)
-            .collect::<Vec<_>>();
-        spur_metrics::K8sClusterMetricsSnapshot::collect(
+        let (controller, worker, single) = self.k0s_role_counts.snapshot();
+        spur_metrics::K8sClusterMetricsSnapshot::from_role_counts(
             config.cluster_name.clone(),
             u64::from(config.cluster.control_plane_replicas),
             phase,
-            roles,
+            controller,
+            worker,
+            single,
         )
     }
 
@@ -4748,6 +4802,10 @@ impl ClusterManager {
                             "removing node with nonzero allocations"
                         );
                     }
+                    // A node can be force-removed while still k0s-assigned (no prior `k8s down`).
+                    if let Some(role) = node.k0s_role {
+                        self.k0s_role_counts.dec(role);
+                    }
                 }
                 nodes.remove(name);
                 info!(
@@ -4989,6 +5047,12 @@ impl ClusterManager {
             } => {
                 // Reuses the `nodes` write guard from the top of this fn.
                 if let Some(node) = nodes.get_mut(name) {
+                    if node.k0s_role != Some(*role) {
+                        if let Some(old) = node.k0s_role {
+                            self.k0s_role_counts.dec(old);
+                        }
+                        self.k0s_role_counts.inc(*role);
+                    }
                     node.k0s_role = Some(*role);
                     node.k0s_mesh_ip = Some(mesh_ip.clone());
                     node.k0s_pod_cidr = Some(pod_cidr.clone());
@@ -4996,7 +5060,9 @@ impl ClusterManager {
             }
             WalOperation::NodeK0sClear { name } => {
                 if let Some(node) = nodes.get_mut(name) {
-                    node.k0s_role = None;
+                    if let Some(old) = node.k0s_role.take() {
+                        self.k0s_role_counts.dec(old);
+                    }
                     node.k0s_mesh_ip = None;
                     node.k0s_pod_cidr = None;
                     node.k0s_last_error = None;
@@ -5180,6 +5246,8 @@ impl StateMachineApply for ClusterManager {
         for node in snap.nodes {
             nodes.insert(node.name.clone(), node);
         }
+        self.k0s_role_counts
+            .recompute_from(nodes.values().map(|n| n.k0s_role));
 
         *self.reservations.write() = snap.reservations;
 
@@ -13022,6 +13090,56 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn k8s_cluster_metrics_role_counts_track_assign_clear_and_remove() {
+        use spur_core::k0s::K0sRole;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        register_node(&cm, "node-b", 4, 8000);
+        wait_for("both registered", || {
+            cm.get_node("node-a").is_some() && cm.get_node("node-b").is_some()
+        });
+
+        let counts = |cm: &ClusterManager| {
+            let snap = cm.k8s_cluster_metrics();
+            (snap.nodes_total, snap.nodes_by_role)
+        };
+        assert_eq!(counts(&cm).0, 0, "no roles assigned yet");
+
+        cm.assign_node_k0s("node-a", K0sRole::Controller, "10.44.0.2", "10.42.2.0/24")
+            .unwrap();
+        cm.assign_node_k0s("node-b", K0sRole::Worker, "10.44.0.3", "10.42.3.0/24")
+            .unwrap();
+        let (total, by_role) = counts(&cm);
+        assert_eq!(total, 2);
+        assert_eq!(by_role[0], (K0sRole::Controller, 1));
+        assert_eq!(by_role[1], (K0sRole::Worker, 1));
+
+        // Re-assigning the same role to the same node must not double-count.
+        cm.assign_node_k0s("node-a", K0sRole::Controller, "10.44.0.2", "10.42.2.0/24")
+            .unwrap();
+        assert_eq!(
+            counts(&cm).0,
+            2,
+            "idempotent re-assign must not inflate the total"
+        );
+
+        cm.clear_node_k0s("node-a").unwrap();
+        let (total, by_role) = counts(&cm);
+        assert_eq!(total, 1);
+        assert_eq!(by_role[0], (K0sRole::Controller, 0));
+        assert_eq!(by_role[1], (K0sRole::Worker, 1));
+
+        // A force-removed node that still holds a role must not leak into the count.
+        cm.remove_node("node-b", true, None).unwrap();
+        assert_eq!(
+            counts(&cm).0,
+            0,
+            "removing an assigned node must release its role count"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn set_k0s_phase_counts_attempts_and_transitions() {
         use spur_core::k0s::K0sPhase;
         let dir = TempDir::new().unwrap();
@@ -13354,6 +13472,29 @@ mod tests {
             !cm2.get_partitions().iter().any(|p| p.name == "gpu"),
             "stale live partition must be gone after restore"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_from_snapshot_rebuilds_k0s_role_counts() {
+        // The target never applies the source's NodeK0sAssign op itself — it only loads the
+        // already-assigned Node from the snapshot's node list — so this only passes if restore
+        // recomputes k0s_role_counts from scratch rather than relying on incremental apply().
+        use spur_core::k0s::K0sRole;
+        let src = TempDir::new().unwrap();
+        let cm = test_cluster(&src).await;
+        register_node(&cm, "node-a", 4, 8000);
+        wait_for("registered", || cm.get_node("node-a").is_some());
+        cm.assign_node_k0s("node-a", K0sRole::Controller, "10.44.0.2", "10.42.2.0/24")
+            .unwrap();
+        let data = cm.snapshot_state().unwrap();
+
+        let dst = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dst).await;
+        cm2.restore_from_snapshot(&data).unwrap();
+
+        let snap = cm2.k8s_cluster_metrics();
+        assert_eq!(snap.nodes_total, 1);
+        assert_eq!(snap.nodes_by_role[0], (K0sRole::Controller, 1));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

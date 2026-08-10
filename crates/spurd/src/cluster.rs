@@ -785,6 +785,8 @@ impl K0sAgent {
             Some(sup) => sup.stop(reset).await?,
             None => self.stop_untracked(reset).await?,
         }
+        // Only after a successful stop — supervise() won't refresh this once `active` is empty.
+        self.status.set_unit_active(false);
         remove_cdi_spec().await;
         info!(reset, "k0s component stopped");
         Ok(())
@@ -1166,6 +1168,20 @@ mod tests {
         assert!(
             sup.unit_status_is(&["is-active"], "active").await,
             "active again after re-write"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_clears_unit_active_even_with_no_tracked_supervisor() {
+        let agent = K0sAgent::from_config(&spur_core::config::ClusterConfig::default());
+        agent.status.set_unit_active(true);
+
+        agent.stop(false).await.unwrap();
+
+        let (active, _, _) = agent.status.take_for_heartbeat();
+        assert!(
+            !active,
+            "stop() must clear unit_active so heartbeats stop reporting node_up=1"
         );
     }
 
