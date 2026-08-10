@@ -247,10 +247,14 @@ async fn cmd_status(controller: &str) -> Result<()> {
         }
     }
     for n in resp.nodes {
-        println!(
+        print!(
             "  {:<24} {:<11} {:<11} enabled={}",
             n.node, n.role, n.component_state, n.enabled
         );
+        if !n.reason.is_empty() {
+            print!("  reason: {}", n.reason);
+        }
+        println!();
     }
     Ok(())
 }

@@ -260,6 +260,9 @@ async fn main() -> anyhow::Result<()> {
             cni_mtu: config.cluster.cni_mtu,
             cni: config.cluster.cni.clone(),
             control_plane_node: config.cluster.control_plane_node.clone(),
+            provisioning_timeout: std::time::Duration::from_secs(
+                config.cluster.k8s_provisioning_timeout_secs,
+            ),
         };
         tokio::spawn(async move {
             cluster_k8s::run(k8s_cluster, k8s_raft, k8s_net).await;
