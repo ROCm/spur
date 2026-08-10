@@ -336,6 +336,9 @@ pub struct ClusterManager {
     k0s: RwLock<spur_core::k0s::K0sClusterState>,
     /// Long-lived k0s lifecycle/node metric accumulator exported at `/metrics/k8s`.
     k8s_metrics: Arc<spur_metrics::K8sMetrics>,
+    /// Serializes k0s phase-transition accounting so concurrent `set_k0s_phase` callers can't both
+    /// read the same prior phase and double-count the edge.
+    k0s_phase_accounting: parking_lot::Mutex<()>,
     raft: RwLock<Option<SpurRaft>>,
     accounting: RwLock<Option<AccountingNotifier>>,
     fairshare_cache: Arc<FairshareCache>,
@@ -397,6 +400,7 @@ impl ClusterManager {
             tokens: RwLock::new(HashMap::new()),
             k0s: RwLock::new(spur_core::k0s::K0sClusterState::default()),
             k8s_metrics: Arc::new(spur_metrics::K8sMetrics::new()),
+            k0s_phase_accounting: parking_lot::Mutex::new(()),
             raft: RwLock::new(None),
             accounting: RwLock::new(None),
             fairshare_cache,
@@ -2149,6 +2153,8 @@ impl ClusterManager {
         self.propose(WalOperation::NodeK0sClear {
             name: name.to_string(),
         })?;
+        self.k8s_metrics
+            .remove_node(&self.config().cluster_name, name);
         info!(node = %name, "node k0s role cleared");
         Ok(())
     }
@@ -2180,6 +2186,9 @@ impl ClusterManager {
         reset_requested: bool,
     ) -> anyhow::Result<()> {
         use spur_core::k0s::K0sPhase;
+        // Serialize prior-phase read, commit, and edge accounting so two concurrent callers can't
+        // both observe the same prior phase and double-count the transition.
+        let _accounting = self.k0s_phase_accounting.lock();
         let from = self.k0s.read().phase;
         self.propose(WalOperation::K0sSetPhase {
             phase,
@@ -2263,6 +2272,10 @@ impl ClusterManager {
                         admin_locked,
                     }) {
                         Ok(resp) => {
+                            // A node that stopped heartbeating won't refresh its k0s unit gauge, so
+                            // reflect the unreachable unit as down rather than leaving a stale 1.
+                            self.k8s_metrics
+                                .set_node_up(&self.config().cluster_name, &name, false);
                             self.run_all_finalized_side_effects(&resp);
                             evicted.extend(resp.jobs_finalized);
                         }
@@ -2369,6 +2382,8 @@ impl ClusterManager {
             name: name.to_string(),
             reason,
         })?;
+        self.k8s_metrics
+            .remove_node(&self.config().cluster_name, name);
         self.run_all_finalized_side_effects(&resp);
         Ok(resp.jobs_finalized)
     }
@@ -12966,6 +12981,7 @@ mod tests {
             cni_mtu: 1450,
             cni: "kuberouter".into(),
             control_plane_node: None,
+            provisioning_timeout: std::time::Duration::from_secs(600),
         };
         let mut tokens = std::collections::HashMap::new();
 
@@ -12973,13 +12989,36 @@ mod tests {
             phase: K0sPhase::Down,
             ..Default::default()
         };
-        assert!(!crate::cluster_k8s::reconcile_phase(&cm, &net, &down, &mut tokens).await);
+        assert!(!crate::cluster_k8s::reconcile_phase(&cm, &net, &down, &mut tokens, false).await);
 
         let degraded = spur_core::k0s::K0sClusterState {
             phase: K0sPhase::Degraded,
             ..Default::default()
         };
-        assert!(!crate::cluster_k8s::reconcile_phase(&cm, &net, &degraded, &mut tokens).await);
+        assert!(!crate::cluster_k8s::reconcile_phase(&cm, &net, &degraded, &mut tokens, false).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clearing_node_k0s_evicts_its_metric_series() {
+        use spur_core::k0s::K0sRole;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        wait_for("registered", || cm.get_node("node-a").is_some());
+        cm.assign_node_k0s("node-a", K0sRole::Worker, "10.44.0.2", "10.42.2.0/24")
+            .unwrap();
+        // Feed node metrics as a heartbeat would.
+        cm.k8s_metrics().set_node_up("test", "node-a", true);
+        cm.k8s_metrics().set_node_restart_total("test", "node-a", 1);
+        let body = spur_metrics::encode_k8s_metrics(&cm.k8s_cluster_metrics(), &cm.k8s_metrics());
+        assert!(body.contains("node=\"node-a\""));
+
+        cm.clear_node_k0s("node-a").unwrap();
+        let body = spur_metrics::encode_k8s_metrics(&cm.k8s_cluster_metrics(), &cm.k8s_metrics());
+        assert!(
+            !body.contains("node=\"node-a\""),
+            "cleared node's series must be evicted"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -12988,23 +13027,47 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
-        cm.set_k0s_phase(K0sPhase::Provisioning, Some("n1".into()), Vec::new(), false)
-            .unwrap();
+        cm.set_k0s_phase(
+            K0sPhase::Provisioning,
+            Some("n1".into()),
+            Vec::new(),
+            Vec::new(),
+            false,
+        )
+        .unwrap();
         wait_for("provisioning", || {
             cm.k0s_state().phase == K0sPhase::Provisioning
         });
-        cm.set_k0s_phase(K0sPhase::Ready, Some("n1".into()), Vec::new(), false)
-            .unwrap();
+        cm.set_k0s_phase(
+            K0sPhase::Ready,
+            Some("n1".into()),
+            Vec::new(),
+            Vec::new(),
+            false,
+        )
+        .unwrap();
         wait_for("ready", || cm.k0s_state().phase == K0sPhase::Ready);
         // Re-provision: a second attempt.
-        cm.set_k0s_phase(K0sPhase::Provisioning, Some("n1".into()), Vec::new(), false)
-            .unwrap();
+        cm.set_k0s_phase(
+            K0sPhase::Provisioning,
+            Some("n1".into()),
+            Vec::new(),
+            Vec::new(),
+            false,
+        )
+        .unwrap();
         wait_for("provisioning again", || {
             cm.k0s_state().phase == K0sPhase::Provisioning
         });
         // A no-op set to the same phase must not double-count.
-        cm.set_k0s_phase(K0sPhase::Provisioning, Some("n1".into()), Vec::new(), false)
-            .unwrap();
+        cm.set_k0s_phase(
+            K0sPhase::Provisioning,
+            Some("n1".into()),
+            Vec::new(),
+            Vec::new(),
+            false,
+        )
+        .unwrap();
 
         let body = spur_metrics::encode_k8s_metrics(&cm.k8s_cluster_metrics(), &cm.k8s_metrics());
         assert!(body.contains(

@@ -676,23 +676,24 @@ impl K0sAgent {
         // Make a fresh bare-metal node self-contained: install the pinned/configured k0s if the
         // binary is missing. No-op (no network) when it is already present. A failure here is fatal
         // to start — the systemd unit's ConditionFileIsExecutable would otherwise silently skip.
-        let install_started = Instant::now();
-        match spur_update::k0s::ensure_k0s(&self.k0s_version, &self.k0s_binary).await {
-            Ok(Some(info)) => {
-                self.status.record_install(install_started.elapsed());
-                info!(
-                    version = %info.version,
-                    path = %info.path.display(),
-                    "installed k0s"
-                );
-            }
-            Ok(None) => {}
-            Err(e) => anyhow::bail!(
-                "k0s not present at {} and auto-install (version {}) failed: {e}",
-                self.k0s_binary.display(),
-                self.k0s_version
-            ),
-        }
+        let start_began = Instant::now();
+        let did_install =
+            match spur_update::k0s::ensure_k0s(&self.k0s_version, &self.k0s_binary).await {
+                Ok(Some(info)) => {
+                    info!(
+                        version = %info.version,
+                        path = %info.path.display(),
+                        "installed k0s"
+                    );
+                    true
+                }
+                Ok(None) => false,
+                Err(e) => anyhow::bail!(
+                    "k0s not present at {} and auto-install (version {}) failed: {e}",
+                    self.k0s_binary.display(),
+                    self.k0s_version
+                ),
+            };
 
         tokio::fs::create_dir_all(&self.config_dir)
             .await
@@ -742,6 +743,11 @@ impl K0sAgent {
         self.status.set_unit_active(state == "active");
         self.status
             .set_restart_count(sup.unit_restart_count().await);
+        // Record the install→active span only when an install actually happened and the unit came
+        // up, so a later start failure never emits a spurious sample.
+        if did_install && state == "active" {
+            self.status.record_install(start_began.elapsed());
+        }
         *self.active.lock().await = Some(sup);
         info!(role = role.as_str(), state = %state, "k0s component started");
         Ok(state)

@@ -221,27 +221,29 @@ impl K8sMetrics {
             .observe(seconds);
     }
 
+    fn node_label(&self, cluster: &str, node: &str) -> NodeBaseLabel {
+        NodeBaseLabel {
+            distribution: DEFAULT_DISTRIBUTION.into(),
+            cluster: cluster.to_string(),
+            node: node.to_string(),
+        }
+    }
+
     /// Set a node's k0s unit up/down gauge (1 active, 0 otherwise). Role is intentionally not a
     /// label here (it would churn/leak series on a role change); per-role counts live in the
     /// fresh-per-scrape `spur_k8s_nodes_by_role` gauge.
     pub fn set_node_up(&self, cluster: &str, node: &str, active: bool) {
         self.node_up
-            .get_or_create(&NodeBaseLabel {
-                distribution: DEFAULT_DISTRIBUTION.into(),
-                cluster: cluster.to_string(),
-                node: node.to_string(),
-            })
+            .get_or_create(&self.node_label(cluster, node))
             .set(i64::from(active));
     }
 
     /// Absolute cumulative restart count reported by a node; advances the counter by any positive
     /// delta so a monotonic counter is preserved across scrapes.
     pub fn set_node_restart_total(&self, cluster: &str, node: &str, total: u64) {
-        let counter = self.node_restarts.get_or_create(&NodeBaseLabel {
-            distribution: DEFAULT_DISTRIBUTION.into(),
-            cluster: cluster.to_string(),
-            node: node.to_string(),
-        });
+        let counter = self
+            .node_restarts
+            .get_or_create(&self.node_label(cluster, node));
         let current = counter.get();
         if total > current {
             counter.inc_by(total - current);
@@ -251,12 +253,17 @@ impl K8sMetrics {
     /// Observe a node's k0s install duration (once per successful install).
     pub fn observe_node_install_duration(&self, cluster: &str, node: &str, seconds: f64) {
         self.node_install_duration
-            .get_or_create(&NodeBaseLabel {
-                distribution: DEFAULT_DISTRIBUTION.into(),
-                cluster: cluster.to_string(),
-                node: node.to_string(),
-            })
+            .get_or_create(&self.node_label(cluster, node))
             .observe(seconds);
+    }
+
+    /// Drop all per-node series for a node that left k0s inventory (deregistered or role cleared),
+    /// so decommissioned names don't accumulate and export stale values forever.
+    pub fn remove_node(&self, cluster: &str, node: &str) {
+        let label = self.node_label(cluster, node);
+        self.node_up.remove(&label);
+        self.node_restarts.remove(&label);
+        self.node_install_duration.remove(&label);
     }
 
     /// Ensure the base-labeled counter/histogram series exist at zero for `cluster`, so a fresh

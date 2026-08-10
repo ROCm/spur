@@ -188,4 +188,23 @@ mod tests {
         assert!(body.contains("spur_k8s_install_duration_seconds_count"));
         assert!(body.ends_with("# EOF\n"));
     }
+
+    #[test]
+    fn remove_node_evicts_all_per_node_series() {
+        let metrics = K8sMetrics::new();
+        metrics.set_node_up("prod", "gone", true);
+        metrics.set_node_restart_total("prod", "gone", 4);
+        metrics.observe_node_install_duration("prod", "gone", 1.0);
+        metrics.set_node_up("prod", "keep", true);
+
+        assert!(encode_k8s_metrics(&sample(), &metrics).contains("node=\"gone\""));
+
+        metrics.remove_node("prod", "gone");
+        let body = encode_k8s_metrics(&sample(), &metrics);
+        assert!(
+            !body.contains("node=\"gone\""),
+            "evicted node must not export"
+        );
+        assert!(body.contains("node=\"keep\""), "other nodes are unaffected");
+    }
 }
