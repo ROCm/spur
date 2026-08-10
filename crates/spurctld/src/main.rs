@@ -261,7 +261,7 @@ async fn main() -> anyhow::Result<()> {
             cni: config.cluster.cni.clone(),
             control_plane_node: config.cluster.control_plane_node.clone(),
             provisioning_timeout: std::time::Duration::from_secs(
-                config.cluster.provisioning_timeout_secs,
+                config.cluster.k8s_provisioning_timeout_secs,
             ),
         };
         tokio::spawn(async move {

@@ -49,8 +49,8 @@ pub struct ClusterNetworking {
     pub cni: String,
     /// Operator-pinned control-plane node (cluster.control_plane_node), if any.
     pub control_plane_node: Option<String>,
-    /// How long a cluster may stay `provisioning` before the loop marks it `degraded`
-    /// (cluster.provisioning_timeout_secs).
+    /// How long a k8s (k0s) node may stay non-`active` during provisioning before the loop
+    /// marks the cluster `degraded` (cluster.k8s_provisioning_timeout_secs).
     pub provisioning_timeout: Duration,
 }
 
