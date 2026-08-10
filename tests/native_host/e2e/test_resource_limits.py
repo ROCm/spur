@@ -16,6 +16,8 @@ import pytest
 
 from cluster import job_node_indices, parse_job_id, wait_job, wait_job_state
 
+pytestmark = pytest.mark.suite_runtime
+
 CGROUP_ROOT = "/sys/fs/cgroup/spur"
 
 HOG_BYTES = 128 * 1024 * 1024

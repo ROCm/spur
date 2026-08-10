@@ -16,6 +16,8 @@ import pytest
 
 from cluster import parse_job_id, job_state, wait_job
 
+pytestmark = pytest.mark.suite_ha
+
 K8S_RESERVED = "Reserved for Kubernetes cluster"
 
 

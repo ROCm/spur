@@ -18,6 +18,9 @@ from k8s_cluster import (
     simple_spurjob,
     wait_pod_ready,
 )
+import pytest
+
+pytestmark = pytest.mark.suite_k8s_ha
 
 
 def assert_all_pods_ready(namespace: str, count: int) -> None:

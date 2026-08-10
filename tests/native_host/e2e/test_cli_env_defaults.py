@@ -16,6 +16,8 @@ import pytest
 
 from cluster import parse_job_id, wait_job
 
+pytestmark = pytest.mark.suite_api
+
 TWO_PARTITIONS = {
     "partitions": [
         {

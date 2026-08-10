@@ -6,6 +6,8 @@ control plane. Identity is whoami-derived, exercised via `cli_as_user`."""
 
 import pytest
 
+pytestmark = pytest.mark.suite_ha
+
 
 class TestK8sAuth:
     def _require_sudo_second_identity(self, cluster):

@@ -29,6 +29,35 @@ def pytest_configure(config):
     )
 
 
+_SUITE_MARKERS = (
+    "suite_scheduling", "suite_policy", "suite_api",
+    "suite_runtime", "suite_fabric", "suite_ha",
+)
+_E2E_DIR = Path(__file__).parent
+
+
+def pytest_collection_modifyitems(config, items):
+    """Fail if any native-host e2e test lacks exactly one suite_* marker.
+
+    Markers select CI suites; a file with none would never run in any suite,
+    and one with two would run twice. Enforced at collection so the mistake
+    surfaces in the fast fixture job, not an hour into E2E.
+    """
+    bad = []
+    for item in items:
+        path = getattr(item, "path", None)
+        if path is None or (path != _E2E_DIR and _E2E_DIR not in path.parents):
+            continue
+        suites = [m.name for m in item.iter_markers() if m.name in _SUITE_MARKERS]
+        if len(suites) != 1:
+            bad.append(f"{item.nodeid}: {sorted(suites) or 'none'}")
+    if bad:
+        raise pytest.UsageError(
+            "each native-host e2e test needs exactly one suite_* marker:\n  "
+            + "\n  ".join(bad)
+        )
+
+
 def _get_nodes_config() -> list[str]:
     raw = os.environ.get("SPUR_TEST_NODES", "")
     nodes = [n.strip() for n in raw.split(",") if n.strip()]

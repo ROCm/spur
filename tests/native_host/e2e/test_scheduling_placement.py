@@ -10,6 +10,9 @@ how equal-weight jobs distribute across idle nodes.
 import time
 
 from cluster import job_node_names, parse_job_id, wait_job, wait_job_state
+import pytest
+
+pytestmark = pytest.mark.suite_scheduling
 
 
 def _job_nodes(cluster, job_id: int) -> list[str]:

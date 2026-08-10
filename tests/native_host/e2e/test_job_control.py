@@ -15,6 +15,8 @@ import pytest
 
 from cluster import job_state, parse_job_id, wait_job, wait_job_state
 
+pytestmark = pytest.mark.suite_scheduling
+
 
 def _running_count(cluster, job_ids: list[int]) -> int:
     sq = cluster.squeue_all()

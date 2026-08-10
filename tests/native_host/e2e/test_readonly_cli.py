@@ -15,6 +15,8 @@ import pytest
 
 from cluster import parse_job_id, wait_job_state
 
+pytestmark = pytest.mark.suite_api
+
 
 def _run(cluster, args: list[str]) -> tuple[int, str]:
     return cluster.cli_with_env(args, {})

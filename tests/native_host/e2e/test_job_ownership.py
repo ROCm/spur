@@ -15,6 +15,8 @@ import pytest
 
 from cluster import parse_job_id, wait_job_state
 
+pytestmark = pytest.mark.suite_runtime
+
 
 # root is an administrative override in check_job_owner, so a denial test has
 # to run as an ordinary account instead.

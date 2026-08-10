@@ -13,6 +13,8 @@ import pytest
 
 from cluster import job_node_names, parse_job_id, wait_job, wait_job_state
 
+pytestmark = pytest.mark.suite_fabric
+
 
 def switches_for(cluster) -> list[dict]:
     """One leaf switch holding node 0, another holding the rest."""

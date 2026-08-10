@@ -16,6 +16,8 @@ import pytest
 
 from cluster import parse_job_id, wait_job, wait_job_state
 
+pytestmark = pytest.mark.suite_policy
+
 # Time allowed for a requeued low-priority job to get back to RUNNING after a
 # preemption cycle. Generous because it spans the eligibility hold plus node
 # release, scheduler pickup, and spurd relaunch, which is sensitive to CI host

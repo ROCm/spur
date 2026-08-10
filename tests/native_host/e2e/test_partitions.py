@@ -9,6 +9,8 @@ import pytest
 
 from cluster import parse_job_id, wait_job, wait_job_state
 
+pytestmark = pytest.mark.suite_scheduling
+
 
 def _unique(prefix: str) -> str:
     return f"{prefix}-{int(time.time())}"

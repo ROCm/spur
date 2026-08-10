@@ -13,6 +13,8 @@ import os
 
 import pytest
 
+pytestmark = pytest.mark.suite_fabric
+
 MUTATING = os.environ.get("SPUR_TEST_WIREGUARD") == "1"
 mutating = pytest.mark.skipif(
     not MUTATING,

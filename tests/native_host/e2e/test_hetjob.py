@@ -19,6 +19,8 @@ import pytest
 
 from cluster import parse_job_id, wait_job, wait_job_state
 
+pytestmark = pytest.mark.suite_scheduling
+
 
 def submit_component(cluster, name: str, group: int, body: str, out_path: str) -> int:
     script = cluster.write_file(f"{name}.sh", f"#!/bin/bash\n{body}\n")

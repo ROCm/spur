@@ -3,6 +3,8 @@
 
 """Pytest fixtures for Spur Kubernetes E2E tests."""
 
+from pathlib import Path
+
 import pytest
 
 from k8s_cluster import (
@@ -55,3 +57,27 @@ def _cleanup_between_tests(request):
         fixture.ensure_controllers_ready()
         if fixture.config.replicas > 1:
             assert_leader_elected(fixture.namespace, fixture.config.replicas)
+
+
+_K8S_SUITE_MARKERS = (
+    "suite_k8s_core", "suite_k8s_spec", "suite_k8s_quota",
+    "suite_k8s_ha", "suite_k8s_nodes",
+)
+_K8S_E2E_DIR = Path(__file__).parent
+
+
+def pytest_collection_modifyitems(config, items):
+    """Fail if any k8s e2e test lacks exactly one suite_k8s_* marker."""
+    bad = []
+    for item in items:
+        path = getattr(item, "path", None)
+        if path is None or (path != _K8S_E2E_DIR and _K8S_E2E_DIR not in path.parents):
+            continue
+        suites = [m.name for m in item.iter_markers() if m.name in _K8S_SUITE_MARKERS]
+        if len(suites) != 1:
+            bad.append(f"{item.nodeid}: {sorted(suites) or 'none'}")
+    if bad:
+        raise pytest.UsageError(
+            "each k8s e2e test needs exactly one suite_k8s_* marker:\n  "
+            + "\n  ".join(bad)
+        )

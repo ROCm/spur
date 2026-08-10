@@ -17,6 +17,8 @@ from kubernetes.client.exceptions import ApiException
 
 from k8s_cluster import assert_eventually, delete_namespace
 
+pytestmark = pytest.mark.suite_k8s_quota
+
 QUOTA_NAME = "spur-account-quota"
 LIMITS_NAME = "spur-account-defaults"
 ROLE_NAME = "spur-account-editor"

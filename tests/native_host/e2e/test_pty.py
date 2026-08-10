@@ -9,6 +9,9 @@ assertions match substrings rather than whole lines.
 """
 
 from cluster import parse_job_id, wait_job_state
+import pytest
+
+pytestmark = pytest.mark.suite_api
 
 
 def _clean(output: str) -> str:

@@ -11,6 +11,9 @@ the same ports on the same nodes.
 The hostname form only works where every node resolves every peer, which a
 stock host does not do -- the fixture probes for it and skips otherwise.
 """
+import pytest
+
+pytestmark = pytest.mark.suite_ha
 
 
 class TestNodeIdDerivation:

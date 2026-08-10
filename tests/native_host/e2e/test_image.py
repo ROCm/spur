@@ -17,6 +17,8 @@ import pytest
 
 from cluster import wait_job, parse_job_id
 
+pytestmark = pytest.mark.suite_runtime
+
 IMAGE_NAME = "demo"
 # Images are stored under the canonical OCI reference, so a bare name lands as
 # docker.io/library/<name>:latest with `/` and `:` folded to `+`. The CLI is

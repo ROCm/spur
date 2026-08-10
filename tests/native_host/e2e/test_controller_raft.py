@@ -16,6 +16,8 @@ import pytest
 
 from cluster import parse_job_id, wait_job, wait_job_state
 
+pytestmark = pytest.mark.suite_ha
+
 
 @pytest.fixture(autouse=True)
 def _restore_quorum(raft_cluster):

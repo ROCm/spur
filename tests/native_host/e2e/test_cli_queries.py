@@ -10,6 +10,9 @@ scancel, which selects jobs by user/partition/name rather than by job ID.
 import time
 
 from cluster import job_state, parse_job_id, wait_job, wait_job_state
+import pytest
+
+pytestmark = pytest.mark.suite_api
 
 
 def _held_job_ids(cluster, name: str, count: int) -> list[int]:

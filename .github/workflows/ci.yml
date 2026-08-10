@@ -139,6 +139,32 @@ jobs:
           SPUR_TEST_SSH_USER: nobody
           KUBECONFIG: /dev/null
 
+      - name: Native-host suite markers are complete and disjoint
+        working-directory: tests
+        env:
+          SPUR_TEST_NODES: 192.0.2.1
+          SPUR_TEST_SSH_USER: nobody
+          KUBECONFIG: /dev/null
+        run: |
+          all=$(pytest native_host/e2e --collect-only -q 2>/dev/null | grep -c '::' || true)
+          sel=$(pytest native_host/e2e --collect-only -q \
+            -m "suite_scheduling or suite_policy or suite_api or suite_runtime or suite_fabric or suite_ha" \
+            2>/dev/null | grep -c '::' || true)
+          echo "collected=$all selected-by-suites=$sel"
+          test "$all" -eq "$sel"
+
+      - name: K8s suite markers are complete and disjoint
+        working-directory: tests
+        env:
+          KUBECONFIG: /dev/null
+        run: |
+          all=$(pytest k8s/e2e --collect-only -q 2>/dev/null | grep -c '::' || true)
+          sel=$(pytest k8s/e2e --collect-only -q \
+            -m "suite_k8s_core or suite_k8s_spec or suite_k8s_quota or suite_k8s_ha or suite_k8s_nodes" \
+            2>/dev/null | grep -c '::' || true)
+          echo "collected=$all selected-by-suites=$sel"
+          test "$all" -eq "$sel"
+
   test-db:
     name: DB tests (accounting)
     runs-on: ubuntu-latest

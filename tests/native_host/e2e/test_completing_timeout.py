@@ -25,6 +25,8 @@ import pytest
 
 from cluster import parse_job_id, wait_job
 
+pytestmark = pytest.mark.suite_scheduling
+
 
 class TestCompletingTimeoutCancel:
     # Well above the 10s force-finish tick, low enough to keep the test fast.

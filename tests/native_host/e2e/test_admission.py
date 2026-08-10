@@ -6,6 +6,9 @@ E2E tests for node admission.
 """
 
 import time
+import pytest
+
+pytestmark = pytest.mark.suite_policy
 
 
 def _wait_registered(cluster, timeout=30):

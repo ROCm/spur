@@ -15,6 +15,8 @@ import pytest
 
 from cluster import parse_job_id, wait_job, wait_job_state
 
+pytestmark = pytest.mark.suite_api
+
 # proto JobState values as surfaced by job_info_t.job_state.
 JOB_PENDING = 0
 JOB_RUNNING = 1

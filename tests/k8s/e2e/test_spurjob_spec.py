@@ -23,6 +23,8 @@ from k8s_cluster import (
     wait_spurjob_state,
 )
 
+pytestmark = pytest.mark.suite_k8s_spec
+
 CONTAINER = "spec.containers.0"
 
 

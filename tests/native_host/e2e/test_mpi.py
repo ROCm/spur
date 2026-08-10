@@ -11,6 +11,8 @@ import pytest
 
 from cluster import SpurCluster, ensure_bins, make_remote_dir, parse_job_id, wait_job, wait_job_state
 
+pytestmark = pytest.mark.suite_ha
+
 MPI_SOAK_ITERATIONS = max(1, int(os.environ.get("SPUR_MPI_SOAK_ITERATIONS", "1")))
 
 

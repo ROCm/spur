@@ -12,6 +12,9 @@ import shlex
 import time
 
 from cluster import wait_job_state
+import pytest
+
+pytestmark = pytest.mark.suite_policy
 
 
 class TestSrunQos:

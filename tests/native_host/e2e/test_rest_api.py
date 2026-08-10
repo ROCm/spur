@@ -19,6 +19,8 @@ import pytest
 
 from cluster import REST_PORT, job_state, wait_job_state
 
+pytestmark = pytest.mark.suite_api
+
 PREFIXES = ["/api/v1", "/slurm/v0.0.42"]
 
 

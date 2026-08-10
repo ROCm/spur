@@ -20,6 +20,8 @@ import pytest
 
 from cluster import parse_job_id, wait_job, wait_job_state
 
+pytestmark = pytest.mark.suite_runtime
+
 POOL_GB = 64
 
 

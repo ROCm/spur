@@ -13,6 +13,9 @@ takes over) lives in test_controller_raft.py.
 """
 
 from cluster import parse_job_id, wait_job
+import pytest
+
+pytestmark = pytest.mark.suite_ha
 
 # Port with nothing listening — connections are refused immediately.
 DEAD_PORT = 1

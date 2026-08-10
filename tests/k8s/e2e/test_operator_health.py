@@ -11,6 +11,9 @@ spurctld.
 """
 
 from k8s_cluster import assert_eventually, service_http_get
+import pytest
+
+pytestmark = pytest.mark.suite_k8s_core
 
 HEALTH_PORT = "health"
 OPERATOR_SERVICE = "spur-k8s-operator"

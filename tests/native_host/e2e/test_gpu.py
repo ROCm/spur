@@ -15,6 +15,9 @@ import os
 from pathlib import Path
 
 from cluster import SpurCluster, parse_job_id, wait_job
+import pytest
+
+pytestmark = pytest.mark.suite_fabric
 
 _FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 

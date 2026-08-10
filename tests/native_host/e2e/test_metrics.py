@@ -16,6 +16,8 @@ import pytest
 
 from cluster import METRICS_PORT, parse_job_id, wait_job_state
 
+pytestmark = pytest.mark.suite_api
+
 # /metrics is an alias for /metrics/jobs.
 ROUTE_FAMILIES = {
     "/metrics": ["spur_jobs_pending", "spur_jobs_running"],

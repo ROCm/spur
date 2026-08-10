@@ -24,6 +24,9 @@ from k8s_cluster import (
     wait_spurjob_pods_exist,
     wait_spurjob_state,
 )
+import pytest
+
+pytestmark = pytest.mark.suite_k8s_core
 
 # `tail` buffers its whole input, so this allocates far past the memory limit.
 MEMORY_HOG = "head -c 512m /dev/zero | tail -c 512m > /dev/null"

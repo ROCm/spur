@@ -75,6 +75,22 @@ cargo test --locked                                                 # all tests 
 - Do not use `unwrap()` in library code. Use `?` or explicit error handling.
 - Do not commit files that may contain secrets.
 
+## E2E Suites
+
+E2E tests run as parallel CI suites selected by markers. Every
+`tests/native_host/e2e/test_*.py` must carry exactly one `suite_*` marker
+(`pytestmark = pytest.mark.suite_<name>`), and every `tests/k8s/e2e/test_*.py`
+exactly one `suite_k8s_*` marker. CI's `e2e-fixtures` job fails collection if a
+file has zero or two, so a new test file cannot silently escape a suite. Keep a
+file's tests within one domain; move a file between suites by editing its
+one-line `pytestmark`. Bare `pytest` (no `-m`) still runs everything locally.
+
+The k8s suites run concurrently on one bootstrapped cluster, each in its own
+namespace (`tests/k8s/e2e/run_suites.sh`). This is safe only because the
+destructive node tests stay skipped (`SPUR_TEST_DESTRUCTIVE_NODES` unset); if
+they are ever enabled, `suite_k8s_nodes` must run alone (drop it from the
+concurrent set in the driver), since it taints shared cluster-scoped Nodes.
+
 ## Further Reading
 
 See `README.md` and `docs/` for detailed documentation. End-to-end tests against real clusters live in `tests/native_host/e2e/` and `tests/k8s/e2e/`.

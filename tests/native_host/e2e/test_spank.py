@@ -15,6 +15,8 @@ import pytest
 
 from cluster import parse_job_id, wait_job
 
+pytestmark = pytest.mark.suite_runtime
+
 ENV_PROBE = (
     "#!/bin/bash\n"
     'echo "SPANK_TEST_VAR=${SPANK_TEST_VAR}"\n'

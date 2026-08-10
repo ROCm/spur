@@ -19,6 +19,9 @@ from cluster import (
     wait_job,
     wait_job_state,
 )
+import pytest
+
+pytestmark = pytest.mark.suite_scheduling
 
 
 def _launched_job_ids(cluster, node_index: int) -> set[int]:

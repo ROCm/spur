@@ -13,6 +13,8 @@ import pytest
 
 from cluster import parse_job_id, job_state, wait_job
 
+pytestmark = pytest.mark.suite_runtime
+
 
 @pytest.fixture
 def container_cluster(cluster, tmp_path):

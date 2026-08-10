@@ -18,6 +18,8 @@ from kubernetes.client.exceptions import ApiException
 
 from k8s_cluster import assert_eventually, simple_spurjob, wait_spurjob_state
 
+pytestmark = pytest.mark.suite_k8s_nodes
+
 MANAGED_SELECTOR = "spur.amd.com/managed=true"
 NOT_READY_TAINT = "node.kubernetes.io/not-ready"
 

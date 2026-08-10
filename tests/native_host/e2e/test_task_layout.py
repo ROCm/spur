@@ -11,6 +11,9 @@ a job asks for more nodes than it has tasks to put on them.
 import re
 
 from cluster import parse_job_id, wait_job
+import pytest
+
+pytestmark = pytest.mark.suite_scheduling
 
 
 def _job_field(show_output: str, field: str) -> int:
