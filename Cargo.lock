@@ -3569,6 +3569,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tracing-subscriber",
  "whoami",
  "zstd",
 ]
