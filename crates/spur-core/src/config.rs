@@ -433,15 +433,10 @@ impl Default for AccountingConfig {
     }
 }
 
-/// When partition limits (currently the wall-time limit) are enforced against a
-/// job's request. Mirrors Slurm's `EnforcePartLimits`.
-///
-/// - `No` (default): over-limit jobs are admitted and pend with a reason
-///   (`PartitionTimeLimit`), matching Slurm's default and preserving prior
-///   behavior on upgrade.
-/// - `All`: reject at submit unless the job fits every requested partition.
-/// - `Any`: reject at submit only when the job fits none of the requested
-///   partitions.
+/// Submit-time enforcement of partition wall-time limits (Slurm's
+/// `EnforcePartLimits`). `No` (default) admits over-limit jobs to pend; `All`
+/// rejects unless the job fits every requested partition; `Any` rejects only
+/// when it fits none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum EnforcePartLimits {
@@ -1344,12 +1339,10 @@ impl SlurmConfig {
     }
 }
 
-/// Parse a partition time field, distinguishing UNLIMITED from a parse error.
-///
-/// `INFINITE`/`UNLIMITED` (case-insensitive) -> `Ok(None)` (no limit); a valid
-/// duration (Slurm grammar or a suffixed form like `"1h"`) -> `Ok(Some(minutes))`;
-/// anything else -> `Err`. Unlike [`parse_time_minutes`], a genuine typo like
-/// `"1 hour"` fails loudly instead of silently collapsing to UNLIMITED.
+/// Parse a partition time field, distinguishing UNLIMITED from a parse error:
+/// `INFINITE`/`UNLIMITED` -> `Ok(None)`, a valid duration -> `Ok(Some(minutes))`,
+/// anything else -> `Err`. Unlike [`parse_time_minutes`], a typo like `"1 hour"`
+/// fails loudly instead of collapsing to UNLIMITED.
 pub fn parse_partition_time(field: &str, s: &str) -> Result<Option<u32>, ConfigError> {
     let trimmed = s.trim();
     if trimmed.eq_ignore_ascii_case("INFINITE") || trimmed.eq_ignore_ascii_case("UNLIMITED") {
@@ -1364,12 +1357,9 @@ pub fn parse_partition_time(field: &str, s: &str) -> Result<Option<u32>, ConfigE
     }
 }
 
-/// Parse a time string to minutes.
-///
-/// Accepts Slurm grammar ("60" minutes, "H:MM", "H:MM:SS", "D-HH:MM:SS",
-/// "INFINITE"/"UNLIMITED") and, as a fallback, suffixed durations
-/// ("90m", "1h", "1h40m", "2d12h", "30s"). Sub-minute remainders round up to
-/// match the seconds-rounding of the "H:MM:SS" form.
+/// Parse a time string to minutes: Slurm grammar (`60`, `H:MM`, `H:MM:SS`,
+/// `D-HH:MM:SS`, `INFINITE`/`UNLIMITED`) or a suffixed duration (`90m`, `1h`,
+/// `2d12h`, `30s`). Sub-minute remainders round up.
 pub fn parse_time_minutes(s: &str) -> Option<u32> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("INFINITE") || s.eq_ignore_ascii_case("UNLIMITED") {
@@ -1449,11 +1439,10 @@ fn parse_slurm_time_seconds(s: &str) -> Option<u64> {
 
 /// Parse a suffixed duration like "90m", "1h", "1h40m", "2d12h", "30s".
 ///
-/// Units are `d`/`h`/`m`/`s` (case-insensitive), each an integer, summed in any
-/// order. Requires at least one unit and must consume the whole string, so a
-/// bare number is rejected here (it means minutes via the Slurm grammar) and
-/// stray characters or trailing digits fail. This is the fallback that lets an
-/// operator write `max_time = "1h"` instead of `"01:00:00"`.
+/// Sum a suffixed duration like `1h40m` or `2d12h` to seconds. Units `d/h/m/s`
+/// (case-insensitive); requires at least one unit and must consume the whole
+/// string, so a bare number or trailing digits fail (the Slurm grammar owns
+/// bare numbers).
 fn parse_suffix_duration_seconds(s: &str) -> Option<u64> {
     let mut total: u64 = 0;
     let mut num: Option<u64> = None;
@@ -1530,6 +1519,26 @@ pub fn format_time(total_minutes: Option<u32>) -> String {
                 format!("{}-{:02}:{:02}:00", days, hours, minutes)
             } else {
                 format!("{:02}:{:02}:00", hours, minutes)
+            }
+        }
+    }
+}
+
+/// Format seconds as D-HH:MM:SS or HH:MM:SS. Unlike [`format_time`] this keeps
+/// second precision, so a sub-minute request is not rounded when reported.
+pub fn format_time_seconds(total_seconds: Option<i64>) -> String {
+    match total_seconds {
+        None => "UNLIMITED".into(),
+        Some(secs) => {
+            let secs = secs.max(0);
+            let days = secs / 86_400;
+            let hours = (secs % 86_400) / 3_600;
+            let minutes = (secs % 3_600) / 60;
+            let seconds = secs % 60;
+            if days > 0 {
+                format!("{days}-{hours:02}:{minutes:02}:{seconds:02}")
+            } else {
+                format!("{hours:02}:{minutes:02}:{seconds:02}")
             }
         }
     }
@@ -1941,6 +1950,39 @@ memory_mb = 1024000
         // A genuine typo still fails loudly.
         assert!(parse_partition_time("p.max_time", "1 hour").is_err());
         assert!(parse_partition_time("p.max_time", "banana").is_err());
+    }
+
+    #[test]
+    fn enforce_part_limits_parses_case_insensitively_and_yes_alias() {
+        #[derive(serde::Deserialize)]
+        struct W {
+            v: EnforcePartLimits,
+        }
+        let parse = |v: &str| toml::from_str::<W>(&format!("v = \"{v}\"")).unwrap().v;
+        assert_eq!(parse("no"), EnforcePartLimits::No);
+        assert_eq!(parse("all"), EnforcePartLimits::All);
+        assert_eq!(parse("ALL"), EnforcePartLimits::All);
+        assert_eq!(parse("Yes"), EnforcePartLimits::All);
+        assert_eq!(parse("any"), EnforcePartLimits::Any);
+        assert_eq!(parse("ANY"), EnforcePartLimits::Any);
+    }
+
+    #[test]
+    fn enforce_part_limits_rejects_unknown_value() {
+        #[derive(serde::Deserialize)]
+        struct W {
+            #[allow(dead_code)]
+            v: EnforcePartLimits,
+        }
+        assert!(toml::from_str::<W>("v = \"sometimes\"").is_err());
+    }
+
+    #[test]
+    fn format_time_seconds_keeps_second_precision() {
+        assert_eq!(format_time_seconds(Some(630)), "00:10:30");
+        assert_eq!(format_time_seconds(Some(3600)), "01:00:00");
+        assert_eq!(format_time_seconds(Some(90_061)), "1-01:01:01");
+        assert_eq!(format_time_seconds(None), "UNLIMITED");
     }
 
     #[test]
