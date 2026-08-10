@@ -64,11 +64,10 @@ pub extern "C" fn slurm_submit_batch_job(
 
     let desc = unsafe { &*desc };
     let result = runtime().block_on(async {
-        use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
         use spur_proto::proto::{JobSpec, SubmitJobRequest};
 
         let channel = spur_client::connect_channel(controller_addr()).await.ok()?;
-        let mut client = SlurmControllerClient::new(channel);
+        let mut client = spur_proto::controller_client(channel);
 
         let spec = JobSpec {
             name: c_str_to_string(desc.name),
@@ -77,7 +76,7 @@ pub extern "C" fn slurm_submit_batch_job(
             script: c_str_to_string(desc.script),
             work_dir: c_str_to_string(desc.work_dir),
             num_nodes: desc.min_nodes,
-            num_tasks: desc.num_tasks,
+            num_tasks: desc_num_tasks(desc.num_tasks),
             cpus_per_task: desc.cpus_per_task,
             time_limit: if desc.time_limit > 0 {
                 Some(prost_types::Duration {
@@ -122,11 +121,10 @@ pub extern "C" fn slurm_load_jobs(
     }
 
     let result = runtime().block_on(async {
-        use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
         use spur_proto::proto::GetJobsRequest;
 
         let channel = spur_client::connect_channel(controller_addr()).await.ok()?;
-        let mut client = SlurmControllerClient::new(channel);
+        let mut client = spur_proto::controller_client(channel);
 
         let resp = client.get_jobs(GetJobsRequest::default()).await.ok()?;
 
@@ -199,11 +197,10 @@ pub extern "C" fn slurm_load_node(
     }
 
     let result = runtime().block_on(async {
-        use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
         use spur_proto::proto::GetNodesRequest;
 
         let channel = spur_client::connect_channel(controller_addr()).await.ok()?;
-        let mut client = SlurmControllerClient::new(channel);
+        let mut client = spur_proto::controller_client(channel);
 
         let resp = client.get_nodes(GetNodesRequest::default()).await.ok()?;
 
@@ -252,11 +249,10 @@ pub extern "C" fn slurm_load_partitions(
     }
 
     let result = runtime().block_on(async {
-        use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
         use spur_proto::proto::GetPartitionsRequest;
 
         let channel = spur_client::connect_channel(controller_addr()).await.ok()?;
-        let mut client = SlurmControllerClient::new(channel);
+        let mut client = spur_proto::controller_client(channel);
 
         let resp = client
             .get_partitions(GetPartitionsRequest::default())
@@ -298,11 +294,10 @@ pub extern "C" fn slurm_load_partitions(
 #[no_mangle]
 pub extern "C" fn slurm_kill_job(job_id: c_uint, signal: u16, _flags: u16) -> c_int {
     let result = runtime().block_on(async {
-        use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
         use spur_proto::proto::CancelJobRequest;
 
         let channel = spur_client::connect_channel(controller_addr()).await.ok()?;
-        let mut client = SlurmControllerClient::new(channel);
+        let mut client = spur_proto::controller_client(channel);
 
         client
             .cancel_job(CancelJobRequest {
@@ -401,6 +396,16 @@ fn c_str_to_string(ptr: *const c_char) -> String {
     unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() }
 }
 
+/// Map a descriptor's task count to the proto field. `NO_VAL` (the caller left
+/// it unset) becomes 0 so the controller defaults to one task per node instead
+/// of collapsing a multi-node request onto a single node.
+fn desc_num_tasks(raw: c_uint) -> u32 {
+    match raw {
+        crate::types::NO_VAL => 0,
+        n => n,
+    }
+}
+
 fn string_to_c_str(s: &str) -> *mut c_char {
     CString::new(s)
         .unwrap_or_else(|_| CString::new("").unwrap())
@@ -412,5 +417,27 @@ fn free_c_str(ptr: *mut c_char) {
         unsafe {
             let _ = CString::from_raw(ptr);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desc_num_tasks_maps_no_val_to_unset() {
+        // C1 (FFI): NO_VAL (the init default) -> 0 so the controller defaults
+        // to one task per node; explicit values pass through unchanged.
+        assert_eq!(desc_num_tasks(crate::types::NO_VAL), 0);
+        assert_eq!(desc_num_tasks(1), 1);
+        assert_eq!(desc_num_tasks(8), 8);
+    }
+
+    #[test]
+    fn job_desc_default_leaves_tasks_unset() {
+        assert_eq!(
+            crate::types::SlurmJobDescMsg::default().num_tasks,
+            crate::types::NO_VAL
+        );
     }
 }

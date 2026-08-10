@@ -12,6 +12,11 @@ use crate::resource::ResourceAllocations;
 /// Unique job identifier assigned by the controller.
 pub type JobId = u32;
 
+/// Base priority assigned to a job that does not request one explicitly.
+/// Non-zero so the multiplicative effective-priority formula (fair-share, age,
+/// partition tier) has a factor to scale, rather than collapsing to the floor.
+pub const DEFAULT_PRIORITY: u32 = 1000;
+
 /// Job states matching Slurm's state model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -68,6 +73,25 @@ impl JobState {
             Self::Suspended => "SUSPENDED",
             Self::Deadline => "DEADLINE",
             Self::OutOfMemory => "OUT_OF_MEMORY",
+        }
+    }
+
+    /// Rank for `squeue -S t` in Slurm's base state order (SUSPENDED after RUNNING),
+    /// which is not the enum's declaration order — hence an explicit match.
+    pub fn sort_rank(&self) -> u8 {
+        match self {
+            Self::Pending => 0,
+            Self::Running => 1,
+            Self::Suspended => 2,
+            Self::Completing => 3,
+            Self::Completed => 4,
+            Self::Cancelled => 5,
+            Self::Failed => 6,
+            Self::Timeout => 7,
+            Self::NodeFail => 8,
+            Self::Preempted => 9,
+            Self::Deadline => 10,
+            Self::OutOfMemory => 11,
         }
     }
 
@@ -226,6 +250,9 @@ pub enum PendingReason {
     ReqNodeNotAvail,
     BeginTime,
     DeadLine,
+    /// Slurm's `FAIL_TIMEOUT`: the run ended because it exhausted its wall-clock
+    /// time limit. Sibling of `DeadLine`, which fires before the job ever starts.
+    TimeLimit,
     Licenses,
     NonZeroExitCode,
     RaisedSignal,
@@ -250,16 +277,36 @@ pub enum PendingReason {
     QosMaxWallDurationPerJobLimit,
     QosMaxMemoryPerJob,
     QosMaxCpuPerUserLimit,
+    QosMaxNodePerUserLimit,
+    QosMaxMemoryPerUser,
     QosMaxSubmitJobPerUserLimit,
     QosMaxNodePerJobLimit,
+    QosMaxGpuPerJobLimit,
+    QosMaxGpuPerUserLimit,
     QosGrpCpuLimit,
     QosGrpMemLimit,
     QosGrpNodeLimit,
+    QosGrpGpuLimit,
     BurstBufferResources,
     BurstBufferStageIn,
     ReservedMaintenance,
     ReservationDeleted,
     JobHoldMaxRequeue,
+
+    // Account/association-level limit parity (mirrors the QOS additions
+    // above, one layer up the hierarchy: `AccountLimits` on an association).
+    AssocMaxJobsLimit,
+    AssocMaxSubmitJobLimit,
+    AssocMaxCpuPerJobLimit,
+    AssocMaxNodePerJobLimit,
+    AssocMaxMemPerJob,
+    AssocMaxGpuPerJobLimit,
+    AssocGrpCpuLimit,
+    AssocGrpNodeLimit,
+    AssocGrpMemLimit,
+    AssocGrpGpuLimit,
+    AssocMaxWallDurationPerJobLimit,
+    K8sReserved,
 }
 
 impl PendingReason {
@@ -269,6 +316,13 @@ impl PendingReason {
             self,
             Self::Held | Self::JobHeldAdmin | Self::JobHoldMaxRequeue | Self::ReservationDeleted
         )
+    }
+
+    /// True when this reason is set alongside a `begin_time` hold to explain it.
+    /// Any other reason on a held job is unrelated to the hold, so recomputing
+    /// it loses nothing.
+    pub fn explains_begin_hold(&self) -> bool {
+        matches!(self, Self::BeginTime | Self::JobLaunchFailure)
     }
 
     pub fn display(&self) -> &'static str {
@@ -286,6 +340,7 @@ impl PendingReason {
             Self::ReqNodeNotAvail => "ReqNodeNotAvail",
             Self::BeginTime => "BeginTime",
             Self::DeadLine => "DeadLine",
+            Self::TimeLimit => "TimeLimit",
             Self::Licenses => "Licenses",
             Self::NonZeroExitCode => "NonZeroExitCode",
             Self::RaisedSignal => "RaisedSignal",
@@ -304,16 +359,33 @@ impl PendingReason {
             Self::QosMaxWallDurationPerJobLimit => "QOSMaxWallDurationPerJobLimit",
             Self::QosMaxMemoryPerJob => "QOSMaxMemoryPerJob",
             Self::QosMaxCpuPerUserLimit => "QOSMaxCpuPerUserLimit",
+            Self::QosMaxNodePerUserLimit => "QOSMaxNodePerUserLimit",
+            Self::QosMaxMemoryPerUser => "QOSMaxMemoryPerUser",
             Self::QosMaxSubmitJobPerUserLimit => "QOSMaxSubmitJobPerUserLimit",
             Self::QosMaxNodePerJobLimit => "QOSMaxNodePerJobLimit",
+            Self::QosMaxGpuPerJobLimit => "QOSMaxGRESPerJob",
+            Self::QosMaxGpuPerUserLimit => "QOSMaxGRESPerUser",
             Self::QosGrpCpuLimit => "QOSGrpCpuLimit",
             Self::QosGrpMemLimit => "QOSGrpMemLimit",
             Self::QosGrpNodeLimit => "QOSGrpNodeLimit",
+            Self::QosGrpGpuLimit => "QOSGrpGRES",
             Self::BurstBufferResources => "BurstBufferResources",
             Self::BurstBufferStageIn => "BurstBufferStageIn",
             Self::ReservedMaintenance => "ReqNodeNotAvail, Reserved for maintenance",
             Self::ReservationDeleted => "ReservationDeleted",
             Self::JobHoldMaxRequeue => "JobHoldMaxRequeue",
+            Self::AssocMaxJobsLimit => "AssocMaxJobsLimit",
+            Self::AssocMaxSubmitJobLimit => "AssocMaxSubmitJobLimit",
+            Self::AssocMaxCpuPerJobLimit => "AssocMaxCpuPerJobLimit",
+            Self::AssocMaxNodePerJobLimit => "AssocMaxNodePerJobLimit",
+            Self::AssocMaxMemPerJob => "AssocMaxMemPerJob",
+            Self::AssocMaxGpuPerJobLimit => "AssocMaxGRESPerJob",
+            Self::AssocGrpCpuLimit => "AssocGrpCpuLimit",
+            Self::AssocGrpNodeLimit => "AssocGrpNodeLimit",
+            Self::AssocGrpMemLimit => "AssocGrpMemLimit",
+            Self::AssocGrpGpuLimit => "AssocGrpGRES",
+            Self::AssocMaxWallDurationPerJobLimit => "AssocMaxWallDurationPerJobLimit",
+            Self::K8sReserved => "ReqNodeNotAvail, Reserved for Kubernetes cluster",
         }
     }
 }
@@ -342,10 +414,21 @@ pub struct JobSpec {
     pub memory_per_node_mb: Option<u64>,
     pub memory_per_cpu_mb: Option<u64>,
     pub gres: Vec<String>,
+    /// GPU requests. At most one is set (see `gpu_request::resolve_gpu_demand`).
+    /// `gpus` = total across the job, the others are per-node / per-task. A
+    /// `gpu:` entry in `gres` is treated as an implicit `gpus_per_node`.
+    #[serde(default)]
+    pub gpus: Option<crate::gpu_request::GpuRequest>,
+    #[serde(default)]
+    pub gpus_per_node: Option<crate::gpu_request::GpuRequest>,
+    #[serde(default)]
+    pub gpus_per_task: Option<crate::gpu_request::GpuRequest>,
 
     // Execution
     pub script: Option<String>,
     pub argv: Vec<String>,
+    #[serde(default)]
+    pub script_args: Vec<String>,
     pub work_dir: String,
     pub stdout_path: Option<String>,
     pub stderr_path: Option<String>,
@@ -358,6 +441,10 @@ pub struct JobSpec {
 
     // Scheduling
     pub qos: Option<String>,
+    /// Explicit base priority request; `None` means "unset", resolved to
+    /// [`DEFAULT_PRIORITY`] in [`Job::new`] (except when `hold` is set, which
+    /// forces base priority to 0). Not the effective priority the scheduler
+    /// ranks on (that is derived from this each cycle).
     pub priority: Option<u32>,
     pub reservation: Option<String>,
     pub dependency: Vec<String>,
@@ -387,6 +474,10 @@ pub struct JobSpec {
     pub exclusive: bool,
     pub hold: bool,
     pub interactive: bool,
+    /// Standalone srun: reserve nodes without a batch script; user command
+    /// runs as a job step after allocation.
+    #[serde(default)]
+    pub srun_job: bool,
     pub mail_type: Vec<String>,
     pub mail_user: Option<String>,
     pub comment: Option<String>,
@@ -434,6 +525,10 @@ pub struct JobSpec {
     // Output mode
     /// How to open stdout/stderr files: "truncate" (default) or "append".
     pub open_mode: Option<String>,
+
+    // Interactive PTY
+    #[serde(default)]
+    pub pty: bool,
 }
 
 impl Default for JobSpec {
@@ -452,8 +547,12 @@ impl Default for JobSpec {
             memory_per_node_mb: None,
             memory_per_cpu_mb: None,
             gres: Vec::new(),
+            gpus: None,
+            gpus_per_node: None,
+            gpus_per_task: None,
             script: None,
             argv: Vec::new(),
+            script_args: Vec::new(),
             work_dir: String::from("/tmp"),
             stdout_path: None,
             stderr_path: None,
@@ -479,6 +578,7 @@ impl Default for JobSpec {
             exclusive: false,
             hold: false,
             interactive: false,
+            srun_job: false,
             mail_type: Vec::new(),
             mail_user: None,
             comment: None,
@@ -503,6 +603,72 @@ impl Default for JobSpec {
             shm_size: None,
             extra_resources: std::collections::HashMap::new(),
             open_mode: None,
+            pty: false,
+        }
+    }
+}
+
+impl JobSpec {
+    /// Node count to actually allocate: `min(num_nodes, num_tasks)`, since a
+    /// task never spans nodes. An explicit `--ntasks-per-node` pins the layout
+    /// and skips the cap.
+    pub fn effective_num_nodes(&self) -> u32 {
+        let nodes = self.num_nodes.max(1);
+        if self.tasks_per_node.is_some() {
+            nodes
+        } else {
+            nodes.min(self.num_tasks.max(1))
+        }
+    }
+}
+
+/// Total memory (MB) a job of `num_nodes` nodes requests, derived from
+/// either an explicit per-node request or a per-CPU request applied across
+/// the job's total CPU count. Falls back to 0 (unconstrained) if neither is
+/// set.
+pub fn effective_memory_mb(spec: &JobSpec, num_nodes: u32) -> u64 {
+    spec.memory_per_node_mb
+        .map(|mem| mem * num_nodes as u64)
+        .or_else(|| {
+            spec.memory_per_cpu_mb
+                .map(|mem| mem * spec.num_tasks as u64 * spec.cpus_per_task as u64)
+        })
+        .unwrap_or(0)
+}
+
+/// Total GPUs a job requests across all its nodes.
+///
+/// `--gpus=N` is a job total; `--gpus-per-node=K` and `--gres=gpu:K` are
+/// K per node (total `K * num_nodes`); `--gpus-per-task=K` is `K * num_tasks`.
+/// Resolution (including the per-task task layout) lives in
+/// [`crate::gpu_request::resolve_gpu_demand`]; this is a thin, non-failing
+/// wrapper for QoS/accounting that treats an invalid request as its total.
+pub fn effective_gpus(spec: &JobSpec, num_nodes: u32) -> u64 {
+    let num_nodes = num_nodes.max(1);
+    match crate::gpu_request::resolve_gpu_demand_for(spec, num_nodes) {
+        Ok(demand) => demand.total(),
+        // On conflict/invalid, fall back to the largest declared intent so
+        // limits are not silently under-counted.
+        Err(_) => {
+            let per_node: u64 = spec
+                .gres
+                .iter()
+                .filter_map(|g| crate::resource::parse_gres(g))
+                .filter(|(name, _, _)| name == "gpu")
+                .map(|(_, _, count)| count as u64)
+                .sum();
+            let total = spec.gpus.as_ref().map(|r| r.count as u64).unwrap_or(0);
+            let pn = spec
+                .gpus_per_node
+                .as_ref()
+                .map(|r| r.count as u64 * num_nodes as u64)
+                .unwrap_or(0);
+            let pt = spec
+                .gpus_per_task
+                .as_ref()
+                .map(|r| r.count as u64 * spec.num_tasks as u64)
+                .unwrap_or(0);
+            total.max(pn).max(pt).max(per_node * num_nodes as u64)
         }
     }
 }
@@ -522,6 +688,13 @@ pub struct Job {
     pub spec: JobSpec,
     pub state: JobState,
     pub pending_reason: PendingReason,
+    /// Slurm's `state_desc`: overrides `pending_reason` in user-facing output
+    /// when set, letting a hold say more than its reason code can. Written only
+    /// through [`Job::set_pending_reason`] and
+    /// [`Job::set_pending_reason_desc`], so it cannot outlive the reason it
+    /// explains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_reason_desc: Option<String>,
     pub priority: u32,
 
     pub submit_time: DateTime<Utc>,
@@ -544,9 +717,19 @@ pub struct Job {
     #[serde(default)]
     pub derived_exit_code: i32,
 
-    /// Number of times this job has been requeued.
+    /// Number of times this job has been requeued after a dispatch failure
+    /// or Timeout/NodeFail. Capped by `max_batch_requeue`.
     #[serde(default)]
     pub requeue_count: u32,
+    /// Number of times this job has been requeued after preemption; tracked
+    /// separately since it isn't a failure signal and never counts toward `max_batch_requeue`.
+    #[serde(default)]
+    pub preempt_requeue_count: u32,
+
+    /// Monotonic run epoch, bumped on each dispatch (first dispatch = 1). Lets
+    /// the controller drop a completion report from a superseded run.
+    #[serde(default)]
+    pub run_attempt: u32,
 
     // Heterogeneous job support
     /// Links het job components to the first component's job ID.
@@ -560,6 +743,19 @@ pub struct Job {
     #[serde(default)]
     pub node_completions: HashMap<String, NodeCompletion>,
 
+    /// Standalone srun: native step dispatch after allocation registration.
+    #[serde(default)]
+    pub srun_step_dispatch: bool,
+
+    /// Wall-clock instant the controller signalled this run for exceeding its
+    /// time limit, cleared on requeue. Replicated rather than kept in the
+    /// watchdog's memory for two reasons: the completion path runs inside the
+    /// Raft apply and must reach the same verdict on every replica, and a
+    /// leadership change mid-grace-period would otherwise restart the grace
+    /// period from scratch.
+    #[serde(default)]
+    pub time_limit_signaled_at: Option<DateTime<Utc>>,
+
     /// Wall-clock instant the job entered Suspended (None unless currently suspended).
     #[serde(default)]
     pub suspended_at: Option<DateTime<Utc>>,
@@ -572,6 +768,19 @@ pub struct Job {
     /// once it completes. A BB job is held off dispatch until `Ready`.
     #[serde(default)]
     pub bb_stage_state: BbStageState,
+
+    /// Absolute path the primary agent resolved at launch (incl. `/tmp` fallback).
+    /// Best-effort advisory: set post-launch, not via WAL replay (may ride along in a
+    /// snapshot). `None` before launch or after a failover that missed it, when
+    /// queries fall back to `resolved_stdout`/`resolved_stderr`.
+    #[serde(default)]
+    pub actual_stdout_path: Option<String>,
+    #[serde(default)]
+    pub actual_stderr_path: Option<String>,
+
+    /// Set when a job is evicted during PMIx bootstrap or partial dispatch.
+    #[serde(default)]
+    pub launch_failure_detail: Option<String>,
 }
 
 impl Job {
@@ -579,7 +788,7 @@ impl Job {
         let priority = if spec.hold {
             0
         } else {
-            spec.priority.unwrap_or(1000)
+            spec.priority.unwrap_or(DEFAULT_PRIORITY)
         };
         let state = JobState::Pending;
         let pending_reason = if spec.hold {
@@ -596,6 +805,7 @@ impl Job {
             spec,
             state,
             pending_reason,
+            pending_reason_desc: None,
             priority,
             submit_time: Utc::now(),
             start_time: None,
@@ -607,13 +817,35 @@ impl Job {
             exit_signal: 0,
             derived_exit_code: 0,
             requeue_count: 0,
+            preempt_requeue_count: 0,
+            run_attempt: 0,
             het_job_id: None,
             het_group: None,
             node_completions: HashMap::new(),
+            time_limit_signaled_at: None,
             suspended_at: None,
             suspended_secs: 0,
             bb_stage_state: BbStageState::None,
+            srun_step_dispatch: false,
+            actual_stdout_path: None,
+            actual_stderr_path: None,
+            launch_failure_detail: None,
         }
+    }
+
+    /// Slurm-style state reason, including PMIx bootstrap detail when present.
+    /// When `pending_reason_desc` is set it wins over the reason code, matching
+    /// Slurm `state_desc` and [`Job::state_reason_display`].
+    pub fn state_reason(&self) -> String {
+        if let Some(ref desc) = self.pending_reason_desc {
+            return desc.clone();
+        }
+        if self.pending_reason == PendingReason::JobLaunchFailure {
+            if let Some(ref detail) = self.launch_failure_detail {
+                return format!("{} ({detail})", self.pending_reason.display());
+            }
+        }
+        self.pending_reason.display().to_string()
     }
 
     /// Derive a job's `ExitCode` and state from per-node completions, matching
@@ -656,6 +888,39 @@ impl Job {
         }
     }
 
+    /// Reconcile the per-node completion verdict with what the controller
+    /// already knows about the run, yielding its final `(state, reason)`.
+    ///
+    /// A run signalled for exceeding its time limit reports `Timeout` however
+    /// the process itself ended: the exit signal records how it was stopped,
+    /// not why. An OOM kill outranks even that, being direct kernel evidence of
+    /// a distinct failure the user has to act on.
+    pub fn completion_verdict(
+        &self,
+        derived_state: JobState,
+        exit_code: i32,
+        signal: i32,
+        oom: bool,
+    ) -> (JobState, PendingReason) {
+        let state = if oom {
+            JobState::OutOfMemory
+        } else if self.time_limit_signaled_at.is_some() {
+            JobState::Timeout
+        } else {
+            derived_state
+        };
+
+        let reason = match state {
+            JobState::OutOfMemory => PendingReason::OutOfMemory,
+            JobState::Timeout => PendingReason::TimeLimit,
+            _ if signal != 0 => PendingReason::RaisedSignal,
+            _ if exit_code != 0 => PendingReason::NonZeroExitCode,
+            _ => PendingReason::None,
+        };
+
+        (state, reason)
+    }
+
     pub fn all_nodes_completed(&self) -> bool {
         !self.allocated_nodes.is_empty()
             && self.node_completions.len() == self.allocated_nodes.len()
@@ -696,7 +961,8 @@ impl Job {
         self.resolve_path(self.spec.stderr_path.as_deref().unwrap_or("spur-%j.out"))
     }
 
-    /// Resolve stdin path, if set.
+    /// Resolve stdin path, if set. Absolute (anchored like stdout/stderr) and
+    /// controller-display-only; the agent resolves stdin itself at launch.
     pub fn resolved_stdin(&self) -> Option<String> {
         self.spec
             .stdin_path
@@ -705,23 +971,103 @@ impl Job {
     }
 
     fn resolve_path(&self, pattern: &str) -> String {
-        let mut result = pattern.to_string();
-        result = result.replace("%j", &self.job_id.to_string());
-        result = result.replace("%J", &self.job_id.to_string());
-        result = result.replace("%x", &self.spec.name);
-        if let Some(tid) = self.spec.array_task_id {
-            result = result.replace("%a", &tid.to_string());
-            result = result.replace(
-                "%A",
-                &self.spec.array_job_id.unwrap_or(self.job_id).to_string(),
-            );
-        }
-        if let Some(node) = self.allocated_nodes.first() {
-            result = result.replace("%N", node);
-        }
-        result = result.replace("%u", &self.spec.user);
-        result
+        resolve_output_pattern(
+            pattern,
+            &OutputPathContext {
+                job_id: self.job_id,
+                name: &self.spec.name,
+                user: &self.spec.user,
+                work_dir: &self.spec.work_dir,
+                node: self.allocated_nodes.first().map(String::as_str),
+                array_job_id: self.spec.array_job_id,
+                array_task_id: self.spec.array_task_id,
+            },
+        )
     }
+}
+
+/// Inputs for expanding Slurm-style output path patterns. Shared by controller
+/// (fallback) and agent (actual) so both resolve the same location — else
+/// `scontrol` shows a path differing from the real output.
+pub struct OutputPathContext<'a> {
+    pub job_id: JobId,
+    pub name: &'a str,
+    pub user: &'a str,
+    pub work_dir: &'a str,
+    /// `%N`: controller passes the primary node, agent its own target (same for primary).
+    pub node: Option<&'a str>,
+    pub array_job_id: Option<JobId>,
+    pub array_task_id: Option<u32>,
+}
+
+/// Fallback work_dir when a job specifies none; the agent launches here, so
+/// path resolution anchors here too.
+pub const DEFAULT_WORK_DIR: &str = "/tmp";
+
+/// Expand `%j`/`%J`/`%x`/`%u`/`%N`/`%a`/`%A` and anchor a relative result to
+/// `work_dir` (or `DEFAULT_WORK_DIR` when empty) so it is absolute, matching
+/// Slurm. An empty pattern defaults to `spur-<id>.out`.
+pub fn resolve_output_pattern(pattern: &str, ctx: &OutputPathContext) -> String {
+    let default;
+    let template: &str = if pattern.is_empty() {
+        default = format!("spur-{}.out", ctx.job_id);
+        &default
+    } else {
+        pattern
+    };
+
+    // Decide anchoring from the raw pattern, not the expanded result: a crafted
+    // job name (`%x`) could otherwise inject a leading `/` and escape work_dir.
+    let anchor = std::path::Path::new(template).is_relative();
+    let expanded = expand_pattern_codes(template, ctx);
+    if !anchor {
+        return expanded;
+    }
+
+    let base = if ctx.work_dir.is_empty() {
+        DEFAULT_WORK_DIR
+    } else {
+        ctx.work_dir
+    };
+    // Join by hand (not `Path::join`, which a substituted leading `/` would
+    // short-circuit) so an injected absolute value still lands under `base`.
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        expanded.trim_start_matches('/')
+    )
+}
+
+/// Single-pass `%`-code expansion. Unlike a chain of `str::replace`, a value
+/// spliced in for one code is never rescanned for a later code. Unknown or
+/// inapplicable codes (`%a`/`%A`/`%N` off an array/node) are left verbatim.
+fn expand_pattern_codes(template: &str, ctx: &OutputPathContext) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('j') | Some('J') => out.push_str(&ctx.job_id.to_string()),
+            Some('x') => out.push_str(ctx.name),
+            Some('u') => out.push_str(ctx.user),
+            Some('a') if ctx.array_task_id.is_some() => {
+                out.push_str(&ctx.array_task_id.unwrap_or_default().to_string());
+            }
+            Some('A') if ctx.array_task_id.is_some() => {
+                out.push_str(&ctx.array_job_id.unwrap_or(ctx.job_id).to_string());
+            }
+            Some('N') if ctx.node.is_some() => out.push_str(ctx.node.unwrap_or_default()),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
 }
 
 /// State transitions.
@@ -784,6 +1130,58 @@ pub enum TransitionOutcome {
 }
 
 impl Job {
+    /// True while a future `begin_time` defers this job's start, whether it came
+    /// from `--begin`, a preemption requeue, or a launch-failure backoff.
+    pub fn is_begin_held(&self, now: DateTime<Utc>) -> bool {
+        self.spec.begin_time.is_some_and(|begin| now < begin)
+    }
+
+    /// True when this job's `pending_reason` exists to explain an active
+    /// `begin_time` hold, so passes that recompute reasons must leave it alone:
+    /// a generic wait reason would overwrite it before anyone could read it.
+    ///
+    /// Narrower than [`Job::is_begin_held`] on purpose. A `--begin` job still
+    /// needs its real blocking reason (bad partition, unmet dependency) surfaced
+    /// during the wait, and only the hold-explaining reasons are worth keeping.
+    pub fn reason_explains_begin_hold(&self, now: DateTime<Utc>) -> bool {
+        self.is_begin_held(now) && self.pending_reason.explains_begin_hold()
+    }
+
+    /// Set the scheduling reason, dropping any description the previous reason
+    /// carried. Every write to `pending_reason` goes through here or
+    /// [`Job::set_pending_reason_desc`]: a description left behind by an
+    /// earlier reason would mask the new one everywhere it is displayed.
+    ///
+    /// Clearing `launch_failure_detail` here is in-memory only; durable detail
+    /// lives in the WAL (`JobLaunchFailureDetail`) until `JobStart` or a new
+    /// detail proposal overwrites it.
+    pub fn set_pending_reason(&mut self, reason: PendingReason) {
+        if self.pending_reason == PendingReason::JobLaunchFailure
+            && reason != PendingReason::JobLaunchFailure
+        {
+            self.launch_failure_detail = None;
+        }
+        self.pending_reason = reason;
+        self.pending_reason_desc = None;
+    }
+
+    /// Set the reason together with a Slurm-style `state_desc` override.
+    pub fn set_pending_reason_desc(&mut self, reason: PendingReason, desc: impl Into<String>) {
+        if self.pending_reason == PendingReason::JobLaunchFailure
+            && reason != PendingReason::JobLaunchFailure
+        {
+            self.launch_failure_detail = None;
+        }
+        self.pending_reason = reason;
+        self.pending_reason_desc = Some(desc.into());
+    }
+
+    /// The reason as users see it. Mirrors Slurm, where a `state_desc` wins
+    /// over the reason code in both `squeue` and `scontrol show job`.
+    pub fn state_reason_display(&self) -> String {
+        self.state_reason()
+    }
+
     /// Attempt a state transition, enforcing the state machine.
     pub fn transition(&mut self, to: JobState) -> Result<(), JobTransitionError> {
         let valid = match (self.state, to) {
@@ -802,6 +1200,10 @@ impl Job {
             (JobState::Completing, JobState::Completed) => true,
             (JobState::Completing, JobState::Failed) => true,
             (JobState::Completing, JobState::Cancelled) => true,
+            // A job signalled for exceeding its time limit routes through
+            // Completing like any other, so the final verdict lands from there
+            // (Slurm's JOB_TIMEOUT | JOB_COMPLETING).
+            (JobState::Completing, JobState::Timeout) => true,
             (JobState::Completing, JobState::NodeFail) => true,
             (JobState::Completing, JobState::OutOfMemory) => true,
             (JobState::Suspended, JobState::Running) => true,
@@ -870,6 +1272,280 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[test]
+    fn effective_memory_mb_defaults_to_zero_when_unset() {
+        let spec = JobSpec::default();
+        assert_eq!(effective_memory_mb(&spec, 1), 0);
+    }
+
+    // Pre-`pty` JobSpec must still deserialize, or spurctld crashes on replay.
+    #[test]
+    fn job_spec_deserializes_without_pty_field() {
+        let mut value = serde_json::to_value(JobSpec::default()).unwrap();
+        value.as_object_mut().unwrap().remove("pty");
+        let spec: JobSpec = serde_json::from_value(value).unwrap();
+        assert!(!spec.pty);
+    }
+
+    #[test]
+    fn resolved_stdout_default_is_absolute_under_work_dir() {
+        let job = Job::new(
+            7,
+            JobSpec {
+                work_dir: "/home/alice".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.resolved_stdout(), "/home/alice/spur-7.out");
+        assert_eq!(job.resolved_stderr(), "/home/alice/spur-7.out");
+    }
+
+    #[test]
+    fn resolved_stdout_empty_work_dir_anchors_to_default() {
+        let job = Job::new(
+            7,
+            JobSpec {
+                work_dir: String::new(),
+                ..Default::default()
+            },
+        );
+        // Matches where the agent launches the job, so reported/computed paths agree.
+        assert_eq!(
+            job.resolved_stdout(),
+            format!("{}/spur-7.out", DEFAULT_WORK_DIR)
+        );
+    }
+
+    #[test]
+    fn resolved_stdout_relative_pattern_joined_and_substituted() {
+        let job = Job::new(
+            42,
+            JobSpec {
+                work_dir: "/work".into(),
+                stdout_path: Some("out-%j.log".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.resolved_stdout(), "/work/out-42.log");
+    }
+
+    #[test]
+    fn resolved_stdout_absolute_pattern_passes_through() {
+        let job = Job::new(
+            9,
+            JobSpec {
+                work_dir: "/work".into(),
+                stdout_path: Some("/shared/job-%j.out".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.resolved_stdout(), "/shared/job-9.out");
+    }
+
+    // A crafted job name must not turn a relative pattern absolute and escape
+    // work_dir: relativity is judged on the pattern, not the substituted value.
+    #[test]
+    fn resolved_stdout_injected_absolute_name_stays_under_work_dir() {
+        let job = Job::new(
+            5,
+            JobSpec {
+                name: "/abs/evil".into(),
+                work_dir: "/work".into(),
+                stdout_path: Some("%x.out".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.resolved_stdout(), "/work/abs/evil.out");
+    }
+
+    // A `%` code appearing inside a substituted value is not re-expanded.
+    #[test]
+    fn resolved_stdout_substituted_value_not_re_expanded() {
+        let job = Job::new(
+            7,
+            JobSpec {
+                name: "%u".into(),
+                user: "bob".into(),
+                work_dir: "/work".into(),
+                stdout_path: Some("%x.out".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.resolved_stdout(), "/work/%u.out");
+    }
+
+    // Absoluteness is guaranteed at submission (CLI cwd, agent /tmp fallback),
+    // not fabricated here: a relative work_dir yields a relative path.
+    #[test]
+    fn resolved_stdout_relative_work_dir_anchored_as_is() {
+        let job = Job::new(
+            3,
+            JobSpec {
+                work_dir: "relwork".into(),
+                stdout_path: Some("out.log".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.resolved_stdout(), "relwork/out.log");
+    }
+
+    #[test]
+    fn effective_num_nodes_caps_at_task_count() {
+        let spec = JobSpec {
+            num_nodes: 4,
+            num_tasks: 1,
+            tasks_per_node: None,
+            ..Default::default()
+        };
+        assert_eq!(spec.effective_num_nodes(), 1);
+    }
+
+    #[test]
+    fn effective_num_nodes_caps_at_partial_task_count() {
+        let spec = JobSpec {
+            num_nodes: 4,
+            num_tasks: 3,
+            tasks_per_node: None,
+            ..Default::default()
+        };
+        assert_eq!(spec.effective_num_nodes(), 3);
+    }
+
+    #[test]
+    fn effective_num_nodes_keeps_exact_fit() {
+        let spec = JobSpec {
+            num_nodes: 4,
+            num_tasks: 4,
+            tasks_per_node: None,
+            ..Default::default()
+        };
+        assert_eq!(spec.effective_num_nodes(), 4);
+    }
+
+    #[test]
+    fn effective_num_nodes_does_not_grow_beyond_request() {
+        let spec = JobSpec {
+            num_nodes: 4,
+            num_tasks: 8,
+            tasks_per_node: None,
+            ..Default::default()
+        };
+        assert_eq!(spec.effective_num_nodes(), 4);
+    }
+
+    #[test]
+    fn effective_num_nodes_honors_explicit_tasks_per_node() {
+        let spec = JobSpec {
+            num_nodes: 4,
+            num_tasks: 1,
+            tasks_per_node: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(spec.effective_num_nodes(), 4);
+    }
+
+    #[test]
+    fn effective_num_nodes_floors_at_one() {
+        let spec = JobSpec {
+            num_nodes: 0,
+            num_tasks: 0,
+            tasks_per_node: None,
+            ..Default::default()
+        };
+        assert_eq!(spec.effective_num_nodes(), 1);
+    }
+
+    #[test]
+    fn effective_memory_mb_uses_per_node_when_set() {
+        let spec = JobSpec {
+            memory_per_node_mb: Some(1024),
+            ..Default::default()
+        };
+        assert_eq!(effective_memory_mb(&spec, 3), 3072);
+    }
+
+    #[test]
+    fn effective_memory_mb_falls_back_to_per_cpu() {
+        let spec = JobSpec {
+            memory_per_node_mb: None,
+            memory_per_cpu_mb: Some(512),
+            num_tasks: 4,
+            cpus_per_task: 2,
+            ..Default::default()
+        };
+        // 4 tasks * 2 cpus/task * 512 MB/cpu
+        assert_eq!(effective_memory_mb(&spec, 1), 4096);
+    }
+
+    #[test]
+    fn effective_memory_mb_prefers_per_node_over_per_cpu() {
+        let spec = JobSpec {
+            memory_per_node_mb: Some(2048),
+            memory_per_cpu_mb: Some(512),
+            num_tasks: 4,
+            cpus_per_task: 2,
+            ..Default::default()
+        };
+        assert_eq!(effective_memory_mb(&spec, 1), 2048);
+    }
+
+    #[test]
+    fn effective_gpus_zero_when_no_gres() {
+        let spec = JobSpec::default();
+        assert_eq!(effective_gpus(&spec, 1), 0);
+    }
+
+    #[test]
+    fn effective_gpus_counts_per_node_times_nodes() {
+        let spec = JobSpec {
+            gres: vec!["gpu:3".into()],
+            ..Default::default()
+        };
+        assert_eq!(effective_gpus(&spec, 1), 3);
+        assert_eq!(effective_gpus(&spec, 2), 6);
+    }
+
+    #[test]
+    fn effective_gpus_handles_typed_and_ignores_non_gpu() {
+        let spec = JobSpec {
+            gres: vec!["gpu:mi300x:4".into(), "bandwidth:lustre:100".into()],
+            ..Default::default()
+        };
+        assert_eq!(effective_gpus(&spec, 1), 4);
+    }
+
+    #[test]
+    fn effective_gpus_sums_multiple_gpu_entries() {
+        let spec = JobSpec {
+            gres: vec!["gpu:2".into(), "gpu:mi300x:1".into()],
+            ..Default::default()
+        };
+        assert_eq!(effective_gpus(&spec, 1), 3);
+    }
+
+    #[test]
+    fn effective_gpus_total_is_not_multiplied_by_nodes() {
+        // --gpus=N is a job total, not per-node.
+        let spec = JobSpec {
+            num_nodes: 2,
+            gpus: Some(crate::gpu_request::GpuRequest::new(8, None)),
+            ..Default::default()
+        };
+        assert_eq!(effective_gpus(&spec, 2), 8);
+    }
+
+    #[test]
+    fn effective_gpus_per_task_scales_with_tasks() {
+        let spec = JobSpec {
+            num_nodes: 2,
+            num_tasks: 4,
+            tasks_per_node: Some(2),
+            gpus_per_task: Some(crate::gpu_request::GpuRequest::new(1, None)),
+            ..Default::default()
+        };
+        assert_eq!(effective_gpus(&spec, 2), 4);
     }
 
     #[test]
@@ -1015,6 +1691,68 @@ mod tests {
         assert_eq!(state, JobState::Failed);
         assert_eq!(code, 5);
         assert_eq!(signal, 11);
+    }
+
+    /// A job whose run the watchdog signalled for exhausting its time limit.
+    fn timed_out_job() -> Job {
+        let mut job = make_job();
+        job.time_limit_signaled_at = Some(Utc::now());
+        job
+    }
+
+    #[test]
+    fn completion_verdict_reports_timeout_for_a_job_killed_by_its_time_limit() {
+        // The regression: SIGTERM from the watchdog looks exactly like any other
+        // signal death to derived_completion, which reports Failed.
+        let (state, reason) = timed_out_job().completion_verdict(JobState::Failed, 0, 15, false);
+        assert_eq!(state, JobState::Timeout);
+        assert_eq!(reason, PendingReason::TimeLimit);
+    }
+
+    #[test]
+    fn completion_verdict_reports_timeout_when_the_job_exits_cleanly_on_sigterm() {
+        // A script that traps SIGTERM, checkpoints, and exits 0 still ran out of
+        // time; the run's outcome is not the handler's exit status.
+        let (state, reason) = timed_out_job().completion_verdict(JobState::Completed, 0, 0, false);
+        assert_eq!(state, JobState::Timeout);
+        assert_eq!(reason, PendingReason::TimeLimit);
+    }
+
+    #[test]
+    fn completion_verdict_leaves_an_unsignalled_death_alone() {
+        // Nothing to do with the time limit: a job killed by an external SIGKILL
+        // must keep reporting Failed / RaisedSignal.
+        let (state, reason) = make_job().completion_verdict(JobState::Failed, 0, 9, false);
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(reason, PendingReason::RaisedSignal);
+
+        let (state, reason) = make_job().completion_verdict(JobState::Failed, 42, 0, false);
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(reason, PendingReason::NonZeroExitCode);
+
+        let (state, reason) = make_job().completion_verdict(JobState::Completed, 0, 0, false);
+        assert_eq!(state, JobState::Completed);
+        assert_eq!(reason, PendingReason::None);
+    }
+
+    #[test]
+    fn completion_verdict_lets_an_oom_kill_outrank_the_time_limit() {
+        // Kernel evidence of a specific failure the user must act on beats the
+        // controller's own reason for signalling the job.
+        let (state, reason) = timed_out_job().completion_verdict(JobState::Failed, 0, 9, true);
+        assert_eq!(state, JobState::OutOfMemory);
+        assert_eq!(reason, PendingReason::OutOfMemory);
+    }
+
+    #[test]
+    fn a_timed_out_job_finalizes_from_completing() {
+        // The completion path routes every job through Completing, so without
+        // this transition a timed-out job could not reach its verdict.
+        let mut job = make_job();
+        job.transition(JobState::Running).unwrap();
+        job.transition(JobState::Completing).unwrap();
+        job.transition(JobState::Timeout).unwrap();
+        assert_eq!(job.state, JobState::Timeout);
     }
 
     #[test]
@@ -1287,6 +2025,11 @@ mod tests {
             "QOSMaxCpuPerUserLimit",
         ),
         (
+            PendingReason::QosMaxNodePerUserLimit,
+            "QOSMaxNodePerUserLimit",
+        ),
+        (PendingReason::QosMaxMemoryPerUser, "QOSMaxMemoryPerUser"),
+        (
             PendingReason::QosMaxSubmitJobPerUserLimit,
             "QOSMaxSubmitJobPerUserLimit",
         ),
@@ -1294,12 +2037,39 @@ mod tests {
             PendingReason::QosMaxNodePerJobLimit,
             "QOSMaxNodePerJobLimit",
         ),
+        (PendingReason::QosMaxGpuPerJobLimit, "QOSMaxGRESPerJob"),
+        (PendingReason::QosMaxGpuPerUserLimit, "QOSMaxGRESPerUser"),
         (PendingReason::QosGrpCpuLimit, "QOSGrpCpuLimit"),
         (PendingReason::QosGrpMemLimit, "QOSGrpMemLimit"),
         (PendingReason::QosGrpNodeLimit, "QOSGrpNodeLimit"),
+        (PendingReason::QosGrpGpuLimit, "QOSGrpGRES"),
         (PendingReason::BurstBufferResources, "BurstBufferResources"),
         (PendingReason::BurstBufferStageIn, "BurstBufferStageIn"),
         (PendingReason::JobHoldMaxRequeue, "JobHoldMaxRequeue"),
+        (PendingReason::TimeLimit, "TimeLimit"),
+        (PendingReason::AssocMaxJobsLimit, "AssocMaxJobsLimit"),
+        (
+            PendingReason::AssocMaxSubmitJobLimit,
+            "AssocMaxSubmitJobLimit",
+        ),
+        (
+            PendingReason::AssocMaxCpuPerJobLimit,
+            "AssocMaxCpuPerJobLimit",
+        ),
+        (
+            PendingReason::AssocMaxNodePerJobLimit,
+            "AssocMaxNodePerJobLimit",
+        ),
+        (PendingReason::AssocMaxMemPerJob, "AssocMaxMemPerJob"),
+        (PendingReason::AssocMaxGpuPerJobLimit, "AssocMaxGRESPerJob"),
+        (PendingReason::AssocGrpCpuLimit, "AssocGrpCpuLimit"),
+        (PendingReason::AssocGrpNodeLimit, "AssocGrpNodeLimit"),
+        (PendingReason::AssocGrpMemLimit, "AssocGrpMemLimit"),
+        (PendingReason::AssocGrpGpuLimit, "AssocGrpGRES"),
+        (
+            PendingReason::AssocMaxWallDurationPerJobLimit,
+            "AssocMaxWallDurationPerJobLimit",
+        ),
     ];
 
     #[test]
@@ -1332,14 +2102,132 @@ mod tests {
     }
 
     #[test]
+    fn a_description_overrides_the_reason_code_in_user_facing_output() {
+        // Mirrors Slurm, where squeue and scontrol print state_desc when it is
+        // set and fall back to the state_reason code when it is not.
+        let mut job = make_job();
+        job.set_pending_reason(PendingReason::Held);
+        assert_eq!(job.state_reason_display(), "JobHeldUser");
+
+        job.set_pending_reason_desc(PendingReason::Held, "launch failed requeued held");
+        assert_eq!(job.state_reason_display(), "launch failed requeued held");
+        assert_eq!(job.state_reason(), "launch failed requeued held");
+        assert_eq!(
+            job.pending_reason,
+            PendingReason::Held,
+            "the description explains the code, it does not replace it"
+        );
+    }
+
+    #[test]
+    fn state_reason_shows_launch_failure_detail_while_pending() {
+        let mut job = make_job();
+        job.state = JobState::Pending;
+        job.set_pending_reason(PendingReason::JobLaunchFailure);
+        job.launch_failure_detail = Some("PMIx prepare failed: n1: connect failed".into());
+        assert_eq!(
+            job.state_reason(),
+            "JobLaunchFailure (PMIx prepare failed: n1: connect failed)"
+        );
+        assert_eq!(
+            job.state_reason_display(),
+            "JobLaunchFailure (PMIx prepare failed: n1: connect failed)"
+        );
+    }
+
+    #[test]
+    fn state_reason_omits_stale_launch_failure_detail_after_requeue() {
+        let mut job = make_job();
+        job.state = JobState::Pending;
+        job.set_pending_reason(PendingReason::JobLaunchFailure);
+        job.launch_failure_detail = Some("PMIx prepare failed: n1: connect failed".into());
+        job.set_pending_reason(PendingReason::Priority);
+        assert_eq!(job.state_reason(), "Priority");
+        assert!(job.launch_failure_detail.is_none());
+    }
+
+    #[test]
+    fn job_dispatch_backoff_preserves_launch_failure_detail() {
+        let mut job = make_job();
+        job.set_pending_reason(PendingReason::JobLaunchFailure);
+        job.launch_failure_detail = Some("PMIx prepare failed: n1: timeout".into());
+        job.requeue_count += 1;
+        job.set_pending_reason(PendingReason::JobLaunchFailure);
+        assert_eq!(
+            job.state_reason(),
+            "JobLaunchFailure (PMIx prepare failed: n1: timeout)"
+        );
+    }
+
+    #[test]
+    fn a_new_reason_never_inherits_the_previous_description() {
+        // The whole point of routing writes through the setters: a description
+        // left behind by an earlier hold would masquerade as the current reason
+        // everywhere the job is displayed.
+        let mut job = make_job();
+        job.set_pending_reason_desc(PendingReason::Held, "launch failed requeued held");
+
+        job.set_pending_reason(PendingReason::JobHoldMaxRequeue);
+
+        assert_eq!(job.pending_reason_desc, None);
+        assert_eq!(job.state_reason_display(), "JobHoldMaxRequeue");
+    }
+
+    #[test]
+    fn a_job_snapshot_without_a_description_still_deserializes() {
+        // Pre-upgrade snapshots carry no pending_reason_desc; they must load
+        // with the field absent rather than failing the whole replay.
+        let mut job = make_job();
+        job.set_pending_reason(PendingReason::Held);
+
+        let mut value = serde_json::to_value(&job).expect("serialize job");
+        assert!(
+            value.get("pending_reason_desc").is_none(),
+            "an absent description must not be written out"
+        );
+        value.as_object_mut().unwrap().remove("pending_reason_desc");
+
+        let back: Job = serde_json::from_value(value).expect("deserialize job");
+        assert_eq!(back.pending_reason_desc, None);
+        assert_eq!(back.state_reason_display(), "JobHeldUser");
+    }
+
+    #[test]
+    fn is_begin_held_tracks_the_hold_window_regardless_of_reason() {
+        let now = Utc::now();
+        let mut job = make_job();
+
+        assert!(!job.is_begin_held(now), "no begin_time means not held");
+
+        job.spec.begin_time = Some(now + chrono::Duration::seconds(30));
+        assert!(job.is_begin_held(now));
+
+        // The predicate is keyed on the hold window alone: a launch-failure
+        // backoff must be recognised as held even though its reason is not
+        // BeginTime, otherwise the reason gets overwritten while it waits.
+        job.pending_reason = PendingReason::JobLaunchFailure;
+        assert!(job.is_begin_held(now));
+
+        job.spec.begin_time = Some(now - chrono::Duration::seconds(1));
+        assert!(!job.is_begin_held(now), "a lapsed hold no longer defers");
+    }
+
+    #[test]
     fn test_path_resolution() {
         let mut job = make_job();
         job.job_id = 42;
         job.spec.name = "train".into();
         job.spec.user = "bob".into();
+        job.spec.work_dir = "/work".into();
 
-        assert_eq!(job.resolve_path("spur-%j.out"), "spur-42.out");
-        assert_eq!(job.resolve_path("output-%x-%u.log"), "output-train-bob.log");
+        // Relative patterns are anchored to work_dir (absolute), matching Slurm.
+        assert_eq!(job.resolve_path("spur-%j.out"), "/work/spur-42.out");
+        assert_eq!(
+            job.resolve_path("output-%x-%u.log"),
+            "/work/output-train-bob.log"
+        );
+        // Absolute patterns pass through unchanged.
+        assert_eq!(job.resolve_path("/abs/out-%j.log"), "/abs/out-42.log");
     }
 
     #[test]
@@ -1414,15 +2302,31 @@ mod tests {
     fn resolved_stdin_expands_pattern() {
         let spec = JobSpec {
             stdin_path: Some("input-%j.txt".into()),
+            work_dir: "/work".into(),
             ..Default::default()
         };
         let job = Job::new(42, spec);
-        assert_eq!(job.resolved_stdin(), Some("input-42.txt".into()));
+        // Relative stdin is anchored to work_dir, mirroring stdout/stderr.
+        assert_eq!(job.resolved_stdin(), Some("/work/input-42.txt".into()));
     }
 
     #[test]
     fn resolved_stdin_none_when_unset() {
         let job = Job::new(1, JobSpec::default());
         assert_eq!(job.resolved_stdin(), None);
+    }
+
+    #[test]
+    fn sort_rank_follows_slurm_state_order_not_enum_order() {
+        // SUSPENDED ranks right after RUNNING and before COMPLETING, unlike the
+        // enum's declaration order (Completing before Suspended).
+        assert!(JobState::Running.sort_rank() < JobState::Suspended.sort_rank());
+        assert!(JobState::Suspended.sort_rank() < JobState::Completing.sort_rank());
+        assert_eq!(JobState::Pending.sort_rank(), 0);
+        // Ranks are unique across all states.
+        let mut ranks: Vec<u8> = JobState::ALL.iter().map(|s| s.sort_rank()).collect();
+        ranks.sort_unstable();
+        ranks.dedup();
+        assert_eq!(ranks.len(), JobState::ALL.len());
     }
 }

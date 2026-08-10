@@ -14,20 +14,42 @@ use nix::unistd::Pid;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
+use spur_core::config::MemlockLimit;
 use spur_core::job::JobId;
-use spur_spank::SpankHost;
+use spur_spank::{SpankContext, SpankHandle, SpankHost};
 
-/// Typed launch errors so callers can distinguish prolog failure from other failures.
+/// Typed launch errors so callers can distinguish a broken node from a job that
+/// simply cannot run here.
 pub enum LaunchError {
     PrologFailed(anyhow::Error),
+    /// The node itself cannot host work: an I/O failure in spurd's own spool
+    /// tree, so every subsequent job will fail identically.
+    NodeFault(anyhow::Error),
     Other(anyhow::Error),
 }
 
 impl std::fmt::Display for LaunchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `{:#}` renders the whole cause chain. Plain `{}` prints only the
+        // outermost context, which would reduce a drain reason to "create job
+        // spool dir" and drop the errno an operator needs to act on.
         match self {
-            Self::PrologFailed(e) => write!(f, "prolog failed: {e}"),
-            Self::Other(e) => write!(f, "{e}"),
+            Self::PrologFailed(e) => write!(f, "prolog failed: {e:#}"),
+            Self::NodeFault(e) => write!(f, "launch failed: {e:#}"),
+            Self::Other(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl LaunchError {
+    /// Reason for the agent to drain itself, or `None` when the controller owns
+    /// the decision. A prolog failure drains too, but the controller does it,
+    /// because only the controller can pair the drain with the hold that stops
+    /// the job walking the cluster.
+    pub fn drain_reason(&self) -> Option<String> {
+        match self {
+            Self::NodeFault(_) => Some(self.to_string()),
+            Self::PrologFailed(_) | Self::Other(_) => None,
         }
     }
 }
@@ -35,6 +57,48 @@ impl std::fmt::Display for LaunchError {
 impl From<anyhow::Error> for LaunchError {
     fn from(e: anyhow::Error) -> Self {
         Self::Other(e)
+    }
+}
+
+/// True when the error chain carries a real OS-level I/O failure that the node
+/// itself is responsible for.
+///
+/// An exclusion list, mirroring Slurm's "all others drain the node" default: the
+/// spool tree is root-owned and every path under it is built from the job id
+/// alone, so a submission cannot steer the errno. Requiring a real
+/// `raw_os_error` keeps a plain `anyhow!("...")` out, and `EDQUOT` stays
+/// excluded as a property of a user on a shared filesystem, not of the node.
+fn is_node_fault_io_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(is_node_fault_errno)
+}
+
+fn is_node_fault_errno(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(errno) if errno != libc::EDQUOT)
+}
+
+/// True when `dir` lives in the spool tree spurd owns, as opposed to the
+/// world-writable temp fallback [`create_job_spool_dir`] drops to on a non-root
+/// dev run. Only the owned tree may condemn a node: `/tmp` exhaustion is
+/// something any single job can cause, so draining on it would let one runaway
+/// job take the cluster down node by node.
+fn is_node_owned_spool(dir: &Path) -> bool {
+    dir.starts_with(SPOOL_ROOT)
+}
+
+/// Classify a failed write to a job's spool directory. An I/O failure under the
+/// node's own spool root condemns the node; anything else is just this job's
+/// problem.
+///
+/// Only spool writes may reach this. Writes to the job's `work_dir` must not use
+/// it: that path is user-controlled and frequently a shared mount, where one user
+/// filling their quota would otherwise drain every node in turn.
+fn classify_spool_error(dir: &Path, err: anyhow::Error) -> LaunchError {
+    if is_node_owned_spool(dir) && is_node_fault_io_error(&err) {
+        LaunchError::NodeFault(err)
+    } else {
+        LaunchError::Other(err)
     }
 }
 
@@ -57,10 +121,27 @@ pub struct ContainerLaunchConfig {
 ///
 /// Groups the resolved execution parameters that come from multiple sources
 /// (JobSpec, scheduler allocation, agent config) into a single value.
+/// How the job's I/O is connected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LaunchIo {
+    /// Traditional file-based stdout/stderr capture.
+    #[default]
+    File,
+    /// PTY-backed: stdout/stderr/stdin all go through a pseudo-terminal.
+    /// The master fd is returned in `LaunchResult::pty_master`.
+    Pty,
+}
+
 pub struct JobLaunchConfig {
     pub job_id: JobId,
     pub script: String,
     pub work_dir: String,
+    /// Needed to expand `%x`/`%u`/`%N`/`%a`/`%A` in output paths as the controller does.
+    pub name: String,
+    pub user: String,
+    pub node: String,
+    pub array_job_id: Option<JobId>,
+    pub array_task_id: Option<u32>,
     pub environment: HashMap<String, String>,
     pub stdout_path: String,
     pub stderr_path: String,
@@ -78,12 +159,138 @@ pub struct JobLaunchConfig {
     pub nodelist: String,
     /// Registry-based device injection plan for host (non-container) jobs.
     pub host_device_plan: Option<spur_devices::inject::HostInjectionPlan>,
+    /// RLIMIT_MEMLOCK to apply before exec (while still privileged).
+    pub memlock: MemlockLimit,
+    /// I/O mode for the job.
+    pub io_mode: LaunchIo,
+    /// Direct multi-rank PMIx launch via a wrapper script (batch `--mpi=pmix`).
+    pub pmix_multi_task: bool,
 }
 
 pub struct LaunchResult {
     pub job: RunningJob,
     pub stdout_path: String,
     pub stderr_path: String,
+    /// Master fd of the PTY (only set when `io_mode == LaunchIo::Pty`).
+    pub pty_master: Option<OwnedFd>,
+}
+
+/// Owns the resolved fds for a job's stdio, built once and consumed by both
+/// the container (raw fork) and non-container (tokio::Command) spawn paths.
+enum JobIo {
+    File {
+        stdin: Option<OwnedFd>,
+        stdout: OwnedFd,
+        stderr: OwnedFd,
+    },
+    Pty {
+        master: OwnedFd,
+        slave: OwnedFd,
+    },
+}
+
+/// `Copy` snapshot of raw fds from a `JobIo`, safe to move into a `pre_exec`
+/// closure or use in a raw-fork child. The parent retains ownership of the
+/// underlying `OwnedFd`s so they stay valid through the fork boundary.
+#[derive(Clone, Copy)]
+pub(crate) enum JobIoRaw {
+    File {
+        stdin: Option<RawFd>,
+        stdout: RawFd,
+        stderr: RawFd,
+    },
+    Pty {
+        master: RawFd,
+        slave: RawFd,
+    },
+}
+
+impl JobIo {
+    fn raw(&self) -> JobIoRaw {
+        match self {
+            JobIo::File {
+                stdin,
+                stdout,
+                stderr,
+            } => JobIoRaw::File {
+                stdin: stdin.as_ref().map(|fd| fd.as_raw_fd()),
+                stdout: stdout.as_raw_fd(),
+                stderr: stderr.as_raw_fd(),
+            },
+            JobIo::Pty { master, slave } => JobIoRaw::Pty {
+                master: master.as_raw_fd(),
+                slave: slave.as_raw_fd(),
+            },
+        }
+    }
+
+    /// Parent-side: extract the PTY master fd, dropping everything else.
+    fn into_master(self) -> Option<OwnedFd> {
+        match self {
+            JobIo::Pty { master, .. } => Some(master),
+            JobIo::File { .. } => None,
+        }
+    }
+}
+
+impl JobIoRaw {
+    /// Wire this job's stdio into the current process.
+    ///
+    /// For File mode: dup2 stdin/stdout/stderr from the opened files.
+    /// For PTY mode: setsid + TIOCSCTTY + dup2 slave + close master.
+    ///
+    /// # Safety
+    /// Must only be called in a child process (post-fork or inside pre_exec).
+    /// All operations are async-signal-safe.
+    pub(crate) unsafe fn wire(self) -> std::io::Result<()> {
+        match self {
+            JobIoRaw::File {
+                stdin,
+                stdout,
+                stderr,
+            } => {
+                if let Some(fd) = stdin {
+                    crate::pty::checked_dup2(fd, libc::STDIN_FILENO)?;
+                    if fd > 2 {
+                        libc::close(fd);
+                    }
+                }
+                crate::pty::checked_dup2(stdout, libc::STDOUT_FILENO)?;
+                if stdout > 2 {
+                    libc::close(stdout);
+                }
+                crate::pty::checked_dup2(stderr, libc::STDERR_FILENO)?;
+                if stderr > 2 && stderr != stdout {
+                    libc::close(stderr);
+                }
+                Ok(())
+            }
+            JobIoRaw::Pty { master, slave } => crate::pty::pty_pre_exec(slave, master),
+        }
+    }
+
+    /// Wire stdin only (stdout/stderr stay as inherited pipe fds).
+    ///
+    /// Used for batch `--mpi=pmix` multi-rank wrappers: Open MPI's PMIx client
+    /// initializes correctly when stdout is a pipe (srun parity) but falls back
+    /// to singleton worlds when stdout is dup2'd to a regular file.
+    ///
+    /// # Safety
+    /// Same constraints as [`Self::wire`].
+    pub(crate) unsafe fn wire_stdin_only(self) -> std::io::Result<()> {
+        match self {
+            JobIoRaw::File { stdin, .. } => {
+                if let Some(fd) = stdin {
+                    crate::pty::checked_dup2(fd, libc::STDIN_FILENO)?;
+                    if fd > 2 {
+                        libc::close(fd);
+                    }
+                }
+                Ok(())
+            }
+            JobIoRaw::Pty { .. } => self.wire(),
+        }
+    }
 }
 
 /// A running job process — either a tokio-managed child or a raw-forked container.
@@ -101,6 +308,8 @@ pub enum RunningJob {
         cgroup_path: Option<PathBuf>,
         reaped: bool,
     },
+    /// Allocation registered without a batch process (standalone srun).
+    AllocationOnly,
 }
 
 /// Split a finished process's wait status into (exit_code, signal).
@@ -110,6 +319,35 @@ pub fn decode_wait_status(status: nix::sys::wait::WaitStatus) -> (i32, i32) {
         nix::sys::wait::WaitStatus::Exited(_, code) => (code, 0),
         nix::sys::wait::WaitStatus::Signaled(_, sig, _) => (0, sig as i32),
         _ => (-1, 0), // unreachable from try_wait (only Exited/Signaled reach here); -1 = shouldn't-happen sentinel
+    }
+}
+
+/// Set RLIMIT_MEMLOCK in the current process. Best-effort: a non-root spurd
+/// cannot raise the hard limit beyond what it inherited.
+pub(crate) fn apply_memlock(limit: MemlockLimit) {
+    let v = match limit {
+        MemlockLimit::Inherit => return,
+        MemlockLimit::Unlimited => libc::RLIM_INFINITY,
+        MemlockLimit::Bytes(n) => n as libc::rlim_t,
+    };
+    let rl = libc::rlimit {
+        rlim_cur: v,
+        rlim_max: v,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rl) } == 0 {
+        return;
+    }
+    // Non-root cannot raise hard limit. Fall back: raise soft to current hard.
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut current) } == 0 {
+        let fallback = libc::rlimit {
+            rlim_cur: current.rlim_max,
+            rlim_max: current.rlim_max,
+        };
+        unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &fallback) };
     }
 }
 
@@ -126,7 +364,12 @@ impl RunningJob {
         match self {
             RunningJob::Managed { child, .. } => child.id(),
             RunningJob::Forked { pid, .. } => Some(*pid as u32),
+            RunningJob::AllocationOnly => None,
         }
+    }
+
+    pub fn is_allocation_only(&self) -> bool {
+        matches!(self, RunningJob::AllocationOnly)
     }
 
     /// Non-blocking check for process exit. Returns (exit_code, signal) if done.
@@ -161,6 +404,7 @@ impl RunningJob {
                     Err(e) => Err(e.into()),
                 }
             }
+            RunningJob::AllocationOnly => Ok(None),
         }
     }
 
@@ -188,6 +432,7 @@ impl RunningJob {
                 kill_process_tree(*pid, sig);
                 Ok(())
             }
+            RunningJob::AllocationOnly => Ok(()),
         }
     }
 
@@ -195,6 +440,7 @@ impl RunningJob {
         match self {
             RunningJob::Managed { cgroup_path, .. } => cgroup_path.take(),
             RunningJob::Forked { cgroup_path, .. } => cgroup_path.take(),
+            RunningJob::AllocationOnly => None,
         }
     }
 }
@@ -228,15 +474,13 @@ pub async fn launch_job(
             .map_err(LaunchError::PrologFailed)?;
     }
 
-    spawn_job_process(cfg, spank)
-        .await
-        .map_err(LaunchError::Other)
+    spawn_job_process(cfg, spank).await
 }
 
 async fn spawn_job_process(
     cfg: &JobLaunchConfig,
     spank: Option<&SpankHost>,
-) -> anyhow::Result<LaunchResult> {
+) -> Result<LaunchResult, LaunchError> {
     let JobLaunchConfig {
         job_id,
         ref script,
@@ -256,16 +500,6 @@ async fn spawn_job_process(
         ..
     } = *cfg;
     info!(job_id, work_dir, "launching job");
-
-    // Invoke SPANK Init hook (after prolog, before process spawn)
-    if let Some(spank) = spank {
-        if let Err(e) = spank.invoke_hook(spur_spank::SpankHook::Init) {
-            warn!(job_id, error = %e, "SPANK Init hook failed");
-        }
-        if let Err(e) = spank.invoke_hook(spur_spank::SpankHook::TaskInit) {
-            warn!(job_id, error = %e, "SPANK TaskInit hook failed");
-        }
-    }
 
     // Set up cgroup for isolation
     let cgroup_path = setup_cgroup(job_id, cpus, memory_mb, cpu_ids)?;
@@ -298,36 +532,91 @@ async fn spawn_job_process(
 
     // Script + wrapper live in the node-local spool dir, not work_dir (see
     // SPOOL_ROOT), so root-side writes survive NFS root_squash work_dirs.
-    let spool_dir = create_job_spool_dir(job_id, uid, gid).context("create job spool dir")?;
+    let spool_dir = create_job_spool_dir(job_id, uid, gid)?;
     let script_path = spool_dir.join("spur_job.sh");
-    write_job_scratch(&script_path, script, uid, gid).context("failed to write job script")?;
+    write_job_scratch(&script_path, script, uid, gid)
+        .context("failed to write job script")
+        .map_err(|e| classify_spool_error(&spool_dir, e))?;
 
-    // Resolve stdout/stderr paths
-    let stdout_resolved = resolve_output_path(stdout_path, job_id, work_dir);
-    let stderr_resolved = resolve_output_path(stderr_path, job_id, work_dir);
+    // Build resolved output paths (empty for PTY mode since output goes to the terminal).
+    let (stdout_resolved, stderr_resolved) = if cfg.io_mode == LaunchIo::Pty {
+        ("/dev/null".to_string(), "/dev/null".to_string())
+    } else {
+        (
+            resolve_output_path(cfg, work_dir, stdout_path),
+            resolve_output_path(cfg, work_dir, stderr_path),
+        )
+    };
 
-    // Guard: stdin must not overlap stdout/stderr (truncation would destroy input)
-    if !stdin_path.is_empty() {
-        let stdin_resolved = resolve_output_path(stdin_path, job_id, work_dir);
-        if stdin_resolved == stdout_resolved || stdin_resolved == stderr_resolved {
-            anyhow::bail!(
-                "stdin path {} overlaps with an output path; this would truncate the input",
-                stdin_resolved
-            );
+    // Build JobIo: a single object owning the fds for either file or PTY mode.
+    let job_io = match cfg.io_mode {
+        LaunchIo::Pty => {
+            let (master, slave) = crate::pty::openpty_with_winsize(None).context("PTY openpty")?;
+            JobIo::Pty { master, slave }
         }
-    }
+        LaunchIo::File => {
+            let stdin_resolved = if stdin_path.is_empty() {
+                None
+            } else {
+                let r = resolve_output_path(cfg, work_dir, stdin_path);
+                if r == stdout_resolved || r == stderr_resolved {
+                    return Err(anyhow::anyhow!(
+                        "stdin path {} overlaps with an output path; this would truncate the input",
+                        r
+                    )
+                    .into());
+                }
+                Some(r)
+            };
 
-    let use_append = open_mode
-        .as_deref()
-        .map(|m| m.eq_ignore_ascii_case("append"))
-        .unwrap_or(false);
+            let use_append = open_mode
+                .as_deref()
+                .map(|m| m.eq_ignore_ascii_case("append"))
+                .unwrap_or(false);
 
-    // Opened as the submitting user, not root — see open_job_output.
-    let (stdout_file, stderr_file) =
-        open_job_output(uid, gid, use_append, &stdout_resolved, &stderr_resolved)
-            .context("failed to open job output files")?;
+            let (out, err) =
+                open_job_output(uid, gid, use_append, &stdout_resolved, &stderr_resolved)
+                    .context("failed to open job output files")?;
+
+            let stdin_fd = match stdin_resolved {
+                None => None,
+                Some(ref resolved) => {
+                    if uid > 0 {
+                        use std::os::unix::fs::MetadataExt;
+                        let meta = std::fs::metadata(resolved)
+                            .with_context(|| format!("stdin file not found: {}", resolved))?;
+                        let (fuid, fgid, mode) = (meta.uid(), meta.gid(), meta.mode());
+                        let readable = (fuid == uid && mode & 0o400 != 0)
+                            || (fgid == gid && mode & 0o040 != 0)
+                            || (mode & 0o004 != 0);
+                        if !readable {
+                            return Err(anyhow::anyhow!(
+                                "stdin file {} is not readable by uid {}",
+                                resolved,
+                                uid
+                            )
+                            .into());
+                        }
+                    }
+                    let f = std::fs::File::open(resolved)
+                        .with_context(|| format!("failed to open stdin file: {}", resolved))?;
+                    Some(OwnedFd::from(f))
+                }
+            };
+
+            JobIo::File {
+                stdin: stdin_fd,
+                stdout: OwnedFd::from(out),
+                stderr: OwnedFd::from(err),
+            }
+        }
+    };
 
     let mut env = environment.clone();
+
+    if cfg.pmix_multi_task {
+        crate::mpi_plugin::strip_launcher_mpi_env(&mut env);
+    }
 
     // GPU isolation via registry-based device injection plan.
     if let Some(ref plan) = cfg.host_device_plan {
@@ -338,32 +627,59 @@ async fn spawn_job_process(
 
     // Environment-based CPU/thread limiting — works even without cgroups.
     // Well-behaved applications (OpenMP, MKL, PyTorch, etc.) read these.
-    env.insert("OMP_NUM_THREADS".into(), cpus.to_string());
-    env.insert("MKL_NUM_THREADS".into(), cpus.to_string());
-    env.insert("OPENBLAS_NUM_THREADS".into(), cpus.to_string());
-    env.insert("VECLIB_MAXIMUM_THREADS".into(), cpus.to_string());
-    env.insert("NUMEXPR_NUM_THREADS".into(), cpus.to_string());
+    if !cfg.pmix_multi_task {
+        env.insert("OMP_NUM_THREADS".into(), cpus.to_string());
+        env.insert("MKL_NUM_THREADS".into(), cpus.to_string());
+        env.insert("OPENBLAS_NUM_THREADS".into(), cpus.to_string());
+        env.insert("VECLIB_MAXIMUM_THREADS".into(), cpus.to_string());
+        env.insert("NUMEXPR_NUM_THREADS".into(), cpus.to_string());
+    }
+
+    // Run SPANK Init/TaskInit against a handle seeded with the assembled env,
+    // then fold plugin edits back so both the container and command paths pick
+    // them up. Hooks run in the spurd (root) process, not the forked task.
+    if let Some(spank) = spank {
+        if !cfg.pmix_multi_task {
+            let context = SpankContext {
+                job_id,
+                uid,
+                gid,
+                ..Default::default()
+            };
+            let mut handle = SpankHandle::new(context, env);
+            for hook in [spur_spank::SpankHook::Init, spur_spank::SpankHook::TaskInit] {
+                if let Err(e) = spank.invoke_hook(hook, &mut handle) {
+                    warn!(job_id, error = %e, "SPANK hook failed");
+                }
+            }
+            env = handle.env;
+        }
+    }
 
     // Container jobs: use explicit fork() + container_init() instead of bash wrapper.
     if let Some(ctn) = container {
-        if !stdin_path.is_empty() {
+        if !stdin_path.is_empty() && matches!(job_io, JobIo::File { .. }) {
             warn!(
                 job_id,
                 "stdin redirection is not supported for container jobs, ignoring"
             );
         }
-        let job = launch_container_job(cfg, ctn, &env, stdout_file, stderr_file).await?;
+        let (job, pty_master) = launch_container_job(cfg, ctn, &env, job_io).await?;
         return Ok(LaunchResult {
             job,
             stdout_path: stdout_resolved,
             stderr_path: stderr_resolved,
+            pty_master,
         });
     }
 
     // --- Non-container jobs: existing tokio::Command path ---
 
     // Issue #99: If root, wrap job with namespace isolation.
-    let use_namespaces = nix::unistd::geteuid().is_root();
+    // Batch `--mpi=pmix` multi-rank wrappers must stay in the host mount/PID
+    // namespace so Open MPI's PMIx client can reach spurd's embedded server
+    // (same as standalone `srun` via `run_command`, which never uses unshare).
+    let use_namespaces = nix::unistd::geteuid().is_root() && !cfg.pmix_multi_task;
     let (launch_cmd, launch_args) = if use_namespaces {
         let wrapper_path = spool_dir.join("spur_ns.sh");
         let visible_devices = cfg
@@ -372,7 +688,8 @@ async fn spawn_job_process(
             .map(|p| p.visible_devices.as_slice())
             .unwrap_or(&[]);
         let wrapper = build_namespace_wrapper(uid, gid, visible_devices, &script_path);
-        write_job_scratch(&wrapper_path, &wrapper, uid, gid)?;
+        write_job_scratch(&wrapper_path, &wrapper, uid, gid)
+            .map_err(|e| classify_spool_error(&spool_dir, e))?;
         debug!(job_id, "namespace isolation wrapper created");
         (
             "/usr/bin/unshare".to_string(),
@@ -392,39 +709,21 @@ async fn spawn_job_process(
     };
 
     // Launch the process
+    let piped_mpi_stdio = cfg.pmix_multi_task && cfg.io_mode == LaunchIo::File;
     let mut cmd = Command::new(&launch_cmd);
-    let stdin_stdio: Stdio = if stdin_path.is_empty() {
-        Stdio::null()
+    cmd.args(&launch_args).current_dir(work_dir).envs(&env);
+    if !cfg.pmix_multi_task {
+        cmd.process_group(0);
+    }
+    if piped_mpi_stdio {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
     } else {
-        let resolved = resolve_output_path(stdin_path, job_id, work_dir);
-        // spurd runs as root; check owner/group/other read bits against
-        // the job's uid/gid so users cannot exfiltrate root-readable files.
-        // Supplementary groups and ACLs are not checked.
-        if uid > 0 {
-            use std::os::unix::fs::MetadataExt;
-            let meta = std::fs::metadata(&resolved)
-                .with_context(|| format!("stdin file not found: {}", resolved))?;
-            let (fuid, fgid, mode) = (meta.uid(), meta.gid(), meta.mode());
-            let readable = (fuid == uid && mode & 0o400 != 0)
-                || (fgid == gid && mode & 0o040 != 0)
-                || (mode & 0o004 != 0);
-            if !readable {
-                anyhow::bail!("stdin file {} is not readable by uid {}", resolved, uid);
-            }
-        }
-        let f = std::fs::File::open(&resolved)
-            .with_context(|| format!("failed to open stdin file: {}", resolved))?;
-        Stdio::from(f)
-    };
-    cmd.args(&launch_args)
-        .current_dir(work_dir)
-        .envs(&env)
-        .stdout(stdout_file)
-        .stderr(stderr_file)
-        .stdin(stdin_stdio)
-        // Run the batch process in its own process group (pgid == its pid) so
-        // signals can target the whole job tree without touching spurd's group.
-        .process_group(0);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    }
 
     // Reset signal dispositions to default before exec. spurd is launched in the
     // background (SIGINT/SIGQUIT/SIGHUP set to SIG_IGN), and a child inherits that
@@ -448,38 +747,37 @@ async fn spawn_job_process(
         });
     }
 
+    // RLIMIT_MEMLOCK: raise before privilege drop so RDMA/NCCL ibv_reg_mr works.
+    let memlock = cfg.memlock;
+    unsafe {
+        cmd.pre_exec(move || {
+            apply_memlock(memlock);
+            Ok(())
+        });
+    }
+
     // Issue #99, #107: Run job as the submitting user (not root).
-    // Must set supplementary groups (video, render) via initgroups()
-    // so the process can access GPU device nodes.
+    // Must set supplementary groups (video, render) so the process can
+    // access GPU device nodes.
     //
     // Issue #128: when use_namespaces is true, the wrapper handles the priv
     // drop *after* unshare runs (via setpriv). Dropping priv here would cause
     // unshare(2) to fail with EPERM since the unprivileged user lacks
     // CAP_SYS_ADMIN.
-    if uid > 0 && nix::unistd::geteuid().is_root() && !use_namespaces {
-        let target_uid = uid;
-        let target_gid = gid;
-        unsafe {
-            cmd.pre_exec(move || {
-                // Set supplementary groups from /etc/group for this user.
-                // This is critical for GPU access — /dev/dri and /dev/kfd
-                // are typically owned by root:video or root:render.
-                let username = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(target_uid))
-                    .ok()
-                    .flatten()
-                    .map(|u| u.name)
-                    .unwrap_or_else(|| format!("{}", target_uid));
-                let c_name = std::ffi::CString::new(username).unwrap_or_default();
-                libc::initgroups(c_name.as_ptr(), target_gid);
-                Ok(())
-            });
+    if !use_namespaces {
+        if let Some(pd) = crate::privdrop::PrivDrop::resolve_if_needed(uid, gid) {
+            unsafe {
+                cmd.pre_exec(move || {
+                    pd.apply()
+                        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+                    Ok(())
+                });
+            }
+            debug!(
+                job_id,
+                uid, gid, "job will run as non-root user with supplementary groups"
+            );
         }
-        cmd.uid(uid);
-        cmd.gid(gid);
-        debug!(
-            job_id,
-            uid, gid, "job will run as non-root user with supplementary groups"
-        );
     }
 
     // Issue #99: Apply seccomp-BPF syscall filter (opt-in via SPUR_SECCOMP=1).
@@ -513,7 +811,43 @@ async fn spawn_job_process(
         }
     }
 
-    let child = cmd.spawn().context("failed to spawn job process")?;
+    // Wire job I/O (file dup2 or PTY setsid+TIOCSCTTY+dup2) in the child.
+    let raw_io = job_io.raw();
+    let wire_stdin_only = piped_mpi_stdio;
+    unsafe {
+        cmd.pre_exec(move || {
+            if wire_stdin_only {
+                raw_io.wire_stdin_only()
+            } else {
+                raw_io.wire()
+            }
+        });
+    }
+
+    let mut child = cmd.spawn().context("failed to spawn job process")?;
+
+    if piped_mpi_stdio {
+        let shared = stderr_resolved == stdout_resolved;
+        let use_append = open_mode
+            .as_deref()
+            .map(|m| m.eq_ignore_ascii_case("append"))
+            .unwrap_or(false);
+        spawn_mpi_stdio_drains(
+            child.stdout.take(),
+            child.stderr.take(),
+            MpiStdioDrainOpts {
+                uid,
+                gid,
+                stdout_path: &stdout_resolved,
+                stderr_path: &stderr_resolved,
+                shared,
+                use_append,
+            },
+        );
+    }
+
+    // Drop the slave fd immediately so the master gets EOF when the child exits.
+    let pty_master = job_io.into_master();
 
     // Move process into cgroup
     if let Some(ref cgroup) = cgroup_path {
@@ -533,6 +867,7 @@ async fn spawn_job_process(
         job: RunningJob::Managed { child, cgroup_path },
         stdout_path: stdout_resolved,
         stderr_path: stderr_resolved,
+        pty_master,
     })
 }
 
@@ -695,40 +1030,10 @@ fn should_run_as_user(uid: u32) -> bool {
     uid > 0 && nix::unistd::geteuid().is_root()
 }
 
-/// A user's credentials with the supplementary group list already resolved.
-struct UserCreds {
-    uid: nix::unistd::Uid,
-    gid: nix::unistd::Gid,
-    groups: Vec<nix::unistd::Gid>,
-}
-
-/// Resolve the user's supplementary groups in the parent, before any fork:
-/// `getpwuid_r`/`getgrouplist` allocate and lock, so they're unsafe between fork
-/// and exec in a multithreaded process. Leaves the child only async-signal-safe
-/// syscalls (`apply_user_creds`). Falls back to the primary gid if unresolved.
-fn resolve_user_creds(uid: u32, gid: u32) -> UserCreds {
-    let gid = nix::unistd::Gid::from_raw(gid);
-    let groups = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
-        .ok()
-        .flatten()
-        .and_then(|u| std::ffi::CString::new(u.name).ok())
-        .and_then(|name| nix::unistd::getgrouplist(&name, gid).ok())
-        .unwrap_or_else(|| vec![gid]);
-    UserCreds {
-        uid: nix::unistd::Uid::from_raw(uid),
-        gid,
-        groups,
-    }
-}
-
-/// Drop to the submitting user in a forked child using pre-resolved credentials.
-/// Groups before gid before uid, since each drop removes the privilege the prior
-/// step needs. Only setgroups/setgid/setuid run here — all async-signal-safe.
-fn apply_user_creds(creds: &UserCreds) -> nix::Result<()> {
-    nix::unistd::setgroups(&creds.groups)?;
-    nix::unistd::setgid(creds.gid)?;
-    nix::unistd::setuid(creds.uid)?;
-    Ok(())
+/// Resolve and apply user credentials for container fork children.
+/// Delegates to the centralized `PrivDrop` implementation.
+fn resolve_user_creds(uid: u32, gid: u32) -> Option<crate::privdrop::PrivDrop> {
+    crate::privdrop::PrivDrop::resolve_if_needed(uid, gid)
 }
 
 /// Open a single output file, creating parent directories. Runs in whatever
@@ -774,6 +1079,73 @@ fn recv_fds(sock: RawFd) -> nix::Result<Vec<OwnedFd>> {
         }
     }
     Ok(fds)
+}
+
+/// Copy a PMIx batch wrapper's piped stdout/stderr into the job output files.
+///
+/// Open MPI's PMIx client path matches standalone `srun` when stdio is a pipe;
+/// dup2'ing stdout/stderr to regular files before `MPI_Init` yields singleton
+/// worlds even with correct per-rank `PMIX_*` exports in the wrapper.
+struct MpiStdioDrainOpts<'a> {
+    uid: u32,
+    gid: u32,
+    stdout_path: &'a str,
+    stderr_path: &'a str,
+    shared: bool,
+    use_append: bool,
+}
+
+fn spawn_mpi_stdio_drains(
+    stdout_pipe: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>,
+    stderr_pipe: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>,
+    opts: MpiStdioDrainOpts<'_>,
+) {
+    let MpiStdioDrainOpts {
+        uid,
+        gid,
+        stdout_path,
+        stderr_path,
+        shared,
+        use_append,
+    } = opts;
+    let Ok((out, err)) = open_job_output(uid, gid, use_append, stdout_path, stderr_path) else {
+        warn!(
+            stdout = stdout_path,
+            stderr = stderr_path,
+            "failed to open PMIx batch output files for pipe drain"
+        );
+        return;
+    };
+
+    if shared {
+        let sink = std::sync::Arc::new(tokio::sync::Mutex::new(tokio::fs::File::from_std(out)));
+        if let Some(pipe) = stdout_pipe {
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                let mut file = sink.lock().await;
+                let _ = tokio::io::copy(&mut tokio::io::BufReader::new(pipe), &mut *file).await;
+            });
+        }
+        if let Some(pipe) = stderr_pipe {
+            tokio::spawn(async move {
+                let mut file = sink.lock().await;
+                let _ = tokio::io::copy(&mut tokio::io::BufReader::new(pipe), &mut *file).await;
+            });
+        }
+    } else {
+        if let Some(pipe) = stdout_pipe {
+            let mut file = tokio::fs::File::from_std(out);
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut tokio::io::BufReader::new(pipe), &mut file).await;
+            });
+        }
+        if let Some(pipe) = stderr_pipe {
+            let mut file = tokio::fs::File::from_std(err);
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut tokio::io::BufReader::new(pipe), &mut file).await;
+            });
+        }
+    }
 }
 
 /// Open a job's stdout/stderr, creating parent directories.
@@ -828,8 +1200,10 @@ fn open_job_output(
             // Exit codes distinguish failure stages.
             drop(parent_sock);
             let code = 'open: {
-                if apply_user_creds(&creds).is_err() {
-                    break 'open 1;
+                if let Some(ref pd) = creds {
+                    if pd.apply().is_err() {
+                        break 'open 1;
+                    }
                 }
                 let Ok(out) = open_output_file(stdout_path, use_append) else {
                     break 'open 2;
@@ -884,12 +1258,13 @@ fn create_dir_as_user(dir: &Path, uid: u32, gid: u32) -> bool {
     if !should_run_as_user(uid) {
         return std::fs::create_dir_all(dir).is_ok();
     }
-    // Resolve credentials before the fork; see resolve_user_creds.
+    // Resolve credentials before the fork.
     let creds = resolve_user_creds(uid, gid);
     match unsafe { nix::unistd::fork() } {
         Ok(nix::unistd::ForkResult::Child) => {
             // _exit skips atexit/stdio flushing, unsafe in a post-fork child.
-            let ok = apply_user_creds(&creds).is_ok() && std::fs::create_dir_all(dir).is_ok();
+            let ok = creds.as_ref().map(|c| c.apply().is_ok()).unwrap_or(true)
+                && std::fs::create_dir_all(dir).is_ok();
             unsafe { libc::_exit(if ok { 0 } else { 1 }) };
         }
         Ok(nix::unistd::ForkResult::Parent { child }) => {
@@ -906,8 +1281,8 @@ fn create_dir_as_user(dir: &Path, uid: u32, gid: u32) -> bool {
 /// `SPOOL_ROOT`; falls back to a temp dir when it isn't writable (e.g. non-root
 /// dev runs). When spurd is root and the job targets a user, the dir is handed
 /// to that user so the job — which runs as the user — can traverse it.
-fn create_job_spool_dir(job_id: JobId, uid: u32, gid: u32) -> anyhow::Result<PathBuf> {
-    let mut last_err = None;
+fn create_job_spool_dir(job_id: JobId, uid: u32, gid: u32) -> Result<PathBuf, LaunchError> {
+    let mut failures = Vec::new();
     for base in [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")] {
         let dir = base.join(format!("job{}", job_id));
         match std::fs::create_dir_all(&dir) {
@@ -924,17 +1299,65 @@ fn create_job_spool_dir(job_id: JobId, uid: u32, gid: u32) -> anyhow::Result<Pat
                 }
                 return Ok(dir);
             }
-            Err(e) => last_err = Some(e),
+            Err(e) => failures.push((dir, e)),
         }
     }
-    bail!("failed to create job spool dir: {last_err:?}")
+    Err(spool_dir_error(failures))
+}
+
+/// Build the error for a spool dir that could not be created under any candidate
+/// root. Prefers the owned root's failure over the temp fallback's, since that
+/// is the one an operator configured and the only one whose failure condemns the
+/// node.
+///
+/// The `io::Error` must stay a source rather than be formatted into the message:
+/// [`is_node_fault_io_error`] detects the fault by walking the chain, so a
+/// flattened errno would silently downgrade a node fault to a job failure.
+fn spool_dir_error(mut failures: Vec<(PathBuf, std::io::Error)>) -> LaunchError {
+    if failures.is_empty() {
+        return LaunchError::Other(anyhow::anyhow!("no spool root candidates configured"));
+    }
+    let chosen = failures
+        .iter()
+        .position(|(dir, _)| is_node_owned_spool(dir))
+        .unwrap_or(0);
+    let (dir, err) = failures.swap_remove(chosen);
+    let err = anyhow::Error::new(err).context(format!("create job spool dir {}", dir.display()));
+    classify_spool_error(&dir, err)
+}
+
+/// Private per-job directory for srun step scripts under the step work dir.
+pub(crate) fn prepare_step_script_dir(
+    work_dir: &str,
+    job_id: JobId,
+    uid: u32,
+    gid: u32,
+) -> anyhow::Result<PathBuf> {
+    let dir = PathBuf::from(work_dir).join(format!(".spur_step_{job_id}"));
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        if should_run_as_user(uid) {
+            use nix::unistd::{Gid, Uid};
+            nix::unistd::chown(&dir, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+                .with_context(|| format!("chown {}", dir.display()))?;
+        }
+    }
+    Ok(dir)
 }
 
 /// Write a scratch file (job script, namespace wrapper) executable. When spurd
 /// is root and the job targets a user, hand ownership to that user and keep the
 /// file private (0700), so only the job and root can read it — matching Slurm's
 /// batch script handling.
-fn write_job_scratch(path: &Path, content: &str, uid: u32, gid: u32) -> anyhow::Result<()> {
+pub(crate) fn write_job_scratch(
+    path: &Path,
+    content: &str,
+    uid: u32,
+    gid: u32,
+) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::write(path, content).with_context(|| format!("write {}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
@@ -956,23 +1379,21 @@ pub fn cleanup_job_spool(job_id: JobId) {
 }
 
 /// Resolve output path patterns (%j → job_id, etc.)
-fn resolve_output_path(pattern: &str, job_id: JobId, work_dir: &str) -> String {
-    let resolved = if pattern.is_empty() {
-        format!("spur-{}.out", job_id)
-    } else {
-        pattern
-            .replace("%j", &job_id.to_string())
-            .replace("%J", &job_id.to_string())
-    };
-
-    if Path::new(&resolved).is_absolute() {
-        resolved
-    } else {
-        PathBuf::from(work_dir)
-            .join(resolved)
-            .to_string_lossy()
-            .into()
-    }
+/// Resolve a pattern against the *effective* work_dir (may be the `/tmp`
+/// fallback) via the shared resolver, so agent and controller paths match.
+fn resolve_output_path(cfg: &JobLaunchConfig, work_dir: &str, pattern: &str) -> String {
+    spur_core::job::resolve_output_pattern(
+        pattern,
+        &spur_core::job::OutputPathContext {
+            job_id: cfg.job_id,
+            name: &cfg.name,
+            user: &cfg.user,
+            work_dir,
+            node: (!cfg.node.is_empty()).then_some(cfg.node.as_str()),
+            array_job_id: cfg.array_job_id,
+            array_task_id: cfg.array_task_id,
+        },
+    )
 }
 
 /// Launch a containerized job via explicit fork() + container_init().
@@ -987,15 +1408,10 @@ async fn launch_container_job(
     cfg: &JobLaunchConfig,
     ctn: &ContainerLaunchConfig,
     env: &HashMap<String, String>,
-    stdout_fd: std::fs::File,
-    stderr_fd: std::fs::File,
-) -> anyhow::Result<RunningJob> {
+    job_io: JobIo,
+) -> anyhow::Result<(RunningJob, Option<OwnedFd>)> {
     let job_id = cfg.job_id;
     let cgroup_path = setup_cgroup(job_id, cfg.cpus, cfg.memory_mb, &cfg.cpu_ids)?;
-
-    // stdout_fd/stderr_fd are already opened as the submitting user by the
-    // caller (open_job_output). The child dup2's these inherited fds directly,
-    // preserving the append/truncate mode set at open time.
 
     // Sync pipe: child writes status, parent reads.
     // Convert OwnedFd to raw fds for manual lifecycle management across fork.
@@ -1011,6 +1427,11 @@ async fn launch_container_job(
     // Keep OwnedFd alive so the fds aren't closed prematurely
     let _pipe_r_owner = pipe_r;
     let _pipe_w_owner = pipe_w;
+
+    // Snapshot raw I/O fds before fork — the Copy JobIoRaw can be used
+    // in the child without owning the fds (parent's OwnedFds keep them alive
+    // across the fork boundary).
+    let raw_io = job_io.raw();
 
     // Snapshot everything the child needs (must not reference async state after fork)
     let config = &ctn.config;
@@ -1033,15 +1454,18 @@ async fn launch_container_job(
                 libc::signal(libc::SIGPIPE, libc::SIG_DFL);
             }
 
-            // Redirect stdout/stderr to the user-opened output files (inherited
-            // fds), then let close_inherited_fds reap the now-redundant originals.
             unsafe {
-                libc::dup2(stdout_fd.as_raw_fd(), libc::STDOUT_FILENO);
-                libc::dup2(stderr_fd.as_raw_fd(), libc::STDERR_FILENO);
+                if let Err(e) = raw_io.wire() {
+                    let msg = format!("E:stdio wire failed: {:#}", e);
+                    let _ = libc::write(ready_w, msg.as_ptr() as *const _, msg.len());
+                    libc::_exit(1);
+                }
             }
 
-            // Close inherited fds (gRPC sockets, other jobs' files)
             crate::container::close_inherited_fds(ready_w);
+
+            // RLIMIT_MEMLOCK: raise while still root, before container_init drops privileges.
+            apply_memlock(cfg.memlock);
 
             // Run container init: namespaces, mounts, pivot_root, priv drop
             let hook_env = match crate::container::container_init(config, &rootfs) {
@@ -1075,25 +1499,30 @@ async fn launch_container_job(
                 .collect();
             let c_env_refs: Vec<&std::ffi::CStr> = c_env.iter().map(|s| s.as_c_str()).collect();
 
-            // Build exec args: with or without entrypoint
-            let c_bash = CString::new("/bin/bash").unwrap();
+            // Pick a shell that exists in the container
+            let shell = if Path::new("/bin/bash").exists() {
+                "/bin/bash"
+            } else {
+                "/bin/sh"
+            };
+            let c_shell = CString::new(shell).unwrap();
             let exec_args: Vec<CString> = if let Some(ref ep) = entrypoint {
-                let cmd = format!("{} && /bin/bash /tmp/spur_job_{}.sh", ep, job_id);
+                let cmd = format!("{} && {} /tmp/spur_job_{}.sh", ep, shell, job_id);
                 vec![
-                    c_bash.clone(),
+                    c_shell.clone(),
                     CString::new("-c").unwrap(),
                     CString::new(cmd).unwrap(),
                 ]
             } else {
                 vec![
-                    c_bash.clone(),
+                    c_shell.clone(),
                     CString::new(format!("/tmp/spur_job_{}.sh", job_id)).unwrap(),
                 ]
             };
             let exec_arg_refs: Vec<&std::ffi::CStr> =
                 exec_args.iter().map(|s| s.as_c_str()).collect();
 
-            let _ = nix::unistd::execve(&c_bash, &exec_arg_refs, &c_env_refs);
+            let _ = nix::unistd::execve(&c_shell, &exec_arg_refs, &c_env_refs);
             eprintln!("spur: execve failed: {}", std::io::Error::last_os_error());
             std::process::exit(1);
         }
@@ -1102,6 +1531,9 @@ async fn launch_container_job(
             unsafe {
                 libc::close(ready_w);
             }
+
+            // Drop the slave fd immediately so the master gets EOF when the child exits.
+            let pty_master = job_io.into_master();
 
             let child_pid = child.as_raw();
 
@@ -1134,12 +1566,15 @@ async fn launch_container_job(
                 "containerized job launched (fork + pivot_root)"
             );
 
-            Ok(RunningJob::Forked {
-                pid: child_pid,
-                _pidfd: pidfd,
-                cgroup_path,
-                reaped: false,
-            })
+            Ok((
+                RunningJob::Forked {
+                    pid: child_pid,
+                    _pidfd: pidfd,
+                    cgroup_path,
+                    reaped: false,
+                },
+                pty_master,
+            ))
         }
     }
 }
@@ -1285,6 +1720,215 @@ mod tests {
         assert_eq!(decode_wait_status(WaitStatus::StillAlive), (-1, 0));
     }
 
+    // ── launch error classification / node drain ─────────────────
+
+    fn disk_full_error(context: &str) -> anyhow::Error {
+        // Same shape the production paths produce: an io::Error from the
+        // filesystem, wrapped by the call site's .context().
+        anyhow::Error::new(std::io::Error::from_raw_os_error(libc::ENOSPC))
+            .context(context.to_owned())
+    }
+
+    fn owned_spool() -> PathBuf {
+        PathBuf::from(SPOOL_ROOT).join("job1")
+    }
+
+    fn fallback_spool() -> PathBuf {
+        std::env::temp_dir().join("spur").join("job1")
+    }
+
+    #[test]
+    fn spool_disk_exhaustion_is_a_node_fault_and_drains() {
+        // create_job_spool_dir / write_job_scratch target SPOOL_ROOT, which
+        // spurd owns, so a full filesystem there condemns the node.
+        let err = classify_spool_error(&owned_spool(), disk_full_error("create job spool dir"));
+        assert!(matches!(err, LaunchError::NodeFault(_)));
+        let reason = err.drain_reason().expect("node fault must drain");
+        assert!(reason.contains("No space left on device"), "{reason}");
+    }
+
+    #[test]
+    fn a_full_temp_fallback_spool_does_not_drain() {
+        // The fallback root is world-writable, so any single job can fill it.
+        // Draining on that would let one runaway job walk the cluster, taking
+        // out every node the scheduler retries it on.
+        let err = classify_spool_error(&fallback_spool(), disk_full_error("write job script"));
+        assert!(matches!(err, LaunchError::Other(_)));
+        assert!(
+            err.drain_reason().is_none(),
+            "a full world-writable /tmp must never drain the node"
+        );
+    }
+
+    #[test]
+    fn exhausted_spool_roots_stay_classifiable_as_a_node_fault() {
+        // Every candidate root failing to mkdir is what an exhausted rootfs
+        // looks like, since SPOOL_ROOT and the temp fallback usually share a
+        // filesystem. Formatting the errno into the message here would hide it
+        // from classification, so the node would keep accepting jobs it cannot
+        // launch — the retry storm this whole path exists to stop.
+        let err = spool_dir_error(vec![
+            (
+                owned_spool(),
+                std::io::Error::from_raw_os_error(libc::ENOSPC),
+            ),
+            (
+                fallback_spool(),
+                std::io::Error::from_raw_os_error(libc::ENOSPC),
+            ),
+        ]);
+        assert!(matches!(err, LaunchError::NodeFault(_)));
+        let reason = err.drain_reason().expect("node fault must drain");
+        assert!(
+            reason.contains(&owned_spool().display().to_string()),
+            "the configured spool root must be the one named, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn an_errno_rendered_into_the_message_is_not_recoverable() {
+        // Why spool_dir_error keeps the io::Error as a source. Classification
+        // walks the chain, so an errno turned into text is gone for good; this
+        // is how the all-roots-failed path used to lose node faults.
+        let flattened = anyhow::anyhow!(
+            "failed to create job spool dir: {:?}",
+            std::io::Error::from_raw_os_error(libc::ENOSPC)
+        );
+        assert!(
+            !is_node_fault_io_error(&flattened),
+            "an errno in the message text must not be mistaken for a real source"
+        );
+    }
+
+    #[test]
+    fn a_failure_confined_to_the_fallback_root_does_not_drain() {
+        // Only the world-writable fallback failed. The node's own spool is
+        // fine, so this is a job failure, not grounds for taking the node out
+        // of service. This is the path check doing the work, not the errno.
+        let err = spool_dir_error(vec![(
+            fallback_spool(),
+            std::io::Error::from_raw_os_error(libc::ENOSPC),
+        )]);
+        assert!(matches!(err, LaunchError::Other(_)));
+        assert!(err.drain_reason().is_none());
+    }
+
+    #[test]
+    fn an_error_with_no_io_source_never_drains() {
+        // Everything under the owned root drains except EDQUOT, so the errno
+        // check is what keeps a plain anyhow error out. Without it a container
+        // or config problem would start condemning nodes.
+        let err =
+            classify_spool_error(&owned_spool(), anyhow::anyhow!("spool root not configured"));
+        assert!(matches!(err, LaunchError::Other(_)));
+        assert!(err.drain_reason().is_none());
+    }
+
+    #[test]
+    fn a_permission_failure_on_the_owned_spool_root_is_a_node_fault() {
+        // The spool tree is root-owned and every path under it is built by
+        // spurd from the job id, so a submission cannot steer the errno. EACCES
+        // there means the node is misconfigured or its filesystem is broken,
+        // and leaving it eligible just feeds it more jobs to fail.
+        let err = spool_dir_error(vec![(
+            owned_spool(),
+            std::io::Error::from_raw_os_error(libc::EACCES),
+        )]);
+        assert!(matches!(err, LaunchError::NodeFault(_)));
+        assert!(err.drain_reason().is_some());
+    }
+
+    #[test]
+    fn a_hardware_io_error_on_the_owned_spool_root_is_a_node_fault() {
+        let err = classify_spool_error(
+            &owned_spool(),
+            anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EIO))
+                .context("write job script"),
+        );
+        assert!(matches!(err, LaunchError::NodeFault(_)));
+    }
+
+    #[test]
+    fn write_job_scratch_keeps_the_errno_downcastable() {
+        // The whole classification scheme rests on write_job_scratch leaving a
+        // real io::Error in the chain. If it ever formatted the errno into its
+        // message instead, every classification test above would still pass
+        // while production silently stopped draining broken nodes.
+        let err = write_job_scratch(
+            Path::new("/nonexistent-spur-audit-dir/job.sh"),
+            "#!/bin/sh\n",
+            0,
+            0,
+        )
+        .expect_err("writing under a nonexistent parent must fail");
+        assert!(
+            err.chain()
+                .any(|c| c.downcast_ref::<std::io::Error>().is_some()),
+            "the io::Error must survive as a source, not be flattened into text"
+        );
+    }
+
+    #[test]
+    fn read_only_spool_is_a_node_fault() {
+        let err = classify_spool_error(
+            &owned_spool(),
+            anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EROFS))
+                .context("write job script"),
+        );
+        assert!(matches!(err, LaunchError::NodeFault(_)));
+    }
+
+    #[test]
+    fn output_file_disk_exhaustion_does_not_drain() {
+        // open_job_output writes to paths resolved against the job's work_dir,
+        // which is user-controlled and frequently a shared mount. Its errors
+        // reach the caller through `?`, i.e. From<anyhow::Error>, so they must
+        // classify as Other: draining here would take a healthy node offline,
+        // and the scheduler would then repeat it on every remaining node.
+        let err: LaunchError = disk_full_error("failed to open job output files").into();
+        assert!(matches!(err, LaunchError::Other(_)));
+        assert!(
+            err.drain_reason().is_none(),
+            "a full user filesystem must never drain the node"
+        );
+    }
+
+    #[test]
+    fn user_quota_exhaustion_is_not_a_node_fault() {
+        // EDQUOT is a property of a user on a shared filesystem, not of the
+        // node, and no quota applies to the root-owned spool tree.
+        let err = classify_spool_error(
+            &owned_spool(),
+            anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EDQUOT))
+                .context("write job script"),
+        );
+        assert!(matches!(err, LaunchError::Other(_)));
+        assert!(err.drain_reason().is_none());
+    }
+
+    #[test]
+    fn a_spool_failure_with_no_errno_does_not_drain() {
+        let err =
+            classify_spool_error(&owned_spool(), anyhow::anyhow!("container image not found"));
+        assert!(matches!(err, LaunchError::Other(_)));
+        assert!(err.drain_reason().is_none());
+    }
+
+    #[test]
+    fn the_agent_does_not_self_drain_on_a_prolog_failure() {
+        // The drain still happens, but the controller issues it, so it can pair
+        // it with the hold. An agent-side drain would retry the job elsewhere
+        // and walk a job-caused failure across the cluster.
+        let err = LaunchError::PrologFailed(anyhow::anyhow!("exit status 1"));
+        assert!(err.drain_reason().is_none());
+        assert_eq!(
+            err.to_string(),
+            "prolog failed: exit status 1",
+            "this text reaches the controller as the launch error and becomes \
+             the drain reason there, so it must not be double-prefixed"
+        );
+    }
+
     // These exercise the in-process (non-fork) branch of the helpers: as a
     // non-root test runner, should_run_as_user() is false, so no privilege drop
     // or fork happens and behaviour is deterministic regardless of the test uid.
@@ -1418,7 +2062,10 @@ mod tests {
         // A job id unlikely to collide with a real job on the test host; as a
         // non-root runner this resolves to the temp-dir fallback.
         let job_id: JobId = 987_654_321;
-        let dir = create_job_spool_dir(job_id, uid, gid).unwrap();
+        // LaunchError has no Debug impl on purpose (it must not be convertible
+        // back into an anyhow::Error), so report it through Display.
+        let dir = create_job_spool_dir(job_id, uid, gid)
+            .unwrap_or_else(|e| panic!("create spool dir: {e}"));
         assert!(dir.is_dir());
         write_job_scratch(&dir.join("spur_job.sh"), "x", uid, gid).unwrap();
         cleanup_job_spool(job_id);
@@ -1489,17 +2136,55 @@ mod tests {
         assert!(received.is_empty());
     }
 
+    fn launch_cfg_for_paths(job_id: JobId, name: &str, user: &str, node: &str) -> JobLaunchConfig {
+        JobLaunchConfig {
+            job_id,
+            script: String::new(),
+            work_dir: String::new(),
+            name: name.to_string(),
+            user: user.to_string(),
+            node: node.to_string(),
+            array_job_id: None,
+            array_task_id: None,
+            environment: HashMap::new(),
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            stdin_path: String::new(),
+            cpus: 1,
+            memory_mb: 0,
+            gpu_devices: Vec::new(),
+            cpu_ids: Vec::new(),
+            open_mode: None,
+            uid: 0,
+            gid: 0,
+            container: None,
+            prolog_script: None,
+            partition: String::new(),
+            nodelist: String::new(),
+            host_device_plan: None,
+            memlock: MemlockLimit::Unlimited,
+            io_mode: LaunchIo::File,
+            pmix_multi_task: false,
+        }
+    }
+
     #[test]
     fn test_resolve_output_path() {
+        let cfg = launch_cfg_for_paths(42, "train", "alice", "node7");
         assert_eq!(
-            resolve_output_path("spur-%j.out", 42, "/home/user"),
+            resolve_output_path(&cfg, "/home/user", "spur-%j.out"),
             "/home/user/spur-42.out"
         );
         assert_eq!(
-            resolve_output_path("/var/log/job-%j.log", 42, "/home/user"),
+            resolve_output_path(&cfg, "/home/user", "/var/log/job-%j.log"),
             "/var/log/job-42.log"
         );
-        assert_eq!(resolve_output_path("", 42, "/tmp"), "/tmp/spur-42.out");
+        assert_eq!(resolve_output_path(&cfg, "/tmp", ""), "/tmp/spur-42.out");
+        // Same codes as the controller (%x/%u/%N), so reported/computed never diverge.
+        assert_eq!(
+            resolve_output_path(&cfg, "/tmp", "out-%x-%u-%N.log"),
+            "/tmp/out-train-alice-node7.log"
+        );
     }
 
     #[test]
@@ -1659,5 +2344,157 @@ mod tests {
 
         assert!(wrapper.contains("renderD128"));
         assert!(!wrapper.contains("nvidia"));
+    }
+
+    #[tokio::test]
+    async fn jobio_wire_pty() {
+        let (master, slave) = crate::pty::openpty_with_winsize(Some(&crate::pty::WindowSize {
+            rows: 24,
+            cols: 80,
+            xpixel: 0,
+            ypixel: 0,
+        }))
+        .expect("openpty");
+
+        let job_io = JobIo::Pty { master, slave };
+        let raw = job_io.raw();
+
+        let mut cmd = Command::new("/bin/echo");
+        cmd.arg("pty_test_output")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        unsafe {
+            cmd.pre_exec(move || raw.wire());
+        }
+
+        let mut child = cmd.spawn().expect("spawn");
+        let master_fd = job_io.into_master().expect("PTY must have master");
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let mut buf = [0u8; 256];
+        let n = unsafe { libc::read(master_fd.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
+        assert!(n > 0, "expected output from PTY master");
+        let output = String::from_utf8_lossy(&buf[..n as usize]);
+        assert!(
+            output.contains("pty_test_output"),
+            "expected 'pty_test_output' in output, got: {output}"
+        );
+
+        let status = child.wait().await.expect("wait");
+        assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn jobio_wire_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("stdout");
+        let err_path = dir.path().join("stderr");
+
+        let out_file = std::fs::File::create(&out_path).unwrap();
+        let err_file = std::fs::File::create(&err_path).unwrap();
+
+        let job_io = JobIo::File {
+            stdin: None,
+            stdout: OwnedFd::from(out_file),
+            stderr: OwnedFd::from(err_file),
+        };
+        let raw = job_io.raw();
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("echo file_stdout; echo file_stderr >&2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        unsafe {
+            cmd.pre_exec(move || raw.wire());
+        }
+
+        let mut child = cmd.spawn().expect("spawn");
+        assert!(job_io.into_master().is_none(), "File mode has no master");
+
+        let status = child.wait().await.expect("wait");
+        assert!(status.success());
+
+        let stdout = std::fs::read_to_string(&out_path).unwrap();
+        let stderr = std::fs::read_to_string(&err_path).unwrap();
+        assert!(
+            stdout.contains("file_stdout"),
+            "expected 'file_stdout' in stdout, got: {stdout}"
+        );
+        assert!(
+            stderr.contains("file_stderr"),
+            "expected 'file_stderr' in stderr, got: {stderr}"
+        );
+    }
+
+    #[test]
+    fn wire_file_closes_originals_gt_2() {
+        // After wire(), originals > 2 should be closed. Verify by checking that
+        // a write to the original fd fails with EBADF.
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("out");
+        let err_path = dir.path().join("err");
+
+        let out_file = std::fs::File::create(&out_path).unwrap();
+        let err_file = std::fs::File::create(&err_path).unwrap();
+        let out_fd = out_file.as_raw_fd();
+        let err_fd = err_file.as_raw_fd();
+
+        // Both fds should be > 2 since 0/1/2 are taken.
+        assert!(out_fd > 2);
+        assert!(err_fd > 2);
+
+        // Fork so we don't corrupt our own stdio.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+
+        if pid == 0 {
+            let raw = JobIoRaw::File {
+                stdin: None,
+                stdout: out_fd,
+                stderr: err_fd,
+            };
+            let result = unsafe { raw.wire() };
+            // Exit with code 0 on success, 1 on failure.
+            std::process::exit(if result.is_ok() { 0 } else { 1 });
+        }
+
+        // Parent: wait for child.
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "child exited with non-zero status"
+        );
+    }
+
+    #[test]
+    fn wire_file_bad_fd_returns_error() {
+        let raw = JobIoRaw::File {
+            stdin: None,
+            stdout: -1,
+            stderr: -1,
+        };
+        // Fork to avoid clobbering test process stdio.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+
+        if pid == 0 {
+            let result = unsafe { raw.wire() };
+            std::process::exit(if result.is_err() { 0 } else { 1 });
+        }
+
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "wire() should have returned an error for bad fd"
+        );
     }
 }

@@ -18,6 +18,44 @@ Build
 
 All crates build in one invocation — no separate steps needed.
 
+MPI plugin (optional)
+~~~~~~~~~~~~~~~~~~~~~
+
+Open MPI jobs use ``--mpi=pmix``, which loads ``spur_mpi_pmix.so`` on compute
+nodes at runtime (``spurd`` itself does not link libpmix).
+
+**For production clusters**, use a **release or nightly tarball** from GitHub
+Releases (or your artifactory mirror). Both ship ``lib/spur/spur_mpi_pmix.so``
+when built with ``BUILD_MPI_PLUGIN=1`` (see ``.github/workflows/release.yml``
+and ``nightly.yml``). See :doc:`/deployment/native-host` for the full MPI deploy
+and upgrade steps.
+
+**For local development**, build the plugin when libpmix development packages are
+installed (``pkg-config pmix`` must succeed):
+
+.. code-block:: bash
+
+   cargo build --release -p spur-mpi-pmix
+   sudo install -D target/release/spur_mpi_pmix.so /usr/lib/spur/spur_mpi_pmix.so
+
+Install the resulting ``spur_mpi_pmix.so`` on **every agent**, using the same
+glibc as the running ``spurd``. If ``pkg-config pmix`` is missing on agents but
+system PMIx headers exist, compile on the agent with ``gcc -fPIC -shared`` and
+the system PMIx ``-I`` / ``libpmix.so`` path (see :doc:`/deployment/native-host`).
+
+``spurd`` launches multi-rank ``--mpi=pmix`` jobs via per-rank fork and
+``PMIx_server_setup_fork`` (see :doc:`/deployment/native-host`). Agents need
+Open MPI libraries matching the application build; ``mpirun`` is not used for
+bootstrap.
+
+Without libpmix, the crate still builds a stub plugin that fails at load time with
+an actionable error. Container/nightly images include a functional plugin via
+``BUILD_MPI_PLUGIN=1`` (see ``Dockerfile`` and ``.github/workflows/nightly.yml``).
+
+Native-host MPI E2E tests (``pytest -m mpi``) additionally require ``mpicc`` on
+the test nodes and ``SPUR_TEST_MPI_PLUGIN`` (or the default plugin path under
+``target/release/../lib/spur/``).
+
 Running Tests
 -------------
 
@@ -42,7 +80,7 @@ Prerequisites
 - Python 3.11+ with ``pip install -r tests/requirements.txt``
 - Pre-provisioned nodes accessible via SSH (password, key, or ssh-agent)
 - Container tests require ``squashfs-tools`` on the runner and all nodes
-- GPU tests require GPU hardware (ROCm/CUDA) on the nodes, plus a Python venv with PyTorch (auto-provisioned if ``SPUR_TEST_GPU_VENV`` is unset)
+- GPU tests require GPU hardware on the nodes, plus a Python venv with PyTorch (auto-provisioned if ``SPUR_TEST_GPU_VENV`` is unset)
 - GPU test scripts (``gpu_test.hip``, ``distributed_test.py``, ``inference_test.py``) live in ``tests/native_host/e2e/fixtures/`` and are shipped to nodes by the harness
 
 Environment Variables

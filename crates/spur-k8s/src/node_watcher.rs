@@ -294,7 +294,10 @@ async fn connect_controller(addr: &str) -> anyhow::Result<SlurmControllerClient<
     } else {
         format!("http://{}", addr)
     };
-    let client = SlurmControllerClient::connect(url).await?;
+    let client = SlurmControllerClient::connect(url)
+        .await?
+        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+        .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE);
     Ok(client)
 }
 

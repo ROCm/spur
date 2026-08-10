@@ -3,7 +3,6 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use spur_proto::proto::slurm_accounting_client::SlurmAccountingClient;
 use spur_proto::proto::GetJobHistoryRequest;
 
 use crate::exit_fmt::format_exit;
@@ -156,7 +155,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to controller")?;
-    let mut client = SlurmAccountingClient::new(channel);
+    let mut client = spur_proto::accounting_client(channel);
 
     let start_after = args
         .starttime
@@ -184,13 +183,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let jobs = response.into_inner().jobs;
 
     if !args.noheader {
-        println!("{}", format_engine::format_header(&fields));
-        // Print separator line
-        let sep = format_engine::format_header(&fields)
-            .chars()
-            .map(|c| if c == ' ' { ' ' } else { '-' })
-            .collect::<String>();
-        println!("{}", sep);
+        format_engine::print_header(&fields);
     }
 
     for job in &jobs {
@@ -407,7 +400,11 @@ mod tests {
             &sacct_field_spec,
             &sacct_header,
         );
-        assert_eq!(fields.len(), 4);
+        let field_count = fields
+            .iter()
+            .filter(|t| matches!(t, format_engine::FormatToken::Field(_)))
+            .count();
+        assert_eq!(field_count, 4);
         let mut j = job(0, 0, 0);
         j.name = "train".into();
         j.partition = "gpu".into();

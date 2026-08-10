@@ -55,7 +55,8 @@ mod tests {
         job.spec.array_job_id = Some(100);
         job.spec.array_task_id = Some(5);
 
-        assert_eq!(job.resolved_stdout(), "output_100_5.log");
+        // Relative patterns are anchored to work_dir (default /tmp), matching Slurm.
+        assert_eq!(job.resolved_stdout(), "/tmp/output_100_5.log");
     }
 
     #[test]
@@ -69,8 +70,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        // %A and %a should not be substituted for non-array jobs
-        assert_eq!(job.resolved_stdout(), "output_%A_%a.log");
+        // %A/%a stay intact for non-array jobs; relative path anchored to /tmp.
+        assert_eq!(job.resolved_stdout(), "/tmp/output_%A_%a.log");
     }
 
     // ── T28.5: Array job IDs ─────────────────────────────────────

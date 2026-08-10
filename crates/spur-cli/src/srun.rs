@@ -1,17 +1,19 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::env_defaults::{
+    apply_csv, apply_flag, apply_num, apply_num_opt, apply_str, was_cli_set,
+};
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use spur_core::config::HooksConfig;
-use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
-    CancelJobRequest, CreateJobStepRequest, GetJobRequest, GetNodeRequest, JobSpec, JobState,
-    StreamJobOutputRequest, SubmitJobRequest,
+    CancelJobRequest, CompleteJobRequest, CreateJobStepRequest, GetJobRequest, GetNodeRequest,
+    JobSpec, JobState, RunStepRequest, StreamJobOutputRequest, SubmitJobRequest,
 };
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::Write as _;
 
 /// Run a parallel job (interactive or allocation-based).
 #[derive(Parser, Debug)]
@@ -29,13 +31,21 @@ pub struct SrunArgs {
     #[arg(short = 'A', long)]
     pub account: Option<String>,
 
+    /// QoS
+    #[arg(short = 'q', long)]
+    pub qos: Option<String>,
+
     /// Number of nodes
     #[arg(short = 'N', long, default_value = "1")]
     pub nodes: u32,
 
-    /// Number of tasks
-    #[arg(short = 'n', long, default_value = "1")]
-    pub ntasks: u32,
+    /// Number of tasks (default: one per node)
+    #[arg(short = 'n', long)]
+    pub ntasks: Option<u32>,
+
+    /// Tasks per node
+    #[arg(long, overrides_with = "ntasks_per_node")]
+    pub ntasks_per_node: Option<u32>,
 
     /// CPUs per task
     #[arg(short = 'c', long, default_value = "1")]
@@ -50,22 +60,32 @@ pub struct SrunArgs {
     pub time: Option<String>,
 
     /// GRES
-    #[arg(long)]
+    // Slurm semantics: comma-lists expand to multiple GRES; a repeated --gres
+    // replaces rather than accumulates (last wins).
+    #[arg(long, value_delimiter = ',', overrides_with = "gres")]
     pub gres: Vec<String>,
 
     /// Licenses (e.g., "fluent:5", "matlab:1")
     #[arg(short = 'L', long)]
     pub licenses: Vec<String>,
 
-    /// GPUs
+    /// GPUs total across the job (e.g., "4" or "mi300x:4")
     #[arg(short = 'G', long)]
     pub gpus: Option<String>,
+
+    /// GPUs per node
+    #[arg(long)]
+    pub gpus_per_node: Option<String>,
+
+    /// GPUs per task
+    #[arg(long)]
+    pub gpus_per_task: Option<String>,
 
     /// Working directory
     #[arg(short = 'D', long)]
     pub chdir: Option<String>,
 
-    /// CPU binding (none, cores, threads, sockets, ldoms, rank, map_cpu, mask_cpu)
+    /// CPU binding (none, rank, map_cpu, mask_cpu; topology modes cores/threads/sockets/ldoms are not applied in step mode)
     #[arg(long)]
     pub cpu_bind: Option<String>,
 
@@ -78,8 +98,20 @@ pub struct SrunArgs {
     pub constraint: Option<String>,
 
     /// Node list
-    #[arg(short = 'w', long)]
+    #[arg(
+        short = 'w',
+        long,
+        overrides_with_all = ["nodelist", "nodefile"]
+    )]
     pub nodelist: Option<String>,
+
+    /// Read the node list from a file
+    #[arg(
+        short = 'F',
+        long,
+        overrides_with_all = ["nodelist", "nodefile"]
+    )]
+    pub nodefile: Option<String>,
 
     /// Exclude nodes
     #[arg(short = 'x', long)]
@@ -89,9 +121,13 @@ pub struct SrunArgs {
     #[arg(long)]
     pub reservation: Option<String>,
 
-    /// MPI type (none, pmix, pmi2)
-    #[arg(long, default_value = "none")]
-    pub mpi: String,
+    /// Exclusive node allocation
+    #[arg(long)]
+    pub exclusive: bool,
+
+    /// MPI type (none, pmix). Inside an allocation, omit to inherit the job setting.
+    #[arg(long)]
+    pub mpi: Option<String>,
 
     /// Stdout file path (supports %j for job ID)
     #[arg(short = 'o', long)]
@@ -142,6 +178,18 @@ pub struct SrunArgs {
     #[arg(long)]
     pub epilog: Option<String>,
 
+    /// Allocate a pseudo-terminal for the job
+    #[arg(long)]
+    pub pty: bool,
+
+    /// Attach to a running job (for --overlap exec-into-job)
+    #[arg(long)]
+    pub jobid: Option<u32>,
+
+    /// Share resources with the running job (requires --jobid)
+    #[arg(long)]
+    pub overlap: bool,
+
     /// Controller address
     #[arg(
         long,
@@ -160,7 +208,35 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = SrunArgs::try_parse_from(&args)?;
+    let matches = SrunArgs::command().try_get_matches_from(&args)?;
+    let mut args = SrunArgs::from_arg_matches(&matches)?;
+    resolve_srun_env(&matches, &mut args)?;
+    args.nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
+
+    // --jobid --overlap: exec into a running job (interactive PTY session)
+    if let Some(job_id) = args.jobid {
+        if !args.overlap {
+            anyhow::bail!("--jobid requires --overlap");
+        }
+        let node = first_node(args.nodelist.as_deref().unwrap_or_default());
+        let exit_code =
+            run_interactive_pty(&args.controller, job_id, args.command.clone(), node).await?;
+        std::process::exit(exit_code);
+    }
+
+    if args.mpi.as_deref() == Some("list") {
+        let mpi_cfg = load_mpi_config();
+        for line in spur_core::mpi::mpi_list_lines(&mpi_cfg.plugin_dir) {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+
+    let step_mode = std::env::var("SPUR_JOB_ID")
+        .ok()
+        .and_then(|id| id.parse::<u32>().ok())
+        .is_some();
+    let resolved_mpi = resolve_srun_mpi(&args, &matches, step_mode)?;
 
     if args.command.is_empty() {
         eprintln!("srun: no command specified");
@@ -192,33 +268,242 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     // Step mode: if running inside an allocation, create a step instead of a new job
     if let Ok(parent_job_id) = std::env::var("SPUR_JOB_ID") {
         if let Ok(job_id) = parent_job_id.parse::<u32>() {
-            return run_as_step(&args, job_id, &hooks, &work_dir).await;
+            return run_as_step(&args, job_id, &hooks, &work_dir, &resolved_mpi).await;
         }
     }
 
-    let io = resolve_io_paths(&args);
+    run_standalone_srun(&args, &hooks, &work_dir, &resolved_mpi).await
+}
 
-    let name = args.job_name.unwrap_or_else(|| args.command[0].clone());
-
-    let script = build_command_script(&args.command)?;
-
-    // Build GRES list
-    let mut gres = args.gres;
-    if let Some(gpus) = &args.gpus {
-        gres.push(format!("gpu:{}", gpus));
+/// Resolve `--mpi` for standalone srun vs step mode inside an allocation.
+fn resolve_srun_mpi(args: &SrunArgs, matches: &ArgMatches, step_mode: bool) -> Result<String> {
+    let mpi_explicit = was_cli_set(matches, "mpi")
+        || crate::env_defaults::env_first(&["SPUR_MPI_TYPE", "SLURM_MPI_TYPE"]).is_some();
+    if step_mode && !mpi_explicit && args.mpi.is_none() {
+        return Ok(String::new());
     }
-    // Don't push licenses into gres here — proto_to_job_spec already folds them in.
+    let raw = args.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
+    Ok(spur_core::mpi::parse_mpi_option(raw)
+        .map_err(|e| anyhow::anyhow!(e))?
+        .expect("list handled above"))
+}
 
-    let time_limit = args
-        .time
-        .as_ref()
-        .and_then(|t| spur_core::config::parse_time_minutes(t))
-        .map(|mins| prost_types::Duration {
-            seconds: mins as i64 * 60,
-            nanos: 0,
-        });
+/// Apply environment-variable defaults to any flag not set on the command
+/// line. srun mirrors real Slurm: most flags read `SLURM_*` (inherited from an
+/// allocation's output vars), a few read genuine `SRUN_*`, and each also
+/// accepts its `SPUR_*` native twin. CLI always overrides env.
+fn resolve_srun_env(matches: &ArgMatches, args: &mut SrunArgs) -> Result<()> {
+    apply_str(
+        matches,
+        "job_name",
+        &["SPUR_JOB_NAME", "SLURM_JOB_NAME"],
+        &mut args.job_name,
+    );
+    apply_str(
+        matches,
+        "partition",
+        &[
+            "SPUR_PARTITION",
+            "SPUR_JOB_PARTITION",
+            "SLURM_PARTITION",
+            "SLURM_JOB_PARTITION",
+        ],
+        &mut args.partition,
+    );
+    apply_str(
+        matches,
+        "account",
+        &[
+            "SPUR_ACCOUNT",
+            "SPUR_JOB_ACCOUNT",
+            "SLURM_ACCOUNT",
+            "SLURM_JOB_ACCOUNT",
+        ],
+        &mut args.account,
+    );
+    apply_str(
+        matches,
+        "qos",
+        &["SPUR_QOS", "SPUR_JOB_QOS", "SLURM_QOS", "SLURM_JOB_QOS"],
+        &mut args.qos,
+    );
+    apply_num(
+        matches,
+        "nodes",
+        &[
+            "SPUR_NNODES",
+            "SPUR_JOB_NUM_NODES",
+            "SLURM_NNODES",
+            "SLURM_JOB_NUM_NODES",
+        ],
+        &mut args.nodes,
+    )?;
+    apply_num_opt(
+        matches,
+        "ntasks",
+        &["SPUR_NTASKS", "SPUR_NPROCS", "SLURM_NTASKS", "SLURM_NPROCS"],
+        &mut args.ntasks,
+    )?;
+    apply_num(
+        matches,
+        "cpus_per_task",
+        &["SPUR_CPUS_PER_TASK", "SLURM_CPUS_PER_TASK"],
+        &mut args.cpus_per_task,
+    )?;
+    apply_str(
+        matches,
+        "mem",
+        &["SPUR_MEM_PER_NODE", "SLURM_MEM_PER_NODE"],
+        &mut args.mem,
+    );
+    apply_str(
+        matches,
+        "time",
+        &["SPUR_TIMELIMIT", "SLURM_TIMELIMIT"],
+        &mut args.time,
+    );
+    apply_csv(
+        matches,
+        "gres",
+        &["SPUR_GRES", "SLURM_GRES"],
+        &mut args.gres,
+    );
+    apply_str(
+        matches,
+        "gpus",
+        &["SPUR_GPUS", "SLURM_GPUS"],
+        &mut args.gpus,
+    );
+    apply_str(
+        matches,
+        "gpus_per_node",
+        &["SPUR_GPUS_PER_NODE", "SLURM_GPUS_PER_NODE"],
+        &mut args.gpus_per_node,
+    );
+    apply_str(
+        matches,
+        "gpus_per_task",
+        &["SPUR_GPUS_PER_TASK", "SLURM_GPUS_PER_TASK"],
+        &mut args.gpus_per_task,
+    );
+    apply_str(
+        matches,
+        "chdir",
+        &[
+            "SPUR_REMOTE_CWD",
+            "SPUR_WORKING_DIR",
+            "SLURM_REMOTE_CWD",
+            "SLURM_WORKING_DIR",
+        ],
+        &mut args.chdir,
+    );
+    apply_str(
+        matches,
+        "cpu_bind",
+        &["SPUR_CPU_BIND", "SLURM_CPU_BIND"],
+        &mut args.cpu_bind,
+    );
+    apply_str(
+        matches,
+        "gpu_bind",
+        &["SPUR_GPU_BIND", "SLURM_GPU_BIND"],
+        &mut args.gpu_bind,
+    );
+    apply_str(
+        matches,
+        "constraint",
+        &["SPUR_CONSTRAINT", "SLURM_CONSTRAINT"],
+        &mut args.constraint,
+    );
+    apply_str(
+        matches,
+        "reservation",
+        &["SPUR_RESERVATION", "SLURM_RESERVATION"],
+        &mut args.reservation,
+    );
+    apply_str(
+        matches,
+        "mpi",
+        &["SPUR_MPI_TYPE", "SLURM_MPI_TYPE"],
+        &mut args.mpi,
+    );
+    apply_flag(
+        matches,
+        "label",
+        &["SPUR_LABELIO", "SLURM_LABELIO"],
+        &mut args.label,
+    );
+    apply_str(
+        matches,
+        "output",
+        &["SPUR_OUTPUT", "SRUN_OUTPUT"],
+        &mut args.output,
+    );
+    apply_str(
+        matches,
+        "error",
+        &["SPUR_ERROR", "SRUN_ERROR"],
+        &mut args.error,
+    );
+    apply_str(
+        matches,
+        "input",
+        &["SPUR_INPUT", "SRUN_INPUT"],
+        &mut args.input,
+    );
+    apply_str(
+        matches,
+        "container_image",
+        &["SPUR_CONTAINER", "SRUN_CONTAINER"],
+        &mut args.container_image,
+    );
+    apply_str(
+        matches,
+        "prolog",
+        &["SPUR_PROLOG", "SLURM_PROLOG"],
+        &mut args.prolog,
+    );
+    apply_str(
+        matches,
+        "epilog",
+        &["SPUR_EPILOG", "SLURM_EPILOG"],
+        &mut args.epilog,
+    );
 
-    // Build environment — pass CPU/GPU binding via env vars
+    Ok(())
+}
+
+struct ResolvedIoPaths {
+    stdout: String,
+    stderr: String,
+    stdin: String,
+}
+
+/// Resolve I/O paths from CLI args. When `-o` is set but `-e` is not,
+/// stderr follows stdout (Slurm default behavior).
+fn resolve_io_paths(args: &SrunArgs) -> ResolvedIoPaths {
+    let stdout = args.output.clone().unwrap_or_default();
+    let stderr = args.error.clone().unwrap_or_else(|| {
+        if stdout.is_empty() {
+            String::new()
+        } else {
+            stdout.clone()
+        }
+    });
+    let stdin = args.input.clone().unwrap_or_default();
+    ResolvedIoPaths {
+        stdout,
+        stderr,
+        stdin,
+    }
+}
+
+#[derive(Debug)]
+struct StepDispatchResult {
+    exit_code: i32,
+}
+
+fn srun_dispatch_environment(args: &SrunArgs) -> HashMap<String, String> {
     let mut environment: HashMap<String, String> = std::env::vars().collect();
     if let Some(ref cpu_bind) = args.cpu_bind {
         environment.insert("SPUR_CPU_BIND".into(), cpu_bind.clone());
@@ -229,6 +514,37 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     if args.label {
         environment.insert("SPUR_LABEL".into(), "1".into());
     }
+    environment
+}
+
+fn build_srun_job_spec(
+    args: &SrunArgs,
+    work_dir: &str,
+    io: &ResolvedIoPaths,
+    mpi: &str,
+) -> Result<JobSpec> {
+    // GPU requests use dedicated proto fields; --gres=gpu:* stays in gres.
+    let gres = args.gres.clone();
+    let gpus = crate::sbatch::parse_gpu_flag(args.gpus.as_deref())?;
+    let gpus_per_node = crate::sbatch::parse_gpu_flag(args.gpus_per_node.as_deref())?;
+    let gpus_per_task = crate::sbatch::parse_gpu_flag(args.gpus_per_task.as_deref())?;
+    crate::sbatch::validate_gpu_flags(
+        gpus.is_some(),
+        gpus_per_node.is_some(),
+        gpus_per_task.is_some(),
+        &gres,
+    )?;
+
+    let time_limit = args
+        .time
+        .as_ref()
+        .and_then(|t| spur_core::config::parse_time_minutes(t))
+        .map(|mins| prost_types::Duration {
+            seconds: mins as i64 * 60,
+            nanos: 0,
+        });
+
+    let environment = srun_dispatch_environment(args);
 
     let memory_mb = args
         .mem
@@ -237,39 +553,43 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .transpose()?
         .unwrap_or(0);
 
-    // Submit as a batch job
-    let channel = spur_client::connect_channel(&args.controller)
-        .await
-        .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
-
-    let job_spec = JobSpec {
-        name,
-        partition: args.partition.unwrap_or_default(),
-        account: args.account.unwrap_or_default(),
+    Ok(JobSpec {
+        name: args
+            .job_name
+            .clone()
+            .unwrap_or_else(|| args.command[0].clone()),
+        partition: args.partition.clone().unwrap_or_default(),
+        account: args.account.clone().unwrap_or_default(),
+        qos: args.qos.clone().unwrap_or_default(),
         user: whoami::username().unwrap_or_else(|_| "unknown".into()),
         uid: nix::unistd::getuid().as_raw(),
         gid: nix::unistd::getgid().as_raw(),
         num_nodes: args.nodes,
-        num_tasks: args.ntasks,
+        num_tasks: crate::sbatch::effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
+        tasks_per_node: args.ntasks_per_node.unwrap_or(0),
         cpus_per_task: args.cpus_per_task,
         memory_per_node_mb: memory_mb,
         gres,
-        script,
-        work_dir: work_dir.clone(),
+        gpus,
+        gpus_per_node,
+        gpus_per_task,
+        script: build_command_script(&args.command)?,
+        work_dir: work_dir.to_string(),
         stdout_path: io.stdout.clone(),
         stderr_path: io.stderr.clone(),
         stdin_path: io.stdin.clone(),
         environment,
         time_limit,
-        constraint: args.constraint.unwrap_or_default(),
-        nodelist: args.nodelist.unwrap_or_default(),
-        exclude: args.exclude.unwrap_or_default(),
-        reservation: args.reservation.unwrap_or_default(),
-        mpi: args.mpi,
-        container_image: args.container_image.unwrap_or_default(),
-        container_mounts: args.container_mounts,
-        container_workdir: args.container_workdir.unwrap_or_default(),
+        constraint: args.constraint.clone().unwrap_or_default(),
+        nodelist: args.nodelist.clone().unwrap_or_default(),
+        exclude: args.exclude.clone().unwrap_or_default(),
+        reservation: args.reservation.clone().unwrap_or_default(),
+        exclusive: args.exclusive,
+        mpi: mpi.to_string(),
+        licenses: args.licenses.clone(),
+        container_image: args.container_image.clone().unwrap_or_default(),
+        container_mounts: args.container_mounts.clone(),
+        container_workdir: args.container_workdir.clone().unwrap_or_default(),
         container_mount_home: args.container_mount_home,
         container_env: args
             .container_env
@@ -280,96 +600,322 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             })
             .collect(),
         container_remap_root: args.container_remap_root,
+        srun_job: true,
+        pty: args.pty,
         ..Default::default()
-    };
+    })
+}
 
-    let response = client
-        .submit_job(SubmitJobRequest {
-            spec: Some(job_spec),
-        })
-        .await
-        .context("job submission failed")?;
-
-    let job_id = response.into_inner().job_id;
-    let user = whoami::username().unwrap_or_else(|_| "unknown".into());
-    eprintln!("srun: job {} submitted, waiting for completion...", job_id);
-
-    // Set up Ctrl+C handler to cancel the job on interrupt
-    let cancel_client = client.clone();
-    let cancel_user = user.clone();
+fn install_ctrl_c_cancel(
+    client: SlurmControllerClient<tonic::transport::Channel>,
+    job_id: u32,
+    user: String,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut cancel_client = cancel_client;
+        let mut client = client;
         if tokio::signal::ctrl_c().await.is_ok() {
             eprintln!("\nsrun: cancelling job {}...", job_id);
-            let _ = cancel_client
+            let _ = client
                 .cancel_job(CancelJobRequest {
                     job_id,
-                    signal: 2, // SIGINT
-                    user: cancel_user,
+                    signal: 2,
+                    user,
                 })
                 .await;
-            std::process::exit(130); // Standard SIGINT exit code
+            std::process::exit(130);
         }
-    });
+    })
+}
 
-    // Wait for the job to start running
+async fn wait_for_job_running(
+    client: &mut SlurmControllerClient<tonic::transport::Channel>,
+    job_id: u32,
+) -> Result<String> {
     let mut poll_interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
-    #[allow(unused_assignments)]
-    let mut nodelist = String::new();
     let mut warned_unknown_state = false;
 
     loop {
         poll_interval.tick().await;
+        let job = client
+            .get_job(GetJobRequest { job_id })
+            .await
+            .context("failed to get job status")?
+            .into_inner();
 
-        match client.get_job(GetJobRequest { job_id }).await {
-            Ok(resp) => {
-                let job = resp.into_inner();
-                match JobState::try_from(job.state) {
-                    Ok(JobState::JobRunning) => {
-                        nodelist = job.nodelist.clone();
-                        if !nodelist.is_empty() {
-                            eprintln!("srun: job {} running on {}", job_id, nodelist);
-                        }
-                        break;
-                    }
-                    Ok(
-                        state @ (JobState::JobCompleted
-                        | JobState::JobFailed
-                        | JobState::JobCancelled
-                        | JobState::JobTimeout
-                        | JobState::JobNodeFail
-                        | JobState::JobDeadline),
-                    ) => {
-                        handle_terminal_state(
-                            state,
-                            job_id,
-                            job.exit_code,
-                            &work_dir,
-                            &io.stdout,
-                            &hooks,
-                            false,
-                        )
-                        .await;
-                    }
-                    Ok(_) => {}
-                    Err(_) if !warned_unknown_state => {
-                        warned_unknown_state = true;
-                        eprintln!(
-                            "srun: warning: job {} has unrecognized state {} \
-                             (controller may be newer than client)",
-                            job_id, job.state
-                        );
-                    }
-                    Err(_) => {}
-                }
+        match JobState::try_from(job.state) {
+            Ok(JobState::JobRunning) if !job.nodelist.is_empty() => {
+                return Ok(job.nodelist);
             }
-            Err(e) => {
-                eprintln!("srun: warning: failed to get job status: {}", e.message());
+            Ok(JobState::JobRunning) => {}
+            Ok(
+                JobState::JobCompleted
+                | JobState::JobFailed
+                | JobState::JobCancelled
+                | JobState::JobTimeout
+                | JobState::JobNodeFail
+                | JobState::JobDeadline,
+            ) => {
+                anyhow::bail!(
+                    "job {} reached terminal state before allocation was ready",
+                    job_id
+                );
             }
+            Ok(_) => {}
+            Err(_) if !warned_unknown_state => {
+                warned_unknown_state = true;
+                eprintln!(
+                    "srun: warning: job {} has unrecognized state {} \
+                     (controller may be newer than client)",
+                    job_id, job.state
+                );
+            }
+            Err(_) => {}
         }
     }
+}
 
-    // Stream output to terminal only when the user didn't ask for file output.
+async fn emit_step_output(
+    io: &ResolvedIoPaths,
+    job_id: u32,
+    work_dir: &str,
+    stdout: &str,
+    stderr: &str,
+) {
+    let stderr_appends = !io.stderr.is_empty() && io.stderr == io.stdout;
+
+    if !stdout.is_empty() {
+        if io.stdout.is_empty() {
+            print!("{stdout}");
+        } else {
+            write_step_file(stdout, &io.stdout, job_id, work_dir, false).await;
+        }
+    }
+    if !stderr.is_empty() {
+        if io.stderr.is_empty() {
+            eprint!("{stderr}");
+        } else {
+            write_step_file(stderr, &io.stderr, job_id, work_dir, stderr_appends).await;
+        }
+    }
+}
+
+struct StepDispatchParams<'a> {
+    args: &'a SrunArgs,
+    work_dir: &'a str,
+    io: &'a ResolvedIoPaths,
+    mpi: &'a str,
+}
+
+async fn dispatch_step(
+    client: &mut SlurmControllerClient<tonic::transport::Channel>,
+    job_id: u32,
+    params: &StepDispatchParams<'_>,
+) -> Result<StepDispatchResult> {
+    let args = params.args;
+    let work_dir = params.work_dir;
+    let io = params.io;
+    let step_mpi = params.mpi;
+    let ntasks = crate::sbatch::effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes);
+    let step_id = client
+        .create_job_step(CreateJobStepRequest {
+            job_id,
+            command: args.command.clone(),
+            num_tasks: ntasks,
+            cpus_per_task: args.cpus_per_task,
+            overlap: false,
+            pty: false,
+            winsize: None,
+            node: String::new(),
+            user: crate::interactive::current_user(),
+        })
+        .await
+        .context("failed to create job step")?
+        .into_inner()
+        .step_id;
+
+    if args.input.is_some() {
+        eprintln!("srun: warning: --input is not supported in step mode, ignoring");
+    }
+
+    let environment = srun_dispatch_environment(args);
+    warn_unsupported_cpu_bind(&environment);
+    if let Some(err) = spur_core::task_launch::map_cpu_bind_error(&environment, ntasks)
+        .or_else(|| spur_core::task_launch::mask_cpu_bind_error(&environment, ntasks))
+    {
+        anyhow::bail!("{err}");
+    }
+    let resp = client
+        .run_step(RunStepRequest {
+            job_id,
+            command: args.command.clone(),
+            uid: nix::unistd::geteuid().as_raw(),
+            gid: nix::unistd::getegid().as_raw(),
+            work_dir: work_dir.to_string(),
+            environment,
+            step_id,
+            label: args.label,
+            mpi: step_mpi.to_string(),
+        })
+        .await
+        .context("RunStep dispatch failed")?
+        .into_inner();
+
+    if !resp.node.is_empty() {
+        eprintln!("srun: dispatched to node {}", resp.node);
+    }
+
+    emit_step_output(io, job_id, work_dir, &resp.stdout, &resp.stderr).await;
+
+    Ok(StepDispatchResult {
+        exit_code: resp.exit_code,
+    })
+}
+
+async fn release_srun_allocation(
+    client: &mut SlurmControllerClient<tonic::transport::Channel>,
+    job_id: u32,
+    user: &str,
+    exit_code: i32,
+) {
+    if let Err(e) = client
+        .complete_job(CompleteJobRequest {
+            job_id,
+            exit_code,
+            user: user.to_string(),
+        })
+        .await
+    {
+        eprintln!(
+            "srun: warning: failed to release allocation for job {}: {}",
+            job_id, e
+        );
+        if let Err(ce) = client
+            .cancel_job(CancelJobRequest {
+                job_id,
+                signal: 2,
+                user: user.to_string(),
+            })
+            .await
+        {
+            eprintln!(
+                "srun: warning: failed to cancel job {} after CompleteJob failure: {}",
+                job_id, ce
+            );
+        }
+    }
+}
+
+async fn dispatch_step_cancellable(
+    client: &mut SlurmControllerClient<tonic::transport::Channel>,
+    job_id: u32,
+    params: &StepDispatchParams<'_>,
+    cancel_job_on_interrupt: bool,
+) -> Result<StepDispatchResult> {
+    if cancel_job_on_interrupt {
+        return dispatch_step(client, job_id, params).await;
+    }
+    tokio::select! {
+        result = dispatch_step(client, job_id, params) => result,
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("\nsrun: step interrupted");
+            std::process::exit(130);
+        }
+    }
+}
+
+async fn run_standalone_srun(
+    args: &SrunArgs,
+    hooks: &HooksConfig,
+    work_dir: &str,
+    mpi: &str,
+) -> Result<()> {
+    let io = resolve_io_paths(args);
+    let channel = spur_client::connect_channel(&args.controller)
+        .await
+        .context("failed to connect to spurctld")?;
+    let mut client = SlurmControllerClient::new(channel);
+    let user = whoami::username().unwrap_or_else(|_| "unknown".into());
+
+    let job_spec = build_srun_job_spec(args, work_dir, &io, mpi)?;
+    let submit_resp = client
+        .submit_job(SubmitJobRequest {
+            spec: Some(job_spec),
+        })
+        .await
+        .context("job submission failed")?
+        .into_inner();
+    for warning in &submit_resp.warnings {
+        eprintln!("srun: warning: {warning}");
+    }
+    let job_id = submit_resp.job_id;
+
+    eprintln!("srun: Pending job allocation {}...", job_id);
+
+    let ctrl_c_handle = install_ctrl_c_cancel(client.clone(), job_id, user.clone());
+
+    let nodelist = wait_for_job_running(&mut client, job_id).await?;
+    if !nodelist.is_empty() {
+        eprintln!("srun: job {} running on {}", job_id, nodelist);
+    }
+
+    if args.pty {
+        ctrl_c_handle.abort();
+        eprintln!("srun: opening interactive session on {}", nodelist);
+        let result = run_interactive_pty(
+            &args.controller,
+            job_id,
+            args.command.clone(),
+            String::new(),
+        )
+        .await;
+        let _ = client
+            .cancel_job(CancelJobRequest {
+                job_id,
+                signal: 0,
+                user: user.clone(),
+            })
+            .await;
+        std::process::exit(result?);
+    }
+
+    let job = client
+        .get_job(GetJobRequest { job_id })
+        .await
+        .context("failed to get job after allocation")?
+        .into_inner();
+
+    if job.srun_step_dispatch {
+        let step_params = StepDispatchParams {
+            args,
+            work_dir,
+            io: &io,
+            mpi,
+        };
+        let dispatch_result =
+            dispatch_step_cancellable(&mut client, job_id, &step_params, true).await;
+        let exit_code = match &dispatch_result {
+            Ok(result) => result.exit_code,
+            Err(_) => 1,
+        };
+        release_srun_allocation(&mut client, job_id, &user, exit_code).await;
+        let result = dispatch_result?;
+        let state = if result.exit_code == 0 {
+            JobState::JobCompleted
+        } else {
+            JobState::JobFailed
+        };
+        handle_terminal_state(
+            state,
+            job_id,
+            result.exit_code,
+            work_dir,
+            &io.stdout,
+            hooks,
+            true,
+        )
+        .await;
+    }
+
     let output_streamed = if io.stdout.is_empty() {
         try_stream_output(&mut client, &nodelist, job_id).await
     } else {
@@ -378,9 +924,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     poll_for_completion(
         &mut client,
         job_id,
-        &work_dir,
+        work_dir,
         &io.stdout,
-        &hooks,
+        hooks,
         output_streamed,
     )
     .await;
@@ -388,14 +934,58 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-/// Try to stream live output from the agent.
-/// Returns true if streaming connected and delivered output.
+/// Client-side output path resolution, mirroring the agent's logic.
+fn resolve_output_path_client(pattern: &str, job_id: u32, work_dir: &str) -> String {
+    let resolved = if pattern.is_empty() {
+        format!("spur-{}.out", job_id)
+    } else {
+        pattern
+            .replace("%j", &job_id.to_string())
+            .replace("%J", &job_id.to_string())
+    };
+
+    if std::path::Path::new(&resolved).is_absolute() {
+        resolved
+    } else {
+        std::path::PathBuf::from(work_dir)
+            .join(resolved)
+            .to_string_lossy()
+            .into()
+    }
+}
+
+/// Wrap the command argv in a bash script for batch submission.
+///
+/// Each argv element is shell-escaped so metacharacters (spaces, quotes, `;`,
+/// `>`, `$`, globs) stay literal arguments instead of being reinterpreted by
+/// the wrapper shell. This matches Slurm's semantics, where `srun` execs the
+/// argv directly with no shell: `srun touch "my file"` creates one file, and
+/// `srun bash -c 'a; b'` passes the whole script as a single `-c` argument.
+fn build_command_script(command: &[String]) -> Result<String> {
+    let cmd_line = shlex::try_join(command.iter().map(String::as_str))
+        .context("command contains a NUL byte and cannot be run")?;
+    Ok(format!("#!/bin/bash\n{cmd_line}\n"))
+}
+
+/// First node of a `-w` value. Interactive `--pty` attaches to a single node,
+/// so a comma list reduces to its head; an empty value stays empty (controller
+/// then defaults to the first allocated node). Hostlist brackets are not
+/// expanded here — the controller rejects an unmatched name with a clear error.
+fn first_node(nodelist: &str) -> String {
+    nodelist
+        .split(',')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
 async fn try_stream_output(
     controller: &mut SlurmControllerClient<tonic::transport::Channel>,
     nodelist: &str,
     job_id: u32,
 ) -> bool {
-    let first_node = nodelist.split(',').next().unwrap_or(nodelist).trim();
+    let first_node = nodelist.split(',').next().unwrap_or_default().trim();
     if first_node.is_empty() {
         return false;
     }
@@ -410,9 +1000,9 @@ async fn try_stream_output(
         return false;
     }
 
-    let agent_addr = format!("http://{}:6818", first_node);
+    let agent_addr = format!("http://{first_node}:6818");
 
-    let mut agent = match SlurmAgentClient::connect(agent_addr).await {
+    let mut agent = match crate::interactive::connect_agent(&agent_addr).await {
         Ok(c) => c,
         Err(_) => return false,
     };
@@ -421,6 +1011,7 @@ async fn try_stream_output(
         .stream_job_output(StreamJobOutputRequest {
             job_id,
             stream: "stdout".into(),
+            user: crate::interactive::current_user(),
         })
         .await
     {
@@ -445,7 +1036,6 @@ async fn try_stream_output(
     }
 }
 
-/// Poll-based fallback for agents that don't support streaming.
 async fn poll_for_completion(
     client: &mut SlurmControllerClient<tonic::transport::Channel>,
     job_id: u32,
@@ -509,7 +1099,6 @@ async fn handle_terminal_state(
     hooks: &HooksConfig,
     output_streamed: bool,
 ) -> ! {
-    // SrunEpilog: run locally after job reaches terminal state
     if let Some(ref srun_epilog) = hooks.srun_epilog {
         let ctx = srun_hook_context("epilog_srun", work_dir);
         if let Err(e) = spur_core::hooks::run_hook(srun_epilog, &ctx).await {
@@ -556,73 +1145,14 @@ async fn handle_terminal_state(
     }
 }
 
-/// Print job output file to stdout (best-effort).
 async fn print_job_output(work_dir: &str, stdout_path: &str, job_id: u32) {
     let path = resolve_output_path_client(stdout_path, job_id, work_dir);
     if let Ok(content) = tokio::fs::read_to_string(&path).await {
-        print!("{}", content);
+        print!("{content}");
     }
 }
 
-/// Client-side output path resolution, mirroring the agent's logic.
-fn resolve_output_path_client(pattern: &str, job_id: u32, work_dir: &str) -> String {
-    let resolved = if pattern.is_empty() {
-        format!("spur-{}.out", job_id)
-    } else {
-        pattern
-            .replace("%j", &job_id.to_string())
-            .replace("%J", &job_id.to_string())
-    };
-
-    if std::path::Path::new(&resolved).is_absolute() {
-        resolved
-    } else {
-        std::path::PathBuf::from(work_dir)
-            .join(resolved)
-            .to_string_lossy()
-            .into()
-    }
-}
-
-struct ResolvedIoPaths {
-    stdout: String,
-    stderr: String,
-    stdin: String,
-}
-
-/// Wrap the command argv in a bash script for batch submission.
-///
-/// Each argv element is shell-escaped so metacharacters (spaces, quotes, `;`,
-/// `>`, `$`, globs) stay literal arguments instead of being reinterpreted by
-/// the wrapper shell. This matches Slurm's semantics, where `srun` execs the
-/// argv directly with no shell: `srun touch "my file"` creates one file, and
-/// `srun bash -c 'a; b'` passes the whole script as a single `-c` argument.
-fn build_command_script(command: &[String]) -> Result<String> {
-    let cmd_line = shlex::try_join(command.iter().map(String::as_str))
-        .context("command contains a NUL byte and cannot be run")?;
-    Ok(format!("#!/bin/bash\n{}\n", cmd_line))
-}
-
-/// Resolve I/O paths from CLI args. When `-o` is set but `-e` is not,
-/// stderr follows stdout (Slurm default behavior).
-fn resolve_io_paths(args: &SrunArgs) -> ResolvedIoPaths {
-    let stdout = args.output.clone().unwrap_or_default();
-    let stderr = args.error.clone().unwrap_or_else(|| {
-        if stdout.is_empty() {
-            String::new()
-        } else {
-            stdout.clone()
-        }
-    });
-    let stdin = args.input.clone().unwrap_or_default();
-    ResolvedIoPaths {
-        stdout,
-        stderr,
-        stdin,
-    }
-}
-
-/// Write step output to a file, used by `run_as_step` for both stdout and stderr.
+/// Write step output to a file, used by step dispatch for stdout and stderr.
 async fn write_step_file(content: &str, pattern: &str, job_id: u32, work_dir: &str, append: bool) {
     let resolved = resolve_output_path_client(pattern, job_id, work_dir);
     if let Some(parent) = std::path::Path::new(&resolved).parent() {
@@ -647,41 +1177,130 @@ async fn write_step_file(content: &str, pattern: &str, job_id: u32, work_dir: &s
     }
 }
 
-/// When srun runs inside an allocation (SPUR_JOB_ID is set, e.g. inside an
-/// `salloc` interactive shell or sbatch script on the submit host), it
-/// dispatches the command to one of the allocation's nodes via the
-/// controller's RunStep RPC. The controller picks an allocated node and
-/// forwards to that agent's RunCommand RPC.
+fn warn_unsupported_cpu_bind(environment: &HashMap<String, String>) {
+    if let Some(cpu_bind) = spur_core::task_launch::unsupported_cpu_bind(environment) {
+        eprintln!(
+            "srun: warning: --cpu-bind={cpu_bind} is not applied in step mode \
+             (supported: rank, map_cpu, mask_cpu)"
+        );
+    }
+}
+
+/// Create an interactive PTY step on a running job and attach to it.
 ///
-/// Closes #146 — previously this ran the command locally, so `srun hostname`
-/// inside `salloc` printed the controller's hostname instead of the
-/// allocated compute node's.
+/// Retries transient failures (job not yet visible on agent after controller
+/// reports it as Running) up to a few seconds before giving up.
+async fn run_interactive_pty(
+    controller: &str,
+    job_id: u32,
+    command: Vec<String>,
+    node: String,
+) -> Result<i32> {
+    let channel = spur_client::connect_channel(controller)
+        .await
+        .context("cannot connect to controller")?;
+    let mut ctrl = SlurmControllerClient::new(channel);
+
+    let winsize = crate::interactive::get_terminal_size();
+
+    let mut last_err: Option<anyhow::Error> = None;
+    let mut cached_step: Option<(u32, String)> = None;
+
+    for attempt in 0..5 {
+        if attempt > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+
+        let (step_id, node_addr) = if let Some(ref cached) = cached_step {
+            cached.clone()
+        } else {
+            let step_resp = match ctrl
+                .create_job_step(CreateJobStepRequest {
+                    job_id,
+                    command: command.clone(),
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    overlap: true,
+                    pty: true,
+                    winsize: Some(winsize),
+                    node: node.clone(),
+                    user: crate::interactive::current_user(),
+                })
+                .await
+            {
+                Ok(resp) => resp.into_inner(),
+                Err(status) if is_retryable_status(&status) && attempt < 4 => {
+                    last_err = Some(anyhow::anyhow!("CreateJobStep: {}", status.message()));
+                    continue;
+                }
+                Err(status) => {
+                    return Err(anyhow::anyhow!(
+                        "CreateJobStep failed: {}",
+                        status.message()
+                    ))
+                }
+            };
+
+            if step_resp.node_addr.is_empty() {
+                anyhow::bail!(
+                    "controller did not return a node address for job {}",
+                    job_id
+                );
+            }
+            let pair = (step_resp.step_id, format!("http://{}", step_resp.node_addr));
+            cached_step = Some(pair.clone());
+            pair
+        };
+
+        let mut agent = crate::interactive::connect_agent(&node_addr).await?;
+
+        match crate::interactive::open_interactive_session(
+            &mut agent,
+            job_id,
+            step_id,
+            command.clone(),
+            winsize,
+            true,
+        )
+        .await
+        {
+            Ok(handle) => {
+                return crate::interactive::drive_interactive_session(handle).await;
+            }
+            Err(status) if is_retryable_status(&status) && attempt < 4 => {
+                last_err = Some(anyhow::anyhow!("InteractiveSession: {}", status.message()));
+                continue;
+            }
+            Err(status) => {
+                return Err(anyhow::anyhow!(
+                    "InteractiveSession RPC failed: {}",
+                    status.message()
+                ));
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("interactive session failed after retries")))
+}
+
+fn is_retryable_status(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::NotFound | tonic::Code::FailedPrecondition | tonic::Code::Unavailable
+    )
+}
+
 async fn run_as_step(
     args: &SrunArgs,
     job_id: u32,
     hooks: &HooksConfig,
     work_dir: &str,
+    step_mpi: &str,
 ) -> Result<()> {
-    use spur_proto::proto::RunStepRequest;
-
     let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
-
-    // Create a step on the controller for tracking; capture the assigned
-    // step_id so the completion (and thus DerivedExitCode) records against it.
-    let step_id = client
-        .create_job_step(CreateJobStepRequest {
-            job_id,
-            command: args.command.clone(),
-            num_tasks: args.ntasks,
-            cpus_per_task: args.cpus_per_task,
-        })
-        .await
-        .context("failed to create job step")?
-        .into_inner()
-        .step_id;
+    let mut client = spur_proto::controller_client(channel);
 
     if args.input.is_some() {
         eprintln!("srun: warning: --input is not supported in step mode, ignoring");
@@ -689,52 +1308,30 @@ async fn run_as_step(
 
     let io = resolve_io_paths(args);
 
-    let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    let step_params = StepDispatchParams {
+        args,
+        work_dir,
+        io: &io,
+        mpi: step_mpi,
+    };
+    let dispatch_result =
+        dispatch_step_cancellable(&mut client, job_id, &step_params, false).await?;
 
-    let resp = client
-        .run_step(RunStepRequest {
-            job_id,
-            command: args.command.clone(),
-            uid: nix::unistd::geteuid().as_raw(),
-            gid: nix::unistd::getegid().as_raw(),
-            work_dir: work_dir.to_string(),
-            environment: env,
-            step_id,
-        })
-        .await
-        .context("RunStep dispatch failed")?
-        .into_inner();
-
-    if !resp.node.is_empty() {
-        eprintln!("srun: dispatched to node {}", resp.node);
-    }
-
-    let stderr_appends = !io.stderr.is_empty() && io.stderr == io.stdout;
-
-    if !resp.stdout.is_empty() {
-        if io.stdout.is_empty() {
-            print!("{}", resp.stdout);
-        } else {
-            write_step_file(&resp.stdout, &io.stdout, job_id, work_dir, false).await;
-        }
-    }
-    if !resp.stderr.is_empty() {
-        if io.stderr.is_empty() {
-            eprint!("{}", resp.stderr);
-        } else {
-            write_step_file(&resp.stderr, &io.stderr, job_id, work_dir, stderr_appends).await;
-        }
-    }
-
-    // SrunEpilog: run locally after step completes (failure logged only)
-    if let Some(ref srun_epilog) = hooks.srun_epilog {
-        let ctx = srun_hook_context("epilog_srun", work_dir);
-        if let Err(e) = spur_core::hooks::run_hook(srun_epilog, &ctx).await {
-            eprintln!("srun: warning: SrunEpilog failed: {}", e);
-        }
-    }
-
-    std::process::exit(resp.exit_code);
+    let state = if dispatch_result.exit_code == 0 {
+        JobState::JobCompleted
+    } else {
+        JobState::JobFailed
+    };
+    handle_terminal_state(
+        state,
+        job_id,
+        dispatch_result.exit_code,
+        work_dir,
+        &io.stdout,
+        hooks,
+        true,
+    )
+    .await;
 }
 
 fn parse_memory_mb(s: &str) -> Result<u64> {
@@ -750,12 +1347,11 @@ fn parse_memory_mb(s: &str) -> Result<u64> {
 }
 
 fn load_hooks_config() -> HooksConfig {
-    let path_str = std::env::var("SPUR_CONF").unwrap_or_else(|_| "/etc/spur/spur.conf".to_string());
-    let path = std::path::Path::new(&path_str);
-    match spur_core::config::SlurmConfig::load_from_file(path) {
-        Ok(config) => config.hooks,
-        Err(_) => HooksConfig::default(),
-    }
+    crate::spur_config::load_spur_config().hooks
+}
+
+fn load_mpi_config() -> spur_core::config::MpiConfig {
+    crate::spur_config::load_spur_config().mpi
 }
 
 fn srun_hook_context(script_context: &str, work_dir: &str) -> spur_core::hooks::HookContext {
@@ -779,6 +1375,26 @@ fn srun_hook_context(script_context: &str, work_dir: &str) -> spur_core::hooks::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_node_reduces_comma_list_to_head() {
+        assert_eq!(first_node("node001,node002"), "node001");
+    }
+
+    #[test]
+    fn first_node_bare_name_passes_through() {
+        assert_eq!(first_node("node007"), "node007");
+    }
+
+    #[test]
+    fn first_node_trims_whitespace() {
+        assert_eq!(first_node(" node003 , node004"), "node003");
+    }
+
+    #[test]
+    fn first_node_empty_stays_empty() {
+        assert_eq!(first_node(""), "");
+    }
 
     #[test]
     fn parses_nodelist_and_exclude_short() {
@@ -808,6 +1424,19 @@ mod tests {
         .expect("parse failed");
         assert_eq!(args.nodelist.as_deref(), Some("node001"));
         assert_eq!(args.exclude.as_deref(), Some("node002"));
+    }
+
+    #[test]
+    fn parses_nodefile_short_and_long() {
+        let short = SrunArgs::try_parse_from(["srun", "-F", "nodes.txt", "hostname"])
+            .expect("parse short nodefile");
+        assert_eq!(short.nodefile.as_deref(), Some("nodes.txt"));
+        assert!(short.nodelist.is_none());
+
+        let long = SrunArgs::try_parse_from(["srun", "--nodefile=other.txt", "hostname"])
+            .expect("parse long nodefile");
+        assert_eq!(long.nodefile.as_deref(), Some("other.txt"));
+        assert!(long.nodelist.is_none());
     }
 
     #[test]
@@ -928,6 +1557,145 @@ mod tests {
     }
 
     #[test]
+    fn build_srun_job_spec_sets_srun_job_and_command_script() {
+        let args =
+            SrunArgs::try_parse_from(["srun", "-N", "2", "-n", "4", "hostname"]).expect("parse");
+        let io = ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        };
+        let spec = build_srun_job_spec(&args, "/tmp/work", &io, "none").expect("spec");
+        assert!(spec.srun_job);
+        assert_eq!(spec.num_nodes, 2);
+        assert_eq!(spec.num_tasks, 4);
+        assert_eq!(spec.work_dir, "/tmp/work");
+        assert!(spec.script.starts_with("#!/bin/bash\n"));
+        assert!(spec.script.contains("hostname"));
+    }
+
+    /// Launchers like PRTE's `plm:slurm` always pass `--ntasks-per-node`, so
+    /// srun must accept both spellings rather than rejecting the command line.
+    #[test]
+    fn parses_ntasks_per_node() {
+        let eq = SrunArgs::try_parse_from(["srun", "--ntasks-per-node=1", "hostname"])
+            .expect("parse --ntasks-per-node=N");
+        assert_eq!(eq.ntasks_per_node, Some(1));
+
+        let spaced = SrunArgs::try_parse_from(["srun", "--ntasks-per-node", "8", "hostname"])
+            .expect("parse --ntasks-per-node N");
+        assert_eq!(spaced.ntasks_per_node, Some(8));
+
+        let absent = SrunArgs::try_parse_from(["srun", "hostname"]).expect("parse");
+        assert!(absent.ntasks_per_node.is_none());
+    }
+
+    #[test]
+    fn build_srun_job_spec_sets_tasks_per_node() {
+        let args = SrunArgs::try_parse_from(["srun", "--ntasks-per-node=4", "hostname"])
+            .expect("parse failed");
+        let io = ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        };
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
+        assert_eq!(spec.tasks_per_node, 4);
+    }
+
+    #[test]
+    fn build_srun_job_spec_tasks_per_node_defaults_zero() {
+        let args = SrunArgs::try_parse_from(["srun", "hostname"]).expect("parse failed");
+        let io = ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        };
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
+        assert_eq!(spec.tasks_per_node, 0);
+    }
+
+    #[test]
+    fn build_srun_job_spec_ntasks_defaults_to_node_count() {
+        let args = SrunArgs::try_parse_from(["srun", "-N", "4", "hostname"]).expect("parse");
+        assert_eq!(args.ntasks, None);
+        let io = ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        };
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
+        assert_eq!(spec.num_tasks, 4);
+    }
+
+    #[test]
+    fn build_srun_job_spec_explicit_ntasks_overrides_node_default() {
+        let args =
+            SrunArgs::try_parse_from(["srun", "-N", "4", "-n", "2", "hostname"]).expect("parse");
+        let io = ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        };
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
+        assert_eq!(spec.num_tasks, 2);
+    }
+
+    #[test]
+    fn parses_qos_short_and_long() {
+        let short =
+            SrunArgs::try_parse_from(["srun", "-q", "high", "hostname"]).expect("parse short qos");
+        assert_eq!(short.qos.as_deref(), Some("high"));
+
+        let long =
+            SrunArgs::try_parse_from(["srun", "--qos=normal", "hostname"]).expect("parse long qos");
+        assert_eq!(long.qos.as_deref(), Some("normal"));
+    }
+
+    #[test]
+    fn build_srun_job_spec_sets_qos() {
+        let args = SrunArgs::try_parse_from(["srun", "--qos", "high", "hostname"]).expect("parse");
+        let io = ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        };
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
+        assert_eq!(spec.qos, "high");
+    }
+
+    #[test]
+    fn build_srun_job_spec_sets_exclusive() {
+        let args = SrunArgs::try_parse_from(["srun", "--exclusive", "hostname"]).expect("parse");
+        let io = ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        };
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
+        assert!(spec.exclusive);
+    }
+
+    #[test]
+    fn build_srun_job_spec_qos_defaults_empty() {
+        let args = SrunArgs::try_parse_from(["srun", "hostname"]).expect("parse");
+        let io = ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        };
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
+        assert!(spec.qos.is_empty());
+    }
+
+    #[test]
     fn build_command_script_simple_argv() {
         assert_eq!(
             build_command_script(&["hostname".to_string()]).unwrap(),
@@ -958,5 +1726,494 @@ mod tests {
     #[test]
     fn build_command_script_preserves_quotes_in_arg() {
         assert_script_round_trips(&["echo", "it's a \"test\""]);
+    }
+
+    // These tests mutate process-global env vars, so they run serially and use
+    // the shared EnvGuard, which clears every SPUR_/SLURM_/SALLOC_/SRUN_-prefixed
+    // var on construction and drop, keeping them independent of the runner's
+    // environment (which may inject SLURM_* vars) and of each other.
+    use crate::env_defaults::EnvGuard;
+    use serial_test::serial;
+
+    /// Run the real matches-parse + env-resolve pipeline used by `main_with_args`.
+    fn resolve_from(cli: &[&str]) -> SrunArgs {
+        let matches = SrunArgs::command()
+            .try_get_matches_from(cli)
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        resolve_srun_env(&matches, &mut args).expect("resolve failed");
+        args
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn env_provides_default() {
+        let env = EnvGuard::new();
+        env.set("SLURM_PARTITION", "gpu");
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(args.partition.as_deref(), Some("gpu"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn cli_overrides_env() {
+        let env = EnvGuard::new();
+        env.set("SLURM_PARTITION", "gpu");
+        let args = resolve_from(&["srun", "--partition=cpu", "hostname"]);
+        assert_eq!(args.partition.as_deref(), Some("cpu"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn spur_native_alias_works() {
+        let env = EnvGuard::new();
+        env.set("SPUR_PARTITION", "spur-part");
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(args.partition.as_deref(), Some("spur-part"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn spur_alias_precedes_slurm_twin() {
+        let env = EnvGuard::new();
+        env.set("SPUR_PARTITION", "from-spur");
+        env.set("SLURM_PARTITION", "from-slurm");
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(args.partition.as_deref(), Some("from-spur"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn qos_env_default_and_cli_override() {
+        let env = EnvGuard::new();
+        env.set("SLURM_QOS", "high");
+        assert_eq!(
+            resolve_from(&["srun", "hostname"]).qos.as_deref(),
+            Some("high")
+        );
+
+        // CLI wins over env.
+        assert_eq!(
+            resolve_from(&["srun", "--qos=low", "hostname"])
+                .qos
+                .as_deref(),
+            Some("low")
+        );
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn qos_spur_alias_precedes_slurm_twin() {
+        let env = EnvGuard::new();
+        env.set("SPUR_QOS", "from-spur");
+        env.set("SLURM_QOS", "from-slurm");
+        assert_eq!(
+            resolve_from(&["srun", "hostname"]).qos.as_deref(),
+            Some("from-spur")
+        );
+    }
+
+    /// An allocation exports QoS under the `*_JOB_QOS` twin, so srun inside a
+    /// Spur allocation inherits it; the direct input var still takes precedence.
+    #[test]
+    #[serial(env_injection)]
+    fn qos_inherits_allocation_twin() {
+        let env = EnvGuard::new();
+        env.set("SLURM_JOB_QOS", "alloc-qos");
+        assert_eq!(
+            resolve_from(&["srun", "hostname"]).qos.as_deref(),
+            Some("alloc-qos")
+        );
+
+        env.set("SLURM_QOS", "input-qos");
+        assert_eq!(
+            resolve_from(&["srun", "hostname"]).qos.as_deref(),
+            Some("input-qos")
+        );
+
+        let overridden = resolve_from(&["srun", "-q", "cli-qos", "hostname"]);
+        assert_eq!(overridden.qos.as_deref(), Some("cli-qos"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn nodes_alias_fallback_and_precedence() {
+        let env = EnvGuard::new();
+        env.set("SLURM_JOB_NUM_NODES", "3");
+        assert_eq!(resolve_from(&["srun", "hostname"]).nodes, 3);
+
+        // SLURM_NNODES is listed before SLURM_JOB_NUM_NODES, so it wins.
+        env.set("SLURM_NNODES", "5");
+        assert_eq!(resolve_from(&["srun", "hostname"]).nodes, 5);
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn ntasks_nprocs_fallback() {
+        let env = EnvGuard::new();
+        env.set("SLURM_NPROCS", "7");
+        assert_eq!(resolve_from(&["srun", "hostname"]).ntasks, Some(7));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn numeric_env_parsed() {
+        let env = EnvGuard::new();
+        env.set("SLURM_NNODES", "4");
+        assert_eq!(resolve_from(&["srun", "hostname"]).nodes, 4);
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn numeric_env_trims_whitespace() {
+        let env = EnvGuard::new();
+        env.set("SLURM_NTASKS", " 4 ");
+        assert_eq!(resolve_from(&["srun", "hostname"]).ntasks, Some(4));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn invalid_numeric_env_errors() {
+        let env = EnvGuard::new();
+        env.set("SLURM_NNODES", "abc");
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "hostname"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        assert!(resolve_srun_env(&matches, &mut args).is_err());
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn genuine_srun_vars() {
+        let env = EnvGuard::new();
+        env.set("SRUN_OUTPUT", "out-%j.log");
+        env.set("SRUN_ERROR", "err-%j.log");
+        env.set("SRUN_INPUT", "/dev/null");
+        env.set("SRUN_CONTAINER", "img.sqsh");
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(args.output.as_deref(), Some("out-%j.log"));
+        assert_eq!(args.error.as_deref(), Some("err-%j.log"));
+        assert_eq!(args.input.as_deref(), Some("/dev/null"));
+        assert_eq!(args.container_image.as_deref(), Some("img.sqsh"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn label_flag_semantics() {
+        let env = EnvGuard::new();
+
+        env.set("SLURM_LABELIO", "yes");
+        assert!(resolve_from(&["srun", "hostname"]).label);
+
+        env.set("SLURM_LABELIO", "1");
+        assert!(resolve_from(&["srun", "hostname"]).label);
+
+        env.set("SLURM_LABELIO", "0");
+        assert!(!resolve_from(&["srun", "hostname"]).label);
+
+        env.set("SLURM_LABELIO", "maybe");
+        assert!(!resolve_from(&["srun", "hostname"]).label);
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn gres_comma_split() {
+        let env = EnvGuard::new();
+        env.set("SLURM_GRES", "gpu:1,fpga:2");
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(args.gres, vec!["gpu:1", "fpga:2"]);
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn gres_env_trims_whitespace_and_drops_empties() {
+        let env = EnvGuard::new();
+        env.set("SLURM_GRES", "gpu:1, fpga:2 ,");
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(args.gres, vec!["gpu:1", "fpga:2"]);
+    }
+
+    #[test]
+    fn cli_gres_comma_list_splits_into_multiple() {
+        let args = SrunArgs::try_parse_from(["srun", "--gres=gpu:1,fpga:2", "hostname"])
+            .expect("parse failed");
+        assert_eq!(args.gres, vec!["gpu:1", "fpga:2"]);
+    }
+
+    #[test]
+    fn cli_repeated_gres_last_wins() {
+        let args = SrunArgs::try_parse_from(["srun", "--gres=gpu:1", "--gres=fpga:2", "hostname"])
+            .expect("parse failed");
+        assert_eq!(args.gres, vec!["fpga:2"]);
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn defaults_unchanged_without_env() {
+        let _env = EnvGuard::new();
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(args.nodes, 1);
+        assert_eq!(args.ntasks, None);
+        assert_eq!(args.cpus_per_task, 1);
+        assert!(args.partition.is_none());
+        assert!(args.mpi.is_none());
+        assert!(!args.exclusive);
+        assert!(!args.label);
+    }
+
+    /// srun launched inside an allocation inherits the allocation's task and
+    /// CPU counts: salloc/sbatch export SLURM_NTASKS and SLURM_CPUS_PER_TASK,
+    /// and srun reads them as defaults (matching Slurm). This is what feeds
+    /// `create_job_step` in step mode, so the step sizes to the allocation
+    /// rather than the bare `-n 1 -c 1` defaults.
+    #[test]
+    #[serial(env_injection)]
+    fn inherits_allocation_task_and_cpu_counts() {
+        let env = EnvGuard::new();
+        env.set("SLURM_NTASKS", "4");
+        env.set("SLURM_CPUS_PER_TASK", "2");
+        env.set("SLURM_JOB_NUM_NODES", "3");
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(args.ntasks, Some(4));
+        assert_eq!(args.cpus_per_task, 2);
+        assert_eq!(args.nodes, 3);
+
+        // An explicit CLI value still wins over the inherited allocation env.
+        let overridden = resolve_from(&["srun", "-n", "1", "hostname"]);
+        assert_eq!(overridden.ntasks, Some(1));
+    }
+
+    /// Outside an allocation there is no `SLURM_NTASKS` to inherit, so the task
+    /// count follows the node count — including when `-N` itself came from env.
+    #[test]
+    #[serial(env_injection)]
+    fn ntasks_defaults_to_node_count_from_env() {
+        let env = EnvGuard::new();
+        env.set("SLURM_NNODES", "3");
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(args.ntasks, None);
+        assert_eq!(
+            crate::sbatch::effective_ntasks(args.ntasks, None, args.nodes),
+            3
+        );
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn invalid_ntasks_env_errors() {
+        let env = EnvGuard::new();
+        env.set("SLURM_NTASKS", "abc");
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "hostname"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        assert!(resolve_srun_env(&matches, &mut args).is_err());
+    }
+
+    /// `--ntasks-per-node` sizes the job when `-n` is absent:
+    /// `srun --ntasks-per-node=1 -N 4` launches one task per node.
+    #[test]
+    #[serial(env_injection)]
+    fn ntasks_per_node_scales_task_count() {
+        let _env = EnvGuard::new();
+        let args = resolve_from(&["srun", "-N", "4", "--ntasks-per-node=1", "hostname"]);
+        assert_eq!(args.ntasks, None);
+        assert_eq!(args.ntasks_per_node, Some(1));
+        assert_eq!(
+            crate::sbatch::effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
+            4
+        );
+
+        let multi = resolve_from(&["srun", "-N", "2", "--ntasks-per-node=8", "hostname"]);
+        assert_eq!(
+            crate::sbatch::effective_ntasks(multi.ntasks, multi.ntasks_per_node, multi.nodes),
+            16
+        );
+
+        // Zero per-node is treated as unset, so the count falls back to nodes.
+        let zero = resolve_from(&["srun", "-N", "4", "--ntasks-per-node=0", "hostname"]);
+        assert_eq!(
+            crate::sbatch::effective_ntasks(zero.ntasks, zero.ntasks_per_node, zero.nodes),
+            4
+        );
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn explicit_ntasks_overrides_ntasks_per_node() {
+        let env = EnvGuard::new();
+        let cli = resolve_from(&[
+            "srun",
+            "-N",
+            "4",
+            "--ntasks-per-node=8",
+            "-n",
+            "3",
+            "hostname",
+        ]);
+        assert_eq!(
+            crate::sbatch::effective_ntasks(cli.ntasks, cli.ntasks_per_node, cli.nodes),
+            3
+        );
+
+        // An inherited allocation task count is a direct request, so it wins
+        // over the per-node derivation.
+        env.set("SLURM_NTASKS", "5");
+        let inherited = resolve_from(&["srun", "-N", "4", "--ntasks-per-node=8", "hostname"]);
+        assert_eq!(
+            crate::sbatch::effective_ntasks(
+                inherited.ntasks,
+                inherited.ntasks_per_node,
+                inherited.nodes
+            ),
+            5
+        );
+    }
+
+    /// Allocation context is exported under the `*_JOB_*` names
+    /// (SLURM_JOB_PARTITION / SLURM_JOB_ACCOUNT), so srun must read those to
+    /// inherit partition/account when run inside a Spur allocation.
+    #[test]
+    #[serial(env_injection)]
+    fn inherits_allocation_partition_and_account() {
+        let env = EnvGuard::new();
+        env.set("SLURM_JOB_PARTITION", "alloc-part");
+        env.set("SLURM_JOB_ACCOUNT", "alloc-acct");
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(args.partition.as_deref(), Some("alloc-part"));
+        assert_eq!(args.account.as_deref(), Some("alloc-acct"));
+
+        // The direct input var takes precedence over the allocation twin.
+        env.set("SLURM_PARTITION", "input-part");
+        let direct = resolve_from(&["srun", "hostname"]);
+        assert_eq!(direct.partition.as_deref(), Some("input-part"));
+
+        // An explicit CLI value still wins over both.
+        let overridden = resolve_from(&["srun", "-p", "cli-part", "hostname"]);
+        assert_eq!(overridden.partition.as_deref(), Some("cli-part"));
+    }
+
+    fn empty_io() -> ResolvedIoPaths {
+        ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        }
+    }
+
+    async fn dispatch_with(
+        client: &mut SlurmControllerClient<tonic::transport::Channel>,
+        cli: &[&str],
+    ) -> Result<StepDispatchResult> {
+        let args = SrunArgs::try_parse_from(cli).expect("parse failed");
+        let io = empty_io();
+        let params = StepDispatchParams {
+            args: &args,
+            work_dir: "/tmp",
+            io: &io,
+            mpi: spur_core::mpi::MPI_NONE,
+        };
+        dispatch_step(client, 1, &params).await
+    }
+
+    /// With no `-n`, the step must ask the controller for one task per node.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn dispatch_step_requests_one_task_per_node_by_default() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        let result = dispatch_with(&mut client, &["srun", "-N", "3", "hostname"])
+            .await
+            .expect("dispatch should succeed");
+
+        assert_eq!(capture.create_step_num_tasks(), 3);
+        assert_eq!(capture.run_step_calls(), 1);
+        assert_eq!(
+            capture.run_step_step_id(),
+            crate::mock_controller::MOCK_STEP_ID,
+            "RunStep must carry the step id returned by CreateJobStep"
+        );
+        assert_eq!(result.exit_code, crate::mock_controller::MOCK_EXIT_CODE);
+    }
+
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn dispatch_step_explicit_ntasks_overrides_node_default() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        dispatch_with(&mut client, &["srun", "-N", "3", "-n", "2", "hostname"])
+            .await
+            .expect("dispatch should succeed");
+
+        assert_eq!(capture.create_step_num_tasks(), 2);
+    }
+
+    /// The per-node default feeds cpu-bind validation, so a `map_cpu` list
+    /// shorter than the node count is rejected before the step is run.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn dispatch_step_rejects_map_cpu_bind_shorter_than_default_ntasks() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        let err = dispatch_with(
+            &mut client,
+            &["srun", "-N", "4", "--cpu-bind", "map_cpu:0,1", "hostname"],
+        )
+        .await
+        .expect_err("two CPUs cannot cover four tasks");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("map_cpu lists 2 CPU(s) but the step requires 4 task(s)"),
+            "expected a cpu-bind arity error, got: {msg}"
+        );
+        assert_eq!(capture.create_step_num_tasks(), 4);
+        assert_eq!(
+            capture.run_step_calls(),
+            0,
+            "dispatch must bail before running the step"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn dispatch_step_surfaces_create_job_step_failure() {
+        let _env = EnvGuard::new();
+        let addr = crate::mock_controller::unreachable_addr().await;
+        let mut client = crate::mock_controller::lazy_client(addr);
+
+        let err = dispatch_with(&mut client, &["srun", "-N", "2", "hostname"])
+            .await
+            .expect_err("no server is listening");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed to create job step"),
+            "expected a CreateJobStep failure, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn jobid_without_overlap_errors() {
+        let result = main_with_args(vec![
+            "srun".into(),
+            "--jobid".into(),
+            "42".into(),
+            "hostname".into(),
+        ])
+        .await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("--overlap"),
+            "expected --overlap error, got: {msg}"
+        );
     }
 }

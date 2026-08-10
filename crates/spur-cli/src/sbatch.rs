@@ -1,10 +1,10 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::env_defaults::{apply_csv, apply_str, apply_string, env_first, was_cli_set};
 use anyhow::{bail, Context, Result};
 use clap::parser::ValueSource;
-use clap::{CommandFactory, FromArgMatches, Parser};
-use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use spur_proto::proto::{JobSpec, SubmitJobRequest};
 use std::collections::HashMap;
 
@@ -12,40 +12,32 @@ use std::collections::HashMap;
 #[derive(Parser, Debug)]
 #[command(name = "sbatch", about = "Submit a batch job script")]
 pub struct SbatchArgs {
-    // Precedence is CLI > env (SBATCH_*) > #SBATCH directive, matching Slurm;
-    // `resolve_sbatch_args` enforces it. `overrides_with = "self"` gives
-    // repeated flags last-wins semantics (gres included). The remaining Vec
-    // args (licenses, container_mounts, container_env) have no `overrides_with`
-    // because they accumulate by design.
+    // Precedence is CLI > env > #SBATCH directive, matching Slurm;
+    // `resolve_sbatch_args` enforces it. Env defaults are resolved by
+    // `resolve_sbatch_env` rather than clap's `env` attribute, which accepts
+    // only one variable name per flag and so cannot honor the `SPUR_*` twins.
+    // `overrides_with = "self"` gives repeated flags last-wins semantics (gres
+    // included). The remaining Vec args (licenses, container_mounts,
+    // container_env) have no `overrides_with` because they accumulate by design.
     /// Job name
-    #[arg(
-        short = 'J',
-        long,
-        env = "SBATCH_JOB_NAME",
-        overrides_with = "job_name"
-    )]
+    #[arg(short = 'J', long, overrides_with = "job_name")]
     pub job_name: Option<String>,
 
     /// Partition
-    #[arg(
-        short = 'p',
-        long,
-        env = "SBATCH_PARTITION",
-        overrides_with = "partition"
-    )]
+    #[arg(short = 'p', long, overrides_with = "partition")]
     pub partition: Option<String>,
 
     /// Account
-    #[arg(short = 'A', long, env = "SBATCH_ACCOUNT", overrides_with = "account")]
+    #[arg(short = 'A', long, overrides_with = "account")]
     pub account: Option<String>,
 
     /// Number of nodes
     #[arg(short = 'N', long, default_value = "1", overrides_with = "nodes")]
     pub nodes: u32,
 
-    /// Number of tasks
-    #[arg(short = 'n', long, default_value = "1", overrides_with = "ntasks")]
-    pub ntasks: u32,
+    /// Number of tasks (default: one per node)
+    #[arg(short = 'n', long, overrides_with = "ntasks")]
+    pub ntasks: Option<u32>,
 
     /// Tasks per node
     #[arg(long, overrides_with = "ntasks_per_node")]
@@ -61,29 +53,24 @@ pub struct SbatchArgs {
     pub cpus_per_task: u32,
 
     /// Memory per node (e.g., "4G", "4096M", "4096")
-    #[arg(long, env = "SBATCH_MEM", overrides_with = "mem")]
+    #[arg(long, overrides_with = "mem")]
     pub mem: Option<String>,
 
     /// Memory per CPU
-    #[arg(long, env = "SBATCH_MEM_PER_CPU", overrides_with = "mem_per_cpu")]
+    #[arg(long, overrides_with = "mem_per_cpu")]
     pub mem_per_cpu: Option<String>,
 
     /// Generic resources (e.g., "gpu:4", "gpu:mi300x:8")
     // Matches Slurm: `value_delimiter` keeps a single comma-list cumulative,
     // while `overrides_with` makes a repeated --gres replace instead of append.
-    #[arg(
-        long,
-        env = "SBATCH_GRES",
-        value_delimiter = ',',
-        overrides_with = "gres"
-    )]
+    #[arg(long, value_delimiter = ',', overrides_with = "gres")]
     pub gres: Vec<String>,
 
     /// Licenses (e.g., "fluent:5", "matlab:1")
     #[arg(short = 'L', long)]
     pub licenses: Vec<String>,
 
-    /// GPUs (shorthand, e.g., "4" or "mi300x:4")
+    /// GPUs total across the job (e.g., "4" or "mi300x:4")
     #[arg(short = 'G', long, overrides_with = "gpus")]
     pub gpus: Option<String>,
 
@@ -91,8 +78,12 @@ pub struct SbatchArgs {
     #[arg(long, overrides_with = "gpus_per_node")]
     pub gpus_per_node: Option<String>,
 
+    /// GPUs per task
+    #[arg(long, overrides_with = "gpus_per_task")]
+    pub gpus_per_task: Option<String>,
+
     /// Time limit (e.g., "4:00:00", "1-00:00:00")
-    #[arg(short = 't', long, env = "SBATCH_TIMELIMIT", overrides_with = "time")]
+    #[arg(short = 't', long, overrides_with = "time")]
     pub time: Option<String>,
 
     /// Minimum time limit
@@ -104,15 +95,15 @@ pub struct SbatchArgs {
     pub chdir: Option<String>,
 
     /// Stdout file
-    #[arg(short = 'o', long, env = "SBATCH_OUTPUT", overrides_with = "output")]
+    #[arg(short = 'o', long, overrides_with = "output")]
     pub output: Option<String>,
 
     /// Stderr file
-    #[arg(short = 'e', long, env = "SBATCH_ERROR", overrides_with = "error")]
+    #[arg(short = 'e', long, overrides_with = "error")]
     pub error: Option<String>,
 
     /// QoS
-    #[arg(short = 'q', long, env = "SBATCH_QOS", overrides_with = "qos")]
+    #[arg(short = 'q', long, overrides_with = "qos")]
     pub qos: Option<String>,
 
     /// Job dependency (e.g., "afterok:123")
@@ -123,26 +114,28 @@ pub struct SbatchArgs {
     #[arg(
         short = 'w',
         long,
-        env = "SBATCH_NODELIST",
-        overrides_with = "nodelist"
+        overrides_with_all = ["nodelist", "nodefile"]
     )]
     pub nodelist: Option<String>,
 
+    /// Read the node list from a file
+    #[arg(
+        short = 'F',
+        long,
+        overrides_with_all = ["nodelist", "nodefile"]
+    )]
+    pub nodefile: Option<String>,
+
     /// Exclude nodes
-    #[arg(short = 'x', long, env = "SBATCH_EXCLUDE", overrides_with = "exclude")]
+    #[arg(short = 'x', long, overrides_with = "exclude")]
     pub exclude: Option<String>,
 
     /// Required node features (e.g., "mi300x,nvlink")
-    #[arg(
-        short = 'C',
-        long,
-        env = "SBATCH_CONSTRAINT",
-        overrides_with = "constraint"
-    )]
+    #[arg(short = 'C', long, overrides_with = "constraint")]
     pub constraint: Option<String>,
 
     /// Target a named reservation
-    #[arg(long, env = "SBATCH_RESERVATION", overrides_with = "reservation")]
+    #[arg(long, overrides_with = "reservation")]
     pub reservation: Option<String>,
 
     /// Job array (e.g., "0-99%10")
@@ -150,12 +143,7 @@ pub struct SbatchArgs {
     pub array: Option<String>,
 
     /// Task distribution (block, cyclic, plane, arbitrary)
-    #[arg(
-        short = 'm',
-        long,
-        env = "SBATCH_DISTRIBUTION",
-        overrides_with = "distribution"
-    )]
+    #[arg(short = 'm', long, overrides_with = "distribution")]
     pub distribution: Option<String>,
 
     /// Heterogeneous job component index (0 = first component)
@@ -186,7 +174,7 @@ pub struct SbatchArgs {
     #[arg(long, overrides_with = "open_mode")]
     pub open_mode: Option<String>,
 
-    /// MPI type (none, pmix, pmi2)
+    /// MPI type (none, pmix)
     #[arg(long, default_value = "none", overrides_with = "mpi")]
     pub mpi: String,
 
@@ -215,12 +203,7 @@ pub struct SbatchArgs {
     pub mail_user: Option<String>,
 
     /// Export environment variables
-    #[arg(
-        long,
-        env = "SBATCH_EXPORT",
-        default_value = "ALL",
-        overrides_with = "export"
-    )]
+    #[arg(long, default_value = "ALL", overrides_with = "export")]
     pub export: String,
 
     // Container
@@ -269,12 +252,20 @@ pub struct SbatchArgs {
     )]
     pub controller: String,
 
+    /// Print only the job ID on success
+    #[arg(long)]
+    pub parsable: bool,
+
     /// Wrap the given command in a minimal shell script (mutually exclusive with a script file)
     #[arg(long, conflicts_with = "script")]
     pub wrap: Option<String>,
 
     /// The batch script file
     pub script: Option<String>,
+
+    /// Arguments passed to the batch script as $1, $2, etc.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub script_args: Vec<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -333,13 +324,15 @@ pub fn parse_sbatch_directives(script: &str) -> Vec<String> {
     args
 }
 
-/// Resolve `SbatchArgs` with Slurm precedence: CLI > env (SBATCH_*) > #SBATCH
-/// directive > default.
+/// Resolve `SbatchArgs` with Slurm precedence: CLI > env > #SBATCH directive >
+/// default.
 ///
-/// clap resolves CLI > env in one parse, but directives fed as argv are tagged
-/// `CommandLine` and would outrank env. So we parse CLI and directives
-/// separately and merge per field: keep the CLI/env value when set, else the
-/// directive.
+/// Directives fed as argv are tagged `CommandLine` and so cannot be
+/// distinguished from real CLI args in a single parse. We therefore parse CLI
+/// and directives separately and merge per field, keeping the CLI value when
+/// set, else the directive. Env is applied last over that merge, but only to
+/// fields the CLI did not set — which lands each field on exactly one of
+/// CLI, env, directive, in that order.
 pub fn resolve_sbatch_args(
     directives: &[String],
     cli_args: &[String],
@@ -351,11 +344,126 @@ pub fn resolve_sbatch_args(
     directive_argv.extend(directives.iter().cloned());
     let dir = SbatchArgs::try_parse_from(&directive_argv)?;
 
-    Ok(merge_resolved(&cli_matches, cli, dir))
+    let mut resolved = merge_resolved(&cli_matches, cli, dir);
+    resolve_sbatch_env(&cli_matches, &mut resolved);
+    Ok(resolved)
+}
+
+/// Apply `SBATCH_*` environment-variable defaults, each preceded by its
+/// `SPUR_*` native twin, to any flag not set on the command line.
+///
+/// Runs after the directive merge so an env value overrides a `#SBATCH`
+/// directive, and skips CLI-set flags so the command line still wins.
+///
+/// Flags whose `SPUR_*` twin is also injected into every running job's
+/// environment (`SPUR_JOB_NAME`, `SPUR_NODELIST`) take the `SBATCH_*` name
+/// only: reading the twin would make an `sbatch` submitted from inside a job
+/// silently inherit the enclosing job's name or node placement. Real Slurm
+/// does not inherit either for `sbatch`.
+fn resolve_sbatch_env(matches: &ArgMatches, args: &mut SbatchArgs) {
+    apply_str(
+        matches,
+        "job_name",
+        &["SBATCH_JOB_NAME"],
+        &mut args.job_name,
+    );
+    apply_str(
+        matches,
+        "partition",
+        &["SPUR_PARTITION", "SBATCH_PARTITION"],
+        &mut args.partition,
+    );
+    apply_str(
+        matches,
+        "account",
+        &["SPUR_ACCOUNT", "SBATCH_ACCOUNT"],
+        &mut args.account,
+    );
+    apply_str(
+        matches,
+        "mem",
+        &["SPUR_MEM_PER_NODE", "SBATCH_MEM"],
+        &mut args.mem,
+    );
+    apply_str(
+        matches,
+        "mem_per_cpu",
+        &["SPUR_MEM_PER_CPU", "SBATCH_MEM_PER_CPU"],
+        &mut args.mem_per_cpu,
+    );
+    apply_csv(
+        matches,
+        "gres",
+        &["SPUR_GRES", "SBATCH_GRES"],
+        &mut args.gres,
+    );
+    apply_str(
+        matches,
+        "time",
+        &["SPUR_TIMELIMIT", "SBATCH_TIMELIMIT"],
+        &mut args.time,
+    );
+    apply_str(
+        matches,
+        "output",
+        &["SPUR_OUTPUT", "SBATCH_OUTPUT"],
+        &mut args.output,
+    );
+    apply_str(
+        matches,
+        "error",
+        &["SPUR_ERROR", "SBATCH_ERROR"],
+        &mut args.error,
+    );
+    apply_str(matches, "qos", &["SPUR_QOS", "SBATCH_QOS"], &mut args.qos);
+    apply_str(
+        matches,
+        "exclude",
+        &["SPUR_EXCLUDE", "SBATCH_EXCLUDE"],
+        &mut args.exclude,
+    );
+    apply_str(
+        matches,
+        "constraint",
+        &["SPUR_CONSTRAINT", "SBATCH_CONSTRAINT"],
+        &mut args.constraint,
+    );
+    apply_str(
+        matches,
+        "reservation",
+        &["SPUR_RESERVATION", "SBATCH_RESERVATION"],
+        &mut args.reservation,
+    );
+    apply_str(
+        matches,
+        "distribution",
+        &["SPUR_DISTRIBUTION", "SBATCH_DISTRIBUTION"],
+        &mut args.distribution,
+    );
+    apply_string(
+        matches,
+        "export",
+        &["SPUR_EXPORT", "SBATCH_EXPORT"],
+        &mut args.export,
+    );
+
+    // --nodelist and --nodefile are two spellings of one choice, so the env
+    // nodelist has to displace a directive nodefile to actually take effect,
+    // and must stay out of the way when either spelling came from the CLI.
+    if !was_cli_set(matches, "nodelist") && !was_cli_set(matches, "nodefile") {
+        if let Some(nodelist) = env_first(&["SBATCH_NODELIST"]) {
+            args.nodelist = Some(nodelist);
+            args.nodefile = None;
+        }
+    }
 }
 
 /// True when neither the CLI nor an env var set the field. `value_source` is
 /// `None` for absent args with no default, which counts the same as a default.
+///
+/// `--controller` is the one flag clap still resolves from the environment
+/// itself, so the `EnvVariable` arm keeps `SPUR_CONTROLLER_ADDR` ahead of a
+/// `#SBATCH` directive.
 fn is_default(matches: &clap::ArgMatches, id: &str) -> bool {
     !matches!(
         matches.value_source(id),
@@ -363,8 +471,8 @@ fn is_default(matches: &clap::ArgMatches, id: &str) -> bool {
     )
 }
 
-/// `cli` already has env values folded in by clap, so falling back to the
-/// directive value only when `is_default` holds yields CLI > env > directive.
+/// Merge CLI over directive values. `resolve_sbatch_env` then layers env
+/// between the two, so the merge only has to prefer the CLI value when present.
 fn merge_resolved(cli_matches: &clap::ArgMatches, cli: SbatchArgs, dir: SbatchArgs) -> SbatchArgs {
     let mut out = cli;
 
@@ -387,6 +495,7 @@ fn merge_resolved(cli_matches: &clap::ArgMatches, cli: SbatchArgs, dir: SbatchAr
     fallback!(mem_per_cpu, "mem_per_cpu");
     fallback!(gpus, "gpus");
     fallback!(gpus_per_node, "gpus_per_node");
+    fallback!(gpus_per_task, "gpus_per_task");
     fallback!(time, "time");
     fallback!(time_min, "time_min");
     fallback!(chdir, "chdir");
@@ -394,7 +503,10 @@ fn merge_resolved(cli_matches: &clap::ArgMatches, cli: SbatchArgs, dir: SbatchAr
     fallback!(error, "error");
     fallback!(qos, "qos");
     fallback!(dependency, "dependency");
-    fallback!(nodelist, "nodelist");
+    if is_default(cli_matches, "nodelist") && is_default(cli_matches, "nodefile") {
+        out.nodelist = dir.nodelist;
+        out.nodefile = dir.nodefile;
+    }
     fallback!(exclude, "exclude");
     fallback!(constraint, "constraint");
     fallback!(reservation, "reservation");
@@ -577,6 +689,42 @@ fn parse_memory_mb(s: &str) -> Result<u64> {
     }
 }
 
+/// Parse a GPU flag value ("4" or "mi300x:4") into a proto GpuRequest.
+pub(crate) fn parse_gpu_flag(value: Option<&str>) -> Result<Option<spur_proto::proto::GpuRequest>> {
+    match value {
+        Some(v) if !v.is_empty() => {
+            let req = spur_core::gpu_request::GpuRequest::parse_flag(v)
+                .with_context(|| format!("invalid GPU specification '{v}'"))?;
+            Ok(req.as_ref().map(Into::into))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Reject mutually-exclusive GPU flags client-side for a clear early error.
+/// A `gpu:` entry in `gres` counts as an implicit per-node request.
+pub(crate) fn validate_gpu_flags(
+    gpus: bool,
+    gpus_per_node: bool,
+    gpus_per_task: bool,
+    gres: &[String],
+) -> Result<()> {
+    let gres_gpu = gres
+        .iter()
+        .filter_map(|g| spur_core::resource::parse_gres(g))
+        .any(|(name, _, _)| name == "gpu");
+    let count = [gpus, gpus_per_node, gpus_per_task, gres_gpu]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+    if count > 1 {
+        anyhow::bail!(
+            "only one GPU request form (gpus, gpus_per_node, gpus_per_task, or a gpu gres entry) may be set"
+        );
+    }
+    Ok(())
+}
+
 /// Resolve a container image name to an absolute squashfs path if possible.
 ///
 /// When an image is imported via `spur image import`, it is stored in the
@@ -600,7 +748,7 @@ fn resolve_container_image(image: Option<&str>) -> String {
     }
 
     // Try to find the .sqsh file in the image directory
-    let sanitized = spur_net::oci::sanitize_name(image);
+    let sanitized = spur_net::oci::image_file_stem(image);
 
     // Check $SPUR_IMAGE_DIR first, then system default, then user fallback
     let candidates = {
@@ -632,19 +780,34 @@ pub async fn main() -> Result<()> {
     main_with_args(std::env::args().collect()).await
 }
 
-/// The token to treat as a batch script path for `#SBATCH` pre-parsing, if any.
-/// Returns `None` when `--wrap` is used (wrap has no script file) or when the
-/// last token is a flag / the `sbatch` argv[0].
-fn candidate_script_path(cli_args: &[String]) -> Option<&str> {
-    if cli_args
-        .iter()
-        .any(|a| a == "--wrap" || a.starts_with("--wrap="))
-    {
+/// Identify the script file for `#SBATCH` directive pre-parsing.
+///
+/// Uses a lightweight clap pre-parse to extract the `script` positional,
+/// which is reliable even when trailing `script_args` are present.
+fn candidate_script_path(cli_args: &[String]) -> Option<String> {
+    let pre = SbatchArgs::try_parse_from(cli_args).ok()?;
+    if pre.wrap.is_some() {
         return None;
     }
-    match cli_args.last() {
-        Some(last) if !last.starts_with('-') && last != "sbatch" => Some(last.as_str()),
-        _ => None,
+    pre.script
+}
+
+/// Slurm allocates one task per node unless `-n` is given, so the default
+/// scales with `-N` instead of being a fixed 1. `--ntasks-per-node=K` raises
+/// that default to `nodes * K`, keeping `SLURM_NTASKS` and accounting in step
+/// with the number of tasks actually launched.
+pub(crate) fn effective_ntasks(
+    ntasks: Option<u32>,
+    ntasks_per_node: Option<u32>,
+    nodes: u32,
+) -> u32 {
+    if let Some(n) = ntasks {
+        return n;
+    }
+    // Zero tasks-per-node means "unset" everywhere downstream.
+    match ntasks_per_node.filter(|&k| k > 0) {
+        Some(k) => nodes.saturating_mul(k),
+        None => nodes,
     }
 }
 
@@ -662,7 +825,7 @@ fn default_job_name(job_name: Option<&str>, script: Option<&str>, is_wrap: bool)
 
 pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
     let script_content =
-        candidate_script_path(&cli_args).and_then(|p| std::fs::read_to_string(p).ok());
+        candidate_script_path(&cli_args).and_then(|p| std::fs::read_to_string(&p).ok());
 
     let directive_args = script_content
         .as_deref()
@@ -670,9 +833,24 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         .unwrap_or_default();
 
     let mut args = resolve_sbatch_args(&directive_args, &cli_args)?;
+    let nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
+
+    if args.mpi == "list" {
+        let plugin_dir = crate::spur_config::load_spur_config().mpi.plugin_dir;
+        for line in spur_core::mpi::mpi_list_lines(&plugin_dir) {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+    args.mpi = spur_core::mpi::parse_mpi_option(&args.mpi)
+        .map_err(|e| anyhow::anyhow!(e))?
+        .expect("list handled above");
 
     // Build the job spec
     let is_wrap = args.wrap.is_some();
+    if is_wrap && !args.script_args.is_empty() {
+        bail!("sbatch: script arguments may not be used with --wrap");
+    }
     let stdin_is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdin());
     let script = match choose_body_source(args.wrap.take(), args.script.clone(), stdin_is_terminal)?
     {
@@ -692,14 +870,19 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
 
     let name = default_job_name(args.job_name.as_deref(), args.script.as_deref(), is_wrap);
 
-    // Build GRES list
-    let mut gres = args.gres;
-    if let Some(gpus) = &args.gpus {
-        gres.push(format!("gpu:{}", gpus));
-    }
-    if let Some(gpn) = &args.gpus_per_node {
-        gres.push(format!("gpu:{}", gpn));
-    }
+    // GPU requests are carried in dedicated proto fields (not folded into
+    // gres) so the controller can distinguish total vs per-node vs per-task.
+    // `--gres=gpu:N` still flows through `gres` as an implicit per-node request.
+    let gres = args.gres;
+    let gpus = parse_gpu_flag(args.gpus.as_deref())?;
+    let gpus_per_node = parse_gpu_flag(args.gpus_per_node.as_deref())?;
+    let gpus_per_task = parse_gpu_flag(args.gpus_per_task.as_deref())?;
+    validate_gpu_flags(
+        gpus.is_some(),
+        gpus_per_node.is_some(),
+        gpus_per_task.is_some(),
+        &gres,
+    )?;
     // Don't push licenses into gres here — proto_to_job_spec already folds them in.
 
     // Parse time limit — use parse_time_seconds so that short values like
@@ -747,14 +930,18 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         uid: nix::unistd::getuid().as_raw(),
         gid: nix::unistd::getgid().as_raw(),
         num_nodes: args.nodes,
-        num_tasks: args.ntasks,
+        num_tasks: effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
         tasks_per_node: args.ntasks_per_node.unwrap_or(0),
         cpus_per_task: args.cpus_per_task,
         memory_per_node_mb: memory_per_node.unwrap_or(0),
         memory_per_cpu_mb: memory_per_cpu.unwrap_or(0),
         gres,
+        gpus,
+        gpus_per_node,
+        gpus_per_task,
         script,
         argv: Vec::new(),
+        script_args: args.script_args.clone(),
         work_dir,
         stdout_path: args.output.unwrap_or_default(),
         stderr_path: args.error.unwrap_or_default(),
@@ -766,7 +953,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         priority: 0,
         reservation: args.reservation.unwrap_or_default(),
         dependency: dependencies,
-        nodelist: args.nodelist.unwrap_or_default(),
+        nodelist: nodelist.unwrap_or_default(),
         exclude: args.exclude.unwrap_or_default(),
         constraint: args.constraint.unwrap_or_default(),
         mpi: args.mpi,
@@ -828,13 +1015,16 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         shm_size: String::new(),
         extra_resources: std::collections::HashMap::new(),
         open_mode: args.open_mode.unwrap_or_default(),
+        srun_job: false,
+        pty: false,
+        initial_winsize: None,
     };
 
     // Submit to controller
     let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
+    let mut client = spur_proto::controller_client(channel);
 
     let response = client
         .submit_job(SubmitJobRequest {
@@ -843,8 +1033,16 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
         .await
         .context("job submission failed")?;
 
-    let job_id = response.into_inner().job_id;
-    println!("Submitted batch job {}", job_id);
+    let response = response.into_inner();
+    for warning in &response.warnings {
+        eprintln!("sbatch: warning: {warning}");
+    }
+    let job_id = response.job_id;
+    if args.parsable {
+        println!("{}", job_id);
+    } else {
+        println!("Submitted batch job {}", job_id);
+    }
 
     Ok(())
 }
@@ -944,8 +1142,12 @@ echo "hello world"
         assert!(args.exclusive);
     }
 
+    // Guarded because `--time` also resolves from SPUR_TIMELIMIT, which a test
+    // runner's environment could otherwise supply.
     #[test]
+    #[serial(env_injection)]
     fn test_directive_only_when_no_cli_override() {
+        let _env = EnvGuard::new();
         let args = parse_merged(&["--nodes=2", "--time=1:00:00"], &["sbatch"]);
         assert_eq!(args.nodes, 2);
         assert_eq!(args.time.as_deref(), Some("1:00:00"));
@@ -955,6 +1157,104 @@ echo "hello world"
     fn test_cli_only_when_no_directive() {
         let args = parse_merged(&[], &["sbatch", "--nodes=4"]);
         assert_eq!(args.nodes, 4);
+    }
+
+    #[test]
+    fn test_ntasks_defaults_to_node_count() {
+        let args = parse_merged(&[], &["sbatch", "-N", "4"]);
+        assert_eq!(args.ntasks, None);
+        assert_eq!(
+            effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
+            4
+        );
+    }
+
+    #[test]
+    fn test_explicit_ntasks_overrides_node_default() {
+        let args = parse_merged(&[], &["sbatch", "-N", "4", "-n", "2"]);
+        assert_eq!(
+            effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
+            2
+        );
+    }
+
+    #[test]
+    fn test_ntasks_directive_used_when_no_cli() {
+        let args = parse_merged(&["--ntasks=8"], &["sbatch", "-N", "4"]);
+        assert_eq!(
+            effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
+            8
+        );
+    }
+
+    #[test]
+    fn test_ntasks_per_node_scales_default_by_node_count() {
+        let args = parse_merged(&[], &["sbatch", "-N", "2", "--ntasks-per-node=4"]);
+        assert_eq!(args.ntasks, None);
+        assert_eq!(
+            effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
+            8
+        );
+    }
+
+    #[test]
+    fn test_explicit_ntasks_overrides_ntasks_per_node_default() {
+        let args = parse_merged(
+            &[],
+            &["sbatch", "-N", "2", "--ntasks-per-node=4", "-n", "3"],
+        );
+        assert_eq!(
+            effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
+            3
+        );
+    }
+
+    #[test]
+    fn test_ntasks_directive_overrides_ntasks_per_node_default() {
+        let args = parse_merged(
+            &["--ntasks=3"],
+            &["sbatch", "-N", "2", "--ntasks-per-node=4"],
+        );
+        assert_eq!(
+            effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
+            3
+        );
+    }
+
+    #[test]
+    fn test_ntasks_per_node_directive_scales_default() {
+        let args = parse_merged(&["--ntasks-per-node=4"], &["sbatch", "-N", "2"]);
+        assert_eq!(
+            effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
+            8
+        );
+    }
+
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn test_submit_path_builds_spec_with_defaulted_ntasks() {
+        // Guarded because a stray SBATCH_*/SPUR_* var in the runner's
+        // environment could fail the parse long before the spec is built.
+        let _env = EnvGuard::new();
+        let err = main_with_args(vec![
+            "sbatch".into(),
+            "--controller".into(),
+            "http://127.0.0.1:1".into(),
+            "--export".into(),
+            "NONE".into(),
+            "-N".into(),
+            "4".into(),
+            "--wrap".into(),
+            "echo hi".into(),
+        ])
+        .await
+        .unwrap_err();
+        // Failing at the connect means the whole JobSpec was built first,
+        // including num_tasks defaulting to the node count.
+        assert!(
+            err.to_string().contains("failed to connect to spurctld"),
+            "expected a connect failure, got: {err}"
+        );
     }
 
     #[test]
@@ -974,6 +1274,47 @@ echo "hello world"
     }
 
     #[test]
+    fn parse_gpu_flag_count_only() {
+        let req = parse_gpu_flag(Some("4")).unwrap().unwrap();
+        assert_eq!(req.count, 4);
+        assert_eq!(req.gpu_type, "");
+    }
+
+    #[test]
+    fn parse_gpu_flag_typed() {
+        let req = parse_gpu_flag(Some("mi300x:8")).unwrap().unwrap();
+        assert_eq!(req.count, 8);
+        assert_eq!(req.gpu_type, "mi300x");
+    }
+
+    #[test]
+    fn parse_gpu_flag_empty_is_none() {
+        assert!(parse_gpu_flag(None).unwrap().is_none());
+        assert!(parse_gpu_flag(Some("")).unwrap().is_none());
+    }
+
+    #[test]
+    fn validate_gpu_flags_rejects_multiple_sources() {
+        // --gpus and --gpus-per-node together.
+        assert!(validate_gpu_flags(true, true, false, &[]).is_err());
+        // --gpus and --gres=gpu together.
+        assert!(validate_gpu_flags(true, false, false, &["gpu:2".into()]).is_err());
+    }
+
+    #[test]
+    fn validate_gpu_flags_allows_single_source() {
+        assert!(validate_gpu_flags(true, false, false, &[]).is_ok());
+        assert!(validate_gpu_flags(false, false, false, &["gpu:2".into()]).is_ok());
+        assert!(validate_gpu_flags(false, false, false, &["fpga:1".into()]).is_ok());
+    }
+
+    #[test]
+    fn gpus_per_task_flag_parses() {
+        let args = parse_merged(&[], &["sbatch", "--gpus-per-task=2"]);
+        assert_eq!(args.gpus_per_task.as_deref(), Some("2"));
+    }
+
+    #[test]
     fn test_comma_gres_is_cumulative() {
         let args = parse_merged(&[], &["sbatch", "--gres=gpu:2,fpga:1"]);
         assert_eq!(args.gres, vec!["gpu:2", "fpga:1"]);
@@ -986,7 +1327,9 @@ echo "hello world"
     }
 
     #[test]
+    #[serial(env_injection)]
     fn test_partial_override_preserves_other_directives() {
+        let _env = EnvGuard::new();
         // CLI overrides nodes but leaves time/job-name from directives.
         let args = parse_merged(
             &["--nodes=2", "--time=1:00:00", "--job-name=script-name"],
@@ -998,6 +1341,31 @@ echo "hello world"
     }
 
     #[test]
+    #[serial(env_injection)]
+    fn test_nodefile_directive_is_parsed() {
+        // Guarded because SBATCH_NODELIST clears a directive nodefile, so a
+        // stray or concurrently-set var would empty the field under test.
+        let _env = EnvGuard::new();
+        let args = parse_merged(&["--nodefile=nodes.txt"], &["sbatch"]);
+        assert_eq!(args.nodefile.as_deref(), Some("nodes.txt"));
+        assert!(args.nodelist.is_none());
+    }
+
+    #[test]
+    fn test_cli_nodelist_overrides_nodefile_directive() {
+        let args = parse_merged(&["--nodefile=nodes.txt"], &["sbatch", "--nodelist=node001"]);
+        assert_eq!(args.nodelist.as_deref(), Some("node001"));
+        assert!(args.nodefile.is_none());
+    }
+
+    #[test]
+    fn test_cli_nodefile_overrides_nodelist_directive() {
+        let args = parse_merged(&["--nodelist=node001"], &["sbatch", "-F", "nodes.txt"]);
+        assert_eq!(args.nodefile.as_deref(), Some("nodes.txt"));
+        assert!(args.nodelist.is_none());
+    }
+
+    #[test]
     fn test_cli_can_override_default_value_arg() {
         // `--cpus-per-task` has default_value = "1". Verify directive sets it
         // and CLI overrides — no surprises from the default interacting with
@@ -1006,48 +1374,18 @@ echo "hello world"
         assert_eq!(args.cpus_per_task, 8);
     }
 
-    // SBATCH_* env vars provide defaults (CLI > env > directive). These tests
-    // mutate process-global env vars, so they run serially and use
-    // SbatchEnvGuard to stay independent of the runner's environment.
+    // SBATCH_*/SPUR_* env vars provide defaults (CLI > env > directive). These
+    // tests mutate process-global env vars, so they run serially and use the
+    // shared EnvGuard, which clears every SPUR_/SLURM_/SALLOC_/SRUN_/SBATCH_-
+    // prefixed var on construction and drop to stay independent of the runner's
+    // environment.
+    use crate::env_defaults::EnvGuard;
     use serial_test::serial;
-
-    /// Clears every SBATCH_* var on construction and on drop, so an assertion
-    /// panic can never leak env state into the next test in this process.
-    struct SbatchEnvGuard;
-
-    impl SbatchEnvGuard {
-        fn new() -> Self {
-            Self::clear();
-            SbatchEnvGuard
-        }
-
-        fn set(&self, key: &str, val: &str) {
-            std::env::set_var(key, val);
-        }
-
-        /// The set of SBATCH_* vars is derived from the `env=` attributes on
-        /// SbatchArgs so it cannot drift as flags are added or removed.
-        fn clear() {
-            for arg in SbatchArgs::command().get_arguments() {
-                let Some(env) = arg.get_env() else { continue };
-                let name = env.to_string_lossy();
-                if name.starts_with("SBATCH_") {
-                    std::env::remove_var(name.as_ref());
-                }
-            }
-        }
-    }
-
-    impl Drop for SbatchEnvGuard {
-        fn drop(&mut self) {
-            Self::clear();
-        }
-    }
 
     #[test]
     #[serial(env_injection)]
     fn test_env_provides_default() {
-        let env = SbatchEnvGuard::new();
+        let env = EnvGuard::new();
         env.set("SBATCH_PARTITION", "gpu");
         let args = parse_merged(&[], &["sbatch"]);
         assert_eq!(args.partition.as_deref(), Some("gpu"));
@@ -1056,7 +1394,7 @@ echo "hello world"
     #[test]
     #[serial(env_injection)]
     fn test_cli_overrides_env() {
-        let env = SbatchEnvGuard::new();
+        let env = EnvGuard::new();
         env.set("SBATCH_PARTITION", "gpu");
         let args = parse_merged(&[], &["sbatch", "--partition=cpu"]);
         assert_eq!(args.partition.as_deref(), Some("cpu"));
@@ -1065,7 +1403,7 @@ echo "hello world"
     #[test]
     #[serial(env_injection)]
     fn test_env_overrides_directive() {
-        let env = SbatchEnvGuard::new();
+        let env = EnvGuard::new();
         env.set("SBATCH_PARTITION", "gpu");
         let args = parse_merged(&["--partition=script-part"], &["sbatch"]);
         assert_eq!(
@@ -1078,7 +1416,7 @@ echo "hello world"
     #[test]
     #[serial(env_injection)]
     fn test_directive_used_when_no_env_or_cli() {
-        let _env = SbatchEnvGuard::new();
+        let _env = EnvGuard::new();
         let args = parse_merged(&["--partition=script-part"], &["sbatch"]);
         assert_eq!(args.partition.as_deref(), Some("script-part"));
     }
@@ -1086,7 +1424,7 @@ echo "hello world"
     #[test]
     #[serial(env_injection)]
     fn test_env_gres_comma_split() {
-        let env = SbatchEnvGuard::new();
+        let env = EnvGuard::new();
         env.set("SBATCH_GRES", "gpu:1,license:x");
         let args = parse_merged(&[], &["sbatch"]);
         assert_eq!(args.gres, vec!["gpu:1", "license:x"]);
@@ -1095,7 +1433,7 @@ echo "hello world"
     #[test]
     #[serial(env_injection)]
     fn test_env_gres_overrides_directive() {
-        let env = SbatchEnvGuard::new();
+        let env = EnvGuard::new();
         env.set("SBATCH_GRES", "gpu:2");
         let args = parse_merged(&["--gres=gpu:8"], &["sbatch"]);
         assert_eq!(
@@ -1108,10 +1446,121 @@ echo "hello world"
     #[test]
     #[serial(env_injection)]
     fn test_cli_gres_replaces_directive_and_ignores_env() {
-        let env = SbatchEnvGuard::new();
+        let env = EnvGuard::new();
         env.set("SBATCH_GRES", "gpu:1");
         let args = parse_merged(&["--gres=gpu:mi300x:8"], &["sbatch", "--gres=gpu:2"]);
         assert_eq!(args.gres, vec!["gpu:2"]);
+    }
+
+    // --- SPUR_* native twins ---
+
+    #[test]
+    #[serial(env_injection)]
+    fn test_spur_twin_provides_default() {
+        let env = EnvGuard::new();
+        env.set("SPUR_PARTITION", "gpu");
+        let args = parse_merged(&[], &["sbatch"]);
+        assert_eq!(
+            args.partition.as_deref(),
+            Some("gpu"),
+            "SPUR_PARTITION must apply to sbatch as it does to srun/salloc"
+        );
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn test_spur_twin_takes_precedence_over_sbatch_var() {
+        let env = EnvGuard::new();
+        env.set("SPUR_PARTITION", "spur-part");
+        env.set("SBATCH_PARTITION", "sbatch-part");
+        let args = parse_merged(&[], &["sbatch"]);
+        assert_eq!(args.partition.as_deref(), Some("spur-part"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn test_spur_twin_overrides_directive_but_not_cli() {
+        let env = EnvGuard::new();
+        env.set("SPUR_TIMELIMIT", "2:00:00");
+        assert_eq!(
+            parse_merged(&["--time=1:00:00"], &["sbatch"])
+                .time
+                .as_deref(),
+            Some("2:00:00")
+        );
+        assert_eq!(
+            parse_merged(&["--time=1:00:00"], &["sbatch", "--time=8:00:00"])
+                .time
+                .as_deref(),
+            Some("8:00:00")
+        );
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn test_spur_twins_cover_every_env_backed_flag() {
+        let env = EnvGuard::new();
+        env.set("SPUR_ACCOUNT", "proj");
+        env.set("SPUR_QOS", "high");
+        env.set("SPUR_MEM_PER_NODE", "8G");
+        env.set("SPUR_MEM_PER_CPU", "512M");
+        env.set("SPUR_GRES", "gpu:2,fpga:1");
+        env.set("SPUR_OUTPUT", "out.log");
+        env.set("SPUR_ERROR", "err.log");
+        env.set("SPUR_EXCLUDE", "node003");
+        env.set("SPUR_CONSTRAINT", "mi300x");
+        env.set("SPUR_RESERVATION", "maint");
+        env.set("SPUR_DISTRIBUTION", "cyclic");
+        env.set("SPUR_EXPORT", "NONE");
+        let args = parse_merged(&[], &["sbatch"]);
+        assert_eq!(args.account.as_deref(), Some("proj"));
+        assert_eq!(args.qos.as_deref(), Some("high"));
+        assert_eq!(args.mem.as_deref(), Some("8G"));
+        assert_eq!(args.mem_per_cpu.as_deref(), Some("512M"));
+        assert_eq!(args.gres, vec!["gpu:2", "fpga:1"]);
+        assert_eq!(args.output.as_deref(), Some("out.log"));
+        assert_eq!(args.error.as_deref(), Some("err.log"));
+        assert_eq!(args.exclude.as_deref(), Some("node003"));
+        assert_eq!(args.constraint.as_deref(), Some("mi300x"));
+        assert_eq!(args.reservation.as_deref(), Some("maint"));
+        assert_eq!(args.distribution.as_deref(), Some("cyclic"));
+        assert_eq!(args.export, "NONE");
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn test_allocation_output_vars_are_not_inherited() {
+        let env = EnvGuard::new();
+        // Both are injected into every running job, so an sbatch submitted from
+        // inside a job must not pick up the enclosing job's name or nodes.
+        env.set("SPUR_JOB_NAME", "parent-job");
+        env.set("SPUR_NODELIST", "node001,node002");
+        let args = parse_merged(&[], &["sbatch"]);
+        assert!(args.job_name.is_none());
+        assert!(args.nodelist.is_none());
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn test_env_nodelist_displaces_directive_nodefile() {
+        let env = EnvGuard::new();
+        env.set("SBATCH_NODELIST", "node001");
+        let args = parse_merged(&["--nodefile=nodes.txt"], &["sbatch"]);
+        assert_eq!(args.nodelist.as_deref(), Some("node001"));
+        assert!(
+            args.nodefile.is_none(),
+            "env nodelist must not leave the directive nodefile in play"
+        );
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn test_cli_nodefile_wins_over_env_nodelist() {
+        let env = EnvGuard::new();
+        env.set("SBATCH_NODELIST", "node001");
+        let args = parse_merged(&[], &["sbatch", "-F", "nodes.txt"]);
+        assert_eq!(args.nodefile.as_deref(), Some("nodes.txt"));
+        assert!(args.nodelist.is_none());
     }
 
     // --- sbatch --wrap ---
@@ -1165,7 +1614,16 @@ echo "hello world"
             .into_iter()
             .map(Into::into)
             .collect();
-        assert_eq!(candidate_script_path(&args), Some("job.sh"));
+        assert_eq!(candidate_script_path(&args), Some("job.sh".to_string()));
+    }
+
+    #[test]
+    fn test_candidate_script_path_with_trailing_args() {
+        let args: Vec<String> = vec!["sbatch", "job.sh", "arg1", "arg2"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert_eq!(candidate_script_path(&args), Some("job.sh".to_string()));
     }
 
     #[test]
@@ -1247,6 +1705,34 @@ echo "hello world"
         assert_eq!(
             wrap_command_body("#SBATCH --nodes=9"),
             "#!/bin/sh\n# This script was created by sbatch --wrap.\n\n#SBATCH --nodes=9\n"
+        );
+    }
+
+    #[test]
+    fn test_resolve_container_image_cross_form() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let stem = spur_net::oci::image_file_stem("docker://busybox:latest");
+        let image_path = dir.path().join(format!("{}.sqsh", stem));
+        std::fs::write(&image_path, b"fake").unwrap();
+
+        let prev = std::env::var_os("SPUR_IMAGE_DIR");
+        std::env::set_var("SPUR_IMAGE_DIR", dir.path());
+
+        let resolved = resolve_container_image(Some("busybox"));
+
+        match prev {
+            Some(v) => std::env::set_var("SPUR_IMAGE_DIR", v),
+            None => std::env::remove_var("SPUR_IMAGE_DIR"),
+        }
+
+        assert_eq!(
+            resolved,
+            image_path.to_string_lossy(),
+            "bare 'busybox' must resolve to the image imported as 'docker://busybox:latest'"
         );
     }
 }

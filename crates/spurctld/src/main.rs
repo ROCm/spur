@@ -4,10 +4,12 @@
 mod accounting;
 mod association_cache;
 mod cluster;
+mod cluster_k8s;
 mod fairshare_cache;
 mod limits_cache;
 mod metrics_proto;
 mod metrics_server;
+mod pmix_dispatch;
 mod raft;
 mod raft_server;
 mod rest;
@@ -62,6 +64,14 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args_os()
+        .skip(1)
+        .any(|a| a == "-V" || a == "--version")
+    {
+        println!("{}", spur_core::version::version_string());
+        return Ok(());
+    }
+
     let args = Args::parse();
 
     tracing_subscriber::fmt()
@@ -71,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    info!(version = env!("CARGO_PKG_VERSION"), "spurctld starting");
+    info!(version = %spur_core::version::version_string(), "spurctld starting");
 
     // Load config if it exists, otherwise use defaults
     let mut config = if args.config.exists() {
@@ -109,8 +119,18 @@ async fn main() -> anyhow::Result<()> {
         spur_update::SPUR_BINARIES,
     );
 
-    // Initialize cluster manager first so Raft recovery can apply entries
-    let cluster = Arc::new(ClusterManager::new(config.clone(), &args.state_dir)?);
+    // Initialize cluster manager first so Raft recovery can apply entries.
+    // Pass the config path so `scontrol reconfigure` can re-read spur.conf.
+    let config_path = if args.config.exists() {
+        Some(args.config.clone())
+    } else {
+        None
+    };
+    let cluster = Arc::new(ClusterManager::new_with_config_path(
+        config.clone(),
+        &args.state_dir,
+        config_path,
+    )?);
 
     // Raft is always-on. When no peers are configured, run a single-node
     // cluster that self-elects instantly (same pattern as Apache Kudu).
@@ -119,19 +139,16 @@ async fn main() -> anyhow::Result<()> {
         info!("single-node Raft mode (no peers configured)");
         (vec![raft_addr], 1u64)
     } else {
-        let id = config
-            .controller
-            .node_id
-            .or_else(raft::detect_node_id_from_hostname)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Raft peers configured but node_id could not be determined. \
-                 Set controller.node_id in spur.conf or use a hostname ending \
-                 in -N (e.g. spurctld-0)."
-                )
-            })?;
+        let hostname = raft::system_hostname()?;
+        let (id, source) = raft::resolve_node_id(
+            config.controller.node_id,
+            &hostname,
+            &config.controller.peers,
+        )?;
         info!(
             node_id = id,
+            source = %source,
+            hostname,
             peers = ?config.controller.peers,
             "initializing Raft consensus"
         );
@@ -162,8 +179,8 @@ async fn main() -> anyhow::Result<()> {
     let sched_stats = Arc::new(SchedStatsCollector::new(config.scheduler.plugin.clone()));
     cluster.set_sched_stats(sched_stats.clone());
 
-    // Build accounting PgPool (best-effort — scheduling works without it)
-    let accounting_pool = if config.accounting.database_url.is_empty() {
+    // Accounting stays best-effort so a database outage does not stop scheduling.
+    let accounting_service = if config.accounting.database_url.is_empty() {
         info!("accounting disabled (database_url not configured)");
         None
     } else {
@@ -175,12 +192,24 @@ async fn main() -> anyhow::Result<()> {
         {
             Ok(pool) => {
                 if let Err(e) = accounting::db::migrate(&pool).await {
-                    tracing::error!(error = %e, "accounting migration failed; disabling accounting");
-                    None
+                    tracing::error!(
+                        error = %e,
+                        "accounting migration failed; accounting service will report unavailable"
+                    );
+                    Some(accounting::AccountingService::unavailable(
+                        "database migration failed at startup",
+                    ))
                 } else {
                     info!("accounting database connected");
                     let notifier = accounting::AccountingNotifier::new(pool.clone());
                     cluster.set_accounting(notifier);
+
+                    accounting::spawn_reconcile_loop(
+                        pool.clone(),
+                        cluster.clone(),
+                        raft_handle.clone(),
+                        std::time::Duration::from_secs(accounting::RECONCILE_INTERVAL_SECS),
+                    );
 
                     cluster.fairshare_cache().spawn_refresh_loop(
                         pool.clone(),
@@ -198,15 +227,17 @@ async fn main() -> anyhow::Result<()> {
                         config.accounting.fairshare_refresh_secs as u64,
                     );
 
-                    Some(pool)
+                    Some(accounting::AccountingService::available(pool))
                 }
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "failed to connect to accounting database; job history will not be recorded"
+                    "failed to connect to accounting database; accounting service will report unavailable"
                 );
-                None
+                Some(accounting::AccountingService::unavailable(
+                    "database connection failed at startup",
+                ))
             }
         }
     };
@@ -217,6 +248,23 @@ async fn main() -> anyhow::Result<()> {
     let sched_handle = tokio::spawn(async move {
         scheduler_loop::run(sched_cluster, sched_raft).await;
     });
+
+    // Start the k0s cluster reconcile loop (leader-gated; only when [cluster].enabled).
+    if config.cluster.enabled {
+        let k8s_cluster = cluster.clone();
+        let k8s_raft = raft_handle.clone();
+        let k8s_net = cluster_k8s::ClusterNetworking {
+            mesh_cidr: config.network.wg_cidr.clone(),
+            pod_cidr: config.cluster.pod_cidr.clone(),
+            service_cidr: config.cluster.service_cidr.clone(),
+            cni_mtu: config.cluster.cni_mtu,
+            cni: config.cluster.cni.clone(),
+            control_plane_node: config.cluster.control_plane_node.clone(),
+        };
+        tokio::spawn(async move {
+            cluster_k8s::run(k8s_cluster, k8s_raft, k8s_net).await;
+        });
+    }
 
     // Start node health checker (only on leader).
     let hb_timeout = config.controller.heartbeat_timeout_secs.unwrap_or(90);
@@ -288,7 +336,8 @@ async fn main() -> anyhow::Result<()> {
         raft_handle,
         rpc_stats,
         sched_stats,
-        accounting_pool,
+        accounting_service,
+        config.cluster.control_plane_replicas,
     )
     .await?;
 
@@ -316,6 +365,8 @@ fn default_config() -> spur_core::config::SlurmConfig {
             allow_accounts: Vec::new(),
             allow_groups: Vec::new(),
             deny_accounts: Vec::new(),
+            deny_qos: Vec::new(),
+            allow_qos: Vec::new(),
             priority_tier: 1,
             preempt_mode: String::new(),
         }],
@@ -323,6 +374,7 @@ fn default_config() -> spur_core::config::SlurmConfig {
         network: Default::default(),
         logging: Default::default(),
         kubernetes: Default::default(),
+        cluster: Default::default(),
         notifications: Default::default(),
         power: Default::default(),
         federation: Default::default(),
@@ -336,5 +388,7 @@ fn default_config() -> spur_core::config::SlurmConfig {
         hooks: Default::default(),
         devices: Default::default(),
         admission: Default::default(),
+        rlimits: Default::default(),
+        mpi: Default::default(),
     }
 }

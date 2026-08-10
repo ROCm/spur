@@ -89,6 +89,34 @@ impl PreemptMode {
     }
 }
 
+/// Non-empty names from a comma-separated partition OR-list.
+pub fn requested_partition_names(spec: Option<&str>) -> impl Iterator<Item = &str> {
+    spec.into_iter()
+        .flat_map(|spec| spec.split(','))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
+/// Partitions a job requests, resolved by name.
+pub fn matched_partitions<'a>(
+    spec: Option<&str>,
+    partitions: &'a [Partition],
+) -> Vec<&'a Partition> {
+    requested_partition_names(spec)
+        .filter_map(|req| partitions.iter().find(|p| p.name == req))
+        .collect()
+}
+
+/// Highest `priority_tier` among a job's requested partitions (see
+/// `matched_partitions`), or 1 if none match.
+pub fn max_priority_tier(spec: Option<&str>, partitions: &[Partition]) -> u32 {
+    matched_partitions(spec, partitions)
+        .into_iter()
+        .map(|p| p.priority_tier)
+        .max()
+        .unwrap_or(1)
+}
+
 impl Default for Partition {
     fn default() -> Self {
         Self {
@@ -123,5 +151,39 @@ mod tests {
         assert!(PreemptMode::Cancel.aggressiveness() > PreemptMode::Requeue.aggressiveness());
         assert!(PreemptMode::Requeue.aggressiveness() > PreemptMode::Suspend.aggressiveness());
         assert!(PreemptMode::Suspend.aggressiveness() > PreemptMode::Off.aggressiveness());
+    }
+
+    fn partition_with_tier(name: &str, priority_tier: u32) -> Partition {
+        Partition {
+            name: name.into(),
+            priority_tier,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn max_priority_tier_picks_highest_among_matched_partitions() {
+        let parts = vec![
+            partition_with_tier("low", 1),
+            partition_with_tier("high", 9),
+        ];
+        assert_eq!(max_priority_tier(Some("low,high"), &parts), 9);
+        assert_eq!(max_priority_tier(Some("high, low"), &parts), 9);
+    }
+
+    #[test]
+    fn requested_partition_names_trims_and_ignores_empty_entries() {
+        assert_eq!(
+            requested_partition_names(Some(" gpu, ,cpu,, ")).collect::<Vec<_>>(),
+            vec!["gpu", "cpu"]
+        );
+        assert!(requested_partition_names(None).next().is_none());
+    }
+
+    #[test]
+    fn max_priority_tier_defaults_to_one_when_unset_or_unmatched() {
+        let parts = vec![partition_with_tier("gpu", 5)];
+        assert_eq!(max_priority_tier(None, &parts), 1);
+        assert_eq!(max_priority_tier(Some("nope"), &parts), 1);
     }
 }

@@ -456,7 +456,15 @@ class TestContainerInjection:
 
 
 class TestMultiNodeSpread:
-    def test_multitask_per_node_gpu_partition(self, gpu_cluster):
+    def test_multitask_per_node_runs_batch_script_once(self, gpu_cluster):
+        # A plain (mpi=none) sbatch script must run exactly once per node,
+        # matching Slurm semantics, regardless of --ntasks-per-node. Without
+        # this, spurd forks one concurrent copy of the whole script per task,
+        # so this probe (a single, non-fan-out command) would print PROBE_OK
+        # 4 times with 4 distinct partitioned ROCR_VISIBLE_DEVICES subsets.
+        # Instead it prints once and sees every GPU allocated to the job —
+        # the script itself is responsible for any further per-task fan-out
+        # (typically via `srun`).
         cluster = gpu_cluster
         cluster.gpu_preflight(1)
         if _max_gpus_per_node(cluster) < 4:
@@ -481,14 +489,15 @@ class TestMultiNodeSpread:
         assert job_id is not None
         wait_job(cluster, job_id, timeout=180)
         content = cluster.wait_output(out_path, "PROBE_OK")
-        assert content.count("PROBE_OK") >= 4, content
+        assert content.count("PROBE_OK") == 1, content
         rocr_lines = [
             ln.split("=", 1)[1]
             for ln in content.splitlines()
             if ln.startswith("ROCR_VISIBLE_DEVICES=")
         ]
-        assert len(rocr_lines) >= 4, content
-        assert len(set(rocr_lines)) >= 4, f"expected distinct per-task ROCR values\n{content}"
+        assert len(rocr_lines) == 1, content
+        visible_count = _parse_probe(content).get("VISIBLE_COUNT")
+        assert visible_count == "4", f"expected all 4 allocated GPUs visible\n{content}"
 
     def test_two_node_gres_spread(self, gpu_cluster):
         cluster = gpu_cluster

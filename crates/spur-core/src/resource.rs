@@ -294,7 +294,15 @@ impl ResourceSet {
 }
 
 /// Parse a GRES string like "gpu:mi300x:4" or "gpu:2".
+///
+/// The input is trimmed and empty strings are rejected, so callers that split a
+/// comma-list (CLI `--gres`, `SLURM_GRES`, REST, FFI) can pass raw segments
+/// without worrying about incidental whitespace or trailing commas.
 pub fn parse_gres(gres: &str) -> Option<(String, Option<String>, u32)> {
+    let gres = gres.trim();
+    if gres.is_empty() {
+        return None;
+    }
     let parts: Vec<&str> = gres.split(':').collect();
     match parts.len() {
         1 => Some((parts[0].to_string(), None, 1)),
@@ -600,5 +608,12 @@ mod tests {
         );
         assert_eq!(parse_gres("gpu:2"), Some(("gpu".into(), None, 2)));
         assert_eq!(parse_gres("license"), Some(("license".into(), None, 1)));
+    }
+
+    #[test]
+    fn test_parse_gres_trims_and_rejects_empty() {
+        assert_eq!(parse_gres(" gpu:2 "), Some(("gpu".into(), None, 2)));
+        assert_eq!(parse_gres(""), None);
+        assert_eq!(parse_gres("   "), None);
     }
 }

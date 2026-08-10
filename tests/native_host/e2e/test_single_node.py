@@ -14,11 +14,11 @@ class TestClusterHealth:
         assert out.strip(), "sinfo produced no output"
 
     def test_all_nodes_registered_and_idle(self, cluster):
-        out = cluster.sinfo()
+        states = cluster.sinfo_nodes()
         for name in cluster.node_names:
-            assert name in out, f"node {name} not in sinfo:\n{out}"
-        assert cluster._cluster_is_ready(out), (
-            f"expected {len(cluster.node_names)} idle nodes, sinfo:\n{out}"
+            assert name in states, f"node {name} not in sinfo:\n{states}"
+        assert cluster._cluster_is_ready(), (
+            f"expected {len(cluster.node_names)} idle nodes, states:\n{states}"
         )
 
 
@@ -88,6 +88,26 @@ class TestJobBasics:
         content = cluster.read_output_on_any_node(path)
         assert "J_OK" in content
 
+    def test_scontrol_reports_absolute_output_path(self, cluster):
+        # A relative -o pattern is resolved to an absolute path on the compute
+        # node and reported back, so `scontrol show job` tells the user exactly
+        # where output landed (anchored to the job's work_dir).
+        script = cluster.write_file("test-abspath.sh", "#!/bin/bash\necho ABSPATH_OK\n")
+        sb = cluster.sbatch(
+            ["-J", "test-abspath", "-N", "1", "-D", cluster.remote_dir,
+             "-o", "rel-%j.out", script]
+        )
+        job_id = parse_job_id(sb)
+        assert job_id is not None
+        wait_job(cluster, job_id, timeout=60)
+
+        show = cluster.scontrol("show", "job", str(job_id))
+        expected = f"StdOut={cluster.remote_dir}/rel-{job_id}.out"
+        assert expected in show, f"expected '{expected}' in:\n{show}"
+
+        content = cluster.read_output_on_any_node(f"{cluster.remote_dir}/rel-{job_id}.out")
+        assert "ABSPATH_OK" in content, f"output:\n{content}"
+
 
 class TestJobLifecycle:
     def test_job_cancel(self, cluster):
@@ -118,11 +138,36 @@ class TestJobLifecycle:
 
         deadline = time.time() + 15
         while time.time() < deadline:
-            info = cluster.sinfo()
-            if "idle" in info and "mix" not in info and "alloc" not in info:
+            states = cluster.sinfo_nodes()
+            if states and all(s.startswith("idle") for s in states.values()):
                 return
             time.sleep(2)
         assert False, "node should return to idle after cancel"
+
+    def test_failed_launch_releases_reservation(self, cluster):
+        # A launch that fails after the agent reserves resources (here: a
+        # nonexistent container image) must release them, or the node becomes a
+        # black hole that rejects every future dispatch while looking idle.
+        script = cluster.write_file("badimg.sh", "#!/bin/bash\nhostname\n")
+        bad = cluster.sbatch(
+            ["-J", "badimg", "-N", "1",
+             "--container-image=/tmp/does-not-exist-9999.sqsh", script]
+        )
+        bad_id = parse_job_id(bad)
+        assert bad_id is not None
+        time.sleep(6)
+
+        # The node must still accept and complete a normal job afterwards.
+        out_path = f"{cluster.remote_dir}/after-bad.out"
+        ok = cluster.sbatch(
+            ["-J", "after-bad", "-N", "1", "-o", out_path,
+             cluster.write_file("after.sh", "#!/bin/bash\necho AFTER_OK\n")]
+        )
+        ok_id = parse_job_id(ok)
+        assert ok_id is not None
+        wait_job(cluster, ok_id, timeout=60)
+        assert "AFTER_OK" in cluster.read_output_on_any_node(out_path)
+        cluster.scancel(str(bad_id))
 
     def test_job_hold_and_release(self, cluster):
         out_path = f"{cluster.remote_dir}/hold.out"

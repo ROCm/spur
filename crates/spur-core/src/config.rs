@@ -55,6 +55,10 @@ pub struct SlurmConfig {
     #[serde(default)]
     pub kubernetes: KubernetesConfig,
 
+    /// Native cluster (k0s) that SPUR provisions and owns. Inverse of `[kubernetes]`.
+    #[serde(default)]
+    pub cluster: ClusterConfig,
+
     #[serde(default)]
     pub notifications: NotificationConfig,
 
@@ -103,6 +107,14 @@ pub struct SlurmConfig {
     /// Node admission control.
     #[serde(default)]
     pub admission: AdmissionConfig,
+
+    /// POSIX per-process resource limits applied to job steps at launch.
+    #[serde(default)]
+    pub rlimits: RlimitsConfig,
+
+    /// MPI plugin settings for `--mpi=pmix` job steps.
+    #[serde(default)]
+    pub mpi: MpiConfig,
 }
 
 /// Configuration for auto-update checking and self-update.
@@ -265,14 +277,17 @@ pub struct ControllerConfig {
     #[serde(default = "default_one")]
     pub first_job_id: u32,
 
-    /// Raft peers for HA consensus. Each entry is "host:port" (Raft gRPC address).
-    /// If empty, single-node mode (no Raft, no replication).
+    /// Raft peers for HA consensus, "host:port" each. Empty = single-node mode.
+    /// Must be identically ordered on every controller: node ids derive from
+    /// list position, so a reordered list can form an inconsistent voter set.
     /// Example: ["node1:6821", "node2:6821", "node3:6821"]
     #[serde(default)]
     pub peers: Vec<String>,
 
-    /// This node's Raft ID. If not set, auto-derived from hostname ordinal
-    /// (e.g. spurctld-2 → node_id 3) or defaults to 1.
+    /// This node's Raft ID. Normally unset; single-node mode always uses 1.
+    /// Otherwise resolved as: explicit value, else position in `peers` (by
+    /// hostname), else hostname ordinal (IP-only peers). Must be in
+    /// `1..=peers.len()` and, if set, equal its position (index + 1).
     pub node_id: Option<u64>,
 
     /// Listen address for Raft internal gRPC traffic (separate from client API).
@@ -284,15 +299,60 @@ pub struct ControllerConfig {
     #[serde(default)]
     pub heartbeat_timeout_secs: Option<u64>,
 
-    /// Maximum automatic requeues before a job is held with `JobHoldMaxRequeue`.
-    /// Configured in TOML as `[controller] max_batch_requeue` (default: 5).
+    /// Maximum automatic requeues (excluding preemption) before a job is held
+    /// with `JobHoldMaxRequeue`. Configured in TOML as `[controller] max_batch_requeue` (default: 5).
     #[serde(default = "default_max_batch_requeue")]
     pub max_batch_requeue: u32,
+
+    /// Upper bound on the hold placed between automatic requeues after a launch
+    /// failure. The hold doubles per attempt, so this caps how long a job with a
+    /// large `max_batch_requeue` can wait between retries. Configured in TOML as
+    /// `[controller] max_launch_backoff_secs` (default: 300).
+    #[serde(default = "default_max_launch_backoff_secs")]
+    pub max_launch_backoff_secs: u64,
+
+    /// Hold a job at priority 0 when its prolog fails, instead of requeueing it
+    /// for another attempt. On by default: a prolog receives the job's own
+    /// context, so the same failure recurs on every node, and retrying would
+    /// drain one node per attempt. Turning it off restores the retry, bounded by
+    /// `max_batch_requeue`. Configured in TOML as
+    /// `[controller] hold_on_prolog_fail` (default: true). Slurm's equivalent is
+    /// the inverse `SchedulerParameters=nohold_on_prolog_fail`.
+    #[serde(default = "default_hold_on_prolog_fail")]
+    pub hold_on_prolog_fail: bool,
+
+    /// Seconds a terminal job stays in controller memory before eviction (default
+    /// 3600). `sacct` history is unaffected but `scontrol show job` stops finding
+    /// it after the window; runs once per `scheduler.interval_secs` and is floored
+    /// to the accounting reconcile interval so a job's DB row can be repaired first.
+    #[serde(default = "default_terminal_job_retention_secs")]
+    pub terminal_job_retention_secs: u64,
 }
 
 fn default_max_batch_requeue() -> u32 {
     5
 }
+
+fn default_terminal_job_retention_secs() -> u64 {
+    3600
+}
+
+fn default_hold_on_prolog_fail() -> bool {
+    true
+}
+
+fn default_max_launch_backoff_secs() -> u64 {
+    300
+}
+
+/// Upper bound for `max_launch_backoff_secs`. A per-attempt retry hold beyond a
+/// day is not a retry policy, and larger values push the computed hold instant
+/// out of chrono's representable range.
+pub const MAX_LAUNCH_BACKOFF_SECS: u64 = 86_400;
+
+/// Upper bound for `terminal_job_retention_secs` (one year). Operational
+/// guardrail: retaining terminal jobs longer defeats the memory bound.
+pub const MAX_TERMINAL_JOB_RETENTION_SECS: u64 = 366 * 24 * 60 * 60;
 
 fn default_listen_addr() -> String {
     "[::]:6817".into()
@@ -327,6 +387,9 @@ impl Default for ControllerConfig {
             raft_listen_addr: "[::]:6821".into(),
             heartbeat_timeout_secs: None,
             max_batch_requeue: default_max_batch_requeue(),
+            max_launch_backoff_secs: default_max_launch_backoff_secs(),
+            hold_on_prolog_fail: default_hold_on_prolog_fail(),
+            terminal_job_retention_secs: default_terminal_job_retention_secs(),
         }
     }
 }
@@ -360,6 +423,15 @@ pub struct AccountingConfig {
     /// How often to refresh fairshare/QoS caches from the accounting database.
     #[serde(default = "default_fairshare_refresh_secs")]
     pub fairshare_refresh_secs: u32,
+    /// Cluster-wide fallback QOS, applied at submit when a job resolves to no
+    /// QOS. The last link in the resolution chain (Slurm's stock `normal`
+    /// analogue). Empty (default) = no fallback.
+    #[serde(default)]
+    pub default_qos: String,
+    /// Reject at submit any job that still has no QOS after the resolution
+    /// chain. Mirrors Slurm's `AccountingStorageEnforce=qos`. Default false.
+    #[serde(default)]
+    pub require_qos: bool,
 }
 
 fn default_fairshare_refresh_secs() -> u32 {
@@ -371,6 +443,8 @@ impl Default for AccountingConfig {
         Self {
             database_url: String::new(),
             fairshare_refresh_secs: 300,
+            default_qos: String::new(),
+            require_qos: false,
         }
     }
 }
@@ -470,6 +544,10 @@ pub struct PartitionConfig {
     #[serde(default)]
     pub deny_accounts: Vec<String>,
     #[serde(default)]
+    pub deny_qos: Vec<String>,
+    #[serde(default)]
+    pub allow_qos: Vec<String>,
+    #[serde(default)]
     pub priority_tier: u32,
     #[serde(default)]
     pub preempt_mode: String,
@@ -498,7 +576,8 @@ pub struct NodeConfig {
     pub gres: Vec<String>,
     #[serde(default)]
     pub features: Vec<String>,
-    /// Override address (if different from hostname).
+    /// Default comm address when the agent has not registered one yet. Does not
+    /// override an agent-registered address.
     pub address: Option<String>,
     /// Scheduling weight. Higher weight = preferred for scheduling.
     #[serde(default = "default_one")]
@@ -523,6 +602,10 @@ pub struct NetworkConfig {
     /// Agent gRPC listen port (default: 6818).
     #[serde(default = "default_agent_port")]
     pub agent_port: u16,
+    /// Reject agent registrations whose comm address is not routable (loopback,
+    /// unspecified, or link-local).
+    #[serde(default)]
+    pub reject_loopback_comm_addr: bool,
 }
 
 fn default_wg_cidr() -> String {
@@ -546,6 +629,7 @@ impl Default for NetworkConfig {
             wg_interface: "spur0".into(),
             wg_port: 51820,
             agent_port: 6818,
+            reject_loopback_comm_addr: false,
         }
     }
 }
@@ -601,6 +685,153 @@ impl Default for KubernetesConfig {
             node_label_selector: "spur.amd.com/managed=true".into(),
         }
     }
+}
+
+/// Native cluster (k0s) integration — SPUR OWNS the Kubernetes cluster lifecycle
+/// (`spur k8s up/down`, spurd-owned k0s systemd units, GPU CDI on join). This is the
+/// inverse of `[kubernetes]` above (which lets SPUR run *inside* an existing k8s and accept
+/// SpurJob CRDs); the two are intentionally distinct sections.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterConfig {
+    /// Enable SPUR-managed k0s. When false, spurd never touches systemd/k0s.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Kubernetes distribution SPUR manages. Only "k0s" is supported today.
+    #[serde(default = "default_cluster_distro")]
+    pub distro: String,
+    /// Pod network CIDR. Calico bird native routing over the mesh carves per-node /24s from this.
+    #[serde(default = "default_pod_cidr")]
+    pub pod_cidr: String,
+    /// Service network CIDR.
+    #[serde(default = "default_service_cidr")]
+    pub service_cidr: String,
+    /// CNI MTU (Calico only). Defaults to 1450 to leave headroom for WireGuard's ~50-byte overhead
+    /// over the mesh; set explicitly if your underlay differs. Emitted into the generated k0s config.
+    #[serde(default = "default_cni_mtu")]
+    pub cni_mtu: u16,
+    /// Hostname of the node that runs the k0s control plane. Empty = pick from inventory.
+    #[serde(default)]
+    pub control_plane_node: Option<String>,
+    /// HA control-plane count (1, 3, or 5). Overridden per-invocation by `spur k8s up --replicas`.
+    #[serde(default = "default_control_plane_replicas")]
+    pub control_plane_replicas: u32,
+    /// k0s release to install/run (e.g. "v1.36.2+k0s.0", or "latest"). Pinned to a known-good
+    /// version by default; bumped per spur release. spurd installs this if the binary is missing.
+    #[serde(default = "default_k0s_version")]
+    pub k0s_version: String,
+    /// Filesystem path to the k0s binary (install target + what the systemd unit runs).
+    #[serde(default = "default_k0s_binary")]
+    pub k0s_binary: String,
+    /// CNI / network mode. "kuberouter" (k0s default — no custom config) or "calico" (Calico in
+    /// bird native-routing mode with the API advertised on the mesh IP, so pods route over the
+    /// WireGuard mesh). Selecting "calico" makes `spur k8s up` generate the k0s config + set each
+    /// worker's kubelet `--node-ip` to its mesh IP.
+    #[serde(default = "default_cni")]
+    pub cni: String,
+    /// Storage provisioner SPUR ships so PVC workloads work out of the box (k0s bundles none).
+    /// "local-path" (default — RWO node-local, set as the default StorageClass) or "none" (bring your
+    /// own). Applied via k0s's manifest deployer on the control-plane node.
+    #[serde(default = "default_storage_provisioner")]
+    pub storage_provisioner: String,
+    /// On-node directory the local-path provisioner stores PersistentVolumes in. Point this at a
+    /// large scratch disk if PVCs will hold much data — the default lives under `/var/lib` (root fs).
+    #[serde(default = "default_local_path_dir")]
+    pub local_path_dir: String,
+}
+
+fn default_cluster_distro() -> String {
+    "k0s".into()
+}
+fn default_k0s_version() -> String {
+    crate::k0s::K0S_PINNED_VERSION.into()
+}
+fn default_control_plane_replicas() -> u32 {
+    1
+}
+fn default_k0s_binary() -> String {
+    crate::k0s::K0S_DEFAULT_BINARY.into()
+}
+fn default_cni() -> String {
+    "kuberouter".into()
+}
+fn default_pod_cidr() -> String {
+    "10.42.0.0/16".into()
+}
+fn default_service_cidr() -> String {
+    "10.43.0.0/16".into()
+}
+fn default_cni_mtu() -> u16 {
+    1450
+}
+fn default_storage_provisioner() -> String {
+    "local-path".into()
+}
+fn default_local_path_dir() -> String {
+    crate::k0s::DEFAULT_LOCAL_PATH_DIR.into()
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            distro: default_cluster_distro(),
+            pod_cidr: default_pod_cidr(),
+            service_cidr: default_service_cidr(),
+            cni_mtu: default_cni_mtu(),
+            control_plane_node: None,
+            control_plane_replicas: default_control_plane_replicas(),
+            k0s_version: default_k0s_version(),
+            k0s_binary: default_k0s_binary(),
+            cni: default_cni(),
+            storage_provisioner: default_storage_provisioner(),
+            local_path_dir: default_local_path_dir(),
+        }
+    }
+}
+
+/// Basic dependency-free CIDR sanity check (`<ip>/<prefix>`), used by config validation.
+fn is_valid_cidr(s: &str) -> bool {
+    // IPv4 only: the native k0s provisioning paths (cluster_k8s IPAM, pod-CIDR carving, AddressPool)
+    // are all `Ipv4Addr`, so an IPv6 CIDR would validate here and then fail later at runtime.
+    match s.split_once('/') {
+        Some((ip, prefix)) => {
+            ip.parse::<std::net::Ipv4Addr>().is_ok()
+                && prefix.parse::<u8>().map(|p| p <= 32).unwrap_or(false)
+        }
+        None => false,
+    }
+}
+
+/// Prefix length of a CIDR string. Returns 255 (an impossible prefix, so any `<=` bound rejects it)
+/// when unparseable — callers gate with `is_valid_cidr` first, so this only extracts the number.
+fn cidr_prefix(s: &str) -> u8 {
+    s.split_once('/')
+        .and_then(|(_, p)| p.parse().ok())
+        .unwrap_or(255)
+}
+
+/// True if two IPv4 CIDRs overlap (share any address). Non-IPv4 / malformed inputs return false
+/// (they are rejected separately by `is_valid_cidr`).
+fn cidrs_overlap(a: &str, b: &str) -> bool {
+    fn parse_v4(s: &str) -> Option<(u32, u8)> {
+        let (ip, prefix) = s.split_once('/')?;
+        let ip: std::net::Ipv4Addr = ip.parse().ok()?;
+        let prefix: u8 = prefix.parse().ok()?;
+        if prefix > 32 {
+            return None;
+        }
+        Some((u32::from(ip), prefix))
+    }
+    let (Some((a_ip, a_pfx)), Some((b_ip, b_pfx))) = (parse_v4(a), parse_v4(b)) else {
+        return false;
+    };
+    let shorter = a_pfx.min(b_pfx);
+    let mask = if shorter == 0 {
+        0
+    } else {
+        u32::MAX << (32 - shorter)
+    };
+    (a_ip & mask) == (b_ip & mask)
 }
 
 /// Power management configuration for suspending/resuming idle nodes.
@@ -790,6 +1021,128 @@ pub enum AdmissionMode {
     Token,
 }
 
+/// PMIx plugin settings for `--mpi=pmix` jobs (batch launch and srun steps).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MpiConfig {
+    #[serde(default = "default_mpi_plugin_dir")]
+    pub plugin_dir: String,
+    #[serde(default)]
+    pub pmix_plugin: String,
+    #[serde(default = "default_pmix_tmpdir")]
+    pub pmix_tmpdir: String,
+    #[serde(default = "default_pmix_min_version")]
+    pub pmix_min_version: String,
+    #[serde(default = "default_modex_connect_timeout_secs")]
+    pub modex_connect_timeout_secs: u32,
+    #[serde(default = "default_modex_fence_timeout_secs")]
+    pub modex_fence_timeout_secs: u32,
+    #[serde(default = "default_modex_verify_timeout_secs")]
+    pub modex_verify_timeout_secs: u32,
+}
+
+fn default_mpi_plugin_dir() -> String {
+    "/usr/lib/spur".into()
+}
+
+fn default_pmix_tmpdir() -> String {
+    "/tmp/spur-pmix".into()
+}
+
+fn default_pmix_min_version() -> String {
+    "4.1.0".into()
+}
+
+fn default_modex_connect_timeout_secs() -> u32 {
+    5
+}
+
+fn default_modex_fence_timeout_secs() -> u32 {
+    120
+}
+
+fn default_modex_verify_timeout_secs() -> u32 {
+    30
+}
+
+impl Default for MpiConfig {
+    fn default() -> Self {
+        Self {
+            plugin_dir: default_mpi_plugin_dir(),
+            pmix_plugin: String::new(),
+            pmix_tmpdir: default_pmix_tmpdir(),
+            pmix_min_version: default_pmix_min_version(),
+            modex_connect_timeout_secs: default_modex_connect_timeout_secs(),
+            modex_fence_timeout_secs: default_modex_fence_timeout_secs(),
+            modex_verify_timeout_secs: default_modex_verify_timeout_secs(),
+        }
+    }
+}
+
+impl MpiConfig {
+    pub fn resolve_pmix_plugin_path(&self) -> std::path::PathBuf {
+        if !self.pmix_plugin.is_empty() {
+            return std::path::PathBuf::from(&self.pmix_plugin);
+        }
+        std::path::Path::new(&self.plugin_dir).join("spur_mpi_pmix.so")
+    }
+}
+
+/// POSIX per-process resource limits (`RLIMIT_*`) applied to job steps at launch.
+///
+/// Distinct from QoS/association caps (scheduling policy) and cgroup limits
+/// (derived per-job from the allocation). This is where Tier 2 propagation
+/// controls (`propagate`, `propagate_except`) will live.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RlimitsConfig {
+    /// RLIMIT_MEMLOCK applied to job processes.
+    /// "unlimited" (default) | "inherit" | byte count as string.
+    #[serde(default = "default_memlock")]
+    pub memlock: String,
+}
+
+fn default_memlock() -> String {
+    "unlimited".into()
+}
+
+impl Default for RlimitsConfig {
+    fn default() -> Self {
+        Self {
+            memlock: default_memlock(),
+        }
+    }
+}
+
+/// Parsed value for RLIMIT_MEMLOCK configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemlockLimit {
+    /// Set both soft and hard to RLIM_INFINITY.
+    Unlimited,
+    /// Do not call setrlimit; inherit from spurd's process.
+    Inherit,
+    /// Set both soft and hard to a fixed byte count.
+    Bytes(u64),
+}
+
+impl RlimitsConfig {
+    pub fn memlock_limit(&self) -> Result<MemlockLimit, ConfigError> {
+        match self.memlock.trim().to_lowercase().as_str() {
+            "unlimited" | "" => Ok(MemlockLimit::Unlimited),
+            "inherit" => Ok(MemlockLimit::Inherit),
+            other => match other.parse::<u64>() {
+                Ok(0) => Ok(MemlockLimit::Unlimited),
+                Ok(n) => Ok(MemlockLimit::Bytes(n)),
+                Err(_) => Err(ConfigError::InvalidValue {
+                    field: "rlimits.memlock".into(),
+                    value: format!(
+                        "{:?} (expected \"unlimited\", \"inherit\", or byte count)",
+                        other
+                    ),
+                }),
+            },
+        }
+    }
+}
+
 impl SlurmConfig {
     /// Load from a TOML file.
     pub fn load_from_file(path: &Path) -> Result<Self, ConfigError> {
@@ -816,6 +1169,130 @@ impl SlurmConfig {
                 value: "0 (must be at least 1)".into(),
             });
         }
+        // Zero would clamp every launch-failure hold to zero, restoring the tight
+        // re-dispatch loop the backoff exists to prevent. The upper bound keeps
+        // the hold instant representable.
+        if self.controller.max_launch_backoff_secs == 0
+            || self.controller.max_launch_backoff_secs > MAX_LAUNCH_BACKOFF_SECS
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.max_launch_backoff_secs".into(),
+                value: format!(
+                    "{} (must be between 1 and {})",
+                    self.controller.max_launch_backoff_secs, MAX_LAUNCH_BACKOFF_SECS
+                ),
+            });
+        }
+        // Guardrail: retention beyond the cap defeats the memory bound.
+        if self.controller.terminal_job_retention_secs > MAX_TERMINAL_JOB_RETENTION_SECS {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.terminal_job_retention_secs".into(),
+                value: format!(
+                    "{} (must be at most {})",
+                    self.controller.terminal_job_retention_secs, MAX_TERMINAL_JOB_RETENTION_SECS
+                ),
+            });
+        }
+        if self.cluster.enabled {
+            if self.cluster.distro != "k0s" {
+                return Err(ConfigError::InvalidValue {
+                    field: "cluster.distro".into(),
+                    value: format!("{} (only \"k0s\" is supported)", self.cluster.distro),
+                });
+            }
+            if let Err(msg) =
+                crate::k0s::validate_control_plane_replicas(self.cluster.control_plane_replicas)
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "cluster.control_plane_replicas".into(),
+                    value: msg,
+                });
+            }
+            // The mesh CIDR feeds the k0s IPAM (AddressPool) exactly like pod/service, so assert it is
+            // a valid IPv4 CIDR in the same pass — otherwise a malformed wg_cidr bypasses validate()
+            // and fails every reconcile tick in AddressPool::new, leaving the cluster silently stuck.
+            for (field, cidr) in [
+                ("network.wg_cidr", &self.network.wg_cidr),
+                ("cluster.pod_cidr", &self.cluster.pod_cidr),
+                ("cluster.service_cidr", &self.cluster.service_cidr),
+            ] {
+                if !is_valid_cidr(cidr) {
+                    return Err(ConfigError::InvalidValue {
+                        field: field.into(),
+                        value: cidr.clone(),
+                    });
+                }
+            }
+            // Pods are carved into per-node /24s (`carve_pod_cidr`), so the pod CIDR must be <= /24.
+            // is_valid_cidr only bounds the prefix at /32, so this would otherwise pass here and then
+            // fail every reconcile tick with only a warn! — the same silent-stuck state.
+            if cidr_prefix(&self.cluster.pod_cidr) > 24 {
+                return Err(ConfigError::InvalidValue {
+                    field: "cluster.pod_cidr".into(),
+                    value: format!(
+                        "{} (prefix must be <= /24 to carve per-node /24s)",
+                        self.cluster.pod_cidr
+                    ),
+                });
+            }
+            // Mesh, pod, and service ranges must be mutually non-overlapping.
+            for (fa, a, fb, b) in [
+                (
+                    "cluster.pod_cidr",
+                    &self.cluster.pod_cidr,
+                    "cluster.service_cidr",
+                    &self.cluster.service_cidr,
+                ),
+                (
+                    "network.wg_cidr",
+                    &self.network.wg_cidr,
+                    "cluster.pod_cidr",
+                    &self.cluster.pod_cidr,
+                ),
+                (
+                    "network.wg_cidr",
+                    &self.network.wg_cidr,
+                    "cluster.service_cidr",
+                    &self.cluster.service_cidr,
+                ),
+            ] {
+                if cidrs_overlap(a, b) {
+                    return Err(ConfigError::InvalidValue {
+                        field: format!("{fa}/{fb}"),
+                        value: format!("{a} overlaps {b}"),
+                    });
+                }
+            }
+            if !matches!(
+                self.cluster.storage_provisioner.as_str(),
+                "local-path" | "none"
+            ) {
+                return Err(ConfigError::InvalidValue {
+                    field: "cluster.storage_provisioner".into(),
+                    value: format!(
+                        "{} (expected \"local-path\" or \"none\")",
+                        self.cluster.storage_provisioner
+                    ),
+                });
+            }
+            // local_path_dir is interpolated verbatim into a JSON string in the generated manifest,
+            // so an absolute path free of quotes/backslashes/whitespace/control chars keeps the JSON
+            // valid and can't inject. Only meaningful when local-path is the chosen provisioner.
+            if self.cluster.storage_provisioner == "local-path" {
+                let d = &self.cluster.local_path_dir;
+                if !d.starts_with('/')
+                    || d.chars()
+                        .any(|c| c == '"' || c == '\\' || c.is_whitespace() || c.is_control())
+                {
+                    return Err(ConfigError::InvalidValue {
+                        field: "cluster.local_path_dir".into(),
+                        value: format!(
+                            "{d} (must be an absolute path with no quotes, backslashes, or whitespace)"
+                        ),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -838,6 +1315,11 @@ impl SlurmConfig {
                 default_time_minutes: pc.default_time.as_ref().and_then(|t| parse_time_minutes(t)),
                 max_nodes: pc.max_nodes,
                 min_nodes: pc.min_nodes,
+                allow_accounts: pc.allow_accounts.clone(),
+                allow_groups: pc.allow_groups.clone(),
+                deny_accounts: pc.deny_accounts.clone(),
+                deny_qos: pc.deny_qos.clone(),
+                allow_qos: pc.allow_qos.clone(),
                 priority_tier: pc.priority_tier,
                 preempt_mode: match pc.preempt_mode.to_lowercase().as_str() {
                     "cancel" => PreemptMode::Cancel,
@@ -845,8 +1327,6 @@ impl SlurmConfig {
                     "suspend" => PreemptMode::Suspend,
                     _ => PreemptMode::Off,
                 },
-                allow_accounts: pc.allow_accounts.clone(),
-                deny_accounts: pc.deny_accounts.clone(),
                 ..Default::default()
             })
             .collect()
@@ -979,6 +1459,114 @@ mod tests {
     fn test_controller_endpoints_single_host() {
         let cfg = ControllerConfig::default();
         assert_eq!(cfg.endpoints(), vec!["http://localhost:6817"]);
+    }
+
+    #[test]
+    fn cluster_config_defaults_are_disabled_and_sane() {
+        let c = ClusterConfig::default();
+        assert!(!c.enabled);
+        assert_eq!(c.distro, "k0s");
+        assert_eq!(c.pod_cidr, "10.42.0.0/16");
+        assert_eq!(c.service_cidr, "10.43.0.0/16");
+        assert_eq!(c.cni_mtu, 1450);
+        assert_eq!(c.cni, "kuberouter");
+        assert_eq!(c.storage_provisioner, "local-path");
+        assert_eq!(c.local_path_dir, "/var/lib/local-path-provisioner");
+    }
+
+    #[test]
+    fn cluster_config_round_trips_from_toml() {
+        let toml = r#"
+cluster_name = "test"
+
+[cluster]
+enabled = true
+pod_cidr = "10.60.0.0/16"
+control_plane_node = "head-node"
+cni = "calico"
+cni_mtu = 1400
+"#;
+        let cfg = SlurmConfig::load_from_str(toml).expect("valid cluster config");
+        assert!(cfg.cluster.enabled);
+        assert_eq!(cfg.cluster.distro, "k0s"); // default fills in
+        assert_eq!(cfg.cluster.pod_cidr, "10.60.0.0/16");
+        assert_eq!(cfg.cluster.control_plane_node.as_deref(), Some("head-node"));
+        assert_eq!(cfg.cluster.service_cidr, "10.43.0.0/16"); // default
+        assert_eq!(cfg.cluster.cni, "calico");
+        assert_eq!(cfg.cluster.cni_mtu, 1400);
+    }
+
+    #[test]
+    fn cluster_validation_gates_on_enabled() {
+        // Bad pod_cidr is rejected when enabled.
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\npod_cidr=\"not-a-cidr\"\n"
+        )
+        .is_err());
+        // Unsupported distro is rejected.
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\ndistro=\"k3s\"\n"
+        )
+        .is_err());
+        // control_plane_replicas must be 1/3/5 (etcd quorum); even/too-large is rejected.
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\ncontrol_plane_replicas=2\n"
+        )
+        .is_err());
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\ncontrol_plane_replicas=3\n"
+        )
+        .is_ok());
+        // Unknown storage provisioner is rejected; "none" and "local-path" are accepted.
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\nstorage_provisioner=\"nfs\"\n"
+        )
+        .is_err());
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\nstorage_provisioner=\"none\"\n"
+        )
+        .is_ok());
+        // A local_path_dir that would break the JSON it is interpolated into is rejected.
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\nlocal_path_dir=\"/mnt/a\\\"b\"\n"
+        )
+        .is_err());
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\nlocal_path_dir=\"relative/path\"\n"
+        )
+        .is_err());
+        // A local_path_dir only matters for local-path; junk is ignored when storage is "none".
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\nstorage_provisioner=\"none\"\nlocal_path_dir=\"bad path\"\n"
+        )
+        .is_ok());
+        // Disabled cluster: no cluster validation applied even with junk values.
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=false\npod_cidr=\"whatever\"\n"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn cidr_overlap_detection() {
+        assert!(cidrs_overlap("10.42.0.0/16", "10.42.5.0/24")); // /24 inside /16
+        assert!(cidrs_overlap("10.42.0.0/16", "10.42.0.0/16")); // identical
+        assert!(!cidrs_overlap("10.42.0.0/16", "10.43.0.0/16")); // adjacent, disjoint
+        assert!(!cidrs_overlap("10.42.0.0/16", "10.96.0.0/12")); // pod vs default service
+        assert!(!cidrs_overlap("bad", "10.42.0.0/16")); // malformed -> false
+    }
+
+    #[test]
+    fn cluster_validation_rejects_overlapping_cidrs() {
+        // pod_cidr overlapping service_cidr is rejected when enabled.
+        assert!(SlurmConfig::load_from_str(
+            "cluster_name=\"t\"\n[cluster]\nenabled=true\npod_cidr=\"10.42.0.0/16\"\nservice_cidr=\"10.42.5.0/24\"\n"
+        )
+        .is_err());
+        // The defaults (10.42/16 pod vs 10.43/16 service) do NOT overlap.
+        assert!(
+            SlurmConfig::load_from_str("cluster_name=\"t\"\n[cluster]\nenabled=true\n").is_ok()
+        );
     }
 
     #[test]
@@ -1274,6 +1862,20 @@ deny_accounts = ["student"]
         let config = ControllerConfig::default();
         assert_eq!(config.heartbeat_timeout_secs, None);
         assert_eq!(config.max_batch_requeue, 5);
+        assert_eq!(config.max_launch_backoff_secs, 300);
+        assert!(config.hold_on_prolog_fail);
+    }
+
+    #[test]
+    fn controller_config_parses_hold_on_prolog_fail() {
+        let toml = r#"
+cluster_name = "test"
+
+[controller]
+hold_on_prolog_fail = false
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert!(!config.controller.hold_on_prolog_fail);
     }
 
     #[test]
@@ -1304,6 +1906,108 @@ max_batch_requeue = 0
     }
 
     #[test]
+    fn controller_config_parses_max_launch_backoff_secs() {
+        let toml = r#"
+cluster_name = "test"
+
+[controller]
+max_launch_backoff_secs = 90
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.controller.max_launch_backoff_secs, 90);
+    }
+
+    #[test]
+    fn controller_config_rejects_out_of_range_max_launch_backoff_secs() {
+        // Past this bound the computed hold instant overflows and panics the
+        // controller, so it must be refused at load rather than at first use.
+        let toml = format!(
+            r#"
+cluster_name = "test"
+
+[controller]
+max_launch_backoff_secs = {}
+"#,
+            MAX_LAUNCH_BACKOFF_SECS + 1
+        );
+        let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("max_launch_backoff_secs"),
+            "unexpected error: {err}"
+        );
+
+        let ok = format!(
+            r#"
+cluster_name = "test"
+
+[controller]
+max_launch_backoff_secs = {MAX_LAUNCH_BACKOFF_SECS}
+"#
+        );
+        assert_eq!(
+            SlurmConfig::load_from_str(&ok)
+                .unwrap()
+                .controller
+                .max_launch_backoff_secs,
+            MAX_LAUNCH_BACKOFF_SECS,
+            "the bound itself must be accepted"
+        );
+    }
+
+    #[test]
+    fn controller_config_rejects_zero_max_launch_backoff_secs() {
+        // Zero would clamp every hold to zero and restore the retry storm.
+        let toml = r#"
+cluster_name = "test"
+
+[controller]
+max_launch_backoff_secs = 0
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("max_launch_backoff_secs"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn controller_config_rejects_out_of_range_terminal_job_retention_secs() {
+        // Beyond the guardrail, load must reject up front rather than silently
+        // retaining terminal jobs long enough to defeat the memory bound.
+        let toml = format!(
+            r#"
+cluster_name = "test"
+
+[controller]
+terminal_job_retention_secs = {}
+"#,
+            MAX_TERMINAL_JOB_RETENTION_SECS + 1
+        );
+        let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("terminal_job_retention_secs"),
+            "unexpected error: {err}"
+        );
+
+        let ok = format!(
+            r#"
+cluster_name = "test"
+
+[controller]
+terminal_job_retention_secs = {MAX_TERMINAL_JOB_RETENTION_SECS}
+"#
+        );
+        assert_eq!(
+            SlurmConfig::load_from_str(&ok)
+                .unwrap()
+                .controller
+                .terminal_job_retention_secs,
+            MAX_TERMINAL_JOB_RETENTION_SECS,
+            "the bound itself must be accepted"
+        );
+    }
+
+    #[test]
     fn controller_config_parses_heartbeat_timeout() {
         let toml = r#"
 cluster_name = "test"
@@ -1325,5 +2029,78 @@ listen_addr = "[::]:6817"
 "#;
         let config = SlurmConfig::load_from_str(toml).unwrap();
         assert_eq!(config.controller.heartbeat_timeout_secs, None);
+    }
+
+    #[test]
+    fn rlimits_default_is_unlimited() {
+        let cfg = RlimitsConfig::default();
+        assert_eq!(cfg.memlock_limit().unwrap(), MemlockLimit::Unlimited);
+    }
+
+    #[test]
+    fn rlimits_parses_unlimited() {
+        let cfg = RlimitsConfig {
+            memlock: "unlimited".into(),
+        };
+        assert_eq!(cfg.memlock_limit().unwrap(), MemlockLimit::Unlimited);
+    }
+
+    #[test]
+    fn rlimits_parses_inherit() {
+        let cfg = RlimitsConfig {
+            memlock: "inherit".into(),
+        };
+        assert_eq!(cfg.memlock_limit().unwrap(), MemlockLimit::Inherit);
+    }
+
+    #[test]
+    fn rlimits_parses_bytes() {
+        let cfg = RlimitsConfig {
+            memlock: "1048576".into(),
+        };
+        assert_eq!(cfg.memlock_limit().unwrap(), MemlockLimit::Bytes(1048576));
+    }
+
+    #[test]
+    fn rlimits_invalid_errors() {
+        let cfg = RlimitsConfig {
+            memlock: "bogus".into(),
+        };
+        assert!(cfg.memlock_limit().is_err());
+    }
+
+    #[test]
+    fn rlimits_zero_treated_as_unlimited() {
+        let cfg = RlimitsConfig {
+            memlock: "0".into(),
+        };
+        assert_eq!(cfg.memlock_limit().unwrap(), MemlockLimit::Unlimited);
+    }
+
+    #[test]
+    fn rlimits_from_toml_default() {
+        let toml = r#"
+cluster_name = "test"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(
+            config.rlimits.memlock_limit().unwrap(),
+            MemlockLimit::Unlimited
+        );
+    }
+
+    #[test]
+    fn rlimits_from_toml_explicit() {
+        let toml = r#"
+cluster_name = "test"
+
+[rlimits]
+memlock = "inherit"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(
+            config.rlimits.memlock_limit().unwrap(),
+            MemlockLimit::Inherit
+        );
     }
 }

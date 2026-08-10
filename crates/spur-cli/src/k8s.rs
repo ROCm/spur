@@ -1,0 +1,299 @@
+// Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! `spur k8s` subcommands: drive the SPUR-managed k0s cluster.
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+
+use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
+use spur_proto::proto::{
+    ClusterDownRequest, ClusterKubeconfigRequest, ClusterStatusRequest, ClusterUpRequest,
+};
+
+/// Manage the SPUR-provisioned k0s cluster.
+#[derive(Parser, Debug)]
+#[command(name = "k8s", about = "Manage the SPUR-provisioned k0s cluster")]
+pub struct K8sArgs {
+    /// Controller address
+    #[arg(
+        long,
+        env = "SPUR_CONTROLLER_ADDR",
+        default_value = "http://localhost:6817",
+        global = true
+    )]
+    controller: String,
+
+    #[command(subcommand)]
+    pub command: K8sCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum K8sCommand {
+    /// Bring the k0s cluster up (assign roles/IPs, then start each node's component).
+    Up {
+        /// Control-plane node (default: picked from inventory / [cluster] config).
+        #[arg(long)]
+        control_plane_node: Option<String>,
+        /// HA control-plane count: 1, 3, or 5 (default: [cluster] config, else 1).
+        #[arg(long)]
+        replicas: Option<u32>,
+        /// Explicit control-plane nodes (repeatable; 1, 3, or 5). First is the etcd bootstrap.
+        /// Overrides --replicas.
+        #[arg(long = "control-plane-nodes", value_delimiter = ',')]
+        control_plane_nodes: Vec<String>,
+    },
+    /// Tear the k0s cluster down.
+    Down {
+        /// Also `k0s reset` each node (destructive: wipes cluster state).
+        #[arg(long)]
+        reset: bool,
+    },
+    /// Show cluster phase + per-node component status.
+    Status,
+    /// Print a kubeconfig to stdout. Default: your own scope. `--admin`: cluster-admin (admins only).
+    /// `--user X`: another user's scope (admins only).
+    Kubeconfig {
+        /// Mint a scoped kubeconfig for this SPUR user; targeting anyone but yourself needs admin.
+        #[arg(long)]
+        user: Option<String>,
+        /// Fetch the cluster-admin kubeconfig instead of a scoped one (requires cluster admin).
+        #[arg(long, conflicts_with = "user")]
+        admin: bool,
+    },
+    /// Download + install the k0s binary on THIS node (local; no controller needed).
+    /// Run as root for the default /usr/local/bin path.
+    InstallK0s {
+        /// k0s release tag to install, or "latest". Defaults to spur's pinned version.
+        #[arg(long, default_value_t = String::from(spur_core::k0s::K0S_PINNED_VERSION))]
+        version: String,
+        /// Install path for the k0s binary.
+        #[arg(long, default_value_t = String::from(spur_core::k0s::K0S_DEFAULT_BINARY))]
+        path: String,
+        /// Reinstall even if a k0s binary already exists at --path.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+pub async fn main() -> Result<()> {
+    main_with_args(std::env::args().collect()).await
+}
+
+pub async fn main_with_args(args: Vec<String>) -> Result<()> {
+    let parsed = K8sArgs::try_parse_from(args)?;
+    let controller = parsed.controller;
+    match parsed.command {
+        K8sCommand::Up {
+            control_plane_node,
+            replicas,
+            control_plane_nodes,
+        } => {
+            cmd_up(
+                &controller,
+                control_plane_node,
+                replicas,
+                control_plane_nodes,
+            )
+            .await
+        }
+        K8sCommand::Down { reset } => cmd_down(&controller, reset).await,
+        K8sCommand::Status => cmd_status(&controller).await,
+        K8sCommand::Kubeconfig { user, admin } => cmd_kubeconfig(&controller, user, admin).await,
+        K8sCommand::InstallK0s {
+            version,
+            path,
+            force,
+        } => cmd_install_k0s(&version, &path, force).await,
+    }
+}
+
+fn effective_user() -> String {
+    whoami::username().unwrap_or_else(|_| "unknown".into())
+}
+
+async fn cmd_install_k0s(version: &str, path: &str, force: bool) -> Result<()> {
+    let dest = std::path::Path::new(path);
+    if dest.exists() && !force {
+        eprintln!("k0s already present at {path} (use --force to reinstall)");
+        return Ok(());
+    }
+    eprintln!("Installing k0s {version} -> {path} ...");
+    let info = spur_update::k0s::install_k0s(version, dest).await?;
+    let short = &info.sha256[..info.sha256.len().min(16)];
+    eprintln!(
+        "Installed k0s {} to {} (sha256 {}…)",
+        info.version,
+        info.path.display(),
+        short
+    );
+    Ok(())
+}
+
+async fn cmd_up(
+    controller: &str,
+    control_plane_node: Option<String>,
+    replicas: Option<u32>,
+    control_plane_nodes: Vec<String>,
+) -> Result<()> {
+    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
+    let resp = client
+        .cluster_up(ClusterUpRequest {
+            control_plane_node,
+            control_plane_replicas: replicas,
+            control_plane_nodes,
+            caller: effective_user(),
+        })
+        .await?
+        .into_inner();
+    if resp.accepted {
+        println!("k0s cluster up requested: {}", resp.message);
+    } else {
+        eprintln!("k0s cluster up NOT accepted: {}", resp.message);
+    }
+    for n in resp.nodes {
+        println!("  {} [{}] {}", n.node, n.role, n.component_state);
+    }
+    Ok(())
+}
+
+async fn cmd_down(controller: &str, reset: bool) -> Result<()> {
+    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
+    let resp = client
+        .cluster_down(ClusterDownRequest {
+            reset,
+            caller: effective_user(),
+        })
+        .await?
+        .into_inner();
+    if resp.accepted {
+        println!("k0s cluster down requested: {}", resp.message);
+    } else {
+        eprintln!("k0s cluster down NOT accepted: {}", resp.message);
+    }
+    Ok(())
+}
+
+async fn cmd_status(controller: &str) -> Result<()> {
+    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
+    let resp = client
+        .cluster_status(ClusterStatusRequest {})
+        .await?
+        .into_inner();
+    println!("phase: {}", resp.phase);
+    if !resp.control_plane_nodes.is_empty() {
+        println!("control-plane: {}", resp.control_plane_nodes.join(", "));
+    } else if !resp.control_plane_node.is_empty() {
+        println!("control-plane: {}", resp.control_plane_node);
+    }
+    for n in resp.nodes {
+        println!(
+            "  {:<24} {:<11} {:<11} enabled={}",
+            n.node, n.role, n.component_state, n.enabled
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_kubeconfig(controller: &str, user: Option<String>, admin: bool) -> Result<()> {
+    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
+    let resp = client
+        .cluster_kubeconfig(ClusterKubeconfigRequest {
+            user: user.unwrap_or_default(),
+            caller: effective_user(),
+            admin,
+        })
+        .await?
+        .into_inner();
+    // stdout = data (the YAML), so it can be redirected to a kubeconfig file.
+    print!("{}", resp.kubeconfig);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_up_with_control_plane() {
+        let args =
+            K8sArgs::try_parse_from(["k8s", "up", "--control-plane-node", "head-node"]).unwrap();
+        match args.command {
+            K8sCommand::Up {
+                control_plane_node,
+                replicas,
+                control_plane_nodes,
+            } => {
+                assert_eq!(control_plane_node.as_deref(), Some("head-node"));
+                assert_eq!(replicas, None);
+                assert!(control_plane_nodes.is_empty());
+            }
+            _ => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn parses_up_with_replicas_and_node_set() {
+        let args = K8sArgs::try_parse_from(["k8s", "up", "--replicas", "3"]).unwrap();
+        match args.command {
+            K8sCommand::Up { replicas, .. } => assert_eq!(replicas, Some(3)),
+            _ => panic!("wrong command"),
+        }
+        let args =
+            K8sArgs::try_parse_from(["k8s", "up", "--control-plane-nodes", "cp-1,cp-2,cp-3"])
+                .unwrap();
+        match args.command {
+            K8sCommand::Up {
+                control_plane_nodes,
+                ..
+            } => assert_eq!(control_plane_nodes, vec!["cp-1", "cp-2", "cp-3"]),
+            _ => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn parses_down_reset_and_status() {
+        let args = K8sArgs::try_parse_from(["k8s", "down", "--reset"]).unwrap();
+        assert!(matches!(args.command, K8sCommand::Down { reset: true }));
+        let args = K8sArgs::try_parse_from(["k8s", "status"]).unwrap();
+        assert!(matches!(args.command, K8sCommand::Status));
+    }
+
+    #[test]
+    fn controller_defaults_and_env() {
+        let args = K8sArgs::try_parse_from(["k8s", "status"]).unwrap();
+        assert_eq!(args.controller, "http://localhost:6817");
+    }
+
+    #[test]
+    fn kubeconfig_bare_is_self_scoped() {
+        let args = K8sArgs::try_parse_from(["k8s", "kubeconfig"]).unwrap();
+        match args.command {
+            K8sCommand::Kubeconfig { user, admin } => {
+                assert_eq!(user, None);
+                assert!(!admin);
+            }
+            _ => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn kubeconfig_admin_flag_parses() {
+        let args = K8sArgs::try_parse_from(["k8s", "kubeconfig", "--admin"]).unwrap();
+        match args.command {
+            K8sCommand::Kubeconfig { admin, .. } => assert!(admin),
+            _ => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn kubeconfig_admin_and_user_conflict() {
+        let err =
+            K8sArgs::try_parse_from(["k8s", "kubeconfig", "--admin", "--user", "bob"]).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "--admin and --user must be mutually exclusive"
+        );
+    }
+}

@@ -7,6 +7,8 @@ mod health;
 mod heartbeat;
 mod job_controller;
 mod node_watcher;
+mod quota;
+mod quota_controller;
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -15,8 +17,6 @@ use backon::{BackoffBuilder, ExponentialBuilder};
 use clap::{Parser, Subcommand};
 use kube::Client;
 use tracing::info;
-
-use spur_proto::proto::slurm_agent_server::SlurmAgentServer;
 
 #[derive(Parser)]
 #[command(
@@ -45,6 +45,11 @@ struct Args {
     /// K8s node label selector
     #[arg(long, default_value = "spur.amd.com/managed=true")]
     node_selector: String,
+
+    /// Enable the quota policy reconciler: project SPUR accounts into per-account Namespace +
+    /// ResourceQuota + LimitRange + RBAC. Off by default (opt-in policy plane).
+    #[arg(long, default_value_t = false)]
+    enable_quota: bool,
 
     /// HTTP health/metrics server address
     #[arg(long, default_value = "[::]:8080")]
@@ -171,12 +176,27 @@ async fn main() -> anyhow::Result<()> {
         .await;
     });
 
+    // Spawn the quota policy reconciler (opt-in): projects SPUR accounts into per-account k8s
+    // Namespace + ResourceQuota + LimitRange + RBAC, and drift-corrects them.
+    if args.enable_quota {
+        let q_client = client.clone();
+        let q_ctrl_addr = args.controller_addr.clone();
+        tokio::spawn(async move {
+            run_with_retry("quota reconciler", || {
+                let c = q_client.clone();
+                let ctrl = q_ctrl_addr.clone();
+                Box::pin(quota_controller::run(c, ctrl))
+            })
+            .await;
+        });
+    }
+
     // Start virtual agent gRPC server
     let virtual_agent = agent::VirtualAgent::new(client);
     info!(%listen_addr, "virtual agent gRPC server listening");
 
     tonic::transport::Server::builder()
-        .add_service(SlurmAgentServer::new(virtual_agent))
+        .add_service(spur_proto::agent_server(virtual_agent))
         .serve(listen_addr)
         .await?;
 

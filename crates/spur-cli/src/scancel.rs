@@ -3,7 +3,6 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::CancelJobRequest;
 
 /// Cancel pending or running jobs.
@@ -78,7 +77,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
+    let mut client = spur_proto::controller_client(channel);
 
     if !args.job_ids.is_empty() {
         // Cancel specific jobs
@@ -103,16 +102,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         }
     } else {
         // Filter-based cancellation: get matching jobs, then cancel each
-        let states = args
-            .state
-            .as_ref()
-            .map(|s| {
-                s.split(',')
-                    .filter_map(|st| parse_state(st.trim()))
-                    .map(|s| s as i32)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let states = filter_states(args.state.as_deref())?;
 
         let response = client
             .get_jobs(spur_proto::proto::GetJobsRequest {
@@ -121,18 +111,20 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 partition: args.partition.unwrap_or_default(),
                 account: args.account.unwrap_or_default(),
                 job_ids: Vec::new(),
+                name: args.name.unwrap_or_default(),
             })
             .await
             .context("failed to get jobs")?;
 
         let jobs = response.into_inner().jobs;
-        let name_filter = args.name.as_deref();
 
+        // Filter-based selection targets only cancellable jobs. Terminal jobs
+        // matched by the filter (e.g. a user's already-finished jobs under
+        // `scancel -u`) are skipped rather than sent to cancel_job, which would
+        // reject each one and emit a spurious per-job error. Matches Slurm.
         for job in &jobs {
-            if let Some(name) = name_filter {
-                if job.name != name {
-                    continue;
-                }
+            if !is_cancellable(job.state) {
+                continue;
             }
             match client
                 .cancel_job(CancelJobRequest {
@@ -155,6 +147,48 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Whether a job in the given proto state can still be cancelled. Unknown
+/// state values are treated as cancellable so the server remains the
+/// authority on rejection rather than the client silently dropping them.
+fn is_cancellable(proto_state: i32) -> bool {
+    match spur_core::job::JobState::from_proto_i32(proto_state) {
+        Some(state) => !state.is_terminal(),
+        None => true,
+    }
+}
+
+fn filter_states(state: Option<&str>) -> Result<Vec<i32>> {
+    let Some(states) = state else {
+        return Ok(cancellable_states());
+    };
+
+    let states = states
+        .split(',')
+        .map(str::trim)
+        .filter(|state| !state.is_empty())
+        .map(|state| {
+            parse_state(state)
+                .map(|state| state as i32)
+                .ok_or_else(|| anyhow::anyhow!("scancel: invalid job state: {state}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Comma-only or whitespace-only input leaves no tokens after normalization.
+    if states.is_empty() {
+        bail!("scancel: invalid job state: (empty)");
+    }
+
+    Ok(states)
+}
+
+fn cancellable_states() -> Vec<i32> {
+    spur_core::job::JobState::ALL
+        .iter()
+        .filter(|state| !state.is_terminal())
+        .map(|state| state.to_proto_i32())
+        .collect()
 }
 
 fn parse_signal(s: Option<&str>) -> Result<i32> {
@@ -180,5 +214,92 @@ fn parse_state(s: &str) -> Option<spur_proto::proto::JobState> {
         "PD" | "PENDING" => Some(spur_proto::proto::JobState::JobPending),
         "R" | "RUNNING" => Some(spur_proto::proto::JobState::JobRunning),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spur_proto::proto::JobState;
+
+    #[test]
+    fn active_states_are_cancellable() {
+        for state in [
+            JobState::JobPending,
+            JobState::JobRunning,
+            JobState::JobCompleting,
+            JobState::JobPreempted,
+            JobState::JobSuspended,
+        ] {
+            assert!(
+                is_cancellable(state as i32),
+                "{state:?} should be cancellable"
+            );
+        }
+    }
+
+    #[test]
+    fn default_filter_requests_only_cancellable_states() {
+        let states = filter_states(None).unwrap();
+
+        assert!(states.contains(&(JobState::JobPending as i32)));
+        assert!(states.contains(&(JobState::JobRunning as i32)));
+        assert!(states.contains(&(JobState::JobCompleting as i32)));
+        assert!(states.contains(&(JobState::JobPreempted as i32)));
+        assert!(states.contains(&(JobState::JobSuspended as i32)));
+        assert!(!states.contains(&(JobState::JobCompleted as i32)));
+        assert!(!states.contains(&(JobState::JobFailed as i32)));
+        assert!(!states.contains(&(JobState::JobCancelled as i32)));
+        assert!(!states.contains(&(JobState::JobTimeout as i32)));
+        assert!(!states.contains(&(JobState::JobNodeFail as i32)));
+        assert!(!states.contains(&(JobState::JobDeadline as i32)));
+        assert!(!states.contains(&(JobState::JobOutOfMemory as i32)));
+    }
+
+    #[test]
+    fn explicit_filter_uses_requested_states() {
+        assert_eq!(
+            filter_states(Some("PD,R")).unwrap(),
+            vec![JobState::JobPending as i32, JobState::JobRunning as i32,]
+        );
+    }
+
+    #[test]
+    fn invalid_explicit_filter_is_rejected() {
+        let error = filter_states(Some("PD,BANANA")).unwrap_err();
+
+        assert_eq!(error.to_string(), "scancel: invalid job state: BANANA");
+    }
+
+    #[test]
+    fn empty_explicit_filter_is_rejected() {
+        let error = filter_states(Some(" , ")).unwrap_err();
+
+        assert_eq!(error.to_string(), "scancel: invalid job state: (empty)");
+    }
+
+    #[test]
+    fn terminal_states_are_not_cancellable() {
+        for state in [
+            JobState::JobCompleted,
+            JobState::JobFailed,
+            JobState::JobCancelled,
+            JobState::JobTimeout,
+            JobState::JobNodeFail,
+            JobState::JobDeadline,
+            JobState::JobOutOfMemory,
+        ] {
+            assert!(
+                !is_cancellable(state as i32),
+                "{state:?} should not be cancellable"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_state_is_cancellable() {
+        // Server stays the authority on rejection for values the client
+        // does not recognize.
+        assert!(is_cancellable(9999));
     }
 }

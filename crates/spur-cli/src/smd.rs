@@ -3,7 +3,6 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{GetNodesRequest, NodeInfo, NodeState};
 
 /// Node health monitoring daemon.
@@ -45,7 +44,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         let channel = spur_client::connect_channel(&args.controller)
             .await
             .context("failed to connect to spurctld")?;
-        let mut client = SlurmControllerClient::new(channel);
+        let mut client = spur_proto::controller_client(channel);
 
         let nodes = client
             .get_nodes(GetNodesRequest {

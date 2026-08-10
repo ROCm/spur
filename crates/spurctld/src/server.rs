@@ -9,15 +9,20 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 use tonic::metadata::MetadataValue;
 use tonic::{Code, Request, Response, Status};
-use tracing::warn;
+use tracing::{info, warn};
 
 use spur_core::job::NodeCompleteError;
+use spur_core::mpi::MPI_PMIX;
 use spur_core::reservation::Reservation;
+use spur_core::task_launch::{
+    batch_script_uses_step_launch, build_step_task_plan, step_needs_pmix_prepare,
+};
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
-use spur_proto::proto::slurm_controller_server::{SlurmController, SlurmControllerServer};
+use spur_proto::proto::slurm_controller_server::SlurmController;
 use spur_proto::proto::*;
 
-use crate::cluster::{ClusterManager, ReservationError};
+use crate::cluster::{ClusterManager, PartitionError, ReservationError};
+use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
 use crate::rpc_middleware::RpcStatsLayer;
 use crate::rpc_stats::RpcStatsCollector;
@@ -25,6 +30,87 @@ use crate::sched_stats::SchedStatsCollector;
 
 const FORWARDED_HEADER: &str = "x-spur-forwarded";
 const LEADER_HEADER: &str = "x-spur-leader";
+
+/// Resolve the comm address for an agent registration.
+///
+/// Tries the advertised address first, then the gRPC peer IP (dynamic registration
+/// fallback). Loopback or link-local results are deferred when a routable
+/// candidate is also available.
+fn resolve_registration_comm_addr(
+    advertised: &str,
+    remote_addr: &str,
+    reject_loopback: bool,
+) -> Result<String, Status> {
+    let mut candidates = Vec::new();
+    if !advertised.is_empty() {
+        candidates.push(advertised);
+    }
+    if !remote_addr.is_empty() && remote_addr != advertised {
+        candidates.push(remote_addr);
+    }
+
+    if candidates.is_empty() {
+        return Err(Status::invalid_argument(
+            "no comm address available for registration",
+        ));
+    }
+
+    let mut last_err = None;
+    let mut unusable_result = None;
+    for candidate in candidates {
+        match spur_net::validate_comm_address(candidate, reject_loopback) {
+            Ok(addr) if spur_net::normalized_comm_addr_is_unusable(&addr) => {
+                if unusable_result.is_none() {
+                    unusable_result = Some((candidate.to_string(), addr));
+                }
+            }
+            Ok(addr) => {
+                if candidate != addr {
+                    info!(
+                        candidate = %candidate,
+                        comm_addr = %addr,
+                        "normalized comm address for registration"
+                    );
+                }
+                return Ok(addr);
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+
+    if let Some((candidate, addr)) = unusable_result {
+        warn!(
+            comm_addr = %addr,
+            candidate = %candidate,
+            "node registered with loopback or link-local comm address"
+        );
+        return Ok(addr);
+    }
+
+    Err(Status::invalid_argument(match last_err {
+        Some(e) => format!("invalid comm address: {e}"),
+        None => "no comm address candidate resolved".into(),
+    }))
+}
+
+fn node_comm_http_url(node: &spur_core::node::Node, node_name: &str) -> Result<String, Status> {
+    let host = node
+        .comm_addr()
+        .ok_or_else(|| Status::unavailable(format!("node {node_name} has no comm address")))?;
+    Ok(spur_net::format_comm_http_url(host, node.port))
+}
+
+fn node_comm_socket(node: &spur_core::node::Node, node_name: &str) -> Result<String, Status> {
+    let host = node
+        .comm_addr()
+        .ok_or_else(|| Status::unavailable(format!("node {node_name} has no comm address")))?;
+    Ok(spur_net::format_comm_socket(host, node.port))
+}
+
+/// Forwarding decision for read RPCs, split out so it's unit-testable.
+fn read_forwarding_policy(is_leader: bool, is_forwarded: bool) -> bool {
+    !is_leader && !is_forwarded
+}
 
 pub struct ControllerService {
     cluster: Arc<ClusterManager>,
@@ -34,6 +120,14 @@ pub struct ControllerService {
     client_addrs: BTreeMap<u64, String>,
     rpc_stats: Arc<RpcStatsCollector>,
     sched_stats: Arc<SchedStatsCollector>,
+    /// Default HA control-plane count (`[cluster] control_plane_replicas`) when `spur k8s up`
+    /// requests neither `--replicas` nor an explicit node set.
+    control_plane_replicas: u32,
+    /// JWT signing key for node tokens, captured at startup. Deliberately NOT
+    /// re-read on `scontrol reconfigure`: swapping it live would instantly fail
+    /// verification of every outstanding node token (7-day TTL), silently
+    /// partitioning healthy nodes. Like Slurm's AuthType, it is restart-only.
+    jwt_key: String,
 }
 
 struct LeaderProxy {
@@ -80,11 +174,43 @@ impl LeaderProxy {
 
         let client = SlurmControllerClient::connect(url)
             .await
-            .map_err(|e| Status::unavailable(format!("cannot reach leader: {e}")))?;
+            .map_err(|e| Status::unavailable(format!("cannot reach leader: {e}")))?
+            .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
 
         *cached = Some((leader_id, client.clone()));
         Ok(client)
     }
+
+    /// `None` instead of an error when no leader is reachable, so read RPCs can
+    /// fall back to local state rather than failing.
+    async fn try_get_leader_client(
+        &self,
+    ) -> Option<SlurmControllerClient<tonic::transport::Channel>> {
+        self.get_leader_client().await.ok()
+    }
+}
+
+/// Resolve the node-token signing key from config at startup. Captured once by
+/// `serve` into `ControllerService::jwt_key`; deliberately not re-read on
+/// `reconfigure` (see the field doc). Falls back to a shared default so
+/// key-less dev clusters interoperate.
+fn resolve_startup_jwt_key(config: &spur_core::config::SlurmConfig) -> String {
+    if let Some(key) = &config.auth.jwt_key {
+        return key.clone();
+    }
+    // Token admission signs/verifies node tokens with this key. A well-known
+    // default is trivially forgeable by anyone who can reach the controller.
+    if matches!(
+        config.admission.mode,
+        spur_core::config::AdmissionMode::Token
+    ) {
+        warn!(
+            "admission.mode=Token but auth.jwt_key is unset: node tokens are signed with a \
+             well-known default key and are forgeable. Set auth.jwt_key to a secret value."
+        );
+    }
+    "spur-default-key".to_string()
 }
 
 impl ControllerService {
@@ -100,6 +226,77 @@ impl ControllerService {
         }
 
         Err(self.not_leader_status())
+    }
+
+    /// Re-send a terminal-job cancel to a node still reporting it on heartbeat,
+    /// freeing an allocation whose terminal cancel never landed. Spawned, best-effort.
+    fn reclaim_stale_agent_jobs(&self, node: &str, reported: &[RunningJobStatus]) {
+        let stale = stale_reported_jobs(&self.cluster, reported);
+        if stale.is_empty() {
+            return;
+        }
+        let cluster = self.cluster.clone();
+        let node = node.to_string();
+        tokio::spawn(async move {
+            for job_id in stale {
+                // Re-check: a requeue since the snapshot above would otherwise
+                // send an unguarded cancel into the job's new run.
+                if !is_still_terminal(&cluster, job_id) {
+                    continue;
+                }
+                warn!(
+                    job_id,
+                    node = %node,
+                    "agent still holds a terminal job — re-sending cancel to reclaim its allocation"
+                );
+                // Signal 0 = graceful release, no-op on an unknown id. Not
+                // epoch-gated — a requeue racing this send is still possible.
+                crate::scheduler_loop::cancel_job_on_nodes(
+                    &cluster,
+                    job_id,
+                    std::slice::from_ref(&node),
+                    0,
+                )
+                .await;
+            }
+        });
+    }
+
+    /// Reads never require the leader (every node applies the committed log),
+    /// so forwarding is only an optional freshness hop. Skipping already-
+    /// forwarded requests avoids forward loops between non-leaders.
+    fn read_should_forward<T>(&self, request: &Request<T>) -> bool {
+        read_forwarding_policy(
+            self.raft.is_leader(),
+            request.metadata().get(FORWARDED_HEADER).is_some(),
+        )
+    }
+
+    /// Best-effort forward of a read to the leader: `Some(payload)` forwards
+    /// (clone lazily via `forward.then(|| ...)`), `None` serves local state. Any
+    /// forward error is swallowed to local — safe only while read handlers return
+    /// Ok/NotFound; a handler with a real error (e.g. InvalidArgument) masks it.
+    async fn forward_read_optional<T, R, F, Fut>(
+        &self,
+        payload: Option<T>,
+        rpc: &str,
+        call: F,
+    ) -> Option<Response<R>>
+    where
+        F: FnOnce(SlurmControllerClient<tonic::transport::Channel>, Request<T>) -> Fut,
+        Fut: std::future::Future<Output = Result<Response<R>, Status>>,
+    {
+        let payload = payload?;
+        let client = self.leader_proxy.try_get_leader_client().await?;
+        let mut fwd = Request::new(payload);
+        *fwd.metadata_mut() = Self::forwarded_metadata();
+        match call(client, fwd).await {
+            Ok(resp) => Some(resp),
+            Err(e) => {
+                warn!("forwarding {rpc} to leader failed, serving locally: {e}");
+                None
+            }
+        }
     }
 
     fn not_leader_status(&self) -> Status {
@@ -138,7 +335,7 @@ impl ControllerService {
     fn validate_admission(&self, join_token: &str, hostname: &str) -> Result<String, Status> {
         use spur_core::config::AdmissionMode;
 
-        if !matches!(self.cluster.config.admission.mode, AdmissionMode::Token) {
+        if !matches!(self.cluster.config().admission.mode, AdmissionMode::Token) {
             return Ok(String::new());
         }
 
@@ -153,17 +350,52 @@ impl ControllerService {
         spur_core::admission::validate_token(token_id, secret, &token_store)
             .map_err(|e| Status::permission_denied(e.to_string()))?;
 
-        let jwt_key = self
-            .cluster
-            .config
-            .auth
-            .jwt_key
-            .as_deref()
-            .unwrap_or("spur-default-key");
-
-        spur_core::admission::generate_node_token(hostname, jwt_key.as_bytes())
+        spur_core::admission::generate_node_token(hostname, self.jwt_key.as_bytes())
             .map_err(|e| Status::internal(e.to_string()))
     }
+}
+
+/// Resolve a user to the (namespace, ServiceAccount) its scoped kubeconfig must be bound to.
+/// Fails closed if associations aren't loaded yet — the cache resolves fail-open, which would
+/// otherwise mint an unscoped token — and rejects a user with no account.
+fn resolve_user_namespace_sa(
+    cache: &crate::association_cache::AssociationCache,
+    user: &str,
+) -> Result<(String, String), Status> {
+    if !cache.is_loaded() {
+        return Err(Status::unavailable(
+            "associations not loaded yet; retry shortly",
+        ));
+    }
+    let (account, _qos, _allowed_qos) = cache.resolve(user, None);
+    let account = account.ok_or_else(|| {
+        Status::not_found(format!("user '{user}' is not associated with any account"))
+    })?;
+    Ok((
+        spur_core::quota_names::account_namespace(&account),
+        spur_core::quota_names::user_service_account(user),
+    ))
+}
+
+/// Whether `caller` may perform k0s cluster-admin ops: empty/root always, else accounting `Admin`.
+/// Fails closed when accounting is off (cache reports no admins), leaving only root/internal.
+fn is_k0s_admin(cache: &crate::association_cache::AssociationCache, caller: &str) -> bool {
+    caller.is_empty() || caller == "root" || cache.is_admin(caller)
+}
+
+/// Whether the controller still considers `job_id` terminal right now — guards
+/// the spawned reclaim loop against a requeue landing after its stale snapshot.
+fn is_still_terminal(cluster: &ClusterManager, job_id: u32) -> bool {
+    cluster.job_state(job_id).is_some_and(|s| s.is_terminal())
+}
+
+/// Reported ids the controller's own record marks terminal. Non-terminal (incl.
+/// Pending mid-dispatch) and unknown ids are spared, so no live job is reclaimed.
+fn stale_reported_jobs(cluster: &ClusterManager, reported: &[RunningJobStatus]) -> Vec<u32> {
+    reported
+        .iter()
+        .filter_map(|r| is_still_terminal(cluster, r.job_id).then_some(r.job_id))
+        .collect()
 }
 
 #[tonic::async_trait]
@@ -193,29 +425,33 @@ impl SlurmController for ControllerService {
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
 
         let core_spec = proto_to_job_spec(spec)?;
-        let job_id = self
+        let outcome = self
             .cluster
             .submit_job(core_spec)
             .map_err(submit_rpc_status)?;
 
-        Ok(Response::new(SubmitJobResponse { job_id }))
+        Ok(Response::new(SubmitJobResponse {
+            job_id: outcome.job_id,
+            warnings: outcome.warnings,
+        }))
     }
 
     async fn get_jobs(
         &self,
         request: Request<GetJobsRequest>,
     ) -> Result<Response<GetJobsResponse>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.get_jobs(fwd).await;
-            }
-        }
-
+        let forward = self.read_should_forward(&request);
         let req = request.into_inner();
+        if let Some(resp) = self
+            .forward_read_optional(
+                forward.then(|| req.clone()),
+                "get_jobs",
+                |mut c, r| async move { c.get_jobs(r).await },
+            )
+            .await
+        {
+            return Ok(resp);
+        }
 
         let states: Vec<spur_core::job::JobState> = req
             .states
@@ -238,10 +474,15 @@ impl SlurmController for ControllerService {
         } else {
             Some(req.account.as_str())
         };
+        let name = if req.name.is_empty() {
+            None
+        } else {
+            Some(req.name.as_str())
+        };
 
         let jobs = self
             .cluster
-            .get_jobs(&states, user, partition, account, &req.job_ids);
+            .get_jobs(&states, user, partition, account, name, &req.job_ids);
 
         let proto_jobs: Vec<JobInfo> = jobs.iter().map(job_to_proto).collect();
 
@@ -249,17 +490,18 @@ impl SlurmController for ControllerService {
     }
 
     async fn get_job(&self, request: Request<GetJobRequest>) -> Result<Response<JobInfo>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.get_job(fwd).await;
-            }
+        let forward = self.read_should_forward(&request);
+        let req = request.into_inner();
+        if let Some(resp) = self
+            .forward_read_optional(forward.then_some(req), "get_job", |mut c, r| async move {
+                c.get_job(r).await
+            })
+            .await
+        {
+            return Ok(resp);
         }
 
-        let job_id = request.into_inner().job_id;
+        let job_id = req.job_id;
         let job = self
             .cluster
             .get_job_for_display(job_id)
@@ -301,6 +543,62 @@ impl SlurmController for ControllerService {
                 crate::scheduler_loop::send_cancel_to_agents(&cluster, &job, 0).await;
             });
         }
+
+        Ok(Response::new(()))
+    }
+
+    async fn complete_job(
+        &self,
+        request: Request<CompleteJobRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.complete_job(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward complete_job to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+
+        let req = request.into_inner();
+        let job = self
+            .cluster
+            .finish_srun_job(req.job_id, req.exit_code, &req.user)
+            .map_err(|e| match e {
+                crate::cluster::SrunCompleteError::NotFound(id) => {
+                    Status::not_found(format!("job {id} not found"))
+                }
+                crate::cluster::SrunCompleteError::NotSrunJob(id) => {
+                    Status::failed_precondition(format!("job {id} is not an srun allocation"))
+                }
+                crate::cluster::SrunCompleteError::NotStepDispatch(id) => {
+                    Status::failed_precondition(format!(
+                        "job {id} does not use native step dispatch"
+                    ))
+                }
+                crate::cluster::SrunCompleteError::AlreadyTerminal { job_id, state } => {
+                    Status::failed_precondition(format!("job {job_id} is already {state:?}"))
+                }
+                crate::cluster::SrunCompleteError::NotOwner { job_id, user } => {
+                    Status::permission_denied(format!(
+                        "user {user} is not permitted to complete job {job_id}"
+                    ))
+                }
+                crate::cluster::SrunCompleteError::Internal { job_id, message } => {
+                    Status::internal(format!("job {job_id}: {message}"))
+                }
+            })?;
+
+        let cluster = self.cluster.clone();
+        tokio::spawn(async move {
+            crate::scheduler_loop::release_srun_allocation_on_agents(&cluster, &job).await;
+        });
 
         Ok(Response::new(()))
     }
@@ -428,17 +726,19 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetNodesRequest>,
     ) -> Result<Response<GetNodesResponse>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.get_nodes(fwd).await;
-            }
+        let forward = self.read_should_forward(&request);
+        let req = request.into_inner();
+        if let Some(resp) = self
+            .forward_read_optional(
+                forward.then(|| req.clone()),
+                "get_nodes",
+                |mut c, r| async move { c.get_nodes(r).await },
+            )
+            .await
+        {
+            return Ok(resp);
         }
 
-        let req = request.into_inner();
         let nodes = self.cluster.get_nodes();
 
         let nodelist = req.nodelist.trim();
@@ -466,17 +766,20 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetNodeRequest>,
     ) -> Result<Response<NodeInfo>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.get_node(fwd).await;
-            }
+        let forward = self.read_should_forward(&request);
+        let req = request.into_inner();
+        if let Some(resp) = self
+            .forward_read_optional(
+                forward.then(|| req.clone()),
+                "get_node",
+                |mut c, r| async move { c.get_node(r).await },
+            )
+            .await
+        {
+            return Ok(resp);
         }
 
-        let name = request.into_inner().name;
+        let name = req.name;
         let node = self
             .cluster
             .get_node(&name)
@@ -622,21 +925,14 @@ impl SlurmController for ControllerService {
         let req = request.into_inner();
 
         if matches!(
-            self.cluster.config.admission.mode,
+            self.cluster.config().admission.mode,
             spur_core::config::AdmissionMode::Token
         ) {
             if req.node_token.is_empty() {
                 return Err(Status::unauthenticated("node token required"));
             }
-            let jwt_key = self
-                .cluster
-                .config
-                .auth
-                .jwt_key
-                .as_deref()
-                .unwrap_or("spur-default-key");
             let identity =
-                spur_core::admission::verify_node_token(&req.node_token, jwt_key.as_bytes())
+                spur_core::admission::verify_node_token(&req.node_token, self.jwt_key.as_bytes())
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
             if identity.hostname != req.hostname {
                 return Err(Status::permission_denied("node token hostname mismatch"));
@@ -663,14 +959,16 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetPartitionsRequest>,
     ) -> Result<Response<GetPartitionsResponse>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.get_partitions(fwd).await;
-            }
+        let forward = self.read_should_forward(&request);
+        if let Some(resp) = self
+            .forward_read_optional(
+                forward.then(|| request.into_inner()),
+                "get_partitions",
+                |mut c, r| async move { c.get_partitions(r).await },
+            )
+            .await
+        {
+            return Ok(resp);
         }
 
         let partitions = self.cluster.get_partitions();
@@ -685,7 +983,7 @@ impl SlurmController for ControllerService {
 
         let federation_peers: Vec<String> = self
             .cluster
-            .config
+            .config()
             .federation
             .clusters
             .iter()
@@ -701,14 +999,16 @@ impl SlurmController for ControllerService {
     }
 
     async fn get_job_metrics(&self, request: Request<()>) -> Result<Response<JobMetrics>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.get_job_metrics(fwd).await;
-            }
+        let forward = self.read_should_forward(&request);
+        if let Some(resp) = self
+            .forward_read_optional(
+                forward.then_some(()),
+                "get_job_metrics",
+                |mut c, r| async move { c.get_job_metrics(r).await },
+            )
+            .await
+        {
+            return Ok(resp);
         }
 
         let snap = self.cluster.job_metrics();
@@ -721,14 +1021,16 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<()>,
     ) -> Result<Response<NodeMetrics>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.get_node_metrics(fwd).await;
-            }
+        let forward = self.read_should_forward(&request);
+        if let Some(resp) = self
+            .forward_read_optional(
+                forward.then_some(()),
+                "get_node_metrics",
+                |mut c, r| async move { c.get_node_metrics(r).await },
+            )
+            .await
+        {
+            return Ok(resp);
         }
 
         let snap = self.cluster.node_metrics();
@@ -825,31 +1127,30 @@ impl SlurmController for ControllerService {
         let req = request.into_inner();
         let resources = req.resources.map(proto_to_resource_set).unwrap_or_default();
 
-        let agent_addr = if !req.address.is_empty() {
-            req.address.clone()
-        } else {
-            let is_loopback =
-                remote_addr.is_empty() || remote_addr == "127.0.0.1" || remote_addr == "::1";
-            if is_loopback {
-                "127.0.0.1".to_string()
-            } else {
-                remote_addr
-            }
-        };
+        let reject_loopback = self.cluster.config().network.reject_loopback_comm_addr;
+        let advertised = req.address.clone();
+        let agent_addr = tokio::task::spawn_blocking(move || {
+            resolve_registration_comm_addr(&advertised, &remote_addr, reject_loopback)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("comm address resolution task failed: {e}")))??;
 
         let agent_port = if req.port > 0 { req.port as u16 } else { 6818 };
 
         let node_token_response = self.validate_admission(&req.join_token, &req.hostname)?;
 
+        let source = spur_core::node::node_source_from_registration(&req.version, &req.labels);
         self.cluster
             .register_node(
+                // NodeName and NodeHostname are the same until agents can supply both.
+                req.hostname.clone(),
                 req.hostname.clone(),
                 resources,
                 agent_addr,
                 agent_port,
                 req.wg_pubkey,
                 req.version,
-                spur_core::node::NodeSource::NativeHost,
+                source,
                 req.labels,
             )
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -894,6 +1195,7 @@ impl SlurmController for ControllerService {
                 &req.reporting_node,
                 req.exit_code,
                 req.signal,
+                req.run_attempt,
             ))
         } else {
             None
@@ -923,12 +1225,48 @@ impl SlurmController for ControllerService {
 
         match completion_result {
             Some(Ok(NodeCompleteResult::AllDone { .. })) => Ok(Response::new(())),
-            Some(Ok(NodeCompleteResult::Completing)) => Ok(Response::new(())),
+            Some(Ok(NodeCompleteResult::Completing)) => {
+                if let Some(job) = self.cluster.get_job(req.job_id) {
+                    if job
+                        .spec
+                        .script
+                        .as_deref()
+                        .is_some_and(batch_script_uses_step_launch)
+                    {
+                        let missing: Vec<String> = job
+                            .allocated_nodes
+                            .iter()
+                            .filter(|node| !job.node_completions.contains_key(*node))
+                            .cloned()
+                            .collect();
+                        if !missing.is_empty() {
+                            let cluster = self.cluster.clone();
+                            let job_id = req.job_id;
+                            tokio::spawn(async move {
+                                crate::scheduler_loop::cancel_job_on_nodes(
+                                    &cluster, job_id, &missing, 15,
+                                )
+                                .await;
+                            });
+                        }
+                    }
+                }
+                Ok(Response::new(()))
+            }
             Some(Ok(NodeCompleteResult::AlreadyTerminal)) => {
                 warn!(
                     job_id = req.job_id,
                     node = %req.reporting_node,
                     "duplicate completion report for terminal job"
+                );
+                Ok(Response::new(()))
+            }
+            Some(Ok(NodeCompleteResult::StaleReport)) => {
+                warn!(
+                    job_id = req.job_id,
+                    node = %req.reporting_node,
+                    run_attempt = req.run_attempt,
+                    "ignoring completion report from superseded run"
                 );
                 Ok(Response::new(()))
             }
@@ -967,21 +1305,14 @@ impl SlurmController for ControllerService {
         let req = request.into_inner();
 
         if matches!(
-            self.cluster.config.admission.mode,
+            self.cluster.config().admission.mode,
             spur_core::config::AdmissionMode::Token
         ) {
             if req.node_token.is_empty() {
                 return Err(Status::unauthenticated("node token required"));
             }
-            let jwt_key = self
-                .cluster
-                .config
-                .auth
-                .jwt_key
-                .as_deref()
-                .unwrap_or("spur-default-key");
             let identity =
-                spur_core::admission::verify_node_token(&req.node_token, jwt_key.as_bytes())
+                spur_core::admission::verify_node_token(&req.node_token, self.jwt_key.as_bytes())
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
             if identity.hostname != req.hostname {
                 return Err(Status::permission_denied("node token hostname mismatch"));
@@ -992,6 +1323,15 @@ impl SlurmController for ControllerService {
             .cluster
             .update_heartbeat(&req.hostname, req.cpu_load, req.free_memory_mb)
         {
+            // Learn a mesh key that appeared/changed after registration so the node joins ApplyMesh
+            // without a restart. Only meaningful once the node is known (heartbeat accepted).
+            if self
+                .cluster
+                .update_node_wg_pubkey(&req.hostname, &req.wg_pubkey)
+            {
+                info!(node = %req.hostname, "learned updated WireGuard mesh key from heartbeat");
+            }
+            self.reclaim_stale_agent_jobs(&req.hostname, &req.running_jobs);
             Ok(Response::new(HeartbeatResponse {}))
         } else {
             Err(Status::not_found(format!(
@@ -1081,17 +1421,20 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetJobStepsRequest>,
     ) -> Result<Response<GetJobStepsResponse>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.get_job_steps(fwd).await;
-            }
+        let forward = self.read_should_forward(&request);
+        let req = request.into_inner();
+        if let Some(resp) = self
+            .forward_read_optional(
+                forward.then_some(req),
+                "get_job_steps",
+                |mut c, r| async move { c.get_job_steps(r).await },
+            )
+            .await
+        {
+            return Ok(resp);
         }
 
-        let job_id = request.into_inner().job_id;
+        let job_id = req.job_id;
         let steps = self.cluster.get_steps(job_id);
         let step_infos: Vec<JobStepInfo> = steps
             .iter()
@@ -1133,12 +1476,26 @@ impl SlurmController for ControllerService {
             .get_job(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
 
+        spur_core::auth::check_job_owner(&req.user, &job.spec.user, "attach to")
+            .map_err(|e| Status::permission_denied(e.to_string()))?;
+
         if job.state != spur_core::job::JobState::Running {
             return Err(Status::failed_precondition(format!(
                 "job {} is not running (state: {:?})",
                 job_id, job.state
             )));
         }
+
+        let target_node =
+            select_step_node(&job.allocated_nodes, &req.node).map_err(Status::invalid_argument)?;
+
+        // Resolve the target agent address BEFORE creating the step: an unregistered node returns a
+        // retryable Unavailable and the client retries the whole call, so resolving first keeps a
+        // failed attempt from leaking a step per retry.
+        let node = self.cluster.get_node(target_node).ok_or_else(|| {
+            Status::unavailable(format!("node {target_node} is not currently registered"))
+        })?;
+        let node_addr = node_comm_socket(&node, target_node)?;
 
         let existing_steps = self.cluster.get_steps(job_id);
         let step_id = existing_steps
@@ -1161,9 +1518,271 @@ impl SlurmController for ControllerService {
             exit_code: None,
         };
 
-        self.cluster.create_step(job_id, step_id, step);
+        self.cluster
+            .create_step(step)
+            .map_err(|e| Status::internal(format!("failed to create job step: {e}")))?;
 
-        Ok(Response::new(CreateJobStepResponse { step_id }))
+        Ok(Response::new(CreateJobStepResponse { step_id, node_addr }))
+    }
+
+    async fn create_partition(
+        &self,
+        request: Request<CreatePartitionRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.create_partition(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward create_partition to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+
+        let req = request.into_inner();
+
+        if req.nodes.is_empty() && req.selector.is_empty() {
+            return Err(Status::invalid_argument(
+                "partition must specify at least one of nodes or selector",
+            ));
+        }
+
+        let max_time_minutes = if req.max_time.is_empty()
+            || req.max_time.eq_ignore_ascii_case("INFINITE")
+            || req.max_time.eq_ignore_ascii_case("UNLIMITED")
+        {
+            None
+        } else {
+            Some(
+                spur_core::config::parse_time_minutes(&req.max_time).ok_or_else(|| {
+                    Status::invalid_argument(format!("invalid max_time: {}", req.max_time))
+                })?,
+            )
+        };
+
+        let default_time_minutes = if req.default_time.is_empty() {
+            None
+        } else {
+            Some(
+                spur_core::config::parse_time_minutes(&req.default_time).ok_or_else(|| {
+                    Status::invalid_argument(format!("invalid default_time: {}", req.default_time))
+                })?,
+            )
+        };
+
+        let state = match req.state.to_uppercase().as_str() {
+            "" | "UP" => spur_core::partition::PartitionState::Up,
+            "DOWN" => spur_core::partition::PartitionState::Down,
+            "DRAIN" => spur_core::partition::PartitionState::Drain,
+            "INACTIVE" => spur_core::partition::PartitionState::Inactive,
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown partition state '{}'; expected UP, DOWN, DRAIN, or INACTIVE",
+                    other
+                )))
+            }
+        };
+
+        let preempt_mode = match req.preempt_mode.to_uppercase().as_str() {
+            "" | "OFF" => spur_core::partition::PreemptMode::Off,
+            "CANCEL" => spur_core::partition::PreemptMode::Cancel,
+            "REQUEUE" => spur_core::partition::PreemptMode::Requeue,
+            "SUSPEND" => spur_core::partition::PreemptMode::Suspend,
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown preempt_mode '{}'; expected OFF, CANCEL, REQUEUE, or SUSPEND",
+                    other
+                )))
+            }
+        };
+
+        let partition = spur_core::partition::Partition {
+            name: req.name,
+            state,
+            is_default: req.is_default,
+            nodes: req.nodes,
+            selector: req.selector.into_iter().collect(),
+            max_time_minutes,
+            default_time_minutes,
+            // A literal 0 means "no limit" (matches the update-partition
+            // contract) rather than a partition that can never run a job.
+            max_nodes: req.max_nodes.filter(|&n| n != 0),
+            min_nodes: if req.min_nodes == 0 { 1 } else { req.min_nodes },
+            allow_accounts: req.allow_accounts,
+            allow_groups: req.allow_groups,
+            deny_accounts: req.deny_accounts,
+            deny_qos: req.deny_qos,
+            allow_qos: req.allow_qos,
+            priority_tier: req.priority_tier,
+            preempt_mode,
+            ..Default::default()
+        };
+
+        self.cluster
+            .create_partition(partition)
+            .map_err(partition_rpc_status)?;
+
+        Ok(Response::new(()))
+    }
+
+    async fn update_partition(
+        &self,
+        request: Request<UpdatePartitionRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.update_partition(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward update_partition to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+
+        let req = request.into_inner();
+
+        let state = req
+            .state
+            .map(|s| match s.to_uppercase().as_str() {
+                v @ ("UP" | "DOWN" | "DRAIN" | "INACTIVE") => Ok(v.to_string()),
+                other => Err(Status::invalid_argument(format!(
+                    "unknown partition state '{}'; expected UP, DOWN, DRAIN, or INACTIVE",
+                    other
+                ))),
+            })
+            .transpose()?;
+
+        let preempt_mode = req
+            .preempt_mode
+            .map(|pm| match pm.to_uppercase().as_str() {
+                v @ ("OFF" | "CANCEL" | "REQUEUE" | "SUSPEND") => Ok(v.to_string()),
+                other => Err(Status::invalid_argument(format!(
+                    "unknown preempt_mode '{}'; expected OFF, CANCEL, REQUEUE, or SUSPEND",
+                    other
+                ))),
+            })
+            .transpose()?;
+
+        let max_time = req.max_time;
+        let allow_accounts = if req.set_allow_accounts {
+            Some(req.allow_accounts)
+        } else {
+            None
+        };
+        let allow_groups = if req.set_allow_groups {
+            Some(req.allow_groups)
+        } else {
+            None
+        };
+        let deny_accounts = if req.set_deny_accounts {
+            Some(req.deny_accounts)
+        } else {
+            None
+        };
+        let deny_qos = if req.set_deny_qos {
+            Some(req.deny_qos)
+        } else {
+            None
+        };
+        let allow_qos = if req.set_allow_qos {
+            Some(req.allow_qos)
+        } else {
+            None
+        };
+        let (max_nodes, clear_max_nodes) =
+            resolve_max_nodes_update(req.max_nodes_value, req.clear_max_nodes);
+
+        let selector = if req.set_selector || !req.selector.is_empty() {
+            Some(req.selector.into_iter().collect())
+        } else {
+            None
+        };
+        // Match create_partition's "0 means unset, not literally zero" rule.
+        let min_nodes = req.min_nodes.map(|mn| if mn == 0 { 1 } else { mn });
+
+        self.cluster
+            .update_partition(
+                &req.name,
+                req.nodes,
+                selector,
+                state,
+                req.is_default,
+                max_time,
+                req.default_time,
+                max_nodes,
+                clear_max_nodes,
+                min_nodes,
+                allow_accounts,
+                allow_groups,
+                deny_accounts,
+                deny_qos,
+                allow_qos,
+                req.priority_tier,
+                preempt_mode,
+            )
+            .map_err(partition_rpc_status)?;
+
+        Ok(Response::new(()))
+    }
+
+    async fn delete_partition(
+        &self,
+        request: Request<DeletePartitionRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.delete_partition(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward delete_partition to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+
+        let name = request.into_inner().name;
+        self.cluster
+            .delete_partition(&name)
+            .map_err(partition_rpc_status)?;
+
+        Ok(Response::new(()))
+    }
+
+    async fn reconfigure(&self, request: Request<()>) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.reconfigure(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward reconfigure to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+
+        self.cluster
+            .reconfigure()
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(()))
     }
 
     async fn create_reservation(
@@ -1209,6 +1828,7 @@ impl SlurmController for ControllerService {
             accounts: req.accounts,
             users: req.users,
             flags,
+            owner: req.user,
         };
 
         self.cluster
@@ -1248,6 +1868,7 @@ impl SlurmController for ControllerService {
                 &req.remove_users,
                 &req.add_accounts,
                 &req.remove_accounts,
+                &req.user,
             )
             .map_err(reservation_rpc_status)?;
         Ok(Response::new(()))
@@ -1272,9 +1893,9 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let name = request.into_inner().name;
+        let req = request.into_inner();
         self.cluster
-            .delete_reservation(&name)
+            .delete_reservation(&req.name, &req.user)
             .map_err(reservation_rpc_status)?;
         Ok(Response::new(()))
     }
@@ -1283,19 +1904,24 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<ListReservationsRequest>,
     ) -> Result<Response<ListReservationsResponse>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let mut fwd = Request::new(request.into_inner());
-                *fwd.metadata_mut() = Self::forwarded_metadata();
-                return client.list_reservations(fwd).await;
-            }
+        let forward = self.read_should_forward(&request);
+        let req = request.into_inner();
+        if let Some(resp) = self
+            .forward_read_optional(
+                forward.then(|| req.clone()),
+                "list_reservations",
+                |mut c, r| async move { c.list_reservations(r).await },
+            )
+            .await
+        {
+            return Ok(resp);
         }
+        let name = req.name.trim();
         let reservations = self.cluster.get_reservations();
         let now = Utc::now();
         let infos: Vec<ReservationInfo> = reservations
             .iter()
+            .filter(|r| name.is_empty() || r.name == name)
             .map(|r| ReservationInfo {
                 name: r.name.clone(),
                 start_time: r.start_time.to_rfc3339(),
@@ -1305,6 +1931,7 @@ impl SlurmController for ControllerService {
                 users: r.users.join(","),
                 flags: r.flags.display_csv(),
                 state: r.state_label(now).into(),
+                owner: r.owner.clone(),
             })
             .collect();
         Ok(Response::new(ListReservationsResponse {
@@ -1336,6 +1963,9 @@ impl SlurmController for ControllerService {
             .get_job(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
 
+        spur_core::auth::check_job_owner(&req.user, &job.spec.user, "exec into")
+            .map_err(|e| Status::permission_denied(e.to_string()))?;
+
         if job.state != spur_core::job::JobState::Running {
             return Err(Status::failed_precondition(format!(
                 "job {} is not running (state: {})",
@@ -1353,22 +1983,21 @@ impl SlurmController for ControllerService {
             .cluster
             .get_node(&node_name)
             .ok_or_else(|| Status::not_found(format!("node {} not found", node_name)))?;
-        let addr = node
-            .address
-            .as_ref()
-            .ok_or_else(|| Status::internal(format!("node {} has no agent address", node_name)))?;
-        let agent_addr = format!("http://{}:{}", addr, node.port);
+        let agent_addr = node_comm_http_url(&node, &node_name)?;
 
         let mut agent = SlurmAgentClient::connect(agent_addr.clone())
             .await
             .map_err(|e| {
                 Status::unavailable(format!("cannot reach agent at {}: {}", agent_addr, e))
-            })?;
+            })?
+            .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
 
         let resp = agent
             .exec_in_job(ExecInJobRequest {
                 job_id,
                 command: req.command,
+                user: req.user,
             })
             .await
             .map_err(|e| Status::internal(format!("exec failed: {}", e)))?;
@@ -1376,9 +2005,9 @@ impl SlurmController for ControllerService {
         Ok(resp)
     }
 
-    /// #146: route a step from `srun-in-salloc` to one of the job's
-    /// allocated nodes. Unlike ExecInJob, the job may not have a tracked
-    /// process — salloc allocations only exist as scheduler bookkeeping.
+    /// Route a step from srun to the job's allocated nodes. Unlike ExecInJob,
+    /// the job may not have a tracked process — salloc allocations only exist
+    /// as scheduler bookkeeping.
     async fn run_step(
         &self,
         request: Request<RunStepRequest>,
@@ -1408,57 +2037,516 @@ impl SlurmController for ControllerService {
             )));
         }
 
-        let node_name = job.allocated_nodes[0].clone();
-        let node = self
+        let step = self
             .cluster
-            .get_node(&node_name)
-            .ok_or_else(|| Status::not_found(format!("node {} not found", node_name)))?;
-        let addr = node
-            .address
-            .as_ref()
-            .ok_or_else(|| Status::internal(format!("node {} has no agent address", node_name)))?;
-        let agent_addr = format!("http://{}:{}", addr, node.port);
-
-        let mut agent = SlurmAgentClient::connect(agent_addr.clone())
-            .await
-            .map_err(|e| {
-                Status::unavailable(format!("cannot reach agent at {}: {}", agent_addr, e))
+            .get_steps(job_id)
+            .into_iter()
+            .find(|s| s.step_id == req.step_id)
+            .ok_or_else(|| {
+                Status::not_found(format!("step {} not found for job {}", req.step_id, job_id))
             })?;
 
-        let agent_resp = agent
-            .run_command(RunCommandRequest {
-                command: req.command,
-                uid: req.uid,
-                gid: req.gid,
-                work_dir: req.work_dir,
-                environment: req.environment,
-                job_id: req.job_id,
-            })
-            .await
-            .map_err(|e| Status::internal(format!("run_command failed: {}", e)))?
-            .into_inner();
+        let num_nodes = job.allocated_nodes.len() as u32;
+        let plan = build_step_task_plan(step.num_tasks, num_nodes, step.distribution);
+        if plan.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "step {} for job {} has no tasks to run",
+                req.step_id, job_id
+            )));
+        }
 
-        // Record the step's exit code durably (Raft) so the job's live
-        // DerivedExitCode (running max over steps) is consistent and survives
-        // restart. Best-effort: a failure here doesn't fail the step itself.
-        if let Err(e) =
-            self.cluster
-                .record_step_complete(req.job_id, req.step_id, agent_resp.exit_code)
-        {
+        let step_num_tasks = step.num_tasks;
+        let command = req.command.clone();
+        let work_dir = req.work_dir.clone();
+        let environment = req.environment.clone();
+        let uid = req.uid;
+        let gid = req.gid;
+        let step_id = req.step_id;
+        let label = req.label;
+        let job_mpi = job.spec.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
+        let mpi = spur_core::mpi::resolve_step_mpi(req.mpi.as_str(), job_mpi).to_string();
+        let pmix_tmpdir = self.cluster.config().mpi.pmix_tmpdir.clone();
+        let modex_connect_timeout_secs = self.cluster.config().mpi.modex_connect_timeout_secs;
+        let modex_fence_timeout_secs = self.cluster.config().mpi.modex_fence_timeout_secs;
+        let modex_verify_timeout_secs = self.cluster.config().mpi.modex_verify_timeout_secs;
+
+        struct NodeDispatch {
+            node_name: String,
+            agent_addr: String,
+            node_tasks: spur_core::task_launch::NodeStepTasks,
+        }
+
+        let mut dispatches = Vec::new();
+        let mut dispatch_errors = Vec::new();
+
+        for node_tasks in plan {
+            let node_name = match job.allocated_nodes.get(node_tasks.node_index as usize) {
+                Some(name) => name.clone(),
+                None => {
+                    dispatch_errors.push(format!(
+                        "step plan references node index {} but job {} has {} nodes",
+                        node_tasks.node_index,
+                        job_id,
+                        job.allocated_nodes.len()
+                    ));
+                    continue;
+                }
+            };
+            let Some(node) = self.cluster.get_node(&node_name) else {
+                dispatch_errors.push(format!("node {node_name} not found"));
+                continue;
+            };
+            let agent_addr = match node_comm_http_url(&node, &node_name) {
+                Ok(url) => url,
+                Err(e) => {
+                    dispatch_errors.push(format!("node {node_name}: {e}"));
+                    continue;
+                }
+            };
+            dispatches.push(NodeDispatch {
+                node_name,
+                agent_addr,
+                node_tasks,
+            });
+        }
+
+        if !dispatch_errors.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "srun step dispatch setup failed: {}",
+                dispatch_errors.join("; ")
+            )));
+        }
+
+        let pmix_peers = if mpi == MPI_PMIX {
+            Some(
+                spur_core::mpi::PmixStepPeers::from_participants(
+                    dispatches
+                        .iter()
+                        .map(|dispatch| dispatch.node_tasks.node_index)
+                        .collect(),
+                    |idx| {
+                        let name = job.allocated_nodes.get(idx as usize)?;
+                        self.cluster
+                            .get_node(name)
+                            .and_then(|n| n.comm_addr().map(str::to_string))
+                    },
+                )
+                .map_err(Status::failed_precondition)?,
+            )
+        } else {
+            None
+        };
+        let needs_pmix_prepare = pmix_peers.as_ref().is_some_and(|peers| {
+            step_needs_pmix_prepare(
+                peers.num_nodes,
+                job.spec.mpi.as_deref(),
+                job.allocated_nodes.len() as u32,
+                job.spec.script.as_deref(),
+            )
+        });
+        let run_attempt = job.run_attempt;
+
+        let dispatch_pmix_plans: Vec<Option<spur_proto::proto::PmixLaunchPlan>> =
+            if let Some(peers) = pmix_peers.as_ref() {
+                dispatches
+                    .iter()
+                    .map(|node_dispatch| {
+                        let local = spur_core::mpi::pmix_local_dispatch_for_step(
+                            peers,
+                            node_dispatch.node_tasks.node_index,
+                            job_id,
+                            step_num_tasks,
+                            node_dispatch.node_tasks.task_offset,
+                            node_dispatch.node_tasks.tasks_on_node,
+                            pmix_tmpdir.clone(),
+                            uid,
+                            gid,
+                            modex_connect_timeout_secs,
+                            modex_fence_timeout_secs,
+                            modex_verify_timeout_secs,
+                        )
+                        .map_err(Status::failed_precondition)?;
+                        spur_core::mpi::build_validated_pmix_plan_proto(mpi.as_str(), local)
+                            .map_err(Status::failed_precondition)?
+                            .ok_or_else(|| {
+                                Status::failed_precondition("job is not configured for PMIx")
+                            })
+                            .map(Some)
+                    })
+                    .collect::<Result<Vec<_>, Status>>()?
+            } else {
+                vec![None; dispatches.len()]
+            };
+
+        let mut pmix_prepare_guard = None;
+
+        if needs_pmix_prepare {
+            if let Some(detail) = pmix_dispatch::multi_node_pmix_unsupported(
+                dispatches.iter().filter_map(|dispatch| {
+                    self.cluster
+                        .get_node(&dispatch.node_name)
+                        .map(|node| node.source.clone())
+                }),
+            ) {
+                return Err(Status::failed_precondition(detail));
+            }
+
+            let prepare_nodes: Vec<PmixPrepareNode> = dispatches
+                .iter()
+                .zip(&dispatch_pmix_plans)
+                .map(|(node_dispatch, pmix_plan)| {
+                    Ok(PmixPrepareNode {
+                        node_name: node_dispatch.node_name.clone(),
+                        agent_addr: node_dispatch.agent_addr.clone(),
+                        pmix_plan: pmix_plan.clone().ok_or_else(|| {
+                            Status::failed_precondition("job is not configured for PMIx")
+                        })?,
+                    })
+                })
+                .collect::<Result<Vec<_>, Status>>()?;
+            if prepare_nodes.len() != dispatches.len() {
+                return Err(Status::failed_precondition(
+                    "multi-node PMIx step missing launch plan for one or more nodes",
+                ));
+            }
+            if let Err(detail) =
+                pmix_dispatch::prepare_pmix_on_nodes(job_id, run_attempt, prepare_nodes).await
+            {
+                return Err(Status::failed_precondition(format!(
+                    "PMIx prepare failed: {detail}"
+                )));
+            }
+            let addrs: Vec<String> = dispatches.iter().map(|d| d.agent_addr.clone()).collect();
+            pmix_prepare_guard = Some(pmix_dispatch::PmixPreparedReleaseGuard::new(job_id, addrs));
+        }
+
+        let mut set = tokio::task::JoinSet::new();
+        for (dispatch, pmix_plan) in dispatches.iter().zip(dispatch_pmix_plans) {
+            let node_name = dispatch.node_name.clone();
+            let agent_addr = dispatch.agent_addr.clone();
+            let node_tasks = dispatch.node_tasks.clone();
+            let command = command.clone();
+            let work_dir = work_dir.clone();
+            let environment = environment.clone();
+            let step_mpi = mpi.clone();
+            set.spawn(async move {
+                let mut agent = SlurmAgentClient::connect(agent_addr.clone())
+                    .await
+                    .map_err(|e| {
+                        Status::unavailable(format!("cannot reach agent at {}: {}", agent_addr, e))
+                    })?
+                    .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+                    .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
+
+                let agent_resp = agent
+                    .run_command(RunCommandRequest {
+                        command: command.clone(),
+                        uid,
+                        gid,
+                        work_dir: work_dir.clone(),
+                        environment: environment.clone(),
+                        job_id,
+                        num_tasks: node_tasks.tasks_on_node,
+                        task_offset: node_tasks.task_offset,
+                        step_id,
+                        step_num_tasks,
+                        label,
+                        pmix_plan,
+                        mpi: step_mpi.clone(),
+                        pmix_prepared: needs_pmix_prepare,
+                    })
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!("run_command on {} failed: {}", node_name, e))
+                    })?
+                    .into_inner();
+
+                Ok::<_, Status>((node_name, agent_resp))
+            });
+        }
+
+        let mut max_exit = 0i32;
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut ran_nodes = Vec::new();
+        let step_node_names: Vec<String> = dispatches.iter().map(|d| d.node_name.clone()).collect();
+        let mut step_abort_sent = false;
+
+        while let Some(result) = set.join_next().await {
+            match result {
+                Ok(Ok((node_name, agent_resp))) => {
+                    max_exit = max_exit.max(agent_resp.exit_code);
+                    stdout.push_str(&agent_resp.stdout);
+                    stderr.push_str(&agent_resp.stderr);
+                    ran_nodes.push(node_name);
+                }
+                Ok(Err(e)) => {
+                    warn!(job_id, step_id, error = %e, "step dispatch failed on one node");
+                    dispatch_errors.push(e.to_string());
+                    max_exit = max_exit.max(1);
+                    if !step_abort_sent {
+                        step_abort_sent = true;
+                        crate::scheduler_loop::cancel_step_on_nodes(
+                            &self.cluster,
+                            job_id,
+                            step_id,
+                            &step_node_names,
+                            15,
+                        )
+                        .await;
+                    }
+                }
+                Err(e) => {
+                    warn!(job_id, step_id, error = %e, "step dispatch task panicked");
+                    dispatch_errors.push(format!("step dispatch task panicked: {e}"));
+                    max_exit = max_exit.max(1);
+                    if !step_abort_sent {
+                        step_abort_sent = true;
+                        crate::scheduler_loop::cancel_step_on_nodes(
+                            &self.cluster,
+                            job_id,
+                            step_id,
+                            &step_node_names,
+                            15,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+
+        if !dispatch_errors.is_empty() {
+            max_exit = max_exit.max(1);
+            stderr.push_str(&format!(
+                "srun step dispatch errors:\n{}\n",
+                dispatch_errors.join("\n")
+            ));
+        }
+
+        if needs_pmix_prepare {
+            if let Some(guard) = pmix_prepare_guard.as_mut() {
+                guard.disarm();
+            }
+            let addrs: Vec<String> = dispatches.iter().map(|d| d.agent_addr.clone()).collect();
+            pmix_dispatch::release_pmix_on_agents(&addrs, job_id).await;
+        }
+
+        if let Err(e) = self.cluster.record_step_complete(job_id, step_id, max_exit) {
             warn!(
-                job_id = req.job_id,
-                step_id = req.step_id,
+                job_id,
+                step_id,
                 error = %e,
                 "failed to record step completion"
             );
         }
 
         Ok(Response::new(RunStepResponse {
-            exit_code: agent_resp.exit_code,
-            stdout: agent_resp.stdout,
-            stderr: agent_resp.stderr,
-            node: node_name,
+            exit_code: max_exit,
+            stdout,
+            stderr,
+            node: ran_nodes.join(","),
         }))
+    }
+
+    // -- Native cluster (k0s) lifecycle. Leader-gated; record intent in the
+    //    replicated k0s state and let the reconcile loop (cluster_k8s.rs) converge in 5b/5c. --
+    async fn cluster_up(
+        &self,
+        request: Request<ClusterUpRequest>,
+    ) -> Result<Response<ClusterUpResponse>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            match self.leader_proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.cluster_up(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward cluster_up to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+        let req = request.into_inner();
+        if !is_k0s_admin(self.cluster.association_cache(), &req.caller) {
+            return Err(Status::permission_denied(
+                "k0s cluster up requires cluster admin",
+            ));
+        }
+        let state = self.cluster.k0s_state();
+        let nodes = self.cluster.get_nodes();
+        let assigned = nodes.iter().any(|n| n.k0s_role.is_some());
+
+        // Resolve the HA control-plane set fail-closed BEFORE recording intent: an explicit node
+        // list wins, else `--replicas` (or the config default) picks the lowest-named nodes.
+        let candidates: Vec<String> = nodes.into_iter().map(|n| n.name).collect();
+        let explicit_override =
+            !req.control_plane_nodes.is_empty() || req.control_plane_replicas.is_some();
+        let replicas = req
+            .control_plane_replicas
+            .filter(|r| *r > 0)
+            .unwrap_or(self.control_plane_replicas);
+        let pinned = req
+            .control_plane_node
+            .clone()
+            .or_else(|| state.control_plane_node.clone());
+        // A bare re-up of an assigned cluster targets the recorded set, so it stays idempotent
+        // regardless of the config default; an explicit list/replica count is resolved and enforced.
+        let cp_set = if assigned && !explicit_override {
+            state.controllers()
+        } else {
+            crate::cluster_k8s::resolve_control_plane_set(
+                candidates,
+                &req.control_plane_nodes,
+                pinned.as_deref(),
+                replicas,
+            )
+            .map_err(Status::invalid_argument)?
+        };
+
+        // A control-plane change after roles are assigned would leave an inconsistent topology
+        // (provisioning skips assigned nodes); require `spur k8s down --reset` to re-elect.
+        if assigned {
+            let mut current = state.controllers();
+            let mut want = cp_set.clone();
+            current.sort();
+            want.sort();
+            if current != want {
+                return Err(Status::failed_precondition(format!(
+                    "control plane is already assigned ({}); tear the cluster down \
+                     (spur k8s down --reset) before changing it to [{}]",
+                    state.controllers().join(", "),
+                    cp_set.join(", "),
+                )));
+            }
+        }
+
+        let bootstrap = cp_set.first().cloned();
+        self.cluster
+            .set_k0s_phase(
+                spur_core::k0s::K0sPhase::Provisioning,
+                bootstrap,
+                cp_set,
+                false,
+            )
+            .map_err(|e| Status::internal(format!("set k0s phase: {e}")))?;
+        Ok(Response::new(ClusterUpResponse {
+            accepted: true,
+            message: "k0s cluster provisioning requested".to_string(),
+            nodes: crate::cluster_k8s::node_statuses(&self.cluster),
+        }))
+    }
+
+    async fn cluster_down(
+        &self,
+        request: Request<ClusterDownRequest>,
+    ) -> Result<Response<ClusterDownResponse>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            match self.leader_proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.cluster_down(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward cluster_down to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+        let req = request.into_inner();
+        if !is_k0s_admin(self.cluster.association_cache(), &req.caller) {
+            return Err(Status::permission_denied(
+                "k0s cluster down requires cluster admin",
+            ));
+        }
+        self.cluster
+            .set_k0s_phase(spur_core::k0s::K0sPhase::Down, None, Vec::new(), req.reset)
+            .map_err(|e| Status::internal(format!("set k0s phase: {e}")))?;
+        Ok(Response::new(ClusterDownResponse {
+            accepted: true,
+            message: "k0s cluster teardown requested".to_string(),
+        }))
+    }
+
+    async fn cluster_status(
+        &self,
+        request: Request<ClusterStatusRequest>,
+    ) -> Result<Response<ClusterStatusResponse>, Status> {
+        if self.check_leader(&request).is_err() {
+            let mut client = self.leader_proxy.get_leader_client().await?;
+            let mut fwd = Request::new(request.into_inner());
+            *fwd.metadata_mut() = Self::forwarded_metadata();
+            return client.cluster_status(fwd).await;
+        }
+        let state = self.cluster.k0s_state();
+        let control_plane_nodes = state.controllers();
+        Ok(Response::new(ClusterStatusResponse {
+            phase: crate::cluster_k8s::phase_str(state.phase),
+            control_plane_node: state.control_plane_node.unwrap_or_default(),
+            control_plane_nodes,
+            nodes: crate::cluster_k8s::live_node_statuses(&self.cluster).await,
+        }))
+    }
+
+    async fn cluster_kubeconfig(
+        &self,
+        request: Request<ClusterKubeconfigRequest>,
+    ) -> Result<Response<ClusterKubeconfigResponse>, Status> {
+        if self.check_leader(&request).is_err() {
+            let mut client = self.leader_proxy.get_leader_client().await?;
+            let mut fwd = Request::new(request.into_inner());
+            *fwd.metadata_mut() = Self::forwarded_metadata();
+            return client.cluster_kubeconfig(fwd).await;
+        }
+        let req = request.into_inner();
+        let is_admin = is_k0s_admin(self.cluster.association_cache(), &req.caller);
+
+        if req.admin {
+            if !is_admin {
+                return Err(Status::permission_denied(
+                    "the cluster-admin kubeconfig requires cluster admin",
+                ));
+            }
+            // Cluster-admin kubeconfig (`k0s kubeconfig admin` on the control-plane agent).
+            return match crate::cluster_k8s::fetch_admin_kubeconfig(&self.cluster).await {
+                Ok(kubeconfig) => Ok(Response::new(ClusterKubeconfigResponse { kubeconfig })),
+                Err(e) => Err(Status::unavailable(format!(
+                    "could not fetch admin kubeconfig from the control-plane agent: {e}"
+                ))),
+            };
+        }
+
+        // A non-admin caller may only mint their own scope; an admin may target any user. An empty
+        // target means "the caller's own namespace" (an empty caller is internal/root).
+        let target = if req.user.is_empty() {
+            req.caller.clone()
+        } else {
+            req.user.clone()
+        };
+        if !is_admin && target != req.caller {
+            return Err(Status::permission_denied(format!(
+                "user '{}' may only request their own kubeconfig",
+                req.caller
+            )));
+        }
+        if target.is_empty() {
+            return Err(Status::invalid_argument(
+                "no target user for the scoped kubeconfig; pass --user or set a caller identity",
+            ));
+        }
+
+        // Scoped kubeconfig: resolve the target's account -> its namespace + per-user ServiceAccount,
+        // then have the control-plane agent mint a bound token there.
+        let (namespace, sa) = resolve_user_namespace_sa(self.cluster.association_cache(), &target)?;
+        match crate::cluster_k8s::fetch_user_kubeconfig(&self.cluster, &target, &namespace, &sa)
+            .await
+        {
+            Ok(kubeconfig) => Ok(Response::new(ClusterKubeconfigResponse { kubeconfig })),
+            Err(e) => Err(Status::unavailable(format!(
+                "could not mint a scoped kubeconfig for user '{target}': {e}"
+            ))),
+        }
     }
 }
 
@@ -1468,7 +2556,8 @@ pub async fn serve(
     raft_handle: Arc<RaftHandle>,
     rpc_stats: Arc<RpcStatsCollector>,
     sched_stats: Arc<SchedStatsCollector>,
-    accounting_pool: Option<sqlx::PgPool>,
+    accounting_service: Option<crate::accounting::AccountingService>,
+    control_plane_replicas: u32,
 ) -> anyhow::Result<()> {
     let client_addrs: BTreeMap<u64, String> = raft_handle
         .peers
@@ -1485,6 +2574,8 @@ pub async fn serve(
 
     let leader_proxy = LeaderProxy::new(raft_handle.clone(), client_addrs.clone());
 
+    let jwt_key = resolve_startup_jwt_key(&cluster.config());
+
     let service = ControllerService {
         cluster,
         client_addrs,
@@ -1492,20 +2583,38 @@ pub async fn serve(
         leader_proxy,
         rpc_stats: rpc_stats.clone(),
         sched_stats: sched_stats.clone(),
+        control_plane_replicas,
+        jwt_key,
     };
 
     let stats_layer = RpcStatsLayer::new(rpc_stats, raft_handle);
 
     let mut builder = tonic::transport::Server::builder().layer(stats_layer);
 
-    let mut router = builder.add_service(SlurmControllerServer::new(service));
-    if let Some(pool) = accounting_pool {
-        router = router.add_service(crate::accounting::accounting_server(pool));
+    let mut router = builder.add_service(spur_proto::controller_server(service));
+    if let Some(service) = accounting_service {
+        router = router.add_service(crate::accounting::accounting_server(service));
     }
 
     router.serve(addr).await?;
 
     Ok(())
+}
+
+/// Resolve the target node for a job step. Empty = first allocated (legacy
+/// default); a named node must be one the job holds, else it targets outside it.
+fn select_step_node<'a>(allocated: &'a [String], requested: &str) -> Result<&'a str, String> {
+    if requested.is_empty() {
+        return allocated
+            .first()
+            .map(String::as_str)
+            .ok_or_else(|| "job has no allocated nodes".to_string());
+    }
+    allocated
+        .iter()
+        .find(|n| n.as_str() == requested)
+        .map(String::as_str)
+        .ok_or_else(|| format!("node {requested} is not allocated to this job"))
 }
 
 // ---- Proto conversion helpers ----
@@ -1518,7 +2627,11 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         gres.push(format!("license:{}", lic));
     }
 
-    Ok(spur_core::job::JobSpec {
+    let gpus = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus);
+    let gpus_per_node = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus_per_node);
+    let gpus_per_task = spur_core::gpu_request::GpuRequest::from_proto(spec.gpus_per_task);
+
+    let job_spec = spur_core::job::JobSpec {
         name: spec.name,
         partition: if spec.partition.is_empty() {
             None
@@ -1534,7 +2647,13 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         uid: spec.uid,
         gid: spec.gid,
         num_nodes: spec.num_nodes.max(1),
-        num_tasks: spec.num_tasks.max(1),
+        // 0 means the caller did not set ntasks: default to one task per node
+        // (Slurm's default) so it scales with num_nodes rather than collapsing.
+        num_tasks: if spec.num_tasks > 0 {
+            spec.num_tasks
+        } else {
+            spec.num_nodes.max(1)
+        },
         tasks_per_node: if spec.tasks_per_node > 0 {
             Some(spec.tasks_per_node)
         } else {
@@ -1552,12 +2671,16 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
             None
         },
         gres,
+        gpus,
+        gpus_per_node,
+        gpus_per_task,
         script: if spec.script.is_empty() {
             None
         } else {
             Some(spec.script)
         },
         argv: spec.argv,
+        script_args: spec.script_args,
         work_dir: if spec.work_dir.is_empty() {
             "/tmp".into()
         } else {
@@ -1641,6 +2764,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         exclusive: spec.exclusive,
         hold: spec.hold,
         interactive: spec.interactive,
+        srun_job: spec.srun_job,
         mail_type: spec.mail_type,
         mail_user: if spec.mail_user.is_empty() {
             None
@@ -1715,7 +2839,13 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         } else {
             Some(spec.open_mode)
         },
-    })
+        pty: spec.pty,
+    };
+
+    // GPU demand is validated in `Cluster::submit_job` after node-count
+    // normalization, so `-N4 -n1 --gpus=2` (valid once reduced to one node)
+    // is not rejected against the pre-normalization node count.
+    Ok(job_spec)
 }
 
 fn proto_to_resource_set(r: spur_proto::proto::ResourceSet) -> spur_core::resource::ResourceSet {
@@ -1752,7 +2882,7 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         partition: job.spec.partition.clone().unwrap_or_default(),
         account: job.spec.account.clone().unwrap_or_default(),
         state: job.state.to_proto_i32(),
-        state_reason: job.pending_reason.display().to_string(),
+        state_reason: job.state_reason(),
         submit_time: Some(datetime_to_proto(job.submit_time)),
         start_time: job.start_time.map(datetime_to_proto),
         end_time: job.end_time.map(datetime_to_proto),
@@ -1787,8 +2917,14 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         exit_code: job.exit_code.unwrap_or(0),
         exit_signal: job.exit_signal,
         derived_exit_code: job.derived_exit_code,
-        stdout_path: job.resolved_stdout(),
-        stderr_path: job.resolved_stderr(),
+        stdout_path: job
+            .actual_stdout_path
+            .clone()
+            .unwrap_or_else(|| job.resolved_stdout()),
+        stderr_path: job
+            .actual_stderr_path
+            .clone()
+            .unwrap_or_else(|| job.resolved_stderr()),
         stdin_path: job.resolved_stdin().unwrap_or_default(),
         resources: job.allocated_resources.as_ref().map(allocations_to_proto),
         priority: job.priority,
@@ -1796,6 +2932,42 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         array_job_id: job.spec.array_job_id.unwrap_or(0),
         array_task_id: job.spec.array_task_id.unwrap_or(0),
         reservation: job.spec.reservation.clone().unwrap_or_default(),
+        comment: job.spec.comment.clone().unwrap_or_default(),
+        srun_step_dispatch: job.srun_step_dispatch,
+        req_gpus: spur_core::job::effective_gpus(&job.spec, job.spec.num_nodes) as u32,
+        req_gpus_detail: requested_gpus_detail(&job.spec),
+    }
+}
+
+/// Human-readable summary of a job's GPU request for display.
+fn requested_gpus_detail(spec: &spur_core::job::JobSpec) -> String {
+    let ty = |t: Option<&str>| t.map(|t| format!("{t}:")).unwrap_or_default();
+
+    // Per-task form: render from the raw spec field (before resolution into PerNode).
+    if let Some(ref r) = spec.gpus_per_task {
+        return format!("gpu:{}{}/task", ty(r.gpu_type.as_deref()), r.count);
+    }
+
+    use spur_core::gpu_request::GpuDemand;
+    let Ok(demand) = spur_core::gpu_request::resolve_gpu_demand(spec) else {
+        return String::new();
+    };
+    match demand {
+        GpuDemand::None => String::new(),
+        GpuDemand::Total { count, gpu_type } => format!("gpu:{}{}", ty(gpu_type.as_deref()), count),
+        GpuDemand::PerNode { counts, gpu_type } => {
+            let first = counts.first().copied().unwrap_or(0);
+            if counts.iter().all(|&c| c == first) {
+                format!("gpu:{}{}/node", ty(gpu_type.as_deref()), first)
+            } else {
+                let list = counts
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("gpu:{}[{}]/node", ty(gpu_type.as_deref()), list)
+            }
+        }
     }
 }
 
@@ -1818,6 +2990,7 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         active_reservation: String::new(),
         labels: node.labels.clone(),
         reservation_maint: false,
+        features: node.features.clone(),
     }
 }
 
@@ -1845,6 +3018,7 @@ fn partition_to_proto(part: &spur_core::partition::Partition) -> PartitionInfo {
         allow_groups: part.allow_groups.join(","),
         allow_qos: part.allow_qos.join(","),
         deny_accounts: part.deny_accounts.join(","),
+        deny_qos: part.deny_qos.join(","),
         preempt_mode: format!("{:?}", part.preempt_mode),
         priority_tier: part.priority_tier,
     }
@@ -1993,6 +3167,7 @@ fn reservation_rpc_status(err: ReservationError) -> Status {
         ReservationError::InvalidArgument(m) => Status::invalid_argument(m),
         ReservationError::NotFound(m) => Status::not_found(m),
         ReservationError::AlreadyExists(m) => Status::already_exists(m),
+        ReservationError::PermissionDenied(m) => Status::permission_denied(m),
         ReservationError::Raft(m) => Status::internal(m),
     }
 }
@@ -2002,6 +3177,29 @@ fn submit_rpc_status(err: crate::cluster::SubmitError) -> Status {
         crate::cluster::SubmitError::InvalidArgument(m) => Status::invalid_argument(m),
         crate::cluster::SubmitError::Internal(m) => Status::internal(m),
     }
+}
+
+fn partition_rpc_status(err: PartitionError) -> Status {
+    match err {
+        PartitionError::InvalidArgument(m) => Status::invalid_argument(m),
+        PartitionError::NotFound(m) => Status::not_found(m),
+        PartitionError::AlreadyExists(m) => Status::already_exists(m),
+        PartitionError::Raft(m) => Status::internal(m),
+    }
+}
+
+/// Resolve an `UpdatePartitionRequest`'s max-nodes intent into the
+/// `(max_nodes, clear)` pair `ClusterManager::update_partition` expects.
+///
+/// `clear_max_nodes` and a literal `max_nodes_value == 0` both mean "no limit"
+/// (0 is documented as "clear limit" in the proto); neither can express a real
+/// 0-node cap. The two inputs must be collapsed into a single `clear` bool that
+/// is passed through — forwarding the raw request flag would drop a `--max-nodes
+/// 0` clear, since that arrives as `Some(0)` with the flag unset.
+fn resolve_max_nodes_update(max_nodes_value: Option<u32>, clear_flag: bool) -> (Option<u32>, bool) {
+    let clear = clear_flag || max_nodes_value == Some(0);
+    let max_nodes = if clear { None } else { max_nodes_value };
+    (max_nodes, clear)
 }
 
 fn cluster_err_to_status(err: anyhow::Error) -> Status {
@@ -2046,6 +3244,220 @@ mod tests {
     use tonic::Code;
 
     #[test]
+    fn resolve_registration_comm_addr_normalizes_explicit_ip() {
+        assert_eq!(
+            resolve_registration_comm_addr("10.0.0.2", "", false).unwrap(),
+            "10.0.0.2"
+        );
+    }
+
+    #[test]
+    fn resolve_registration_comm_addr_falls_back_to_peer_ip() {
+        assert_eq!(
+            resolve_registration_comm_addr("", "10.0.0.9", false).unwrap(),
+            "10.0.0.9"
+        );
+    }
+
+    #[test]
+    fn resolve_registration_comm_addr_prefers_peer_over_loopback_advertised() {
+        assert_eq!(
+            resolve_registration_comm_addr("127.0.0.1", "10.245.159.30", false).unwrap(),
+            "10.245.159.30"
+        );
+    }
+
+    #[test]
+    fn resolve_registration_comm_addr_rejects_loopback_when_configured() {
+        assert!(resolve_registration_comm_addr("127.0.0.1", "", true).is_err());
+    }
+
+    #[test]
+    fn resolve_registration_comm_addr_prefers_peer_when_rejecting_loopback() {
+        assert_eq!(
+            resolve_registration_comm_addr("127.0.0.1", "10.245.159.30", true).unwrap(),
+            "10.245.159.30"
+        );
+    }
+
+    #[test]
+    fn node_comm_http_url_brackets_ipv6() {
+        let mut node =
+            spur_core::node::Node::new("n1".into(), spur_core::resource::ResourceSet::default());
+        node.address = Some("2001:db8::1".into());
+        node.port = 6818;
+        assert_eq!(
+            node_comm_http_url(&node, "n1").unwrap(),
+            "http://[2001:db8::1]:6818"
+        );
+    }
+
+    #[test]
+    fn resolve_user_namespace_sa_fails_closed_on_cold_cache() {
+        // A not-yet-loaded cache resolves fail-open, so the scoped-kubeconfig path
+        // must reject rather than mint an unscoped (cluster-wide) token.
+        let cache = crate::association_cache::AssociationCache::new();
+        let err = resolve_user_namespace_sa(&cache, "alice").unwrap_err();
+        assert_eq!(err.code(), Code::Unavailable);
+    }
+
+    #[test]
+    fn resolve_user_namespace_sa_rejects_unassociated_user() {
+        let cache = crate::association_cache::AssociationCache::new();
+        cache.set_loaded_without_associations();
+        let err = resolve_user_namespace_sa(&cache, "alice").unwrap_err();
+        assert_eq!(err.code(), Code::NotFound);
+    }
+
+    #[test]
+    fn resolve_user_namespace_sa_derives_namespace_and_sa() {
+        let cache = crate::association_cache::AssociationCache::new();
+        cache.insert_default_account("alice", "physics");
+        let (namespace, sa) = resolve_user_namespace_sa(&cache, "alice").unwrap();
+        assert_eq!(namespace, "spur-acct-physics");
+        assert_eq!(sa, "spur-user-alice");
+    }
+
+    #[test]
+    fn is_k0s_admin_root_and_empty_always_admin_even_cold_cache() {
+        let cache = crate::association_cache::AssociationCache::new();
+        assert!(is_k0s_admin(&cache, ""));
+        assert!(is_k0s_admin(&cache, "root"));
+    }
+
+    #[test]
+    fn is_k0s_admin_named_user_denied_when_accounting_off() {
+        // Cold cache = accounting disabled/not loaded: only root/internal are admin.
+        let cache = crate::association_cache::AssociationCache::new();
+        assert!(!is_k0s_admin(&cache, "alice"));
+    }
+
+    #[test]
+    fn is_k0s_admin_honors_accounting_admin_level() {
+        let cache = crate::association_cache::AssociationCache::new();
+        cache.insert_admin_level("carol", "Admin");
+        cache.insert_admin_level("dave", "Operator");
+        assert!(is_k0s_admin(&cache, "carol"));
+        // Operator is not full admin; a plain member isn't either.
+        assert!(!is_k0s_admin(&cache, "dave"));
+        assert!(!is_k0s_admin(&cache, "erin"));
+    }
+
+    #[test]
+    fn read_forwards_only_when_follower_and_not_already_forwarded() {
+        // Leader serves reads locally; never forwards.
+        assert!(!read_forwarding_policy(true, false));
+        assert!(!read_forwarding_policy(true, true));
+        // Follower forwards a fresh read to the leader.
+        assert!(read_forwarding_policy(false, false));
+        // An already-forwarded read is served locally to avoid forward loops.
+        assert!(!read_forwarding_policy(false, true));
+    }
+
+    fn test_slurm_config() -> spur_core::config::SlurmConfig {
+        serde_json::from_str(r#"{"cluster_name":"test"}"#).unwrap()
+    }
+
+    /// A `ControllerService` on a node that can never elect a leader: three
+    /// unreachable peers mean no quorum, so `current_leader` stays `None`.
+    async fn no_leader_service(
+        cluster: Arc<crate::cluster::ClusterManager>,
+        dir: &std::path::Path,
+    ) -> ControllerService {
+        use crate::rpc_stats::RpcStatsCollector;
+        use crate::sched_stats::SchedStatsCollector;
+
+        let handle = crate::raft::start_raft(
+            1,
+            &[
+                "[::1]:0".to_string(),
+                "[::1]:0".to_string(),
+                "[::1]:0".to_string(),
+            ],
+            dir,
+            cluster.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!handle.is_leader());
+        assert_eq!(handle.current_leader(), None);
+
+        let raft = Arc::new(handle);
+        let client_addrs: BTreeMap<u64, String> = BTreeMap::new();
+        ControllerService {
+            cluster,
+            raft: raft.clone(),
+            leader_proxy: LeaderProxy::new(raft.clone(), client_addrs.clone()),
+            client_addrs,
+            rpc_stats: Arc::new(RpcStatsCollector::new()),
+            sched_stats: Arc::new(SchedStatsCollector::new("sched/backfill")),
+            control_plane_replicas: 1,
+            jwt_key: String::new(),
+        }
+    }
+
+    /// A non-leader that can't reach a leader must still answer reads
+    /// from local applied state, not fail with "no leader elected yet".
+    #[tokio::test]
+    async fn get_jobs_serves_locally_when_no_leader_elected() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::JobSpec;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+
+        // Mirrors a follower applying a committed entry, without a leader.
+        let spec = JobSpec {
+            name: "job-a".into(),
+            user: "alice".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+            cluster.as_ref(),
+            &WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(spec),
+            },
+        );
+
+        let service = no_leader_service(cluster, dir.path()).await;
+
+        let resp = service
+            .get_jobs(Request::new(GetJobsRequest::default()))
+            .await;
+        let jobs = resp
+            .expect("get_jobs must serve local state, not fail with 'no leader elected yet'")
+            .into_inner()
+            .jobs;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_id, 1);
+    }
+
+    /// The write side of the contract: with no leader, writes must fail rather
+    /// than fall back to local state — guards against a refactor extending the
+    /// read fallback to writes.
+    #[tokio::test]
+    async fn submit_job_fails_when_no_leader_elected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        let service = no_leader_service(cluster, dir.path()).await;
+
+        let status = service
+            .submit_job(Request::new(SubmitJobRequest::default()))
+            .await
+            .expect_err("submit_job must not serve locally when there is no leader");
+        assert_eq!(status.code(), Code::Unavailable);
+        assert_eq!(status.message(), "not the Raft leader");
+    }
+
+    #[test]
     fn submit_rpc_status_maps_invalid_argument() {
         use crate::cluster::SubmitError;
 
@@ -2054,12 +3466,912 @@ mod tests {
         assert_eq!(status.message(), "partition 'gpu' not found");
     }
 
+    /// Only a controller-terminal job is stale; Pending (mid-dispatch), Running,
+    /// and unknown ids are all spared.
+    #[tokio::test]
+    async fn stale_reported_jobs_selects_only_terminal_jobs() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState};
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+
+        let submit = |job_id: u32, name: &str| WalOperation::JobSubmit {
+            job_id,
+            spec: Box::new(JobSpec {
+                name: name.into(),
+                user: "alice".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            }),
+        };
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                cluster.as_ref(),
+                op,
+            );
+        };
+
+        // 10 Pending, 11 Running, 12 terminal, and the non-Running active states
+        // that must also be spared: 13 Completing, 14 Suspended, 15 Preempted.
+        apply(&submit(10, "pending"));
+        for id in [11, 12, 13, 14, 15] {
+            apply(&submit(id, "job"));
+        }
+
+        let res = spur_core::resource::ResourceAllocations {
+            cpus: 1,
+            memory_mb: 0,
+            devices: std::collections::HashMap::new(),
+        };
+        let mut per_node = std::collections::HashMap::new();
+        per_node.insert("n1".to_string(), res.clone());
+        for id in [11, 12, 13, 14, 15] {
+            apply(&WalOperation::job_start(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node.clone(),
+            ));
+            apply(&WalOperation::job_state_change(
+                id,
+                JobState::Pending,
+                JobState::Running,
+            ));
+        }
+        apply(&WalOperation::job_state_change(
+            12,
+            JobState::Running,
+            JobState::Cancelled,
+        ));
+        apply(&WalOperation::job_state_change(
+            13,
+            JobState::Running,
+            JobState::Completing,
+        ));
+        apply(&WalOperation::job_state_change(
+            14,
+            JobState::Running,
+            JobState::Suspended,
+        ));
+        apply(&WalOperation::job_state_change(
+            15,
+            JobState::Running,
+            JobState::Preempted,
+        ));
+
+        assert_eq!(cluster.job_state(10), Some(JobState::Pending));
+        assert_eq!(cluster.job_state(11), Some(JobState::Running));
+        assert!(cluster.job_state(12).unwrap().is_terminal());
+        assert_eq!(cluster.job_state(13), Some(JobState::Completing));
+        assert_eq!(cluster.job_state(14), Some(JobState::Suspended));
+        assert_eq!(cluster.job_state(15), Some(JobState::Preempted));
+
+        let reported: Vec<RunningJobStatus> = [10, 11, 12, 13, 14, 15, 999]
+            .into_iter()
+            .map(|job_id| RunningJobStatus {
+                job_id,
+                ..Default::default()
+            })
+            .collect();
+
+        let stale = stale_reported_jobs(&cluster, &reported);
+        assert_eq!(
+            stale,
+            vec![12],
+            "only the terminal job is reclaimed; Pending/Running/Completing/Suspended/Preempted/unknown are spared"
+        );
+    }
+
+    /// GATE: a job requeued (Timeout -> Pending) between the reclaim snapshot
+    /// and the spawned loop's send must fail the re-check, not just the snapshot.
+    #[tokio::test]
+    async fn is_still_terminal_false_after_requeue_race() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState};
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                cluster.as_ref(),
+                op,
+            );
+        };
+
+        apply(&WalOperation::JobSubmit {
+            job_id: 77,
+            spec: Box::new(JobSpec {
+                name: "interactive".into(),
+                user: "alice".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                requeue: true,
+                ..Default::default()
+            }),
+        });
+        let res = spur_core::resource::ResourceAllocations {
+            cpus: 1,
+            memory_mb: 0,
+            devices: std::collections::HashMap::new(),
+        };
+        let mut per_node = std::collections::HashMap::new();
+        per_node.insert("n1".to_string(), res.clone());
+        apply(&WalOperation::job_start(
+            77,
+            vec!["n1".into()],
+            res,
+            per_node,
+        ));
+        apply(&WalOperation::job_state_change(
+            77,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        apply(&WalOperation::job_state_change(
+            77,
+            JobState::Running,
+            JobState::Timeout,
+        ));
+        assert!(is_still_terminal(&cluster, 77), "snapshot sees Timeout");
+
+        // Concurrent requeue lands before the reclaim loop's re-check.
+        apply(&WalOperation::job_state_change(
+            77,
+            JobState::Timeout,
+            JobState::Pending,
+        ));
+
+        assert!(
+            !is_still_terminal(&cluster, 77),
+            "re-check must skip a job requeued since the snapshot"
+        );
+    }
+
+    /// GATE: `auth.jwt_key` is captured at startup and must NOT change on
+    /// `reconfigure`. Swapping it live would instantly invalidate every
+    /// outstanding node token. This drives the real capture path
+    /// (`resolve_startup_jwt_key`) and the real `reconfigure`, then proves the
+    /// running controller still verifies a token minted with the startup key.
+    #[tokio::test]
+    async fn reconfigure_does_not_adopt_new_jwt_key() {
+        use spur_core::admission::{generate_node_token, verify_node_token};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let conf_path = dir.path().join("spur.conf");
+        std::fs::write(
+            &conf_path,
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\njwt_key = \"old-secret\"\n",
+        )
+        .unwrap();
+
+        let config = spur_core::config::SlurmConfig::load_from_file(&conf_path).unwrap();
+        let cluster = Arc::new(
+            ClusterManager::new_with_config_path(config, dir.path(), Some(conf_path.clone()))
+                .unwrap(),
+        );
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cluster.clone())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .unwrap();
+        cluster.set_raft(handle.raft);
+
+        // The controller captures the signing key exactly here, at startup.
+        let startup_key = resolve_startup_jwt_key(&cluster.config());
+        assert_eq!(startup_key, "old-secret");
+        let token = generate_node_token("node-1", startup_key.as_bytes()).unwrap();
+
+        // Operator edits jwt_key and reconfigures.
+        std::fs::write(
+            &conf_path,
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\njwt_key = \"new-secret\"\n",
+        )
+        .unwrap();
+        cluster.reconfigure().unwrap();
+
+        // The live config reflects the new key (proving reconfigure did swap
+        // config)...
+        assert_eq!(
+            cluster.config().auth.jwt_key.as_deref(),
+            Some("new-secret"),
+            "reconfigure must swap the live config"
+        );
+        // ...but the controller's captured key is unchanged, so tokens minted
+        // with the startup key still verify. A live-reloaded key would reject
+        // this token.
+        assert_eq!(startup_key, "old-secret", "captured key must not change");
+        assert!(
+            verify_node_token(&token, startup_key.as_bytes()).is_ok(),
+            "outstanding node token must still verify against the startup key"
+        );
+        assert!(
+            verify_node_token(&token, b"new-secret").is_err(),
+            "sanity: the token would fail under the new key (proving the key matters)"
+        );
+    }
+
     #[test]
     fn submit_rpc_status_maps_internal() {
         use crate::cluster::SubmitError;
 
         let status = submit_rpc_status(SubmitError::internal("raft propose failed"));
         assert_eq!(status.code(), Code::Internal);
+    }
+
+    fn step_test_config() -> spur_core::config::SlurmConfig {
+        spur_core::config::SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n\
+             [controller]\nfirst_job_id = 1\n\
+             [[partitions]]\nname = \"default\"\ndefault = true\nnodes = \"ALL\"\n",
+        )
+        .unwrap()
+    }
+
+    async fn test_service(dir: &tempfile::TempDir) -> ControllerService {
+        use crate::cluster::ClusterManager;
+        let cluster =
+            std::sync::Arc::new(ClusterManager::new(step_test_config(), dir.path()).unwrap());
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cluster.clone())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .unwrap();
+        cluster.set_raft(handle.raft.clone());
+        let raft = std::sync::Arc::new(handle);
+        ControllerService {
+            cluster,
+            raft: raft.clone(),
+            leader_proxy: LeaderProxy::new(raft, BTreeMap::new()),
+            client_addrs: BTreeMap::new(),
+            rpc_stats: std::sync::Arc::new(RpcStatsCollector::new()),
+            sched_stats: std::sync::Arc::new(SchedStatsCollector::new("backfill")),
+            control_plane_replicas: 1,
+            jwt_key: String::new(),
+        }
+    }
+
+    // A step must NOT be created when the target node is allocated but unregistered: address
+    // resolution runs first and returns a retryable Unavailable, so the client's retries can't
+    // each leak a step.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_job_step_unregistered_target_creates_no_step() {
+        use spur_core::resource::{ResourceAllocations, ResourceSet};
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        svc.cluster
+            .register_node(
+                "n1".into(),
+                "n1".into(),
+                ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                std::collections::HashMap::new(),
+            )
+            .unwrap();
+        for _ in 0..200 {
+            if svc.cluster.get_node("n1").is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let mut spec = spur_core::job::JobSpec {
+            name: "leak".into(),
+            user: "u".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        spec.srun_job = true;
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
+        // Allocate to a real node plus a ghost node that is never registered.
+        let res = ResourceAllocations::with_scalar(2, 4000);
+        let per_node: std::collections::HashMap<_, _> = [
+            ("n1".to_string(), res.clone()),
+            ("ghost".to_string(), res.clone()),
+        ]
+        .into_iter()
+        .collect();
+        svc.cluster
+            .start_job(job_id, vec!["n1".into(), "ghost".into()], res, per_node)
+            .unwrap();
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).map(|j| j.state) == Some(JobState::Running) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let steps_before = svc.cluster.get_steps(job_id).len();
+        // Simulate the client's retry loop: each attempt returns retryable Unavailable and must
+        // leave the step count unchanged (the pre-fix bug created one step per attempt).
+        for _ in 0..5 {
+            let err = svc
+                .create_job_step(Request::new(CreateJobStepRequest {
+                    job_id,
+                    command: vec!["hostname".into()],
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    overlap: true,
+                    pty: true,
+                    winsize: None,
+                    node: "ghost".into(),
+                    user: "u".into(),
+                }))
+                .await
+                .expect_err("unregistered target must fail");
+            assert_eq!(err.code(), Code::Unavailable);
+        }
+        assert_eq!(
+            svc.cluster.get_steps(job_id).len(),
+            steps_before,
+            "no step should be created when the target node is unregistered"
+        );
+    }
+
+    // exec_in_job and create_job_step are what keep job_entry (backing
+    // exec_in_job and interactive_session/attach) and the step-dispatch path
+    // from ever reaching a node before its LaunchJob is confirmed: both
+    // reject here, before any node is even resolved, for a job that hasn't
+    // reached Running. Pin that both gates actually exist and fire, since
+    // confirm_dispatch_on_nodes closing the race for those RPCs depends on
+    // this check never being bypassed or accidentally dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_in_job_rejects_when_job_not_running() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let spec = spur_core::job::JobSpec {
+            name: "pending-exec".into(),
+            user: "u".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
+
+        let err = svc
+            .exec_in_job(Request::new(ExecInJobRequest {
+                job_id,
+                command: vec!["hostname".into()],
+                user: "u".into(),
+            }))
+            .await
+            .expect_err("a still-Pending job must not be exec'd into");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_job_step_rejects_when_job_not_running() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let mut spec = spur_core::job::JobSpec {
+            name: "pending-step".into(),
+            user: "u".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        spec.srun_job = true;
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
+
+        let err = svc
+            .create_job_step(Request::new(CreateJobStepRequest {
+                job_id,
+                command: vec!["hostname".into()],
+                user: "u".into(),
+                num_tasks: 1,
+                cpus_per_task: 1,
+                overlap: true,
+                pty: false,
+                winsize: None,
+                node: String::new(),
+            }))
+            .await
+            .expect_err("a still-Pending job must not accept a new step");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    /// Submit and start a single-node job owned by `owner`, returning its id.
+    async fn running_job_owned_by(svc: &ControllerService, owner: &str) -> u32 {
+        use spur_core::resource::{ResourceAllocations, ResourceSet};
+
+        svc.cluster
+            .register_node(
+                "n1".into(),
+                "n1".into(),
+                ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                std::collections::HashMap::new(),
+            )
+            .unwrap();
+        for _ in 0..200 {
+            if svc.cluster.get_node("n1").is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let spec = spur_core::job::JobSpec {
+            name: "owned".into(),
+            user: owner.into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
+
+        let res = ResourceAllocations::with_scalar(1, 1000);
+        let per_node: std::collections::HashMap<_, _> =
+            [("n1".to_string(), res.clone())].into_iter().collect();
+        svc.cluster
+            .start_job(job_id, vec!["n1".into()], res, per_node)
+            .unwrap();
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).map(|j| j.state) == Some(JobState::Running) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        job_id
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_in_job_denies_non_owner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let err = svc
+            .exec_in_job(Request::new(ExecInJobRequest {
+                job_id,
+                command: vec!["whoami".into()],
+                user: "rsikande".into(),
+            }))
+            .await
+            .expect_err("a non-owner must not exec inside another user's job");
+
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    /// A REST submission omitting `user` records no owner. Such a job runs as
+    /// root, so non-root users must be denied to prevent privilege escalation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_in_job_denies_non_root_on_empty_owner_job() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "").await;
+
+        let err = svc
+            .exec_in_job(Request::new(ExecInJobRequest {
+                job_id,
+                command: vec!["whoami".into()],
+                user: "alice".into(),
+            }))
+            .await
+            .expect_err("empty-owner jobs run as root; non-root must be denied");
+
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_job_step_denies_non_owner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let steps_before = svc.cluster.get_steps(job_id).len();
+        let err = svc
+            .create_job_step(Request::new(CreateJobStepRequest {
+                job_id,
+                command: vec!["bash".into()],
+                num_tasks: 1,
+                cpus_per_task: 1,
+                overlap: true,
+                pty: true,
+                winsize: None,
+                node: String::new(),
+                user: "rsikande".into(),
+            }))
+            .await
+            .expect_err("a non-owner must not attach to another user's job");
+
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert_eq!(
+            svc.cluster.get_steps(job_id).len(),
+            steps_before,
+            "a denied attach must not leave a step behind"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_job_step_allows_owner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let resp = svc
+            .create_job_step(Request::new(CreateJobStepRequest {
+                job_id,
+                command: vec!["bash".into()],
+                num_tasks: 1,
+                cpus_per_task: 1,
+                overlap: true,
+                pty: true,
+                winsize: None,
+                node: String::new(),
+                user: "ubuntu".into(),
+            }))
+            .await
+            .expect("the owner must be allowed to attach");
+
+        assert_eq!(resp.into_inner().node_addr, "127.0.0.1:6818");
+    }
+
+    async fn assign_ha_control_plane(svc: &ControllerService) {
+        use spur_core::k0s::{K0sPhase, K0sRole};
+        use spur_core::node::NodeSource;
+        for (i, name) in ["cp-a", "cp-b", "cp-c"].iter().enumerate() {
+            svc.cluster
+                .register_node(
+                    (*name).into(),
+                    (*name).into(),
+                    spur_core::resource::ResourceSet {
+                        cpus: 4,
+                        memory_mb: 8000,
+                        ..Default::default()
+                    },
+                    "127.0.0.1".into(),
+                    6818 + i as u16,
+                    String::new(),
+                    String::new(),
+                    NodeSource::NativeHost,
+                    std::collections::HashMap::new(),
+                )
+                .unwrap();
+            svc.cluster
+                .assign_node_k0s(
+                    name,
+                    K0sRole::Controller,
+                    &format!("10.44.0.{}", i + 1),
+                    "10.42.0.0/24",
+                )
+                .unwrap();
+        }
+        svc.cluster
+            .set_k0s_phase(
+                K0sPhase::Ready,
+                Some("cp-a".into()),
+                vec!["cp-a".into(), "cp-b".into(), "cp-c".into()],
+                false,
+            )
+            .unwrap();
+    }
+
+    // A bare `spur k8s up` (no flags) on an assigned 3-CP cluster is idempotent: it must target the
+    // recorded set, not re-resolve against the replicas=1 config default and spuriously reject.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_bare_reup_on_ha_cluster_is_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        assign_ha_control_plane(&svc).await;
+
+        let resp = svc
+            .cluster_up(Request::new(ClusterUpRequest::default()))
+            .await
+            .expect("bare re-up of an assigned HA cluster must be accepted")
+            .into_inner();
+        assert!(resp.accepted);
+    }
+
+    // An explicit replica count that doesn't match the assigned set is still rejected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_mismatched_replicas_on_ha_cluster_is_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        assign_ha_control_plane(&svc).await;
+
+        let err = svc
+            .cluster_up(Request::new(ClusterUpRequest {
+                control_plane_replicas: Some(1),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("shrinking an assigned 3-CP cluster must be rejected");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_denied_for_non_admin_caller() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .association_cache()
+            .insert_association("alice", "physics");
+        let err = svc
+            .cluster_up(Request::new(ClusterUpRequest {
+                caller: "alice".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a non-admin caller must not bring the cluster up");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_down_denied_for_non_admin_caller() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .association_cache()
+            .insert_association("alice", "physics");
+        let err = svc
+            .cluster_down(Request::new(ClusterDownRequest {
+                caller: "alice".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a non-admin caller must not tear the cluster down");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_allowed_for_admin_level_caller() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .register_node(
+                "cp-a".into(),
+                "cp-a".into(),
+                spur_core::resource::ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                std::collections::HashMap::new(),
+            )
+            .unwrap();
+        svc.cluster
+            .association_cache()
+            .insert_admin_level("carol", "Admin");
+        let resp = svc
+            .cluster_up(Request::new(ClusterUpRequest {
+                caller: "carol".into(),
+                control_plane_replicas: Some(1),
+                ..Default::default()
+            }))
+            .await
+            .expect("an Admin-level caller may bring the cluster up")
+            .into_inner();
+        assert!(resp.accepted);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_kubeconfig_admin_flag_denied_for_non_admin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .association_cache()
+            .insert_association("alice", "physics");
+        let err = svc
+            .cluster_kubeconfig(Request::new(ClusterKubeconfigRequest {
+                caller: "alice".into(),
+                admin: true,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a non-admin must not get the cluster-admin kubeconfig");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_kubeconfig_other_user_denied_for_non_admin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .association_cache()
+            .insert_default_account("alice", "physics");
+        let err = svc
+            .cluster_kubeconfig(Request::new(ClusterKubeconfigRequest {
+                caller: "alice".into(),
+                user: "bob".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a non-admin must not mint another user's kubeconfig");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_kubeconfig_bare_self_scope_clears_authz_for_non_admin() {
+        // A non-admin bare request (own scope) clears authz; the absent control-plane agent then
+        // yields Unavailable, never PermissionDenied/InvalidArgument.
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .association_cache()
+            .insert_default_account("alice", "physics");
+        let err = svc
+            .cluster_kubeconfig(Request::new(ClusterKubeconfigRequest {
+                caller: "alice".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("no control-plane agent is running in this test");
+        assert_eq!(err.code(), Code::Unavailable);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_kubeconfig_admin_may_target_other_user() {
+        // An Admin caller clears authz for another user's scope; failure is the absent agent
+        // (Unavailable), not PermissionDenied.
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let cache = svc.cluster.association_cache();
+        cache.insert_admin_level("carol", "Admin");
+        cache.insert_default_account("bob", "chem");
+        let err = svc
+            .cluster_kubeconfig(Request::new(ClusterKubeconfigRequest {
+                caller: "carol".into(),
+                user: "bob".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("no control-plane agent is running in this test");
+        assert_eq!(err.code(), Code::Unavailable);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_kubeconfig_admin_flag_allowed_for_admin_level_caller() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .association_cache()
+            .insert_admin_level("carol", "Admin");
+        let err = svc
+            .cluster_kubeconfig(Request::new(ClusterKubeconfigRequest {
+                caller: "carol".into(),
+                admin: true,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("no control-plane agent is running in this test");
+        assert_eq!(err.code(), Code::Unavailable);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_denied_for_named_caller_when_accounting_off() {
+        // Cold cache = accounting disabled: a named caller is not admin, so up fails closed.
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let err = svc
+            .cluster_up(Request::new(ClusterUpRequest {
+                caller: "alice".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a named caller must be denied when accounting is off");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[test]
+    fn select_step_node_empty_request_uses_first_allocated() {
+        let allocated = vec!["node001".to_string(), "node002".to_string()];
+        assert_eq!(select_step_node(&allocated, ""), Ok("node001"));
+    }
+
+    #[test]
+    fn select_step_node_named_request_targets_that_node() {
+        let allocated = vec!["node001".to_string(), "node002".to_string()];
+        assert_eq!(select_step_node(&allocated, "node002"), Ok("node002"));
+    }
+
+    #[test]
+    fn select_step_node_rejects_node_outside_allocation() {
+        let allocated = vec!["node001".to_string(), "node002".to_string()];
+        let err = select_step_node(&allocated, "node999").unwrap_err();
+        assert!(err.contains("node999"));
+        assert!(err.contains("not allocated"));
+    }
+
+    #[test]
+    fn select_step_node_empty_request_no_nodes_errors() {
+        let allocated: Vec<String> = Vec::new();
+        assert!(select_step_node(&allocated, "").is_err());
+    }
+
+    #[test]
+    fn select_step_node_rejects_comma_joined_request() {
+        let allocated = vec!["node001".to_string(), "node002".to_string()];
+        assert!(select_step_node(&allocated, "node001,node002").is_err());
+    }
+
+    #[test]
+    fn job_to_proto_output_path_prefers_actual_else_absolute_computed() {
+        use spur_core::job::{Job, JobSpec};
+
+        let mut job = Job::new(
+            42,
+            JobSpec {
+                work_dir: "/home/alice".into(),
+                ..Default::default()
+            },
+        );
+
+        // Unset: absolute computed fallback.
+        let info = job_to_proto(&job);
+        assert_eq!(info.stdout_path, "/home/alice/spur-42.out");
+        assert_eq!(info.stderr_path, "/home/alice/spur-42.out");
+
+        // Set: reported path wins.
+        job.actual_stdout_path = Some("/tmp/spur-42.out".into());
+        job.actual_stderr_path = Some("/tmp/spur-42.out".into());
+        let info = job_to_proto(&job);
+        assert_eq!(info.stdout_path, "/tmp/spur-42.out");
+        assert_eq!(info.stderr_path, "/tmp/spur-42.out");
+    }
+
+    #[test]
+    fn resolve_max_nodes_update_maps_intents() {
+        // `--max-nodes 0` (Some(0), flag unset) must resolve to a clear, not a
+        // silent no-op: cluster.rs only clears when the passed bool is true.
+        assert_eq!(resolve_max_nodes_update(Some(0), false), (None, true));
+        // Explicit clear flag, regardless of value.
+        assert_eq!(resolve_max_nodes_update(None, true), (None, true));
+        assert_eq!(resolve_max_nodes_update(Some(4), true), (None, true));
+        // A real positive cap is preserved and does not clear.
+        assert_eq!(resolve_max_nodes_update(Some(4), false), (Some(4), false));
+        // No value and no flag means "leave unchanged".
+        assert_eq!(resolve_max_nodes_update(None, false), (None, false));
     }
 
     fn make_node_info(name: &str) -> NodeInfo {
@@ -2084,6 +4396,7 @@ mod tests {
             accounts: Vec::new(),
             users: Vec::new(),
             flags: Default::default(),
+            owner: String::new(),
         }
     }
 
@@ -2092,6 +4405,16 @@ mod tests {
             spur_core::node::Node::new(name.into(), spur_core::resource::ResourceSet::default());
         n.partitions = vec![partition.into()];
         n
+    }
+
+    #[test]
+    fn node_info_includes_available_features() {
+        let mut node = core_node("gpu-node1", "gpu");
+        node.features = vec!["mi350x".into(), "atl".into()];
+
+        let info = node_to_proto(&node);
+
+        assert_eq!(info.features, ["mi350x", "atl"]);
     }
 
     fn names(pattern: &str) -> Option<HashSet<String>> {
@@ -2219,6 +4542,7 @@ mod tests {
                 overlap: true,
                 ..Default::default()
             },
+            owner: String::new(),
         };
         let maint = Reservation {
             name: "maint".into(),
@@ -2232,6 +4556,7 @@ mod tests {
                 overlap: true,
                 ..Default::default()
             },
+            owner: String::new(),
         };
         let reservations = vec![plain, maint];
         annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now());
@@ -2320,5 +4645,196 @@ mod tests {
         let err = validate_completion_report_state_for_rpc(JobState::Running, 0).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("invalid completion state"));
+    }
+
+    #[test]
+    fn requested_gpus_detail_per_task() {
+        use spur_core::gpu_request::GpuRequest;
+        use spur_core::job::JobSpec;
+
+        let spec = JobSpec {
+            num_nodes: 2,
+            num_tasks: 4,
+            cpus_per_task: 1,
+            gpus_per_task: Some(GpuRequest::new(2, None)),
+            ..Default::default()
+        };
+        assert_eq!(requested_gpus_detail(&spec), "gpu:2/task");
+    }
+
+    #[test]
+    fn requested_gpus_detail_per_task_typed() {
+        use spur_core::gpu_request::GpuRequest;
+        use spur_core::job::JobSpec;
+
+        let spec = JobSpec {
+            num_nodes: 2,
+            num_tasks: 4,
+            cpus_per_task: 1,
+            gpus_per_task: Some(GpuRequest::new(4, Some("mi300x".into()))),
+            ..Default::default()
+        };
+        assert_eq!(requested_gpus_detail(&spec), "gpu:mi300x:4/task");
+    }
+
+    #[test]
+    fn requested_gpus_detail_total() {
+        use spur_core::gpu_request::GpuRequest;
+        use spur_core::job::JobSpec;
+
+        let spec = JobSpec {
+            num_nodes: 2,
+            num_tasks: 2,
+            cpus_per_task: 1,
+            gpus: Some(GpuRequest::new(8, None)),
+            ..Default::default()
+        };
+        assert_eq!(requested_gpus_detail(&spec), "gpu:8");
+    }
+
+    #[test]
+    fn requested_gpus_detail_per_node() {
+        use spur_core::gpu_request::GpuRequest;
+        use spur_core::job::JobSpec;
+
+        let spec = JobSpec {
+            num_nodes: 2,
+            num_tasks: 2,
+            cpus_per_task: 1,
+            gpus_per_node: Some(GpuRequest::new(4, None)),
+            ..Default::default()
+        };
+        assert_eq!(requested_gpus_detail(&spec), "gpu:4/node");
+    }
+
+    #[test]
+    fn proto_to_job_spec_defaults_absent_ntasks_to_nodes() {
+        // C1: num_tasks=0 (unset over the wire) defaults to one task per node,
+        // not 1, so the node count is not silently collapsed.
+        let spec = spur_proto::proto::JobSpec {
+            num_nodes: 4,
+            num_tasks: 0,
+            ..Default::default()
+        };
+        let core = proto_to_job_spec(spec).unwrap();
+        assert_eq!(core.num_tasks, 4);
+        assert_eq!(core.effective_num_nodes(), 4);
+    }
+
+    #[test]
+    fn proto_to_job_spec_respects_explicit_single_task() {
+        // An explicit --ntasks=1 is preserved and reduces the job to one node.
+        let spec = spur_proto::proto::JobSpec {
+            num_nodes: 4,
+            num_tasks: 1,
+            ..Default::default()
+        };
+        let core = proto_to_job_spec(spec).unwrap();
+        assert_eq!(core.num_tasks, 1);
+        assert_eq!(core.effective_num_nodes(), 1);
+    }
+
+    #[test]
+    fn proto_to_job_spec_defers_gpu_validation() {
+        // C3: proto_to_job_spec no longer rejects -N4 -n1 --gpus=2. GPU demand
+        // is validated in submit_job against the normalized (1) node count.
+        let spec = spur_proto::proto::JobSpec {
+            num_nodes: 4,
+            num_tasks: 1,
+            gpus: Some(spur_proto::proto::GpuRequest {
+                count: 2,
+                gpu_type: String::new(),
+            }),
+            ..Default::default()
+        };
+        assert!(proto_to_job_spec(spec).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_reservations_filters_by_name() {
+        use spur_core::resource::ResourceSet;
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        for n in ["n1", "n2"] {
+            svc.cluster
+                .register_node(
+                    n.into(),
+                    n.into(),
+                    ResourceSet {
+                        cpus: 4,
+                        memory_mb: 8000,
+                        ..Default::default()
+                    },
+                    "127.0.0.1".into(),
+                    6818,
+                    String::new(),
+                    String::new(),
+                    spur_core::node::NodeSource::NativeHost,
+                    std::collections::HashMap::new(),
+                )
+                .unwrap();
+        }
+        for _ in 0..200 {
+            if svc.cluster.get_node("n1").is_some() && svc.cluster.get_node("n2").is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        for (name, node) in [("rocm_patch", "n1"), ("other_resv", "n2")] {
+            svc.create_reservation(Request::new(CreateReservationRequest {
+                name: name.into(),
+                start_time: "now".into(),
+                duration_minutes: 60,
+                nodes: vec![node.into()],
+                accounts: Vec::new(),
+                users: Vec::new(),
+                flags: Vec::new(),
+                user: String::new(),
+            }))
+            .await
+            .unwrap();
+        }
+
+        let one = svc
+            .list_reservations(Request::new(ListReservationsRequest {
+                name: "rocm_patch".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .reservations;
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].name, "rocm_patch");
+
+        let all = svc
+            .list_reservations(Request::new(ListReservationsRequest {
+                name: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .reservations;
+        assert_eq!(all.len(), 2);
+
+        // A whitespace-only name is trimmed to empty and treated as no filter.
+        let blank = svc
+            .list_reservations(Request::new(ListReservationsRequest { name: "   ".into() }))
+            .await
+            .unwrap()
+            .into_inner()
+            .reservations;
+        assert_eq!(blank.len(), 2);
+
+        let none = svc
+            .list_reservations(Request::new(ListReservationsRequest {
+                name: "does_not_exist".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .reservations;
+        assert!(none.is_empty());
     }
 }

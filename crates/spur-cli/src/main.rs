@@ -1,12 +1,19 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod env_defaults;
 mod exec;
 mod exit_fmt;
 mod format_engine;
 mod image;
+mod interactive;
+mod k8s;
+#[cfg(test)]
+mod mock_controller;
 mod net;
 mod node;
+mod nodelist;
+mod privilege;
 mod sacct;
 mod sacctmgr;
 mod salloc;
@@ -19,6 +26,7 @@ mod sdiag;
 mod sinfo;
 mod smd;
 mod sprio;
+mod spur_config;
 mod squeue;
 mod sreport;
 mod srun;
@@ -65,6 +73,20 @@ fn main() -> anyhow::Result<()> {
         let _ = signal(Signal::SIGPIPE, SigHandler::SigDfl);
     }
 
+    // Applies to every entry point (native `spur` and all Slurm-compatible
+    // symlinks alike), ahead of per-subcommand clap parsing that doesn't
+    // otherwise register -V/--version. Only the first argument is checked so
+    // that trailing args forwarded to a user program (srun, exec, scontrol
+    // update, sacctmgr, ...) can't be mistaken for this flag. Requiring no
+    // further arguments lets `spur -V --check`/`spur --version --check` fall
+    // through to the native dispatch below, where `--check` is handled.
+    if std::env::args_os().len() <= 2
+        && matches!(std::env::args_os().nth(1).as_deref(), Some(a) if a == "-V" || a == "--version")
+    {
+        println!("{}", spur_core::version::version_string());
+        std::process::exit(0);
+    }
+
     load_controller_addr_from_config();
 
     // Multi-call binary: dispatch based on argv[0] (symlink name).
@@ -98,6 +120,7 @@ fn main() -> anyhow::Result<()> {
         "smd" => return runtime.block_on(smd::main()),
         "net" => return runtime.block_on(net::main()),
         "node" => return runtime.block_on(node::main()),
+        "k8s" => return runtime.block_on(k8s::main()),
         "image" => return runtime.block_on(image::main()),
         "exec" => return runtime.block_on(exec::main()),
         "token" => return runtime.block_on(token::main()),
@@ -137,7 +160,7 @@ fn main() -> anyhow::Result<()> {
         "sbatch" | "srun" | "squeue" | "scancel" | "sinfo" | "sacct" | "sacctmgr" | "scontrol"
         | "sprio" | "sshare" | "sstat" | "sdiag" | "sreport" | "strigger" | "sattach"
         | "scrontab" | "smd" => Some(args[1].as_str()),
-        "net" | "node" | "image" | "exec" | "token" => Some(args[1].as_str()),
+        "net" | "node" | "k8s" | "image" | "exec" | "token" => Some(args[1].as_str()),
         _ => None,
     };
 
@@ -187,6 +210,7 @@ fn main() -> anyhow::Result<()> {
             "smd" | "health" | "monitor" => runtime.block_on(smd::main_with_args(rewritten)),
             "net" => runtime.block_on(net::main_with_args(rewritten)),
             "node" => runtime.block_on(node::main_with_args(rewritten)),
+            "k8s" => runtime.block_on(k8s::main_with_args(rewritten)),
             "image" => runtime.block_on(image::main_with_args(rewritten)),
             "exec" => runtime.block_on(exec::main_with_args(rewritten)),
             "token" => runtime.block_on(token::main_with_args(rewritten)),
@@ -197,7 +221,7 @@ fn main() -> anyhow::Result<()> {
 
     match args[1].as_str() {
         "version" | "--version" | "-V" => {
-            println!("spur {}", env!("CARGO_PKG_VERSION"));
+            println!("{}", spur_core::version::version_string());
             if args.len() > 2 && args[2] == "--check" {
                 runtime.block_on(async {
                     print!("Checking for updates... ");
@@ -258,6 +282,7 @@ fn print_usage() {
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  net         Manage WireGuard mesh network (init/join/status)");
+    eprintln!("  k8s         Manage the SPUR-provisioned k0s cluster (up/down/status/kubeconfig)");
     eprintln!("  image       Manage container images (import/list/remove)");
     eprintln!("  exec        Execute a command inside a running container job");
     eprintln!("  submit      Submit a batch job script");

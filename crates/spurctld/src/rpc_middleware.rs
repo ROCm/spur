@@ -182,6 +182,8 @@ mod tests {
                     allow_accounts: Vec::new(),
                     allow_groups: Vec::new(),
                     deny_accounts: Vec::new(),
+                    deny_qos: Vec::new(),
+                    allow_qos: Vec::new(),
                     priority_tier: 1,
                     preempt_mode: String::new(),
                 }],
@@ -189,6 +191,7 @@ mod tests {
                 network: Default::default(),
                 logging: Default::default(),
                 kubernetes: Default::default(),
+                cluster: Default::default(),
                 notifications: Default::default(),
                 power: Default::default(),
                 federation: Default::default(),
@@ -202,6 +205,8 @@ mod tests {
                 devices: Default::default(),
                 admission: Default::default(),
                 burst_buffer: Default::default(),
+                rlimits: Default::default(),
+                mpi: Default::default(),
             }
         }
 

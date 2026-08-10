@@ -297,7 +297,10 @@ pub async fn run(
     } else {
         format!("http://{}", controller_addr)
     };
-    let ctrl_client = SlurmControllerClient::connect(url).await?;
+    let ctrl_client = SlurmControllerClient::connect(url)
+        .await?
+        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+        .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE);
 
     let ctx = Arc::new(JobControllerCtx {
         client: client.clone(),
@@ -521,6 +524,9 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                     drain_node: false,
                     drain_reason: String::new(),
                     reporting_node,
+                    // K8s operator doesn't track run epochs; 0 disables the
+                    // controller-side staleness check for this report.
+                    run_attempt: 0,
                 };
                 if let Err(e) = ctrl.report_job_status(req).await {
                     error!(job_id, error = %e, "failed to report job status");
@@ -763,8 +769,12 @@ fn core_job_spec_to_proto(spec: &spur_core::job::JobSpec) -> spur_proto::proto::
         memory_per_node_mb: spec.memory_per_node_mb.unwrap_or(0),
         memory_per_cpu_mb: spec.memory_per_cpu_mb.unwrap_or(0),
         gres: spec.gres.clone(),
+        gpus: spec.gpus.as_ref().map(Into::into),
+        gpus_per_node: spec.gpus_per_node.as_ref().map(Into::into),
+        gpus_per_task: spec.gpus_per_task.as_ref().map(Into::into),
         script: spec.script.clone().unwrap_or_default(),
         argv: spec.argv.clone(),
+        script_args: spec.script_args.clone(),
         work_dir: spec.work_dir.clone(),
         stdout_path: spec.stdout_path.clone().unwrap_or_default(),
         stderr_path: spec.stderr_path.clone().unwrap_or_default(),
@@ -779,6 +789,9 @@ fn core_job_spec_to_proto(spec: &spur_core::job::JobSpec) -> spur_proto::proto::
             nanos: 0,
         }),
         qos: spec.qos.clone().unwrap_or_default(),
+        // Proto `priority` is non-optional; 0 encodes "unset", not a base
+        // priority of zero. The receiver decodes 0 back to `None`, which
+        // `Job::new` then resolves to the default.
         priority: spec.priority.unwrap_or(0),
         reservation: spec.reservation.clone().unwrap_or_default(),
         dependency: spec.dependency.clone(),
@@ -808,6 +821,7 @@ fn core_job_spec_to_proto(spec: &spur_core::job::JobSpec) -> spur_proto::proto::
         mail_type: Vec::new(),
         mail_user: String::new(),
         interactive: false,
+        srun_job: spec.srun_job,
         begin_time: spec.begin_time.map(|dt| prost_types::Timestamp {
             seconds: dt.timestamp(),
             nanos: dt.timestamp_subsec_nanos() as i32,
@@ -824,6 +838,8 @@ fn core_job_spec_to_proto(spec: &spur_core::job::JobSpec) -> spur_proto::proto::
         shm_size: spec.shm_size.clone().unwrap_or_default(),
         extra_resources: spec.extra_resources.clone(),
         open_mode: spec.open_mode.clone().unwrap_or_default(),
+        pty: spec.pty,
+        initial_winsize: None,
     }
 }
 

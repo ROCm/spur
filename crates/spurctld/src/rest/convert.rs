@@ -14,7 +14,7 @@ pub fn job_to_json(job: &Job) -> serde_json::Value {
         "partition": job.spec.partition,
         "account": job.spec.account,
         "job_state": job.state.display(),
-        "state_reason": job.pending_reason.display(),
+        "state_reason": job.state_reason(),
         "submit_time": job.submit_time.timestamp(),
         "start_time": job.start_time.map(|t| t.timestamp()),
         "end_time": job.end_time.map(|t| t.timestamp()),

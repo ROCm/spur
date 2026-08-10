@@ -50,7 +50,7 @@ mod tests {
 
     #[test]
     fn t21_4_tres_parse() {
-        let rec = TresRecord::parse("cpu=128,mem=512000,gres/gpu=8");
+        let rec = TresRecord::parse("cpu=128,mem=512000,gres/gpu=8").unwrap();
         assert_eq!(rec.get(TresType::Cpu), 128);
         assert_eq!(rec.get(TresType::Memory), 512000);
         assert_eq!(rec.get(TresType::Gpu), 8);
@@ -61,7 +61,7 @@ mod tests {
         let mut orig = TresRecord::new();
         orig.set(TresType::Cpu, 32);
         orig.set(TresType::Gpu, 4);
-        let parsed = TresRecord::parse(&orig.format());
+        let parsed = TresRecord::parse(&orig.format()).unwrap();
         assert_eq!(parsed.get(TresType::Cpu), 32);
         assert_eq!(parsed.get(TresType::Gpu), 4);
     }

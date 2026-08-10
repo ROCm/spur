@@ -112,7 +112,8 @@ mod tests {
     fn t50_15_path_resolve_job_id() {
         let mut job = make_job("train");
         job.job_id = 42;
-        assert_eq!(job.resolved_stdout(), "spur-42.out");
+        // Relative default is anchored to work_dir (/tmp), matching Slurm.
+        assert_eq!(job.resolved_stdout(), "/tmp/spur-42.out");
     }
 
     #[test]
@@ -121,7 +122,7 @@ mod tests {
         job.job_id = 42;
         job.spec.user = "bob".into();
         job.spec.stdout_path = Some("output-%x-%u-%j.log".into());
-        assert_eq!(job.resolved_stdout(), "output-train-bob-42.log");
+        assert_eq!(job.resolved_stdout(), "/tmp/output-train-bob-42.log");
     }
 
     #[test]
@@ -130,7 +131,7 @@ mod tests {
         job.job_id = 10;
         job.allocated_nodes = vec!["gpu001".into()];
         job.spec.stdout_path = Some("out-%N-%j.log".into());
-        assert_eq!(job.resolved_stdout(), "out-gpu001-10.log");
+        assert_eq!(job.resolved_stdout(), "/tmp/out-gpu001-10.log");
     }
 
     // ── T50.18: Job run time ──────────────────────────────────────
@@ -530,6 +531,14 @@ mod tests {
     // ── T50.50–52: Heterogeneous job fields ────────────────────
 
     #[test]
+    fn t50_49b_mpi_list_lines() {
+        let lines = spur_core::mpi::mpi_list_lines("/usr/lib/spur");
+        assert!(lines.iter().any(|l| l == "none"));
+        assert!(lines.iter().any(|l| l == "pmix"));
+        assert!(lines.iter().any(|l| l.contains("plugin_dir=/usr/lib/spur")));
+    }
+
+    #[test]
     fn t50_50_het_job_fields_default_none() {
         let job = make_job("het-test");
         assert!(job.het_job_id.is_none());
@@ -785,6 +794,7 @@ mod tests {
             users: vec!["alice".into()],
             accounts: Vec::new(),
             flags: Default::default(),
+            owner: String::new(),
         };
         // All fields must be mutable for an update to work.
         res.end_time = now + chrono::Duration::hours(8);
@@ -961,30 +971,99 @@ address = "http://peer-a:6817"
         let req = spur_proto::proto::ExecInJobRequest {
             job_id: 42,
             command: vec!["ls".into(), "-la".into()],
+            user: "alice".into(),
         };
         assert_eq!(req.job_id, 42);
         assert_eq!(req.command.len(), 2);
     }
 
-    // ── Issue #45: sattach interactive attach ─────────────────────
+    // ── Interactive session proto messages ────────────────────────
 
     #[test]
-    fn t50_92_attach_job_proto_messages_exist() {
-        // Issue #45: AttachJob bidirectional streaming RPC should exist
-        // with AttachJobInput and AttachJobOutput messages.
-        let input = spur_proto::proto::AttachJobInput {
-            job_id: 10,
-            data: b"ls\n".to_vec(),
+    fn t50_92_interactive_input_init_session() {
+        use std::collections::HashMap;
+        let msg = spur_proto::proto::InteractiveInput {
+            msg: Some(spur_proto::proto::interactive_input::Msg::Init(
+                spur_proto::proto::InitSession {
+                    job_id: 10,
+                    step_id: 0,
+                    overlap: true,
+                    pty: true,
+                    winsize: Some(spur_proto::proto::WindowSize {
+                        rows: 24,
+                        cols: 80,
+                        xpixel: 0,
+                        ypixel: 0,
+                    }),
+                    argv: vec!["/bin/bash".into()],
+                    env: HashMap::new(),
+                    user: "alice".into(),
+                },
+            )),
         };
-        assert_eq!(input.job_id, 10);
-        assert_eq!(input.data, b"ls\n");
+        match msg.msg.unwrap() {
+            spur_proto::proto::interactive_input::Msg::Init(init) => {
+                assert_eq!(init.job_id, 10);
+                assert!(init.overlap);
+                assert_eq!(init.winsize.unwrap().cols, 80);
+            }
+            _ => panic!("expected Init variant"),
+        }
+    }
 
-        let output = spur_proto::proto::AttachJobOutput {
-            data: b"hello\n".to_vec(),
-            eof: false,
+    #[test]
+    fn t50_92b_interactive_input_stdin_raw_bytes() {
+        let esc_seq = vec![0x1b, 0x5b, 0x41]; // ESC [ A (arrow up)
+        let msg = spur_proto::proto::InteractiveInput {
+            msg: Some(spur_proto::proto::interactive_input::Msg::Stdin(
+                esc_seq.clone(),
+            )),
         };
-        assert!(!output.eof);
-        assert_eq!(output.data, b"hello\n");
+        match msg.msg.unwrap() {
+            spur_proto::proto::interactive_input::Msg::Stdin(data) => {
+                assert_eq!(data, esc_seq);
+            }
+            _ => panic!("expected Stdin variant"),
+        }
+    }
+
+    #[test]
+    fn t50_92c_interactive_output_data_and_exit() {
+        let out = spur_proto::proto::InteractiveOutput {
+            msg: Some(spur_proto::proto::interactive_output::Msg::Data(
+                b"hello\r\n".to_vec(),
+            )),
+        };
+        match out.msg.unwrap() {
+            spur_proto::proto::interactive_output::Msg::Data(d) => {
+                assert_eq!(d, b"hello\r\n");
+            }
+            _ => panic!("expected Data variant"),
+        }
+
+        let exit = spur_proto::proto::InteractiveOutput {
+            msg: Some(spur_proto::proto::interactive_output::Msg::ExitStatus(42)),
+        };
+        match exit.msg.unwrap() {
+            spur_proto::proto::interactive_output::Msg::ExitStatus(code) => {
+                assert_eq!(code, 42);
+            }
+            _ => panic!("expected ExitStatus variant"),
+        }
+    }
+
+    #[test]
+    fn t50_92d_window_size_construction() {
+        let ws = spur_proto::proto::WindowSize {
+            rows: 50,
+            cols: 200,
+            xpixel: 1024,
+            ypixel: 768,
+        };
+        assert_eq!(ws.rows, 50);
+        assert_eq!(ws.cols, 200);
+        assert_eq!(ws.xpixel, 1024);
+        assert_eq!(ws.ypixel, 768);
     }
 
     // ── Issue #46: CLI reads config file for controller port ──────
@@ -1158,27 +1237,6 @@ address = "http://peer-a:6817"
                 assert!(expected.to_str().unwrap().contains(".spur/images"));
             }
         }
-    }
-
-    // ── Issue #54 (reopen): sattach buffer sizes ─────────────────
-
-    #[test]
-    fn t50_99_attach_job_messages_support_raw_bytes() {
-        // Issue #54: AttachJobInput should carry raw bytes (not just
-        // newline-terminated lines) for interactive use.
-        let input = spur_proto::proto::AttachJobInput {
-            job_id: 42,
-            data: vec![0x1b, 0x5b, 0x41], // ESC [ A (arrow up)
-        };
-        assert_eq!(input.data.len(), 3);
-        assert_eq!(input.data[0], 0x1b); // ESC byte
-
-        let output = spur_proto::proto::AttachJobOutput {
-            data: vec![0x1b, 0x5b, 0x48], // ESC [ H (cursor home)
-            eof: false,
-        };
-        assert_eq!(output.data.len(), 3);
-        assert!(!output.eof);
     }
 
     // ── Issue #53: CLI show dispatch ─────────────────────────────

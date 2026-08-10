@@ -10,6 +10,7 @@ and CLI wrappers for interacting with the running cluster.
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -119,7 +120,7 @@ class SshNode:
 
 
 def ensure_bins(nodes: list[SshNode], binaries_dir: str, bin_dir: str,
-                with_accounting: bool = False):
+                with_accounting: bool = False, with_mpi_plugin: bool = False):
     """
     Upload binaries to all nodes if not already present (or size differs).
     bin_dir is the remote directory where binaries are installed.
@@ -162,6 +163,25 @@ def ensure_bins(nodes: list[SshNode], binaries_dir: str, bin_dir: str,
     )
     for node in nodes:
         node.exec_allow_fail(symlink_cmd)
+
+    if with_mpi_plugin:
+        plugin_local = os.environ.get("SPUR_TEST_MPI_PLUGIN", "").strip()
+        if not plugin_local:
+            plugin_local = str(Path(binaries_dir).parent / "lib" / "spur" / "spur_mpi_pmix.so")
+            if not Path(plugin_local).is_file():
+                plugin_local = str(Path(binaries_dir) / "libspur_mpi_pmix.so")
+        plugin_path = Path(plugin_local)
+        if not plugin_path.is_file():
+            raise FileNotFoundError(
+                f"Missing MPI plugin: {plugin_path}\n"
+                "Build with: cargo build --release -p spur-mpi-pmix\n"
+                "Or set SPUR_TEST_MPI_PLUGIN"
+            )
+        remote_plugin_dir = str(Path(bin_dir).parent / "lib" / "spur")
+        for node in nodes:
+            node.exec(f"mkdir -p '{remote_plugin_dir}'")
+            remote_plugin = f"{remote_plugin_dir}/spur_mpi_pmix.so"
+            node.upload(str(plugin_path), remote_plugin)
 
     logger.info("Binaries ready at %s on all nodes", bin_dir)
 
@@ -346,8 +366,66 @@ class SpurCluster:
         cmd_parts.extend(f"'{a}'" for a in args[1:])
         return self.nodes[0].exec_allow_fail(" ".join(cmd_parts))
 
+    def cli_as_user(
+        self, run_as: str, args: list[str], controller_addr: str | None = None
+    ) -> str:
+        """Run a spur CLI command as a specific UNIX user via sudo, returning
+        stdout+stderr regardless of exit code.
+
+        Commands that carry an identity (reservation create/update/delete,
+        job cancel, ...) derive it from the invoking account (``whoami``), so
+        this is how a test exercises owner-vs-non-owner behavior end to end.
+        """
+        inner = [
+            f"SPUR_CONTROLLER_ADDR='{controller_addr or self.controller_addr}'",
+            f"PATH='{self.bin_dir}':$PATH",
+            f"'{self.bin_dir}/{args[0]}'",
+        ]
+        inner.extend(f"'{a}'" for a in args[1:])
+        cmd = f"{self._sudo_prefix()}-u '{run_as}' env {' '.join(inner)}"
+        return self.nodes[0].exec_allow_fail(cmd)
+
+    def cli_with_exit(
+        self, args: list[str], controller_addr: str | None = None
+    ) -> tuple[int, str]:
+        """Run a spur CLI command and return (exit_code, combined stdout+stderr)."""
+        cmd_parts = [
+            f"SPUR_CONTROLLER_ADDR='{controller_addr or self.controller_addr}'",
+            f"PATH='{self.bin_dir}':$PATH",
+            f"'{self.bin_dir}/{args[0]}'",
+        ]
+        cmd_parts.extend(f"'{a}'" for a in args[1:])
+        _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
+        code = stdout.channel.recv_exit_status()
+        return code, stdout.read().decode() + stderr.read().decode()
+
     def sbatch(self, args: list[str]) -> str:
         return self.cli(["sbatch"] + args)
+
+    def srun_with_exit(self, args: list[str]) -> tuple[int, str]:
+        """Run srun and return (exit_code, combined stdout+stderr)."""
+        cmd_parts = [
+            f"SPUR_CONTROLLER_ADDR={shlex.quote(self.controller_addr)}",
+            f"PATH={shlex.quote(self.bin_dir)}:$PATH",
+            shlex.quote(f"{self.bin_dir}/srun"),
+        ]
+        cmd_parts.extend(shlex.quote(a) for a in args)
+        _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
+        code = stdout.channel.recv_exit_status()
+        return code, stdout.read().decode() + stderr.read().decode()
+
+    def srun_in_allocation(self, job_id: int, args: list[str]) -> tuple[int, str]:
+        """Run srun inside an existing allocation (step mode, as after salloc)."""
+        cmd_parts = [
+            f"SPUR_JOB_ID={job_id}",
+            f"SPUR_CONTROLLER_ADDR={shlex.quote(self.controller_addr)}",
+            f"PATH={shlex.quote(self.bin_dir)}:$PATH",
+            shlex.quote(f"{self.bin_dir}/srun"),
+        ]
+        cmd_parts.extend(shlex.quote(a) for a in args)
+        _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
+        code = stdout.channel.recv_exit_status()
+        return code, stdout.read().decode() + stderr.read().decode()
 
     def squeue(self, args: list[str]) -> str:
         return self.cli(["squeue"] + args)
@@ -355,14 +433,120 @@ class SpurCluster:
     def squeue_all(self) -> str:
         return self.cli(["squeue", "-t", "all"])
 
+    def running_job_ids_by_name(self, name: str) -> list[int]:
+        """Return running job IDs matching *name* (uses server-side name filter)."""
+        out = self.squeue(["-n", name, "-t", "R", "-h", "-o", "%i"])
+        ids: list[int] = []
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ids.append(int(line.split()[0]))
+            except ValueError:
+                continue
+        return ids
+
     def sinfo(self) -> str:
         return self.cli(["sinfo"])
+
+    def sinfo_nodes(self, controller_addr: str | None = None) -> dict[str, str]:
+        """Map node name to state via node-oriented sinfo.
+
+        ``sinfo -N`` emits one line per node with the full, uncompressed name,
+        so this is agnostic to NODELIST hostlist compression (``node[1-4]``).
+        The state is the short form (idle/mix/alloc/down/drain/resv), with any
+        trailing ``*`` (non-responding marker) stripped.
+
+        *controller_addr* overrides the endpoint(s) as in :meth:`cli`.
+        """
+        out = self.cli(["sinfo", "-N", "-h", "-o", "%N %t"],
+                       controller_addr=controller_addr)
+        states: dict[str, str] = {}
+        for line in out.splitlines():
+            fields = line.split()
+            if len(fields) >= 2:
+                states[fields[0]] = fields[1].rstrip("*")
+        return states
+
+    def nodes_in_partition(self, partition: str) -> set[str]:
+        """Return the set of node names belonging to *partition*.
+
+        Uses node-oriented sinfo so membership is exact even when the default
+        output would compress several nodes into one bracketed hostlist. A node
+        in multiple partitions appears once per partition. The partition name
+        carries a trailing ``*`` when it is the default, so that is stripped.
+        """
+        out = self.cli(["sinfo", "-N", "-h", "-o", "%N %P"])
+        members: set[str] = set()
+        for line in out.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and fields[1].rstrip("*") == partition:
+                members.add(fields[0])
+        return members
 
     def scancel(self, job_id: str) -> str:
         return self.cli(["scancel", job_id])
 
     def scontrol(self, *args: str) -> str:
         return self.cli(["scontrol"] + list(args))
+
+    # --- Native k0s cluster (spur k8s) wrappers ---
+
+    def k8s_up(self, args: list[str] | None = None) -> str:
+        # k0s up/down are admin-gated; run as root so they pass without accounting.
+        return self.cli_as_user("root", ["spur", "k8s", "up"] + (args or []))
+
+    def k8s_down(self, reset: bool = True) -> str:
+        extra = ["--reset"] if reset else []
+        return self.cli_as_user("root", ["spur", "k8s", "down"] + extra)
+
+    def k8s_status(self) -> str:
+        return self.cli(["spur", "k8s", "status"])
+
+    def k8s_control_planes(self) -> list[str]:
+        """Parse the control-plane node list from `spur k8s status`."""
+        for line in self.k8s_status().splitlines():
+            if line.startswith("control-plane:"):
+                names = line.split(":", 1)[1].strip()
+                return [n.strip() for n in names.split(",") if n.strip()]
+        return []
+
+    def k8s_active_controllers(self) -> list[str]:
+        """Node names whose `spur k8s status` row is role=controller/single and active."""
+        out = []
+        for line in self.k8s_status().splitlines():
+            fields = line.split()
+            if len(fields) >= 3 and fields[1] in ("controller", "single") and fields[2] == "active":
+                out.append(fields[0])
+        return out
+
+    def wait_k8s_phase(self, phase: str, timeout: int = 600) -> str:
+        """Poll `spur k8s status` until it reports the given phase."""
+        deadline = time.time() + timeout
+        last = ""
+        while time.time() < deadline:
+            last = self.k8s_status()
+            for line in last.splitlines():
+                if line.startswith("phase:") and line.split(":", 1)[1].strip() == phase:
+                    return last
+            time.sleep(5)
+        raise TimeoutError(f"k0s phase did not reach {phase} within {timeout}s:\n{last}")
+
+    def etcd_member_count(self) -> int:
+        """Ground-truth etcd quorum size via `k0s etcd member-list`. Runs on a control-plane node
+        (etcd only exists there; node 0 may be a worker since CPs are chosen by lexical order)."""
+        cps = set(self.k8s_control_planes())
+        for i, name in enumerate(self.node_names):
+            if name not in cps:
+                continue
+            out = self.nodes[i].exec_allow_fail(
+                f"{self._sudo_prefix()}k0s etcd member-list 2>/dev/null"
+            )
+            members = re.findall(r"https?://[^\"]+:2380", out)
+            if members:
+                return len(members)
+        return 0
 
     def sacct(self, args: list[str]) -> str:
         return self.cli(["sacct"] + args)
@@ -562,6 +746,66 @@ class SpurCluster:
                 pytest.skip(f"hipcc could not build {hip_filename} on {node.host}")
         return remote_bin
 
+    def mpi_preflight(self, min_nodes: int = 1):
+        """Skip unless MPI plugin, libpmix, and mpicc are available."""
+        missing = []
+        plugin_local = os.environ.get("SPUR_TEST_MPI_PLUGIN", "").strip()
+        if not plugin_local:
+            binaries_dir = os.environ.get(
+                "SPUR_TEST_BINARIES_DIR",
+                str(Path(__file__).resolve().parents[3] / "target" / "release"),
+            )
+            candidates = [
+                Path(binaries_dir).parent / "lib" / "spur" / "spur_mpi_pmix.so",
+                Path(binaries_dir) / "libspur_mpi_pmix.so",
+            ]
+            plugin_local = next((str(p) for p in candidates if p.is_file()), "")
+        if not plugin_local or not Path(plugin_local).is_file():
+            missing.append("spur_mpi_pmix.so (build -p spur-mpi-pmix or set SPUR_TEST_MPI_PLUGIN)")
+
+        if len(self.nodes) < min_nodes:
+            pytest.skip(
+                f"MPI tests require at least {min_nodes} node(s) "
+                f"(got {len(self.nodes)})"
+            )
+
+        for i, node in enumerate(self.nodes[:min_nodes]):
+            libpmix = node.exec_allow_fail(
+                "ldconfig -p 2>/dev/null | grep -q libpmix && echo OK || echo MISSING"
+            )
+            if "OK" not in libpmix:
+                missing.append(f"libpmix on {self.node_names[i]}")
+
+        mpicc = os.environ.get("SPUR_TEST_MPICC", "mpicc").strip() or "mpicc"
+        build_node = self.nodes[0]
+        mpicc_ok = build_node.exec_allow_fail(
+            f"command -v {shlex.quote(mpicc)} >/dev/null && echo OK || echo MISSING"
+        )
+        if "OK" not in mpicc_ok:
+            missing.append(f"{mpicc} on controller node {self.node_names[0]}")
+
+        if missing:
+            pytest.skip("MPI preflight failed: " + "; ".join(missing))
+
+    def compile_mpi_fixture(self, source_name: str = "hello_mpi.c") -> str:
+        """Ship and compile an MPI C fixture on all nodes. Returns remote binary path."""
+        self.mpi_preflight(1)
+        self.ship_fixture(source_name)
+        bin_name = source_name.rsplit(".", 1)[0]
+        remote_src = f"{self.remote_dir}/{source_name}"
+        remote_bin = f"{self.remote_dir}/{bin_name}"
+        mpicc = os.environ.get("SPUR_TEST_MPICC", "mpicc").strip() or "mpicc"
+        for node in self.nodes:
+            node.exec(
+                f"{shlex.quote(mpicc)} -o {shlex.quote(remote_bin)} {shlex.quote(remote_src)}"
+            )
+            if not node.exec_allow_fail(f"test -x '{remote_bin}' && echo OK").strip():
+                pytest.skip(f"{mpicc} could not build {source_name} on {node.host}")
+        return remote_bin
+
+    def mpi_plugin_dir(self) -> str:
+        return str(Path(self.bin_dir).parent / "lib" / "spur")
+
     def restart_agent(self, node_index: int = 0):
         """Restart spurd on one node without touching the controller."""
         node = self.nodes[node_index]
@@ -581,7 +825,8 @@ class SpurCluster:
         deadline = time.time() + 60
         while time.time() < deadline:
             try:
-                if all(n in self.sinfo() for n in self.node_names):
+                nodes = self.sinfo_nodes()
+                if all(n in nodes for n in self.node_names):
                     return
             except Exception:
                 pass
@@ -839,8 +1084,7 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                out = self.sinfo()
-                if self._cluster_is_ready(out):
+                if self._cluster_is_ready():
                     return
             except Exception:
                 pass
@@ -851,22 +1095,14 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
             f"sinfo output:\n{self.sinfo()}"
         )
 
-    def _cluster_is_ready(self, sinfo_output: str) -> bool:
-        for name in self.node_names:
-            if name not in sinfo_output:
-                return False
-        total_idle = 0
-        for line in sinfo_output.splitlines():
-            if "idle" not in line:
-                continue
-            fields = line.split()
-            for j, field in enumerate(fields):
-                if field == "idle" and j > 0:
-                    try:
-                        total_idle += int(fields[j - 1])
-                    except ValueError:
-                        pass
-        return total_idle >= len(self.node_names)
+    def _cluster_is_ready(self) -> bool:
+        states = self.sinfo_nodes()
+        if not all(name in states for name in self.node_names):
+            return False
+        idle = sum(
+            1 for name in self.node_names if states[name].startswith("idle")
+        )
+        return idle >= len(self.node_names)
 
 
 # --- Job helpers ---

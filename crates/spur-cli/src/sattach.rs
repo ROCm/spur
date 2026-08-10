@@ -4,8 +4,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
-use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
-use spur_proto::proto::{AttachJobInput, GetJobRequest, JobState, StreamJobOutputRequest};
+use spur_proto::proto::{GetJobRequest, JobState, StreamJobOutputRequest};
 use std::io::Write;
 
 /// Attach to a running job step's standard I/O.
@@ -50,7 +49,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
+    let mut client = spur_proto::controller_client(channel);
 
     // Look up the job to find which node it is running on
     let job = client
@@ -76,16 +75,13 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     // Connect to the first node's agent
     let first_node = nodelist.split(',').next().unwrap_or(nodelist).trim();
     let agent_addr = format!("http://{}:6818", first_node);
-    let mut agent = SlurmAgentClient::connect(agent_addr.clone())
-        .await
-        .context(format!("failed to connect to agent at {}", agent_addr))?;
+    let mut agent = crate::interactive::connect_agent(&agent_addr).await?;
 
     if args.output_only {
-        // Output-only mode: stream stdout/stderr without stdin
         stream_output_only(&mut agent, job_id, &args.output).await
     } else {
-        // Interactive mode: bidirectional stdin/stdout forwarding
-        interactive_attach(&mut agent, job_id).await
+        let exit_code = interactive_attach(&mut agent, job_id).await?;
+        std::process::exit(exit_code);
     }
 }
 
@@ -99,6 +95,7 @@ async fn stream_output_only(
         .stream_job_output(StreamJobOutputRequest {
             job_id,
             stream: stream_name.to_string(),
+            user: crate::interactive::current_user(),
         })
         .await
         .context("failed to start output stream")?
@@ -131,176 +128,17 @@ async fn stream_output_only(
     Ok(())
 }
 
-/// Interactive attach: bidirectional stdin/stdout forwarding via AttachJob RPC.
-///
-/// Issue #64 (reopen of #54):
-/// - Put terminal into raw mode so keystrokes are forwarded immediately
-///   (not buffered until newline by the kernel's line discipline)
-/// - Restore terminal on exit via Drop guard
-/// - Previous fix only switched to per-byte reads, but the terminal was still
-///   in canonical mode, so reads blocked on newline anyway
+/// Interactive attach via InteractiveSession RPC. Returns the remote exit code.
 async fn interactive_attach(
     agent: &mut SlurmAgentClient<tonic::transport::Channel>,
     job_id: u32,
-) -> Result<()> {
-    use tokio::io::AsyncReadExt;
-
-    // Enable raw mode on stdin so keystrokes are forwarded immediately.
-    // Save original termios to restore on exit (via Drop guard).
-    let _raw_guard = RawModeGuard::enter().ok(); // Non-fatal: if stdin isn't a TTY, continue in cooked mode
-
-    let (tx, rx) = tokio::sync::mpsc::channel::<AttachJobInput>(256);
-
-    // Send first message with job_id
-    tx.send(AttachJobInput {
-        job_id,
-        data: Vec::new(),
-    })
-    .await
-    .context("failed to send initial attach message")?;
-
-    // Spawn stdin reader task — reads raw bytes for interactive use
-    let tx_stdin = tx.clone();
-    tokio::spawn(async move {
-        let mut stdin = tokio::io::stdin();
-        let mut buf = vec![0u8; 4096];
-        loop {
-            match stdin.read(&mut buf).await {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    if tx_stdin
-                        .send(AttachJobInput {
-                            job_id,
-                            data: buf[..n].to_vec(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        drop(tx_stdin);
-    });
-
-    // Make the bidirectional streaming call
-    let response = agent
-        .attach_job(tokio_stream::wrappers::ReceiverStream::new(rx))
-        .await
-        .context("attach_job RPC failed")?;
-
-    let mut out_stream = response.into_inner();
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-
-    loop {
-        match out_stream.message().await {
-            Ok(Some(chunk)) => {
-                if chunk.eof {
-                    break;
-                }
-                if !chunk.data.is_empty() {
-                    let _ = handle.write_all(&chunk.data);
-                    let _ = handle.flush();
-                }
-            }
-            Ok(None) => break,
-            Err(e) => {
-                eprintln!("\r\nsattach: stream error: {}", e);
-                break;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// RAII guard that sets the terminal to raw mode and restores it on drop.
-///
-/// Raw mode disables the kernel's line discipline so that:
-/// - Keystrokes are forwarded immediately (no buffering until Enter)
-/// - Special keys (Ctrl-C, Ctrl-Z) are sent as bytes instead of signals
-/// - No local echo (the remote shell handles echo)
-///
-/// RAII guard that sets the terminal to raw mode and restores it on drop.
-pub(crate) struct RawModeGuard {
-    fd: i32,
-    original: libc::termios,
-}
-
-impl RawModeGuard {
-    /// Enter raw mode on stdin. Returns Err if stdin is not a TTY.
-    pub(crate) fn enter() -> Result<Self> {
-        use std::os::unix::io::AsRawFd;
-        Self::enter_on_fd(std::io::stdin().as_raw_fd())
-    }
-
-    /// Enter raw mode on a specific file descriptor.
-    /// Exposed for testing with explicit fds (pipes, ptys).
-    pub(crate) fn enter_on_fd(fd: i32) -> Result<Self> {
-        use std::mem::MaybeUninit;
-
-        // Check fd is a TTY
-        if unsafe { libc::isatty(fd) } != 1 {
-            anyhow::bail!("fd {} is not a TTY", fd);
-        }
-
-        // Save original termios
-        let mut original = MaybeUninit::<libc::termios>::uninit();
-        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
-            anyhow::bail!("tcgetattr failed");
-        }
-        let original = unsafe { original.assume_init() };
-
-        // Set raw mode
-        let mut raw = original;
-        unsafe { libc::cfmakeraw(&mut raw) };
-        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
-            anyhow::bail!("tcsetattr failed");
-        }
-
-        Ok(Self { fd, original })
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
-    }
+) -> Result<i32> {
+    let winsize = crate::interactive::get_terminal_size();
+    crate::interactive::run_interactive_session(agent, job_id, 0, Vec::new(), winsize, true).await
 }
 
 fn state_name(state: i32) -> &'static str {
     spur_core::job::JobState::from_proto_i32(state)
         .map(|s| s.display())
         .unwrap_or("UNKNOWN")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn raw_mode_fails_on_pipe() {
-        // Create a pipe — a non-TTY fd — and verify RawModeGuard::enter_on_fd
-        // returns Err. This tests the REAL RawModeGuard code, not a simulation.
-        // Works identically in CI, interactive terminal, and IDE.
-        let mut fds = [0i32; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let read_fd = fds[0];
-
-        let result = RawModeGuard::enter_on_fd(read_fd);
-        assert!(result.is_err(), "RawModeGuard should fail on a pipe fd");
-        let err_msg = format!("{}", result.err().unwrap());
-        assert!(
-            err_msg.contains("not a TTY"),
-            "error should mention TTY, got: {err_msg}"
-        );
-
-        unsafe {
-            libc::close(fds[0]);
-            libc::close(fds[1]);
-        }
-    }
 }

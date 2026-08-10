@@ -17,7 +17,8 @@ use spur_core::reservation::Reservation;
 /// Job placement constraints, parsed once and reused across all candidate nodes.
 pub struct NodePlacement<'a> {
     job: &'a Job,
-    /// Explicit `--nodelist` allow-list (expanded from hostlist), if any.
+    /// Expanded, deduplicated `--nodelist`, whose cardinality determines
+    /// whether the request is a candidate pool or an additive requirement.
     nodelist: Option<HashSet<String>>,
     /// `--exclude` deny-list (expanded from hostlist).
     exclude: HashSet<String>,
@@ -77,11 +78,24 @@ impl<'a> NodePlacement<'a> {
     /// Name-only check: no partition, feature, capacity, or state involved.
     pub fn allows_name(&self, name: &str) -> bool {
         if let Some(ref allowed) = self.nodelist {
-            if !allowed.contains(name) {
+            if !self.nodelist_is_additive() && !allowed.contains(name) {
                 return false;
             }
         }
         !self.exclude.contains(name)
+    }
+
+    pub fn nodelist_is_additive(&self) -> bool {
+        let Some(ref nodelist) = self.nodelist else {
+            return false;
+        };
+        (self.job.spec.num_nodes as usize).max(1) > nodelist.len()
+    }
+
+    pub fn is_listed(&self, name: &str) -> bool {
+        self.nodelist
+            .as_ref()
+            .is_some_and(|nodelist| nodelist.contains(name))
     }
 
     /// True if the node is in one of the job's requested partitions (or the job
@@ -114,6 +128,19 @@ impl<'a> NodePlacement<'a> {
     /// [`eligible`](Self::eligible) plus runtime state (schedulable,
     /// exclusive-idle), still ignoring free capacity.
     pub fn matches(&self, node: &Node, reservations: &[Reservation], now: DateTime<Utc>) -> bool {
+        // A node claimed by the managed k0s cluster is owned by the k8s
+        // scheduler; Spur must not also place jobs on it (no GPU double-booking).
+        !node.is_k0s_reserved() && self.matches_ignoring_k0s(node, reservations, now)
+    }
+
+    /// [`matches`](Self::matches) without the k0s-reservation gate, so the pending-reason
+    /// classifier can ask "would this node match if it weren't reserved for k0s?".
+    pub fn matches_ignoring_k0s(
+        &self,
+        node: &Node,
+        reservations: &[Reservation],
+        now: DateTime<Utc>,
+    ) -> bool {
         if !self.eligible(node, reservations, now) {
             return false;
         }
@@ -165,7 +192,7 @@ impl<'a> NodePlacement<'a> {
 /// Falls back to a plain comma-split if the pattern is malformed, so existing
 /// behaviour is preserved for simple comma-separated lists.
 pub fn expand_hostlist_or_split(pattern: &str) -> Vec<String> {
-    match spur_core::hostlist::expand(pattern) {
+    let names = match spur_core::hostlist::expand(pattern) {
         Ok(names) => names,
         Err(e) => {
             warn!(
@@ -175,7 +202,8 @@ pub fn expand_hostlist_or_split(pattern: &str) -> Vec<String> {
             );
             pattern.split(',').map(|s| s.trim().to_string()).collect()
         }
-    }
+    };
+    names.into_iter().filter(|name| !name.is_empty()).collect()
 }
 
 #[cfg(test)]
@@ -217,6 +245,42 @@ mod tests {
     }
 
     #[test]
+    fn k0s_reserved_node_is_not_a_scheduling_match() {
+        let job = job_with(base_spec());
+        let p = NodePlacement::new(&job);
+        let now = Utc::now();
+
+        let mut n = node("n1");
+        assert!(p.matches(&n, &[], now), "idle node should match");
+
+        n.k0s_role = Some(spur_core::k0s::K0sRole::Worker);
+        assert!(!p.matches(&n, &[], now), "k0s worker must not match");
+        // Placement identity is unchanged; only the runtime gate rejects it.
+        assert!(p.eligible(&n, &[], now));
+
+        n.k0s_role = None;
+        assert!(
+            p.matches(&n, &[], now),
+            "cleared role reverts to schedulable"
+        );
+    }
+
+    #[test]
+    fn k0s_controller_and_single_are_also_excluded() {
+        let job = job_with(base_spec());
+        let p = NodePlacement::new(&job);
+        let now = Utc::now();
+        for role in [
+            spur_core::k0s::K0sRole::Controller,
+            spur_core::k0s::K0sRole::Single,
+        ] {
+            let mut n = node("n1");
+            n.k0s_role = Some(role);
+            assert!(!p.matches(&n, &[], now), "{role:?} must be excluded");
+        }
+    }
+
+    #[test]
     fn malformed_hostlist_falls_back_to_comma_split() {
         // Reversed range is invalid; fallback returns the literal as one token.
         assert_eq!(
@@ -225,6 +289,21 @@ mod tests {
         );
         // Plain comma list is not a hostlist pattern; fallback splits it.
         assert_eq!(expand_hostlist_or_split("a,b,c"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn empty_hostlist_entries_are_ignored() {
+        assert_eq!(
+            expand_hostlist_or_split("node001,,node002,"),
+            vec!["node001", "node002"]
+        );
+
+        let job = job_with(JobSpec {
+            nodelist: Some("node001,".into()),
+            num_nodes: 2,
+            ..base_spec()
+        });
+        assert!(NodePlacement::new(&job).nodelist_is_additive());
     }
 
     #[test]
@@ -294,6 +373,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         assert!(!p.matches(&node("node001"), std::slice::from_ref(&res), now));
         assert!(p.matches(&node("node002"), &[res], now));

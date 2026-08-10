@@ -28,12 +28,15 @@ tokio-stream = "0.1"
 whoami = "2.1.1"
 nix = { workspace = true, features = ["user"] }
 libc = "0.2"
-flate2 = { workspace = true }
+crossterm = "0.29"
 tar = { workspace = true }
 shlex = "2"
 
 [dev-dependencies]
+flate2 = { workspace = true }
 serial_test = { workspace = true }
+tempfile = "3"
+zstd = { workspace = true }
 
 [lints]
 workspace = true

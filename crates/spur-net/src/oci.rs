@@ -11,15 +11,17 @@
 //! 1. Parse image reference (registry/repo:tag)
 //! 2. Authenticate (token-based for Docker Hub, anonymous for others)
 //! 3. Fetch manifest → list of layer digests
-//! 4. Download each layer (tar.gz blobs)
+//! 4. Download each layer blob
 //! 5. Extract layers in order to build rootfs
 //! 6. Pack rootfs into squashfs via mksquashfs
 
-use std::path::{Path, PathBuf};
+use std::{
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{bail, Context};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use flate2::read::GzDecoder;
 use reqwest::header::{ACCEPT, AUTHORIZATION};
 use serde::Deserialize;
 use tracing::{debug, info};
@@ -116,6 +118,36 @@ pub fn parse_image_ref(image: &str) -> ImageRef {
     }
 }
 
+impl ImageRef {
+    /// Canonical `registry/repository:tag` form.
+    ///
+    /// Equivalent references (`busybox`, `busybox:latest`, `docker://busybox`,
+    /// `docker.io/library/busybox:latest`) all normalize to the same string.
+    pub fn canonical(&self) -> String {
+        format!("{}/{}:{}", self.registry, self.repository, self.tag)
+    }
+}
+
+/// Canonical filename stem for an image reference.
+///
+/// Derives the on-disk name from the normalized `ImageRef` rather than the raw
+/// input string, so all equivalent references map to a single stored image.
+pub fn image_file_stem(image: &str) -> String {
+    sanitize_name(&parse_image_ref(image).canonical())
+}
+
+/// Render a stored filename stem back to a canonical image reference for display.
+///
+/// The last `+` is always the tag separator (canonical form guarantees a tag),
+/// and remaining `+` map back to `/`. Port-bearing registries lose the port
+/// colon (shown as `/`) since `sanitize_name` maps both `:` and `/` to `+`.
+pub fn display_name(stem: &str) -> String {
+    match stem.rsplit_once('+') {
+        Some((path, tag)) => format!("{}:{}", path.replace('+', "/"), tag),
+        None => stem.to_string(),
+    }
+}
+
 /// Pull an image from a registry and create a squashfs file.
 ///
 /// Returns the path to the squashfs file.
@@ -129,7 +161,7 @@ pub async fn pull_image(image: &str, output_dir: &Path, arch: &str) -> anyhow::R
         "pulling image"
     );
 
-    let sanitized = sanitize_name(image);
+    let sanitized = sanitize_name(&image_ref.canonical());
     let sqsh_path = output_dir.join(format!("{}.sqsh", sanitized));
     let arch_path = sqsh_path.with_extension("sqsh.arch");
 
@@ -371,10 +403,8 @@ async fn pull_and_extract(
     // Extract layers sequentially (order matters for whiteout files)
     for (i, (_, data)) in layer_data.iter().enumerate() {
         let media_type = &manifest.layers[i].media_type;
-        if media_type.contains("gzip") || manifest.layers[i].digest.starts_with("sha256:") {
-            extract_tar_gz(data, rootfs_dir)
-                .with_context(|| format!("failed to extract layer {}", i + 1))?;
-        }
+        extract_layer(data, Some(media_type), rootfs_dir)
+            .with_context(|| format!("failed to extract layer {}", i + 1))?;
     }
 
     Ok(())
@@ -628,42 +658,38 @@ async fn resolve_manifest_list(
     Ok(manifest)
 }
 
-/// Extract a gzipped tarball into a directory.
-fn extract_tar_gz(data: &[u8], dest: &Path) -> anyhow::Result<()> {
-    let decoder = GzDecoder::new(data);
-    let mut archive = tar::Archive::new(decoder);
+fn extract_layer(data: &[u8], media_type: Option<&str>, dest: &Path) -> anyhow::Result<()> {
+    extract_tar(crate::image_layer::decode(data, media_type)?, dest)
+}
+
+fn extract_tar(reader: impl Read, dest: &Path) -> anyhow::Result<()> {
+    let mut archive = tar::Archive::new(reader);
     archive.set_overwrite(true);
     // Unpack, ignoring permission errors (common in rootless)
     for entry in archive.entries()? {
-        match entry {
-            Ok(mut entry) => {
-                // Skip whiteout files (.wh.*) — used for layer deletion
-                let path = entry.path()?.to_path_buf();
-                let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
-                if filename.starts_with(".wh.") {
-                    // Whiteout: delete the corresponding file
-                    let target = if filename == ".wh..wh..opq" {
-                        // Opaque whiteout: directory should be empty
-                        // (skip for now — complex to handle)
-                        continue;
-                    } else {
-                        let real_name = filename.strip_prefix(".wh.").unwrap();
-                        dest.join(path.parent().unwrap_or(Path::new("")))
-                            .join(real_name)
-                    };
-                    let _ = std::fs::remove_file(&target);
-                    let _ = std::fs::remove_dir_all(&target);
-                    continue;
-                }
+        let mut entry = entry?;
+        // Skip whiteout files (.wh.*) — used for layer deletion
+        let path = entry.path()?.to_path_buf();
+        let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+        if filename.starts_with(".wh.") {
+            // Whiteout: delete the corresponding file
+            let target = if filename == ".wh..wh..opq" {
+                // Opaque whiteout: directory should be empty
+                // (skip for now — complex to handle)
+                continue;
+            } else {
+                let real_name = filename.strip_prefix(".wh.").unwrap_or(filename);
+                dest.join(path.parent().unwrap_or(Path::new("")))
+                    .join(real_name)
+            };
+            let _ = std::fs::remove_file(&target);
+            let _ = std::fs::remove_dir_all(&target);
+            continue;
+        }
 
-                if let Err(e) = entry.unpack_in(dest) {
-                    // Ignore permission errors on special files
-                    debug!(path = %path.display(), error = %e, "skipping entry");
-                }
-            }
-            Err(e) => {
-                debug!(error = %e, "skipping tar entry");
-            }
+        if let Err(e) = entry.unpack_in(dest) {
+            // Ignore permission errors on special files
+            debug!(path = %path.display(), error = %e, "skipping entry");
         }
     }
     Ok(())
@@ -688,6 +714,7 @@ pub fn sanitize_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use flate2::{write::GzEncoder, Compression};
 
     use super::*;
 
@@ -703,6 +730,127 @@ mod tests {
             }
         ]
     }"#;
+
+    fn tar_layer(path: &str, contents: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        let mut archive = tar::Builder::new(&mut data);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append_data(&mut header, path, contents).unwrap();
+        archive.finish().unwrap();
+        drop(archive);
+        data
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn extract_layer_supports_uncompressed_tar() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let layer = tar_layer("plain.txt", b"plain layer");
+
+        extract_layer(
+            &layer,
+            Some("application/vnd.oci.image.layer.v1.tar"),
+            rootfs.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(rootfs.path().join("plain.txt")).unwrap(),
+            b"plain layer"
+        );
+    }
+
+    #[test]
+    fn extract_layer_supports_gzip_tar() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let layer = gzip(&tar_layer("gzip.txt", b"gzip layer"));
+
+        extract_layer(
+            &layer,
+            Some("application/vnd.oci.image.layer.v1.tar+gzip"),
+            rootfs.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(rootfs.path().join("gzip.txt")).unwrap(),
+            b"gzip layer"
+        );
+    }
+
+    #[test]
+    fn extract_layer_supports_zstd_tar() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let layer =
+            zstd::stream::encode_all(tar_layer("zstd.txt", b"zstd layer").as_slice(), 0).unwrap();
+
+        extract_layer(
+            &layer,
+            Some("application/vnd.oci.image.layer.v1.tar+zstd"),
+            rootfs.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(rootfs.path().join("zstd.txt")).unwrap(),
+            b"zstd layer"
+        );
+    }
+
+    #[test]
+    fn extract_layer_applies_whiteout() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let removed = rootfs.path().join("nested/removed.txt");
+        let retained = rootfs.path().join("nested/retained.txt");
+        std::fs::create_dir_all(removed.parent().unwrap()).unwrap();
+        std::fs::write(&removed, b"remove me").unwrap();
+        std::fs::write(&retained, b"keep me").unwrap();
+        let layer = tar_layer("nested/.wh.removed.txt", b"");
+
+        extract_layer(
+            &layer,
+            Some("application/vnd.oci.image.layer.v1.tar"),
+            rootfs.path(),
+        )
+        .unwrap();
+
+        assert!(!removed.exists());
+        assert_eq!(std::fs::read(retained).unwrap(), b"keep me");
+        assert!(!rootfs.path().join("nested/.wh.removed.txt").exists());
+    }
+
+    #[test]
+    fn extract_layer_rejects_truncated_compressed_tar() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let contents: Vec<u8> = (0..65_536)
+            .scan(0x1234_5678_u32, |state, _| {
+                *state ^= *state << 13;
+                *state ^= *state >> 17;
+                *state ^= *state << 5;
+                Some(*state as u8)
+            })
+            .collect();
+        let mut layer =
+            zstd::stream::encode_all(tar_layer("data.bin", &contents).as_slice(), 0).unwrap();
+        layer.truncate(layer.len() / 2);
+
+        assert!(extract_layer(
+            &layer,
+            Some("application/vnd.oci.image.layer.v1.tar+zstd"),
+            rootfs.path(),
+        )
+        .is_err());
+    }
 
     #[test]
     fn test_decode_registry_auth_b64_valid() {
@@ -844,6 +992,63 @@ mod tests {
         );
         assert_eq!(registry_base_url("ghcr.io"), "https://ghcr.io");
         assert_eq!(registry_base_url("localhost:5000"), "http://localhost:5000");
+    }
+
+    #[test]
+    fn test_canonical_equivalent_refs_collapse() {
+        // All of these reference the same Docker Hub official image and must
+        // resolve to a single canonical name / filename stem.
+        let expected = "docker.io/library/busybox:latest";
+        for r in [
+            "busybox",
+            "busybox:latest",
+            "docker://busybox",
+            "docker://busybox:latest",
+            "docker.io/library/busybox:latest",
+        ] {
+            assert_eq!(parse_image_ref(r).canonical(), expected, "ref: {}", r);
+            assert_eq!(
+                image_file_stem(r),
+                "docker.io+library+busybox+latest",
+                "ref: {}",
+                r
+            );
+        }
+    }
+
+    #[test]
+    fn test_canonical_custom_registry() {
+        assert_eq!(
+            parse_image_ref("nvcr.io/nvidia/pytorch:24.01").canonical(),
+            "nvcr.io/nvidia/pytorch:24.01"
+        );
+        assert_eq!(
+            image_file_stem("nvcr.io/nvidia/pytorch:24.01"),
+            "nvcr.io+nvidia+pytorch+24.01"
+        );
+    }
+
+    #[test]
+    fn test_canonical_port_bearing_registry() {
+        let r = parse_image_ref("localhost:5000/myimage:dev");
+        assert_eq!(r.canonical(), "localhost:5000/myimage:dev");
+        assert_eq!(
+            image_file_stem("localhost:5000/myimage:dev"),
+            "localhost+5000+myimage+dev"
+        );
+    }
+
+    #[test]
+    fn test_display_name() {
+        assert_eq!(
+            display_name("docker.io+library+busybox+latest"),
+            "docker.io/library/busybox:latest"
+        );
+        assert_eq!(
+            display_name("nvcr.io+nvidia+pytorch+24.01"),
+            "nvcr.io/nvidia/pytorch:24.01"
+        );
+        assert_eq!(display_name("alpine"), "alpine");
     }
 
     #[test]

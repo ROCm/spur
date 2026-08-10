@@ -194,6 +194,16 @@ impl NodeState {
     pub fn to_proto_i32(self) -> i32 {
         self.to_proto() as i32
     }
+
+    /// Parse from a short sinfo suffix ("idle", "alloc", "mix") or full name
+    /// ("idle", "allocated", "mixed"). Case-insensitive.
+    pub fn from_short_or_name(s: &str) -> Option<Self> {
+        let lower = s.to_lowercase();
+        Self::ALL
+            .iter()
+            .find(|st| st.short() == lower || st.display() == lower)
+            .copied()
+    }
 }
 
 impl std::fmt::Display for NodeState {
@@ -213,10 +223,52 @@ pub enum NodeSource {
     Kubernetes { namespace: String },
 }
 
+/// `RegisterAgentRequest.version` sent by the spur-k8s operator.
+pub const K8S_OPERATOR_VERSION: &str = "spur-k8s-operator";
+
+/// Node label carrying the operator's Kubernetes namespace.
+pub const K8S_NAMESPACE_LABEL: &str = "spur.amd.com/k8s-namespace";
+
+/// Derive node source from agent registration metadata.
+pub fn node_source_from_registration(
+    version: &str,
+    labels: &HashMap<String, String>,
+) -> NodeSource {
+    if version == K8S_OPERATOR_VERSION {
+        NodeSource::Kubernetes {
+            namespace: labels
+                .get(K8S_NAMESPACE_LABEL)
+                .cloned()
+                .filter(|ns| !ns.is_empty())
+                .unwrap_or_else(|| "default".to_string()),
+        }
+    } else {
+        NodeSource::NativeHost
+    }
+}
+
+/// Apply WAL-stored source on replay; re-derive from registration metadata when the
+/// persisted value is the default (pre-source WAL entries and native agents).
+pub fn resolve_wal_node_source(
+    source: &NodeSource,
+    version: &str,
+    labels: &HashMap<String, String>,
+) -> NodeSource {
+    if matches!(source, NodeSource::NativeHost) {
+        node_source_from_registration(version, labels)
+    } else {
+        source.clone()
+    }
+}
+
 /// A compute node in the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
+    /// Cluster node name (NodeName): used by `-w`, partitions, and display.
     pub name: String,
+    /// OS hostname reported at agent registration (NodeHostname).
+    #[serde(default)]
+    pub hostname: String,
     pub state: NodeState,
     pub state_reason: Option<String>,
     /// When true, the current state was set by an operator (admin API, drain,
@@ -251,7 +303,7 @@ pub struct Node {
     pub agent_start_time: Option<DateTime<Utc>>,
     pub last_heartbeat: Option<DateTime<Utc>>,
 
-    /// Agent address for gRPC communication.
+    /// Routable comm address for agent gRPC and inter-node TCP (NodeAddr).
     pub address: Option<String>,
     /// Agent gRPC listen port.
     pub port: u16,
@@ -265,16 +317,29 @@ pub struct Node {
     /// Leaf switch this node belongs to (from topology config).
     #[serde(default)]
     pub switch_name: Option<String>,
+    /// Native k0s: role assigned to this node's spurd-owned unit.
+    #[serde(default)]
+    pub k0s_role: Option<crate::k0s::K0sRole>,
+    /// mesh IP allocated to this node for k0s (--node-ip / advertise address).
+    #[serde(default)]
+    pub k0s_mesh_ip: Option<String>,
+    /// per-node pod /24 carved from the cluster pod_cidr.
+    #[serde(default)]
+    pub k0s_pod_cidr: Option<String>,
 }
 
 fn default_weight() -> u32 {
-    1
+    Node::DEFAULT_WEIGHT
 }
 
 impl Node {
+    /// Default scheduling weight for a node with no matching `NodeConfig`.
+    pub const DEFAULT_WEIGHT: u32 = 1;
+
     pub fn new(name: String, resources: ResourceSet) -> Self {
         Self {
             name,
+            hostname: String::new(),
             state: NodeState::Unknown,
             state_reason: None,
             admin_locked: false,
@@ -296,9 +361,20 @@ impl Node {
             port: 6818,
             wg_pubkey: None,
             version: None,
-            weight: 1,
+            weight: Self::DEFAULT_WEIGHT,
             switch_name: None,
+            k0s_role: None,
+            k0s_mesh_ip: None,
+            k0s_pod_cidr: None,
         }
+    }
+
+    /// Reset config-derived scheduling policy (features, weight) to defaults.
+    /// Used when a node no longer matches any `NodeConfig` so stale policy does
+    /// not persist. Keeps the "no match" state identical to a freshly created node.
+    pub fn reset_config_policy(&mut self) {
+        self.features.clear();
+        self.weight = Self::DEFAULT_WEIGHT;
     }
 
     /// Whether available inventory can satisfy a count-based request.
@@ -307,9 +383,25 @@ impl Node {
             .can_satisfy_with_allocated(&self.alloc_resources, request)
     }
 
+    /// Whether the node has any unallocated CPU headroom (a saturated node is full).
+    pub fn has_free_cpu_capacity(&self) -> bool {
+        !(self.alloc_resources.cpus >= self.total_resources.cpus && self.total_resources.cpus > 0)
+    }
+
     /// Whether this node can accept new work.
     pub fn is_schedulable(&self) -> bool {
         self.state.is_available()
+    }
+
+    /// Routable comm address (NodeAddr), when registered.
+    pub fn comm_addr(&self) -> Option<&str> {
+        self.address.as_deref()
+    }
+
+    /// True once `spur k8s up` has claimed this node for the managed k0s cluster.
+    /// Such nodes are owned by the k8s scheduler and must not also take Spur jobs.
+    pub fn is_k0s_reserved(&self) -> bool {
+        self.k0s_role.is_some()
     }
 
     /// Update state based on allocation level.
@@ -331,6 +423,16 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_k0s_reserved_tracks_role_assignment() {
+        let mut n = Node::new("n1".into(), ResourceSet::default());
+        assert!(!n.is_k0s_reserved());
+        n.k0s_role = Some(crate::k0s::K0sRole::Worker);
+        assert!(n.is_k0s_reserved());
+        n.k0s_role = None;
+        assert!(!n.is_k0s_reserved());
+    }
 
     #[test]
     fn register_from_unknown_yields_idle() {
@@ -552,5 +654,23 @@ mod tests {
             assert_eq!(NodeState::from_proto_i32(core.to_proto_i32()), Some(core));
             assert_eq!(NodeState::from_proto(core.to_proto()), core);
         }
+    }
+
+    #[test]
+    fn node_state_from_short_or_name_roundtrip() {
+        for &state in &NodeState::ALL {
+            assert_eq!(NodeState::from_short_or_name(state.short()), Some(state));
+            assert_eq!(NodeState::from_short_or_name(state.display()), Some(state));
+            assert_eq!(
+                NodeState::from_short_or_name(&state.short().to_uppercase()),
+                Some(state)
+            );
+        }
+    }
+
+    #[test]
+    fn node_state_from_short_or_name_rejects_unknown() {
+        assert_eq!(NodeState::from_short_or_name("bogus"), None);
+        assert_eq!(NodeState::from_short_or_name(""), None);
     }
 }

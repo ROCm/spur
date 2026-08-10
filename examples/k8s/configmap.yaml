@@ -9,7 +9,8 @@ data:
 
     [controller]
     # Raft peers use StatefulSet DNS names on the dedicated Raft port.
-    # node_id is auto-detected from the pod hostname ordinal (spurctld-N → N+1).
+    # node_id is auto-derived from each pod's position in this peers list
+    # (its hostname matched against each entry), so it never needs to be set.
     peers = [
       "spurctld-0.spurctld.spur.svc.cluster.local:6821",
       "spurctld-1.spurctld.spur.svc.cluster.local:6821",

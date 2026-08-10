@@ -5,13 +5,18 @@ pub(crate) mod db;
 mod fairshare;
 mod grpc;
 mod notifier;
+mod reconcile;
 
-pub use grpc::accounting_server;
+pub(crate) use grpc::{accounting_server, AccountingService};
 pub use notifier::{AccountingNotifier, JobStartRecord};
+pub use reconcile::spawn_loop as spawn_reconcile_loop;
+pub use reconcile::RECONCILE_INTERVAL_SECS;
 
 use std::collections::{HashMap, HashSet};
 
 use sqlx::PgPool;
+
+use spur_core::accounting::{AccountLimits, TresRecord};
 
 /// Compute fairshare factors directly from the database.
 ///
@@ -45,29 +50,128 @@ pub async fn fairshare_factors(
     ))
 }
 
-/// Load association defaults and the full user→account membership set backing
-/// the controller's `AssociationCache`.
+/// Fold one user-row's admin_level into the per-user map, keeping the highest: `Admin` wins over
+/// any lower level so a later non-admin row for a multi-account user can't clobber it.
+fn merge_admin_level(map: &mut HashMap<String, String>, user: &str, level: &str) {
+    if level.is_empty() || level.eq_ignore_ascii_case("none") {
+        return;
+    }
+    let entry = map.entry(user.to_owned()).or_default();
+    if entry.is_empty() || level.eq_ignore_ascii_case("admin") {
+        *entry = level.to_owned();
+    }
+}
+
+/// Load association defaults, the full user→account membership set, and
+/// per-association resource limits backing the controller's `AssociationCache`.
 pub async fn association_maps(
     pool: &PgPool,
 ) -> anyhow::Result<(
     HashMap<(String, String), String>,
     HashMap<String, String>,
     HashSet<(String, String)>,
+    HashMap<(String, String), AccountLimits>,
+    HashMap<(String, String), HashSet<String>>,
+    HashMap<String, String>,
 )> {
-    let users = db::list_users(pool, None).await?;
+    let users = db::list_users(pool, None, None).await?;
 
     let mut default_qos = HashMap::new();
     let mut default_account = HashMap::new();
     let mut memberships = HashSet::new();
+    let mut allowed_qos = HashMap::new();
+    let mut admin_level = HashMap::new();
     for u in users {
-        memberships.insert((u.name.clone(), u.account.clone()));
+        let key = (u.name.clone(), u.account.clone());
+        memberships.insert(key.clone());
+        merge_admin_level(&mut admin_level, &u.name, &u.admin_level);
         if let Some(qos) = u.default_qos {
-            default_qos.insert((u.name.clone(), u.account), qos);
+            default_qos.insert(key.clone(), qos);
         }
         if let Some(acct) = u.default_account {
             default_account.insert(u.name, acct);
         }
+        if let Some(list) = u.allowed_qos {
+            let set: HashSet<String> = list
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if !set.is_empty() {
+                allowed_qos.insert(key, set);
+            }
+        }
     }
 
-    Ok((default_qos, default_account, memberships))
+    let limits = db::list_associations(pool)
+        .await?
+        .into_iter()
+        .map(|a| {
+            let key = (a.user_name.clone(), a.account.clone());
+            (key, account_limits_from_record(a))
+        })
+        .collect();
+
+    Ok((
+        default_qos,
+        default_account,
+        memberships,
+        limits,
+        allowed_qos,
+        admin_level,
+    ))
+}
+
+fn account_limits_from_record(r: db::AssociationRecord) -> AccountLimits {
+    let opt_u32 = |v: Option<i32>| v.filter(|&x| x > 0).map(|x| x as u32);
+    // Values are validated by `add_user` before being stored, so a parse
+    // failure here means the DB row predates that check or was edited
+    // out-of-band; treat it as unset rather than poisoning the whole load.
+    let opt_tres = |s: Option<String>| {
+        s.filter(|s| !s.is_empty()).and_then(|s| {
+            TresRecord::parse(&s)
+                .inspect_err(
+                    |e| tracing::warn!(tres = %s, error = %e, "dropping unparseable stored TRES"),
+                )
+                .ok()
+        })
+    };
+
+    AccountLimits {
+        max_running_jobs: opt_u32(r.max_running_jobs),
+        max_submit_jobs: opt_u32(r.max_submit_jobs),
+        max_tres_per_job: opt_tres(r.max_tres_per_job),
+        grp_tres: opt_tres(r.grp_tres),
+        max_wall_minutes: opt_u32(r.max_wall_min),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_admin_level;
+    use std::collections::HashMap;
+
+    #[test]
+    fn admin_wins_regardless_of_row_order() {
+        // Admin then Operator: Admin must survive the later non-admin row.
+        let mut m = HashMap::new();
+        merge_admin_level(&mut m, "carol", "Admin");
+        merge_admin_level(&mut m, "carol", "Operator");
+        assert_eq!(m.get("carol").map(String::as_str), Some("Admin"));
+
+        // Operator then Admin: Admin must still win.
+        let mut m = HashMap::new();
+        merge_admin_level(&mut m, "carol", "Operator");
+        merge_admin_level(&mut m, "carol", "Admin");
+        assert_eq!(m.get("carol").map(String::as_str), Some("Admin"));
+    }
+
+    #[test]
+    fn none_and_empty_levels_are_dropped() {
+        let mut m = HashMap::new();
+        merge_admin_level(&mut m, "dave", "none");
+        merge_admin_level(&mut m, "dave", "");
+        assert!(!m.contains_key("dave"));
+    }
 }

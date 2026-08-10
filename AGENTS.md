@@ -43,6 +43,15 @@ Do not use `#N` to reference numbered points within a PR or issue description �
 
 A pre-commit hook is available in `.githooks/` (activate with `git config core.hooksPath .githooks`). It enforces formatting and SPDX license headers.
 
+## Breaking Changes
+
+Some changes compile and pass tests but break a running cluster on upgrade or break existing clients. Code review MUST flag these. Prefer the compatible option (add, don't remove/rename/retype); when a break is genuinely unavoidable, append `!` to the PR title type/scope (e.g. `fix(spur-core)!: ...`, `feat(proto)!: ...`) so it is called out. Watch for:
+
+- **Persisted state (Raft/WAL log, snapshots)** — `WalOperation` and every type it reaches (`JobSpec`, `JobStep`, `Reservation`, `NodeState`, resource/alloc types, `AdmissionToken`, k0s state) serialize to JSON in the Raft log; `PersistedSnapshot` likewise. A new field without `#[serde(default)]` or `Option`, or a renamed/removed field or enum variant, makes a new controller crash replaying old entries.
+- **gRPC proto (`proto/slurm.proto`)** — renumbering, removing, or retyping a field breaks FFI, REST, and cross-version wire compat. Only append fields with new tags; never reuse or renumber tags.
+- **Config (`/etc/spur/spur.conf`, `config.rs`)** — removing/renaming a field or changing its type breaks deployed configs.
+- **User-facing CLI/REST** — removing a flag, subcommand, or response field, or changing its meaning, breaks Slurm-compatible scripts.
+
 Validate your changes before submitting:
 
 ```bash
@@ -56,6 +65,7 @@ cargo test --locked                                                 # all tests 
 - **IMPORTANT**: Do not add comments that explain *what* the code does. Comments are only for *why* — non-obvious intent, trade-offs, or constraints the code itself cannot convey. Self-explanatory code gets no comments.
 - **IMPORTANT**: Do not reference issue numbers, PR numbers, or task IDs in code comments. That context belongs in git history, not in the source.
 - Do not add comments that narrate the intent of a fix or review feedback (e.g. "changed per review", "moved here to fix X"). The code should stand on its own — review context belongs in the commit message or PR discussion.
+- Keep comments short — 1-3 lines is the norm. Do not write long, multi-line comment blocks unless it is really a must; if an explanation needs a full paragraph, it usually belongs in the commit message or PR description, not the source.
 - **IMPORTANT**: Do not apply band-aid fixes. If a fix would be cleaner with a broader refactor that improves testability or idiomaticness, do the refactor. Explain the reasoning to the user. Maintainability over fast delivery.
 - Do not write tests that simulate a unit's behavior instead of calling the actual unit. Tests must exercise real code.
 - Do not write tests that depend on the test runner's environment. Use explicit fixtures so tests pass identically everywhere.

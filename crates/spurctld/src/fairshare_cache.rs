@@ -38,6 +38,14 @@ impl FairshareCache {
         *self.factors.write() = new_factors;
     }
 
+    /// Set a factor directly, bypassing the DB refresh loop; for tests only.
+    #[cfg(test)]
+    pub(crate) fn set_for_test(&self, user: &str, account: &str, factor: f64) {
+        self.factors
+            .write()
+            .insert((user.to_owned(), account.to_owned()), factor);
+    }
+
     pub fn spawn_refresh_loop(
         self: &Arc<Self>,
         pool: PgPool,

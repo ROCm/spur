@@ -47,7 +47,7 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         run: |
           echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
-          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_OUTPUT"
           echo "full_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
@@ -63,6 +63,10 @@ jobs:
           target: dist
           push: false
           outputs: type=local,dest=./dist
+          build-args: |
+            SPUR_GIT_SHA=${{ steps.meta.outputs.short_sha }}
+            SPUR_GIT_DIRTY=false
+            BUILD_MPI_PLUGIN=1
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -77,6 +81,11 @@ jobs:
           for bin in spur spurctld spurd; do
             cp "dist/bin/${bin}" "${DIST}/bin/"
           done
+
+          if [ -f "dist/lib/spur/spur_mpi_pmix.so" ]; then
+            mkdir -p "${DIST}/lib/spur"
+            cp "dist/lib/spur/spur_mpi_pmix.so" "${DIST}/lib/spur/"
+          fi
 
           cd "${DIST}/bin"
           for cmd in sbatch srun squeue scancel sinfo sacct scontrol; do
@@ -166,6 +175,9 @@ jobs:
           tags: |
             rocm/spur:nightly
             rocm/spur:nightly-${{ needs.build.outputs.date }}
+          build-args: |
+            SPUR_GIT_SHA=${{ needs.build.outputs.short_sha }}
+            SPUR_GIT_DIRTY=false
           cache-from: type=gha,scope=nightly-docker
           cache-to: type=gha,scope=nightly-docker,mode=max
 
@@ -208,7 +220,7 @@ jobs:
 
       - name: Upload SARIF to GitHub Security
         if: always() && steps.scan.outcome != 'skipped'
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@v4.37.4
         with:
           sarif_file: trivy-nightly.sarif
           category: trivy-nightly

@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -11,16 +11,17 @@ use parking_lot::RwLock;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
+use spur_core::account_limits::{check_account_limits, AccountCheckResult};
 use spur_core::accounting::{Qos, TresRecord, TresType};
-use spur_core::auth::AuthError;
 use spur_core::burst_buffer::BbStageState;
 use spur_core::config::SlurmConfig;
 use spur_core::job::{
-    Job, JobId, JobSpec, JobState, NodeCompleteError, PendingReason, TransitionOutcome,
+    effective_gpus, effective_memory_mb, Job, JobId, JobSpec, JobState, NodeCompleteError,
+    PendingReason, TransitionOutcome, DEFAULT_PRIORITY,
 };
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
-use spur_core::partition::{Partition, PreemptMode};
-use spur_core::qos::{check_qos_limits, QosCheckResult};
+use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
+use spur_core::qos::{check_qos_limits, qos_adjusted_priority, QosCheckResult};
 use spur_core::reservation::{self, normalize_node_list, running_jobs_overlap_start, Reservation};
 use spur_core::resource::{ResourceAllocations, ResourceSet};
 use spur_core::step::{JobStep, StepState, STEP_BATCH, STEP_RESERVED_MIN};
@@ -31,11 +32,31 @@ use spur_metrics::partition::PartitionMetricsSnapshot;
 use spur_metrics::user_acct::UserAcctMetricsSnapshot;
 
 use crate::accounting::{AccountingNotifier, JobStartRecord};
-use crate::association_cache::AssociationCache;
+use crate::association_cache::{qos_permitted, AccountMembership, AssociationCache};
 use crate::fairshare_cache::FairshareCache;
 use crate::limits_cache::QosCache;
+use crate::pmix_dispatch;
 use crate::raft::{ClientResponse, JobFinalized, SpurRaft, StateMachineApply};
 use crate::sched_stats::SchedStatsCollector;
+
+/// Description shown for a job parked after a launch failure it would carry to
+/// the next node. Byte-exact with the `state_desc` Slurm sets in the same case,
+/// so operator runbooks and log greps written against Slurm keep working.
+pub const LAUNCH_FAILURE_HELD_DESC: &str = "launch failed requeued held";
+
+/// Seconds to defer a job by after its `requeue_count`-th launch failure,
+/// doubling per attempt from the same base the preemption requeue uses.
+///
+/// The shift is clamped and the result double-capped because `max_batch_requeue`
+/// and the cap are both operator-supplied: an unvalidated config must degrade
+/// rather than push the computed instant out of chrono's range and panic the
+/// controller.
+fn launch_backoff_secs(interval_secs: u32, cap: u64, requeue_count: u32) -> u64 {
+    let base = (interval_secs as u64 * 2 + 3).max(5);
+    base.saturating_mul(1u64 << requeue_count.min(16))
+        .min(cap)
+        .min(spur_core::config::MAX_LAUNCH_BACKOFF_SECS)
+}
 
 /// Result of recording a per-node completion report.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +67,9 @@ pub enum NodeCompleteResult {
     AllDone { state: JobState, exit_code: i32 },
     /// Job was already in a terminal state (duplicate or race with cancel/timeout).
     AlreadyTerminal,
+    /// Report came from a superseded run (older `run_attempt`); ignored so it
+    /// cannot fail a job that has since been requeued and re-dispatched.
+    StaleReport,
 }
 
 /// Reservation CRUD errors for the gRPC boundary.
@@ -54,6 +78,7 @@ pub enum ReservationError {
     InvalidArgument(String),
     NotFound(String),
     AlreadyExists(String),
+    PermissionDenied(String),
     Raft(String),
 }
 
@@ -63,6 +88,7 @@ impl std::fmt::Display for ReservationError {
             Self::InvalidArgument(m)
             | Self::NotFound(m)
             | Self::AlreadyExists(m)
+            | Self::PermissionDenied(m)
             | Self::Raft(m) => f.write_str(m),
         }
     }
@@ -76,6 +102,43 @@ pub enum SubmitError {
     InvalidArgument(String),
     Internal(String),
 }
+
+/// Errors from completing a standalone srun allocation.
+#[derive(Debug)]
+pub enum SrunCompleteError {
+    NotFound(JobId),
+    NotSrunJob(JobId),
+    NotStepDispatch(JobId),
+    AlreadyTerminal { job_id: JobId, state: JobState },
+    NotOwner { job_id: JobId, user: String },
+    Internal { job_id: JobId, message: String },
+}
+
+impl std::fmt::Display for SrunCompleteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(id) => write!(f, "job {id} not found"),
+            Self::NotSrunJob(id) => write!(f, "job {id} is not an srun allocation"),
+            Self::NotStepDispatch(id) => {
+                write!(
+                    f,
+                    "job {id} does not use native step dispatch (CompleteJob is not valid)"
+                )
+            }
+            Self::AlreadyTerminal { job_id, state } => {
+                write!(f, "job {job_id} is already {state:?}")
+            }
+            Self::NotOwner { job_id, user } => {
+                write!(f, "user {user} is not permitted to complete job {job_id}")
+            }
+            Self::Internal { job_id, message } => {
+                write!(f, "job {job_id}: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SrunCompleteError {}
 
 impl std::fmt::Display for SubmitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -97,7 +160,105 @@ impl SubmitError {
     }
 }
 
+/// A successful submission: the (parent) job id plus any user-facing warnings
+/// (e.g. a node-count reduction) to surface at the CLI and REST response.
+#[derive(Debug, Clone, Default)]
+pub struct SubmitOutcome {
+    pub job_id: JobId,
+    pub warnings: Vec<String>,
+}
+
+/// Maximum serialized size of a single job submission, in bytes.
+///
+/// A submission becomes one Raft log entry (`WalOperation::JobSubmit`) that is
+/// also retained in every snapshot, so bounding the whole serialized spec keeps
+/// that entry well under `crate::raft::RAFT_MAX_MESSAGE_SIZE`. Measuring the
+/// serialized form rather than individual fields counts every payload the spec
+/// carries (script, environment, argv, container env/mounts, ...), so it cannot
+/// be bypassed by a field the check forgot to sum. Mirrors Slurm, which rejects
+/// oversized batch scripts.
+const MAX_JOB_SPEC_SIZE: usize = 4 * 1024 * 1024;
+
+/// A `std::io::Write` that only tallies byte counts and discards the data. Used
+/// to measure a value's serialized size without allocating the serialized bytes.
+#[derive(Default)]
+struct ByteCounter {
+    len: usize,
+}
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.len += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn check_submission_size(spec: &JobSpec) -> Result<(), SubmitError> {
+    // Count serialized bytes without allocating the output; the entry is
+    // re-serialized by openraft on propose.
+    let mut counter = ByteCounter::default();
+    serde_json::to_writer(&mut counter, spec)
+        .map_err(|e| SubmitError::internal(format!("failed to encode job spec: {e}")))?;
+    let size = counter.len;
+    if size > MAX_JOB_SPEC_SIZE {
+        return Err(SubmitError::invalid(format!(
+            "job submission too large: {:.1} MiB serialized, limit is {} MiB (reduce script, environment, or argv size)",
+            size as f64 / (1024.0 * 1024.0),
+            MAX_JOB_SPEC_SIZE / (1024 * 1024),
+        )));
+    }
+    Ok(())
+}
+
 impl ReservationError {
+    pub fn invalid(msg: impl Into<String>) -> Self {
+        Self::InvalidArgument(msg.into())
+    }
+
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self::NotFound(msg.into())
+    }
+
+    pub fn already_exists(msg: impl Into<String>) -> Self {
+        Self::AlreadyExists(msg.into())
+    }
+
+    pub fn permission_denied(msg: impl Into<String>) -> Self {
+        Self::PermissionDenied(msg.into())
+    }
+
+    pub fn raft(msg: impl Into<String>) -> Self {
+        Self::Raft(msg.into())
+    }
+}
+
+/// Partition CRUD errors for the gRPC boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartitionError {
+    InvalidArgument(String),
+    NotFound(String),
+    AlreadyExists(String),
+    Raft(String),
+}
+
+impl std::fmt::Display for PartitionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidArgument(m)
+            | Self::NotFound(m)
+            | Self::AlreadyExists(m)
+            | Self::Raft(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for PartitionError {}
+
+impl PartitionError {
     pub fn invalid(msg: impl Into<String>) -> Self {
         Self::InvalidArgument(msg.into())
     }
@@ -129,10 +290,35 @@ pub enum PreemptOutcome {
 /// Thread-safe via RwLock. The scheduler and gRPC server both access this.
 /// State recovery happens through Raft log replay (via `StateMachineApply`).
 pub struct ClusterManager {
-    pub config: SlurmConfig,
+    /// Live cluster configuration, swapped wholesale by `reconfigure()`.
+    ///
+    /// Held behind `RwLock<Arc<_>>` so `reconfigure` can atomically replace it
+    /// while readers take a cheap snapshot via `config()`. Sections consumed
+    /// per-request or per-scheduler-cycle through that snapshot pick up new
+    /// values live; sections captured once at startup (bound sockets, DB pool,
+    /// scheduler loop interval) remain restart-only — see `reconfigure`.
+    config: RwLock<Arc<SlurmConfig>>,
+    /// Scheduler tick interval captured at startup. The scheduler loop's cadence
+    /// is fixed once at boot (restart-only), so the preemption requeue hold —
+    /// which is sized to that cadence — must read this pinned value, not the
+    /// live `config()`, or the hold window would drift after `reconfigure`
+    /// while the loop keeps ticking at the old rate.
+    scheduler_interval_secs: u32,
+    /// Path to the spur.conf file, re-read by `reconfigure()`. spur.conf is
+    /// never written back — the Raft WAL is the sole source of runtime truth.
+    /// None when running without a config file (e.g. in tests).
+    config_path: Option<PathBuf>,
     jobs: RwLock<HashMap<JobId, Job>>,
     nodes: RwLock<HashMap<String, Node>>,
     partitions: RwLock<Vec<Partition>>,
+    /// Names of partitions that were runtime-deleted. Used to suppress config-file
+    /// partitions with the same name from re-appearing on restart.
+    deleted_partition_names: RwLock<HashSet<String>>,
+    /// Partition names seeded from config before WAL replay. A replayed
+    /// `PartitionCreate` for one overwrites the seed (WAL is authoritative);
+    /// once overridden the name is removed, so later duplicates stay
+    /// first-writer-wins. Runtime-only, never persisted.
+    config_seeded_partitions: RwLock<HashSet<String>>,
     next_job_id: AtomicU32,
     reservations: RwLock<Vec<Reservation>>,
     steps: RwLock<HashMap<(JobId, u32), JobStep>>,
@@ -146,6 +332,8 @@ pub struct ClusterManager {
     /// `available_bb_with`), so it cannot drift from config.
     burst_buffer_total_gb: RwLock<u64>,
     tokens: RwLock<HashMap<String, spur_core::admission::AdmissionToken>>,
+    /// Native k0s cluster state (phase, control-plane node, join-token metadata).
+    k0s: RwLock<spur_core::k0s::K0sClusterState>,
     raft: RwLock<Option<SpurRaft>>,
     accounting: RwLock<Option<AccountingNotifier>>,
     fairshare_cache: Arc<FairshareCache>,
@@ -156,27 +344,56 @@ pub struct ClusterManager {
     sched_stats: OnceLock<Arc<SchedStatsCollector>>,
 }
 
+struct PendingJobClassification {
+    jobs: Vec<Job>,
+    blocked: Vec<(JobId, PendingReason)>,
+    bb_stage_candidates: Vec<JobId>,
+}
+
+struct PendingJobCandidate {
+    job: Job,
+    scheduling_eligible: bool,
+    tag_reason: bool,
+}
+
 impl ClusterManager {
-    pub fn new(config: SlurmConfig, _state_dir: &Path) -> anyhow::Result<Self> {
+    #[cfg(test)]
+    pub fn new(config: SlurmConfig, state_dir: &Path) -> anyhow::Result<Self> {
+        Self::new_with_config_path(config, state_dir, None)
+    }
+
+    pub fn new_with_config_path(
+        config: SlurmConfig,
+        _state_dir: &Path,
+        config_path: Option<PathBuf>,
+    ) -> anyhow::Result<Self> {
         let partitions = config.build_partitions();
+        let config_seeded_partitions: HashSet<String> =
+            partitions.iter().map(|p| p.name.clone()).collect();
         let license_pool = config.licenses.clone();
         let burst_buffer_total_gb = config.burst_buffer.total_gb;
         let fairshare_cache = Arc::new(FairshareCache::new());
         let first_job_id = config.controller.first_job_id;
+        let scheduler_interval_secs = config.scheduler.interval_secs;
         let qos_cache = Arc::new(QosCache::new());
         let association_cache = Arc::new(AssociationCache::new());
 
         let cm = Self {
-            config,
+            config: RwLock::new(Arc::new(config)),
+            scheduler_interval_secs,
+            config_path,
             jobs: RwLock::new(HashMap::new()),
             nodes: RwLock::new(HashMap::new()),
             partitions: RwLock::new(partitions),
+            deleted_partition_names: RwLock::new(HashSet::new()),
+            config_seeded_partitions: RwLock::new(config_seeded_partitions),
             reservations: RwLock::new(Vec::new()),
             steps: RwLock::new(HashMap::new()),
             next_job_id: AtomicU32::new(first_job_id),
             license_pool: RwLock::new(license_pool),
             burst_buffer_total_gb: RwLock::new(burst_buffer_total_gb),
             tokens: RwLock::new(HashMap::new()),
+            k0s: RwLock::new(spur_core::k0s::K0sClusterState::default()),
             raft: RwLock::new(None),
             accounting: RwLock::new(None),
             fairshare_cache,
@@ -191,13 +408,73 @@ impl ClusterManager {
         Ok(cm)
     }
 
+    /// Snapshot the live configuration. Cheap `Arc` clone; callers read fields
+    /// off the returned snapshot so a concurrent `reconfigure` swap is atomic
+    /// from their point of view.
+    pub fn config(&self) -> Arc<SlurmConfig> {
+        self.config.read().clone()
+    }
+
     /// Submit a new job. If it has an array spec, expand into individual tasks.
-    pub fn submit_job(&self, mut spec: JobSpec) -> Result<JobId, SubmitError> {
+    pub fn submit_job(&self, mut spec: JobSpec) -> Result<SubmitOutcome, SubmitError> {
         apply_default_partition(&mut spec, &self.partitions.read());
+        apply_default_time_limit(&mut spec, &self.partitions.read());
         apply_default_account(&mut spec, &self.association_cache);
         validate_user_account(&spec, &self.association_cache)?;
+        let config = self.config();
+        // Default QoS must resolve before the partition ACL, or `allow_qos` sees
+        // an empty QoS and wrongly rejects a user's inherited default.
+        apply_default_qos(
+            &mut spec,
+            &self.association_cache,
+            &self.qos_cache,
+            &config.accounting,
+        )?;
         self.validate_partition(&spec)?;
-        apply_default_qos(&mut spec, &self.association_cache, &self.qos_cache)?;
+
+        // Fewer tasks than nodes cannot use the surplus nodes; cap at the task
+        // count so reported node/GPU counts match the allocation (unless a
+        // per-node layout is pinned).
+        let requested_nodes = spec.num_nodes.max(1);
+        spec.num_nodes = spec.effective_num_nodes();
+
+        let mut warnings = Vec::new();
+        if spec.num_nodes < requested_nodes {
+            warn!(
+                requested_nodes,
+                allocated_nodes = spec.num_nodes,
+                num_tasks = spec.num_tasks,
+                "reduced requested node count to task count at submit"
+            );
+            warnings.push(format!(
+                "requested {requested_nodes} nodes but only {} will be allocated \
+                 ({} task(s), one per node)",
+                spec.num_nodes, spec.num_tasks
+            ));
+        }
+
+        // Validate GPU demand against the normalized node count so a request
+        // like `-N4 -n1 --gpus=2` (valid once reduced to one node) is accepted.
+        spur_core::gpu_request::resolve_gpu_demand(&spec)
+            .map_err(|e| SubmitError::invalid(e.to_string()))?;
+
+        // Reject a node count outside the partition's bounds at submit, matching
+        // Slurm, instead of accepting a job that would pend forever.
+        self.validate_partition_node_bounds(&spec)?;
+
+        let mpi = spec.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
+        pmix_dispatch::validate_multi_node_pmix_nodelist(
+            mpi,
+            spec.num_nodes,
+            spec.nodelist.as_deref(),
+            |name| self.nodes.read().get(name).map(|node| node.source.clone()),
+        )
+        .map_err(SubmitError::invalid)?;
+
+        // Checked after defaults are applied so we measure the final spec.
+        // Array expansion only adds bounded integer metadata per task, so a
+        // single pre-expansion check still bounds each Raft log entry.
+        check_submission_size(&spec)?;
 
         // Reject unknown/malformed dependency types up front so users get a
         // clear error instead of a silently-deadlocked job (e.g. `expand:N`).
@@ -232,37 +509,104 @@ impl ClusterManager {
         self.scheduler_notify.notify_one();
 
         info!(job_id, "job submitted");
-        Ok(job_id)
+        Ok(SubmitOutcome { job_id, warnings })
+    }
+
+    /// Reject a submission whose (normalized) node count falls outside the
+    /// bounds of every requested partition. Matches Slurm, which rejects such
+    /// jobs at submit rather than leaving them permanently pending. A partition
+    /// list is accepted if any one partition can hold the request.
+    fn validate_partition_node_bounds(&self, spec: &JobSpec) -> Result<(), SubmitError> {
+        let Some(partition_spec) = spec.partition.as_deref().filter(|p| !p.is_empty()) else {
+            return Ok(());
+        };
+
+        let partitions = self.partitions.read();
+        let requested: Vec<&Partition> = requested_partition_names(Some(partition_spec))
+            .filter_map(|name| partitions.iter().find(|part| part.name == name))
+            .collect();
+        // Existence was already checked in validate_partition.
+        if requested.is_empty() {
+            return Ok(());
+        }
+
+        let nodes = spec.num_nodes;
+        let fits = |part: &Partition| {
+            let below_min = part.min_nodes > 0 && nodes < part.min_nodes;
+            let above_max = part.max_nodes.is_some_and(|max| nodes > max);
+            !below_min && !above_max
+        };
+        if requested.iter().copied().any(fits) {
+            return Ok(());
+        }
+
+        let part = requested[0];
+        let max = part
+            .max_nodes
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "unlimited".into());
+        Err(SubmitError::invalid(format!(
+            "requested node count {nodes} is outside partition '{}' limits (min {}, max {})",
+            part.name, part.min_nodes, max
+        )))
     }
 
     /// Validate partition constraints: access control and node limits.
-    fn validate_partition(&self, spec: &JobSpec) -> Result<(), SubmitError> {
-        let partition_name = match spec.partition.as_ref() {
+    pub(crate) fn validate_partition(&self, spec: &JobSpec) -> Result<(), SubmitError> {
+        let partition_spec = match spec.partition.as_deref() {
             Some(p) if !p.is_empty() => p,
             _ => return Ok(()), // Unset or empty partition name — nothing to validate
         };
 
         let partitions = self.partitions.read();
-        let part = match partitions.iter().find(|p| p.name == *partition_name) {
-            Some(p) => p,
-            None => {
-                return Err(SubmitError::invalid(format!(
-                    "partition '{partition_name}' not found"
-                )));
-            }
-        };
-
-        let needs_acl = !part.allow_accounts.is_empty() || !part.deny_accounts.is_empty();
-        if !needs_acl {
-            return Ok(());
+        let requested = requested_partition_names(Some(partition_spec))
+            .map(|name| {
+                partitions
+                    .iter()
+                    .find(|part| part.name == name)
+                    .ok_or_else(|| SubmitError::invalid(format!("partition '{name}' not found")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if requested.is_empty() {
+            return Err(SubmitError::invalid(format!(
+                "partition '{partition_spec}' not found"
+            )));
         }
 
-        if !self.association_cache.is_loaded() {
-            warn!(
-                user = %spec.user,
-                partition = %partition_name,
-                "association cache unavailable; skipping partition account access checks"
-            );
+        for part in &requested {
+            if !part.allow_qos.is_empty() {
+                match spec.qos.as_deref().filter(|q| !q.is_empty()) {
+                    Some(qos) if part.allow_qos.iter().any(|q| q == qos) => {}
+                    Some(qos) => {
+                        return Err(SubmitError::invalid(format!(
+                            "QoS '{qos}' not allowed on partition '{}' (allowed: {})",
+                            part.name,
+                            part.allow_qos.join(", ")
+                        )));
+                    }
+                    None => {
+                        return Err(SubmitError::invalid(format!(
+                            "a QoS is required on partition '{}' (allowed: {})",
+                            part.name,
+                            part.allow_qos.join(", ")
+                        )));
+                    }
+                }
+            }
+            if let Some(ref qos) = spec.qos {
+                if part.deny_qos.iter().any(|q| q == qos) {
+                    return Err(SubmitError::invalid(format!(
+                        "QoS '{qos}' denied on partition '{}'",
+                        part.name
+                    )));
+                }
+            }
+        }
+
+        let needs_acl = requested
+            .iter()
+            .any(|part| !part.allow_accounts.is_empty() || !part.deny_accounts.is_empty());
+        if !needs_acl {
             return Ok(());
         }
 
@@ -270,22 +614,28 @@ impl ClusterManager {
             Some(a) => a,
             None => {
                 return Err(SubmitError::invalid(format!(
-                    "no account for user '{}' on partition '{partition_name}'",
+                    "no account for user '{}' on partition '{partition_spec}'",
                     spec.user
                 )));
             }
         };
 
-        if !part.allow_accounts.is_empty() {
-            if !part.allow_accounts.iter().any(|a| a == account) {
+        for part in requested {
+            if !part.allow_accounts.is_empty() {
+                if part.allow_accounts.iter().any(|a| a == account) {
+                    continue;
+                }
                 return Err(SubmitError::invalid(format!(
-                    "account '{account}' not allowed on partition '{partition_name}'"
+                    "account '{account}' not allowed on partition '{}'",
+                    part.name
                 )));
             }
-        } else if part.deny_accounts.iter().any(|a| a == account) {
-            return Err(SubmitError::invalid(format!(
-                "account '{account}' denied on partition '{partition_name}'"
-            )));
+            if part.deny_accounts.iter().any(|a| a == account) {
+                return Err(SubmitError::invalid(format!(
+                    "account '{account}' denied on partition '{}'",
+                    part.name
+                )));
+            }
         }
 
         Ok(())
@@ -294,6 +644,11 @@ impl ClusterManager {
     /// Get a job by ID.
     pub fn get_job(&self, job_id: JobId) -> Option<Job> {
         self.jobs.read().get(&job_id).cloned()
+    }
+
+    /// A job's state by ID, without cloning the whole `Job`.
+    pub fn job_state(&self, job_id: JobId) -> Option<JobState> {
+        self.jobs.read().get(&job_id).map(|j| j.state)
     }
 
     /// Get a job by ID, synthesizing an aggregate record for an array *parent*
@@ -393,6 +748,7 @@ impl ClusterManager {
         user: Option<&str>,
         partition: Option<&str>,
         account: Option<&str>,
+        name: Option<&str>,
         job_ids: &[JobId],
     ) -> Vec<Job> {
         let matches = |j: &Job| -> bool {
@@ -411,6 +767,11 @@ impl ClusterManager {
             }
             if let Some(a) = account {
                 if !a.is_empty() && j.spec.account.as_deref() != Some(a) {
+                    return false;
+                }
+            }
+            if let Some(n) = name {
+                if !n.is_empty() && !n.split(',').any(|pat| pat.trim() == j.spec.name) {
                     return false;
                 }
             }
@@ -471,7 +832,7 @@ impl ClusterManager {
             // Record the reason before the terminal transition so any
             // observer (history, audit log, late `squeue` poll) sees DeadLine
             // instead of whatever update_pending_reasons last wrote.
-            job.pending_reason = PendingReason::DeadLine;
+            job.set_pending_reason(PendingReason::DeadLine);
         }
 
         let resp = self.propose(WalOperation::JobComplete {
@@ -486,17 +847,9 @@ impl ClusterManager {
     }
 
     /// Check that `user` is allowed to perform `action` on a job owned by `owner`.
-    /// Empty user (internal/daemon calls) and root are always allowed.
+    /// Delegates to [`spur_core::auth::check_job_owner`]; see there for the bypass rules.
     fn check_job_owner(user: &str, owner: &str, action: &str) -> anyhow::Result<()> {
-        if user.is_empty() || user == "root" || user == owner {
-            return Ok(());
-        }
-        Err(AuthError::NotJobOwner {
-            user: user.into(),
-            owner: owner.into(),
-            action: action.into(),
-        }
-        .into())
+        spur_core::auth::check_job_owner(user, owner, action).map_err(Into::into)
     }
 
     /// Cancel a job. The requesting `user` must be the job owner, root, or
@@ -525,6 +878,54 @@ impl ClusterManager {
 
         info!(job_id, "job cancelled");
         Ok(())
+    }
+
+    /// Complete a standalone srun allocation after its step finishes.
+    pub fn finish_srun_job(
+        &self,
+        job_id: JobId,
+        exit_code: i32,
+        user: &str,
+    ) -> Result<Job, SrunCompleteError> {
+        let job = {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or(SrunCompleteError::NotFound(job_id))?;
+            if !job.spec.srun_job {
+                return Err(SrunCompleteError::NotSrunJob(job_id));
+            }
+            if !job.srun_step_dispatch {
+                return Err(SrunCompleteError::NotStepDispatch(job_id));
+            }
+            if job.state.is_terminal() {
+                return Err(SrunCompleteError::AlreadyTerminal {
+                    job_id,
+                    state: job.state,
+                });
+            }
+            Self::check_job_owner(user, &job.spec.user, "complete").map_err(|_| {
+                SrunCompleteError::NotOwner {
+                    job_id,
+                    user: user.to_string(),
+                }
+            })?;
+            job.clone()
+        };
+
+        let state = if exit_code == 0 {
+            JobState::Completed
+        } else {
+            JobState::Failed
+        };
+        self.complete_job(job_id, exit_code, state).map_err(|e| {
+            warn!(job_id, error = %e, "finish_srun_job: complete_job failed");
+            SrunCompleteError::Internal {
+                job_id,
+                message: e.to_string(),
+            }
+        })?;
+        Ok(job)
     }
 
     /// Suspend a running job: validate state, record through Raft. Allocation is retained.
@@ -570,13 +971,26 @@ impl ClusterManager {
     }
 
     /// Start a job on specific nodes.
+    /// Transition a pending job to Running and record its allocation. Returns
+    /// the run epoch assigned to this dispatch (threaded into the launch RPC).
     pub fn start_job(
         &self,
         job_id: JobId,
         node_names: Vec<String>,
         resources: ResourceAllocations,
         per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u32> {
+        self.start_job_impl(job_id, node_names, resources, per_node_alloc, false)
+    }
+
+    pub(crate) fn start_job_impl(
+        &self,
+        job_id: JobId,
+        node_names: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
+        srun_step_dispatch: bool,
+    ) -> anyhow::Result<u32> {
         for name in &node_names {
             if !per_node_alloc.contains_key(name) {
                 anyhow::bail!(
@@ -591,6 +1005,7 @@ impl ClusterManager {
         let old_state;
         let spec_for_notify;
         let submit_time_for_notify;
+        let run_attempt;
         {
             let jobs = self.jobs.read();
             let job = jobs
@@ -599,6 +1014,8 @@ impl ClusterManager {
             old_state = job.state;
             spec_for_notify = job.spec.clone();
             submit_time_for_notify = job.submit_time;
+            // Next run epoch (first dispatch = 1), threaded to the agents.
+            run_attempt = job.run_attempt.saturating_add(1);
             if job.state != JobState::Pending {
                 anyhow::bail!("job {} cannot start from state {:?}", job_id, job.state);
             }
@@ -615,6 +1032,8 @@ impl ClusterManager {
             nodes: node_names.clone(),
             resources: resources.clone(),
             per_node_alloc: per_node_alloc.clone(),
+            srun_step_dispatch,
+            run_attempt,
         })?;
 
         let node_count = node_names.len().max(1) as u32;
@@ -627,21 +1046,25 @@ impl ClusterManager {
                     resources.memory_mb / node_count as u64,
                 )
             });
-        let batch_step = JobStep {
-            job_id,
-            step_id: STEP_BATCH,
-            name: "batch".into(),
-            state: StepState::Running,
-            num_tasks: 1,
-            cpus_per_task: per_node.cpus,
-            resources: per_node,
-            nodes: node_names,
-            distribution: spur_core::step::TaskDistribution::Block,
-            start_time: Some(Utc::now()),
-            end_time: None,
-            exit_code: None,
-        };
-        self.create_step(job_id, STEP_BATCH, batch_step);
+        if !srun_step_dispatch {
+            let batch_step = JobStep {
+                job_id,
+                step_id: STEP_BATCH,
+                name: "batch".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: per_node.cpus,
+                resources: per_node,
+                nodes: node_names,
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: Some(Utc::now()),
+                end_time: None,
+                exit_code: None,
+            };
+            if let Err(e) = self.create_step(batch_step) {
+                warn!(job_id, error = %e, "failed to record batch step");
+            }
+        }
 
         if spec_for_notify
             .mail_type
@@ -669,7 +1092,7 @@ impl ClusterManager {
         }
 
         debug!(job_id, "job started");
-        Ok(())
+        Ok(run_attempt)
     }
 
     /// Record completion from one allocated node (multi-node COMPLETING flow).
@@ -679,6 +1102,7 @@ impl ClusterManager {
         node_name: &str,
         exit_code: i32,
         signal: i32,
+        run_attempt: u32,
     ) -> Result<NodeCompleteResult, NodeCompleteError> {
         {
             let jobs = self.jobs.read();
@@ -687,6 +1111,12 @@ impl ClusterManager {
                 .ok_or(NodeCompleteError::JobNotFound { job_id })?;
             if job.state.is_terminal() {
                 return Ok(NodeCompleteResult::AlreadyTerminal);
+            }
+            // Drop a report from a superseded run (older epoch); e.g. the
+            // delayed SIGKILL of a preemption-requeued process. Epoch 0 on
+            // either side (legacy) disables the check.
+            if run_attempt != 0 && job.run_attempt != 0 && run_attempt < job.run_attempt {
+                return Ok(NodeCompleteResult::StaleReport);
             }
             if !job.allocated_nodes.iter().any(|n| n == node_name) {
                 return Err(NodeCompleteError::NodeNotAllocated {
@@ -728,8 +1158,15 @@ impl ClusterManager {
         exit_code: i32,
         state: JobState,
     ) -> anyhow::Result<()> {
-        // Validate
-        {
+        // A time-limit expiry has to win over the caller's outcome here, not
+        // just in the per-node completion path. The marker is only ever set on
+        // a run the watchdog signalled, so any completion routed through this
+        // method — the completing-timeout force-finish and the srun path, both
+        // of which finalize without seeing node_completions — is a wall-time
+        // expiry that would otherwise be reported as an ordinary failure and
+        // skip the Timeout requeue. Cancelled (user cancel, preemption) and an
+        // already-correct Timeout pass through untouched.
+        let state = {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
@@ -737,7 +1174,14 @@ impl ClusterManager {
             if job.state.is_terminal() {
                 anyhow::bail!("invalid transition from {:?} to {:?}", job.state, state);
             }
-        }
+            if job.time_limit_signaled_at.is_some()
+                && matches!(state, JobState::Failed | JobState::Completed)
+            {
+                JobState::Timeout
+            } else {
+                state
+            }
+        };
 
         // propose() handles: state transition, exit_code, end_time,
         // resource deallocation, step completion, license return
@@ -749,6 +1193,16 @@ impl ClusterManager {
         self.run_all_finalized_side_effects(&resp);
 
         debug!(job_id, exit_code, "job completed");
+        Ok(())
+    }
+
+    /// Record that a running job has exhausted its time limit, before the
+    /// caller sends SIGTERM. Durably marking the run first is what lets the
+    /// completion path report `Timeout` instead of reading the terminating
+    /// signal as an ordinary failure — a job that exits promptly on SIGTERM
+    /// reports back long before the grace period is up.
+    pub fn signal_time_limit(&self, job_id: JobId, at: DateTime<Utc>) -> anyhow::Result<()> {
+        self.propose(WalOperation::JobTimeLimitSignaled { job_id, at })?;
         Ok(())
     }
 
@@ -789,7 +1243,7 @@ impl ClusterManager {
                 // the maybe_requeue MAX_REQUEUE cap: Slurm always requeues a
                 // preempted job regardless of its --requeue flag. This is a
                 // deliberate divergence from the ordinary requeue path.
-                let hold_secs = (self.config.scheduler.interval_secs as i64 * 2 + 3).max(5);
+                let hold_secs = (self.scheduler_interval_secs as i64 * 2 + 3).max(5);
                 let hold = Utc::now() + chrono::Duration::seconds(hold_secs);
                 // Honor a later user --begin: compute the max on the leader so
                 // followers apply one verbatim instant (no per-replica clock).
@@ -822,7 +1276,7 @@ impl ClusterManager {
     }
 
     fn run_epilog_slurmctld(&self, job_id: JobId) {
-        let Some(epilog_ctld) = self.config.hooks.epilog_slurmctld.clone() else {
+        let Some(epilog_ctld) = self.config().hooks.epilog_slurmctld.clone() else {
             return;
         };
         let job = self.get_job(job_id);
@@ -901,8 +1355,8 @@ impl ClusterManager {
 
     /// Requeue a job if spec.requeue is set and attempt limit not exceeded.
     fn maybe_requeue(&self, job_id: JobId) -> anyhow::Result<()> {
-        let max = self.config.controller.max_batch_requeue;
-        let (should_requeue, old_state) = {
+        let max = self.config().controller.max_batch_requeue;
+        let (old_state, backoff) = {
             let jobs = self.jobs.read();
             let Some(job) = jobs.get(&job_id) else {
                 return Ok(());
@@ -920,19 +1374,32 @@ impl ClusterManager {
             if !job.spec.requeue {
                 return Ok(());
             }
-            (true, job.state)
+            // The eviction tagged the cause, so a launch failure gets the same
+            // backoff the all-nodes-failed path gets. Without it a job with one
+            // broken node in its allocation burns its whole requeue budget in
+            // seconds. Node health and timeout requeues keep today's immediate
+            // retry: the blocking condition is already gone by then.
+            let launch_failed = job.pending_reason == PendingReason::JobLaunchFailure;
+            (
+                job.state,
+                launch_failed.then(|| self.launch_backoff_until(job)),
+            )
         };
-        if !should_requeue {
-            return Ok(());
-        }
 
-        self.propose(WalOperation::job_state_change(
-            job_id,
-            old_state,
-            JobState::Pending,
-        ))?;
+        // Computed before the proposal so every replica applies one verbatim
+        // instant rather than reading its own clock.
+        let op = match backoff {
+            Some(hold) => WalOperation::job_state_change_backoff_pending(
+                job_id,
+                old_state,
+                PendingReason::JobLaunchFailure,
+                hold,
+            ),
+            None => WalOperation::job_state_change(job_id, old_state, JobState::Pending),
+        };
+        self.propose(op)?;
 
-        info!(job_id, from = %old_state, "job requeued");
+        info!(job_id, from = %old_state, hold_until = ?backoff, "job requeued");
         Ok(())
     }
 
@@ -942,7 +1409,18 @@ impl ClusterManager {
     /// (e.g., container image not found) so it can be retried after the
     /// user fixes the issue. (Issue #91)
     pub fn requeue_job(&self, job_id: JobId) -> anyhow::Result<()> {
-        let old_state = {
+        self.requeue_after_launch_failure(job_id, false)
+    }
+
+    /// Requeue after a dispatch failure, optionally parking the job for an
+    /// operator instead of retrying it.
+    ///
+    /// `hold` is for failures the job carries with it, which would fail the same
+    /// way on the next node and drain that one too. Such a job skips the backoff
+    /// and the requeue cap, neither of which means anything to a job that will
+    /// not retry on its own.
+    pub fn requeue_after_launch_failure(&self, job_id: JobId, hold: bool) -> anyhow::Result<()> {
+        let (old_state, begin_time) = {
             let jobs = self.jobs.read();
             let Some(job) = jobs.get(&job_id) else {
                 return Ok(());
@@ -950,11 +1428,22 @@ impl ClusterManager {
             if job.state.is_terminal() {
                 return Ok(());
             }
-            if job.requeue_count >= self.config.controller.max_batch_requeue {
+            if !hold && job.requeue_count >= self.config().controller.max_batch_requeue {
                 drop(jobs);
                 return self.hold_job_at_max_requeue(job_id);
             }
-            job.state
+            // A job that never reached Running has nothing to requeue: Pending ->
+            // Failed is not a legal transition and Pending -> Pending applies as a
+            // NoOp, so both proposals below would be discarded and the hold lost.
+            // Callers that fail before dispatch fall to the next scheduler tick.
+            if job.state == JobState::Pending {
+                debug!(
+                    job_id,
+                    "requeue requested for a job that never started; no backoff hold applied"
+                );
+                return Ok(());
+            }
+            (job.state, self.launch_backoff_until(job))
         };
 
         // transition to Failed via JobComplete so node resources,
@@ -965,15 +1454,116 @@ impl ClusterManager {
             state: JobState::Failed,
         })?;
 
-        // Failed → Pending resets allocation fields and makes
-        // the job schedulable again.
-        self.propose(WalOperation::job_state_change(
+        if hold {
+            self.propose(WalOperation::job_state_change_held_pending_desc(
+                job_id,
+                JobState::Failed,
+                PendingReason::Held,
+                LAUNCH_FAILURE_HELD_DESC,
+            ))?;
+            info!(job_id, from = %old_state, "job requeued and held after launch failure");
+            return Ok(());
+        }
+
+        // Failed → Pending resets allocation fields and makes the job
+        // schedulable again, but only once the backoff hold lapses: without it
+        // the next scheduler tick re-dispatches to the same node, which for a
+        // node-local fault burns the whole requeue budget in seconds.
+        self.propose(WalOperation::job_state_change_backoff_pending(
             job_id,
             JobState::Failed,
-            JobState::Pending,
+            PendingReason::JobLaunchFailure,
+            begin_time,
         ))?;
 
-        info!(job_id, from = %old_state, "job requeued after dispatch failure");
+        info!(job_id, from = %old_state, hold_until = %begin_time, "job requeued after dispatch failure");
+        Ok(())
+    }
+
+    /// Back off a job whose batch dispatch confirmation failed for a non-prolog
+    /// reason (agent briefly unreachable, no resolved address) before it left
+    /// Pending. `requeue_after_launch_failure` can't be reused: its `requeue_count`
+    /// bookkeeping is gated on a real transition out of Running, so without this a
+    /// flaky node's job would be reassigned to it every tick, forever unbounded.
+    pub(crate) fn backoff_pending_job_after_dispatch_failure(
+        &self,
+        job_id: JobId,
+    ) -> anyhow::Result<()> {
+        let begin_time = {
+            let jobs = self.jobs.read();
+            let Some(job) = jobs.get(&job_id) else {
+                return Ok(());
+            };
+            if job.state != JobState::Pending {
+                // Moved on already (e.g. cancelled concurrently) between the
+                // failed confirmation and this call — nothing to back off.
+                return Ok(());
+            }
+            if job.requeue_count >= self.config().controller.max_batch_requeue {
+                drop(jobs);
+                return self.hold_job_at_max_requeue(job_id);
+            }
+            self.launch_backoff_until(job)
+        };
+
+        self.propose(WalOperation::JobDispatchBackoff { job_id, begin_time })?;
+        info!(job_id, hold_until = %begin_time, "job's batch dispatch failed before it started; backing off");
+        Ok(())
+    }
+
+    /// Instant until which a job requeued after a launch failure is held. A user
+    /// `--begin` further out always wins, so the hold never shortens a
+    /// user-supplied constraint. Computed on the leader so every replica applies
+    /// one verbatim instant rather than reading its own clock.
+    fn launch_backoff_until(&self, job: &Job) -> DateTime<Utc> {
+        let config = self.config();
+        let hold_secs = launch_backoff_secs(
+            config.scheduler.interval_secs,
+            config.controller.max_launch_backoff_secs,
+            job.requeue_count,
+        );
+        let hold = Utc::now() + chrono::Duration::seconds(hold_secs as i64);
+        job.spec.begin_time.map_or(hold, |user| user.max(hold))
+    }
+
+    /// Evict a running job to NodeFail: frees allocations and feeds the
+    /// existing auto-requeue path in `notify_job_finished`, same as the
+    /// health-check path (`evict_jobs_on_node`) that runs when an entire
+    /// node goes Down, but scoped to a single job. Unlike the health-check
+    /// path, this does not by itself cancel the job on nodes that *did*
+    /// launch it — a caller evicting a job with launched-but-unconfirmed
+    /// nodes is responsible for sending the cancel RPC once eviction
+    /// succeeds.
+    ///
+    /// No longer called from `scheduler_loop`: batch dispatch is now
+    /// confirmed on every assigned node *before* a job is allowed to become
+    /// Running (see `confirm_dispatch_on_nodes`), so a job can no longer
+    /// reach Running with only some of its nodes actually launched — this
+    /// function's original trigger. Kept as a public primitive, with its
+    /// back-off/requeue contract still exercised directly by this module's
+    /// tests, for any other caller that needs to evict an already-Running
+    /// job (e.g. a future admin-initiated NodeFail).
+    #[allow(dead_code)]
+    pub fn evict_job(&self, job_id: JobId) -> anyhow::Result<()> {
+        self.evict_job_with_detail(job_id, None)
+    }
+
+    pub fn evict_job_with_detail(
+        &self,
+        job_id: JobId,
+        detail: Option<String>,
+    ) -> anyhow::Result<()> {
+        {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            if job.state.is_terminal() {
+                return Ok(());
+            }
+        }
+        let resp = self.propose(WalOperation::JobEvict { job_id, detail })?;
+        self.run_all_finalized_side_effects(&resp);
         Ok(())
     }
 
@@ -982,6 +1572,7 @@ impl ClusterManager {
     pub fn register_node(
         &self,
         name: String,
+        hostname: String,
         resources: ResourceSet,
         address: String,
         port: u16,
@@ -990,6 +1581,11 @@ impl ClusterManager {
         source: NodeSource,
         labels: HashMap<String, String>,
     ) -> anyhow::Result<()> {
+        let hostname = if hostname.is_empty() {
+            name.clone()
+        } else {
+            hostname
+        };
         let action = {
             let nodes = self.nodes.read();
             evaluate_registration(nodes.get(&name), &resources)
@@ -999,15 +1595,44 @@ impl ClusterManager {
             RegistrationAction::Skip => {
                 debug!(node = %name, "node unchanged, skipping");
                 self.sync_node_labels(&name, labels)?;
+                if let Some(existing) = self.get_node(&name) {
+                    let needs_update = existing.address.as_deref() != Some(address.as_str())
+                        || existing.hostname != hostname
+                        || existing.port != port
+                        || (!wg_pubkey.is_empty()
+                            && existing.wg_pubkey.as_deref() != Some(wg_pubkey.as_str()))
+                        || (!version.is_empty()
+                            && existing.version.as_deref() != Some(version.as_str()));
+                    if needs_update {
+                        self.propose(WalOperation::NodeUpdate {
+                            name: name.clone(),
+                            hostname: hostname.clone(),
+                            resources: existing.total_resources.clone(),
+                            address,
+                            port,
+                            wg_pubkey,
+                            version,
+                            source: source.clone(),
+                        })?;
+                        info!(node = %name, "node comm address or metadata updated");
+                    }
+                    if existing.source != source {
+                        if let Some(node) = self.nodes.write().get_mut(&name) {
+                            node.source = source;
+                        }
+                    }
+                }
             }
             RegistrationAction::Update => {
                 self.propose(WalOperation::NodeUpdate {
                     name: name.clone(),
+                    hostname: hostname.clone(),
                     resources,
                     address,
                     port,
                     wg_pubkey,
                     version,
+                    source: source.clone(),
                 })?;
                 self.sync_node_labels(&name, labels)?;
                 if let Some(node) = self.nodes.write().get_mut(&name) {
@@ -1018,12 +1643,14 @@ impl ClusterManager {
             RegistrationAction::Register => {
                 self.propose(WalOperation::NodeRegister {
                     name: name.clone(),
+                    hostname: hostname.clone(),
                     resources,
                     address,
                     port,
                     wg_pubkey,
                     version,
                     labels,
+                    source: source.clone(),
                 })?;
                 if let Some(node) = self.nodes.write().get_mut(&name) {
                     node.source = source;
@@ -1076,6 +1703,24 @@ impl ClusterManager {
         } else {
             false
         }
+    }
+
+    /// Update a node's WireGuard mesh public key from a heartbeat when it appears or changes (mesh
+    /// came up after registration, or `spur0` was recreated). In-memory like `update_heartbeat` —
+    /// the mesh reconcile loop reads live inventory, so this is enough to include the node in
+    /// ApplyMesh without a spurd restart. Returns true if the stored key changed.
+    pub fn update_node_wg_pubkey(&self, name: &str, pubkey: &str) -> bool {
+        if pubkey.is_empty() {
+            return false;
+        }
+        let mut nodes = self.nodes.write();
+        if let Some(node) = nodes.get_mut(name) {
+            if node.wg_pubkey.as_deref() != Some(pubkey) {
+                node.wg_pubkey = Some(pubkey.to_string());
+                return true;
+            }
+        }
+        false
     }
 
     /// Create an admission token and persist via Raft.
@@ -1148,10 +1793,50 @@ impl ClusterManager {
             old_priority,
             new_priority: 0,
             pending_reason: Some(PendingReason::Held),
+            pending_reason_desc: None,
             reset_requeue_count: false,
             clear_reservation: false,
         })?;
         info!(job_id, "job held");
+        Ok(())
+    }
+
+    /// Hold a *Pending* job whose batch dispatch failed to confirm on a node
+    /// (prolog rejection with `hold_on_prolog_fail` set). Same end state as
+    /// [`Self::hold_job`] (priority 0, `PendingReason::Held`), but carries the
+    /// launch-failure description so it reads the same as the pre-fix path
+    /// that reached this via a Running→Failed→Held detour: the job here never
+    /// actually left Pending, so that detour isn't available.
+    pub(crate) fn hold_job_for_launch_failure(
+        &self,
+        job_id: JobId,
+        reason_desc: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let old_priority = {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            if job.state != JobState::Pending {
+                anyhow::bail!(
+                    "can only hold pending jobs (job {} is {:?})",
+                    job_id,
+                    job.state
+                );
+            }
+            job.priority
+        };
+
+        self.propose(WalOperation::JobPriorityChange {
+            job_id,
+            old_priority,
+            new_priority: 0,
+            pending_reason: Some(PendingReason::Held),
+            pending_reason_desc: Some(reason_desc.unwrap_or(LAUNCH_FAILURE_HELD_DESC).to_string()),
+            reset_requeue_count: false,
+            clear_reservation: false,
+        })?;
+        info!(job_id, "job held after launch failure");
         Ok(())
     }
 
@@ -1210,6 +1895,7 @@ impl ClusterManager {
                 old_priority,
                 new_priority: 0,
                 pending_reason: Some(PendingReason::JobHoldMaxRequeue),
+                pending_reason_desc: None,
                 reset_requeue_count: false,
                 clear_reservation: false,
             })?;
@@ -1238,8 +1924,9 @@ impl ClusterManager {
         self.propose(WalOperation::JobPriorityChange {
             job_id,
             old_priority,
-            new_priority: 1000,
+            new_priority: DEFAULT_PRIORITY,
             pending_reason: Some(PendingReason::Priority),
+            pending_reason_desc: None,
             reset_requeue_count: reset_requeue,
             clear_reservation,
         })?;
@@ -1259,12 +1946,46 @@ impl ClusterManager {
         account: Option<String>,
         qos: Option<String>,
     ) -> anyhow::Result<()> {
-        {
+        let (job_user, job_account) = {
             let jobs = self.jobs.read();
-            if !jobs.contains_key(&job_id) {
-                anyhow::bail!("job {} not found", job_id);
+            let job = jobs
+                .get(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            (job.spec.user.clone(), job.spec.account.clone())
+        };
+
+        // Reject before mutating: an unknown QOS resolves to the limitless
+        // default and an empty QOS clears enforcement — both reopen the bypass.
+        let qos = match qos {
+            Some(q) => {
+                let q = q.trim().to_string();
+                if q.is_empty() {
+                    anyhow::bail!("cannot clear a job's QOS");
+                }
+                if self.qos_cache.get(&q).is_none() {
+                    let hint = if self.qos_cache.is_loaded() {
+                        ""
+                    } else {
+                        QOS_ACCOUNTING_HINT
+                    };
+                    anyhow::bail!("QOS '{q}' does not exist{hint}");
+                }
+                // Treat account="" as unset so we authorize against the
+                // job's existing account, rather than erroring on a blank
+                // value that check_qos_authorized would otherwise reject.
+                let effective_account = account
+                    .as_deref()
+                    .filter(|a| !a.is_empty())
+                    .or(job_account.as_deref());
+                if let Some(acct) = effective_account {
+                    self.association_cache
+                        .check_qos_authorized(&job_user, acct, &q)
+                        .map_err(anyhow::Error::msg)?;
+                }
+                Some(q)
             }
-        }
+            None => None,
+        };
 
         if let Some(p) = priority {
             let old = self
@@ -1278,6 +1999,7 @@ impl ClusterManager {
                 old_priority: old,
                 new_priority: p,
                 pending_reason: None,
+                pending_reason_desc: None,
                 reset_requeue_count: false,
                 clear_reservation: false,
             })?;
@@ -1304,6 +2026,19 @@ impl ClusterManager {
         }
         info!(job_id, "job updated");
         Ok(())
+    }
+
+    /// Record the primary agent's resolved output paths for `scontrol`. Display-only
+    /// advisory metadata written straight to the in-memory job — not applied via a WAL
+    /// op (though it may ride along in a periodic snapshot), so a failover before the
+    /// next snapshot falls back to the computed path.
+    /// Empty paths stay `None` (a mixed-version agent decodes the fields as "").
+    pub fn set_job_output_paths(&self, job_id: JobId, stdout_path: String, stderr_path: String) {
+        let mut jobs = self.jobs.write();
+        if let Some(job) = jobs.get_mut(&job_id) {
+            job.actual_stdout_path = (!stdout_path.is_empty()).then_some(stdout_path);
+            job.actual_stderr_path = (!stderr_path.is_empty()).then_some(stderr_path);
+        }
     }
 
     /// Update node state (admin: drain, resume, etc.)
@@ -1374,6 +2109,71 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// assign a k0s role + allocated mesh IP + pod /24 to a node (replicated via Raft).
+    /// Callers never touch `self.nodes`/`self.k0s` directly — that would bypass Raft.
+    pub fn assign_node_k0s(
+        &self,
+        name: &str,
+        role: spur_core::k0s::K0sRole,
+        mesh_ip: &str,
+        pod_cidr: &str,
+    ) -> anyhow::Result<()> {
+        {
+            let nodes = self.nodes.read();
+            if !nodes.contains_key(name) {
+                anyhow::bail!("node {} not found", name);
+            }
+        }
+        self.propose(WalOperation::NodeK0sAssign {
+            name: name.to_string(),
+            role,
+            mesh_ip: mesh_ip.to_string(),
+            pod_cidr: pod_cidr.to_string(),
+        })?;
+        info!(node = %name, ?role, "node k0s role assigned");
+        Ok(())
+    }
+
+    /// Clear a node's k0s role + mesh IP + pod /24 (replicated via Raft). Returns the node to
+    /// Spur batch scheduling after k0s teardown. Idempotent: a no-op on an already-cleared node.
+    pub fn clear_node_k0s(&self, name: &str) -> anyhow::Result<()> {
+        {
+            let nodes = self.nodes.read();
+            if !nodes.contains_key(name) {
+                anyhow::bail!("node {} not found", name);
+            }
+        }
+        self.propose(WalOperation::NodeK0sClear {
+            name: name.to_string(),
+        })?;
+        info!(node = %name, "node k0s role cleared");
+        Ok(())
+    }
+
+    /// set the cluster-wide k0s phase (+ optional control-plane node/set / reset flag). A `None`
+    /// `control_plane_node` or empty `control_plane_nodes` leaves the persisted value untouched.
+    pub fn set_k0s_phase(
+        &self,
+        phase: spur_core::k0s::K0sPhase,
+        control_plane_node: Option<String>,
+        control_plane_nodes: Vec<String>,
+        reset_requested: bool,
+    ) -> anyhow::Result<()> {
+        self.propose(WalOperation::K0sSetPhase {
+            phase,
+            control_plane_node,
+            control_plane_nodes,
+            reset_requested,
+        })?;
+        info!(?phase, "k0s cluster phase set");
+        Ok(())
+    }
+
+    /// snapshot of the current cluster-wide k0s state.
+    pub fn k0s_state(&self) -> spur_core::k0s::K0sClusterState {
+        self.k0s.read().clone()
+    }
+
     /// Reconcile node liveness state with heartbeat data.
     /// Marks stale nodes Down and recovers nodes whose heartbeat has resumed.
     /// Returns finalized jobs from eviction so callers can send cancel RPCs.
@@ -1438,11 +2238,17 @@ impl ClusterManager {
         reason: Option<String>,
     ) -> anyhow::Result<(NodeState, u32)> {
         let (old_state, running_count) = {
+            // Lock order is jobs before nodes, matching apply_operation. Taking
+            // nodes first deadlocks against a raft apply that already holds jobs
+            // and is waiting on nodes: parking_lot queues writers ahead of new
+            // readers, so neither side can make progress and the controller
+            // wedges. The agent calls this on a launch failure at the same
+            // instant the requeue is being applied for that job.
+            let jobs = self.jobs.read();
             let nodes = self.nodes.read();
             let node = nodes
                 .get(name)
                 .ok_or_else(|| anyhow::anyhow!("node '{}' not found", name))?;
-            let jobs = self.jobs.read();
             let count = jobs
                 .values()
                 .filter(|j| {
@@ -1508,10 +2314,15 @@ impl ClusterManager {
         Ok(resp.jobs_finalized)
     }
 
-    /// Create a job step.
-    pub fn create_step(&self, job_id: JobId, step_id: u32, step: JobStep) {
-        self.steps.write().insert((job_id, step_id), step);
+    /// Create a job step durably via Raft.
+    pub fn create_step(&self, step: JobStep) -> anyhow::Result<()> {
+        let job_id = step.job_id;
+        let step_id = step.step_id;
+        self.propose(WalOperation::JobStepCreate {
+            step: Box::new(step),
+        })?;
         debug!(job_id, step_id, "step created");
+        Ok(())
     }
 
     /// Record an srun step's completion via Raft so the step exit code and the
@@ -1541,24 +2352,59 @@ impl ClusterManager {
             .collect()
     }
 
-    /// Get pending jobs sorted by priority, filtering out held and dependency-blocked jobs.
-    /// Recomputes effective priority using age and partition tier before sorting.
+    /// Get pending jobs sorted by priority, filtering out blocked jobs.
+    /// Recomputes effective priority using QoS, age, and partition tier before sorting.
     pub fn pending_jobs(&self) -> Vec<Job> {
-        let jobs = self.jobs.read();
-        let mut pending: Vec<Job> = jobs
-            .values()
-            .filter(|j| j.state == JobState::Pending && !j.pending_reason.is_scheduling_hold())
-            .cloned()
-            .collect();
+        self.classify_pending_jobs().jobs
+    }
 
-        // Drop jobs blocked by partition state/config (shares partition_block()
-        // with tag_blocked_pending_reasons() so drop and shown reason agree).
+    /// Classify pending jobs once, apply displayed block reasons, advance burst-buffer
+    /// stage-in for selected candidates, and return the jobs eligible for scheduling.
+    pub fn pending_jobs_and_tag_reasons(&self) -> Vec<Job> {
+        let classification = self.classify_pending_jobs();
+        self.apply_blocked_pending_reasons(classification.blocked);
+        self.advance_bb_staging_for(&classification.bb_stage_candidates);
+        classification.jobs
+    }
+
+    fn classify_pending_jobs(&self) -> PendingJobClassification {
+        let jobs = self.jobs.read();
+        let now = Utc::now();
+        let running_array_counts: HashMap<JobId, u32> = jobs
+            .values()
+            .filter(|job| job.state == JobState::Running)
+            .filter_map(|job| job.spec.array_job_id)
+            .fold(HashMap::new(), |mut counts, array_id| {
+                *counts.entry(array_id).or_insert(0) += 1;
+                counts
+            });
+        let mut candidates: Vec<PendingJobCandidate> = jobs
+            .values()
+            .filter(|job| job.state == JobState::Pending)
+            .filter(|job| !job.pending_reason.is_scheduling_hold())
+            .filter_map(|job| {
+                let before_begin_time = job.spec.begin_time.is_some_and(|begin| now < begin);
+                if before_begin_time && job.pending_reason == PendingReason::BeginTime {
+                    return None;
+                }
+                Some(PendingJobCandidate {
+                    job: job.clone(),
+                    scheduling_eligible: !before_begin_time,
+                    tag_reason: job.pending_reason != PendingReason::DeadLine,
+                })
+            })
+            .collect();
+        let mut blocked = Vec::new();
+
+        // Structural blockers retain their precedence before begin-time eligibility;
+        // unlike consumables, they do not reserve capacity while the job waits.
         {
             let partitions = self.partitions.read();
-            pending.retain(|job| partition_block(job, &partitions).is_none());
+            retain_unblocked(&mut candidates, &mut blocked, |job| {
+                partition_block(job, &partitions)
+            });
         }
 
-        // Check dependencies
         let get_job = |id: JobId| -> Option<Job> { jobs.get(&id).cloned() };
         let get_array_tasks = |id: JobId| -> Vec<Job> {
             jobs.values()
@@ -1573,112 +2419,116 @@ impl ClusterManager {
                 .collect()
         };
 
-        pending.retain(|job| {
+        retain_unblocked(&mut candidates, &mut blocked, |job| {
             if job.spec.dependency.is_empty() {
-                return true;
+                return None;
             }
             use spur_core::dependency::{check_dependencies, DependencyResult};
             match check_dependencies(job, &get_job, &get_array_tasks, &get_jobs_by_name_user) {
-                DependencyResult::Satisfied => true,
-                // Waiting and Failed are both filtered out of scheduling here.
-                // Failed jobs are separately cancelled by
-                // cancel_unsatisfiable_dependency_jobs() in the scheduler loop,
-                // which can take the write lock this read-locked scan cannot.
-                DependencyResult::Waiting | DependencyResult::Failed => false,
+                DependencyResult::Satisfied => None,
+                DependencyResult::Waiting | DependencyResult::Failed => {
+                    Some(PendingReason::Dependency)
+                }
             }
         });
 
-        // Filter out jobs whose begin_time is in the future (not yet eligible)
-        {
-            let now = Utc::now();
-            pending.retain(|job| {
-                if let Some(begin) = job.spec.begin_time {
-                    if now < begin {
-                        return false; // Not yet eligible
-                    }
-                }
-                true
-            });
-        }
+        let qos_by_job: HashMap<JobId, Qos> = candidates
+            .iter()
+            .map(|candidate| (candidate.job.job_id, self.resolve_qos(&candidate.job)))
+            .collect();
 
-        // Enforce array max_concurrent: suppress tasks if too many siblings already running
-        let running_array_counts: std::collections::HashMap<JobId, u32> = {
-            let mut counts = std::collections::HashMap::new();
-            for j in jobs.values() {
-                if j.state == JobState::Running {
-                    if let Some(aid) = j.spec.array_job_id {
-                        *counts.entry(aid).or_insert(0) += 1;
-                    }
-                }
-            }
-            counts
-        };
-        pending.retain(|job| {
-            if let (Some(aid), Some(max)) = (job.spec.array_job_id, job.spec.array_max_concurrent) {
-                let running = running_array_counts.get(&aid).copied().unwrap_or(0);
-                if running >= max {
-                    return false; // Throttled — too many siblings running
-                }
-            }
-            true
-        });
-
-        // QoS enforcement: check per-user limits for jobs with a QoS. Shares
-        // the eligibility logic with tag_blocked_pending_reasons() via
-        // qos_block_for() so the drop decision and the displayed reason agree.
-        pending.retain(|job| qos_block_for(job, &self.resolve_qos(job), &jobs).is_none());
-
-        // License enforcement is applied after the priority sort below, so scarce
-        // licenses are reserved highest-priority-first and a single pass cannot
-        // over-subscribe the pool.
-
-        // Reservation validation: reject jobs targeting expired/nonexistent reservations
-        {
-            let reservations = self.get_reservations();
-            let now = Utc::now();
-            pending.retain(|job| reservation_block(job, &reservations, now).is_none());
-        }
-
-        // Recompute effective priority with age + partition tier
-        let now = Utc::now();
-        let partitions = self.partitions.read();
         let reservations = self.get_reservations();
-        for job in &mut pending {
+        retain_unblocked(&mut candidates, &mut blocked, |job| {
+            reservation_block(job, &reservations, now)
+        });
+
+        let partitions = self.partitions.read();
+        for candidate in &mut candidates {
+            let job = &mut candidate.job;
             let age_minutes = (now - job.submit_time).num_minutes().max(0);
-            let partition_tier = job
-                .spec
-                .partition
-                .as_ref()
-                .and_then(|pname| partitions.iter().find(|p| p.name == *pname))
-                .map(|p| p.priority_tier)
-                .unwrap_or(1);
+            let partition_tier =
+                spur_core::partition::max_priority_tier(job.spec.partition.as_deref(), &partitions);
             let fair_share = self
                 .fairshare_cache
                 .get(&job.spec.user, job.spec.account.as_deref().unwrap_or(""));
-            job.priority = spur_sched::priority::effective_priority(
+            job.priority = compute_effective_priority(
                 job.priority,
                 fair_share,
                 age_minutes,
                 partition_tier,
+                &qos_by_job[&job.job_id],
             );
         }
         drop(partitions);
 
-        pending.sort_by(|a, b| {
-            let a_res = reservation::job_has_active_reservation(a, &reservations, now);
-            let b_res = reservation::job_has_active_reservation(b, &reservations, now);
-            b_res.cmp(&a_res).then(b.priority.cmp(&a.priority))
+        candidates.sort_by(|a, b| {
+            let a_res = reservation::job_has_active_reservation(&a.job, &reservations, now);
+            let b_res = reservation::job_has_active_reservation(&b.job, &reservations, now);
+            b_res
+                .cmp(&a_res)
+                .then(b.job.priority.cmp(&a.job.priority))
+                .then(a.job.job_id.cmp(&b.job.job_id))
         });
 
-        // License reservation, in priority order. `remaining` starts from current
-        // availability (config total minus licenses held by running jobs) and each
-        // kept job reserves its licenses so lower-priority jobs in the same pass see
-        // the reduced availability — preventing a single pass from over-subscribing.
-        // An absolute shortage is also reported as `Licenses` by
-        // tag_blocked_pending_reasons() via license_block().
+        let mut array_counts = running_array_counts;
+        for candidate in &mut candidates {
+            if !candidate.scheduling_eligible {
+                continue;
+            }
+            let (Some(array_id), Some(max)) = (
+                candidate.job.spec.array_job_id,
+                candidate.job.spec.array_max_concurrent,
+            ) else {
+                continue;
+            };
+            let count = array_counts.entry(array_id).or_insert(0);
+            if *count >= max {
+                candidate.scheduling_eligible = false;
+            } else {
+                *count += 1;
+            }
+        }
+
         {
-            let mut remaining = self.available_licenses_with(&jobs);
-            pending.retain(|job| {
+            let mut reserved = PassReservations::default();
+            candidates.retain(|candidate| {
+                if !candidate.scheduling_eligible {
+                    return true;
+                }
+                let job = &candidate.job;
+                if let Some(reason) =
+                    account_block_with(job, &self.association_cache, &jobs, &reserved)
+                {
+                    if account_block_for(job, &self.association_cache, &jobs).is_some() {
+                        record_blocked(&mut blocked, candidate, reason);
+                    }
+                    return false;
+                }
+                if let Some(reason) =
+                    qos_block_with(job, &qos_by_job[&job.job_id], &jobs, &reserved)
+                {
+                    if qos_block_for(job, &qos_by_job[&job.job_id], &jobs).is_some() {
+                        record_blocked(&mut blocked, candidate, reason);
+                    }
+                    return false;
+                }
+                reserved.reserve(job);
+                true
+            });
+        }
+
+        {
+            let available = self.available_licenses_with(&jobs);
+            let mut remaining = available.clone();
+            candidates.retain(|candidate| {
+                if !candidate.scheduling_eligible {
+                    return true;
+                }
+                let job = &candidate.job;
+                if let Some(reason) = license_block(job, &available) {
+                    record_blocked(&mut blocked, candidate, reason);
+                    return false;
+                }
                 let req = extract_license_requirements(&job.spec);
                 if req
                     .iter()
@@ -1695,38 +2545,49 @@ impl ClusterManager {
             });
         }
 
-        // Burst-buffer gate, after licenses (the most downstream consumable;
-        // staging happens last, just before dispatch). Two holds:
-        //   - capacity shortage: a job needing more BB than is free is dropped
-        //     (also reported `BurstBufferResources` by tag_blocked...).
-        //   - mid-stage-in: a job whose capacity is reserved but whose stage-in
-        //     has not completed (`Staging`) is NOT dispatchable yet; only a
-        //     `Ready` (or no-BB) job passes. `remaining` reserves capacity
-        //     highest-priority-first so one pass can't over-subscribe the pool.
+        let mut bb_stage_candidates = Vec::new();
         {
-            let mut remaining = self.available_bb_with(&jobs);
-            pending.retain(|job| {
+            let available = self.available_bb_with(&jobs);
+            let mut remaining = available;
+            candidates.retain(|candidate| {
+                if !candidate.scheduling_eligible {
+                    return true;
+                }
+                let job = &candidate.job;
+                if job.bb_stage_state == BbStageState::Staging {
+                    record_blocked(&mut blocked, candidate, PendingReason::BurstBufferStageIn);
+                    return false;
+                }
+                if let Some(reason) = burst_buffer_block(job, available) {
+                    record_blocked(&mut blocked, candidate, reason);
+                    return false;
+                }
                 let req = extract_bb_requirement(&job.spec);
                 if req == 0 {
-                    return true; // no BB -> unaffected by the gate
+                    return true;
                 }
-                match job.bb_stage_state {
-                    // Capacity already reserved in bb_capacity_in_use(), so
-                    // don't double-count `remaining`.
-                    BbStageState::Ready => true,
-                    BbStageState::Staging => false,
-                    BbStageState::None => {
-                        if req > remaining {
-                            return false;
-                        }
-                        remaining = remaining.saturating_sub(req);
-                        false
-                    }
+                if job.bb_stage_state == BbStageState::Ready {
+                    return true;
                 }
+                if req > remaining {
+                    return false;
+                }
+                remaining = remaining.saturating_sub(req);
+                bb_stage_candidates.push(job.job_id);
+                false
             });
         }
 
-        pending
+        candidates.retain(|candidate| candidate.scheduling_eligible);
+
+        PendingJobClassification {
+            jobs: candidates
+                .into_iter()
+                .map(|candidate| candidate.job)
+                .collect(),
+            blocked,
+            bb_stage_candidates,
+        }
     }
 
     /// Licenses held by jobs actively occupying resources
@@ -1807,58 +2668,48 @@ impl ClusterManager {
         self.available_bb_with(&jobs)
     }
 
-    /// Advance burst-buffer staging for pending BB jobs (leader-only; takes the
-    /// write lock). Reserves capacity highest-priority-first for jobs that have
-    /// not yet staged, moving them `None -> Staging`. Stage-in itself is
-    /// performed out-of-band; [`complete_bb_stage_in`](Self::complete_bb_stage_in)
-    /// advances `Staging -> Ready`. A `Ready` job is dispatchable; a `Staging`
-    /// job is held with `BurstBufferStageIn`. Returns the ids moved into staging.
+    /// Advance classifier-selected burst-buffer jobs from `None` to `Staging`.
+    /// Stage-in itself is performed out-of-band;
+    /// [`complete_bb_stage_in`](Self::complete_bb_stage_in) advances `Staging`
+    /// to `Ready`.
     ///
     /// NOTE: the actual data movement (the real stage-in) is a follow-up; this
     /// drives the controller-side state machine and the scheduler hold only.
-    pub fn advance_bb_staging(&self) -> Vec<JobId> {
+    fn advance_bb_staging_for(&self, candidates: &[JobId]) -> Vec<JobId> {
         let mut started = Vec::new();
         let mut jobs = self.jobs.write();
         let total = *self.burst_buffer_total_gb.read();
         let mut remaining =
             spur_core::burst_buffer::free_capacity_gb(total, Self::bb_capacity_in_use(&jobs));
 
-        // Reserve highest-priority-first so a scarce pool is not over-subscribed
-        // and low-priority jobs do not jump ahead of blocked high-priority ones.
-        let mut candidates: Vec<JobId> = jobs
-            .values()
-            .filter(|j| {
-                j.state == JobState::Pending
-                    && j.bb_stage_state == BbStageState::None
-                    && !j.pending_reason.is_scheduling_hold()
-                    && j.pending_reason != PendingReason::DeadLine
-                    && extract_bb_requirement(&j.spec) > 0
-            })
-            .map(|j| j.job_id)
-            .collect();
-        // Sort by priority desc, then job_id asc for determinism.
-        candidates.sort_by_key(|id| {
-            jobs.get(id)
-                .map(|j| (std::cmp::Reverse(j.priority), *id))
-                .unwrap_or((std::cmp::Reverse(0), *id))
-        });
-
         for id in candidates {
             let req = jobs
-                .get(&id)
-                .map(|j| extract_bb_requirement(&j.spec))
+                .get(id)
+                .filter(|job| {
+                    job.state == JobState::Pending
+                        && job.bb_stage_state == BbStageState::None
+                        && !job.pending_reason.is_scheduling_hold()
+                        && job.pending_reason != PendingReason::DeadLine
+                })
+                .map(|job| extract_bb_requirement(&job.spec))
                 .unwrap_or(0);
             if req == 0 || req > remaining {
                 continue;
             }
-            if let Some(job) = jobs.get_mut(&id) {
+            if let Some(job) = jobs.get_mut(id) {
                 job.bb_stage_state = BbStageState::Staging;
-                job.pending_reason = PendingReason::BurstBufferStageIn;
+                job.set_pending_reason(PendingReason::BurstBufferStageIn);
                 remaining = remaining.saturating_sub(req);
-                started.push(id);
+                started.push(*id);
             }
         }
         started
+    }
+
+    #[cfg(test)]
+    fn advance_bb_staging(&self) -> Vec<JobId> {
+        let candidates = self.classify_pending_jobs().bb_stage_candidates;
+        self.advance_bb_staging_for(&candidates)
     }
 
     /// Drive in-flight burst-buffer stage-ins to completion and return the ids
@@ -1896,7 +2747,7 @@ impl ClusterManager {
             if job.state == JobState::Pending && job.bb_stage_state == BbStageState::Staging {
                 job.bb_stage_state = BbStageState::Ready;
                 if job.pending_reason == PendingReason::BurstBufferStageIn {
-                    job.pending_reason = PendingReason::None;
+                    job.set_pending_reason(PendingReason::None);
                 }
                 self.scheduler_notify.notify_one();
                 return true;
@@ -1954,13 +2805,14 @@ impl ClusterManager {
             let mut jobs = self.jobs.write();
             for id in &to_wait {
                 if let Some(j) = jobs.get_mut(id) {
-                    // Don't clobber Held or DeadLine — matches
-                    // update_pending_reasons().
+                    // Don't clobber Held, DeadLine or a begin-hold reason —
+                    // matches update_pending_reasons().
                     if j.state == JobState::Pending
                         && !j.pending_reason.is_scheduling_hold()
                         && j.pending_reason != PendingReason::DeadLine
+                        && !j.reason_explains_begin_hold(Utc::now())
                     {
-                        j.pending_reason = PendingReason::Dependency;
+                        j.set_pending_reason(PendingReason::Dependency);
                     }
                 }
             }
@@ -1993,85 +2845,16 @@ impl ClusterManager {
         cancelled
     }
 
-    /// Set `pending_reason` for jobs `pending_jobs()` drops from scheduling
-    /// (dependency/QoS/license/reservation), which never reach
-    /// `update_pending_reasons()` and would otherwise show a stale reason.
-    /// Leader-only; mirrors `cancel_unsatisfiable_dependency_jobs()`.
-    pub fn tag_blocked_pending_reasons(&self) {
-        use spur_core::job::PendingReason;
+    /// Reclassify pending jobs and apply their displayed block reasons.
+    /// Leader-only; enforced by the scheduler-loop caller, not this function
+    /// itself (mirrors `cancel_unsatisfiable_dependency_jobs()`).
+    #[cfg(test)]
+    fn tag_blocked_pending_reasons(&self) {
+        let blocked = self.classify_pending_jobs().blocked;
+        self.apply_blocked_pending_reasons(blocked);
+    }
 
-        // Evaluate under read locks; release before taking the write lock.
-        let blocked: Vec<(JobId, PendingReason)> = {
-            let jobs = self.jobs.read();
-            let reservations = self.get_reservations();
-            let now = Utc::now();
-            let available = self.available_licenses_with(&jobs);
-            let partitions = self.partitions.read();
-            let bb_free = self.available_bb_with(&jobs);
-
-            // Dependency outranks QoS/Licenses/Reservation in pending_jobs() and
-            // is tagged just before this pass, so re-check it first (same closures).
-            use spur_core::dependency::{check_dependencies, DependencyResult};
-            let get_job = |id: JobId| -> Option<Job> { jobs.get(&id).cloned() };
-            let get_array_tasks = |id: JobId| -> Vec<Job> {
-                jobs.values()
-                    .filter(|j| j.spec.array_job_id == Some(id))
-                    .cloned()
-                    .collect()
-            };
-            let get_jobs_by_name_user = |name: &str, user: &str| -> Vec<Job> {
-                jobs.values()
-                    .filter(|j| j.spec.name == name && j.spec.user == user)
-                    .cloned()
-                    .collect()
-            };
-            let dependency_block = |job: &Job| -> Option<PendingReason> {
-                if job.spec.dependency.is_empty() {
-                    return None;
-                }
-                match check_dependencies(job, &get_job, &get_array_tasks, &get_jobs_by_name_user) {
-                    DependencyResult::Waiting | DependencyResult::Failed => {
-                        Some(PendingReason::Dependency)
-                    }
-                    DependencyResult::Satisfied => None,
-                }
-            };
-
-            // A BB job mid-stage-in displays `BurstBufferStageIn`; one short of
-            // free capacity displays `BurstBufferResources`. Staging is checked
-            // first so a job that already reserved capacity isn't mislabeled as
-            // a resource shortage.
-            let bb_block = |job: &Job| -> Option<PendingReason> {
-                if job.bb_stage_state == BbStageState::Staging {
-                    return Some(PendingReason::BurstBufferStageIn);
-                }
-                burst_buffer_block(job, bb_free)
-            };
-
-            jobs.values()
-                .filter(|job| {
-                    let begin_held = job.pending_reason == PendingReason::BeginTime
-                        && job.spec.begin_time.is_some_and(|b| now < b);
-                    job.state == JobState::Pending
-                        && !job.pending_reason.is_scheduling_hold()
-                        && job.pending_reason != PendingReason::DeadLine
-                        && !begin_held
-                })
-                .filter_map(|job| {
-                    // Same drop order as pending_jobs(): Part -> Dep -> QoS ->
-                    // Resv -> Lic -> BB (partition block is permanent, so first;
-                    // BB is last because staging runs just before dispatch).
-                    partition_block(job, &partitions)
-                        .or_else(|| dependency_block(job))
-                        .or_else(|| qos_block_for(job, &self.resolve_qos(job), &jobs))
-                        .or_else(|| reservation_block(job, &reservations, now))
-                        .or_else(|| license_block(job, &available))
-                        .or_else(|| bb_block(job))
-                        .map(|reason| (job.job_id, reason))
-                })
-                .collect()
-        };
-
+    fn apply_blocked_pending_reasons(&self, blocked: Vec<(JobId, PendingReason)>) {
         if blocked.is_empty() {
             return;
         }
@@ -2082,17 +2865,294 @@ impl ClusterManager {
             if let Some(j) = jobs.get_mut(&id) {
                 // Re-check under the write lock: the read snapshot was released,
                 // so the job may have started or been held/deadlined since.
-                let begin_held = j.pending_reason == PendingReason::BeginTime
-                    && j.spec.begin_time.is_some_and(|b| now < b);
                 if j.state == JobState::Pending
                     && !j.pending_reason.is_scheduling_hold()
                     && j.pending_reason != PendingReason::DeadLine
-                    && !begin_held
+                    && !j.reason_explains_begin_hold(now)
                 {
-                    j.pending_reason = reason;
+                    j.set_pending_reason(reason);
                 }
             }
         }
+    }
+
+    pub fn create_partition(&self, partition: Partition) -> Result<(), PartitionError> {
+        if partition.name.is_empty() {
+            return Err(PartitionError::invalid("partition name must not be empty"));
+        }
+        if self
+            .partitions
+            .read()
+            .iter()
+            .any(|p| p.name == partition.name)
+        {
+            return Err(PartitionError::already_exists(format!(
+                "partition '{}' already exists",
+                partition.name
+            )));
+        }
+        let resp = self
+            .propose(WalOperation::PartitionCreate { partition })
+            .map_err(|e| PartitionError::raft(e.to_string()))?;
+        if !resp.partition_created {
+            return Err(PartitionError::already_exists(
+                "partition already exists".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Update fields of an existing partition (persisted via Raft).
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_partition(
+        &self,
+        name: &str,
+        nodes: Option<String>,
+        selector: Option<std::collections::HashMap<String, String>>,
+        state: Option<String>,
+        is_default: Option<bool>,
+        max_time: Option<String>,
+        default_time: Option<String>,
+        max_nodes: Option<u32>,
+        clear_max_nodes: bool,
+        min_nodes: Option<u32>,
+        allow_accounts: Option<Vec<String>>,
+        allow_groups: Option<Vec<String>>,
+        deny_accounts: Option<Vec<String>>,
+        deny_qos: Option<Vec<String>>,
+        allow_qos: Option<Vec<String>>,
+        priority_tier: Option<u32>,
+        preempt_mode: Option<String>,
+    ) -> Result<(), PartitionError> {
+        if !self.partitions.read().iter().any(|p| p.name == name) {
+            return Err(PartitionError::not_found(format!(
+                "partition '{}' not found",
+                name
+            )));
+        }
+
+        let max_time_minutes = if let Some(ref t) = max_time {
+            if t.eq_ignore_ascii_case("INFINITE") || t.eq_ignore_ascii_case("UNLIMITED") {
+                Some(None)
+            } else {
+                let m = spur_core::config::parse_time_minutes(t)
+                    .ok_or_else(|| PartitionError::invalid(format!("invalid time: {}", t)))?;
+                Some(Some(m))
+            }
+        } else {
+            None
+        };
+
+        let default_time_minutes = if let Some(ref t) = default_time {
+            if t.eq_ignore_ascii_case("INFINITE") || t.eq_ignore_ascii_case("UNLIMITED") {
+                Some(None)
+            } else {
+                let m = spur_core::config::parse_time_minutes(t).ok_or_else(|| {
+                    PartitionError::invalid(format!("invalid default_time: {}", t))
+                })?;
+                Some(Some(m))
+            }
+        } else {
+            None
+        };
+
+        let max_nodes_wal = if clear_max_nodes {
+            Some(None)
+        } else {
+            max_nodes.map(Some)
+        };
+
+        self.propose(WalOperation::PartitionUpdate {
+            name: name.to_string(),
+            nodes,
+            selector,
+            state,
+            max_time_minutes,
+            default_time_minutes,
+            max_nodes: max_nodes_wal,
+            min_nodes,
+            allow_accounts,
+            allow_groups,
+            deny_accounts,
+            deny_qos,
+            allow_qos,
+            priority_tier,
+            preempt_mode,
+            is_default,
+        })
+        .map_err(|e| PartitionError::raft(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Delete a partition by name (persisted via Raft).
+    ///
+    /// Refuses if any running jobs are using the partition.
+    pub fn delete_partition(&self, name: &str) -> Result<(), PartitionError> {
+        if !self.partitions.read().iter().any(|p| p.name == name) {
+            return Err(PartitionError::not_found(format!(
+                "partition '{}' not found",
+                name
+            )));
+        }
+        for job in self.jobs.read().values() {
+            if !matches!(
+                job.state,
+                JobState::Running | JobState::Completing | JobState::Suspended
+            ) {
+                continue;
+            }
+            if job.spec.partition.as_deref() == Some(name) {
+                return Err(PartitionError::invalid(format!(
+                    "partition '{}' in use by running job {}",
+                    name, job.job_id
+                )));
+            }
+        }
+        self.propose(WalOperation::PartitionDelete {
+            name: name.to_string(),
+        })
+        .map_err(|e| PartitionError::raft(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Re-read spur.conf and apply it to the running controller.
+    ///
+    /// Makes the config file authoritative, matching `scontrol reconfigure`
+    /// semantics in Slurm: runtime-only changes not reflected in the conf are
+    /// overwritten by the incoming conf values.
+    ///
+    /// **Leader-only.** The command is forwarded to the Raft leader, and this
+    /// swaps only the leader's in-memory config — no WAL entry carries the new
+    /// config. Followers keep the config they read at startup until they
+    /// restart (in Kubernetes they re-read the same ConfigMap). Do not rely on
+    /// reconfigured non-partition state surviving an immediate failover.
+    /// Partition edits DO propagate (via partition WAL ops), but a follower
+    /// re-runs `reconcile_partitions` against its own stale `config().nodes`,
+    /// so after a partition edit followers pick up new partition membership but
+    /// keep old node features until restart. WAL-propagating config is a
+    /// planned follow-up.
+    ///
+    /// Reloaded live on the leader (readers take a fresh snapshot via
+    /// `config()`): `[[partitions]]`, `[[nodes]]` features/weight, `licenses`,
+    /// `burst_buffer`, `scheduler` tunables (`complete_wait`, `resv_overrun`),
+    /// `controller.max_batch_requeue`, `hooks`, `notifications`, `federation`,
+    /// `power` suspend/resume commands, `admission.mode`, and
+    /// `metrics.high_cardinality`.
+    ///
+    /// Restart-only (baked in at startup — mirrors Slurm's restart-required set
+    /// of ports/plugins/StateSaveLocation/AuthType): bind addresses and ports
+    /// (`controller.listen_addr`, `metrics`/`rest_api` listeners), the
+    /// accounting database pool (`accounting.database_url`), Raft identity/peers,
+    /// `controller.first_job_id`, `auth.jwt_key` (swapping it live would
+    /// instantly invalidate every outstanding node token), and the scheduler
+    /// loop cadence (`scheduler.interval_secs`, `max_jobs_per_cycle`,
+    /// `topology`).
+    pub fn reconfigure(&self) -> Result<(), anyhow::Error> {
+        let Some(ref path) = self.config_path else {
+            anyhow::bail!("reconfigure requires a config file path, but none is configured");
+        };
+        let new_config = spur_core::config::SlurmConfig::load_from_file(path)?;
+        let conf_partitions = new_config.build_partitions();
+
+        let conf_names: std::collections::HashSet<String> =
+            conf_partitions.iter().map(|p| p.name.clone()).collect();
+        let current_names: std::collections::HashSet<String> = self
+            .partitions
+            .read()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+
+        // Delete partitions absent from the new conf.
+        for name in current_names.difference(&conf_names) {
+            // Skip if active jobs are running on the partition — callers should
+            // drain first, matching Slurm's behaviour.
+            let in_use = self.jobs.read().values().any(|j| {
+                matches!(
+                    j.state,
+                    JobState::Running | JobState::Completing | JobState::Suspended
+                ) && j.spec.partition.as_deref() == Some(name.as_str())
+            });
+            if in_use {
+                warn!(
+                    partition = %name,
+                    "reconfigure: partition removed from conf but has active jobs; skipping deletion"
+                );
+                continue;
+            }
+            self.propose(WalOperation::PartitionDelete { name: name.clone() })
+                .map_err(|e| anyhow::anyhow!("reconfigure: delete {name}: {e}"))?;
+        }
+
+        // Create partitions present in conf but absent from current WAL state.
+        // `WalOperation::PartitionCreate`'s own apply already clears any
+        // tombstone for the name being (re)created — no separate step needed.
+        for part in conf_partitions
+            .iter()
+            .filter(|p| !current_names.contains(&p.name))
+        {
+            self.propose(WalOperation::PartitionCreate {
+                partition: part.clone(),
+            })
+            .map_err(|e| anyhow::anyhow!("reconfigure: create {}: {e}", part.name))?;
+        }
+
+        // Update partitions present in both — conf wins unconditionally.
+        for part in conf_partitions
+            .iter()
+            .filter(|p| current_names.contains(&p.name))
+        {
+            let preempt_str = match part.preempt_mode {
+                spur_core::partition::PreemptMode::Cancel => "cancel",
+                spur_core::partition::PreemptMode::Requeue => "requeue",
+                spur_core::partition::PreemptMode::Suspend => "suspend",
+                spur_core::partition::PreemptMode::Off => "off",
+            };
+            self.propose(WalOperation::PartitionUpdate {
+                name: part.name.clone(),
+                nodes: Some(part.nodes.clone()),
+                selector: Some(part.selector.clone()),
+                state: Some(part.state.to_string()),
+                max_time_minutes: Some(part.max_time_minutes),
+                default_time_minutes: Some(part.default_time_minutes),
+                max_nodes: Some(part.max_nodes),
+                min_nodes: Some(part.min_nodes),
+                allow_accounts: Some(part.allow_accounts.clone()),
+                allow_groups: Some(part.allow_groups.clone()),
+                deny_accounts: Some(part.deny_accounts.clone()),
+                deny_qos: Some(part.deny_qos.clone()),
+                allow_qos: Some(part.allow_qos.clone()),
+                priority_tier: Some(part.priority_tier),
+                preempt_mode: Some(preempt_str.to_string()),
+                is_default: Some(part.is_default),
+            })
+            .map_err(|e| anyhow::anyhow!("reconfigure: update {}: {e}", part.name))?;
+        }
+
+        // Re-derive the config-total pools. Availability is computed as total
+        // minus in-use elsewhere, so swapping the totals cannot strand
+        // capacity already held by running jobs.
+        *self.license_pool.write() = new_config.licenses.clone();
+        *self.burst_buffer_total_gb.write() = new_config.burst_buffer.total_gb;
+
+        // Swap the live config last, after partition WAL ops have been accepted,
+        // so a mid-reconfigure failure leaves the previous config in place.
+        // Readers pick up the new sections on their next `config()` snapshot.
+        *self.config.write() = Arc::new(new_config);
+
+        // Re-derive per-node `[[nodes]]` policy (features/weight) and partition
+        // membership against the freshly-swapped config. This is a local derived
+        // projection (recomputed identically on snapshot restore and inside the
+        // partition WAL apply handlers), so recomputing it here is consistent.
+        // Partition ops above already trigger the same recompute on every peer
+        // via the WAL; this covers a nodes-only edit that proposes no op.
+        {
+            let mut nodes = self.nodes.write();
+            self.reconcile_partitions(&mut nodes);
+        }
+
+        info!("reconfigure: applied spur.conf on this leader (followers converge on restart); restart-only sections (listen ports, accounting DB, raft peers, jwt_key, scheduler cadence) unchanged until controller restart");
+        Ok(())
     }
 
     /// Create a new reservation (validated, persisted via Raft).
@@ -2122,7 +3182,10 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Update an existing reservation (validated, persisted via Raft).
+    /// Update an existing reservation (validated, persisted via Raft). The
+    /// requesting `user` must be the reservation owner, root, or empty (trusted
+    /// internal calls); legacy reservations with no recorded owner are
+    /// modifiable by anyone.
     #[allow(clippy::too_many_arguments)]
     pub fn update_reservation(
         &self,
@@ -2134,6 +3197,7 @@ impl ClusterManager {
         remove_users: &[String],
         add_accounts: &[String],
         remove_accounts: &[String],
+        user: &str,
     ) -> Result<(), ReservationError> {
         let mut preview = self
             .reservations
@@ -2144,6 +3208,13 @@ impl ClusterManager {
             .ok_or_else(|| {
                 ReservationError::not_found(format!("reservation '{}' not found", name))
             })?;
+
+        if !preview.can_be_managed_by(user) {
+            return Err(ReservationError::permission_denied(format!(
+                "user '{}' cannot modify reservation '{}' owned by '{}'",
+                user, name, preview.owner
+            )));
+        }
 
         if duration_minutes > 0 {
             preview.end_time =
@@ -2163,9 +3234,9 @@ impl ClusterManager {
             }
         }
         preview.nodes.retain(|n| !remove_nodes.contains(n));
-        for user in add_users {
-            if !preview.users.contains(user) {
-                preview.users.push(user.clone());
+        for add_user in add_users {
+            if !preview.users.contains(add_user) {
+                preview.users.push(add_user.clone());
             }
         }
         preview.users.retain(|u| !remove_users.contains(u));
@@ -2195,13 +3266,24 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Delete a reservation by name (persisted via Raft).
-    pub fn delete_reservation(&self, name: &str) -> Result<(), ReservationError> {
-        if !self.reservations.read().iter().any(|r| r.name == name) {
-            return Err(ReservationError::not_found(format!(
-                "reservation '{}' not found",
-                name
-            )));
+    /// Delete a reservation by name (persisted via Raft). The requesting `user`
+    /// must be the reservation owner, root, or empty (trusted internal calls);
+    /// legacy reservations with no recorded owner are deletable by anyone.
+    pub fn delete_reservation(&self, name: &str, user: &str) -> Result<(), ReservationError> {
+        {
+            let reservations = self.reservations.read();
+            let res = reservations
+                .iter()
+                .find(|r| r.name == name)
+                .ok_or_else(|| {
+                    ReservationError::not_found(format!("reservation '{}' not found", name))
+                })?;
+            if !res.can_be_managed_by(user) {
+                return Err(ReservationError::permission_denied(format!(
+                    "user '{}' cannot delete reservation '{}' owned by '{}'",
+                    user, name, res.owner
+                )));
+            }
         }
 
         for job in self.jobs.read().values() {
@@ -2252,10 +3334,53 @@ impl ClusterManager {
         }
     }
 
+    /// Evict finished jobs whose end_time is older than the retention window,
+    /// bounding controller memory. No-op when nothing has aged out.
+    pub fn evict_expired_terminal_jobs(&self) {
+        // Floor above the reconcile interval so a job survives at least one
+        // accounting reconcile pass before it can be evicted (retention 0 included).
+        let retention = self
+            .config()
+            .controller
+            .terminal_job_retention_secs
+            .max(crate::accounting::RECONCILE_INTERVAL_SECS);
+        let before = Utc::now() - chrono::Duration::seconds(retention as i64);
+        let jobs = self.jobs.read();
+        // Spare a target still referenced by a live job's dependency: dropping it
+        // makes resolve_target_state return None, which cancels/early-releases dependents.
+        let mut referenced: HashSet<JobId> = HashSet::new();
+        for j in jobs.values().filter(|j| !j.state.is_finalized()) {
+            for dep in spur_core::dependency::parse_dependencies(&j.spec.dependency) {
+                if let Some(id) = dep.target_job_id() {
+                    referenced.insert(id);
+                }
+            }
+        }
+        // is_finalized is load-bearing, not redundant: end_time survives a
+        // requeue, so a re-dispatched job's stale end_time alone would reap it.
+        let job_ids: Vec<JobId> = jobs
+            .iter()
+            .filter(|(id, j)| {
+                j.state.is_finalized()
+                    && j.end_time.is_some_and(|t| t < before)
+                    && !referenced.contains(id)
+                    && j.spec.array_job_id.is_none_or(|p| !referenced.contains(&p))
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        drop(jobs);
+        if job_ids.is_empty() {
+            return;
+        }
+        if let Err(e) = self.propose(WalOperation::EvictTerminalJobs { job_ids }) {
+            warn!(error = %e, "failed to evict expired terminal jobs");
+        }
+    }
+
     /// Cancel running jobs whose reservation window has ended (after optional grace).
     pub fn enforce_reservation_end_times(&self) {
         let now = Utc::now();
-        let grace = chrono::Duration::minutes(self.config.scheduler.resv_overrun_minutes as i64);
+        let grace = chrono::Duration::minutes(self.config().scheduler.resv_overrun_minutes as i64);
         let reservations: std::collections::HashMap<String, Reservation> = self
             .get_reservations()
             .into_iter()
@@ -2344,7 +3469,7 @@ impl ClusterManager {
                 continue;
             }
             job.priority = 0;
-            job.pending_reason = PendingReason::ReservationDeleted;
+            job.set_pending_reason(PendingReason::ReservationDeleted);
         }
     }
 
@@ -2358,7 +3483,7 @@ impl ClusterManager {
             }
             job.spec.reservation = None;
             if job.pending_reason == PendingReason::ReservationDeleted {
-                job.pending_reason = PendingReason::None;
+                job.set_pending_reason(PendingReason::None);
             }
         }
     }
@@ -2442,16 +3567,15 @@ impl ClusterManager {
             if job_entry.pending_reason == PendingReason::DeadLine {
                 continue;
             }
-            // Keep an active BeginTime hold (e.g. requeue-by-preemption) until
-            // it lapses, then fall through to the real wait reason.
-            if job_entry.pending_reason == PendingReason::BeginTime
-                && job_entry.spec.begin_time.is_some_and(|b| Utc::now() < b)
-            {
+            // Keep a reason that explains an active begin_time hold (preemption
+            // requeue, launch-failure backoff) until it lapses, then fall through
+            // to the real wait reason.
+            if job_entry.reason_explains_begin_hold(Utc::now()) {
                 continue;
             }
 
             if let Some(reason) = reservation_fence_reason(job, cluster_state) {
-                job_entry.pending_reason = reason;
+                job_entry.set_pending_reason(reason);
                 continue;
             }
 
@@ -2468,6 +3592,19 @@ impl ClusterManager {
                 .filter(|n| placement.eligible(n, cluster_state.reservations, now))
                 .collect();
 
+            let required = spur_sched::backfill::job_resource_request(job);
+            if placement.nodelist_is_additive()
+                && eligible.iter().any(|node| {
+                    placement.is_listed(&node.name)
+                        && node.total_resources.can_satisfy(&required)
+                        && (!placement.matches(node, cluster_state.reservations, now)
+                            || !node.can_satisfy_request(&required))
+                })
+            {
+                job_entry.set_pending_reason(PendingReason::ReqNodeNotAvail);
+                continue;
+            }
+
             // Fewer eligible nodes than requested: unschedulable as written.
             if eligible.len() < needed {
                 let partition_size = cluster_state
@@ -2476,15 +3613,17 @@ impl ClusterManager {
                     .filter(|n| placement.in_partition(n))
                     .count();
 
-                job_entry.pending_reason = if needed > partition_size {
+                job_entry.set_pending_reason(if needed > partition_size {
                     PendingReason::PartitionNodeLimit
                 } else if job.spec.constraint.is_some() && eligible.is_empty() {
                     PendingReason::BadConstraints
-                } else if job.spec.nodelist.as_deref().is_some_and(|s| !s.is_empty()) {
+                } else if job.spec.nodelist.as_deref().is_some_and(|s| !s.is_empty())
+                    && !placement.nodelist_is_additive()
+                {
                     PendingReason::ReqNodeNotAvail
                 } else {
                     PendingReason::Resources
-                };
+                });
                 continue;
             }
 
@@ -2492,36 +3631,47 @@ impl ClusterManager {
             // `Allocated` cluster out of NodeDown; a nodelist pin to down nodes
             // is ReqNodeNotAvail (Slurm parity).
             if eligible.iter().all(|n| !n.state.is_up()) {
-                job_entry.pending_reason =
+                job_entry.set_pending_reason(
                     if job.spec.nodelist.as_deref().is_some_and(|s| !s.is_empty()) {
                         PendingReason::ReqNodeNotAvail
                     } else {
                         PendingReason::NodeDown
-                    };
+                    },
+                );
                 continue;
             }
 
             // Fewer nodes free (schedulable, available resources) than needed →
             // Resources; otherwise queued behind higher priority.
-            let required = spur_sched::backfill::job_resource_request(job);
+            let has_capacity = |n: &spur_core::node::Node| {
+                n.has_free_cpu_capacity() && n.can_satisfy_request(&required)
+            };
             let free_now = eligible
                 .iter()
                 .filter(|n| placement.matches(n, cluster_state.reservations, now))
-                .filter(|n| {
-                    if n.alloc_resources.cpus >= n.total_resources.cpus
-                        && n.total_resources.cpus > 0
-                    {
-                        return false;
-                    }
-                    n.can_satisfy_request(&required)
-                })
+                .filter(|n| has_capacity(n))
                 .count();
 
-            job_entry.pending_reason = if free_now < needed {
-                PendingReason::Resources
-            } else {
+            let reason = if free_now >= needed {
                 PendingReason::Priority
+            } else {
+                // k0s-caused shortfall: nodes that would match but for the k0s gate.
+                // Uses matches_ignoring_k0s so exclusive/idle rules stay in lockstep.
+                let k0s_blocked = eligible
+                    .iter()
+                    .filter(|n| {
+                        n.is_k0s_reserved()
+                            && placement.matches_ignoring_k0s(n, cluster_state.reservations, now)
+                            && has_capacity(n)
+                    })
+                    .count();
+                if free_now + k0s_blocked >= needed {
+                    PendingReason::K8sReserved
+                } else {
+                    PendingReason::Resources
+                }
             };
+            job_entry.set_pending_reason(reason);
         }
     }
 
@@ -2529,7 +3679,8 @@ impl ClusterManager {
     ///
     /// Uses `curl` as a subprocess to avoid pulling in an HTTP client dependency.
     fn send_notification(&self, job_id: JobId, event: &str, spec: &JobSpec) {
-        let webhook_url = self.config.notifications.webhook_url.clone();
+        let config = self.config();
+        let webhook_url = config.notifications.webhook_url.clone();
         if let Some(url) = webhook_url {
             let event = event.to_string();
             let user = spec.user.clone();
@@ -2580,9 +3731,8 @@ impl ClusterManager {
         }
 
         // SMTP email notification via sendmail-compatible command
-        if let Some(ref smtp_cmd) = self.config.notifications.smtp_command {
-            let from = self
-                .config
+        if let Some(ref smtp_cmd) = config.notifications.smtp_command {
+            let from = config
                 .notifications
                 .from_address
                 .as_deref()
@@ -2656,11 +3806,31 @@ impl ClusterManager {
     }
 
     /// Resolve a job's QoS from the cache; unknown/absent name → limitless default.
-    fn resolve_qos(&self, job: &Job) -> Qos {
+    pub(crate) fn resolve_qos(&self, job: &Job) -> Qos {
         match job.spec.qos.as_deref() {
             Some(name) => self.qos_cache.get(name).unwrap_or_default(),
             None => Qos::default(),
         }
+    }
+
+    /// Recompute a job's live effective priority (a running job's stored
+    /// `priority` is stale). Takes `qos` pre-resolved so it can be reused,
+    /// and `partitions` so callers iterating over multiple jobs don't pay
+    /// for a separate lock acquisition per call.
+    pub(crate) fn current_effective_priority_with_qos(
+        &self,
+        job: &Job,
+        qos: &Qos,
+        partitions: &[Partition],
+    ) -> u32 {
+        let now = Utc::now();
+        let age_minutes = (now - job.submit_time).num_minutes().max(0);
+        let partition_tier =
+            spur_core::partition::max_priority_tier(job.spec.partition.as_deref(), partitions);
+        let fair_share = self
+            .fairshare_cache
+            .get(&job.spec.user, job.spec.account.as_deref().unwrap_or(""));
+        compute_effective_priority(job.priority, fair_share, age_minutes, partition_tier, qos)
     }
 
     /// Persist a mutation via Raft consensus. The apply callback
@@ -2705,25 +3875,57 @@ impl ClusterManager {
         .map_err(|e| anyhow::anyhow!("raft propose failed: {}", e))
     }
 
-    /// Clear a job's run-state so it is schedulable again after requeue.
-    fn reset_job_for_requeue(job: &mut Job) {
-        job.requeue_count += 1;
+    /// Clear a job's run-state fields so it's schedulable again after requeue.
+    /// Does not bump either counter; callers do that based on why they're requeuing.
+    fn clear_run_state_for_requeue(job: &mut Job) {
         job.start_time = None;
         job.exit_code = None;
         job.allocated_nodes.clear();
         job.allocated_resources = None;
         job.per_node_alloc.clear();
+        job.time_limit_signaled_at = None;
         job.pending_reason = PendingReason::None;
+        job.pending_reason_desc = None;
+        // Stale after requeue (points at nodes the job left); next dispatch resets it.
+        job.actual_stdout_path = None;
+        job.actual_stderr_path = None;
+    }
+
+    pub fn set_job_launch_failure_detail(
+        &self,
+        job_id: JobId,
+        detail: String,
+    ) -> anyhow::Result<()> {
+        self.propose(WalOperation::JobLaunchFailureDetail { job_id, detail })?;
+        Ok(())
+    }
+
+    /// Requeue after a dispatch failure or Timeout/NodeFail: counts against
+    /// `max_batch_requeue`.
+    fn reset_job_for_requeue(job: &mut Job) {
+        job.requeue_count += 1;
+        Self::clear_run_state_for_requeue(job);
+    }
+
+    /// Requeue after preemption: tracked separately since it isn't a failure
+    /// signal and must never contribute to the `max_batch_requeue` hold.
+    fn reset_job_for_preempt_requeue(job: &mut Job) {
+        job.preempt_requeue_count += 1;
+        Self::clear_run_state_for_requeue(job);
     }
 
     /// Evict a single job by ID: transition to NodeFail, then free its
     /// allocations on every node it spans. Transition is validated first
     /// so allocations are never freed for a job that can't be evicted.
-    fn evict_job(
+    /// Nodes that already reported completion via `JobNodeComplete` (which
+    /// frees a node's slice as it arrives, ahead of the whole job finishing)
+    /// are skipped so their resources aren't subtracted twice.
+    fn evict_job_locked(
         job_id: JobId,
         jobs: &mut HashMap<JobId, Job>,
         nodes: &mut HashMap<String, Node>,
         timestamp: chrono::DateTime<Utc>,
+        reason: PendingReason,
     ) -> Option<JobFinalized> {
         let job = jobs.get_mut(&job_id)?;
 
@@ -2736,13 +3938,17 @@ impl ClusterManager {
         }
         job.exit_code = Some(-1);
         job.end_time = Some(timestamp);
-        job.pending_reason = PendingReason::NodeDown;
+        job.set_pending_reason(reason);
+        let already_deallocated: Vec<String> = job.node_completions.keys().cloned().collect();
         job.node_completions.clear();
 
         let alloc_nodes = job.allocated_nodes.clone();
         if let Some(ref total) = job.allocated_resources {
             let node_count = alloc_nodes.len().max(1) as u32;
             for alloc_node in &alloc_nodes {
+                if already_deallocated.iter().any(|n| n == alloc_node) {
+                    continue;
+                }
                 if let Some(node) = nodes.get_mut(alloc_node) {
                     let slice = job
                         .per_node_alloc
@@ -2794,7 +4000,9 @@ impl ClusterManager {
             .collect();
 
         for jid in affected {
-            if let Some(fin) = Self::evict_job(jid, jobs, nodes, timestamp) {
+            if let Some(fin) =
+                Self::evict_job_locked(jid, jobs, nodes, timestamp, PendingReason::NodeDown)
+            {
                 response.jobs_finalized.push(fin);
             }
         }
@@ -2834,6 +4042,8 @@ impl ClusterManager {
                 new_state,
                 pending_reason,
                 pending_priority,
+                begin_time,
+                pending_reason_desc,
                 ..
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
@@ -2847,22 +4057,38 @@ impl ClusterManager {
                     // Gated on a real transition so a replay doesn't re-wipe
                     // fields or double-count requeue_count.
                     if outcome == TransitionOutcome::Applied && *new_state == JobState::Pending {
-                        let max = self.config.controller.max_batch_requeue;
+                        let max = self.config().controller.max_batch_requeue;
                         if job.requeue_count < max {
                             Self::reset_job_for_requeue(job);
                         } else {
-                            job.start_time = None;
-                            job.exit_code = None;
-                            job.allocated_nodes.clear();
-                            job.allocated_resources = None;
-                            job.per_node_alloc.clear();
+                            Self::clear_run_state_for_requeue(job);
                         }
-                        job.pending_reason = pending_reason.clone().unwrap_or(PendingReason::None);
+                        let reason = pending_reason.clone().unwrap_or(PendingReason::None);
+                        match pending_reason_desc {
+                            Some(desc) => job.set_pending_reason_desc(reason, desc.clone()),
+                            None => job.set_pending_reason(reason),
+                        }
                         if let Some(priority) = pending_priority {
                             job.priority = *priority;
                         }
+                        if let Some(hold) = begin_time {
+                            job.spec.begin_time = Some(*hold);
+                        }
                     }
                 }
+            }
+            WalOperation::JobDispatchBackoff { job_id, begin_time } => {
+                // NoOp if the job left Pending since the leader proposed this
+                // (e.g. a concurrent cancel).
+                let Some(job) = jobs.get_mut(job_id) else {
+                    return ClientResponse::default();
+                };
+                if job.state != JobState::Pending {
+                    return ClientResponse::default();
+                }
+                Self::reset_job_for_requeue(job);
+                job.spec.begin_time = Some(*begin_time);
+                job.set_pending_reason(PendingReason::JobLaunchFailure);
             }
             WalOperation::JobPreemptRequeue { job_id, begin_time } => {
                 // Only a running job is preempted; on replay the job is already
@@ -2898,9 +4124,9 @@ impl ClusterManager {
                         warn!(job_id = *job_id, error = %e, "invalid requeue transition in WAL apply");
                         return ClientResponse::default();
                     }
-                    Self::reset_job_for_requeue(job);
+                    Self::reset_job_for_preempt_requeue(job);
                     job.spec.begin_time = Some(*begin_time);
-                    job.pending_reason = PendingReason::BeginTime;
+                    job.set_pending_reason(PendingReason::BeginTime);
                 }
                 if let Some(ref total) = allocated_resources {
                     let node_count = freed_nodes.len().max(1) as u32;
@@ -2965,18 +4191,42 @@ impl ClusterManager {
                     }
                 }
             }
+            WalOperation::JobEvict { job_id, detail } => {
+                if let Some(job) = jobs.get_mut(job_id) {
+                    job.launch_failure_detail = detail.clone();
+                }
+                if let Some(fin) = Self::evict_job_locked(
+                    *job_id,
+                    &mut jobs,
+                    &mut nodes,
+                    timestamp,
+                    PendingReason::JobLaunchFailure,
+                ) {
+                    response.jobs_finalized.push(fin);
+                }
+            }
+            WalOperation::JobLaunchFailureDetail { job_id, detail } => {
+                if let Some(job) = jobs.get_mut(job_id) {
+                    job.launch_failure_detail = Some(detail.clone());
+                }
+            }
             WalOperation::JobStart {
                 job_id,
                 nodes: node_names,
                 resources,
                 per_node_alloc,
+                srun_step_dispatch,
+                run_attempt,
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.start_time = Some(timestamp);
                     job.allocated_nodes = node_names.clone();
                     job.allocated_resources = Some(resources.clone());
                     job.per_node_alloc = per_node_alloc.clone();
-                    job.pending_reason = PendingReason::None;
+                    job.set_pending_reason(PendingReason::None);
+                    job.srun_step_dispatch = *srun_step_dispatch;
+                    job.run_attempt = *run_attempt;
+                    job.launch_failure_detail = None;
                 }
                 let node_count = node_names.len().max(1) as u32;
                 for name in node_names {
@@ -3068,11 +4318,8 @@ impl ClusterManager {
                         let (derived_state, final_exit, raw_signal) =
                             Job::derived_completion(&job.node_completions, &primary);
                         let final_signal = raw_signal & !spur_core::job::OOM_SIGNAL_FLAG;
-                        let final_state = if oom {
-                            JobState::OutOfMemory
-                        } else {
-                            derived_state
-                        };
+                        let (final_state, final_reason) =
+                            job.completion_verdict(derived_state, final_exit, final_signal, oom);
                         match job.transition(final_state) {
                             Ok(()) => {
                                 job.exit_code = Some(final_exit);
@@ -3081,15 +4328,7 @@ impl ClusterManager {
                                 // steps, accumulated live by JobStepComplete; a
                                 // job with no srun steps keeps 0 (Slurm parity),
                                 // not the batch exit. Left as-is here.
-                                job.pending_reason = if oom {
-                                    PendingReason::OutOfMemory
-                                } else if final_signal != 0 {
-                                    PendingReason::RaisedSignal
-                                } else if final_exit != 0 {
-                                    PendingReason::NonZeroExitCode
-                                } else {
-                                    PendingReason::None
-                                };
+                                job.set_pending_reason(final_reason);
                                 job.end_time = Some(timestamp);
                                 job.node_completions.clear();
                                 Some((final_state, final_exit))
@@ -3121,6 +4360,15 @@ impl ClusterManager {
                         }],
                         ..Default::default()
                     };
+                }
+            }
+            WalOperation::JobTimeLimitSignaled { job_id, at } => {
+                if let Some(job) = jobs.get_mut(job_id) {
+                    // A run that already ended keeps the verdict it finalized
+                    // with: the watchdog raced the job's own exit and lost.
+                    if job.state.is_active() && job.time_limit_signaled_at.is_none() {
+                        job.time_limit_signaled_at = Some(*at);
+                    }
                 }
             }
             WalOperation::JobComplete {
@@ -3157,6 +4405,11 @@ impl ClusterManager {
                     }
                     job.exit_code = Some(*exit_code);
                     job.end_time = Some(timestamp);
+                    // Derived from the replicated entry, so every replica reports
+                    // the same reason for a job the watchdog had to force-kill.
+                    if *state == JobState::Timeout {
+                        job.set_pending_reason(PendingReason::TimeLimit);
+                    }
                     // Suspended -> terminal: fold the final suspended interval in
                     // and clear suspended_at so it never lingers on a terminal job.
                     if let Some(since) = job.suspended_at.take() {
@@ -3231,10 +4484,34 @@ impl ClusterManager {
                     }
                 }
             }
+            WalOperation::JobStepCreate { step } => match jobs.get(&step.job_id) {
+                None => {
+                    warn!(
+                        job_id = step.job_id,
+                        step_id = step.step_id,
+                        "JobStepCreate: skipping step for unknown job"
+                    );
+                }
+                Some(job) if job.state.is_terminal() => {
+                    warn!(
+                        job_id = step.job_id,
+                        step_id = step.step_id,
+                        state = ?job.state,
+                        "JobStepCreate: skipping step for terminal job"
+                    );
+                }
+                Some(_) => {
+                    let mut steps = self.steps.write();
+                    steps
+                        .entry((step.job_id, step.step_id))
+                        .or_insert_with(|| (**step).clone());
+                }
+            },
             WalOperation::JobPriorityChange {
                 job_id,
                 new_priority,
                 pending_reason,
+                pending_reason_desc,
                 reset_requeue_count,
                 clear_reservation,
                 ..
@@ -3242,7 +4519,10 @@ impl ClusterManager {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.priority = *new_priority;
                     if let Some(reason) = pending_reason {
-                        job.pending_reason = reason.clone();
+                        match pending_reason_desc {
+                            Some(desc) => job.set_pending_reason_desc(reason.clone(), desc.clone()),
+                            None => job.set_pending_reason(reason.clone()),
+                        }
                     }
                     if *reset_requeue_count {
                         job.requeue_count = 0;
@@ -3254,23 +4534,34 @@ impl ClusterManager {
             }
             WalOperation::NodeRegister {
                 name,
+                hostname,
                 resources,
                 address,
                 port,
                 wg_pubkey,
                 version,
                 labels,
+                source,
             } => {
                 let mut node = Node::new(name.clone(), resources.clone());
-                node.address = Some(address.clone());
-                node.port = *port;
+                node.hostname = if hostname.is_empty() {
+                    name.clone()
+                } else {
+                    hostname.clone()
+                };
                 node.labels = labels.clone();
+                self.apply_node_config_policy(&mut node);
+                if !address.is_empty() {
+                    node.address = Some(address.clone());
+                }
+                node.port = *port;
                 if !wg_pubkey.is_empty() {
                     node.wg_pubkey = Some(wg_pubkey.clone());
                 }
                 if !version.is_empty() {
                     node.version = Some(version.clone());
                 }
+                node.source = spur_core::node::resolve_wal_node_source(source, version, labels);
                 node.last_heartbeat = Some(Utc::now());
                 node.state = node
                     .state
@@ -3294,15 +4585,6 @@ impl ClusterManager {
                 }
                 drop(partitions);
 
-                // Apply features/weight from matching NodeConfig (by hostname OR selector)
-                for nc in &self.config.nodes {
-                    if node_config_matches(nc, name, labels) {
-                        node.features = nc.features.clone();
-                        node.weight = nc.weight;
-                        break;
-                    }
-                }
-
                 let mut nodes = self.nodes.write();
                 nodes.insert(name.clone(), node);
                 self.next_job_id.store(next_id, Ordering::Relaxed);
@@ -3310,15 +4592,22 @@ impl ClusterManager {
             }
             WalOperation::NodeUpdate {
                 name,
+                hostname,
                 resources,
                 address,
                 port,
                 wg_pubkey,
                 version,
+                source,
             } => {
                 if let Some(node) = nodes.get_mut(name) {
                     node.total_resources = resources.clone();
-                    node.address = Some(address.clone());
+                    if !hostname.is_empty() {
+                        node.hostname = hostname.clone();
+                    }
+                    if !address.is_empty() {
+                        node.address = Some(address.clone());
+                    }
                     node.port = *port;
                     if !wg_pubkey.is_empty() {
                         node.wg_pubkey = Some(wg_pubkey.clone());
@@ -3326,6 +4615,8 @@ impl ClusterManager {
                     if !version.is_empty() {
                         node.version = Some(version.clone());
                     }
+                    node.source =
+                        spur_core::node::resolve_wal_node_source(source, version, &node.labels);
                     node.last_heartbeat = Some(Utc::now());
                 }
             }
@@ -3370,14 +4661,7 @@ impl ClusterManager {
                     }
                     node.partitions = matched;
 
-                    // Re-apply NodeConfig features/weight
-                    for nc in &self.config.nodes {
-                        if node_config_matches(nc, &node.name, &node.labels) {
-                            node.features = nc.features.clone();
-                            node.weight = nc.weight;
-                            break;
-                        }
-                    }
+                    self.apply_node_config_policy(node);
                 }
             }
             WalOperation::NodeRemove { name, reason } => {
@@ -3405,6 +4689,164 @@ impl ClusterManager {
                 if let Some(t) = self.tokens.write().get_mut(token_id) {
                     t.revoked = true;
                 }
+            }
+            WalOperation::PartitionCreate { partition } => {
+                // A create always clears any tombstone for this name — the admin
+                // is explicitly recreating a previously-deleted partition.
+                self.deleted_partition_names.write().remove(&partition.name);
+                {
+                    let mut partitions = self.partitions.write();
+                    let existing = partitions.iter().position(|p| p.name == partition.name);
+                    // Seeded name => the existing entry is only the pre-replay
+                    // config seed, so the WAL entry overrides it; else duplicate.
+                    let seeded = self
+                        .config_seeded_partitions
+                        .write()
+                        .remove(&partition.name);
+                    match existing {
+                        Some(idx) if seeded => {
+                            if partition.is_default {
+                                for p in partitions.iter_mut() {
+                                    p.is_default = false;
+                                }
+                            }
+                            partitions[idx] = partition.clone();
+                            response.partition_created = true;
+                            info!(name = %partition.name, "partition restored from WAL over config seed");
+                        }
+                        Some(_) => {
+                            warn!(
+                                name = %partition.name,
+                                "duplicate partition create in WAL apply, ignoring"
+                            );
+                        }
+                        None => {
+                            // Promote exactly one default: clear all others when
+                            // the new partition is created as the default.
+                            if partition.is_default {
+                                for p in partitions.iter_mut() {
+                                    p.is_default = false;
+                                }
+                            }
+                            partitions.push(partition.clone());
+                            response.partition_created = true;
+                            info!(name = %partition.name, "partition created");
+                        }
+                    }
+                }
+                // Node-to-partition membership is derived from the partition
+                // table (nodes/selector match), so a create can immediately
+                // change which partitions already-registered nodes belong to.
+                self.reconcile_partitions(&mut nodes);
+            }
+            WalOperation::PartitionUpdate {
+                name,
+                nodes: new_hostlist,
+                selector,
+                state,
+                max_time_minutes,
+                default_time_minutes,
+                max_nodes,
+                min_nodes,
+                allow_accounts,
+                allow_groups,
+                deny_accounts,
+                deny_qos,
+                allow_qos,
+                priority_tier,
+                preempt_mode,
+                is_default,
+            } => {
+                {
+                    let mut partitions = self.partitions.write();
+                    let set_as_default = *is_default == Some(true);
+                    if let Some(part) = partitions.iter_mut().find(|p| p.name == *name) {
+                        if let Some(n) = new_hostlist {
+                            part.nodes = n.clone();
+                        }
+                        if let Some(sel) = selector {
+                            part.selector = sel.clone();
+                        }
+                        if let Some(s) = state {
+                            part.state = match s.to_uppercase().as_str() {
+                                "UP" => spur_core::partition::PartitionState::Up,
+                                "DOWN" => spur_core::partition::PartitionState::Down,
+                                "DRAIN" => spur_core::partition::PartitionState::Drain,
+                                _ => spur_core::partition::PartitionState::Inactive,
+                            };
+                        }
+                        if let Some(mt) = max_time_minutes {
+                            part.max_time_minutes = *mt;
+                        }
+                        if let Some(dt) = default_time_minutes {
+                            part.default_time_minutes = *dt;
+                        }
+                        if let Some(mn) = max_nodes {
+                            part.max_nodes = *mn;
+                        }
+                        if let Some(mn) = min_nodes {
+                            part.min_nodes = *mn;
+                        }
+                        if let Some(aa) = allow_accounts {
+                            part.allow_accounts = aa.clone();
+                        }
+                        if let Some(ag) = allow_groups {
+                            part.allow_groups = ag.clone();
+                        }
+                        if let Some(da) = deny_accounts {
+                            part.deny_accounts = da.clone();
+                        }
+                        if let Some(dq) = deny_qos {
+                            part.deny_qos = dq.clone();
+                        }
+                        if let Some(aq) = allow_qos {
+                            part.allow_qos = aq.clone();
+                        }
+                        if let Some(pt) = priority_tier {
+                            part.priority_tier = *pt;
+                        }
+                        if let Some(pm) = preempt_mode {
+                            part.preempt_mode = match pm.to_lowercase().as_str() {
+                                "cancel" => spur_core::partition::PreemptMode::Cancel,
+                                "requeue" => spur_core::partition::PreemptMode::Requeue,
+                                "suspend" => spur_core::partition::PreemptMode::Suspend,
+                                _ => spur_core::partition::PreemptMode::Off,
+                            };
+                        }
+                        if let Some(def) = is_default {
+                            part.is_default = *def;
+                        }
+                        info!(name, "partition updated");
+                    } else {
+                        warn!(name, "partition update for unknown partition, ignoring");
+                    }
+                    // Promote exactly one default: clear all others when this one was set.
+                    if set_as_default {
+                        for p in partitions.iter_mut() {
+                            if p.name != *name {
+                                p.is_default = false;
+                            }
+                        }
+                    }
+                }
+                // Node/selector may have changed which nodes this partition covers.
+                self.reconcile_partitions(&mut nodes);
+            }
+            WalOperation::PartitionDelete { name } => {
+                {
+                    let mut partitions = self.partitions.write();
+                    let len_before = partitions.len();
+                    partitions.retain(|p| p.name != *name);
+                    if partitions.len() < len_before {
+                        // Record the tombstone so this name is suppressed from the
+                        // spur.conf baseline on the next restart.
+                        self.deleted_partition_names.write().insert(name.clone());
+                        info!(name, "partition deleted");
+                    }
+                }
+                // A node whose partition was deleted needs to fall back to
+                // another matching partition (or the cluster default).
+                self.reconcile_partitions(&mut nodes);
             }
             WalOperation::ReservationCreate { reservation } => {
                 let mut reservations = self.reservations.write();
@@ -3462,6 +4904,60 @@ impl ClusterManager {
                     }
                 }
             }
+
+            // Native k0s cluster operations. All idempotent/replay-safe: NodeK0sAssign is
+            // keyed by node name, token insert/revoke are keyed by id, phase is a last-write set.
+            WalOperation::NodeK0sAssign {
+                name,
+                role,
+                mesh_ip,
+                pod_cidr,
+            } => {
+                // Reuses the `nodes` write guard from the top of this fn.
+                if let Some(node) = nodes.get_mut(name) {
+                    node.k0s_role = Some(*role);
+                    node.k0s_mesh_ip = Some(mesh_ip.clone());
+                    node.k0s_pod_cidr = Some(pod_cidr.clone());
+                }
+            }
+            WalOperation::NodeK0sClear { name } => {
+                if let Some(node) = nodes.get_mut(name) {
+                    node.k0s_role = None;
+                    node.k0s_mesh_ip = None;
+                    node.k0s_pod_cidr = None;
+                }
+            }
+            WalOperation::K0sSetPhase {
+                phase,
+                control_plane_node,
+                control_plane_nodes,
+                reset_requested,
+            } => {
+                let mut k0s = self.k0s.write();
+                k0s.phase = *phase;
+                if control_plane_node.is_some() {
+                    k0s.control_plane_node = control_plane_node.clone();
+                }
+                if !control_plane_nodes.is_empty() {
+                    k0s.control_plane_nodes = control_plane_nodes.clone();
+                }
+                k0s.reset_requested = *reset_requested;
+            }
+            WalOperation::EvictTerminalJobs { job_ids } => {
+                // Re-check finalized: spare an id requeued between propose and
+                // apply. Deterministic — every replica applies in the same order.
+                let evicted: HashSet<JobId> = job_ids
+                    .iter()
+                    .filter(|id| jobs.get(id).is_some_and(|j| j.state.is_finalized()))
+                    .copied()
+                    .collect();
+                if !evicted.is_empty() {
+                    jobs.retain(|id, _| !evicted.contains(id));
+                    self.steps
+                        .write()
+                        .retain(|_, s| !evicted.contains(&s.job_id));
+                }
+            }
         }
         self.next_job_id.store(next_id, Ordering::Relaxed);
         response
@@ -3475,6 +4971,16 @@ struct ClusterSnapshot {
     jobs: Vec<Job>,
     nodes: Vec<Node>,
     reservations: Vec<Reservation>,
+    /// The leader's authoritative partition table. `None` = pre-partition-support
+    /// snapshot (field absent) → restore falls back to the config baseline.
+    /// `Some(_)`, empty included, is installed verbatim so a leader with zero
+    /// partitions is not reseeded from a follower's local config.
+    #[serde(default)]
+    partitions: Option<Vec<Partition>>,
+    /// Names of partitions deleted at runtime. Suppresses config-file
+    /// partitions with the same name from re-seeding on restart.
+    #[serde(default)]
+    deleted_partition_names: HashSet<String>,
     steps: Vec<JobStep>,
     license_pool: HashMap<String, u64>,
     #[serde(default)]
@@ -3484,9 +4990,37 @@ struct ClusterSnapshot {
     /// staging phase rides along on each `Job`.
     #[serde(default)]
     burst_buffer_total_gb: u64,
+    /// cluster-wide k0s state (phase, control-plane node, join-token metadata). Unlike
+    /// license_pool/burst_buffer this is runtime-authoritative allocated state and MUST be
+    /// restored (see restore_from_snapshot).
+    #[serde(default)]
+    k0s: spur_core::k0s::K0sClusterState,
+    /// Job-id high-water mark. Eviction removes the high-id tail, so restoring
+    /// from survivors alone would reissue used ids; restore takes max(rebuilt, this).
+    #[serde(default)]
+    next_job_id: JobId,
 }
 
 impl ClusterManager {
+    /// Apply features/weight from the first matching NodeConfig, reverting to
+    /// node defaults when none matches so stale policy from a previously matching
+    /// entry does not persist.
+    fn apply_node_config_policy(&self, node: &mut Node) {
+        for nc in self.config().nodes.iter() {
+            if node_config_matches(nc, &node.name, &node.labels) {
+                node.features = nc.features.clone();
+                node.weight = nc.weight;
+                if node.address.is_none() {
+                    if let Some(ref cfg_addr) = nc.address {
+                        node.address = Some(cfg_addr.clone());
+                    }
+                }
+                return;
+            }
+        }
+        node.reset_config_policy();
+    }
+
     /// Re-evaluate partition membership and NodeConfig policy (features, weight)
     /// for all nodes against the current config. Called after snapshot restore to
     /// handle config changes that occurred between snapshot creation and restart.
@@ -3508,13 +5042,7 @@ impl ClusterManager {
             }
             node.partitions = matched;
 
-            for nc in &self.config.nodes {
-                if node_config_matches(nc, &node.name, &node.labels) {
-                    node.features = nc.features.clone();
-                    node.weight = nc.weight;
-                    break;
-                }
-            }
+            self.apply_node_config_policy(node);
         }
     }
 }
@@ -3529,10 +5057,14 @@ impl StateMachineApply for ClusterManager {
             jobs: self.jobs.read().values().cloned().collect(),
             nodes: self.nodes.read().values().cloned().collect(),
             reservations: self.reservations.read().clone(),
+            partitions: Some(self.partitions.read().clone()),
+            deleted_partition_names: self.deleted_partition_names.read().clone(),
             steps: self.steps.read().values().cloned().collect(),
             license_pool: self.license_pool.read().clone(),
             tokens: self.tokens.read().values().cloned().collect(),
             burst_buffer_total_gb: *self.burst_buffer_total_gb.read(),
+            k0s: self.k0s.read().clone(),
+            next_job_id: self.next_job_id.load(Ordering::Relaxed),
         };
         serde_json::to_vec(&snap).map_err(Into::into)
     }
@@ -3540,7 +5072,9 @@ impl StateMachineApply for ClusterManager {
     fn restore_from_snapshot(&self, data: &[u8]) -> Result<(), anyhow::Error> {
         let snap = serde_json::from_slice::<ClusterSnapshot>(data)?;
 
-        let mut next_id = self.config.controller.first_job_id;
+        // Fold in the persisted high-water mark so evicting the high-id tail
+        // can't lower next_job_id and reissue used ids (absent → 0, harmless).
+        let mut next_id = self.config().controller.first_job_id.max(snap.next_job_id);
         let mut jobs = self.jobs.write();
         jobs.clear();
         for job in snap.jobs {
@@ -3555,6 +5089,27 @@ impl StateMachineApply for ClusterManager {
         }
 
         *self.reservations.write() = snap.reservations;
+
+        // Restore tombstone set first — used below to filter the config baseline.
+        *self.deleted_partition_names.write() = snap.deleted_partition_names.clone();
+
+        // `snap.partitions` is the leader's authoritative set, installed
+        // wholesale. Only a pre-partition snapshot (`None`) falls back to the
+        // config baseline; an authoritative empty set installs verbatim.
+        {
+            let mut partitions = self.partitions.write();
+            *partitions = match snap.partitions {
+                Some(p) => p,
+                None => {
+                    let mut base = self.config().build_partitions();
+                    base.retain(|p| !snap.deleted_partition_names.contains(&p.name));
+                    base
+                }
+            };
+        }
+        // The installed table is authoritative; no config seed remains for the
+        // tail log to override.
+        self.config_seeded_partitions.write().clear();
 
         let mut steps = self.steps.write();
         steps.clear();
@@ -3574,6 +5129,10 @@ impl StateMachineApply for ClusterManager {
             tokens.insert(token.id.clone(), token);
         }
 
+        // k0s phase + join-token metadata are runtime-authoritative allocated state
+        // (NOT config-derived like license_pool/burst_buffer) — restore them.
+        *self.k0s.write() = snap.k0s;
+
         self.next_job_id.store(next_id, Ordering::Relaxed);
 
         // Re-evaluate partition membership and NodeConfig policy
@@ -3590,67 +5149,26 @@ impl StateMachineApply for ClusterManager {
 }
 
 fn job_candidate_node_names(job: &Job, nodes: &[spur_core::node::Node]) -> Vec<String> {
-    let partitions = self_partitions_for_job(job);
-    let nodelist: Option<Vec<&str>> = job.spec.nodelist.as_deref().map(|s| {
-        s.split(',')
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .collect()
-    });
-    let exclude: std::collections::HashSet<&str> = job
-        .spec
-        .exclude
-        .as_deref()
-        .map(|s| {
-            s.split(',')
-                .map(str::trim)
-                .filter(|p| !p.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+    let placement = spur_sched::node_match::NodePlacement::new(job);
+    let required = spur_sched::backfill::job_resource_request(job);
 
     nodes
         .iter()
         .filter(|node| {
-            if exclude.contains(node.name.as_str()) {
-                return false;
-            }
-            if let Some(ref nl) = nodelist {
-                if !nl.iter().any(|n| *n == node.name) {
-                    return false;
-                }
-            }
-            if !partitions.is_empty()
-                && !partitions
-                    .iter()
-                    .any(|p| node.partitions.iter().any(|np| np == p))
-            {
-                return false;
-            }
-            true
+            placement.allows_name(&node.name)
+                && placement.in_partition(node)
+                && placement.has_features(node)
+                && node.total_resources.can_satisfy(&required)
         })
         .map(|n| n.name.clone())
         .collect()
-}
-
-fn self_partitions_for_job(job: &Job) -> Vec<String> {
-    job.spec
-        .partition
-        .as_deref()
-        .map(|p| {
-            p.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn reservation_fence_reason(
     job: &Job,
     cluster_state: &spur_sched::traits::ClusterState,
 ) -> Option<PendingReason> {
+    let placement = spur_sched::node_match::NodePlacement::new(job);
     let candidates = job_candidate_node_names(job, cluster_state.nodes);
     if candidates.is_empty() {
         return None;
@@ -3659,7 +5177,9 @@ fn reservation_fence_reason(
     let now = Utc::now();
     let duration = job.spec.time_limit.unwrap_or(chrono::Duration::hours(1));
     let mut maint_block = false;
-    let mut all_blocked = true;
+    let mut blocked = 0;
+    let mut listed_blocked = false;
+    let mut unblocked = 0;
 
     for node_name in &candidates {
         let mut node_blocked = false;
@@ -3671,13 +5191,16 @@ fn reservation_fence_reason(
                 }
             }
         }
-        if !node_blocked {
-            all_blocked = false;
-            break;
+        if node_blocked {
+            blocked += 1;
+            listed_blocked |= placement.nodelist_is_additive() && placement.is_listed(node_name);
+        } else {
+            unblocked += 1;
         }
     }
 
-    if !all_blocked {
+    let needed = (job.spec.num_nodes as usize).max(1);
+    if blocked == 0 || (!listed_blocked && unblocked >= needed) {
         return None;
     }
     if maint_block {
@@ -3687,9 +5210,32 @@ fn reservation_fence_reason(
     }
 }
 
+fn retain_unblocked(
+    candidates: &mut Vec<PendingJobCandidate>,
+    blocked: &mut Vec<(JobId, PendingReason)>,
+    mut block: impl FnMut(&Job) -> Option<PendingReason>,
+) {
+    candidates.retain(|candidate| {
+        let Some(reason) = block(&candidate.job) else {
+            return true;
+        };
+        record_blocked(blocked, candidate, reason);
+        false
+    });
+}
+
+fn record_blocked(
+    blocked: &mut Vec<(JobId, PendingReason)>,
+    candidate: &PendingJobCandidate,
+    reason: PendingReason,
+) {
+    if candidate.tag_reason {
+        blocked.push((candidate.job.job_id, reason));
+    }
+}
+
 /// `Reservation` if the job's `--reservation` is absent/inactive/expired or
-/// denies it, else `None`. Shared by `pending_jobs()` (drop) and
-/// `tag_blocked_pending_reasons()` (displayed reason) so the two agree.
+/// denies it, else `None`.
 fn reservation_block(
     job: &Job,
     reservations: &[Reservation],
@@ -3710,6 +5256,24 @@ fn reservation_block(
     }
 }
 
+/// QoS is added on top of the fairshare/age/tier product rather than fed
+/// into it, so it's a constant offset instead of an amplified/diluted one.
+fn compute_effective_priority(
+    base_priority: u32,
+    fair_share: f64,
+    age_minutes: i64,
+    partition_tier: u32,
+    qos: &Qos,
+) -> u32 {
+    let raw = spur_sched::priority::effective_priority(
+        base_priority,
+        fair_share,
+        age_minutes,
+        partition_tier,
+    );
+    qos_adjusted_priority(raw, qos)
+}
+
 /// Reason a job is ineligible because currently-available licenses cannot satisfy
 /// its `license:` GRES requests, or `None`. Reported as `Licenses`. `available`
 /// is the configured total minus licenses held by active jobs.
@@ -3724,16 +5288,27 @@ fn license_block(job: &Job, pool: &HashMap<String, u64>) -> Option<spur_core::jo
     None
 }
 
-/// Shared by `pending_jobs()` and `tag_blocked_pending_reasons()` so the drop
-/// decision and displayed reason always agree. Caller resolves the `Qos`.
+/// Caller resolves the `Qos`.
 fn qos_block_for(
     job: &Job,
     qos: &Qos,
     jobs: &HashMap<JobId, Job>,
 ) -> Option<spur_core::job::PendingReason> {
+    qos_block_with(job, qos, jobs, &PassReservations::default())
+}
+
+/// Like [`qos_block_for`] but folds `reserved` (headroom already claimed by
+/// higher-priority jobs earlier in the same scheduling pass) into the running
+/// aggregates, so a single pass can't over-subscribe a QOS group/per-user cap.
+fn qos_block_with(
+    job: &Job,
+    qos: &Qos,
+    jobs: &HashMap<JobId, Job>,
+    reserved: &PassReservations,
+) -> Option<spur_core::job::PendingReason> {
     let qos_name = job.spec.qos.as_ref()?;
     let user = &job.spec.user;
-    let running_count = jobs
+    let mut running_count = jobs
         .values()
         .filter(|j| {
             j.state == JobState::Running
@@ -3741,19 +5316,31 @@ fn qos_block_for(
                 && j.spec.qos.as_deref() == Some(qos_name.as_str())
         })
         .count() as u32;
+    // Count only earlier-submitted jobs (lower job_id) so a later job never
+    // makes an earlier, within-limit job retroactively blocked.
     let submitted_count = jobs
         .values()
         .filter(|j| {
-            (j.state == JobState::Pending || j.state == JobState::Running)
+            j.job_id < job.job_id
+                && (j.state == JobState::Pending || j.state == JobState::Running)
                 && j.spec.user == *user
                 && j.spec.qos.as_deref() == Some(qos_name.as_str())
         })
         .count() as u32;
-    let user_running_tres = sum_running_tres(jobs, |j| {
+    let mut user_running_tres = sum_running_tres(jobs, |j| {
         j.spec.user == *user && j.spec.qos.as_deref() == Some(qos_name.as_str())
     });
-    let qos_running_tres =
+    let mut qos_running_tres =
         sum_running_tres(jobs, |j| j.spec.qos.as_deref() == Some(qos_name.as_str()));
+
+    let user_key = (user.clone(), qos_name.clone());
+    running_count += reserved.qos_user_count.get(&user_key).copied().unwrap_or(0);
+    if let Some(t) = reserved.qos_user_tres.get(&user_key) {
+        user_running_tres.add(t);
+    }
+    if let Some(t) = reserved.qos_grp.get(qos_name) {
+        qos_running_tres.add(t);
+    }
 
     match check_qos_limits(
         job,
@@ -3768,54 +5355,199 @@ fn qos_block_for(
     }
 }
 
-/// `PartitionInactive` if the partition is not Up, `PartitionConfig` if the
-/// request exceeds its node/time limits, else `None`. Shared by `pending_jobs()`
-/// and `tag_blocked_pending_reasons()` so drop and displayed reason agree.
+/// Looks up the job's (user, account) association limits from
+/// `AssociationCache`; a job with no account (or an association the cache has
+/// no limits for) is unconstrained.
+fn account_block_for(
+    job: &Job,
+    assoc_cache: &AssociationCache,
+    jobs: &HashMap<JobId, Job>,
+) -> Option<spur_core::job::PendingReason> {
+    account_block_with(job, assoc_cache, jobs, &PassReservations::default())
+}
+
+/// Like [`account_block_for`] but folds `reserved` (headroom already claimed by
+/// higher-priority jobs earlier in the same scheduling pass) into the running
+/// aggregates, so a single pass can't over-subscribe an account group cap.
+fn account_block_with(
+    job: &Job,
+    assoc_cache: &AssociationCache,
+    jobs: &HashMap<JobId, Job>,
+    reserved: &PassReservations,
+) -> Option<spur_core::job::PendingReason> {
+    let account = job.spec.account.as_deref().filter(|a| !a.is_empty())?;
+    let user = &job.spec.user;
+    let limits = assoc_cache.limits(user, account);
+
+    let mut running_count = jobs
+        .values()
+        .filter(|j| {
+            j.state == JobState::Running
+                && j.spec.user == *user
+                && j.spec.account.as_deref() == Some(account)
+        })
+        .count() as u32;
+    // Count only earlier-submitted jobs (lower job_id) so a later job never
+    // makes an earlier, within-limit job retroactively blocked.
+    let submitted_count = jobs
+        .values()
+        .filter(|j| {
+            j.job_id < job.job_id
+                && (j.state == JobState::Pending || j.state == JobState::Running)
+                && j.spec.user == *user
+                && j.spec.account.as_deref() == Some(account)
+        })
+        .count() as u32;
+    let mut account_running_tres =
+        sum_running_tres(jobs, |j| j.spec.account.as_deref() == Some(account));
+
+    running_count += reserved
+        .account_user_count
+        .get(&(user.clone(), account.to_string()))
+        .copied()
+        .unwrap_or(0);
+    if let Some(t) = reserved.account_grp.get(account) {
+        account_running_tres.add(t);
+    }
+
+    match check_account_limits(
+        job,
+        &limits,
+        running_count,
+        submitted_count,
+        &account_running_tres,
+    ) {
+        AccountCheckResult::Allowed => None,
+        AccountCheckResult::Blocked(reason) => Some(reason),
+    }
+}
+
+/// For a partition OR-list, returns `None` when any requested partition is Up
+/// and permits the request. Unknown names and limits rejected by every Up
+/// alternative return `PartitionConfig`; all-inactive alternatives return
+/// `PartitionInactive`.
 fn partition_block(job: &Job, partitions: &[Partition]) -> Option<spur_core::job::PendingReason> {
     use spur_core::job::PendingReason;
     use spur_core::partition::PartitionState;
 
-    let name = job.spec.partition.as_deref().filter(|p| !p.is_empty())?;
-    let Some(part) = partitions.iter().find(|p| p.name == name) else {
+    let partition_spec = job
+        .spec
+        .partition
+        .as_deref()
+        .filter(|spec| !spec.is_empty())?;
+    let requested = requested_partition_names(Some(partition_spec))
+        .map(|name| partitions.iter().find(|part| part.name == name))
+        .collect::<Option<Vec<_>>>();
+    let Some(requested) = requested else {
         return Some(PendingReason::PartitionConfig);
     };
-
-    if part.state != PartitionState::Up {
-        return Some(PendingReason::PartitionInactive);
+    if requested.is_empty() {
+        return Some(PendingReason::PartitionConfig);
     }
+
+    let mut has_up_partition = false;
+    for part in requested {
+        if part.state != PartitionState::Up {
+            continue;
+        }
+        has_up_partition = true;
+        if partition_limits_allow(job, part) {
+            return None;
+        }
+    }
+
+    Some(if has_up_partition {
+        PendingReason::PartitionConfig
+    } else {
+        PendingReason::PartitionInactive
+    })
+}
+
+fn partition_limits_allow(job: &Job, part: &Partition) -> bool {
     if let Some(max) = part.max_nodes {
         if job.spec.num_nodes > max {
-            return Some(PendingReason::PartitionConfig);
+            return false;
         }
     }
     if part.min_nodes > 0 && job.spec.num_nodes < part.min_nodes {
-        return Some(PendingReason::PartitionConfig);
+        return false;
     }
     if let (Some(max_mins), Some(tl)) = (part.max_time_minutes, &job.spec.time_limit) {
         if tl.num_minutes() > i64::from(max_mins) {
-            return Some(PendingReason::PartitionConfig);
+            return false;
         }
     }
-    None
+    true
 }
 
 fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> TresRecord {
     let mut tres = TresRecord::new();
-    let (mut cpu, mut node, mut mem) = (0u64, 0u64, 0u64);
     for j in jobs.values() {
         if j.state != JobState::Running || !pred(j) {
             continue;
         }
-        cpu += (j.spec.num_tasks * j.spec.cpus_per_task) as u64;
-        node += j.spec.num_nodes as u64;
-        if let Some(m) = j.spec.memory_per_node_mb {
-            mem += m * j.spec.num_nodes as u64;
+        tres.add(&job_tres(j));
+    }
+    tres
+}
+
+/// The TRES a single job occupies (its scheduling footprint). Shared by the
+/// running-usage sum and the same-pass reservation accounting so both count a
+/// job's CPU/node/mem/GPU footprint identically.
+fn job_tres(job: &Job) -> TresRecord {
+    let mut tres = TresRecord::new();
+    tres.set(
+        TresType::Cpu,
+        (job.spec.num_tasks * job.spec.cpus_per_task) as u64,
+    );
+    tres.set(TresType::Node, job.spec.num_nodes as u64);
+    tres.set(
+        TresType::Memory,
+        effective_memory_mb(&job.spec, job.spec.num_nodes),
+    );
+    tres.set(TresType::Gpu, effective_gpus(&job.spec, job.spec.num_nodes));
+    tres
+}
+
+/// Headroom claimed by jobs already kept earlier in a single `pending_jobs()`
+/// pass, folded into the running aggregates so aggregate QOS/account caps
+/// (`grp_tres`, per-user TRES, per-user running-job counts) can't be
+/// over-subscribed within one pass — the same guarantee licenses and
+/// burst-buffer capacity already get via priority-ordered reservation.
+#[derive(Default)]
+struct PassReservations {
+    qos_grp: HashMap<String, TresRecord>,
+    qos_user_tres: HashMap<(String, String), TresRecord>,
+    qos_user_count: HashMap<(String, String), u32>,
+    account_grp: HashMap<String, TresRecord>,
+    account_user_count: HashMap<(String, String), u32>,
+}
+
+impl PassReservations {
+    /// Record that `job` (kept this pass) now occupies its footprint against the
+    /// QOS and account aggregates, so lower-priority jobs later in the pass see
+    /// the reduced headroom.
+    fn reserve(&mut self, job: &Job) {
+        let tres = job_tres(job);
+        let user = job.spec.user.clone();
+        if let Some(qos) = job.spec.qos.as_ref().filter(|q| !q.is_empty()) {
+            self.qos_grp.entry(qos.clone()).or_default().add(&tres);
+            let key = (user.clone(), qos.clone());
+            self.qos_user_tres
+                .entry(key.clone())
+                .or_default()
+                .add(&tres);
+            *self.qos_user_count.entry(key).or_insert(0) += 1;
+        }
+        if let Some(account) = job.spec.account.as_deref().filter(|a| !a.is_empty()) {
+            let account = account.to_string();
+            self.account_grp
+                .entry(account.clone())
+                .or_default()
+                .add(&tres);
+            *self.account_user_count.entry((user, account)).or_insert(0) += 1;
         }
     }
-    tres.set(TresType::Cpu, cpu);
-    tres.set(TresType::Node, node);
-    tres.set(TresType::Memory, mem);
-    tres
 }
 
 /// Burst-buffer capacity (GB) a job's `--bb` string reserves cluster-wide.
@@ -3830,8 +5562,7 @@ fn extract_bb_requirement(spec: &JobSpec) -> u64 {
 /// `BurstBufferResources` if the job needs more BB capacity than is currently
 /// free, else `None`. Reported when an absolute shortage means the job can
 /// never stage in the current cluster state. `free_gb` is the configured total
-/// minus capacity reserved by staging/active jobs. Shared by `pending_jobs()`
-/// (drop) and `tag_blocked_pending_reasons()` (displayed reason) so they agree.
+/// minus capacity reserved by staging/active jobs.
 fn burst_buffer_block(job: &Job, free_gb: u64) -> Option<spur_core::job::PendingReason> {
     use spur_core::job::PendingReason;
     // A job that already reserved capacity (Staging/Ready) is not blocked on
@@ -3993,6 +5724,21 @@ fn apply_default_partition(spec: &mut JobSpec, partitions: &[Partition]) {
     }
 }
 
+fn apply_default_time_limit(spec: &mut JobSpec, partitions: &[Partition]) {
+    if spec.time_limit.is_some() {
+        return;
+    }
+    let partition = spec
+        .partition
+        .as_deref()
+        .and_then(|name| partitions.iter().find(|p| p.name == name))
+        .or_else(|| partitions.iter().find(|p| p.is_default))
+        .or_else(|| partitions.first());
+    if let Some(minutes) = partition.and_then(|p| p.default_time_minutes) {
+        spec.time_limit = Some(chrono::Duration::minutes(minutes as i64));
+    }
+}
+
 /// Resolve the submitting user's default account from the association cache
 /// when `--account` was not provided (mirrors `apply_default_partition`).
 fn apply_default_account(spec: &mut JobSpec, assoc_cache: &AssociationCache) {
@@ -4002,7 +5748,7 @@ fn apply_default_account(spec: &mut JobSpec, assoc_cache: &AssociationCache) {
     if spec.account.as_deref().is_some_and(|a| !a.is_empty()) {
         return;
     }
-    let (account, _) = assoc_cache.resolve(&spec.user, None);
+    let (account, ..) = assoc_cache.resolve(&spec.user, None);
     if let Some(acct) = account.filter(|a| !a.is_empty()) {
         spec.account = Some(acct);
     }
@@ -4016,42 +5762,77 @@ fn validate_user_account(
     let Some(account) = spec.account.as_deref().filter(|a| !a.is_empty()) else {
         return Ok(());
     };
-    if !assoc_cache.is_loaded() {
-        return Ok(());
+    match assoc_cache.account_membership(&spec.user, account) {
+        AccountMembership::CacheUnavailable | AccountMembership::Member => Ok(()),
+        AccountMembership::NotMember(valid_accounts) if valid_accounts.is_empty() => {
+            Err(SubmitError::invalid(format!(
+                "user '{}' has no account associations. Contact your cluster admin to run: sacctmgr add user name={} account=<account>",
+                spec.user, spec.user
+            )))
+        }
+        AccountMembership::NotMember(valid_accounts) => Err(SubmitError::invalid(format!(
+            "user '{}' is not associated with account '{account}'. Accounts associated with this user: [{}].",
+            spec.user,
+            valid_accounts.join(", ")
+        ))),
     }
-    if !assoc_cache.has_membership(&spec.user, account) {
-        return Err(SubmitError::invalid(format!(
-            "user '{}' is not associated with account '{account}'",
-            spec.user
-        )));
-    }
-    Ok(())
 }
 
-/// Resolve a job's effective QOS at submission time (mirrors
-/// `apply_default_partition`). An explicit `--qos` naming an unknown QOS is
-/// rejected; a stale association default degrades silently instead.
+const QOS_ACCOUNTING_HINT: &str =
+    " (hint: accounting may not be enabled on this controller -- check controller logs)";
+
+/// Resolve a job's QOS at submit, in Slurm's order: explicit `--qos` (must
+/// exist and be permitted for the association) → association default →
+/// cluster fallback (`accounting.default_qos`, also gated by the
+/// association's allow-list) → reject if `accounting.require_qos`, else
+/// accept with no QOS.
 fn apply_default_qos(
     spec: &mut JobSpec,
     assoc_cache: &AssociationCache,
     qos_cache: &QosCache,
+    accounting: &spur_core::config::AccountingConfig,
 ) -> Result<(), SubmitError> {
+    let given_account = spec.account.as_deref().filter(|a| !a.is_empty());
+    // Resolved once and shared by both branches below: `resolve()` reads
+    // the account, default QOS, and allow-list under a single lock, so a
+    // concurrent cache refresh can't validate one against the other's
+    // stale snapshot.
+    let (account, default_qos, allowed_qos) = assoc_cache.resolve(&spec.user, given_account);
+    // A stale pinned default (removed from qos_cache since it was set) is
+    // treated as unset for authorization, matching how the fallback chain
+    // below already ignores it rather than letting it block every explicit
+    // `--qos` a user could otherwise submit.
+    let default_qos_for_auth = default_qos
+        .as_deref()
+        .filter(|d| qos_cache.get(d).is_some())
+        .map(str::to_owned);
+
     if let Some(name) = spec.qos.as_deref().filter(|n| !n.is_empty()) {
         if qos_cache.get(name).is_none() {
-            return Err(SubmitError::invalid(format!("QOS '{name}' does not exist")));
+            let hint = if qos_cache.is_loaded() {
+                String::new()
+            } else {
+                QOS_ACCOUNTING_HINT.into()
+            };
+            return Err(SubmitError::invalid(format!(
+                "QOS '{name}' does not exist{hint}"
+            )));
+        }
+        if !qos_permitted(&allowed_qos, default_qos_for_auth.as_deref(), name) {
+            return Err(SubmitError::invalid(format!(
+                "QOS '{name}' is not permitted for user '{}' under account '{}'",
+                spec.user,
+                account.as_deref().unwrap_or_default()
+            )));
         }
         return Ok(());
     }
 
-    let given_account = spec.account.as_deref().filter(|a| !a.is_empty());
-    let (account, default_qos) = assoc_cache.resolve(&spec.user, given_account);
-    let Some(default_qos) = default_qos else {
-        return Ok(());
-    };
-
-    if qos_cache.get(&default_qos).is_some() {
-        spec.qos = Some(default_qos);
-    } else {
+    if let Some(default_qos) = default_qos {
+        if qos_cache.get(&default_qos).is_some() {
+            spec.qos = Some(default_qos);
+            return Ok(());
+        }
         warn!(
             user = %spec.user,
             account = account.as_deref().unwrap_or_default(),
@@ -4059,6 +5840,42 @@ fn apply_default_qos(
             "association default QOS no longer exists, ignoring"
         );
     }
+
+    // A configured fallback naming a nonexistent QOS is a hard error — silently
+    // ignoring it would leave the job unenforced, the gap this closes. A fallback
+    // that exists but isn't permitted for this association degrades like a stale
+    // default instead, since it reflects the association's own restriction, not
+    // a misconfiguration.
+    let fallback = accounting.default_qos.trim();
+    if !fallback.is_empty() {
+        if qos_cache.get(fallback).is_none() {
+            let hint = if qos_cache.is_loaded() {
+                String::new()
+            } else {
+                QOS_ACCOUNTING_HINT.into()
+            };
+            return Err(SubmitError::invalid(format!(
+                "configured default QOS '{fallback}' does not exist{hint}"
+            )));
+        }
+        if qos_permitted(&allowed_qos, default_qos_for_auth.as_deref(), fallback) {
+            spec.qos = Some(fallback.to_string());
+            return Ok(());
+        }
+        warn!(
+            user = %spec.user,
+            account = account.as_deref().unwrap_or_default(),
+            qos = %fallback,
+            "cluster default QOS not permitted for this association, ignoring"
+        );
+    }
+
+    if accounting.require_qos {
+        return Err(SubmitError::invalid(
+            "no QOS specified and no default QOS is configured for this user/account",
+        ));
+    }
+
     Ok(())
 }
 
@@ -4103,6 +5920,41 @@ mod tests {
     use spur_metrics::job::JobMetricsSnapshot;
     use tempfile::TempDir;
 
+    #[test]
+    fn submission_size_accepts_normal_script() {
+        let spec = JobSpec {
+            script: Some("#!/bin/bash\necho hello\n".into()),
+            ..Default::default()
+        };
+        assert!(check_submission_size(&spec).is_ok());
+    }
+
+    #[test]
+    fn submission_size_rejects_oversized_script() {
+        let spec = JobSpec {
+            script: Some("x".repeat(MAX_JOB_SPEC_SIZE + 1)),
+            ..Default::default()
+        };
+        let err = check_submission_size(&spec).expect_err("oversized script must be rejected");
+        assert!(matches!(err, SubmitError::InvalidArgument(_)));
+        assert!(err.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn submission_size_counts_all_fields() {
+        // Split the payload across environment and argv (not script) to prove the
+        // check bounds the whole serialized spec, not just the script field.
+        let big = "y".repeat(MAX_JOB_SPEC_SIZE / 2 + 1024);
+        let spec = JobSpec {
+            environment: std::iter::once(("BIG".to_string(), big.clone())).collect(),
+            argv: vec![big],
+            ..Default::default()
+        };
+        let err =
+            check_submission_size(&spec).expect_err("env + argv over the cap must be rejected");
+        assert!(matches!(err, SubmitError::InvalidArgument(_)));
+    }
+
     fn test_config() -> SlurmConfig {
         SlurmConfig {
             cluster_name: "test".into(),
@@ -4126,6 +5978,8 @@ mod tests {
                 allow_accounts: Vec::new(),
                 allow_groups: Vec::new(),
                 deny_accounts: Vec::new(),
+                deny_qos: Vec::new(),
+                allow_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
             }],
@@ -4133,6 +5987,7 @@ mod tests {
             network: Default::default(),
             logging: Default::default(),
             kubernetes: Default::default(),
+            cluster: Default::default(),
             notifications: Default::default(),
             power: Default::default(),
             federation: Default::default(),
@@ -4146,6 +6001,8 @@ mod tests {
             hooks: Default::default(),
             devices: Default::default(),
             admission: Default::default(),
+            rlimits: Default::default(),
+            mpi: Default::default(),
         }
     }
 
@@ -4183,6 +6040,159 @@ mod tests {
         }
     }
 
+    fn srun_spec(name: &str) -> JobSpec {
+        let mut spec = basic_spec(name);
+        spec.srun_job = true;
+        spec
+    }
+
+    /// Build a cluster backed by a real spur.conf on disk so `reconfigure()`
+    /// has a path to re-read. Returns the cluster and the conf path so tests
+    /// can rewrite the file and reconcile.
+    async fn test_cluster_with_conf_file(
+        dir: &TempDir,
+        toml: &str,
+    ) -> (Arc<ClusterManager>, PathBuf) {
+        let conf_path = dir.path().join("spur.conf");
+        std::fs::write(&conf_path, toml).unwrap();
+        let config = SlurmConfig::load_from_file(&conf_path).unwrap();
+        let cm = Arc::new(
+            ClusterManager::new_with_config_path(config, dir.path(), Some(conf_path.clone()))
+                .unwrap(),
+        );
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .expect("single-node raft did not self-elect within 5s");
+        cm.set_raft(handle.raft);
+        (cm, conf_path)
+    }
+
+    /// Consumer-driven: `maybe_requeue` must honor the new `max_batch_requeue`
+    /// after reconfigure, not just the swapped config value. A job whose
+    /// `requeue_count` sits between the old and new caps is a no-op under the
+    /// old cap but requeues to Pending under the new one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_max_batch_requeue_changes_consumer_behavior() {
+        let conf = |cap: u32| {
+            format!(
+                "cluster_name = \"test\"\n\
+                 [controller]\nmax_batch_requeue = {cap}\n\
+                 [[partitions]]\nname = \"default\"\ndefault = true\nstate = \"UP\"\nnodes = \"ALL\"\n"
+            )
+        };
+        let dir = TempDir::new().unwrap();
+        let (cm, conf_path) = test_cluster_with_conf_file(&dir, &conf(3)).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "requeue-cap", "worker1");
+        // Put the job in a terminal, requeue-eligible state (Failed → Pending is
+        // a valid requeue transition and is NOT in the max-requeue hold set, so
+        // over-cap is a clean no-op) with 5 attempts already recorded.
+        {
+            let mut jobs = cm.jobs.write();
+            let job = jobs.get_mut(&job_id).unwrap();
+            job.state = JobState::Failed;
+            job.spec.requeue = true;
+            job.requeue_count = 5;
+        }
+
+        // Cap = 3, count = 5 → over cap → maybe_requeue is a no-op (stays Failed).
+        cm.maybe_requeue(job_id).unwrap();
+        assert_eq!(
+            cm.get_job(job_id).unwrap().state,
+            JobState::Failed,
+            "over-cap job must not requeue before reconfigure"
+        );
+
+        // Raise the cap past the attempt count and reconfigure.
+        std::fs::write(&conf_path, conf(9)).unwrap();
+        cm.reconfigure().unwrap();
+
+        // Cap = 9, count = 5 → under cap → maybe_requeue returns it to Pending.
+        cm.maybe_requeue(job_id).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().state,
+            JobState::Pending,
+            "after reconfigure raised the cap, the consumer must requeue the job"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconfigure_reloads_scheduler_tunables_live() {
+        let dir = TempDir::new().unwrap();
+        let (cm, conf_path) = test_cluster_with_conf_file(
+            &dir,
+            "cluster_name = \"test\"\n[scheduler]\nresv_overrun_minutes = 5\ncomplete_wait_secs = 30\n",
+        )
+        .await;
+        assert_eq!(cm.config().scheduler.resv_overrun_minutes, 5);
+
+        std::fs::write(
+            &conf_path,
+            "cluster_name = \"test\"\n[scheduler]\nresv_overrun_minutes = 45\ncomplete_wait_secs = 90\n",
+        )
+        .unwrap();
+        cm.reconfigure().unwrap();
+
+        let cfg = cm.config();
+        assert_eq!(cfg.scheduler.resv_overrun_minutes, 45);
+        assert_eq!(cfg.scheduler.complete_wait_secs, 90);
+    }
+
+    #[tokio::test]
+    async fn reconfigure_reloads_hooks_and_notifications_live() {
+        let dir = TempDir::new().unwrap();
+        let (cm, conf_path) = test_cluster_with_conf_file(&dir, "cluster_name = \"test\"\n").await;
+        assert!(cm.config().hooks.epilog_slurmctld.is_none());
+        assert!(cm.config().notifications.webhook_url.is_none());
+
+        std::fs::write(
+            &conf_path,
+            "cluster_name = \"test\"\n[hooks]\nepilog_slurmctld = \"/usr/bin/epi\"\n[notifications]\nwebhook_url = \"http://hook/\"\n",
+        )
+        .unwrap();
+        cm.reconfigure().unwrap();
+
+        let cfg = cm.config();
+        assert_eq!(cfg.hooks.epilog_slurmctld.as_deref(), Some("/usr/bin/epi"));
+        assert_eq!(
+            cfg.notifications.webhook_url.as_deref(),
+            Some("http://hook/")
+        );
+    }
+
+    #[tokio::test]
+    async fn reconfigure_reloads_license_pool_live() {
+        let dir = TempDir::new().unwrap();
+        let (cm, conf_path) =
+            test_cluster_with_conf_file(&dir, "cluster_name = \"test\"\n[licenses]\nfluent = 5\n")
+                .await;
+        // Availability is derived from the pool total; no jobs hold licenses.
+        assert_eq!(cm.available_licenses().get("fluent").copied(), Some(5));
+
+        std::fs::write(
+            &conf_path,
+            "cluster_name = \"test\"\n[licenses]\nfluent = 20\ncomsol = 2\n",
+        )
+        .unwrap();
+        cm.reconfigure().unwrap();
+
+        let avail = cm.available_licenses();
+        assert_eq!(
+            avail.get("fluent").copied(),
+            Some(20),
+            "reconfigure must apply the new license total"
+        );
+        assert_eq!(avail.get("comsol").copied(), Some(2));
+    }
+
     fn scalar_alloc(cpus: u32, memory_mb: u64) -> ResourceAllocations {
         ResourceAllocations::with_scalar(cpus, memory_mb)
     }
@@ -4215,6 +6225,7 @@ mod tests {
     fn register_node(cm: &ClusterManager, name: &str, cpus: u32, mem: u64) {
         cm.register_node(
             name.into(),
+            name.into(),
             ResourceSet {
                 cpus,
                 memory_mb: mem,
@@ -4235,7 +6246,7 @@ mod tests {
     }
 
     fn submit_and_wait(cm: &ClusterManager, spec: JobSpec) -> JobId {
-        let id = cm.submit_job(spec).unwrap();
+        let id = cm.submit_job(spec).unwrap().job_id;
         wait_for(&format!("job {id} applied"), || cm.get_job(id).is_some());
         id
     }
@@ -4289,13 +6300,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("j")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
 
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Running);
@@ -4318,6 +6327,8 @@ mod tests {
             nodes: vec!["node1".into()],
             resources: resources.clone(),
             per_node_alloc: per_node_for(&["node1"], resources),
+            srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -4339,19 +6350,19 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("j")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(4, 8000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["node1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["node1"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         cm.apply_operation(&WalOperation::JobComplete {
@@ -4371,6 +6382,324 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_terminal_jobs_drops_only_aged_terminal_jobs() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("done")),
+        });
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Cancelled,
+        });
+        assert!(
+            cm.get_job(1).unwrap().state.is_terminal(),
+            "job 1 is terminal"
+        );
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 2,
+            spec: Box::new(basic_spec("running")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            2,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 3,
+            spec: Box::new(basic_spec("pending")),
+        });
+        // A job stranded in Preempted (a rare requeue-strand): finalized with an
+        // end_time, so it must be reapable even though it isn't is_terminal().
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 4,
+            spec: Box::new(basic_spec("preempted")),
+        });
+        {
+            let mut jobs = cm.jobs.write();
+            let j = jobs.get_mut(&4).unwrap();
+            j.state = JobState::Preempted;
+            j.end_time = Some(chrono::Utc::now());
+        }
+        assert!(!cm.get_job(4).unwrap().state.is_terminal());
+        assert!(cm.get_job(4).unwrap().state.is_finalized());
+
+        // A step on each of the terminal (1) and live (2) jobs: eviction must
+        // drop the evicted job's step and keep the live one's.
+        let step = |job_id: JobId| JobStep {
+            job_id,
+            step_id: 0,
+            name: "s".into(),
+            state: StepState::Running,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            resources: scalar_alloc(1, 0),
+            nodes: vec!["node1".into()],
+            distribution: spur_core::step::TaskDistribution::Block,
+            start_time: None,
+            end_time: None,
+            exit_code: None,
+        };
+        cm.steps.write().insert((1, 0), step(1));
+        cm.steps.write().insert((2, 0), step(2));
+
+        // Apply removes only ids still finalized; live ids 2 and 3 are no-ops
+        // even when named (a job requeued between propose and apply).
+        cm.apply_operation(&WalOperation::EvictTerminalJobs {
+            job_ids: vec![1, 2, 3, 4],
+        });
+        assert!(
+            cm.get_job(1).is_none(),
+            "named terminal job must be evicted"
+        );
+        assert!(cm.get_job(2).is_some(), "running job must be spared");
+        assert!(cm.get_job(3).is_some(), "pending job must be spared");
+        assert!(
+            cm.get_job(4).is_none(),
+            "named finalized (Preempted) job must be evicted"
+        );
+        assert!(
+            cm.steps.read().get(&(1, 0)).is_none(),
+            "evicted job's step must be removed"
+        );
+        assert!(
+            cm.steps.read().get(&(2, 0)).is_some(),
+            "live job's step must be kept"
+        );
+    }
+
+    // Apply-time state, not per-replica end_time, decides eviction: a replica
+    // where the id requeued before apply spares it; skew never changes the set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_terminal_jobs_is_replica_deterministic() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let cm_a = test_cluster(&dir_a).await;
+        let cm_b = test_cluster(&dir_b).await;
+
+        for cm in [&cm_a, &cm_b] {
+            cm.apply_operation(&WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(basic_spec("done")),
+            });
+            cm.apply_operation(&WalOperation::JobComplete {
+                job_id: 1,
+                exit_code: 0,
+                state: JobState::Cancelled,
+            });
+        }
+        // Divergent local end_times: skew must not change the outcome, since the
+        // apply guard reads state, not end_time.
+        cm_a.jobs.write().get_mut(&1).unwrap().end_time =
+            Some(chrono::Utc::now() - chrono::Duration::hours(2));
+        cm_b.jobs.write().get_mut(&1).unwrap().end_time =
+            Some(chrono::Utc::now() + chrono::Duration::hours(2));
+
+        let entry = WalOperation::EvictTerminalJobs { job_ids: vec![1] };
+        cm_a.apply_operation(&entry);
+        cm_b.apply_operation(&entry);
+        assert!(cm_a.get_job(1).is_none(), "finalized id is evicted");
+        assert!(
+            cm_b.get_job(1).is_none(),
+            "end_time skew must not change the evicted set",
+        );
+
+        // A replica where the id left the finalized set before apply spares it:
+        // the guard is what makes eviction converge with real state, not the id.
+        let dir_c = TempDir::new().unwrap();
+        let cm_c = test_cluster(&dir_c).await;
+        cm_c.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("requeued")),
+        });
+        cm_c.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm_c.apply_operation(&entry);
+        assert!(
+            cm_c.get_job(1).is_some(),
+            "an id no longer finalized at apply is spared",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_expired_terminal_jobs_honors_retention_window() {
+        // A large retention window spares a fresh terminal job: guards against a
+        // producer that proposes everything regardless of age.
+        let dir2 = TempDir::new().unwrap();
+        let mut cfg2 = test_config();
+        cfg2.controller.terminal_job_retention_secs = 86_400;
+        let cm2 = test_cluster_with_config(&dir2, cfg2).await;
+        cm2.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("fresh")),
+        });
+        cm2.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Cancelled,
+        });
+        cm2.evict_expired_terminal_jobs();
+        assert!(
+            cm2.get_job(1).is_some(),
+            "a fresh terminal job within the retention window is spared"
+        );
+
+        // An aged job (end_time well past the window) is evicted.
+        cm2.jobs.write().get_mut(&1).unwrap().end_time =
+            Some(chrono::Utc::now() - chrono::Duration::days(2));
+        cm2.evict_expired_terminal_jobs();
+        assert!(
+            cm2.get_job(1).is_none(),
+            "a terminal job older than the retention window is evicted"
+        );
+    }
+
+    // retention below the reconcile interval is floored so a job survives at
+    // least one reconcile pass, else its DB row strands as RUNNING in sacct.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_floors_retention_to_reconcile_interval() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.controller.terminal_job_retention_secs = 0;
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("done")),
+        });
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Cancelled,
+        });
+
+        // Just completed: within the floored window, so retention 0 does not
+        // evict on the next tick.
+        cm.evict_expired_terminal_jobs();
+        assert!(
+            cm.get_job(1).is_some(),
+            "retention 0 must be floored above the reconcile interval, not evict immediately"
+        );
+
+        // Older than the floor: now evictable.
+        cm.jobs.write().get_mut(&1).unwrap().end_time = Some(
+            chrono::Utc::now()
+                - chrono::Duration::seconds(crate::accounting::RECONCILE_INTERVAL_SECS as i64 + 1),
+        );
+        cm.evict_expired_terminal_jobs();
+        assert!(
+            cm.get_job(1).is_none(),
+            "a job past the floored window is evicted"
+        );
+    }
+
+    // A target referenced by a pending job's dependency must not be evicted:
+    // dropping it would cancel the afterok dependent before its trigger fires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_spares_jobs_referenced_by_pending_dependency() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.controller.terminal_job_retention_secs = 0;
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        // Target runs, completes, and ages out of the window.
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 100,
+            spec: Box::new(basic_spec("target")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            100,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 100,
+            exit_code: 0,
+            state: JobState::Completed,
+        });
+        cm.jobs.write().get_mut(&100).unwrap().end_time =
+            Some(chrono::Utc::now() - chrono::Duration::days(1));
+
+        // Pending child depends on it (begin-time hold, not a scheduling hold).
+        let mut child = basic_spec("child");
+        child.dependency = vec!["afterok:100".into()];
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 101,
+            spec: Box::new(child),
+        });
+
+        cm.evict_expired_terminal_jobs();
+        assert!(
+            cm.get_job(100).is_some(),
+            "a target referenced by a pending afterok dependent must be spared"
+        );
+
+        // Once the child is gone, the target is evictable.
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 101,
+            exit_code: 0,
+            state: JobState::Cancelled,
+        });
+        cm.jobs.write().get_mut(&101).unwrap().end_time =
+            Some(chrono::Utc::now() - chrono::Duration::days(1));
+        cm.evict_expired_terminal_jobs();
+        assert!(
+            cm.get_job(100).is_none(),
+            "with no live dependent, the aged target is evicted"
+        );
+    }
+
+    // Eviction removes the high-id tail; a snapshot+restore must not lower
+    // next_job_id and reissue a used id (which would clobber the sacct row).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_restore_preserves_next_job_id_after_eviction() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        // Allocate ids 1 and 2. id1 survives; the high-id tail (id2) completes
+        // and is evicted, so rebuild-from-survivors alone would yield id1+1.
+        let id1 = cm.next_job_id.fetch_add(1, Ordering::SeqCst);
+        let id2 = cm.next_job_id.fetch_add(1, Ordering::SeqCst);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: id1,
+            spec: Box::new(basic_spec("survivor")),
+        });
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: id2,
+            spec: Box::new(basic_spec("high")),
+        });
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: id2,
+            exit_code: 0,
+            state: JobState::Cancelled,
+        });
+        let next_before = cm.next_job_id.load(Ordering::Relaxed);
+        cm.apply_operation(&WalOperation::EvictTerminalJobs { job_ids: vec![id2] });
+        assert!(cm.get_job(id2).is_none(), "high-id job evicted");
+
+        // Snapshot AFTER eviction: id2's JobSubmit is compacted away, so the map
+        // no longer contains the high id.
+        let snap = cm.snapshot_state().unwrap();
+
+        // Restore into a fresh controller: surviving jobs alone would rebuild
+        // next_job_id below next_before, reissuing id2.
+        let dir2 = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dir2).await;
+        cm2.restore_from_snapshot(&snap).unwrap();
+        assert!(
+            cm2.next_job_id.load(Ordering::Relaxed) >= next_before,
+            "next_job_id must not regress below {next_before} after evicting id {id2} (was {}), id {id1} survives",
+            cm2.next_job_id.load(Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_suspend_then_resume_accumulates_suspended_secs() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -4379,13 +6708,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("s")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let t0 = chrono::Utc::now();
         cm.apply_operation(&WalOperation::JobSuspend { job_id: 1, at: t0 });
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Suspended);
@@ -4545,13 +6872,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("acc")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let t0 = chrono::Utc::now();
         // Cycle 1: 10s suspended.
         cm.apply_operation(&WalOperation::JobSuspend { job_id: 1, at: t0 });
@@ -4584,13 +6909,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("cancel-susp")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         // Suspended 30s ago, then cancelled now (JobComplete stamps Utc::now()).
         let since = chrono::Utc::now() - chrono::Duration::seconds(30);
         cm.apply_operation(&WalOperation::JobSuspend {
@@ -4641,6 +6964,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
         );
         assert!(
@@ -4656,6 +6980,7 @@ mod tests {
 
         cm.apply_operation(&WalOperation::NodeRegister {
             name: "gpu-node".into(),
+            hostname: String::new(),
             resources: ResourceSet {
                 cpus: 64,
                 memory_mb: 256000,
@@ -4666,12 +6991,14 @@ mod tests {
             wg_pubkey: String::new(),
             version: "1.0".into(),
             labels: HashMap::new(),
+            source: NodeSource::default(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
         assert_eq!(node.total_resources.cpus, 64);
         assert_eq!(node.state, NodeState::Idle);
         assert_eq!(node.address, Some("10.0.0.1".into()));
+        assert_eq!(node.hostname, "gpu-node");
         // Dynamically registered nodes get the default partition
         assert!(
             !node.partitions.is_empty(),
@@ -4713,6 +7040,7 @@ mod tests {
             old_priority: 1000,
             new_priority: 5000,
             pending_reason: None,
+            pending_reason_desc: None,
             reset_requeue_count: false,
             clear_reservation: false,
         });
@@ -4733,6 +7061,182 @@ mod tests {
         assert_eq!(job.spec.name, "my-job");
         assert_eq!(job.state, JobState::Pending);
         assert_eq!(job.spec.partition, Some("default".into()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_reduces_nodes_to_task_count() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let mut spec = basic_spec("fewer-tasks");
+        spec.num_nodes = 4;
+        spec.num_tasks = 1;
+        let id = submit_and_wait(&cm, spec);
+
+        // The persisted spec (what all reporting reads) reflects the node count
+        // actually allocatable, not the over-request.
+        assert_eq!(cm.get_job(id).unwrap().spec.num_nodes, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_keeps_nodes_when_tasks_match() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let mut spec = basic_spec("full-fit");
+        spec.num_nodes = 4;
+        spec.num_tasks = 4;
+        let id = submit_and_wait(&cm, spec);
+
+        assert_eq!(cm.get_job(id).unwrap().spec.num_nodes, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_keeps_nodes_with_explicit_tasks_per_node() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let mut spec = basic_spec("per-node-layout");
+        spec.num_nodes = 4;
+        spec.num_tasks = 1;
+        spec.tasks_per_node = Some(2);
+        let id = submit_and_wait(&cm, spec);
+
+        // An explicit per-node layout pins the node count regardless of the
+        // task total.
+        assert_eq!(cm.get_job(id).unwrap().spec.num_nodes, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_accepts_gpu_after_node_reduction() {
+        // C3: -N4 -n1 --gpus=2 is valid once the node count is reduced to one;
+        // the pre-normalization guard used to reject it.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let mut spec = basic_spec("gpu-reduced");
+        spec.num_nodes = 4;
+        spec.num_tasks = 1;
+        spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(2, None));
+        let outcome = cm.submit_job(spec).unwrap();
+        wait_for("job applied", || cm.get_job(outcome.job_id).is_some());
+        assert_eq!(cm.get_job(outcome.job_id).unwrap().spec.num_nodes, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_warns_when_node_count_reduced() {
+        // I2: a shrunk request returns a user-facing warning; an exact-fit
+        // request returns none.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let mut shrunk = basic_spec("shrunk");
+        shrunk.num_nodes = 4;
+        shrunk.num_tasks = 1;
+        let outcome = cm.submit_job(shrunk).unwrap();
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.contains("requested 4 nodes but only 1")),
+            "expected a node-reduction warning, got {:?}",
+            outcome.warnings
+        );
+
+        let mut exact = basic_spec("exact");
+        exact.num_nodes = 4;
+        exact.num_tasks = 4;
+        let outcome = cm.submit_job(exact).unwrap();
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_rejects_below_partition_min_nodes() {
+        // I1: -N4 -n1 on a MinNodes=4 partition is rejected at submit, not left
+        // pending forever.
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].min_nodes = 4;
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("undersize");
+        spec.partition = Some("default".into());
+        spec.num_nodes = 4;
+        spec.num_tasks = 1; // reduces to 1 node, below min 4
+        let err = cm.submit_job(spec).unwrap_err();
+        assert!(matches!(err, SubmitError::InvalidArgument(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_rejects_above_partition_max_nodes() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].max_nodes = Some(1);
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("oversize");
+        spec.partition = Some("default".into());
+        spec.num_nodes = 2;
+        spec.num_tasks = 2;
+        assert!(cm.submit_job(spec).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_accepts_within_partition_node_bounds() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].min_nodes = 1;
+        config.partitions[0].max_nodes = Some(4);
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("fits");
+        spec.partition = Some("default".into());
+        spec.num_nodes = 2;
+        spec.num_tasks = 2;
+        assert!(cm.submit_job(spec).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_pmix_accepts_single_node_after_reduction() {
+        // I5: -N4 -n1 --mpi=pmix reduces to one node and is accepted.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let mut spec = basic_spec("pmix-one");
+        spec.num_nodes = 4;
+        spec.num_tasks = 1;
+        spec.mpi = Some(spur_core::mpi::MPI_PMIX.into());
+        assert!(cm.submit_job(spec).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_pmix_accepts_multi_node_on_native_hosts() {
+        // Multi-node --mpi=pmix is allowed on native hosts (K8s agents reject at dispatch).
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let mut spec = basic_spec("pmix-many");
+        spec.num_nodes = 4;
+        spec.num_tasks = 4;
+        spec.mpi = Some(spur_core::mpi::MPI_PMIX.into());
+        assert!(cm.submit_job(spec).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_keeps_full_node_count_for_total_gpus() {
+        // C2: -N4 --gpus=8 (ntasks defaulted to nodes) keeps all four nodes so
+        // the eight GPUs spread across them instead of collapsing to one node.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let mut spec = basic_spec("gpu-spread");
+        spec.num_nodes = 4;
+        spec.num_tasks = 4; // one task per node (adapter default for absent -n)
+        spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(8, None));
+        let outcome = cm.submit_job(spec).unwrap();
+        wait_for("job applied", || cm.get_job(outcome.job_id).is_some());
+        assert_eq!(cm.get_job(outcome.job_id).unwrap().spec.num_nodes, 4);
+        assert!(outcome.warnings.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4825,19 +7329,19 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("single-completing")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -4866,19 +7370,19 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("oom")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -4908,19 +7412,19 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("multi-completing")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -4974,18 +7478,18 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("steps")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(4, 8000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
+            srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         // Three srun steps exit 7, 3, 2 (in that order). DerivedExitCode tracks
@@ -5035,13 +7539,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("batch-only")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
 
         cm.apply_operation(&WalOperation::JobStepComplete {
             job_id: 1,
@@ -5065,19 +7567,19 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("finalize-response")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into()],
             resources: scalar_alloc(4, 8000),
             per_node_alloc: per_node_for(&["n1", "n2"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         let r1 = cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -5115,19 +7617,19 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("job-complete-response")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         let resp = cm.apply_operation(&WalOperation::JobComplete {
@@ -5154,19 +7656,19 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("double-complete")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         let first = cm.apply_operation(&WalOperation::JobComplete {
@@ -5211,19 +7713,19 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("penultimate")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 0,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
@@ -5232,7 +7734,7 @@ mod tests {
             signal: 0,
         });
 
-        let result = cm.node_complete(1, "n2", 0, 0).unwrap();
+        let result = cm.node_complete(1, "n2", 0, 0, 0).unwrap();
         assert_eq!(result, NodeCompleteResult::Completing);
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
     }
@@ -5248,27 +7750,171 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("signal-job")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+            srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
-        cm.node_complete(1, "n1", 0, 9).unwrap();
+        cm.node_complete(1, "n1", 0, 9, 0).unwrap();
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Failed);
         assert_eq!(job.exit_code, Some(0));
         assert_eq!(job.exit_signal, 9);
         assert_eq!(job.derived_exit_code, 0);
         assert_eq!(job.pending_reason, PendingReason::RaisedSignal);
+    }
+
+    // A job that exits promptly on the watchdog's SIGTERM used to report FAILED:
+    // its completion reached the controller well before the grace period was up,
+    // and nothing durable recorded why it had been signalled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_complete_after_a_time_limit_signal_reports_timeout() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "time-limit-job", "worker1");
+        cm.signal_time_limit(job_id, Utc::now()).unwrap();
+        wait_for("time limit expiry recorded", || {
+            cm.get_job(job_id)
+                .is_some_and(|j| j.time_limit_signaled_at.is_some())
+        });
+
+        // What spurd reports for a script that dies on SIGTERM.
+        cm.node_complete(job_id, "worker1", 0, 15, 0).unwrap();
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Timeout);
+        assert_eq!(job.pending_reason, PendingReason::TimeLimit);
+        // The terminating signal is still reported, so ExitCode stays 0:15.
+        assert_eq!(job.exit_code, Some(0));
+        assert_eq!(job.exit_signal, 15);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_time_limit_signal_after_the_run_ended_is_a_noop() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        // The watchdog can lose the race: the job finished on its own just as
+        // the deadline passed, so its verdict is already final.
+        let job_id = run_job_on(&cm, "raced-job", "worker1");
+        cm.node_complete(job_id, "worker1", 0, 0, 0).unwrap();
+        settle(&cm, job_id, JobState::Completed);
+
+        cm.signal_time_limit(job_id, Utc::now()).unwrap();
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Completed);
+        assert_eq!(job.pending_reason, PendingReason::None);
+        assert!(job.time_limit_signaled_at.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_kill_after_the_grace_period_reports_the_time_limit_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        // A job that outlives the grace period is finalized by the watchdog
+        // itself rather than by an agent report.
+        let job_id = run_job_on(&cm, "grace-expired", "worker1");
+        cm.signal_time_limit(job_id, Utc::now()).unwrap();
+        cm.complete_job(job_id, -1, JobState::Timeout).unwrap();
+        settle(&cm, job_id, JobState::Timeout);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::TimeLimit);
+        assert_eq!(job.exit_code, Some(-1));
+    }
+
+    // The completing-timeout force-finish and srun completion paths finalize
+    // through complete_job with a state derived from exit status alone, never
+    // consulting the marker. A run the watchdog already signalled must still
+    // report TIMEOUT through those paths, or a well-behaved job skips requeue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn complete_job_promotes_a_signaled_run_to_timeout() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let record_marker = |job_id: JobId| {
+            cm.signal_time_limit(job_id, Utc::now()).unwrap();
+            wait_for("time limit expiry recorded", || {
+                cm.get_job(job_id)
+                    .is_some_and(|j| j.time_limit_signaled_at.is_some())
+            });
+        };
+
+        // force_finish_completing_job passes Failed (e.g. a node never reported)
+        // and its exit_code must survive the promotion.
+        let failed = run_job_on(&cm, "completing-timeout", "worker1");
+        record_marker(failed);
+        cm.complete_job(failed, 1, JobState::Failed).unwrap();
+        settle(&cm, failed, JobState::Timeout);
+        let job = cm.get_job(failed).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::TimeLimit);
+        assert_eq!(job.exit_code, Some(1));
+
+        // finish_srun_job passes Completed for a handler that trapped SIGTERM
+        // and exited 0; the run still expired, matching Job::completion_verdict.
+        let clean = run_job_on(&cm, "srun-timeout", "worker1");
+        record_marker(clean);
+        cm.complete_job(clean, 0, JobState::Completed).unwrap();
+        settle(&cm, clean, JobState::Timeout);
+        assert_eq!(
+            cm.get_job(clean).unwrap().pending_reason,
+            PendingReason::TimeLimit
+        );
+
+        // The promotion is narrow: a cancel on a signalled run stays Cancelled,
+        // since the user's intent is not a time-limit expiry.
+        let cancelled = run_job_on(&cm, "cancel-wins", "worker1");
+        record_marker(cancelled);
+        cm.complete_job(cancelled, -1, JobState::Cancelled).unwrap();
+        settle(&cm, cancelled, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeue_after_a_time_limit_kill_clears_the_marker() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let mut spec = basic_spec("requeue-after-timeout");
+        spec.requeue = true;
+        let job_id = submit_and_wait(&cm, spec);
+        let alloc = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            alloc.clone(),
+            per_node_for(&["worker1"], alloc),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        cm.signal_time_limit(job_id, Utc::now()).unwrap();
+        cm.node_complete(job_id, "worker1", 0, 15, 0).unwrap();
+
+        // Attributing the kill to the time limit is what routes a well-behaved
+        // job into the requeue path at all.
+        settle(&cm, job_id, JobState::Pending);
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.requeue_count, 1);
+        // A marker left behind would make the next run report TIMEOUT the
+        // moment it ended, whatever its outcome.
+        assert!(job.time_limit_signaled_at.is_none());
     }
 
     // Reproduces the two steps report_job_status performs (validate the wire
@@ -5290,22 +7936,22 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("rpc-signal-job")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+            srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         // Step 2: the call the RPC makes after validation (wire state dropped).
-        cm.node_complete(1, "n1", 0, 9).unwrap();
+        cm.node_complete(1, "n1", 0, 9, 0).unwrap();
 
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Failed);
@@ -5325,21 +7971,21 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("exit-job")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+            srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
-        cm.node_complete(1, "n1", 42, 0).unwrap();
+        cm.node_complete(1, "n1", 42, 0, 0).unwrap();
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Failed);
         assert_eq!(job.exit_code, Some(42));
@@ -5348,6 +7994,44 @@ mod tests {
         // exit (42) surfaces as ExitCode, not DerivedExitCode.
         assert_eq!(job.derived_exit_code, 0);
         assert_eq!(job.pending_reason, PendingReason::NonZeroExitCode);
+    }
+
+    // A completion report from a superseded run (older epoch) must be dropped,
+    // not fail the re-dispatched run. Reproduces the preempt-requeue race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_complete_drops_stale_run_report() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("stale-job")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        // Re-dispatched run: current epoch is 2.
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: scalar_alloc(6, 12000),
+            per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+            srun_step_dispatch: false,
+            run_attempt: 2,
+        });
+
+        // Stale SIGKILL report from epoch 1 must be ignored.
+        let res = cm.node_complete(1, "n1", 0, 9, 1).unwrap();
+        assert!(matches!(res, NodeCompleteResult::StaleReport));
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Running);
+
+        // Current-epoch report is applied normally.
+        cm.node_complete(1, "n1", 0, 9, 2).unwrap();
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Failed);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5363,19 +8047,19 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("cancel-while-cg")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 0,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -5430,19 +8114,19 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("nc-after-cancel")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["n1".into(), "n2".into(), "n3".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 0,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
@@ -5454,7 +8138,7 @@ mod tests {
         cm.cancel_job(1, "testuser").unwrap();
         settle(&cm, 1, JobState::Cancelled);
 
-        let result = cm.node_complete(1, "n2", 0, 0).unwrap();
+        let result = cm.node_complete(1, "n2", 0, 0, 0).unwrap();
         assert_eq!(result, NodeCompleteResult::AlreadyTerminal);
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Cancelled);
     }
@@ -5496,7 +8180,8 @@ mod tests {
         assert_eq!(m.running_cpus, 0);
 
         // Snapshot matches a full scan of the job map.
-        let expected = JobMetricsSnapshot::collect(cm.get_jobs(&[], None, None, None, &[]).iter());
+        let expected =
+            JobMetricsSnapshot::collect(cm.get_jobs(&[], None, None, None, None, &[]).iter());
         assert_eq!(cm.job_metrics(), expected);
     }
 
@@ -5556,6 +8241,34 @@ mod tests {
 
         let job = cm.get_job(job_id).unwrap();
         assert_eq!(job.state, JobState::Cancelled);
+    }
+
+    // A cancelled job keeps its reported path (unlike requeue): the file was
+    // created there, so scontrol should still point at it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_preserves_output_path() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("cancel-me"));
+
+        let alloc = scalar_alloc(2, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            alloc.clone(),
+            per_node_for(&["n1"], alloc),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+
+        cm.set_job_output_paths(id, "/tmp/spur.out".into(), "/tmp/spur.out".into());
+        cm.cancel_job(id, "testuser").unwrap();
+        settle(&cm, id, JobState::Cancelled);
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.actual_stdout_path.as_deref(), Some("/tmp/spur.out"));
+        assert_eq!(job.actual_stderr_path.as_deref(), Some("/tmp/spur.out"));
     }
 
     /// Drive a fresh job all the way to RUNNING on `node`, returning its id.
@@ -5703,6 +8416,433 @@ mod tests {
         settle(&cm, job_id, JobState::Running);
     }
 
+    // ── requeue-after-launch-failure backoff ─────────────────────
+
+    /// Let an active hold lapse, exactly as the wall clock would, so the next
+    /// dispatch attempt can proceed without sleeping in the test.
+    fn lapse_hold(cm: &ClusterManager, job_id: JobId) {
+        let mut jobs = cm.jobs.write();
+        let job = jobs.get_mut(&job_id).unwrap();
+        job.spec.begin_time = Some(Utc::now() - chrono::Duration::seconds(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launch_failure_requeue_holds_job_and_reports_reason() {
+        // The dispatch-failure requeue must defer the job and say why. Without
+        // the hold the scheduler re-dispatches on the very next tick, and for a
+        // node-local fault that means the same broken node again.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "launch-fail", "worker1");
+        assert_eq!(cm.node_metrics().alloc_cpus, 2);
+
+        cm.requeue_job(job_id).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert!(job.allocated_nodes.is_empty());
+        assert_eq!(cm.node_metrics().alloc_cpus, 0, "nodes must be freed");
+        assert_eq!(job.requeue_count, 1);
+        assert_eq!(
+            job.pending_reason,
+            PendingReason::JobLaunchFailure,
+            "squeue must show why the job is waiting"
+        );
+        assert!(
+            job.spec.begin_time.is_some_and(|begin| begin > Utc::now()),
+            "requeue must carry a future hold"
+        );
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "held job must not be eligible for immediate re-dispatch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeueing_a_job_that_never_started_is_a_no_op() {
+        // Pending -> Failed is illegal and Pending -> Pending applies as a NoOp,
+        // so the two proposals would be silently discarded. Bailing out keeps the
+        // caller from logging a hold that was never applied.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = submit_and_wait(&cm, basic_spec("never-started"));
+        cm.requeue_job(job_id).unwrap();
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.requeue_count, 0, "no attempt was consumed");
+        assert!(job.spec.begin_time.is_none(), "no hold was applied");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_job_at_the_requeue_cap_is_held_not_ignored() {
+        // The cap has to be checked before the never-started bail-out. A job
+        // that exhausts its budget while Pending would otherwise be dropped on
+        // the floor and re-dispatched at full priority every scheduler tick.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let max = cm.config().controller.max_batch_requeue;
+
+        let job_id = submit_and_wait(&cm, basic_spec("pending-at-cap"));
+        cm.jobs.write().get_mut(&job_id).unwrap().requeue_count = max;
+
+        cm.requeue_job(job_id).unwrap();
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.pending_reason, PendingReason::JobHoldMaxRequeue);
+        assert_eq!(job.priority, 0, "a held job must not outrank live work");
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "the hold must take the job out of scheduling"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn draining_a_node_for_a_launch_failure_still_lets_the_job_requeue() {
+        // The agent drains the node on a spool fault. That drain must not
+        // finalize the job: it still has to reach Pending so the scheduler can
+        // retry it somewhere healthy.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        register_node(&cm, "worker2", 8, 16000);
+
+        let job_id = run_job_on(&cm, "spool-fault", "worker1");
+
+        let (state, _) = cm
+            .drain_node("worker1", Some("launch failed: ENOSPC".into()))
+            .unwrap();
+        assert_eq!(state, NodeState::Draining, "the job still holds the node");
+
+        cm.requeue_job(job_id).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::JobLaunchFailure
+        );
+        let node = cm.get_node("worker1").unwrap();
+        assert!(
+            node.state.is_admin_hold(),
+            "the broken node must stay excluded from scheduling"
+        );
+        assert_eq!(
+            node.state_reason.as_deref(),
+            Some("launch failed: ENOSPC"),
+            "operators need the fault text"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_completion_report_for_a_launch_failure_strands_the_job() {
+        // Why the agent drains instead of reporting a completion: a completion
+        // finalizes the job, and requeue_job refuses terminal jobs, so the
+        // launch failure would never be retried anywhere.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "stranded", "worker1");
+        cm.node_complete(job_id, "worker1", -1, 0, 0).unwrap();
+        wait_for("job reaches a terminal state", || {
+            cm.get_job(job_id).is_some_and(|j| j.state.is_terminal())
+        });
+
+        cm.requeue_job(job_id).unwrap();
+
+        let job = cm.get_job(job_id).unwrap();
+        assert!(
+            job.state.is_terminal(),
+            "the completion report won the race"
+        );
+        assert_eq!(job.requeue_count, 0, "a terminal job is never retried");
+    }
+
+    #[test]
+    fn the_backoff_doubles_each_attempt_up_to_the_cap() {
+        // The schedule itself, checked as arithmetic. With the default
+        // interval_secs = 1 the base is 5s, so the five attempts allowed by
+        // max_batch_requeue = 5 wait 5, 10, 20, 40 and 80 seconds: 155s in
+        // total instead of burning the budget in ~5s.
+        let uncapped = spur_core::config::MAX_LAUNCH_BACKOFF_SECS;
+        for (attempt, expected) in [5u64, 10, 20, 40, 80].into_iter().enumerate() {
+            assert_eq!(
+                launch_backoff_secs(1, uncapped, attempt as u32),
+                expected,
+                "attempt {attempt}"
+            );
+        }
+
+        // A cap clamps the doubling without stopping it from reaching the cap.
+        assert_eq!(launch_backoff_secs(1, 12, 0), 5);
+        assert_eq!(launch_backoff_secs(1, 12, 1), 10);
+        assert_eq!(launch_backoff_secs(1, 12, 2), 12);
+
+        // A slow scheduler waits at least two of its own cycles plus slack, and
+        // a zero interval still gets the 5s floor rather than no backoff at all.
+        assert_eq!(launch_backoff_secs(10, uncapped, 0), 23);
+        assert_eq!(launch_backoff_secs(0, uncapped, 0), 5);
+
+        // An operator-supplied max_batch_requeue large enough to overflow the
+        // shift must saturate at the cap, not panic the controller.
+        assert_eq!(launch_backoff_secs(1, 300, u32::MAX), 300);
+        assert_eq!(launch_backoff_secs(1, uncapped, u32::MAX), uncapped);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launch_failure_backoff_defers_every_attempt_until_the_budget_runs_out() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = submit_and_wait(&cm, basic_spec("backoff-schedule"));
+
+        for attempt in 0..cm.config().controller.max_batch_requeue {
+            let resources = scalar_alloc(2, 4000);
+            cm.start_job(
+                job_id,
+                vec!["worker1".into()],
+                resources.clone(),
+                per_node_for(&["worker1"], resources),
+            )
+            .unwrap();
+            settle(&cm, job_id, JobState::Running);
+
+            cm.requeue_job(job_id).unwrap();
+            settle(&cm, job_id, JobState::Pending);
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.requeue_count, attempt + 1);
+            assert!(
+                job.spec.begin_time.is_some_and(|begin| begin > Utc::now()),
+                "attempt {attempt} must defer the retry"
+            );
+            assert!(
+                !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+                "attempt {attempt} must not leave the job immediately eligible"
+            );
+
+            lapse_hold(&cm, job_id);
+        }
+
+        // Budget exhausted: the next failure holds the job for an operator.
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            resources.clone(),
+            per_node_for(&["worker1"], resources),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+        cm.requeue_job(job_id).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::JobHoldMaxRequeue
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launch_failure_requeue_preserves_later_user_begin() {
+        // The backoff must never shorten a user's --begin constraint.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let user_begin = Utc::now() + chrono::Duration::hours(1);
+        let mut spec = basic_spec("user-begin-launch-fail");
+        spec.begin_time = Some(user_begin);
+        let job_id = submit_and_wait(&cm, spec);
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            resources.clone(),
+            per_node_for(&["worker1"], resources),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        cm.requeue_job(job_id).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+
+        assert_eq!(
+            cm.get_job(job_id).unwrap().spec.begin_time,
+            Some(user_begin),
+            "user --begin beyond the hold must be preserved"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launch_failure_reason_survives_both_pending_reason_passes() {
+        // JobLaunchFailure must outlive every pass that recomputes
+        // pending_reason. The predicate lives in four places; miss one and the
+        // reason is clobbered back to Resources before an operator sees it.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "reason-survives", "worker1");
+        cm.requeue_job(job_id).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+
+        // Both guard sites in tag_blocked_pending_reasons.
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::JobLaunchFailure,
+            "tag_blocked_pending_reasons must not clobber an active hold"
+        );
+
+        // The guard site in update_pending_reasons. An empty cluster_state would
+        // otherwise force Resources/NodeDown.
+        let empty_state = spur_sched::traits::ClusterState {
+            nodes: &[],
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        let snapshot = cm.get_job(job_id).unwrap();
+        cm.update_pending_reasons(&[&snapshot], &empty_state);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::JobLaunchFailure,
+            "update_pending_reasons must not clobber an active hold"
+        );
+
+        // The guard site in cancel_unsatisfiable_dependency_jobs.
+        cm.cancel_unsatisfiable_dependency_jobs();
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::JobLaunchFailure,
+            "the dependency pass must not clobber an active hold"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_user_begin_job_still_reports_what_blocks_it() {
+        // A --begin job carries no reason explaining its own hold, so the wait
+        // reason passes must still tag it. Skipping every held job would leave
+        // squeue showing None for as long as the user asked to wait.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let mut spec = basic_spec("begin-blocked");
+        spec.begin_time = Some(Utc::now() + chrono::Duration::hours(1));
+        let job_id = submit_and_wait(&cm, spec);
+        assert!(cm.get_job(job_id).unwrap().is_begin_held(Utc::now()));
+
+        let empty_state = spur_sched::traits::ClusterState {
+            nodes: &[],
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        let snapshot = cm.get_job(job_id).unwrap();
+        cm.update_pending_reasons(&[&snapshot], &empty_state);
+
+        let reason = cm.get_job(job_id).unwrap().pending_reason;
+        assert_ne!(
+            reason,
+            PendingReason::None,
+            "a held --begin job must still say what blocks it"
+        );
+        assert!(
+            !reason.explains_begin_hold(),
+            "the hold is not the blocker here, the empty cluster is"
+        );
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "tagging a reason must not make a held job eligible"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launch_failure_hold_expires_and_job_reschedules() {
+        // The hold defers the job, it must not strand it.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "hold-lapses", "worker1");
+        cm.requeue_job(job_id).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+        lapse_hold(&cm, job_id);
+
+        assert!(
+            cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "job must be eligible again once the hold lapses"
+        );
+
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            resources.clone(),
+            per_node_for(&["worker1"], resources),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replayed_backoff_requeue_does_not_double_count_or_drift() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("backoff-replay")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: -1,
+            state: JobState::Failed,
+        });
+
+        let hold = Utc::now() + chrono::Duration::seconds(40);
+        let requeue = WalOperation::job_state_change_backoff_pending(
+            1,
+            JobState::Failed,
+            PendingReason::JobLaunchFailure,
+            hold,
+        );
+        cm.apply_operation(&requeue);
+
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.requeue_count, 1);
+        assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+        assert_eq!(job.spec.begin_time, Some(hold));
+
+        // Replay the identical entry: the job is already Pending, so this is a
+        // NoOp. Followers and WAL recovery must not compound the hold.
+        cm.apply_operation(&requeue);
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(
+            job.requeue_count, 1,
+            "replayed requeue must not double-count"
+        );
+        assert_eq!(
+            job.spec.begin_time,
+            Some(hold),
+            "replayed hold instant must not drift"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn preempt_job_cancel_terminates_and_frees_nodes() {
         let dir = TempDir::new().unwrap();
@@ -5768,22 +8908,18 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("replay")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
 
         // Re-applying the same running transition is a NoOp, not an error.
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Running);
 
         let alloc = scalar_alloc(2, 4000);
@@ -5792,6 +8928,8 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 0,
         });
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
@@ -5822,35 +8960,29 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("requeue-replay")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
             exit_code: -1,
             state: JobState::Preempted,
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Preempted,
-            new_state: JobState::Pending,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Preempted,
+            JobState::Pending,
+        ));
         assert_eq!(cm.get_job(1).unwrap().requeue_count, 1);
 
         // Replay the same requeue transition (job already Pending): NoOp.
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Preempted,
-            new_state: JobState::Pending,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Preempted,
+            JobState::Pending,
+        ));
         assert_eq!(
             cm.get_job(1).unwrap().requeue_count,
             1,
@@ -5872,19 +9004,19 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("preempt-replay")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
         let alloc = scalar_alloc(2, 4000);
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 0,
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
 
@@ -5901,7 +9033,8 @@ mod tests {
         assert_eq!(job.state, JobState::Pending);
         assert_eq!(job.spec.begin_time, Some(begin_time));
         assert_eq!(job.pending_reason, PendingReason::BeginTime);
-        assert_eq!(job.requeue_count, 1);
+        assert_eq!(job.preempt_requeue_count, 1);
+        assert_eq!(job.requeue_count, 0);
         assert!(job.allocated_nodes.is_empty());
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
 
@@ -5921,7 +9054,7 @@ mod tests {
             "instant must not drift"
         );
         assert_eq!(
-            job.requeue_count, 1,
+            job.preempt_requeue_count, 1,
             "replayed preempt-requeue must not double-count"
         );
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
@@ -6100,6 +9233,57 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn k8s_reserved_node_reports_k8s_reserved_not_resources() {
+        // A job that would fit but for the node being claimed by k8s must report
+        // K8sReserved, so `squeue` explains why an "idle"-looking node won't run it.
+        use spur_core::k0s::K0sRole;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let job_id = submit_and_wait(&cm, basic_spec("wants-k8s-node"));
+        let snapshot = cm.get_job(job_id).unwrap();
+
+        // Idle node with capacity, but reserved for k8s -> K8sReserved.
+        let mut node = cm.get_node("n1").unwrap();
+        node.k0s_role = Some(K0sRole::Worker);
+        let nodes = vec![node];
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::K8sReserved
+        );
+
+        // An exclusive job needs an idle node, so a busy k8s node would not run it
+        // even if the role were cleared -> plain Resources, not K8sReserved.
+        let mut busy = cm.get_node("n1").unwrap();
+        busy.k0s_role = Some(K0sRole::Worker);
+        busy.alloc_resources = scalar_alloc(2, 4000);
+        busy.state = NodeState::Mixed;
+        let nodes = vec![busy];
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        let mut excl_spec = basic_spec("excl");
+        excl_spec.exclusive = true;
+        let excl = submit_and_wait(&cm, excl_spec);
+        let excl_snap = cm.get_job(excl).unwrap();
+        cm.update_pending_reasons(&[&excl_snap], &state);
+        assert_eq!(
+            cm.get_job(excl).unwrap().pending_reason,
+            PendingReason::Resources
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nodelist_that_cannot_match_reports_req_node_not_avail() {
         // A job pinned to a node that isn't idle/usable must report
         // ReqNodeNotAvail, not Priority (as if merely queued behind others).
@@ -6129,6 +9313,176 @@ mod tests {
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::ReqNodeNotAvail
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn additive_nodelist_fill_shortage_reports_resources() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        register_node(&cm, "n3", 4, 8000);
+
+        let mut spec = basic_spec("fill-shortage");
+        spec.num_nodes = 3;
+        spec.num_tasks = 3;
+        spec.nodelist = Some("n1".into());
+        spec.exclude = Some("n3".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let snapshot = cm.get_job(job_id).unwrap();
+
+        let nodes = vec![
+            cm.get_node("n1").unwrap(),
+            cm.get_node("n2").unwrap(),
+            cm.get_node("n3").unwrap(),
+        ];
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::Resources
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn additive_nodelist_unavailable_listed_node_reports_req_node_not_avail() {
+        use spur_core::node::NodeState;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        register_node(&cm, "n3", 4, 8000);
+        register_node(&cm, "n4", 4, 8000);
+
+        let mut spec = basic_spec("listed-down");
+        spec.num_nodes = 3;
+        spec.num_tasks = 3;
+        spec.nodelist = Some("n1".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let snapshot = cm.get_job(job_id).unwrap();
+
+        let mut n1 = cm.get_node("n1").unwrap();
+        n1.state = NodeState::Drain;
+        let nodes = vec![
+            n1,
+            cm.get_node("n2").unwrap(),
+            cm.get_node("n3").unwrap(),
+            cm.get_node("n4").unwrap(),
+        ];
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::ReqNodeNotAvail
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn additive_nodelist_fill_blocked_by_maintenance_reports_reserved_maintenance() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        register_node(&cm, "n3", 4, 8000);
+        register_node(&cm, "n4", 4, 8000);
+
+        let mut spec = basic_spec("fill-maintenance");
+        spec.num_nodes = 3;
+        spec.num_tasks = 3;
+        spec.nodelist = Some("n1".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let snapshot = cm.get_job(job_id).unwrap();
+
+        let nodes = vec![
+            cm.get_node("n1").unwrap(),
+            cm.get_node("n2").unwrap(),
+            cm.get_node("n3").unwrap(),
+            cm.get_node("n4").unwrap(),
+        ];
+        let now = Utc::now();
+        let reservations = vec![Reservation {
+            name: "maintenance".into(),
+            start_time: now + chrono::Duration::minutes(30),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n2".into(), "n3".into(), "n4".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: spur_core::reservation::ReservationFlags {
+                maint: true,
+                ..Default::default()
+            },
+            owner: String::new(),
+        }];
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &reservations,
+            topology: None,
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::ReservedMaintenance
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn additive_nodelist_listed_node_blocked_by_maintenance_reports_reserved_maintenance() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        register_node(&cm, "n3", 4, 8000);
+        register_node(&cm, "n4", 4, 8000);
+
+        let mut spec = basic_spec("listed-maintenance");
+        spec.num_nodes = 3;
+        spec.num_tasks = 3;
+        spec.nodelist = Some("n1".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let snapshot = cm.get_job(job_id).unwrap();
+
+        let nodes = vec![
+            cm.get_node("n1").unwrap(),
+            cm.get_node("n2").unwrap(),
+            cm.get_node("n3").unwrap(),
+            cm.get_node("n4").unwrap(),
+        ];
+        let now = Utc::now();
+        let reservations = vec![Reservation {
+            name: "maintenance".into(),
+            start_time: now + chrono::Duration::minutes(30),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: spur_core::reservation::ReservationFlags {
+                maint: true,
+                ..Default::default()
+            },
+            owner: String::new(),
+        }];
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &reservations,
+            topology: None,
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::ReservedMaintenance
         );
     }
 
@@ -6191,7 +9545,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tag_blocked_sets_partition_config_reason() {
-        // Request exceeds partition max_nodes -> PartitionConfig, not Resources.
+        // A job exceeding partition max_nodes that reaches the scheduler (e.g. a
+        // replayed pre-upgrade WAL entry predating submit-time bounds checking)
+        // must be tagged PartitionConfig and dropped, not scheduled. Fresh
+        // submits are rejected earlier (see submit_rejects_node_bounds_*).
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.partitions[0].max_nodes = Some(1);
@@ -6200,7 +9557,13 @@ mod tests {
         let mut spec = basic_spec("toobig");
         spec.partition = Some("default".into());
         spec.num_nodes = 2;
-        let job_id = submit_and_wait(&cm, spec);
+        spec.num_tasks = 2;
+        let job_id = 1;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id,
+            spec: Box::new(spec),
+        });
+        wait_for("job applied", || cm.get_job(job_id).is_some());
 
         cm.tag_blocked_pending_reasons();
         assert_eq!(
@@ -6223,15 +9586,26 @@ mod tests {
         config.partitions[0].min_nodes = 2;
         let cm = test_cluster_with_config(&dir, config).await;
 
+        // Meets min_nodes but exceeds max_time: the time cap is not a
+        // submit-time bound, so this is admitted and pends with PartitionConfig.
         let mut over_time = basic_spec("overtime");
         over_time.partition = Some("default".into());
+        over_time.num_nodes = 2;
+        over_time.num_tasks = 2;
         over_time.time_limit = Some(chrono::Duration::hours(1));
         let t_id = submit_and_wait(&cm, over_time);
 
+        // Below min_nodes is rejected at submit now, so inject directly to
+        // exercise the scheduler's PartitionConfig tagging for replayed entries.
         let mut under_nodes = basic_spec("undernodes");
         under_nodes.partition = Some("default".into());
         under_nodes.num_nodes = 1; // below min_nodes=2
-        let n_id = submit_and_wait(&cm, under_nodes);
+        let n_id = 999;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: n_id,
+            spec: Box::new(under_nodes),
+        });
+        wait_for("undernodes applied", || cm.get_job(n_id).is_some());
 
         cm.tag_blocked_pending_reasons();
         assert_eq!(
@@ -6274,6 +9648,53 @@ mod tests {
         assert!(
             !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
             "job in a non-Up partition must be dropped from scheduling"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multi_partition_job_reaches_scheduling_when_one_partition_is_eligible() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].state = "DOWN".into();
+        config.partitions[0].max_nodes = Some(1);
+        let mut batch = config.partitions[0].clone();
+        batch.name = "batch".into();
+        batch.default = false;
+        batch.state = "UP".into();
+        batch.max_nodes = Some(2);
+        config.partitions.push(batch);
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("multi-partition");
+        spec.partition = Some("default, batch".into());
+        spec.num_nodes = 2;
+        spec.num_tasks = 2;
+        let job_id = submit_and_wait(&cm, spec);
+
+        assert!(cm.pending_jobs().iter().any(|job| job.job_id == job_id));
+        assert_eq!(
+            cm.get_job(job_id).unwrap().spec.partition.as_deref(),
+            Some("default, batch")
+        );
+    }
+
+    #[test]
+    fn partition_block_rejects_mixed_known_and_unknown_partitions() {
+        let job = Job::new(
+            1,
+            JobSpec {
+                partition: Some("default,missing".into()),
+                ..basic_spec("mixed-partitions")
+            },
+        );
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+
+        assert_eq!(
+            partition_block(&job, &partitions),
+            Some(PendingReason::PartitionConfig)
         );
     }
 
@@ -6399,14 +9820,35 @@ mod tests {
         cfg.partitions[0].allow_accounts = vec!["research".into()];
         let cm = test_cluster_with_config(&dir, cfg).await;
         cm.association_cache()
-            .insert_association("testuser", "student");
+            .insert_association("testuser", "student-z");
+        cm.association_cache()
+            .insert_association("testuser", "student-a");
 
         let mut spec = basic_spec("spoof");
         spec.account = Some("research".into());
         let err = cm.submit_job(spec).unwrap_err();
         assert_eq!(
             err,
-            SubmitError::invalid("user 'testuser' is not associated with account 'research'")
+            SubmitError::invalid(
+                "user 'testuser' is not associated with account 'research'. Accounts associated with this user: [student-a, student-z]."
+            )
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_rejects_account_when_user_has_no_associations() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.association_cache().set_loaded_without_associations();
+
+        let mut spec = basic_spec("unassociated");
+        spec.account = Some("research".into());
+        let err = cm.submit_job(spec).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid(
+                "user 'testuser' has no account associations. Contact your cluster admin to run: sacctmgr add user name=testuser account=<account>"
+            )
         );
     }
 
@@ -6426,7 +9868,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn submit_skips_allow_accounts_when_association_cache_unavailable() {
+    async fn submit_enforces_allow_accounts_without_association_cache() {
+        // Partition ACL is pure string matching — it must fire even when the
+        // accounting association cache is empty (no Postgres backend running).
         let dir = TempDir::new().unwrap();
         let mut cfg = test_config();
         cfg.partitions[0].allow_accounts = vec!["research".into()];
@@ -6434,7 +9878,10 @@ mod tests {
 
         let mut spec = basic_spec("nocache");
         spec.account = Some("student".into());
-        assert!(cm.submit_job(spec).is_ok());
+        assert!(
+            cm.submit_job(spec).is_err(),
+            "unlisted account must be rejected"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6447,6 +9894,43 @@ mod tests {
         assert!(
             cm.submit_job(spec).is_err(),
             "submitting to an unknown partition must error"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_rejects_nonexistent_partition_in_or_list() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let mut spec = basic_spec("badpart");
+        spec.partition = Some("default, does-not-exist".into());
+        let err = cm.submit_job(spec).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid("partition 'does-not-exist' not found")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_enforces_account_access_on_every_requested_partition() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].allow_accounts = vec!["research".into()];
+        let mut restricted = config.partitions[0].clone();
+        restricted.name = "restricted".into();
+        restricted.default = false;
+        restricted.allow_accounts = vec!["faculty".into()];
+        config.partitions.push(restricted);
+        let cm = test_cluster_with_config(&dir, config).await;
+        cm.association_cache()
+            .insert_association("testuser", "research");
+
+        let mut spec = basic_spec("mixed-access");
+        spec.partition = Some("default,restricted".into());
+        spec.account = Some("research".into());
+        let err = cm.submit_job(spec).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid("account 'research' not allowed on partition 'restricted'")
         );
     }
 
@@ -6492,6 +9976,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         let mut r1 = base.clone();
         r1.name = "r1".into();
@@ -6516,6 +10001,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         let mut r1 = base.clone();
         r1.name = "r1".into();
@@ -6541,6 +10027,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["testuser".into()],
             flags: Default::default(),
+            owner: String::new(),
         })
         .unwrap();
 
@@ -6559,6 +10046,139 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_applies_qos_priority_adjustment() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache().insert(Qos {
+            name: "low".into(),
+            priority: -500,
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 5000,
+            ..Default::default()
+        });
+
+        let mut low = basic_spec("low");
+        low.priority = Some(1000);
+        low.qos = Some("low".into());
+        let low_id = submit_and_wait(&cm, low);
+
+        let mut high = basic_spec("high");
+        high.priority = Some(1000);
+        high.qos = Some("high".into());
+        let high_id = submit_and_wait(&cm, high);
+
+        let pending = cm.pending_jobs();
+        let low_priority = pending
+            .iter()
+            .find(|j| j.job_id == low_id)
+            .unwrap()
+            .priority;
+        let high_priority = pending
+            .iter()
+            .find(|j| j.job_id == high_id)
+            .unwrap()
+            .priority;
+        assert!(
+            high_priority > low_priority,
+            "high-QoS job ({high_priority}) should outrank low-QoS job ({low_priority}) \
+             despite identical base priority"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_qos_ordering_holds_with_nonneutral_fairshare_and_age() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache().insert(Qos {
+            name: "low".into(),
+            priority: 100,
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 5000,
+            ..Default::default()
+        });
+
+        // Non-neutral fairshare/age on the low-QoS job would previously let
+        // that unrelated boost amplify its QoS delta and outrank the high-QoS job.
+        cm.fairshare_cache().set_for_test("low-user", "", 3.0);
+
+        let mut low = basic_spec("low");
+        low.user = "low-user".into();
+        low.priority = Some(1000);
+        low.qos = Some("low".into());
+        let low_id = submit_and_wait(&cm, low);
+        {
+            let mut jobs = cm.jobs.write();
+            jobs.get_mut(&low_id).unwrap().submit_time = Utc::now() - chrono::Duration::days(6);
+        }
+
+        let mut high = basic_spec("high");
+        high.priority = Some(1000);
+        high.qos = Some("high".into());
+        let high_id = submit_and_wait(&cm, high);
+
+        let pending = cm.pending_jobs();
+        let low_priority = pending
+            .iter()
+            .find(|j| j.job_id == low_id)
+            .unwrap()
+            .priority;
+        let high_priority = pending
+            .iter()
+            .find(|j| j.job_id == high_id)
+            .unwrap()
+            .priority;
+        assert!(
+            high_priority > low_priority,
+            "high-QoS job ({high_priority}) should still outrank low-QoS job ({low_priority}) \
+             once fairshare/age no longer amplify the QoS delta"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn current_effective_priority_multi_partition_uses_highest_priority_tier() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        {
+            let mut partitions = cm.partitions.write();
+            partitions.push(Partition {
+                name: "low".into(),
+                priority_tier: 1,
+                ..Default::default()
+            });
+            partitions.push(Partition {
+                name: "high".into(),
+                priority_tier: 9,
+                ..Default::default()
+            });
+        }
+
+        // Built directly (not submitted) to isolate priority resolution from
+        // unrelated eligibility filters like partition_block().
+        let job = Job::new(
+            1,
+            JobSpec {
+                partition: Some("low,high".into()),
+                priority: Some(1000),
+                ..basic_spec("multi")
+            },
+        );
+
+        let priority =
+            cm.current_effective_priority_with_qos(&job, &Qos::default(), &cm.get_partitions());
+        assert_eq!(
+            priority, 9000,
+            "multi-partition job should use the highest matched priority_tier (9), \
+             not fall back to 1 because \"low,high\" isn't an exact partition name"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resv_overrun_grace_delays_cancel() {
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
@@ -6574,6 +10194,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["testuser".into()],
             flags: Default::default(),
+            owner: String::new(),
         })
         .unwrap();
 
@@ -6610,6 +10231,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["testuser".into()],
             flags: Default::default(),
+            owner: String::new(),
         })
         .unwrap();
 
@@ -6672,6 +10294,90 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_triggers_when_qos_priority_differentiates_pending_job() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].preempt_mode = "cancel".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 5000,
+            ..Default::default()
+        });
+
+        // Same base priority on both jobs; only the QoS adjustment differentiates them.
+        let mut low = basic_spec("low");
+        low.priority = Some(1000);
+        let low_id = submit_and_wait(&cm, low);
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            low_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, low_id, JobState::Running);
+
+        let mut high = basic_spec("high");
+        high.priority = Some(1000);
+        high.qos = Some("high".into());
+        submit_and_wait(&cm, high);
+
+        // pending_jobs() applies the QoS adjustment, unlike a synthetic Job.
+        let pending = cm.pending_jobs();
+        let pending_refs: Vec<&Job> = pending.iter().collect();
+        let partitions = cm.get_partitions();
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs).await;
+
+        settle(&cm, low_id, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_uses_candidate_qos_preempt_mode_over_partition() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        // Partition says Cancel; the candidate's QoS overrides it to Suspend.
+        config.partitions[0].preempt_mode = "cancel".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.qos_cache().insert(Qos {
+            name: "suspend-me".into(),
+            preempt_mode: spur_core::accounting::QosPreemptMode::Suspend,
+            ..Default::default()
+        });
+
+        let mut low = basic_spec("low");
+        low.priority = Some(100);
+        low.qos = Some("suspend-me".into());
+        let low_id = submit_and_wait(&cm, low);
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            low_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, low_id, JobState::Running);
+
+        let mut high = basic_spec("high");
+        high.priority = Some(10_000);
+        let high_id = submit_and_wait(&cm, high);
+        let high_job = cm.get_job(high_id).unwrap();
+        let partitions = cm.get_partitions();
+
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job]).await;
+
+        // Suspended, not Cancelled: proves the QoS override reached the real
+        // preemption action, not just the pure job_preempt_mode() decision.
+        settle(&cm, low_id, JobState::Suspended);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn purge_expired_holds_pending_reservation_jobs() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -6686,6 +10392,7 @@ mod tests {
                 accounts: Vec::new(),
                 users: vec!["testuser".into()],
                 flags: Default::default(),
+                owner: String::new(),
             },
         });
 
@@ -6715,6 +10422,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         cm.apply_operation(&WalOperation::ReservationCreate {
             reservation: res.clone(),
@@ -6761,6 +10469,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         cm.apply_operation(&WalOperation::ReservationCreate {
             reservation: res.clone(),
@@ -6784,6 +10493,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         };
         let cm1 = cm.clone();
         let cm2 = cm.clone();
@@ -6818,6 +10528,7 @@ mod tests {
                 accounts: Vec::new(),
                 users: vec!["alice".into()],
                 flags: Default::default(),
+                owner: String::new(),
             })
             .unwrap();
             assert_eq!(cm.get_reservations().len(), 1);
@@ -6847,6 +10558,7 @@ mod tests {
                 no_hold_jobs: true,
                 ..Default::default()
             },
+            owner: String::new(),
         })
         .unwrap();
 
@@ -6854,7 +10566,7 @@ mod tests {
         spec.reservation = Some("r1".into());
         let job_id = submit_and_wait(&cm, spec);
 
-        cm.delete_reservation("r1").unwrap();
+        cm.delete_reservation("r1", "root").unwrap();
         wait_for("reservation deleted", || cm.get_reservations().is_empty());
 
         let job = cm.get_job(job_id).unwrap();
@@ -6866,6 +10578,106 @@ mod tests {
             cm.pending_jobs().iter().any(|j| j.job_id == job_id),
             "job must remain schedulable after no_hold_jobs delete"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_reservation_rejects_non_owner() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "r1".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: Default::default(),
+            owner: "alice".into(),
+        })
+        .unwrap();
+
+        let err = cm.delete_reservation("r1", "bob").unwrap_err();
+        assert!(
+            matches!(err, ReservationError::PermissionDenied(_)),
+            "non-owner delete must be denied, got {err:?}"
+        );
+        assert_eq!(cm.get_reservations().len(), 1, "reservation must survive");
+
+        cm.delete_reservation("r1", "alice").unwrap();
+        assert!(
+            cm.get_reservations().is_empty(),
+            "owner delete must succeed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_reservation_rejects_non_owner() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "r1".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: Default::default(),
+            owner: "alice".into(),
+        })
+        .unwrap();
+
+        let err = cm
+            .update_reservation("r1", 30, &[], &[], &[], &[], &[], &[], "bob")
+            .unwrap_err();
+        assert!(
+            matches!(err, ReservationError::PermissionDenied(_)),
+            "non-owner update must be denied, got {err:?}"
+        );
+
+        cm.update_reservation("r1", 30, &[], &[], &[], &[], &[], &[], "alice")
+            .expect("owner update must succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_reservation_allows_root_and_unowned() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "owned".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: Default::default(),
+            owner: "alice".into(),
+        })
+        .unwrap();
+        cm.create_reservation(Reservation {
+            name: "legacy".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: Vec::new(),
+            flags: spur_core::reservation::ReservationFlags {
+                overlap: true,
+                ..Default::default()
+            },
+            owner: String::new(),
+        })
+        .unwrap();
+
+        cm.delete_reservation("owned", "root")
+            .expect("root may delete any reservation");
+        cm.delete_reservation("legacy", "bob")
+            .expect("unowned reservation stays manageable by anyone");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6886,6 +10698,7 @@ mod tests {
                     no_hold_jobs: true,
                     ..Default::default()
                 },
+                owner: String::new(),
             },
         });
 
@@ -6919,6 +10732,7 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["alice".into()],
             flags: Default::default(),
+            owner: String::new(),
         })
         .unwrap();
 
@@ -6988,33 +10802,27 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         let job_id = submit_and_wait(&cm, basic_spec("preempt-me"));
-        cm.apply_operation(&WalOperation::JobStateChange {
+        cm.apply_operation(&WalOperation::job_state_change(
             job_id,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+            JobState::Pending,
+            JobState::Running,
+        ));
         cm.apply_operation(&WalOperation::JobComplete {
             job_id,
             exit_code: -1,
             state: JobState::Preempted,
         });
         for _ in 0..5 {
-            cm.apply_operation(&WalOperation::JobStateChange {
+            cm.apply_operation(&WalOperation::job_state_change(
                 job_id,
-                old_state: JobState::Preempted,
-                new_state: JobState::Pending,
-                pending_reason: None,
-                pending_priority: None,
-            });
-            cm.apply_operation(&WalOperation::JobStateChange {
+                JobState::Preempted,
+                JobState::Pending,
+            ));
+            cm.apply_operation(&WalOperation::job_state_change(
                 job_id,
-                old_state: JobState::Pending,
-                new_state: JobState::Running,
-                pending_reason: None,
-                pending_priority: None,
-            });
+                JobState::Pending,
+                JobState::Running,
+            ));
             cm.apply_operation(&WalOperation::JobComplete {
                 job_id,
                 exit_code: -1,
@@ -7052,13 +10860,14 @@ mod tests {
                 accounts: Vec::new(),
                 users: vec!["testuser".into()],
                 flags: Default::default(),
+                owner: String::new(),
             })
             .unwrap();
 
             let mut spec = basic_spec("resv-hold");
             spec.reservation = Some("r1".into());
             let job_id = submit_and_wait(&cm, spec);
-            cm.delete_reservation("r1").unwrap();
+            cm.delete_reservation("r1", "root").unwrap();
             wait_for("job held after delete", || {
                 cm.get_job(job_id).is_some_and(|j| {
                     j.pending_reason == PendingReason::ReservationDeleted && j.priority == 0
@@ -7094,13 +10903,14 @@ mod tests {
                     no_hold_jobs: true,
                     ..Default::default()
                 },
+                owner: String::new(),
             })
             .unwrap();
 
             let mut spec = basic_spec("resv-no-hold");
             spec.reservation = Some("r1".into());
             job_id = submit_and_wait(&cm, spec);
-            cm.delete_reservation("r1").unwrap();
+            cm.delete_reservation("r1", "root").unwrap();
             wait_for("reservation detached from job", || {
                 cm.get_job(job_id)
                     .is_some_and(|j| j.spec.reservation.is_none() && j.priority > 0)
@@ -7128,13 +10938,14 @@ mod tests {
             accounts: Vec::new(),
             users: vec!["testuser".into()],
             flags: Default::default(),
+            owner: String::new(),
         })
         .unwrap();
 
         let mut spec = basic_spec("release-me");
         spec.reservation = Some("r1".into());
         let job_id = submit_and_wait(&cm, spec);
-        cm.delete_reservation("r1").unwrap();
+        cm.delete_reservation("r1", "root").unwrap();
         wait_for("job held after delete", || {
             cm.get_job(job_id).is_some_and(|j| {
                 j.pending_reason == PendingReason::ReservationDeleted && j.priority == 0
@@ -7180,6 +10991,184 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_requeue_never_holds_job_regardless_of_repeat_count() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let max = cm.config().controller.max_batch_requeue;
+
+        let job_id = run_job_on(&cm, "chronic-preempt", "worker1");
+        for _ in 0..(max + 3) {
+            cm.preempt_job(job_id, PreemptMode::Requeue).unwrap();
+            settle(&cm, job_id, JobState::Pending);
+            {
+                let mut jobs = cm.jobs.write();
+                jobs.get_mut(&job_id).unwrap().spec.begin_time =
+                    Some(Utc::now() - chrono::Duration::seconds(1));
+            }
+            let resources = scalar_alloc(2, 4000);
+            cm.start_job(
+                job_id,
+                vec!["worker1".into()],
+                resources.clone(),
+                per_node_for(&["worker1"], resources),
+            )
+            .unwrap();
+            settle(&cm, job_id, JobState::Running);
+        }
+        cm.preempt_job(job_id, PreemptMode::Requeue).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert!(
+            job.preempt_requeue_count > max,
+            "job must have been preempted more times than max_batch_requeue"
+        );
+        assert_eq!(
+            job.requeue_count, 0,
+            "repeated preemption must not touch the failure-requeue counter"
+        );
+        assert_ne!(
+            job.pending_reason,
+            PendingReason::JobHoldMaxRequeue,
+            "a chronically-preempted but otherwise healthy job must never be held"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chronic_preemption_does_not_exhaust_failure_requeue_budget() {
+        // A job preempted max_batch_requeue times must still get a full
+        // failure-requeue budget: the two counters are independent.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let max = cm.config().controller.max_batch_requeue;
+
+        let mut spec = basic_spec("chronic-then-timeout");
+        spec.requeue = true;
+        let job_id = submit_and_wait(&cm, spec);
+        let resources = scalar_alloc(2, 4000);
+
+        for _ in 0..max {
+            cm.start_job(
+                job_id,
+                vec!["worker1".into()],
+                resources.clone(),
+                per_node_for(&["worker1"], resources.clone()),
+            )
+            .unwrap();
+            settle(&cm, job_id, JobState::Running);
+            cm.preempt_job(job_id, PreemptMode::Requeue).unwrap();
+            settle(&cm, job_id, JobState::Pending);
+            {
+                let mut jobs = cm.jobs.write();
+                jobs.get_mut(&job_id).unwrap().spec.begin_time =
+                    Some(Utc::now() - chrono::Duration::seconds(1));
+            }
+        }
+        assert_eq!(cm.get_job(job_id).unwrap().preempt_requeue_count, max);
+        assert_eq!(cm.get_job(job_id).unwrap().requeue_count, 0);
+
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            resources.clone(),
+            per_node_for(&["worker1"], resources),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+        cm.complete_job(job_id, -1, JobState::Timeout).unwrap();
+
+        settle(&cm, job_id, JobState::Pending);
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(
+            job.requeue_count, 1,
+            "the first genuine failure must count, unaffected by prior preemptions"
+        );
+        assert_ne!(
+            job.pending_reason,
+            PendingReason::JobHoldMaxRequeue,
+            "one timeout after chronic preemption must not exhaust the failure budget"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_partial_dispatch_failure_backs_off_like_a_total_one() {
+        // Both launch-failure paths must throttle. Without this, a 2-node job
+        // with one broken node evicts, requeues immediately, lands on the same
+        // node and burns its whole requeue budget in seconds.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+
+        let mut spec = basic_spec("partial-backoff");
+        spec.num_nodes = 2;
+        spec.requeue = true;
+        let job_id = submit_and_wait(&cm, spec);
+
+        let alloc = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["n1".into(), "n2".into()],
+            scalar_alloc(4, 8000),
+            per_node_for(&["n1", "n2"], alloc),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        cm.evict_job(job_id).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+        assert!(
+            job.spec.begin_time.is_some_and(|begin| begin > Utc::now()),
+            "a launch-failure requeue must carry a future hold"
+        );
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "the hold must keep the job out of the very next dispatch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_failure_requeue_still_retries_immediately() {
+        // The backoff is scoped to launch failures. A job evicted because its
+        // node died has nothing to back off from: the node is already out of the
+        // candidate set, so delaying the retry only wastes capacity.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+
+        let mut spec = basic_spec("nodedown-requeue");
+        spec.requeue = true;
+        let job_id = submit_and_wait(&cm, spec);
+
+        let alloc = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["n1".into()],
+            alloc.clone(),
+            per_node_for(&["n1"], alloc),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        if let Some(node) = cm.nodes.write().get_mut("n1") {
+            node.last_heartbeat = Some(Utc::now() - chrono::Duration::seconds(200));
+        }
+        cm.check_node_health(90);
+        settle(&cm, job_id, JobState::Pending);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::None);
+        assert!(job.spec.begin_time.is_none(), "no hold on a node failure");
+        assert!(cm.pending_jobs().iter().any(|j| j.job_id == job_id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn maybe_requeue_holds_at_max_for_timeout() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -7217,33 +11206,27 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         let job_id = submit_and_wait(&cm, basic_spec("release-me"));
-        cm.apply_operation(&WalOperation::JobStateChange {
+        cm.apply_operation(&WalOperation::job_state_change(
             job_id,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+            JobState::Pending,
+            JobState::Running,
+        ));
         cm.apply_operation(&WalOperation::JobComplete {
             job_id,
             exit_code: -1,
             state: JobState::Preempted,
         });
         for _ in 0..5 {
-            cm.apply_operation(&WalOperation::JobStateChange {
+            cm.apply_operation(&WalOperation::job_state_change(
                 job_id,
-                old_state: JobState::Preempted,
-                new_state: JobState::Pending,
-                pending_reason: None,
-                pending_priority: None,
-            });
-            cm.apply_operation(&WalOperation::JobStateChange {
+                JobState::Preempted,
+                JobState::Pending,
+            ));
+            cm.apply_operation(&WalOperation::job_state_change(
                 job_id,
-                old_state: JobState::Pending,
-                new_state: JobState::Running,
-                pending_reason: None,
-                pending_priority: None,
-            });
+                JobState::Pending,
+                JobState::Running,
+            ));
             cm.apply_operation(&WalOperation::JobComplete {
                 job_id,
                 exit_code: -1,
@@ -7273,13 +11256,11 @@ mod tests {
         let cm = test_cluster(&dir).await;
         let job_id = submit_and_wait(&cm, basic_spec("cancel-preempted"));
 
-        cm.apply_operation(&WalOperation::JobStateChange {
+        cm.apply_operation(&WalOperation::job_state_change(
             job_id,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+            JobState::Pending,
+            JobState::Running,
+        ));
         cm.apply_operation(&WalOperation::JobComplete {
             job_id,
             exit_code: -1,
@@ -7438,6 +11419,231 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_default_qos_reaches_real_enforcement() {
+        // A cluster fallback QOS must bind a no-qos job and its limits must
+        // actually block a second job — end to end.
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.accounting.default_qos = "normal".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.qos_cache().insert(Qos {
+            name: "normal".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_jobs_per_user: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let j1 = submit_and_wait(&cm, basic_spec("d1"));
+        assert_eq!(
+            cm.get_job(j1).unwrap().spec.qos.as_deref(),
+            Some("normal"),
+            "no-qos job must be bound to the cluster fallback at submit"
+        );
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            j1,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, j1, JobState::Running);
+
+        let j2 = submit_and_wait(&cm, basic_spec("d2"));
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::QoSMaxJobsPerUser,
+            "the fallback QOS's limits must actually enforce"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_sets_account_max_jobs_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.association_cache().insert_limits(
+            "testuser",
+            "research",
+            spur_core::accounting::AccountLimits {
+                max_running_jobs: Some(1),
+                ..Default::default()
+            },
+        );
+
+        let mut s1 = basic_spec("a1");
+        s1.account = Some("research".into());
+        let j1 = submit_and_wait(&cm, s1);
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            j1,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, j1, JobState::Running);
+
+        let mut s2 = basic_spec("a2");
+        s2.account = Some("research".into());
+        let j2 = submit_and_wait(&cm, s2);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::AssocMaxJobsLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_sets_account_max_submit_jobs_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.association_cache().insert_limits(
+            "testuser",
+            "research",
+            spur_core::accounting::AccountLimits {
+                max_submit_jobs: Some(1),
+                ..Default::default()
+            },
+        );
+
+        let mut s1 = basic_spec("b1");
+        s1.account = Some("research".into());
+        let j1 = submit_and_wait(&cm, s1);
+
+        let mut s2 = basic_spec("b2");
+        s2.account = Some("research".into());
+        let j2 = submit_and_wait(&cm, s2);
+
+        cm.tag_blocked_pending_reasons();
+        // j1 alone is within the limit (max_submit_jobs=1) and must not be
+        // blocked by counting itself; only j2, which pushes the count over
+        // the cap, should be blocked.
+        assert_eq!(cm.get_job(j1).unwrap().pending_reason, PendingReason::None);
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::AssocMaxSubmitJobLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_sets_qos_max_submit_jobs_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache().insert(Qos {
+            name: "capped".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_submit_jobs_per_user: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut s1 = basic_spec("c1");
+        s1.qos = Some("capped".into());
+        let j1 = submit_and_wait(&cm, s1);
+
+        let mut s2 = basic_spec("c2");
+        s2.qos = Some("capped".into());
+        let j2 = submit_and_wait(&cm, s2);
+
+        cm.tag_blocked_pending_reasons();
+        // j1 alone is within the limit (max_submit_jobs_per_user=1) and must
+        // not be blocked by counting itself; only j2, which pushes the count
+        // over the cap, should be blocked.
+        assert_eq!(cm.get_job(j1).unwrap().pending_reason, PendingReason::None);
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::QosMaxSubmitJobPerUserLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_sets_account_grp_cpu_reason_across_users() {
+        // GrpTRES aggregates across every user in the account, not just the
+        // requester: a different user's running job fills the cap so the next
+        // job in the same account blocks with AssocGrpCpuLimit.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Cpu, 4);
+        cm.association_cache().insert_limits(
+            "alice",
+            "research",
+            spur_core::accounting::AccountLimits {
+                grp_tres: Some(grp.clone()),
+                ..Default::default()
+            },
+        );
+        cm.association_cache().insert_limits(
+            "bob",
+            "research",
+            spur_core::accounting::AccountLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+        );
+
+        let mut s1 = basic_spec("c1");
+        s1.user = "alice".into();
+        s1.account = Some("research".into());
+        s1.num_tasks = 4;
+        let j1 = submit_and_wait(&cm, s1);
+        let res = scalar_alloc(4, 1000);
+        cm.start_job(
+            j1,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, j1, JobState::Running);
+
+        let mut s2 = basic_spec("c2");
+        s2.user = "bob".into();
+        s2.account = Some("research".into());
+        s2.num_tasks = 1;
+        let j2 = submit_and_wait(&cm, s2);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::AssocGrpCpuLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn account_limits_do_not_block_jobs_without_an_account() {
+        // A job with no account can't be constrained by an association it
+        // doesn't belong to.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.association_cache().insert_limits(
+            "testuser",
+            "research",
+            spur_core::accounting::AccountLimits {
+                max_running_jobs: Some(0),
+                ..Default::default()
+            },
+        );
+
+        let spec = basic_spec("d1");
+        let job_id = submit_and_wait(&cm, spec);
+
+        cm.tag_blocked_pending_reasons();
+        assert_ne!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::AssocMaxJobsLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn running_job_license_consumption_blocks_next_job() {
         // Concurrent license accounting: a running job holding all of a license
         // must make a second job requesting that license ineligible, even though
@@ -7514,10 +11720,213 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn array_throttle_reserves_slots_within_classification() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        let mut spec = basic_spec("arr-throttle-pass");
+        spec.array_spec = Some("0-2%1".into());
+        let parent_id = cm.submit_job(spec).unwrap().job_id;
+        let task_ids: Vec<JobId> = (1..=3).map(|offset| parent_id + offset).collect();
+        for id in &task_ids {
+            wait_for(&format!("array task {id}"), || cm.get_job(*id).is_some());
+        }
+
+        let pending: Vec<JobId> = cm
+            .pending_jobs_and_tag_reasons()
+            .iter()
+            .map(|job| job.job_id)
+            .collect();
+        let admitted = task_ids.iter().filter(|id| pending.contains(id)).count();
+        assert_eq!(admitted, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn array_throttle_excludes_task_from_pending_classification() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        let mut spec = basic_spec("arr-throttle");
+        spec.array_spec = Some("0-2%1".into());
+        let parent_id = cm.submit_job(spec).unwrap().job_id;
+        let task_ids: Vec<JobId> = (1..=3).map(|offset| parent_id + offset).collect();
+        for id in &task_ids {
+            wait_for(&format!("array task {id}"), || cm.get_job(*id).is_some());
+        }
+
+        start_job_on(&cm, task_ids[0], "n1");
+        settle(&cm, task_ids[0], JobState::Running);
+
+        let pending: Vec<JobId> = cm
+            .pending_jobs_and_tag_reasons()
+            .iter()
+            .map(|j| j.job_id)
+            .collect();
+        for id in &task_ids[1..] {
+            assert!(
+                !pending.contains(id),
+                "array-throttled task {id} must be excluded from scheduling"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn array_throttle_does_not_consume_scarce_license_pool() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.license_pool.write().insert("fluent".into(), 2);
+
+        let mut spec = basic_spec("arr-lic");
+        spec.array_spec = Some("0-1%1".into());
+        spec.gres = vec!["license:fluent:1".into()];
+        let parent_id = cm.submit_job(spec).unwrap().job_id;
+        let t1 = parent_id + 1;
+        let t2 = parent_id + 2;
+        wait_for("array license tasks", || {
+            cm.get_job(t1).is_some() && cm.get_job(t2).is_some()
+        });
+
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            t1,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, t1, JobState::Running);
+
+        let solo = submit_and_wait(&cm, {
+            let mut s = basic_spec("solo-lic");
+            s.gres = vec!["license:fluent:1".into()];
+            s
+        });
+
+        let pending: Vec<JobId> = cm
+            .pending_jobs_and_tag_reasons()
+            .iter()
+            .map(|j| j.job_id)
+            .collect();
+        assert!(
+            !pending.contains(&t2),
+            "array-throttled task must not enter the scheduling set"
+        );
+        assert!(
+            pending.contains(&solo),
+            "the eligible job must still receive the remaining license slot"
+        );
+        assert_ne!(
+            cm.get_job(t2).unwrap().pending_reason,
+            PendingReason::Licenses
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn array_throttle_does_not_consume_scarce_bb_pool() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        *cm.burst_buffer_total_gb.write() = 160;
+
+        let mut spec = basic_spec("arr-bb");
+        spec.array_spec = Some("0-1%1".into());
+        spec.burst_buffer = Some("capacity=60".into());
+        let parent_id = cm.submit_job(spec).unwrap().job_id;
+        let t1 = parent_id + 1;
+        let t2 = parent_id + 2;
+        wait_for("array bb tasks", || {
+            cm.get_job(t1).is_some() && cm.get_job(t2).is_some()
+        });
+
+        start_job_on(&cm, t1, "n1");
+        settle(&cm, t1, JobState::Running);
+
+        let solo = submit_and_wait(&cm, {
+            let mut s = basic_spec("solo-bb");
+            s.burst_buffer = Some("capacity=60".into());
+            s
+        });
+
+        let pending: Vec<JobId> = cm
+            .pending_jobs_and_tag_reasons()
+            .iter()
+            .map(|j| j.job_id)
+            .collect();
+        assert!(
+            !pending.contains(&t2),
+            "array-throttled task must not enter the scheduling set"
+        );
+        assert_eq!(
+            cm.available_bb(),
+            40,
+            "only the running task and eligible solo job may reserve capacity"
+        );
+        assert_eq!(cm.get_job(t2).unwrap().bb_stage_state, BbStageState::None);
+        assert_eq!(
+            cm.get_job(solo).unwrap().bb_stage_state,
+            BbStageState::Staging
+        );
+
+        assert!(cm.complete_bb_stage_in(solo));
+        let pending: Vec<JobId> = cm
+            .pending_jobs_and_tag_reasons()
+            .iter()
+            .map(|j| j.job_id)
+            .collect();
+        assert!(pending.contains(&solo));
+        assert!(!pending.contains(&t2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn future_begin_jobs_do_not_receive_consumable_block_reasons() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        *cm.burst_buffer_total_gb.write() = 100;
+        let begin_time = Utc::now() + chrono::Duration::hours(1);
+
+        let mut license_spec = basic_spec("future-license");
+        license_spec.begin_time = Some(begin_time);
+        license_spec.gres = vec!["license:missing:1".into()];
+        let license_id = submit_and_wait(&cm, license_spec);
+
+        let mut bb_spec = basic_spec("future-bb");
+        bb_spec.begin_time = Some(begin_time);
+        bb_spec.burst_buffer = Some("capacity=500".into());
+        let bb_id = submit_and_wait(&cm, bb_spec);
+
+        {
+            let mut jobs = cm.jobs.write();
+            jobs.get_mut(&license_id).unwrap().pending_reason = PendingReason::Priority;
+            jobs.get_mut(&bb_id).unwrap().pending_reason = PendingReason::Priority;
+        }
+
+        let pending: Vec<JobId> = cm
+            .pending_jobs_and_tag_reasons()
+            .iter()
+            .map(|job| job.job_id)
+            .collect();
+
+        assert!(!pending.contains(&license_id));
+        assert!(!pending.contains(&bb_id));
+        assert_eq!(
+            cm.get_job(license_id).unwrap().pending_reason,
+            PendingReason::Priority
+        );
+        assert_eq!(
+            cm.get_job(bb_id).unwrap().pending_reason,
+            PendingReason::Priority
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pending_jobs_does_not_overallocate_licenses_within_one_pass() {
         // Two pending jobs each request fluent:1 but the pool holds only 1.
-        // A single pending_jobs() pass must not return both — otherwise the
-        // scheduler would allocate both and over-subscribe the license.
+        // A single classification must not return both or label the greedy
+        // contention drop as an absolute license shortage.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 8, 16000);
@@ -7530,11 +11939,237 @@ mod tests {
         s2.gres = vec!["license:fluent:1".into()];
         let b = submit_and_wait(&cm, s2);
 
-        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        let pending: Vec<JobId> = cm
+            .pending_jobs_and_tag_reasons()
+            .iter()
+            .map(|j| j.job_id)
+            .collect();
         let granted = [a, b].iter().filter(|id| pending.contains(id)).count();
         assert_eq!(
             granted, 1,
             "pending_jobs() returned {granted} fluent jobs but the pool holds only 1"
+        );
+        for id in [a, b] {
+            assert_ne!(
+                cm.get_job(id).unwrap().pending_reason,
+                PendingReason::Licenses
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_does_not_oversubscribe_qos_grp_node_within_one_pass() {
+        // Three pending 1-node jobs share a QOS capped at grp_tres node=2. Each
+        // fits against the empty running total, but a single pass must admit at
+        // most 2 or the QOSGrpNodeLimit is over-subscribed.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 2);
+        cm.qos_cache().insert(Qos {
+            name: "burst".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let ids: Vec<JobId> = (0..3)
+            .map(|i| {
+                let mut s = basic_spec(&format!("b{i}"));
+                s.qos = Some("burst".into());
+                submit_and_wait(&cm, s)
+            })
+            .collect();
+
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        let granted = ids.iter().filter(|id| pending.contains(id)).count();
+        assert_eq!(
+            granted, 2,
+            "pending_jobs() returned {granted} burst jobs but grp_tres node=2 allows 2"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_qos_grp_reserves_highest_priority_first() {
+        // A high-priority 2-node job and a low-priority 1-node job share a QOS
+        // capped at grp_tres node=2. The pass must keep the high-priority job
+        // (which alone fills the cap) and drop the low-priority one, not admit
+        // the small job first and starve the large one.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 2);
+        cm.qos_cache().insert(Qos {
+            name: "burst".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut big = basic_spec("big");
+        big.qos = Some("burst".into());
+        big.num_nodes = 2;
+        big.num_tasks = 2;
+        big.priority = Some(1000);
+        let big_id = submit_and_wait(&cm, big);
+
+        let mut small = basic_spec("small");
+        small.qos = Some("burst".into());
+        small.num_nodes = 1;
+        small.priority = Some(1);
+        let small_id = submit_and_wait(&cm, small);
+
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        assert!(
+            pending.contains(&big_id),
+            "the highest-priority job must win the group reservation"
+        );
+        assert!(
+            !pending.contains(&small_id),
+            "the low-priority job must not consume headroom the big job needs"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_does_not_oversubscribe_account_grp_node_within_one_pass() {
+        // Same one-pass over-subscription guard, one layer up: an account
+        // association capped at grp_tres node=2 must not admit 3 pending 1-node
+        // jobs in a single pass.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 2);
+        cm.association_cache().insert_limits(
+            "testuser",
+            "research",
+            spur_core::accounting::AccountLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+        );
+
+        let ids: Vec<JobId> = (0..3)
+            .map(|i| {
+                let mut s = basic_spec(&format!("a{i}"));
+                s.account = Some("research".into());
+                submit_and_wait(&cm, s)
+            })
+            .collect();
+
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        let granted = ids.iter().filter(|id| pending.contains(id)).count();
+        assert_eq!(
+            granted, 2,
+            "pending_jobs() returned {granted} account jobs but grp_tres node=2 allows 2"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_does_not_oversubscribe_account_max_running_jobs_within_one_pass() {
+        // Same guard as the QOS max_jobs_per_user test, one layer up: an account
+        // association capped at max_running_jobs=2 must not admit 3 pending jobs
+        // from one user in a single pass even though none is running yet.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        cm.association_cache().insert_limits(
+            "testuser",
+            "research",
+            spur_core::accounting::AccountLimits {
+                max_running_jobs: Some(2),
+                ..Default::default()
+            },
+        );
+
+        let ids: Vec<JobId> = (0..3)
+            .map(|i| {
+                let mut s = basic_spec(&format!("m{i}"));
+                s.account = Some("research".into());
+                submit_and_wait(&cm, s)
+            })
+            .collect();
+
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        let granted = ids.iter().filter(|id| pending.contains(id)).count();
+        assert_eq!(
+            granted, 2,
+            "pending_jobs() returned {granted} account jobs but max_running_jobs=2 allows 2"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_does_not_oversubscribe_qos_max_jobs_per_user_within_one_pass() {
+        // The per-user running-job count cap is a same-pass accumulator too: three
+        // pending jobs from one user under a QOS capped at max_jobs_per_user=2
+        // must not all be admitted in a single pass even though none is running yet.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        cm.qos_cache().insert(Qos {
+            name: "cnt".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_jobs_per_user: Some(2),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let ids: Vec<JobId> = (0..3)
+            .map(|i| {
+                let mut s = basic_spec(&format!("c{i}"));
+                s.qos = Some("cnt".into());
+                submit_and_wait(&cm, s)
+            })
+            .collect();
+
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        let granted = ids.iter().filter(|id| pending.contains(id)).count();
+        assert_eq!(
+            granted, 2,
+            "pending_jobs() returned {granted} jobs but max_jobs_per_user=2 allows 2"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_does_not_oversubscribe_qos_max_tres_per_user_within_one_pass() {
+        // The per-user TRES cap (distinct from the group cap) also accumulates
+        // within a pass: two 3-cpu jobs from one user under maxtresperuser cpu=4
+        // must not both be admitted (3+3 > 4), even with an empty running set.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 64, 128000);
+        let mut per_user = TresRecord::new();
+        per_user.set(TresType::Cpu, 4);
+        cm.qos_cache().insert(Qos {
+            name: "usertres".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_tres_per_user: Some(per_user),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let ids: Vec<JobId> = (0..2)
+            .map(|i| {
+                let mut s = basic_spec(&format!("u{i}"));
+                s.qos = Some("usertres".into());
+                s.num_tasks = 3;
+                submit_and_wait(&cm, s)
+            })
+            .collect();
+
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        let granted = ids.iter().filter(|id| pending.contains(id)).count();
+        assert_eq!(
+            granted, 1,
+            "pending_jobs() returned {granted} jobs but maxtresperuser cpu=4 fits only one 3-cpu job"
         );
     }
 
@@ -7717,9 +12352,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tag_blocked_dependency_takes_precedence_over_reservation() {
+    async fn pending_classification_uses_first_block_reason() {
         // Blocked by both a dependency and an absent reservation -> Dependency
-        // wins (pending_jobs() drops at the dependency filter, ahead of reservation).
+        // wins and the same classification excludes the job from scheduling.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
@@ -7728,13 +12363,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("parent")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
 
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:1".into()];
@@ -7744,7 +12377,8 @@ mod tests {
             spec: Box::new(child),
         });
 
-        cm.tag_blocked_pending_reasons();
+        let pending = cm.pending_jobs_and_tag_reasons();
+        assert!(!pending.iter().any(|job| job.job_id == 2));
         assert_eq!(
             cm.get_job(2).unwrap().pending_reason,
             PendingReason::Dependency
@@ -7980,6 +12614,388 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn k0s_state_survives_snapshot() {
+        use spur_core::k0s::{K0sPhase, K0sRole};
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+        cm.assign_node_k0s("n1", K0sRole::Worker, "10.44.0.2", "10.42.2.0/24")
+            .unwrap();
+        cm.set_k0s_phase(K0sPhase::Ready, Some("head-node".into()), Vec::new(), false)
+            .unwrap();
+        wait_for("k0s state applied", || {
+            cm.k0s_state().phase == K0sPhase::Ready
+                && cm.get_node("n1").and_then(|n| n.k0s_role).is_some()
+        });
+
+        // snapshot -> restore into a fresh cluster (log-compaction / HA follower path)
+        let data = cm.snapshot_state().unwrap();
+        let dir2 = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dir2).await;
+        cm2.restore_from_snapshot(&data).unwrap();
+
+        // Cluster-wide k0s state must be restored (it is runtime-authoritative).
+        let st = cm2.k0s_state();
+        assert_eq!(st.phase, K0sPhase::Ready);
+        assert_eq!(st.control_plane_node.as_deref(), Some("head-node"));
+        // Per-node k0s fields ride snap.nodes.
+        let n1 = cm2.get_node("n1").unwrap();
+        assert_eq!(n1.k0s_role, Some(K0sRole::Worker));
+        assert_eq!(n1.k0s_mesh_ip.as_deref(), Some("10.44.0.2"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clear_node_k0s_returns_node_to_scheduling() {
+        use spur_core::k0s::K0sRole;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        cm.assign_node_k0s("n1", K0sRole::Worker, "10.44.0.2", "10.42.2.0/24")
+            .unwrap();
+        wait_for("role assigned", || {
+            cm.get_node("n1").is_some_and(|n| n.is_k0s_reserved())
+        });
+
+        cm.clear_node_k0s("n1").unwrap();
+        wait_for("role cleared", || {
+            cm.get_node("n1").is_some_and(|n| !n.is_k0s_reserved())
+        });
+        let n1 = cm.get_node("n1").unwrap();
+        assert!(n1.k0s_mesh_ip.is_none());
+        assert!(n1.k0s_pod_cidr.is_none());
+
+        // A cleared node must place jobs again (teardown reverses the gate).
+        let job = submit_and_wait(&cm, basic_spec("post-teardown"));
+        let nodes = vec![cm.get_node("n1").unwrap()];
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        let snap = cm.get_job(job).unwrap();
+        cm.update_pending_reasons(&[&snap], &state);
+        assert_ne!(
+            cm.get_job(job).unwrap().pending_reason,
+            PendingReason::K8sReserved
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_reassigns_a_readded_node() {
+        // The Ready-phase self-heal: a spurd restart deregisters on SIGTERM (the node is REMOVED),
+        // then re-registers as a fresh node with no k0s role. Re-running provisioning (which the
+        // reconcile loop now does in Ready, not only Provisioning) must re-assign the un-roled node
+        // its role + mesh IP + pod CIDR so it rejoins the mesh — without disturbing the others.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        register_node(&cm, "node-b", 4, 8000);
+        wait_for("both registered", || {
+            cm.get_node("node-a").is_some() && cm.get_node("node-b").is_some()
+        });
+        let net = crate::cluster_k8s::ClusterNetworking {
+            mesh_cidr: "10.44.0.0/16".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
+            cni: "kuberouter".into(),
+            control_plane_node: None,
+        };
+        crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
+        wait_for("both assigned", || {
+            cm.get_node("node-a").and_then(|n| n.k0s_role).is_some()
+                && cm.get_node("node-b").and_then(|n| n.k0s_role).is_some()
+        });
+        let b_role = cm.get_node("node-b").unwrap().k0s_role;
+        let b_ip = cm.get_node("node-b").unwrap().k0s_mesh_ip.clone();
+        let b_cidr = cm.get_node("node-b").unwrap().k0s_pod_cidr.clone();
+        assert!(b_ip.is_some() && b_cidr.is_some());
+
+        // spurd restart: deregister (remove) then re-register as a fresh, un-roled node.
+        cm.remove_node("node-b", true, Some("test restart".into()))
+            .unwrap();
+        wait_for("node-b removed", || cm.get_node("node-b").is_none());
+        register_node(&cm, "node-b", 4, 8000);
+        wait_for("node-b re-registered without a role", || {
+            cm.get_node("node-b")
+                .map(|n| n.k0s_role.is_none())
+                .unwrap_or(false)
+        });
+
+        // The Ready-phase reconcile re-runs provisioning and heals the un-roled node.
+        crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
+        wait_for("node-b re-assigned", || {
+            cm.get_node("node-b").and_then(|n| n.k0s_role).is_some()
+        });
+        let b = cm.get_node("node-b").unwrap();
+        assert_eq!(b.k0s_role, b_role, "same role after re-add");
+        assert_eq!(b.k0s_mesh_ip, b_ip, "same mesh IP reclaimed after re-add");
+        assert_eq!(b.k0s_pod_cidr, b_cidr, "same pod CIDR after re-add");
+        // The untouched node keeps its assignment (provisioning is idempotent).
+        assert!(cm.get_node("node-a").and_then(|n| n.k0s_role).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_phase_reconcile_assigns_unroled_node() {
+        // The loop wiring: reconcile_phase must run provisioning in the Ready phase, not only
+        // Provisioning. An un-roled node present while Ready (e.g. re-added after a spurd restart)
+        // must be assigned by a Ready-phase reconcile tick. If Ready were a no-op it would stay
+        // un-roled forever (out of the mesh) — the bug this fixes.
+        use spur_core::k0s::K0sPhase;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        wait_for("registered", || cm.get_node("node-a").is_some());
+        // Cluster is Ready with the control plane already recorded, but node-a has no k0s role.
+        cm.set_k0s_phase(K0sPhase::Ready, Some("node-a".into()), Vec::new(), false)
+            .unwrap();
+        wait_for("phase ready", || cm.k0s_state().phase == K0sPhase::Ready);
+        assert!(cm.get_node("node-a").and_then(|n| n.k0s_role).is_none());
+
+        let net = crate::cluster_k8s::ClusterNetworking {
+            mesh_cidr: "10.44.0.0/16".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
+            cni: "kuberouter".into(),
+            control_plane_node: Some("node-a".into()),
+        };
+        let mut tokens = std::collections::HashMap::new();
+        crate::cluster_k8s::reconcile_phase(&cm, &net, &cm.k0s_state(), &mut tokens).await;
+
+        wait_for("un-roled node assigned by a Ready-phase tick", || {
+            cm.get_node("node-a").and_then(|n| n.k0s_role).is_some()
+        });
+        assert!(cm.get_node("node-a").and_then(|n| n.k0s_mesh_ip).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_assigns_controller_and_worker_for_two_nodes() {
+        use spur_core::k0s::K0sRole;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        register_node(&cm, "node-b", 4, 8000);
+        wait_for("both nodes registered", || {
+            cm.get_node("node-a").is_some() && cm.get_node("node-b").is_some()
+        });
+
+        let net = crate::cluster_k8s::ClusterNetworking {
+            mesh_cidr: "10.44.0.0/16".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
+            cni: "kuberouter".into(),
+            control_plane_node: None,
+        };
+        crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
+        wait_for("both nodes assigned k0s roles", || {
+            cm.get_node("node-a").and_then(|n| n.k0s_role).is_some()
+                && cm.get_node("node-b").and_then(|n| n.k0s_role).is_some()
+        });
+
+        // Two nodes -> the deterministic control-plane (lexically-first, node-a) is a Controller
+        // (NOT Single, which would never exercise the worker token-mint/join path); node-b is a
+        // Worker. Each gets a distinct mesh IP + pod /24, and the control-plane choice is recorded.
+        let a = cm.get_node("node-a").unwrap();
+        let b = cm.get_node("node-b").unwrap();
+        assert_eq!(a.k0s_role, Some(K0sRole::Controller));
+        assert_eq!(b.k0s_role, Some(K0sRole::Worker));
+        assert!(a.k0s_mesh_ip.is_some() && b.k0s_mesh_ip.is_some());
+        assert_ne!(a.k0s_mesh_ip, b.k0s_mesh_ip);
+        assert_ne!(a.k0s_pod_cidr, b.k0s_pod_cidr);
+        assert_eq!(cm.k0s_state().control_plane_node.as_deref(), Some("node-a"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_assigns_three_controllers_for_ha_set() {
+        use spur_core::k0s::{K0sPhase, K0sRole};
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        for name in ["cp-a", "cp-b", "cp-c", "w-d"] {
+            register_node(&cm, name, 4, 8000);
+        }
+        wait_for("all registered", || {
+            ["cp-a", "cp-b", "cp-c", "w-d"]
+                .iter()
+                .all(|n| cm.get_node(n).is_some())
+        });
+        // A 3-CP HA set recorded up front (as `cluster_up` does), bootstrap cp-a first.
+        cm.set_k0s_phase(
+            K0sPhase::Provisioning,
+            Some("cp-a".into()),
+            vec!["cp-a".into(), "cp-b".into(), "cp-c".into()],
+            false,
+        )
+        .unwrap();
+        wait_for("cp set recorded", || {
+            cm.k0s_state().controllers().len() == 3
+        });
+
+        let net = crate::cluster_k8s::ClusterNetworking {
+            mesh_cidr: "10.44.0.0/16".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
+            cni: "kuberouter".into(),
+            control_plane_node: None,
+        };
+        crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
+        wait_for("all four assigned", || {
+            ["cp-a", "cp-b", "cp-c", "w-d"]
+                .iter()
+                .all(|n| cm.get_node(n).and_then(|x| x.k0s_role).is_some())
+        });
+
+        // All three CP nodes are Controllers; the fourth is a Worker. The bootstrap keeps `.1`.
+        for cp in ["cp-a", "cp-b", "cp-c"] {
+            assert_eq!(
+                cm.get_node(cp).unwrap().k0s_role,
+                Some(K0sRole::Controller),
+                "{cp} is a controller"
+            );
+        }
+        assert_eq!(cm.get_node("w-d").unwrap().k0s_role, Some(K0sRole::Worker));
+        assert_eq!(
+            cm.get_node("cp-a").unwrap().k0s_mesh_ip.as_deref(),
+            Some("10.44.0.1"),
+            "bootstrap holds .1"
+        );
+        // Every node has a distinct mesh IP.
+        let ips: std::collections::HashSet<_> = ["cp-a", "cp-b", "cp-c", "w-d"]
+            .iter()
+            .map(|n| cm.get_node(n).unwrap().k0s_mesh_ip.clone())
+            .collect();
+        assert_eq!(ips.len(), 4, "distinct mesh IPs");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_derives_bootstrap_from_set_when_singular_absent() {
+        use spur_core::k0s::{K0sPhase, K0sRole};
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        for name in ["cp-a", "cp-b", "cp-c"] {
+            register_node(&cm, name, 4, 8000);
+        }
+        wait_for("all registered", || {
+            ["cp-a", "cp-b", "cp-c"]
+                .iter()
+                .all(|n| cm.get_node(n).is_some())
+        });
+        // HA set recorded bootstrap-first (cp-b) with the singular field unset. The first-of-set must
+        // hold `.1` — cp-b, NOT the sorted-first cp-a, so this fails if bootstrap ignores the set.
+        cm.set_k0s_phase(
+            K0sPhase::Provisioning,
+            None,
+            vec!["cp-b".into(), "cp-a".into(), "cp-c".into()],
+            false,
+        )
+        .unwrap();
+        wait_for("cp set recorded", || {
+            cm.k0s_state().controllers().len() == 3
+        });
+
+        let net = crate::cluster_k8s::ClusterNetworking {
+            mesh_cidr: "10.44.0.0/16".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
+            cni: "kuberouter".into(),
+            control_plane_node: None,
+        };
+        crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
+        wait_for("all assigned", || {
+            ["cp-a", "cp-b", "cp-c"]
+                .iter()
+                .all(|n| cm.get_node(n).and_then(|x| x.k0s_role).is_some())
+        });
+
+        for cp in ["cp-a", "cp-b", "cp-c"] {
+            assert_eq!(cm.get_node(cp).unwrap().k0s_role, Some(K0sRole::Controller));
+        }
+        assert_eq!(
+            cm.get_node("cp-b").unwrap().k0s_mesh_ip.as_deref(),
+            Some("10.44.0.1"),
+            "bootstrap (first of recorded set) holds .1"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_from_snapshot_drops_stale_live_partition() {
+        // A partition present in the target's live memory but absent from the
+        // snapshot (and not tombstoned) must not survive a snapshot install —
+        // otherwise a follower diverges from the leader's partition table.
+        let src = TempDir::new().unwrap();
+        let cm = test_cluster(&src).await;
+        let data = cm.snapshot_state().unwrap();
+
+        let dst = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dst).await;
+        cm2.apply_operation(&WalOperation::PartitionCreate {
+            partition: gpu_partition(),
+        });
+        assert!(cm2.get_partitions().iter().any(|p| p.name == "gpu"));
+
+        cm2.restore_from_snapshot(&data).unwrap();
+        assert!(
+            !cm2.get_partitions().iter().any(|p| p.name == "gpu"),
+            "stale live partition must be gone after restore"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_from_pre_partition_snapshot_keeps_config_baseline() {
+        // An old snapshot predating partition support has no `partitions` field
+        // (serde-default → empty). Restore must fall back to the config
+        // baseline, not wipe all partitions.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let baseline: Vec<String> = cm.get_partitions().iter().map(|p| p.name.clone()).collect();
+        assert!(!baseline.is_empty(), "test config must define a partition");
+
+        let mut snap: serde_json::Value =
+            serde_json::from_slice(&cm.snapshot_state().unwrap()).unwrap();
+        snap.as_object_mut().unwrap().remove("partitions");
+        let data = serde_json::to_vec(&snap).unwrap();
+
+        cm.restore_from_snapshot(&data).unwrap();
+        let after: Vec<String> = cm.get_partitions().iter().map(|p| p.name.clone()).collect();
+        assert_eq!(
+            after, baseline,
+            "config baseline must survive an old snapshot"
+        );
+    }
+
+    // An authoritative empty set (leader deleted them all) must install verbatim,
+    // not reseed from local config — the case `is_empty()` conflated with legacy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_from_authoritative_empty_snapshot_wipes_partitions() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        assert!(
+            !cm.get_partitions().is_empty(),
+            "test config must seed a partition"
+        );
+
+        // A leader snapshot with an explicit empty (Some(vec![])) partition set.
+        let mut snap: serde_json::Value =
+            serde_json::from_slice(&cm.snapshot_state().unwrap()).unwrap();
+        snap.as_object_mut()
+            .unwrap()
+            .insert("partitions".into(), serde_json::json!([]));
+        let data = serde_json::to_vec(&snap).unwrap();
+
+        cm.restore_from_snapshot(&data).unwrap();
+        assert!(
+            cm.get_partitions().is_empty(),
+            "authoritative empty set must wipe local partitions, not reseed from config"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restore_from_snapshot_rejects_corrupt_data() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -8010,6 +13026,201 @@ mod tests {
         assert_eq!(job.pending_reason, PendingReason::Priority);
     }
 
+    // hold_job_for_launch_failure is confirm_dispatch_on_nodes's Pending-
+    // compatible equivalent of the old Running->Failed->Held detour: same end
+    // state as a plain hold_job (Pending, priority 0, PendingReason::Held),
+    // plus the launch-failure description, and it must refuse a job that
+    // already started (unlike a fresh Pending job, that would silently do the
+    // wrong thing by holding it mid-run).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hold_job_for_launch_failure_holds_a_pending_job_with_its_description() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("prolog-hold"));
+
+        cm.hold_job_for_launch_failure(id, None).unwrap();
+        wait_for("hold applied", || {
+            cm.get_job(id).is_some_and(|j| j.priority == 0)
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.priority, 0);
+        assert_eq!(job.pending_reason, PendingReason::Held);
+        assert_eq!(
+            job.state_reason_display(),
+            LAUNCH_FAILURE_HELD_DESC,
+            "must carry the same description the old post-Running hold used"
+        );
+
+        // Releasing it behaves exactly like releasing a plain hold_job.
+        cm.release_job(id).unwrap();
+        wait_for("release applied", || {
+            cm.get_job(id).is_some_and(|j| j.priority > 0)
+        });
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(
+            job.pending_reason_desc, None,
+            "the release must clear the description with the reason"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hold_job_for_launch_failure_refuses_a_job_that_already_started() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("already-running"));
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            scalar_alloc(1, 1000),
+            per_node_for(&["n1"], scalar_alloc(1, 1000)),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+
+        assert!(cm.hold_job_for_launch_failure(id, None).is_err());
+    }
+
+    // backoff_pending_job_after_dispatch_failure is confirm_dispatch_on_nodes's
+    // Pending-safe equivalent of requeue_after_launch_failure's backoff: both
+    // are no-ops rather than errors for a job that's already moved on by the
+    // time the caller gets around to backing it off (e.g. a concurrent
+    // cancel, or a stale/unknown job_id) — the caller only has a job_id and
+    // no reason to assume it's still exactly as it left it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backoff_pending_job_after_dispatch_failure_is_a_noop_for_a_missing_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        assert!(cm.backoff_pending_job_after_dispatch_failure(999).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backoff_pending_job_after_dispatch_failure_is_a_noop_once_the_job_left_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("backoff-already-cancelled"));
+        cm.cancel_job(id, "testuser").unwrap();
+        settle(&cm, id, JobState::Cancelled);
+
+        assert!(cm.backoff_pending_job_after_dispatch_failure(id).is_ok());
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backoff_pending_job_after_dispatch_failure_applies_backoff_and_bumps_requeue_count() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("backoff-applies"));
+
+        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        wait_for("backoff applied", || {
+            cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+        assert!(job.spec.begin_time.is_some_and(|t| t > Utc::now()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_dispatch_backoff_preserves_launch_failure_detail() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("backoff-detail"));
+        cm.set_job_launch_failure_detail(id, "PMIx prepare failed: n2: timeout".into())
+            .unwrap();
+
+        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        wait_for("backoff applied", || {
+            cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+        assert_eq!(
+            job.launch_failure_detail.as_deref(),
+            Some("PMIx prepare failed: n2: timeout")
+        );
+        assert_eq!(
+            job.state_reason(),
+            "JobLaunchFailure (PMIx prepare failed: n2: timeout)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn second_dispatch_backoff_preserves_launch_failure_detail() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("backoff-detail-twice"));
+
+        cm.set_job_launch_failure_detail(id, "PMIx prepare failed: n1: timeout".into())
+            .unwrap();
+        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        wait_for("first backoff applied", || {
+            cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
+        });
+
+        cm.set_job_launch_failure_detail(id, "PMIx prepare failed: n2: timeout".into())
+            .unwrap();
+        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        wait_for("second backoff applied", || {
+            cm.get_job(id).is_some_and(|j| j.requeue_count == 2)
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+        assert_eq!(
+            job.launch_failure_detail.as_deref(),
+            Some("PMIx prepare failed: n2: timeout")
+        );
+        assert_eq!(
+            job.state_reason(),
+            "JobLaunchFailure (PMIx prepare failed: n2: timeout)"
+        );
+    }
+
+    // The apply-level checks mirror the public method's, guarding against a
+    // narrower race: the job matched (existed, was Pending) when the public
+    // method read it, but no longer does by the time this specific WAL entry
+    // is actually applied (a state change committed in between). Exercised
+    // directly against apply_operation, bypassing the public method's own
+    // up-front checks, so this is testing the apply arm's defense
+    // independently of whether the caller's own check could have caught it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_dispatch_backoff_apply_is_a_noop_for_a_missing_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&WalOperation::JobDispatchBackoff {
+            job_id: 999,
+            begin_time: Utc::now(),
+        });
+        assert!(cm.get_job(999).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_dispatch_backoff_apply_is_a_noop_once_the_job_left_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("backoff-apply-already-cancelled"));
+        cm.cancel_job(id, "testuser").unwrap();
+        settle(&cm, id, JobState::Cancelled);
+        let requeue_count_before = cm.get_job(id).unwrap().requeue_count;
+
+        cm.apply_operation(&WalOperation::JobDispatchBackoff {
+            job_id: id,
+            begin_time: Utc::now(),
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(job.requeue_count, requeue_count_before);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn update_job_priority() {
         let dir = TempDir::new().unwrap();
@@ -8022,6 +13233,211 @@ mod tests {
             cm.get_job(id).is_some_and(|j| j.priority == 5000)
         });
         assert_eq!(cm.get_job(id).unwrap().priority, 5000);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_qos_validates_against_cache() {
+        // `scontrol update job qos=` must not be a second door to the bypass:
+        // unknown and empty QOS are rejected, leaving the job's QOS unchanged.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache().insert(Qos {
+            name: "highprio".into(),
+            ..Default::default()
+        });
+        let id = submit_and_wait(&cm, basic_spec("q"));
+        assert_eq!(cm.get_job(id).unwrap().spec.qos, None);
+
+        // Unknown QOS rejected.
+        let err = cm
+            .update_job(id, None, None, None, None, None, Some("ghost".into()))
+            .unwrap_err();
+        assert!(err.to_string().contains("QOS 'ghost' does not exist"));
+        assert!(!err.to_string().contains("accounting may not be enabled"));
+        assert_eq!(cm.get_job(id).unwrap().spec.qos, None);
+
+        // Empty QOS (clear-to-limitless) rejected.
+        let err = cm
+            .update_job(id, None, None, None, None, None, Some(String::new()))
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot clear a job's QOS"));
+        assert_eq!(cm.get_job(id).unwrap().spec.qos, None);
+
+        // A valid QOS is applied.
+        cm.update_job(id, None, None, None, None, None, Some("highprio".into()))
+            .unwrap();
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.qos.as_deref(),
+            Some("highprio")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_qos_hints_when_cache_unloaded() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("q"));
+        assert_eq!(cm.get_job(id).unwrap().spec.qos, None);
+
+        let err = cm
+            .update_job(id, None, None, None, None, None, Some("any-qos".into()))
+            .unwrap_err();
+        assert!(err.to_string().contains("QOS 'any-qos' does not exist"));
+        assert!(err.to_string().contains("accounting may not be enabled"));
+        assert_eq!(cm.get_job(id).unwrap().spec.qos, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_qos_rejects_unauthorized_association_qos() {
+        // `scontrol update job qos=` must enforce the same per-association
+        // authorization as submission (SPUR-101).
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache().insert(Qos {
+            name: "highprio".into(),
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "other-teams-qos".into(),
+            ..Default::default()
+        });
+        cm.association_cache()
+            .insert_default_qos("testuser", "research", "highprio");
+        let mut spec = basic_spec("q");
+        spec.account = Some("research".into());
+        let id = submit_and_wait(&cm, spec);
+        // Submission already applied the association's own default QOS.
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.qos.as_deref(),
+            Some("highprio")
+        );
+
+        let err = cm
+            .update_job(
+                id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("other-teams-qos".into()),
+            )
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("QOS 'other-teams-qos' is not permitted"));
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.qos.as_deref(),
+            Some("highprio"),
+            "rejected update must leave the existing QOS untouched"
+        );
+
+        // The association's own default QOS is still accepted explicitly.
+        cm.update_job(id, None, None, None, None, None, Some("highprio".into()))
+            .unwrap();
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.qos.as_deref(),
+            Some("highprio")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_qos_rejects_bypass_via_unaffiliated_account() {
+        // Pairing the QOS change with an account the user has no recorded
+        // association for must not fall back to "nothing to check" — that
+        // was a live bypass of the authorization this PR adds.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache().insert(Qos {
+            name: "highprio".into(),
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "other-teams-qos".into(),
+            ..Default::default()
+        });
+        cm.association_cache()
+            .insert_default_qos("testuser", "research", "highprio");
+        let id = submit_and_wait(&cm, basic_spec("q"));
+
+        let err = cm
+            .update_job(
+                id,
+                None,
+                None,
+                None,
+                None,
+                Some("made-up-account".into()),
+                Some("other-teams-qos".into()),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not associated with account"),
+            "expected an association error, got {err}"
+        );
+        assert_eq!(cm.get_job(id).unwrap().spec.qos, None);
+
+        // An empty account string must fall back to the job's existing
+        // account, not to "no account given" (which would skip
+        // authorization entirely).
+        let mut spec = basic_spec("q2");
+        spec.account = Some("research".into());
+        let id2 = submit_and_wait(&cm, spec);
+        let err = cm
+            .update_job(
+                id2,
+                None,
+                None,
+                None,
+                None,
+                Some(String::new()),
+                Some("other-teams-qos".into()),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("is not permitted"),
+            "expected re-enforcement against the job's own account 'research', got {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_qos_allows_any_member_of_the_allow_list() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache().insert(Qos {
+            name: "a".into(),
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "b".into(),
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "other-teams-qos".into(),
+            ..Default::default()
+        });
+        cm.association_cache()
+            .insert_allowed_qos("testuser", "research", &["a", "b"]);
+        let mut spec = basic_spec("q");
+        spec.account = Some("research".into());
+        let id = submit_and_wait(&cm, spec);
+
+        cm.update_job(id, None, None, None, None, None, Some("b".into()))
+            .unwrap();
+        assert_eq!(cm.get_job(id).unwrap().spec.qos.as_deref(), Some("b"));
+
+        let err = cm
+            .update_job(
+                id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("other-teams-qos".into()),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("is not permitted"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8107,6 +13523,7 @@ mod tests {
         // Agent reconnects — re-registration must NOT recover to Idle
         cm.register_node(
             "locked".into(),
+            "locked".into(),
             ResourceSet {
                 cpus: 4,
                 memory_mb: 8000,
@@ -8146,6 +13563,10 @@ mod tests {
         .unwrap();
         settle(&cm, id, JobState::Running);
 
+        // A reported path must not survive requeue (points at a node the job leaves).
+        cm.set_job_output_paths(id, "/tmp/spur.out".into(), "/tmp/spur.out".into());
+        assert!(cm.get_job(id).unwrap().actual_stdout_path.is_some());
+
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: id,
             exit_code: -1,
@@ -8154,13 +13575,11 @@ mod tests {
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Timeout);
 
         // Requeue: Timeout → Pending should reset allocation fields
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: id,
-            old_state: JobState::Timeout,
-            new_state: JobState::Pending,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            id,
+            JobState::Timeout,
+            JobState::Pending,
+        ));
 
         let job = cm.get_job(id).unwrap();
         assert_eq!(job.state, JobState::Pending);
@@ -8178,6 +13597,24 @@ mod tests {
             "allocated_resources should be cleared"
         );
         assert_eq!(job.pending_reason, PendingReason::None);
+        assert!(
+            job.actual_stdout_path.is_none() && job.actual_stderr_path.is_none(),
+            "stale reported output path should be cleared on requeue"
+        );
+    }
+
+    // Empty ("" from a mixed-version agent) must not shadow the computed fallback.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_job_output_paths_ignores_empty() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("empty-paths"));
+
+        cm.set_job_output_paths(id, String::new(), String::new());
+        let job = cm.get_job(id).unwrap();
+        assert!(job.actual_stdout_path.is_none());
+        assert!(job.actual_stderr_path.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8230,6 +13667,128 @@ mod tests {
             "node devices must be freed after requeue"
         );
         assert_eq!(node.state, NodeState::Idle, "node should return to Idle");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_job_transitions_partial_dispatch_failure_to_nodefail() {
+        // A multi-node job where the dispatch RPC only reaches some of the
+        // assigned nodes must not be left running forever waiting on
+        // completions from a node that never launched it.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+
+        let mut spec = basic_spec("partial-dispatch-fail");
+        spec.num_nodes = 2;
+        let id = submit_and_wait(&cm, spec);
+
+        let alloc = scalar_alloc(2, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into(), "n2".into()],
+            scalar_alloc(4, 8000),
+            per_node_for(&["n1", "n2"], alloc),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+
+        // n1's dispatch succeeded, n2's never reached the agent.
+        cm.evict_job(id).unwrap();
+        settle(&cm, id, JobState::NodeFail);
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::NodeFail);
+        assert_eq!(
+            job.pending_reason,
+            PendingReason::JobLaunchFailure,
+            "partial-dispatch eviction must report the job never fully launched, \
+             not a mid-run node failure"
+        );
+        assert!(
+            job.node_completions.is_empty(),
+            "node_completions must be cleared so a stray late report can't reopen the job"
+        );
+
+        for name in ["n1", "n2"] {
+            let node = cm.get_node(name).unwrap();
+            assert_eq!(
+                node.alloc_resources.cpus, 0,
+                "allocation on {name} must be freed on eviction"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evict_job_does_not_double_deallocate_a_node_that_already_completed() {
+        // Job A spans n1+n2 and shares n1 with unrelated Job B. n1 reports
+        // A's completion (freeing A's slice, moving A to Completing) before
+        // n2's dispatch failure is discovered and A is evicted. Evicting A
+        // must not subtract A's already-freed n1 slice a second time — doing
+        // so would incorrectly free capacity that actually still belongs to
+        // B, letting the node be oversubscribed.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16_000);
+        register_node(&cm, "n2", 4, 8000);
+
+        let mut spec_a = basic_spec("job-a-shares-n1");
+        spec_a.num_nodes = 2;
+        let job_a = submit_and_wait(&cm, spec_a);
+        cm.start_job(
+            job_a,
+            vec!["n1".into(), "n2".into()],
+            scalar_alloc(4, 8000),
+            per_node_for(&["n1", "n2"], scalar_alloc(2, 4000)),
+        )
+        .unwrap();
+        settle(&cm, job_a, JobState::Running);
+
+        let spec_b = basic_spec("job-b-shares-n1");
+        let job_b = submit_and_wait(&cm, spec_b);
+        cm.start_job(
+            job_b,
+            vec!["n1".into()],
+            scalar_alloc(3, 3000),
+            per_node_for(&["n1"], scalar_alloc(3, 3000)),
+        )
+        .unwrap();
+        settle(&cm, job_b, JobState::Running);
+
+        assert_eq!(
+            cm.get_node("n1").unwrap().alloc_resources.cpus,
+            5,
+            "n1 should hold both A's (2) and B's (3) allocations"
+        );
+
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id: job_a,
+            node_name: "n1".into(),
+            exit_code: 0,
+            signal: 0,
+        });
+        settle(&cm, job_a, JobState::Completing);
+        assert_eq!(
+            cm.get_node("n1").unwrap().alloc_resources.cpus,
+            3,
+            "A's n1 slice must already be freed by its own completion report, \
+             leaving only B's 3 cpus"
+        );
+
+        cm.evict_job(job_a).unwrap();
+        settle(&cm, job_a, JobState::NodeFail);
+
+        assert_eq!(
+            cm.get_node("n1").unwrap().alloc_resources.cpus,
+            3,
+            "evicting A must not re-subtract its already-freed n1 slice and \
+             clobber B's still-running allocation"
+        );
+        assert_eq!(
+            cm.get_node("n2").unwrap().alloc_resources.cpus,
+            0,
+            "n2's slice must still be freed by the eviction"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8495,6 +14054,47 @@ mod tests {
     }
 
     #[test]
+    fn apply_default_time_limit_uses_partition_default() {
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: Some(30),
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(30)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_noop_when_set() {
+        let mut spec = basic_spec("j");
+        spec.time_limit = Some(chrono::Duration::minutes(5));
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: Some(30),
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(5)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_skips_when_partition_has_no_default() {
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: None,
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions);
+        assert!(spec.time_limit.is_none());
+    }
+
+    #[test]
     fn apply_default_partition_falls_back_to_first() {
         let mut spec = basic_spec("j");
         spec.partition = None;
@@ -8546,6 +14146,19 @@ mod tests {
         cache
     }
 
+    // Inert config: no fallback, require_qos off (base resolution chain).
+    fn acct_cfg() -> spur_core::config::AccountingConfig {
+        spur_core::config::AccountingConfig::default()
+    }
+
+    fn acct_cfg_with(default_qos: &str, require_qos: bool) -> spur_core::config::AccountingConfig {
+        spur_core::config::AccountingConfig {
+            default_qos: default_qos.into(),
+            require_qos,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn apply_default_qos_explicit_valid_passes_through() {
         let assoc = AssociationCache::new();
@@ -8553,7 +14166,7 @@ mod tests {
         let mut spec = basic_spec("j");
         spec.qos = Some("highprio".into());
 
-        super::apply_default_qos(&mut spec, &assoc, &qos).unwrap();
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
         assert_eq!(spec.qos.as_deref(), Some("highprio"));
     }
 
@@ -8564,11 +14177,24 @@ mod tests {
         let mut spec = basic_spec("j");
         spec.qos = Some("doesnotexist".into());
 
-        let err = super::apply_default_qos(&mut spec, &assoc, &qos).unwrap_err();
+        let err = super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap_err();
         assert_eq!(
             err,
             SubmitError::invalid("QOS 'doesnotexist' does not exist")
         );
+        assert!(!err.to_string().contains("accounting may not be enabled"));
+    }
+
+    #[test]
+    fn apply_default_qos_explicit_invalid_hints_when_cache_unloaded() {
+        let assoc = AssociationCache::new();
+        let qos = QosCache::new();
+        let mut spec = basic_spec("j");
+        spec.qos = Some("any-qos".into());
+
+        let err = super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap_err();
+        assert!(err.to_string().contains("QOS 'any-qos' does not exist"));
+        assert!(err.to_string().contains("accounting may not be enabled"));
     }
 
     #[test]
@@ -8579,7 +14205,7 @@ mod tests {
         let mut spec = basic_spec("j");
         spec.account = Some("research".into());
 
-        super::apply_default_qos(&mut spec, &assoc, &qos).unwrap();
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
         assert_eq!(spec.qos.as_deref(), Some("highprio"));
     }
 
@@ -8623,7 +14249,7 @@ mod tests {
         // No --account given at all.
         assert!(spec.account.is_none());
 
-        super::apply_default_qos(&mut spec, &assoc, &qos).unwrap();
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
         assert_eq!(spec.qos.as_deref(), Some("highprio"));
     }
 
@@ -8634,7 +14260,7 @@ mod tests {
         let mut spec = basic_spec("j");
         spec.account = Some("research".into());
 
-        super::apply_default_qos(&mut spec, &assoc, &qos).unwrap();
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
         assert_eq!(spec.qos, None);
     }
 
@@ -8647,8 +14273,319 @@ mod tests {
         let mut spec = basic_spec("j");
         spec.account = Some("research".into());
 
-        super::apply_default_qos(&mut spec, &assoc, &qos).unwrap();
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
         assert_eq!(spec.qos, None, "must not fail submission on stale data");
+    }
+
+    #[test]
+    fn apply_default_qos_falls_back_to_cluster_default() {
+        // No --qos and no association default → cluster fallback applies.
+        let assoc = AssociationCache::new();
+        let qos = qos_cache_with(&["normal"]);
+        let mut spec = basic_spec("j");
+
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg_with("normal", false)).unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("normal"));
+    }
+
+    #[test]
+    fn apply_default_qos_explicit_permitted_despite_stale_association_default() {
+        // Association's pinned default was deleted from the cluster; that must
+        // not poison authorization for an unrelated, unrestricted explicit --qos.
+        let assoc = AssociationCache::new();
+        assoc.insert_default_qos("testuser", "research", "deleted-qos");
+        let qos = qos_cache_with(&["highprio"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+        spec.qos = Some("highprio".into());
+
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("highprio"));
+    }
+
+    #[test]
+    fn apply_default_qos_cluster_fallback_ignored_outside_allow_list() {
+        // Association is restricted to an allow-list that omits the cluster
+        // fallback; omitting --qos must not silently grant it.
+        let assoc = AssociationCache::new();
+        assoc.insert_allowed_qos("testuser", "research", &["a", "b"]);
+        let qos = qos_cache_with(&["a", "b", "cluster-default"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        super::apply_default_qos(
+            &mut spec,
+            &assoc,
+            &qos,
+            &acct_cfg_with("cluster-default", false),
+        )
+        .unwrap();
+        assert_eq!(spec.qos, None, "unauthorized fallback must not be assigned");
+    }
+
+    #[test]
+    fn apply_default_qos_cluster_fallback_outside_allow_list_with_require_qos_errors() {
+        let assoc = AssociationCache::new();
+        assoc.insert_allowed_qos("testuser", "research", &["a", "b"]);
+        let qos = qos_cache_with(&["a", "b", "cluster-default"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        let err = super::apply_default_qos(
+            &mut spec,
+            &assoc,
+            &qos,
+            &acct_cfg_with("cluster-default", true),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid(
+                "no QOS specified and no default QOS is configured for this user/account"
+            )
+        );
+    }
+
+    #[test]
+    fn apply_default_qos_cluster_fallback_permitted_when_in_allow_list() {
+        let assoc = AssociationCache::new();
+        assoc.insert_allowed_qos("testuser", "research", &["cluster-default"]);
+        let qos = qos_cache_with(&["cluster-default"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        super::apply_default_qos(
+            &mut spec,
+            &assoc,
+            &qos,
+            &acct_cfg_with("cluster-default", false),
+        )
+        .unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("cluster-default"));
+    }
+
+    #[test]
+    fn apply_default_qos_association_default_beats_cluster_default() {
+        let assoc = AssociationCache::new();
+        assoc.insert_default_qos("testuser", "research", "highprio");
+        let qos = qos_cache_with(&["highprio", "normal"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg_with("normal", false)).unwrap();
+        assert_eq!(
+            spec.qos.as_deref(),
+            Some("highprio"),
+            "association default takes precedence over the cluster fallback"
+        );
+    }
+
+    #[test]
+    fn apply_default_qos_nonexistent_cluster_default_is_rejected() {
+        // A misconfigured fallback must hard-error, not silently leave it unenforced.
+        let assoc = AssociationCache::new();
+        let qos = qos_cache_with(&["normal"]);
+        let mut spec = basic_spec("j");
+
+        let err = super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg_with("ghost", false))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid("configured default QOS 'ghost' does not exist")
+        );
+        assert!(!err.to_string().contains("accounting may not be enabled"));
+    }
+
+    #[test]
+    fn apply_default_qos_cluster_default_hints_when_cache_unloaded() {
+        let assoc = AssociationCache::new();
+        let qos = QosCache::new();
+        let mut spec = basic_spec("j");
+
+        let err = super::apply_default_qos(
+            &mut spec,
+            &assoc,
+            &qos,
+            &acct_cfg_with("fallback-qos", false),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("configured default QOS 'fallback-qos' does not exist"));
+        assert!(err.to_string().contains("accounting may not be enabled"));
+    }
+
+    #[test]
+    fn apply_default_qos_require_qos_rejects_when_none_resolves() {
+        // require_qos with no fallback rejects a job that resolves to no QOS.
+        let assoc = AssociationCache::new();
+        let qos = QosCache::new();
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        let err = super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg_with("", true))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid(
+                "no QOS specified and no default QOS is configured for this user/account"
+            )
+        );
+    }
+
+    #[test]
+    fn apply_default_qos_require_qos_satisfied_by_cluster_default() {
+        // With both set, the fallback satisfies require_qos — no rejection.
+        let assoc = AssociationCache::new();
+        let qos = qos_cache_with(&["normal"]);
+        let mut spec = basic_spec("j");
+
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg_with("normal", true)).unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("normal"));
+    }
+
+    #[test]
+    fn apply_default_qos_require_qos_satisfied_by_explicit() {
+        // An explicit valid QOS satisfies require_qos regardless of fallback.
+        let assoc = AssociationCache::new();
+        let qos = qos_cache_with(&["highprio"]);
+        let mut spec = basic_spec("j");
+        spec.qos = Some("highprio".into());
+
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg_with("", true)).unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("highprio"));
+    }
+
+    #[test]
+    fn apply_default_qos_explicit_unauthorized_qos_is_rejected() {
+        // An explicit QOS that exists but isn't the association's own default
+        // must be rejected, not silently accepted (SPUR-101).
+        let assoc = AssociationCache::new();
+        assoc.insert_default_qos("testuser", "research", "highprio");
+        let qos = qos_cache_with(&["highprio", "other-teams-qos"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+        spec.qos = Some("other-teams-qos".into());
+
+        let err = super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid(
+                "QOS 'other-teams-qos' is not permitted for user 'testuser' under account 'research'"
+            )
+        );
+    }
+
+    #[test]
+    fn apply_default_qos_explicit_matches_association_default_is_allowed() {
+        let assoc = AssociationCache::new();
+        assoc.insert_default_qos("testuser", "research", "highprio");
+        let qos = qos_cache_with(&["highprio"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+        spec.qos = Some("highprio".into());
+
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("highprio"));
+    }
+
+    #[test]
+    fn apply_default_qos_explicit_allowed_when_association_has_no_default_pinned() {
+        // A loaded cache with a real membership but no default QOS on record
+        // for this association has never been pinned to one — stay permissive.
+        let assoc = AssociationCache::new();
+        assoc.insert_association("testuser", "research");
+        let qos = qos_cache_with(&["anything"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+        spec.qos = Some("anything".into());
+
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("anything"));
+    }
+
+    #[test]
+    fn apply_default_qos_explicit_skips_authz_when_no_account_resolves() {
+        // Cache loaded but the user has no resolvable account (e.g. no
+        // default account and none given) — nothing to authorize against.
+        let assoc = AssociationCache::new();
+        assoc.set_loaded_without_associations();
+        let qos = qos_cache_with(&["anything"]);
+        let mut spec = basic_spec("j");
+        spec.qos = Some("anything".into());
+
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("anything"));
+    }
+
+    #[test]
+    fn apply_default_qos_explicit_rejects_other_accounts_qos() {
+        // A user in two accounts, each pinned to its own QOS, must not be
+        // able to borrow one account's QOS while submitting under the
+        // other — the exact cross-account confusion reported in SPUR-101.
+        let assoc = AssociationCache::new();
+        assoc.insert_default_qos("testuser", "hyperloom", "hyperloom-qos");
+        assoc.insert_default_qos("testuser", "primus", "primus-qos");
+        let qos = qos_cache_with(&["hyperloom-qos", "primus-qos"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("hyperloom".into());
+        spec.qos = Some("primus-qos".into());
+
+        let err = super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid(
+                "QOS 'primus-qos' is not permitted for user 'testuser' under account 'hyperloom'"
+            )
+        );
+    }
+
+    #[test]
+    fn apply_default_qos_explicit_allows_any_member_of_the_allow_list() {
+        let assoc = AssociationCache::new();
+        assoc.insert_allowed_qos("testuser", "research", &["a", "b", "c"]);
+        let qos = qos_cache_with(&["a", "b", "c"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        for name in ["a", "b", "c"] {
+            spec.qos = Some(name.into());
+            super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
+            assert_eq!(spec.qos.as_deref(), Some(name));
+        }
+    }
+
+    #[test]
+    fn apply_default_qos_explicit_rejects_qos_outside_the_allow_list() {
+        let assoc = AssociationCache::new();
+        assoc.insert_allowed_qos("testuser", "research", &["a", "b"]);
+        let qos = qos_cache_with(&["a", "b", "other-teams-qos"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+        spec.qos = Some("other-teams-qos".into());
+
+        let err = super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid(
+                "QOS 'other-teams-qos' is not permitted for user 'testuser' under account 'research'"
+            )
+        );
+    }
+
+    #[test]
+    fn apply_default_qos_no_explicit_qos_resolves_pinned_default_from_allow_list() {
+        // The common real-world config: an allow-list plus a default that's
+        // a member of it. Omitting --qos must still resolve to the default.
+        let assoc = AssociationCache::new();
+        assoc.insert_allowed_qos("testuser", "research", &["a", "b"]);
+        assoc.insert_default_qos("testuser", "research", "b");
+        let qos = qos_cache_with(&["a", "b"]);
+        let mut spec = basic_spec("j");
+        spec.account = Some("research".into());
+
+        super::apply_default_qos(&mut spec, &assoc, &qos, &acct_cfg()).unwrap();
+        assert_eq!(spec.qos.as_deref(), Some("b"));
     }
 
     // ── array-parent dependency: cancel + display synthesis ──────
@@ -8669,13 +14606,11 @@ mod tests {
         // Jobs may only reach Completed/Failed/etc. via Running; cancel is the
         // only legal direct transition out of Pending.
         if state != JobState::Cancelled {
-            cm.apply_operation(&WalOperation::JobStateChange {
-                job_id: id,
-                old_state: JobState::Pending,
-                new_state: JobState::Running,
-                pending_reason: None,
-                pending_priority: None,
-            });
+            cm.apply_operation(&WalOperation::job_state_change(
+                id,
+                JobState::Pending,
+                JobState::Running,
+            ));
         }
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: id,
@@ -8729,13 +14664,11 @@ mod tests {
             spec: Box::new(child),
         });
         // Child is already Running by the time the cancel pass fires.
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 2,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            2,
+            JobState::Pending,
+            JobState::Running,
+        ));
 
         let cancelled = cm.cancel_unsatisfiable_dependency_jobs();
         assert!(cancelled.is_empty(), "running job must not be cancelled");
@@ -8752,13 +14685,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("parent")),
         });
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: 1,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
 
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:1".into()];
@@ -8879,19 +14810,48 @@ mod tests {
         submit_array_task(&cm, 12, 10, 1);
 
         // Query the parent id explicitly.
-        let got = cm.get_jobs(&[], None, None, None, &[10]);
+        let got = cm.get_jobs(&[], None, None, None, None, &[10]);
         assert_eq!(got.len(), 1, "parent id should synthesize one record");
         assert_eq!(got[0].job_id, 10);
         assert_eq!(got[0].state, JobState::Pending);
         assert_eq!(got[0].spec.array_job_id, Some(10));
 
         // Querying a real task id still returns that task, not the parent.
-        let got_task = cm.get_jobs(&[], None, None, None, &[11]);
+        let got_task = cm.get_jobs(&[], None, None, None, None, &[11]);
         assert_eq!(got_task.len(), 1);
         assert_eq!(got_task[0].job_id, 11);
 
         // Unknown id → empty.
-        assert!(cm.get_jobs(&[], None, None, None, &[999]).is_empty());
+        assert!(cm.get_jobs(&[], None, None, None, None, &[999]).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_jobs_filters_by_name() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        submit_and_wait(&cm, basic_spec("alpha"));
+        submit_and_wait(&cm, basic_spec("beta"));
+        submit_and_wait(&cm, basic_spec("alpha"));
+
+        let all = cm.get_jobs(&[], None, None, None, None, &[]);
+        assert_eq!(all.len(), 3);
+
+        let alphas = cm.get_jobs(&[], None, None, None, Some("alpha"), &[]);
+        assert_eq!(alphas.len(), 2);
+        assert!(alphas.iter().all(|j| j.spec.name == "alpha"));
+
+        let betas = cm.get_jobs(&[], None, None, None, Some("beta"), &[]);
+        assert_eq!(betas.len(), 1);
+
+        let multi = cm.get_jobs(&[], None, None, None, Some("alpha,beta"), &[]);
+        assert_eq!(multi.len(), 3);
+
+        let none = cm.get_jobs(&[], None, None, None, Some("nonexistent"), &[]);
+        assert!(none.is_empty());
+
+        let empty = cm.get_jobs(&[], None, None, None, Some(""), &[]);
+        assert_eq!(empty.len(), 3);
     }
 
     // --- Partition matching tests ---
@@ -9007,6 +14967,8 @@ mod tests {
                 allow_accounts: Vec::new(),
                 allow_groups: Vec::new(),
                 deny_accounts: Vec::new(),
+                deny_qos: Vec::new(),
+                allow_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
             },
@@ -9023,6 +14985,8 @@ mod tests {
                 allow_accounts: Vec::new(),
                 allow_groups: Vec::new(),
                 deny_accounts: Vec::new(),
+                deny_qos: Vec::new(),
+                allow_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
             },
@@ -9080,6 +15044,8 @@ mod tests {
             allow_accounts: Vec::new(),
             allow_groups: Vec::new(),
             deny_accounts: Vec::new(),
+            deny_qos: Vec::new(),
+            allow_qos: Vec::new(),
             priority_tier: 1,
             preempt_mode: String::new(),
         }];
@@ -9096,6 +15062,7 @@ mod tests {
         cm.set_raft(handle.raft);
 
         cm.register_node(
+            "dyn-node".into(),
             "dyn-node".into(),
             ResourceSet {
                 cpus: 8,
@@ -9163,6 +15130,7 @@ mod tests {
         // First registration with labels
         cm.register_node(
             "worker1".into(),
+            "worker1".into(),
             ResourceSet {
                 cpus: 4,
                 memory_mb: 8000,
@@ -9184,6 +15152,7 @@ mod tests {
 
         // Re-register with same resources but different labels
         cm.register_node(
+            "worker1".into(),
             "worker1".into(),
             ResourceSet {
                 cpus: 4,
@@ -9209,6 +15178,131 @@ mod tests {
         assert_eq!(node.labels.get("tier"), Some(&"1".into()));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reregistration_updates_comm_address_without_resource_change() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let resources = ResourceSet {
+            cpus: 4,
+            memory_mb: 8000,
+            ..Default::default()
+        };
+
+        cm.register_node(
+            "worker1".into(),
+            "worker1".into(),
+            resources.clone(),
+            "10.0.0.1".into(),
+            6818,
+            String::new(),
+            String::new(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::new(),
+        )
+        .unwrap();
+        wait_for("node registered", || cm.get_node("worker1").is_some());
+
+        cm.register_node(
+            "worker1".into(),
+            "worker1".into(),
+            resources,
+            "10.0.0.2".into(),
+            6818,
+            String::new(),
+            String::new(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::new(),
+        )
+        .unwrap();
+        wait_for("comm address updated", || {
+            cm.get_node("worker1").and_then(|n| n.address).as_deref() == Some("10.0.0.2")
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_config_address_does_not_override_registered_comm_addr() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.nodes = vec![spur_core::config::NodeConfig {
+            names: "worker1".into(),
+            selector: HashMap::new(),
+            cpus: 0,
+            memory_mb: 0,
+            gres: Vec::new(),
+            features: Vec::new(),
+            address: Some("10.0.0.99".into()),
+            weight: 1,
+        }];
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        cm.register_node(
+            "worker1".into(),
+            "worker1".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            "10.0.0.1".into(),
+            6818,
+            String::new(),
+            String::new(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::from([("pool".into(), "train".into())]),
+        )
+        .unwrap();
+        wait_for("node registered", || cm.get_node("worker1").is_some());
+
+        cm.apply_operation(&WalOperation::NodeLabelsUpdate {
+            name: "worker1".into(),
+            set: HashMap::from([("pool".into(), "infer".into())]),
+            remove: Vec::new(),
+        });
+
+        assert_eq!(
+            cm.get_node("worker1").unwrap().address,
+            Some("10.0.0.1".into())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_config_address_fills_when_agent_address_empty() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.nodes = vec![spur_core::config::NodeConfig {
+            names: "worker1".into(),
+            selector: HashMap::new(),
+            cpus: 0,
+            memory_mb: 0,
+            gres: Vec::new(),
+            features: Vec::new(),
+            address: Some("10.0.0.99".into()),
+            weight: 1,
+        }];
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "worker1".into(),
+            hostname: "worker1".into(),
+            resources: ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            address: String::new(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        });
+
+        assert_eq!(
+            cm.get_node("worker1").unwrap().address,
+            Some("10.0.0.99".into())
+        );
+    }
+
     #[test]
     fn label_update_applies_nodeconfig_features() {
         let dir = TempDir::new().unwrap();
@@ -9228,6 +15322,7 @@ mod tests {
         // Register a node directly via WAL apply
         cm.apply_operation(&WalOperation::NodeRegister {
             name: "gpu-node".into(),
+            hostname: String::new(),
             resources: ResourceSet {
                 cpus: 8,
                 memory_mb: 16000,
@@ -9238,6 +15333,7 @@ mod tests {
             wg_pubkey: String::new(),
             version: String::new(),
             labels: HashMap::new(),
+            source: NodeSource::default(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -9253,6 +15349,140 @@ mod tests {
         let node = cm.get_node("gpu-node").unwrap();
         assert_eq!(node.features, vec!["mi300x", "rocm6"]);
         assert_eq!(node.weight, 10);
+    }
+
+    #[test]
+    fn label_update_resets_features_when_no_match() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.nodes = vec![spur_core::config::NodeConfig {
+            names: String::new(),
+            selector: HashMap::from([("gpu".into(), "mi300x".into())]),
+            cpus: 0,
+            memory_mb: 0,
+            gres: Vec::new(),
+            features: vec!["mi300x".into(), "rocm6".into()],
+            address: None,
+            weight: 10,
+        }];
+        let cm = ClusterManager::new(cfg, dir.path()).unwrap();
+
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "gpu-node".into(),
+            hostname: String::new(),
+            resources: ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::from([("gpu".into(), "mi300x".into())]),
+            source: NodeSource::default(),
+        });
+
+        let node = cm.get_node("gpu-node").unwrap();
+        assert_eq!(node.features, vec!["mi300x", "rocm6"]);
+        assert_eq!(node.weight, 10);
+
+        cm.apply_operation(&WalOperation::NodeLabelsUpdate {
+            name: "gpu-node".into(),
+            set: HashMap::new(),
+            remove: vec!["gpu".into()],
+        });
+
+        let node = cm.get_node("gpu-node").unwrap();
+        assert!(node.features.is_empty());
+        assert_eq!(node.weight, 1);
+    }
+
+    #[test]
+    fn node_register_no_match_uses_defaults() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.nodes = vec![spur_core::config::NodeConfig {
+            names: String::new(),
+            selector: HashMap::from([("gpu".into(), "mi300x".into())]),
+            cpus: 0,
+            memory_mb: 0,
+            gres: Vec::new(),
+            features: vec!["mi300x".into(), "rocm6".into()],
+            address: None,
+            weight: 10,
+        }];
+        let cm = ClusterManager::new(cfg, dir.path()).unwrap();
+
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "cpu-node".into(),
+            hostname: String::new(),
+            resources: ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::from([("gpu".into(), "mi250".into())]),
+            source: NodeSource::default(),
+        });
+
+        let node = cm.get_node("cpu-node").unwrap();
+        assert!(node.features.is_empty());
+        assert_eq!(node.weight, 1);
+    }
+
+    #[test]
+    fn reconcile_resets_stale_features_on_restore() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.nodes = vec![spur_core::config::NodeConfig {
+            names: String::new(),
+            selector: HashMap::from([("gpu".into(), "mi300x".into())]),
+            cpus: 0,
+            memory_mb: 0,
+            gres: Vec::new(),
+            features: vec!["mi300x".into(), "rocm6".into()],
+            address: None,
+            weight: 10,
+        }];
+        let cm = ClusterManager::new(cfg, dir.path()).unwrap();
+
+        // Snapshot node has stale policy but labels that no longer match the config.
+        let mut stale = Node::new(
+            "gpu-node".into(),
+            ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+        );
+        stale.features = vec!["mi300x".into(), "rocm6".into()];
+        stale.weight = 10;
+        stale.labels = HashMap::new();
+
+        let snap = ClusterSnapshot {
+            jobs: Vec::new(),
+            nodes: vec![stale],
+            reservations: Vec::new(),
+            partitions: None,
+            deleted_partition_names: HashSet::new(),
+            steps: Vec::new(),
+            license_pool: HashMap::new(),
+            tokens: Vec::new(),
+            burst_buffer_total_gb: 0,
+            k0s: spur_core::k0s::K0sClusterState::default(),
+            next_job_id: 0,
+        };
+        let bytes = serde_json::to_vec(&snap).unwrap();
+        cm.restore_from_snapshot(&bytes).unwrap();
+
+        let node = cm.get_node("gpu-node").unwrap();
+        assert!(node.features.is_empty());
+        assert_eq!(node.weight, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9299,7 +15529,7 @@ mod tests {
         // array parent id, which is not stored — only per-task ids exist in `jobs`.
         let mut spec = basic_spec("array");
         spec.array_spec = Some("0-2".into()); // Creates 3 tasks
-        let parent_id = cm.submit_job(spec).unwrap();
+        let parent_id = cm.submit_job(spec).unwrap().job_id;
         let first_task_id = parent_id + 1;
         wait_for(&format!("array task {first_task_id} applied"), || {
             cm.get_job(first_task_id).is_some()
@@ -9316,18 +15546,34 @@ mod tests {
     // ---- Node deregistration tests ----
 
     fn start_job_on(cm: &ClusterManager, id: JobId, node: &str) {
-        cm.apply_operation(&WalOperation::JobStateChange {
-            job_id: id,
-            old_state: JobState::Pending,
-            new_state: JobState::Running,
-            pending_reason: None,
-            pending_priority: None,
-        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            id,
+            JobState::Pending,
+            JobState::Running,
+        ));
         cm.apply_operation(&WalOperation::JobStart {
             job_id: id,
             nodes: vec![node.into()],
             resources: scalar_alloc(1, 1000),
             per_node_alloc: per_node_for(&[node], scalar_alloc(1, 1000)),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+        });
+    }
+
+    fn start_srun_job_on(cm: &ClusterManager, id: JobId, node: &str) {
+        cm.apply_operation(&WalOperation::job_state_change(
+            id,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: id,
+            nodes: vec![node.into()],
+            resources: scalar_alloc(1, 1000),
+            per_node_alloc: per_node_for(&[node], scalar_alloc(1, 1000)),
+            srun_step_dispatch: true,
+            run_attempt: 0,
         });
     }
 
@@ -9583,7 +15829,13 @@ mod tests {
     fn evict_job_returns_none_for_missing_job() {
         let mut jobs = HashMap::new();
         let mut nodes = HashMap::new();
-        let result = ClusterManager::evict_job(999, &mut jobs, &mut nodes, Utc::now());
+        let result = ClusterManager::evict_job_locked(
+            999,
+            &mut jobs,
+            &mut nodes,
+            Utc::now(),
+            PendingReason::NodeDown,
+        );
         assert!(result.is_none());
     }
 
@@ -9594,7 +15846,14 @@ mod tests {
         jobs.insert(1, make_running_job(1, &["n1"], 2));
         nodes.insert("n1".into(), make_test_node("n1", 4, 2));
 
-        let fin = ClusterManager::evict_job(1, &mut jobs, &mut nodes, Utc::now()).unwrap();
+        let fin = ClusterManager::evict_job_locked(
+            1,
+            &mut jobs,
+            &mut nodes,
+            Utc::now(),
+            PendingReason::NodeDown,
+        )
+        .unwrap();
         assert_eq!(fin.job_id, 1);
         assert_eq!(fin.state, JobState::NodeFail);
         assert_eq!(fin.exit_code, -1);
@@ -9614,7 +15873,13 @@ mod tests {
         nodes.insert("n1".into(), make_test_node("n1", 4, 2));
         nodes.insert("n2".into(), make_test_node("n2", 4, 2));
 
-        ClusterManager::evict_job(1, &mut jobs, &mut nodes, Utc::now());
+        ClusterManager::evict_job_locked(
+            1,
+            &mut jobs,
+            &mut nodes,
+            Utc::now(),
+            PendingReason::NodeDown,
+        );
 
         assert_eq!(nodes["n1"].alloc_resources.cpus, 0);
         assert_eq!(nodes["n2"].alloc_resources.cpus, 0);
@@ -9629,7 +15894,13 @@ mod tests {
         jobs.insert(1, job);
         nodes.insert("n1".into(), make_test_node("n1", 4, 2));
 
-        let result = ClusterManager::evict_job(1, &mut jobs, &mut nodes, Utc::now());
+        let result = ClusterManager::evict_job_locked(
+            1,
+            &mut jobs,
+            &mut nodes,
+            Utc::now(),
+            PendingReason::NodeDown,
+        );
         assert!(result.is_none());
     }
 
@@ -9645,7 +15916,13 @@ mod tests {
         jobs.insert(1, job);
         nodes.insert("n1".into(), make_test_node("n1", 4, 2));
 
-        ClusterManager::evict_job(1, &mut jobs, &mut nodes, Utc::now());
+        ClusterManager::evict_job_locked(
+            1,
+            &mut jobs,
+            &mut nodes,
+            Utc::now(),
+            PendingReason::NodeDown,
+        );
 
         let job = &jobs[&1];
         assert!(job.suspended_at.is_none());
@@ -9661,7 +15938,14 @@ mod tests {
         jobs.insert(1, job);
         nodes.insert("n1".into(), make_test_node("n1", 4, 2));
 
-        let fin = ClusterManager::evict_job(1, &mut jobs, &mut nodes, Utc::now()).unwrap();
+        let fin = ClusterManager::evict_job_locked(
+            1,
+            &mut jobs,
+            &mut nodes,
+            Utc::now(),
+            PendingReason::NodeDown,
+        )
+        .unwrap();
         assert_eq!(fin.state, JobState::NodeFail);
         assert_eq!(jobs[&1].state, JobState::NodeFail);
         assert_eq!(nodes["n1"].alloc_resources.cpus, 0);
@@ -9676,8 +15960,698 @@ mod tests {
         node.state = NodeState::Draining;
         nodes.insert("n1".into(), node);
 
-        ClusterManager::evict_job(1, &mut jobs, &mut nodes, Utc::now());
+        ClusterManager::evict_job_locked(
+            1,
+            &mut jobs,
+            &mut nodes,
+            Utc::now(),
+            PendingReason::NodeDown,
+        );
 
         assert_eq!(nodes["n1"].state, NodeState::Drain);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_completes_running_allocation() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-alloc"));
+        start_srun_job_on(&cm, id, "n1");
+
+        let returned = cm.finish_srun_job(id, 0, "testuser").unwrap();
+        assert_eq!(returned.job_id, id);
+        settle(&cm, id, JobState::Completed);
+        assert_eq!(cm.get_job(id).unwrap().exit_code, Some(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_rejects_non_srun_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("batch"));
+        start_job_on(&cm, id, "n1");
+
+        assert!(matches!(
+            cm.finish_srun_job(id, 0, "testuser"),
+            Err(SrunCompleteError::NotSrunJob(j)) if j == id
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_rejects_terminal_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-done"));
+        start_srun_job_on(&cm, id, "n1");
+        cm.finish_srun_job(id, 0, "testuser").unwrap();
+        settle(&cm, id, JobState::Completed);
+
+        assert!(matches!(
+            cm.finish_srun_job(id, 0, "testuser"),
+            Err(SrunCompleteError::AlreadyTerminal {
+                job_id,
+                state: JobState::Completed,
+            }) if job_id == id
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_rejects_wrong_user() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-owner"));
+        start_srun_job_on(&cm, id, "n1");
+
+        assert!(matches!(
+            cm.finish_srun_job(id, 0, "otheruser"),
+            Err(SrunCompleteError::NotOwner { job_id, user }) if job_id == id && user == "otheruser"
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_rejects_batch_fallback_srun() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-batch-fallback"));
+        start_job_on(&cm, id, "n1");
+
+        assert!(matches!(
+            cm.finish_srun_job(id, 0, "testuser"),
+            Err(SrunCompleteError::NotStepDispatch(j)) if j == id
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_not_found() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        assert!(matches!(
+            cm.finish_srun_job(999, 0, "testuser"),
+            Err(SrunCompleteError::NotFound(999))
+        ));
+    }
+
+    // ---------------------------------------------------------------
+    // Partition CRUD tests
+    // ---------------------------------------------------------------
+
+    fn gpu_partition() -> spur_core::partition::Partition {
+        spur_core::partition::Partition {
+            name: "gpu".into(),
+            state: spur_core::partition::PartitionState::Up,
+            is_default: false,
+            nodes: "gpu[01-04]".into(),
+            max_time_minutes: Some(1440),
+            allow_accounts: vec!["ml-team".into()],
+            priority_tier: 2,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_partition_create_update_delete() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&WalOperation::PartitionCreate {
+            partition: gpu_partition(),
+        });
+
+        let parts = cm.get_partitions();
+        assert!(
+            parts.iter().any(|p| p.name == "gpu"),
+            "gpu partition missing after create"
+        );
+        let gpu = parts.iter().find(|p| p.name == "gpu").unwrap();
+        assert_eq!(gpu.max_time_minutes, Some(1440));
+        assert_eq!(gpu.allow_accounts, vec!["ml-team"]);
+        assert_eq!(gpu.priority_tier, 2);
+
+        cm.apply_operation(&WalOperation::PartitionUpdate {
+            name: "gpu".into(),
+            nodes: None,
+            selector: None,
+            state: Some("DRAIN".into()),
+            max_time_minutes: Some(Some(2880)),
+            default_time_minutes: None,
+            max_nodes: None,
+            min_nodes: None,
+            allow_accounts: Some(vec!["ml-team".into(), "infra".into()]),
+            allow_groups: None,
+            deny_accounts: None,
+            deny_qos: None,
+            allow_qos: None,
+            priority_tier: None,
+            preempt_mode: None,
+            is_default: None,
+        });
+
+        let gpu = cm
+            .get_partitions()
+            .into_iter()
+            .find(|p| p.name == "gpu")
+            .unwrap();
+        assert_eq!(gpu.state, spur_core::partition::PartitionState::Drain);
+        assert_eq!(gpu.max_time_minutes, Some(2880));
+        assert!(gpu.allow_accounts.contains(&"infra".into()));
+
+        cm.apply_operation(&WalOperation::PartitionDelete { name: "gpu".into() });
+        assert!(
+            !cm.get_partitions().iter().any(|p| p.name == "gpu"),
+            "gpu partition still present after delete"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_partition_create_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&WalOperation::PartitionCreate {
+            partition: gpu_partition(),
+        });
+        cm.apply_operation(&WalOperation::PartitionCreate {
+            partition: gpu_partition(),
+        });
+
+        let gpu_count = cm
+            .get_partitions()
+            .iter()
+            .filter(|p| p.name == "gpu")
+            .count();
+        assert_eq!(
+            gpu_count, 1,
+            "duplicate PartitionCreate must not add a second entry"
+        );
+    }
+
+    // A config-seeded partition must lose to a replayed WAL PartitionCreate of
+    // the same name, or a runtime edit later codified into spur.conf reverts on
+    // restart and two controllers with differing confs diverge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_partition_create_overrides_config_seed() {
+        let dir = TempDir::new().unwrap();
+        // Default test config seeds a partition named "default".
+        let cm = test_cluster(&dir).await;
+        assert!(
+            cm.config_seeded_partitions.read().contains("default"),
+            "precondition: 'default' is config-seeded"
+        );
+
+        let runtime = spur_core::partition::Partition {
+            name: "default".into(),
+            state: spur_core::partition::PartitionState::Up,
+            is_default: true,
+            nodes: "node[01-09]".into(),
+            max_time_minutes: Some(720),
+            allow_accounts: vec!["runtime-team".into()],
+            priority_tier: 7,
+            ..Default::default()
+        };
+        cm.apply_operation(&WalOperation::PartitionCreate {
+            partition: runtime.clone(),
+        });
+
+        let parts = cm.get_partitions();
+        let def = parts.iter().find(|p| p.name == "default").unwrap();
+        assert_eq!(def.nodes, "node[01-09]", "WAL value must overwrite seed");
+        assert_eq!(def.max_time_minutes, Some(720));
+        assert_eq!(def.priority_tier, 7);
+        assert_eq!(
+            parts.iter().filter(|p| p.name == "default").count(),
+            1,
+            "override must not add a second entry"
+        );
+        assert!(
+            !cm.config_seeded_partitions.read().contains("default"),
+            "seed marker must be cleared once the WAL has overridden it"
+        );
+
+        // The seed override is one-shot: a further duplicate is a genuine
+        // create race and stays first-writer-wins.
+        let mut evil = runtime.clone();
+        evil.priority_tier = 99;
+        cm.apply_operation(&WalOperation::PartitionCreate { partition: evil });
+        let def = cm
+            .get_partitions()
+            .into_iter()
+            .find(|p| p.name == "default")
+            .unwrap();
+        assert_eq!(
+            def.priority_tier, 7,
+            "post-override duplicate must be ignored (first-writer-wins)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_partition_update_unknown_is_a_noop() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let before = cm.get_partitions().len();
+
+        cm.apply_operation(&WalOperation::PartitionUpdate {
+            name: "does-not-exist".into(),
+            nodes: Some("n1".into()),
+            selector: None,
+            state: None,
+            max_time_minutes: None,
+            default_time_minutes: None,
+            max_nodes: None,
+            min_nodes: None,
+            allow_accounts: None,
+            allow_groups: None,
+            deny_accounts: None,
+            deny_qos: None,
+            allow_qos: None,
+            priority_tier: None,
+            preempt_mode: None,
+            is_default: None,
+        });
+
+        assert_eq!(
+            cm.get_partitions().len(),
+            before,
+            "unknown partition update must not add an entry"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_partition_set_default_clears_others() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        // Baseline: the "default" partition created by test_config() is already is_default=true.
+        cm.apply_operation(&WalOperation::PartitionCreate {
+            partition: gpu_partition(),
+        });
+        assert!(
+            !cm.get_partitions()
+                .iter()
+                .find(|p| p.name == "gpu")
+                .unwrap()
+                .is_default
+        );
+
+        // Make "gpu" the default.
+        cm.apply_operation(&WalOperation::PartitionUpdate {
+            name: "gpu".into(),
+            nodes: None,
+            selector: None,
+            state: None,
+            max_time_minutes: None,
+            default_time_minutes: None,
+            max_nodes: None,
+            min_nodes: None,
+            allow_accounts: None,
+            allow_groups: None,
+            deny_accounts: None,
+            deny_qos: None,
+            allow_qos: None,
+            priority_tier: None,
+            preempt_mode: None,
+            is_default: Some(true),
+        });
+
+        let parts = cm.get_partitions();
+        let defaults: Vec<&str> = parts
+            .iter()
+            .filter(|p| p.is_default)
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(
+            defaults,
+            vec!["gpu"],
+            "exactly one partition must be default after promotion"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_partition_rejects_duplicate_name() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.create_partition(gpu_partition()).unwrap();
+        let err = cm.create_partition(gpu_partition()).unwrap_err();
+        assert!(
+            matches!(err, PartitionError::AlreadyExists(_)),
+            "expected AlreadyExists, got {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_partition_rejects_not_found() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let err = cm.delete_partition("no-such-partition").unwrap_err();
+        assert!(
+            matches!(err, PartitionError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_partition_rejects_when_running_job_uses_it() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        // Use an open partition (no account restriction) so basic_spec's testuser can submit.
+        let open_part = spur_core::partition::Partition {
+            name: "gpu".into(),
+            nodes: "ALL".into(),
+            ..Default::default()
+        };
+        cm.create_partition(open_part).unwrap();
+        wait_for("gpu partition created", || {
+            cm.get_partitions().iter().any(|p| p.name == "gpu")
+        });
+
+        let mut spec = basic_spec("gpu-job");
+        spec.partition = Some("gpu".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let alloc = scalar_alloc(1, 1000);
+        cm.start_job(
+            job_id,
+            vec!["n1".into()],
+            alloc.clone(),
+            per_node_for(&["n1"], alloc),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        let err = cm.delete_partition("gpu").unwrap_err();
+        assert!(
+            matches!(err, PartitionError::InvalidArgument(_)),
+            "expected InvalidArgument for in-use partition, got {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partition_survives_wal_replay() {
+        let dir = TempDir::new().unwrap();
+        {
+            let cm = test_cluster(&dir).await;
+            cm.create_partition(gpu_partition()).unwrap();
+            wait_for("gpu created", || {
+                cm.get_partitions().iter().any(|p| p.name == "gpu")
+            });
+        }
+
+        let cm2 = test_cluster(&dir).await;
+        wait_for("gpu replayed from WAL", || {
+            cm2.get_partitions().iter().any(|p| p.name == "gpu")
+        });
+        let gpu = cm2
+            .get_partitions()
+            .into_iter()
+            .find(|p| p.name == "gpu")
+            .unwrap();
+        assert_eq!(gpu.allow_accounts, vec!["ml-team"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_partition_create_keeps_single_entry() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let cm1 = cm.clone();
+        let cm2 = cm.clone();
+        let (first, second) = tokio::join!(
+            tokio::task::spawn_blocking(move || cm1.create_partition(gpu_partition())),
+            tokio::task::spawn_blocking(move || cm2.create_partition(gpu_partition())),
+        );
+        let outcomes = [first.unwrap(), second.unwrap()];
+        assert_eq!(
+            outcomes.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "exactly one concurrent create must succeed"
+        );
+        let gpu_count = cm
+            .get_partitions()
+            .iter()
+            .filter(|p| p.name == "gpu")
+            .count();
+        assert_eq!(gpu_count, 1);
+    }
+
+    // ---------------------------------------------------------------
+    // Tombstone tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleted_partition_does_not_resurface_after_snapshot_restore() {
+        let state_dir = TempDir::new().unwrap();
+        let cm = test_cluster(&state_dir).await;
+
+        // Create then delete "gpu" via the public API (goes through Raft).
+        cm.create_partition(gpu_partition()).unwrap();
+        wait_for("gpu created", || {
+            cm.get_partitions().iter().any(|p| p.name == "gpu")
+        });
+        cm.delete_partition("gpu").unwrap();
+        wait_for("gpu deleted", || {
+            !cm.get_partitions().iter().any(|p| p.name == "gpu")
+        });
+
+        // Tombstone set must contain "gpu".
+        assert!(
+            cm.deleted_partition_names.read().contains("gpu"),
+            "tombstone not recorded after delete"
+        );
+
+        // Simulate snapshot + restore: take a snapshot, apply it to a fresh manager.
+        let snap_bytes = cm.snapshot_state().unwrap();
+
+        let cm2 = Arc::new(ClusterManager::new(test_config(), state_dir.path()).unwrap());
+        cm2.restore_from_snapshot(&snap_bytes).unwrap();
+
+        assert!(
+            !cm2.get_partitions().iter().any(|p| p.name == "gpu"),
+            "deleted partition must not re-appear after snapshot restore"
+        );
+        assert!(
+            cm2.deleted_partition_names.read().contains("gpu"),
+            "tombstone must survive snapshot round-trip"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recreating_tombstoned_partition_clears_tombstone() {
+        let state_dir = TempDir::new().unwrap();
+        let cm = test_cluster(&state_dir).await;
+
+        cm.create_partition(gpu_partition()).unwrap();
+        wait_for("gpu created", || {
+            cm.get_partitions().iter().any(|p| p.name == "gpu")
+        });
+
+        cm.delete_partition("gpu").unwrap();
+        wait_for("gpu deleted", || {
+            !cm.get_partitions().iter().any(|p| p.name == "gpu")
+        });
+        assert!(cm.deleted_partition_names.read().contains("gpu"));
+
+        // Recreate.
+        cm.create_partition(gpu_partition()).unwrap();
+        wait_for("gpu recreated", || {
+            cm.get_partitions().iter().any(|p| p.name == "gpu")
+        });
+
+        assert!(
+            !cm.deleted_partition_names.read().contains("gpu"),
+            "tombstone must be cleared when the partition is recreated"
+        );
+
+        // After another snapshot round-trip the partition must be present.
+        let snap_bytes = cm.snapshot_state().unwrap();
+        let cm2 = Arc::new(ClusterManager::new(test_config(), state_dir.path()).unwrap());
+        cm2.restore_from_snapshot(&snap_bytes).unwrap();
+        assert!(
+            cm2.get_partitions().iter().any(|p| p.name == "gpu"),
+            "recreated partition must survive snapshot round-trip"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn config_partition_not_touched_by_runtime_stays_after_snapshot_restore() {
+        // Verify that the existing deployment path is unaffected: a partition that
+        // was only ever defined in spur.conf and never touched at runtime must
+        // still be present after snapshot restore.
+        let state_dir = TempDir::new().unwrap();
+        let cm = test_cluster(&state_dir).await;
+
+        // test_config() includes a "default" partition — never touch it at runtime.
+        // Take a snapshot and restore.
+        let snap_bytes = cm.snapshot_state().unwrap();
+        let cm2 = Arc::new(ClusterManager::new(test_config(), state_dir.path()).unwrap());
+        cm2.restore_from_snapshot(&snap_bytes).unwrap();
+
+        assert!(
+            cm2.get_partitions().iter().any(|p| p.name == "default"),
+            "config-only partition must survive snapshot restore untouched"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // QoS enforcement tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn validate_partition_rejects_qos_not_in_allow_qos() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let part = spur_core::partition::Partition {
+            name: "restricted".into(),
+            nodes: "ALL".into(),
+            allow_qos: vec!["premium".into()],
+            ..Default::default()
+        };
+        cm.create_partition(part).unwrap();
+        wait_for("restricted created", || {
+            cm.get_partitions().iter().any(|p| p.name == "restricted")
+        });
+
+        // QoS not in allow list → rejected.
+        let mut spec = basic_spec("bad-qos");
+        spec.partition = Some("restricted".into());
+        spec.qos = Some("cheap".into());
+        assert!(
+            cm.validate_partition(&spec).is_err(),
+            "QoS not in allow_qos must fail validation"
+        );
+
+        // QoS in allow list → accepted.
+        let mut spec = basic_spec("good-qos");
+        spec.partition = Some("restricted".into());
+        spec.qos = Some("premium".into());
+        assert!(
+            cm.validate_partition(&spec).is_ok(),
+            "QoS in allow_qos must pass validation"
+        );
+
+        // No QoS with allow_qos set → rejected (empty string not in list).
+        let mut spec = basic_spec("no-qos");
+        spec.partition = Some("restricted".into());
+        spec.qos = None;
+        assert!(
+            cm.validate_partition(&spec).is_err(),
+            "absent QoS must fail when allow_qos is non-empty"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn validate_partition_rejects_qos_in_deny_qos() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let part = spur_core::partition::Partition {
+            name: "nodebug".into(),
+            nodes: "ALL".into(),
+            deny_qos: vec!["debug".into()],
+            ..Default::default()
+        };
+        cm.create_partition(part).unwrap();
+        wait_for("nodebug created", || {
+            cm.get_partitions().iter().any(|p| p.name == "nodebug")
+        });
+
+        // Denied QoS → rejected.
+        let mut spec = basic_spec("denied-qos");
+        spec.partition = Some("nodebug".into());
+        spec.qos = Some("debug".into());
+        assert!(
+            cm.validate_partition(&spec).is_err(),
+            "denied QoS must fail validation"
+        );
+
+        // Non-denied QoS → allowed.
+        let mut spec = basic_spec("other-qos");
+        spec.partition = Some("nodebug".into());
+        spec.qos = Some("premium".into());
+        assert!(
+            cm.validate_partition(&spec).is_ok(),
+            "non-denied QoS must pass validation"
+        );
+
+        // None QoS → allowed (deny_qos only blocks explicitly-named values).
+        let mut spec = basic_spec("no-qos");
+        spec.partition = Some("nodebug".into());
+        spec.qos = None;
+        assert!(
+            cm.validate_partition(&spec).is_ok(),
+            "absent QoS must not be blocked by deny_qos"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn validate_partition_passes_any_qos_when_allow_qos_empty() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        let part = spur_core::partition::Partition {
+            name: "open".into(),
+            nodes: "ALL".into(),
+            allow_qos: vec![],
+            ..Default::default()
+        };
+        cm.create_partition(part).unwrap();
+        wait_for("open created", || {
+            cm.get_partitions().iter().any(|p| p.name == "open")
+        });
+
+        let mut spec = basic_spec("any-qos");
+        spec.partition = Some("open".into());
+        spec.qos = Some("whatever".into());
+        assert!(
+            cm.validate_partition(&spec).is_ok(),
+            "empty allow_qos must not restrict any QoS"
+        );
+    }
+
+    // Full submit path: a user with no explicit `-q` whose association default
+    // QoS is in the partition's allow_qos must be admitted. The tests above call
+    // validate_partition with an explicit qos, so none covers this ordering.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_admits_association_default_qos_on_allow_qos_partition() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache().insert(Qos {
+            name: "premium".into(),
+            ..Default::default()
+        });
+        cm.association_cache()
+            .insert_default_qos("testuser", "research", "premium");
+
+        let part = spur_core::partition::Partition {
+            name: "restricted".into(),
+            nodes: "ALL".into(),
+            allow_qos: vec!["premium".into()],
+            ..Default::default()
+        };
+        cm.create_partition(part).unwrap();
+        wait_for("restricted created", || {
+            cm.get_partitions().iter().any(|p| p.name == "restricted")
+        });
+
+        let mut spec = basic_spec("inherits-default");
+        spec.account = Some("research".into());
+        spec.partition = Some("restricted".into());
+        spec.qos = None;
+        let id = cm
+            .submit_job(spec)
+            .expect("association default QoS must satisfy the partition allow_qos")
+            .job_id;
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.qos.as_deref(),
+            Some("premium"),
+            "the resolved default QoS must be recorded on the job"
+        );
     }
 }

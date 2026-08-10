@@ -198,6 +198,81 @@ pub fn add_peer(interface: &str, peer: &WgPeer) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Remove a peer from the mesh interface by its public key (the counterpart to `add_peer`, used
+/// when a node leaves the cluster: `wg set <iface> peer <key> remove`). Idempotent.
+pub fn remove_peer(interface: &str, public_key: &str) -> anyhow::Result<()> {
+    let output = Command::new("wg")
+        .args(["set", interface, "peer", public_key, "remove"])
+        .output()
+        .context("failed to run `wg set peer remove`")?;
+    if !output.status.success() {
+        bail!(
+            "wg set peer remove failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Add (or replace) a kernel route for `cidr` via the WireGuard interface.
+///
+/// Used to route a peer's pod CIDR over the mesh when a CNI runs in
+/// native-routing mode (no overlay) on top of WireGuard. `wg set allowed-ips`
+/// only updates the cryptokey routing table — it does not install a kernel
+/// route — so this is required alongside it. Uses `ip route replace` so it is
+/// idempotent (add-or-update).
+pub fn add_route(interface: &str, cidr: &str) -> anyhow::Result<()> {
+    let output = Command::new("ip")
+        .args(["route", "replace", cidr, "dev", interface])
+        .output()
+        .context("failed to run `ip route replace` — is iproute2 installed?")?;
+    if !output.status.success() {
+        bail!(
+            "ip route replace {} dev {} failed: {}",
+            cidr,
+            interface,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    info!(cidr, interface, "route programmed over WireGuard");
+    Ok(())
+}
+
+/// List the public keys of the interface's current WireGuard peers (`wg show <iface> peers`), so a
+/// reconcile can prune peers no longer in the desired membership.
+pub fn list_peers(interface: &str) -> anyhow::Result<Vec<String>> {
+    let output = Command::new("wg")
+        .args(["show", interface, "peers"])
+        .output()
+        .context("failed to run `wg show peers`")?;
+    if !output.status.success() {
+        bail!(
+            "wg show {interface} peers failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// The public key of an existing WireGuard interface (`wg show <iface> public-key`).
+pub fn interface_public_key(interface: &str) -> anyhow::Result<String> {
+    let output = Command::new("wg")
+        .args(["show", interface, "public-key"])
+        .output()
+        .context("failed to run `wg show public-key`")?;
+    if !output.status.success() {
+        bail!(
+            "wg show {interface} public-key failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,7 +286,7 @@ mod tests {
             peers: vec![WgPeer {
                 public_key: "peerPubKeyBase64=".into(),
                 allowed_ips: "10.44.0.2/32".into(),
-                endpoint: Some("192.168.1.10:51820".into()),
+                endpoint: Some("203.0.113.10:51820".into()),
                 persistent_keepalive: Some(25),
             }],
         };
@@ -220,7 +295,7 @@ mod tests {
         assert!(ini.contains("PrivateKey = aPrivateKeyBase64="));
         assert!(ini.contains("ListenPort = 51820"));
         assert!(ini.contains("[Peer]"));
-        assert!(ini.contains("Endpoint = 192.168.1.10:51820"));
+        assert!(ini.contains("Endpoint = 203.0.113.10:51820"));
         assert!(ini.contains("PersistentKeepalive = 25"));
     }
 

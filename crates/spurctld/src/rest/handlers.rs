@@ -44,10 +44,11 @@ pub async fn get_jobs(
     let user = query.user.as_deref();
     let partition = query.partition.as_deref();
     let account = query.account.as_deref();
+    let name = query.name.as_deref();
 
     let jobs = state
         .cluster
-        .get_jobs(&states, user, partition, account, &[]);
+        .get_jobs(&states, user, partition, account, name, &[]);
     let json_jobs: Vec<serde_json::Value> = jobs.iter().map(job_to_json).collect();
 
     Ok(ApiResponse::ok(JobsData { jobs: json_jobs }))
@@ -65,6 +66,14 @@ pub async fn get_job(
     Ok(ApiResponse::ok(JobsData {
         jobs: vec![job_to_json(&job)],
     }))
+}
+
+/// Default an absent or zero REST `ntasks` to one task per requested node
+/// (Slurm's default), so a multi-node request is not silently collapsed to one.
+fn rest_effective_ntasks(ntasks: Option<u32>, nodes: Option<u32>) -> u32 {
+    ntasks
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| nodes.unwrap_or(1).max(1))
 }
 
 pub async fn submit_job(
@@ -88,17 +97,37 @@ pub async fn submit_job(
         partition: body.job.partition,
         account: body.job.account,
         num_nodes: body.job.nodes.unwrap_or(1),
-        num_tasks: body.job.ntasks.unwrap_or(1),
+        num_tasks: rest_effective_ntasks(body.job.ntasks, body.job.nodes),
         cpus_per_task: body.job.cpus_per_task.unwrap_or(1),
         time_limit,
         script: body.job.script,
         environment: body.job.environment,
+        gres: body.job.gres,
+        gpus: parse_rest_gpu(body.job.gpus.as_deref())?,
+        gpus_per_node: parse_rest_gpu(body.job.gpus_per_node.as_deref())?,
+        gpus_per_task: parse_rest_gpu(body.job.gpus_per_task.as_deref())?,
         ..Default::default()
     };
 
-    let job_id = state.cluster.submit_job(spec).map_err(submit_rest_error)?;
+    // GPU demand is validated in submit_job after node-count normalization.
+    let outcome = state.cluster.submit_job(spec).map_err(submit_rest_error)?;
 
-    Ok(ApiResponse::ok(SubmitResponse { job_id }))
+    Ok(ApiResponse::ok(SubmitResponse {
+        job_id: outcome.job_id,
+        warnings: outcome.warnings,
+    }))
+}
+
+/// Parse a REST GPU field ("4" or "mi300x:4") into a core GPU request.
+#[allow(clippy::result_large_err)]
+fn parse_rest_gpu(
+    value: Option<&str>,
+) -> Result<Option<spur_core::gpu_request::GpuRequest>, RestError> {
+    match value {
+        Some(v) if !v.is_empty() => spur_core::gpu_request::GpuRequest::parse_flag(v)
+            .map_err(|e| bad_request_response(&e.to_string())),
+        _ => Ok(None),
+    }
 }
 
 fn submit_rest_error(err: crate::cluster::SubmitError) -> RestError {
@@ -165,4 +194,53 @@ pub async fn get_partitions(
     Ok(ApiResponse::ok(PartitionsData {
         partitions: json_parts,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rest_effective_ntasks_defaults_absent_to_nodes() {
+        // C1 (REST): absent ntasks -> one task per node, not 1.
+        assert_eq!(rest_effective_ntasks(None, Some(4)), 4);
+        // Zero is treated as unset.
+        assert_eq!(rest_effective_ntasks(Some(0), Some(4)), 4);
+        // Explicit ntasks is preserved (reduces the job to one node later).
+        assert_eq!(rest_effective_ntasks(Some(1), Some(4)), 1);
+        // No nodes given falls back to a single task.
+        assert_eq!(rest_effective_ntasks(None, None), 1);
+    }
+
+    #[test]
+    fn parse_rest_gpu_valid() {
+        let req = parse_rest_gpu(Some("mi300x:4"));
+        assert!(req.is_ok());
+        let req = req.ok().flatten().unwrap();
+        assert_eq!(req.count, 4);
+        assert_eq!(req.gpu_type, Some("mi300x".into()));
+    }
+
+    #[test]
+    fn parse_rest_gpu_zero_is_none() {
+        let res = parse_rest_gpu(Some("0"));
+        assert!(res.is_ok());
+        assert!(res.ok().flatten().is_none());
+    }
+
+    #[test]
+    fn parse_rest_gpu_invalid_returns_error() {
+        let err = parse_rest_gpu(Some("::bad"));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn conflict_error_text_is_neutral() {
+        let msg = spur_core::gpu_request::GpuRequestError::Conflict.to_string();
+        assert!(
+            !msg.contains("--"),
+            "error message should not contain CLI flags"
+        );
+        assert!(msg.contains("gres"));
+    }
 }

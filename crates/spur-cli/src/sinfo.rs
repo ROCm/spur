@@ -5,14 +5,17 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{GetNodesRequest, GetPartitionsRequest, NodeInfo, PartitionInfo};
 
 use crate::format_engine;
 
 /// View information about nodes and partitions.
 #[derive(Parser, Debug)]
-#[command(name = "sinfo", about = "View cluster information")]
+#[command(
+    name = "sinfo",
+    about = "View cluster information",
+    disable_help_flag = true
+)]
 pub struct SinfoArgs {
     /// Show only this partition
     #[arg(short = 'p', long)]
@@ -49,6 +52,10 @@ pub struct SinfoArgs {
         default_value = "http://localhost:6817"
     )]
     pub controller: String,
+
+    /// Print help
+    #[arg(long, action = clap::ArgAction::Help)]
+    pub help: Option<bool>,
 }
 
 pub async fn main() -> Result<()> {
@@ -70,10 +77,13 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     let fields = format_engine::parse_format(&fmt, &format_engine::sinfo_header);
 
+    // Built before connecting so an invalid `-t` fails without a round-trip.
+    let nodes_req = build_get_nodes_request(&args)?;
+
     let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
+    let mut client = spur_proto::controller_client(channel);
 
     // Get partitions
     let partitions_resp = client
@@ -87,11 +97,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     // Get nodes
     let nodes_resp = client
-        .get_nodes(GetNodesRequest {
-            states: Vec::new(),
-            partition: args.partition.unwrap_or_default(),
-            nodelist: args.nodes.unwrap_or_default(),
-        })
+        .get_nodes(nodes_req)
         .await
         .context("failed to get nodes")?;
 
@@ -108,6 +114,48 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+fn build_get_nodes_request(args: &SinfoArgs) -> Result<GetNodesRequest> {
+    let states = match args.states.as_deref() {
+        Some(s) => parse_states_arg(s)?,
+        None => Vec::new(),
+    };
+
+    Ok(GetNodesRequest {
+        states: states.iter().map(|s| *s as i32).collect(),
+        partition: args.partition.clone().unwrap_or_default(),
+        nodelist: args.nodes.clone().unwrap_or_default(),
+    })
+}
+
+/// Parse `-t` / `--states` (comma-separated). Whole-string `all` means no state filter.
+/// Unknown tokens are rejected (Slurm exits with an error rather than showing all nodes).
+fn parse_states_arg(s: &str) -> Result<Vec<spur_proto::proto::NodeState>> {
+    use spur_core::node::NodeState;
+
+    let trimmed = s.trim();
+    if trimmed.eq_ignore_ascii_case("all") {
+        return Ok(Vec::new());
+    }
+
+    let tokens: Vec<&str> = trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    if tokens.is_empty() {
+        anyhow::bail!("Invalid node state specified: (empty)");
+    }
+
+    let mut states = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let core = NodeState::from_short_or_name(token)
+            .ok_or_else(|| anyhow::anyhow!("Invalid node state specified: {token}"))?;
+        states.push(core.to_proto());
+    }
+    Ok(states)
+}
+
 fn group_nodes_by_display_state<'a>(nodes: &[&'a NodeInfo]) -> Vec<(String, Vec<&'a NodeInfo>)> {
     let mut groups: BTreeMap<String, Vec<&'a NodeInfo>> = BTreeMap::new();
     for node in nodes {
@@ -118,7 +166,7 @@ fn group_nodes_by_display_state<'a>(nodes: &[&'a NodeInfo]) -> Vec<(String, Vec<
 }
 
 fn render_sinfo_output(
-    fields: &[format_engine::FormatField],
+    fields: &[format_engine::FormatToken],
     partitions: &[PartitionInfo],
     nodes: &[NodeInfo],
     node_oriented: bool,
@@ -216,6 +264,13 @@ fn resolve_node_field(
         }
         'O' => node.cpu_load.to_string(),
         'e' => node.free_memory_mb.to_string(),
+        'f' => {
+            if node.features.is_empty() {
+                "(null)".into()
+            } else {
+                node.features.join(",")
+            }
+        }
         'l' => "UNLIMITED".into(), // Would need partition context
         _ => "?".into(),
     }
@@ -242,43 +297,31 @@ fn resolve_partition_field(
                 "infinite".into()
             }
         }
-        'D' => {
-            // part.total_nodes may be 0 (not populated by server),
-            // so fall back to the actual node count from the query.
-            // If node filtering returned 0 matches (e.g. nodes lack partition
-            // metadata), fall back to counting entries in the partition's
-            // nodelist string, then to part.total_nodes.
-            if !nodes.is_empty() {
-                nodes.len().to_string()
-            } else if !part.nodes.is_empty() {
-                part.nodes
-                    .split(',')
-                    .filter(|s| !s.trim().is_empty())
-                    .count()
-                    .to_string()
-            } else if part.total_nodes > 0 {
-                part.total_nodes.to_string()
-            } else {
-                "0".into()
-            }
-        }
+        'D' => nodes.len().to_string(),
         't' | 'T' => {
             if nodes.is_empty() {
-                "idle".into()
+                "n/a".into()
             } else {
                 effective_state_str(nodes[0])
             }
         }
         'N' => {
-            if !nodes.is_empty() {
-                nodes
-                    .iter()
-                    .map(|n| n.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            } else {
-                part.nodes.clone()
-            }
+            let names: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
+            spur_core::hostlist::compress(&names)
+        }
+        'n' => {
+            // Expanded form of the same sorted hostlist as `%N`, so `%n` and
+            // `%N` stay consistent (Slurm derives both from one sorted list).
+            let names: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
+            let compressed = spur_core::hostlist::compress(&names);
+            spur_core::hostlist::expand(&compressed)
+                .unwrap_or_else(|_| {
+                    let mut fallback = names;
+                    fallback.sort();
+                    fallback.dedup();
+                    fallback
+                })
+                .join(",")
         }
         'c' => part.total_cpus.to_string(),
         _ => "?".into(),
@@ -302,7 +345,11 @@ fn effective_state_str(node: &NodeInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spur_proto::proto as pb;
+    use spur_proto::proto::slurm_controller_server::SlurmController;
     use spur_proto::proto::NodeState;
+    use std::sync::{Arc, Mutex};
+    use tonic::{Request, Response, Status};
 
     fn make_node(name: &str, state: NodeState, partition: &str) -> NodeInfo {
         NodeInfo {
@@ -322,11 +369,211 @@ mod tests {
         }
     }
 
-    fn default_fields() -> Vec<format_engine::FormatField> {
+    fn default_fields() -> Vec<format_engine::FormatToken> {
         format_engine::parse_format(
             format_engine::SINFO_DEFAULT_FORMAT,
             &format_engine::sinfo_header,
         )
+    }
+
+    // --- state filter plumbing tests ---
+
+    fn parse_sinfo_args(argv: &[&str]) -> SinfoArgs {
+        SinfoArgs::try_parse_from(argv).unwrap()
+    }
+
+    #[test]
+    fn state_filter_reaches_the_request() {
+        let args = parse_sinfo_args(&["sinfo", "-t", "idle"]);
+        let req = build_get_nodes_request(&args).unwrap();
+        assert_eq!(req.states, vec![NodeState::NodeIdle as i32]);
+    }
+
+    #[test]
+    fn state_filter_accepts_comma_separated_short_and_long_names() {
+        let args = parse_sinfo_args(&["sinfo", "--states", "alloc,DOWN,draining"]);
+        let req = build_get_nodes_request(&args).unwrap();
+        assert_eq!(
+            req.states,
+            vec![
+                NodeState::NodeAllocated as i32,
+                NodeState::NodeDown as i32,
+                NodeState::NodeDraining as i32,
+            ]
+        );
+    }
+
+    #[test]
+    fn no_state_filter_leaves_request_states_empty() {
+        let args = parse_sinfo_args(&["sinfo"]);
+        let req = build_get_nodes_request(&args).unwrap();
+        assert!(req.states.is_empty());
+    }
+
+    #[test]
+    fn state_filter_all_means_no_filter() {
+        for spec in ["all", "ALL"] {
+            let args = parse_sinfo_args(&["sinfo", "-t", spec]);
+            assert!(build_get_nodes_request(&args).unwrap().states.is_empty());
+        }
+    }
+
+    #[test]
+    fn state_filter_rejects_unknown_state() {
+        let args = parse_sinfo_args(&["sinfo", "-t", "BOGUS"]);
+        let err = build_get_nodes_request(&args).unwrap_err();
+        assert!(err.to_string().contains("BOGUS"), "{err}");
+    }
+
+    #[test]
+    fn state_filter_rejects_empty_list() {
+        let args = parse_sinfo_args(&["sinfo", "-t", "  ,  "]);
+        assert!(build_get_nodes_request(&args).is_err());
+    }
+
+    #[test]
+    fn partition_and_nodelist_still_reach_the_request() {
+        let args = parse_sinfo_args(&["sinfo", "-p", "batch", "-n", "n[1-2]"]);
+        let req = build_get_nodes_request(&args).unwrap();
+        assert_eq!(req.partition, "batch");
+        assert_eq!(req.nodelist, "n[1-2]");
+    }
+
+    #[test]
+    fn short_h_is_noheader_not_help() {
+        assert!(parse_sinfo_args(&["sinfo", "-h"]).noheader);
+    }
+
+    #[tokio::test]
+    async fn invalid_state_fails_before_connecting() {
+        // Errors while building the request, so no server/network is needed here.
+        let err = main_with_args(vec!["sinfo".into(), "-t".into(), "BOGUS".into()])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("BOGUS"), "{err}");
+    }
+
+    /// Serves the two RPCs sinfo issues and records the `GetNodesRequest` it
+    /// saw, so a test can assert what actually went over the wire.
+    #[derive(Default)]
+    struct StubController {
+        nodes_req: Arc<Mutex<Option<pb::GetNodesRequest>>>,
+    }
+
+    /// Generates the impl so `async_trait` runs after expansion. Only the two
+    /// RPCs sinfo calls need behavior; the rest just have to exist.
+    macro_rules! stub_controller {
+        ($($name:ident($req:ty) -> $resp:ty;)*) => {
+            #[tonic::async_trait]
+            impl SlurmController for StubController {
+                async fn get_partitions(
+                    &self,
+                    _: Request<pb::GetPartitionsRequest>,
+                ) -> Result<Response<pb::GetPartitionsResponse>, Status> {
+                    Ok(Response::new(pb::GetPartitionsResponse {
+                        partitions: vec![make_partition("batch", true)],
+                    }))
+                }
+
+                async fn get_nodes(
+                    &self,
+                    request: Request<pb::GetNodesRequest>,
+                ) -> Result<Response<pb::GetNodesResponse>, Status> {
+                    *self.nodes_req.lock().unwrap() = Some(request.into_inner());
+                    Ok(Response::new(pb::GetNodesResponse {
+                        nodes: vec![make_node("n1", NodeState::NodeIdle, "batch")],
+                    }))
+                }
+
+                $(
+                    async fn $name(&self, _: Request<$req>) -> Result<Response<$resp>, Status> {
+                        Err(Status::unimplemented(stringify!($name)))
+                    }
+                )*
+            }
+        };
+    }
+
+    stub_controller! {
+        submit_job(pb::SubmitJobRequest) -> pb::SubmitJobResponse;
+        get_jobs(pb::GetJobsRequest) -> pb::GetJobsResponse;
+        get_job(pb::GetJobRequest) -> pb::JobInfo;
+        cancel_job(pb::CancelJobRequest) -> ();
+        complete_job(pb::CompleteJobRequest) -> ();
+        suspend_job(pb::SuspendJobRequest) -> ();
+        resume_job(pb::ResumeJobRequest) -> ();
+        update_job(pb::UpdateJobRequest) -> ();
+        get_node(pb::GetNodeRequest) -> pb::NodeInfo;
+        update_node(pb::UpdateNodeRequest) -> ();
+        drain_node(pb::DrainNodeRequest) -> pb::DrainNodeResponse;
+        deregister_node(pb::DeregisterNodeRequest) -> pb::DeregisterNodeResponse;
+        deregister_agent(pb::DeregisterAgentRequest) -> ();
+        get_job_steps(pb::GetJobStepsRequest) -> pb::GetJobStepsResponse;
+        create_job_step(pb::CreateJobStepRequest) -> pb::CreateJobStepResponse;
+        create_partition(pb::CreatePartitionRequest) -> ();
+        update_partition(pb::UpdatePartitionRequest) -> ();
+        delete_partition(pb::DeletePartitionRequest) -> ();
+        reconfigure(()) -> ();
+        ping(()) -> pb::PingResponse;
+        get_job_metrics(()) -> pb::JobMetrics;
+        get_node_metrics(()) -> pb::NodeMetrics;
+        get_rpc_stats(()) -> pb::RpcStats;
+        reset_diag_stats(()) -> ();
+        get_sched_stats(()) -> pb::SchedStats;
+        register_agent(pb::RegisterAgentRequest) -> pb::RegisterAgentResponse;
+        heartbeat(pb::HeartbeatRequest) -> pb::HeartbeatResponse;
+        create_token(pb::CreateTokenRequest) -> pb::CreateTokenResponse;
+        list_tokens(pb::ListTokensRequest) -> pb::ListTokensResponse;
+        revoke_token(pb::RevokeTokenRequest) -> pb::RevokeTokenResponse;
+        report_job_status(pb::ReportJobStatusRequest) -> ();
+        create_reservation(pb::CreateReservationRequest) -> ();
+        update_reservation(pb::UpdateReservationRequest) -> ();
+        delete_reservation(pb::DeleteReservationRequest) -> ();
+        list_reservations(pb::ListReservationsRequest) -> pb::ListReservationsResponse;
+        exec_in_job(pb::ExecInJobRequest) -> pb::ExecInJobResponse;
+        run_step(pb::RunStepRequest) -> pb::RunStepResponse;
+        cluster_up(pb::ClusterUpRequest) -> pb::ClusterUpResponse;
+        cluster_down(pb::ClusterDownRequest) -> pb::ClusterDownResponse;
+        cluster_status(pb::ClusterStatusRequest) -> pb::ClusterStatusResponse;
+        cluster_kubeconfig(pb::ClusterKubeconfigRequest) -> pb::ClusterKubeconfigResponse;
+    }
+
+    #[tokio::test]
+    async fn stub_controller_rejects_rpcs_sinfo_does_not_use() {
+        let err = StubController::default()
+            .ping(Request::new(()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn state_filter_reaches_the_controller() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let stub = StubController::default();
+        let seen = stub.nodes_req.clone();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(spur_proto::controller_server(stub))
+                .serve_with_incoming(incoming),
+        );
+
+        main_with_args(vec![
+            "sinfo".into(),
+            "-t".into(),
+            "idle".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+        ])
+        .await
+        .expect("sinfo against the stub controller");
+
+        let req = seen.lock().unwrap().clone().expect("get_nodes was called");
+        assert_eq!(req.states, vec![NodeState::NodeIdle as i32]);
     }
 
     #[test]
@@ -398,12 +645,8 @@ mod tests {
             "idle row should show 2 nodes: {idle_line}"
         );
         assert!(
-            idle_line.contains("n1"),
-            "idle row should list n1: {idle_line}"
-        );
-        assert!(
-            idle_line.contains("n2"),
-            "idle row should list n2: {idle_line}"
+            idle_line.contains("n[1-2]"),
+            "idle row should list a compressed n[1-2]: {idle_line}"
         );
         assert!(
             !idle_line.contains("n3"),
@@ -441,14 +684,60 @@ mod tests {
     }
 
     #[test]
-    fn test_render_empty_partition() {
+    fn test_render_nodelist_compressed() {
         let fields = default_fields();
+        let partitions = vec![make_partition("gpu", true)];
+        let nodes = vec![
+            make_node("gpu001", NodeState::NodeIdle, "gpu"),
+            make_node("gpu002", NodeState::NodeIdle, "gpu"),
+            make_node("gpu003", NodeState::NodeIdle, "gpu"),
+            make_node("gpu004", NodeState::NodeIdle, "gpu"),
+        ];
+
+        let lines = render_sinfo_output(&fields, &partitions, &nodes, false);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("gpu[001-004]"),
+            "NODELIST should be a compressed hostlist: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn test_render_nodelist_expanded_with_percent_n() {
+        let fields = format_engine::parse_format("%P|%n", &format_engine::sinfo_header);
+        let partitions = vec![make_partition("gpu", true)];
+        let nodes = vec![
+            make_node("gpu001", NodeState::NodeIdle, "gpu"),
+            make_node("gpu002", NodeState::NodeIdle, "gpu"),
+        ];
+
+        let lines = render_sinfo_output(&fields, &partitions, &nodes, false);
+        assert_eq!(lines, ["gpu*|gpu001,gpu002"]);
+    }
+
+    #[test]
+    fn test_render_empty_partition() {
+        let fields = format_engine::parse_format("%P|%D|%t|%N", &format_engine::sinfo_header);
         let partitions = vec![make_partition("empty", false)];
         let nodes: Vec<NodeInfo> = vec![];
 
         let lines = render_sinfo_output(&fields, &partitions, &nodes, false);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("idle"));
+        assert_eq!(lines, ["empty|0|n/a|"]);
+    }
+
+    #[test]
+    fn test_unregistered_configured_nodes_are_not_reported() {
+        let fields = format_engine::parse_format("%P|%D|%t|%N", &format_engine::sinfo_header);
+        let mut partition = make_partition("gpu", false);
+        partition.nodes = "gpu-node1,gpu-node2".into();
+
+        let lines = render_sinfo_output(&fields, std::slice::from_ref(&partition), &[], false);
+        assert_eq!(lines, ["gpu|0|n/a|"]);
+
+        let nodes = [make_node("gpu-node1", NodeState::NodeIdle, "gpu")];
+        let lines = render_sinfo_output(&fields, &[partition], &nodes, false);
+        assert_eq!(lines, ["gpu|1|idle|gpu-node1"]);
     }
 
     #[test]
@@ -471,6 +760,29 @@ mod tests {
         assert!(lines[0].contains("idle"));
         assert!(lines[1].contains("n2"));
         assert!(lines[1].contains("down"));
+    }
+
+    #[test]
+    fn node_oriented_output_displays_available_features() {
+        let fields = format_engine::parse_format("%n|%f", &format_engine::sinfo_header);
+        let partitions = vec![make_partition("gpu", true)];
+        let mut node = make_node("gpu-node1", NodeState::NodeIdle, "gpu");
+        node.features = vec!["mi350x".into(), "atl".into()];
+
+        let lines = render_sinfo_output(&fields, &partitions, &[node], true);
+
+        assert_eq!(lines, ["gpu-node1|mi350x,atl"]);
+    }
+
+    #[test]
+    fn node_oriented_output_displays_null_when_features_are_empty() {
+        let fields = format_engine::parse_format("%n|%f", &format_engine::sinfo_header);
+        let partitions = vec![make_partition("cpu", true)];
+        let node = make_node("cpu-node1", NodeState::NodeIdle, "cpu");
+
+        let lines = render_sinfo_output(&fields, &partitions, &[node], true);
+
+        assert_eq!(lines, ["cpu-node1|(null)"]);
     }
 
     // --- effective_state_str tests ---
@@ -548,8 +860,10 @@ mod tests {
             .iter()
             .find(|l| l.contains("idle"))
             .expect("no idle row");
-        assert!(idle_line.contains("n1"), "idle row should list n1");
-        assert!(idle_line.contains("n2"), "idle row should list n2");
+        assert!(
+            idle_line.contains("n[1-2]"),
+            "idle row should list a compressed n[1-2]: {idle_line}"
+        );
         assert!(!idle_line.contains("n3"), "idle row should not list n3");
 
         let resv_line = lines

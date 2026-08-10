@@ -13,6 +13,7 @@ members = [
     "crates/spur-cli",
     "crates/spur-ffi",
     "crates/spur-spank",
+    "crates/spur-mpi-pmix",
     "crates/spur-k8s",
     "crates/spur-tests",
     "crates/spur-update",
@@ -20,7 +21,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.7.0"
 edition = "2021"
 license = "Apache-2.0"
 publish = false
@@ -63,10 +64,10 @@ k8s-openapi = { version = "0.28", features = ["latest", "schemars"] }
 schemars = "1"
 
 # Unix
-nix = { version = "0.31", features = ["process", "signal", "fs", "user", "sched", "mount", "socket"] }
+nix = { version = "0.31", features = ["process", "signal", "fs", "user", "sched", "mount", "socket", "term"] }
 
 # Auth
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 
 # Logging
 tracing = "0.1"
@@ -90,12 +91,13 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 futures-util = "0.3"
 flate2 = "1"
 tar = "0.4"
+zstd = "0.13"
 semver = "1"
 sha2 = "0.11"
-base64 = "0.22"
+base64 = "0.23"
 rand = "0.10"
 subtle = "2"
-serial_test = "3"
+serial_test = "4"
 
 # Internal
 spur-update = { path = "crates/spur-update" }

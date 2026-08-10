@@ -131,14 +131,14 @@ def _wait_node_state(cluster, target_state, timeout=15):
     """Poll sinfo until any node shows *target_state* (case-insensitive)."""
     target = target_state.lower()
     deadline = time.time() + timeout
-    info = ""
+    states = {}
     while time.time() < deadline:
-        info = cluster.sinfo()
-        if target in info.lower():
-            return info
+        states = cluster.sinfo_nodes()
+        if any(target in s.lower() for s in states.values()):
+            return states
         time.sleep(1)
     assert False, (
-        f"no node reached '{target_state}' within {timeout}s:\n{info}"
+        f"no node reached '{target_state}' within {timeout}s:\n{states}"
     )
 
 
@@ -427,6 +427,42 @@ class TestHookFailure:
 
         cluster.scancel(str(job_id))
 
+    def test_missing_work_dir_does_not_drain_node(self, unstarted_cluster):
+        """A job whose WorkDir is absent on the node must run, not drain it."""
+        cluster = unstarted_cluster
+        cluster.start(_setup_hooks(cluster, prolog=LOGGING_PROLOG))
+
+        # Unique per run so a leftover dir can't let the prolog chdir succeed.
+        missing = f"{cluster.remote_dir}/nonexistent-wd/deep/missing"
+        out_path = f"{cluster.remote_dir}/missing-wd.out"
+        script = cluster.write_file("test.sh", "#!/bin/bash\necho WD_OK\n")
+        sb = cluster.sbatch(
+            ["-J", "missing-wd", "-N", "1", "-D", missing, "-o", out_path, script]
+        )
+        job_id = parse_job_id(sb)
+        assert job_id is not None
+
+        state = wait_job(cluster, job_id, timeout=60)
+        assert state in ("CD", "GONE"), (
+            f"job with a missing WorkDir should complete, got {state}"
+        )
+
+        states = cluster.sinfo_nodes()
+        assert not any(s.startswith("drain") for s in states.values()), (
+            f"a missing WorkDir must not drain the node:\n{states}"
+        )
+
+        content = cluster.read_output_on_any_node(out_path)
+        assert "WD_OK" in content, f"job output missing:\n{content}"
+
+        # Prolog ran from the fallback CWD but still reports the submitted dir.
+        prolog = _read_hook_log(cluster, job_id, "prolog")
+        assert prolog["SPUR_JOB_ID"] == str(job_id)
+        assert prolog["SPUR_JOB_WORK_DIR"] == missing, (
+            f"prolog should still report the submitted WorkDir, got "
+            f"{prolog.get('SPUR_JOB_WORK_DIR')!r}"
+        )
+
     def test_epilog_slurmctld_failure_is_nonfatal(self, unstarted_cluster):
         """EpilogSlurmctld failure is logged but does not affect job or node state."""
         cluster = unstarted_cluster
@@ -445,7 +481,7 @@ class TestHookFailure:
         content = cluster.read_output_on_any_node(out_path)
         assert "NONFATAL_OK" in content
 
-        info = cluster.sinfo()
-        assert "drain" not in info.lower(), (
-            f"EpilogSlurmctld failure should not drain nodes:\n{info}"
+        states = cluster.sinfo_nodes()
+        assert not any(s.startswith("drain") for s in states.values()), (
+            f"EpilogSlurmctld failure should not drain nodes:\n{states}"
         )

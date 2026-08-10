@@ -85,7 +85,8 @@ impl VirtualAgent {
 impl SlurmAgent for VirtualAgent {
     type StreamJobOutputStream =
         tokio_stream::wrappers::ReceiverStream<Result<StreamJobOutputChunk, Status>>;
-    type AttachJobStream = tokio_stream::wrappers::ReceiverStream<Result<AttachJobOutput, Status>>;
+    type InteractiveSessionStream =
+        tokio_stream::wrappers::ReceiverStream<Result<InteractiveOutput, Status>>;
 
     async fn launch_job(
         &self,
@@ -440,6 +441,7 @@ impl SlurmAgent for VirtualAgent {
                 Ok(Response::new(LaunchJobResponse {
                     success: true,
                     error: String::new(),
+                    ..Default::default()
                 }))
             }
             Err(kube::Error::Api(e)) if e.code == 409 => {
@@ -447,6 +449,7 @@ impl SlurmAgent for VirtualAgent {
                 Ok(Response::new(LaunchJobResponse {
                     success: true,
                     error: String::new(),
+                    ..Default::default()
                 }))
             }
             Err(e) => {
@@ -454,9 +457,26 @@ impl SlurmAgent for VirtualAgent {
                 Ok(Response::new(LaunchJobResponse {
                     success: false,
                     error: e.to_string(),
+                    ..Default::default()
                 }))
             }
         }
+    }
+
+    async fn prepare_pmix(
+        &self,
+        _request: Request<PreparePmixRequest>,
+    ) -> Result<Response<PreparePmixResponse>, Status> {
+        Err(Status::unimplemented(
+            "PMIx prepare is not supported on the K8s virtual agent",
+        ))
+    }
+
+    async fn release_pmix(
+        &self,
+        _request: Request<ReleasePmixRequest>,
+    ) -> Result<Response<ReleasePmixResponse>, Status> {
+        Ok(Response::new(ReleasePmixResponse {}))
     }
 
     async fn cancel_job(
@@ -598,15 +618,29 @@ impl SlurmAgent for VirtualAgent {
         &self,
         _request: Request<RunCommandRequest>,
     ) -> Result<Response<RunCommandResponse>, Status> {
-        // #146: srun-in-salloc step dispatch. The K8s virtual agent does
-        // not currently support one-shot commands outside the job pod's
-        // lifecycle — salloc + srun-in-allocation is not a common K8s
-        // workflow. Implementations that need it could spawn a transient
-        // pod (e.g. via PodSpec with the same image as the allocation
-        // template), but that's a non-trivial design choice and the
-        // user-facing path uses the native spurd agent.
+        // Srun step dispatch. The K8s virtual agent does not currently support
+        // one-shot commands outside the job pod's lifecycle — salloc plus
+        // srun-in-allocation is not a common K8s workflow.
         Err(Status::unimplemented(
             "RunCommand is not yet supported by the K8s virtual agent",
+        ))
+    }
+
+    async fn cancel_step(
+        &self,
+        _request: Request<CancelStepRequest>,
+    ) -> Result<Response<()>, Status> {
+        Err(Status::unimplemented(
+            "CancelStep is not yet supported by the K8s virtual agent",
+        ))
+    }
+
+    async fn register_job_allocation(
+        &self,
+        _request: Request<RegisterJobAllocationRequest>,
+    ) -> Result<Response<RegisterJobAllocationResponse>, Status> {
+        Err(Status::unimplemented(
+            "RegisterJobAllocation is not yet supported by the K8s virtual agent",
         ))
     }
 
@@ -670,13 +704,67 @@ impl SlurmAgent for VirtualAgent {
         )))
     }
 
-    async fn attach_job(
+    async fn interactive_session(
         &self,
-        _request: Request<tonic::Streaming<AttachJobInput>>,
-    ) -> Result<Response<Self::AttachJobStream>, Status> {
+        _request: Request<tonic::Streaming<InteractiveInput>>,
+    ) -> Result<Response<Self::InteractiveSessionStream>, Status> {
         Err(Status::unimplemented(
-            "interactive attach not supported for K8s agent",
+            "interactive session not supported for K8s agent",
         ))
+    }
+
+    // -- Native cluster component control. The virtual K8s agent does not run k0s
+    //    systemd units, so these are permanently unsupported here. --
+    async fn start_cluster_component(
+        &self,
+        _request: Request<StartClusterComponentRequest>,
+    ) -> Result<Response<StartClusterComponentResponse>, Status> {
+        Err(Status::unimplemented(
+            "cluster components not supported for K8s agent",
+        ))
+    }
+
+    async fn stop_cluster_component(
+        &self,
+        _request: Request<StopClusterComponentRequest>,
+    ) -> Result<Response<StopClusterComponentResponse>, Status> {
+        Err(Status::unimplemented(
+            "cluster components not supported for K8s agent",
+        ))
+    }
+
+    async fn get_cluster_component_status(
+        &self,
+        _request: Request<GetClusterComponentStatusRequest>,
+    ) -> Result<Response<GetClusterComponentStatusResponse>, Status> {
+        Err(Status::unimplemented(
+            "cluster components not supported for K8s agent",
+        ))
+    }
+
+    async fn create_k0s_join_token(
+        &self,
+        _request: Request<CreateK0sJoinTokenRequest>,
+    ) -> Result<Response<CreateK0sJoinTokenResponse>, Status> {
+        Err(Status::unimplemented(
+            "cluster components not supported for K8s agent",
+        ))
+    }
+
+    async fn get_kubeconfig(
+        &self,
+        _request: Request<GetKubeconfigRequest>,
+    ) -> Result<Response<GetKubeconfigResponse>, Status> {
+        Err(Status::unimplemented(
+            "cluster components not supported for K8s agent",
+        ))
+    }
+
+    async fn apply_mesh(
+        &self,
+        _request: Request<MeshMembership>,
+    ) -> Result<Response<ApplyMeshResponse>, Status> {
+        Err(Status::unimplemented("mesh not supported for K8s agent"))
     }
 }
 

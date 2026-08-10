@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 use spur_net::address::AddressPool;
+use spur_net::mesh::{self, MeshMembership};
 use spur_net::wireguard::{self, WgConfig, WgPeer};
 
 /// Network mesh management.
@@ -45,7 +46,7 @@ pub enum NetCommand {
     /// Generates a local keypair, connects to the controller to exchange
     /// keys, and brings up the interface.
     Join {
-        /// Controller's real IP and WireGuard port (e.g. 192.168.1.100:51820)
+        /// Controller's real IP and WireGuard port (e.g. 203.0.113.1:51820)
         #[arg(long)]
         endpoint: String,
         /// Controller's WireGuard public key
@@ -78,12 +79,51 @@ pub enum NetCommand {
         /// Peer's allowed IP (e.g. 10.44.0.3/32)
         #[arg(long)]
         allowed_ip: String,
-        /// Peer's endpoint (e.g. 192.168.1.11:51820)
+        /// Peer's pod CIDR (e.g. 10.42.3.0/24), folded into AllowedIPs so
+        /// WireGuard forwards the peer's pod traffic. Required for a
+        /// native-routing CNI (Calico `bird`) over the mesh.
+        #[arg(long)]
+        pod_cidr: Option<String>,
+        /// Also install a kernel route (`<pod-cidr> dev <iface>`). OFF by
+        /// default: a native-routing CNI owns the FIB routes and spur must not
+        /// fight it. Use only when NO CNI manages routes (e.g. bare-mesh test).
+        #[arg(long)]
+        program_routes: bool,
+        /// Peer's endpoint (e.g. 203.0.113.2:51820)
         #[arg(long)]
         endpoint: Option<String>,
         /// WireGuard interface name
         #[arg(long, default_value = "spur0")]
         interface: String,
+    },
+    /// Apply a full-mesh peering from a membership file on the local node.
+    ///
+    /// Adds every other node as a direct peer with pod-CIDR-aware AllowedIPs,
+    /// turning the default hub-and-spoke into a full mesh a native-routing CNI
+    /// can ride. Run on each node (e.g. SSH fan-out from the head) with the
+    /// SAME membership file.
+    ///
+    /// This REPLACES the hub-and-spoke fallback: the membership file MUST list
+    /// every live mesh node (nodes it omits lose the controller's catch-all
+    /// route and become unreachable). It is additive — it does not remove peers
+    /// or routes for nodes dropped from the file.
+    Mesh {
+        /// Path to the membership file (JSON: {"nodes":[{public_key, mesh_ip, endpoint, pod_cidr?}, ...]}).
+        #[arg(long)]
+        config: PathBuf,
+        /// This node's mesh IP (the entry to skip), e.g. 10.44.0.2.
+        #[arg(long = "self")]
+        self_ip: String,
+        /// Also install kernel pod-CIDR routes. OFF by default (the CNI owns
+        /// FIB routes; see `add-peer --program-routes`).
+        #[arg(long)]
+        program_routes: bool,
+        /// WireGuard interface name
+        #[arg(long, default_value = "spur0")]
+        interface: String,
+        /// Print the computed peers/routes without applying them.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -120,9 +160,25 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         NetCommand::AddPeer {
             key,
             allowed_ip,
+            pod_cidr,
+            program_routes,
             endpoint,
             interface,
-        } => cmd_add_peer(&key, &allowed_ip, endpoint.as_deref(), &interface),
+        } => cmd_add_peer(
+            &key,
+            &allowed_ip,
+            pod_cidr.as_deref(),
+            program_routes,
+            endpoint.as_deref(),
+            &interface,
+        ),
+        NetCommand::Mesh {
+            config,
+            self_ip,
+            program_routes,
+            interface,
+            dry_run,
+        } => cmd_mesh(&config, &self_ip, &interface, program_routes, dry_run),
     }
 }
 
@@ -247,24 +303,150 @@ fn cmd_status(interface: &str) -> Result<()> {
 fn cmd_add_peer(
     key: &str,
     allowed_ip: &str,
+    pod_cidr: Option<&str>,
+    program_routes: bool,
     endpoint: Option<&str>,
     interface: &str,
 ) -> Result<()> {
+    // Validate CIDRs before shelling out to `wg`/`ip` so bad input fails fast.
+    mesh::validate_cidr(allowed_ip).context("--allowed-ip")?;
+    let pod_cidr = pod_cidr.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(pod) = pod_cidr {
+        mesh::validate_cidr(pod).context("--pod-cidr")?;
+    }
+
+    // When a pod CIDR is given, fold it into AllowedIPs so WireGuard forwards
+    // the peer's pod traffic (native-routing CNI over the mesh).
+    let allowed_ips = match pod_cidr {
+        Some(pod) => format!("{},{}", allowed_ip, pod),
+        None => allowed_ip.to_string(),
+    };
+
     let peer = WgPeer {
         public_key: key.to_string(),
-        allowed_ips: allowed_ip.to_string(),
+        allowed_ips: allowed_ips.clone(),
         endpoint: endpoint.map(|s| s.to_string()),
         persistent_keepalive: Some(25),
     };
 
     wireguard::add_peer(interface, &peer)?;
+
+    // AllowedIPs (above) is all WireGuard needs. The kernel FIB route is the
+    // CNI's job in native-routing mode; only program it when asked (no CNI).
+    if program_routes {
+        if let Some(pod) = pod_cidr {
+            wireguard::add_route(interface, pod)?;
+        }
+    }
+
     eprintln!("Peer added to {}:", interface);
     eprintln!("  Public key:  {}", key);
-    eprintln!("  Allowed IPs: {}", allowed_ip);
+    eprintln!("  Allowed IPs: {}", allowed_ips);
     if let Some(ep) = endpoint {
         eprintln!("  Endpoint:    {}", ep);
     }
+    if let Some(pod) = pod_cidr {
+        if program_routes {
+            eprintln!("  Pod route:   {} dev {}", pod, interface);
+        } else {
+            eprintln!(
+                "  Pod CIDR:    {} (AllowedIPs only; CNI owns the route)",
+                pod
+            );
+        }
+    }
 
+    Ok(())
+}
+
+fn cmd_mesh(
+    config: &Path,
+    self_ip: &str,
+    interface: &str,
+    program_routes: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let self_ip = self_ip.trim();
+    let raw = std::fs::read_to_string(config)
+        .with_context(|| format!("failed to read mesh membership file {}", config.display()))?;
+    let membership: MeshMembership = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse mesh membership file {}", config.display()))?;
+
+    // Validate the membership up front: self must be listed, every mesh_ip is an
+    // IP, and every pod_cidr is a CIDR (fail fast before touching `wg`/`ip`).
+    if !membership.nodes.iter().any(|n| n.mesh_ip.trim() == self_ip) {
+        bail!(
+            "--self {} is not present in {} (nodes: {})",
+            self_ip,
+            config.display(),
+            membership
+                .nodes
+                .iter()
+                .map(|n| n.mesh_ip.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    for n in &membership.nodes {
+        n.mesh_ip
+            .trim()
+            .parse::<Ipv4Addr>()
+            .with_context(|| format!("invalid mesh_ip in membership: {:?}", n.mesh_ip))?;
+        if let Some(pod) = n
+            .pod_cidr
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            mesh::validate_cidr(pod)
+                .with_context(|| format!("invalid pod_cidr for node {}", n.mesh_ip))?;
+        }
+    }
+
+    let peers = mesh::mesh_peers_for(self_ip, &membership.nodes);
+    let routes = mesh::mesh_pod_routes(self_ip, &membership.nodes);
+
+    if dry_run {
+        eprintln!("Mesh apply (dry run) for {} on {}:", self_ip, interface);
+        for p in &peers {
+            eprintln!(
+                "  peer {}  allowed-ips {}  endpoint {}",
+                p.public_key,
+                p.allowed_ips,
+                p.endpoint.as_deref().unwrap_or("-")
+            );
+        }
+        if program_routes {
+            for r in &routes {
+                eprintln!("  route {} dev {}", r, interface);
+            }
+        } else if !routes.is_empty() {
+            eprintln!(
+                "  (routes not programmed — CNI owns them; pass --program-routes to install)"
+            );
+        }
+        return Ok(());
+    }
+
+    // This replaces the hub-and-spoke fallback (each peer's AllowedIPs is set,
+    // not appended), so an omitted node loses reachability. Warn loudly.
+    eprintln!(
+        "note: applying full mesh — this replaces the hub-and-spoke fallback; \
+         the membership file must list every live node."
+    );
+
+    let applied = mesh::apply_mesh(interface, self_ip, &membership.nodes, program_routes)?;
+    eprintln!(
+        "Mesh applied on {}: {} peer(s){} for {}.",
+        interface,
+        applied,
+        if program_routes {
+            format!(", {} pod route(s)", routes.len())
+        } else {
+            " (AllowedIPs only; CNI owns routes)".to_string()
+        },
+        self_ip
+    );
     Ok(())
 }
 

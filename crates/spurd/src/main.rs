@@ -2,10 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod agent_server;
+mod cluster;
 pub mod container;
 mod executor;
+pub(crate) mod job_entry;
 mod landlock;
-pub mod pmi;
+mod mpi_plugin;
+pub(crate) mod privdrop;
+pub(crate) mod pty;
 mod reporter;
 mod seccomp;
 
@@ -21,6 +25,34 @@ use spur_devices::cdi::cache::CdiCache;
 use spur_devices::DeviceRegistry;
 
 use reporter::NodeReporter;
+
+fn log_memlock_status(memlock: spur_core::config::MemlockLimit) {
+    use spur_core::config::MemlockLimit;
+    let configured_desc = match memlock {
+        MemlockLimit::Unlimited => "unlimited",
+        MemlockLimit::Inherit => "inherit",
+        MemlockLimit::Bytes(_) => "bytes",
+    };
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut current) };
+    let effective = if current.rlim_max == libc::RLIM_INFINITY {
+        "unlimited".to_string()
+    } else {
+        format!("{} bytes", current.rlim_max)
+    };
+    info!(configured = configured_desc, effective_hard = %effective, "memlock rlimit");
+    let is_root = unsafe { libc::geteuid() } == 0;
+    if memlock == MemlockLimit::Unlimited && current.rlim_max != libc::RLIM_INFINITY && !is_root {
+        warn!(
+            effective_hard = %effective,
+            "configured memlock=unlimited but process hard limit is finite; \
+             jobs will get at most the hard limit unless spurd runs as root"
+        );
+    }
+}
 
 /// Parse a "key=value" string into a validated label.
 fn parse_label(s: &str) -> Result<String, String> {
@@ -54,7 +86,7 @@ struct Args {
     #[arg(short = 'N', long)]
     hostname: Option<String>,
 
-    /// Advertised IP address for the controller to reach this agent.
+    /// Advertised comm address (IP or routable hostname) for inter-node reachability.
     /// If not set, auto-detected from WireGuard interface or hostname resolution.
     #[arg(long, env = "SPUR_NODE_ADDRESS")]
     address: Option<String>,
@@ -79,6 +111,14 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args_os()
+        .skip(1)
+        .any(|a| a == "-V" || a == "--version")
+    {
+        println!("{}", spur_core::version::version_string());
+        return Ok(());
+    }
+
     let args = Args::parse();
 
     tracing_subscriber::fmt()
@@ -103,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(6818);
 
     info!(
-        version = env!("CARGO_PKG_VERSION"),
+        version = %spur_core::version::version_string(),
         hostname = %hostname,
         controller = %args.controller,
         listen = %args.listen,
@@ -139,17 +179,58 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Detect node address (explicit --address > WireGuard > hostname)
-    let node_address = if let Some(ref addr) = args.address {
-        info!(ip = %addr, "using explicit node address");
-        spur_net::address::NodeAddress {
-            ip: addr.clone(),
-            hostname: hostname.clone(),
-            port: listen_port,
-            source: spur_net::address::AddressSource::Static,
+    let explicit_addr = args.address.clone();
+    let node_address = if let Some(ref addr) = explicit_addr {
+        let addr_input = addr.clone();
+        match tokio::task::spawn_blocking(move || spur_net::normalize_comm_address(&addr_input))
+            .await
+            .map_err(|e| anyhow::anyhow!("comm address normalization task failed: {e}"))?
+        {
+            Ok(normalized) => {
+                if spur_net::normalized_comm_addr_is_unusable(&normalized) {
+                    warn!(
+                        comm_addr = %normalized,
+                        input = %addr,
+                        "explicit comm address is not routable; inter-node jobs may fail"
+                    );
+                } else if normalized != *addr {
+                    info!(
+                        input = %addr,
+                        comm_addr = %normalized,
+                        "normalized explicit comm address"
+                    );
+                } else {
+                    info!(comm_addr = %normalized, "using explicit comm address");
+                }
+                spur_net::address::NodeAddress {
+                    ip: normalized,
+                    hostname: hostname.clone(),
+                    port: listen_port,
+                    source: spur_net::address::AddressSource::Static,
+                }
+            }
+            Err(e) => {
+                warn!(
+                    input = %addr,
+                    error = %e,
+                    "failed to normalize comm address; using raw value"
+                );
+                spur_net::address::NodeAddress {
+                    ip: addr.clone(),
+                    hostname: hostname.clone(),
+                    port: listen_port,
+                    source: spur_net::address::AddressSource::Static,
+                }
+            }
         }
     } else {
+        let detect_hostname = hostname.clone();
         let wg_interface = std::env::var("SPUR_WG_INTERFACE").unwrap_or_else(|_| "spur0".into());
-        spur_net::detect_node_address(&hostname, listen_port, &wg_interface)
+        tokio::task::spawn_blocking(move || {
+            spur_net::detect_node_address(&detect_hostname, listen_port, &wg_interface)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("node address detection task failed: {e}"))?
     };
     info!(
         ip = %node_address.ip,
@@ -184,6 +265,14 @@ async fn main() -> anyhow::Result<()> {
         })
         .collect();
 
+    // The WireGuard interface this node's mesh key is read from; the reporter re-reads the key on
+    // every register/heartbeat so the controller learns a key that appears/changes after startup.
+    let wg_iface = std::env::var("SPUR_WG_INTERFACE").unwrap_or_else(|_| "spur0".into());
+
+    // Shared between the reporter (reads held ids for heartbeats) and the agent
+    // service (owns/mutates it) so the controller can reconcile stale allocations.
+    let running_jobs = agent_server::new_running_jobs();
+
     // Create the node reporter
     let reporter = Arc::new(NodeReporter::new(
         hostname.clone(),
@@ -192,6 +281,8 @@ async fn main() -> anyhow::Result<()> {
         node_address,
         labels,
         args.token.unwrap_or_default(),
+        wg_iface,
+        running_jobs.clone(),
     ));
 
     // Register with controller
@@ -203,16 +294,45 @@ async fn main() -> anyhow::Result<()> {
         hb_reporter.heartbeat_loop().await;
     });
 
-    // Start agent gRPC server (receives job launches from spurctld)
-    let agent_service =
-        agent_server::AgentService::new(reporter.clone(), hooks_config, registry.clone());
+    // Start agent gRPC server (receives job launches + cluster-component RPCs from spurctld).
+    // Pass the [cluster] config so the K0sAgent uses the operator's k0s version + install path.
+    let memlock = match config.as_ref() {
+        Some(c) => c.rlimits.memlock_limit()?,
+        None => spur_core::config::MemlockLimit::Unlimited,
+    };
+    log_memlock_status(memlock);
+    let cluster_config = config
+        .as_ref()
+        .map(|c| c.cluster.clone())
+        .unwrap_or_default();
+    let mpi_config = config.as_ref().map(|c| c.mpi.clone()).unwrap_or_default();
+    let agent_service = agent_server::AgentService::with_cluster_config(
+        reporter.clone(),
+        hooks_config,
+        registry.clone(),
+        &cluster_config,
+        memlock,
+        mpi_config,
+        running_jobs,
+    );
+
+    // the RPC-driven k0s component owner is idle until the controller sends
+    // StartClusterComponent; k0s then runs under its OWN systemd unit — never as a spurd job/child —
+    // so it survives spurd restart and stays out of the executor/monitor/time-limit job path. The
+    // background loop heals the unit; the SlurmAgent start/stop/status RPCs drive it.
+    // Re-adopt an already-running k0s unit (spurd restart leaves it running) so status/heal are
+    // correct immediately, then spawn the heal loop.
+    let k0s = agent_service.k0s();
+    k0s.adopt_running_unit().await;
+    tokio::spawn(k0s.supervise());
+
     agent_service.start_monitor(args.controller.clone());
 
     let addr = args.listen.parse()?;
     info!(%addr, "agent gRPC server listening");
 
     let server_future = tonic::transport::Server::builder()
-        .add_service(spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent_service))
+        .add_service(spur_proto::agent_server(agent_service))
         .serve(addr);
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;

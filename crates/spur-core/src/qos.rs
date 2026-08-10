@@ -5,8 +5,29 @@
 //!
 //! Checks per-QOS limits before allowing a job to be scheduled.
 
-use crate::accounting::{Qos, TresRecord, TresType};
-use crate::job::{Job, PendingReason};
+use crate::accounting::{Qos, QosPreemptMode, TresRecord, TresType};
+use crate::job::{effective_gpus, effective_memory_mb, Job, PendingReason};
+use crate::partition::PreemptMode;
+
+impl From<QosPreemptMode> for PreemptMode {
+    fn from(mode: QosPreemptMode) -> Self {
+        match mode {
+            QosPreemptMode::Off => PreemptMode::Off,
+            QosPreemptMode::Cancel => PreemptMode::Cancel,
+            QosPreemptMode::Requeue => PreemptMode::Requeue,
+            QosPreemptMode::Suspend => PreemptMode::Suspend,
+        }
+    }
+}
+
+/// A QOS-level preempt mode override, or `None` if unset. `Off` can't be
+/// told apart from "unset" on the wire, so it's treated as no override.
+pub fn qos_preempt_override(qos: &Qos) -> Option<PreemptMode> {
+    match qos.preempt_mode {
+        QosPreemptMode::Off => None,
+        other => Some(other.into()),
+    }
+}
 
 /// Result of QOS limit check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +42,9 @@ pub enum QosCheckResult {
 ///
 /// `user_running_*` aggregate the requesting user's load; `qos_running_tres`
 /// aggregates all running jobs in the QOS (for the `Grp*` group limits).
+///
+/// `grp_wall_minutes` is not enforced: it needs a persisted, period-resetting
+/// consumed-wall accumulator that does not exist yet (stored/shown only).
 pub fn check_qos_limits(
     job: &Job,
     qos: &Qos,
@@ -70,11 +94,14 @@ pub fn check_qos_limits(
             return QosCheckResult::Blocked(PendingReason::QosMaxNodePerJobLimit);
         }
 
-        if let Some(mem) = job.spec.memory_per_node_mb {
-            let total_mem = mem * job.spec.num_nodes as u64;
-            if max_tres.get(TresType::Memory) > 0 && total_mem > max_tres.get(TresType::Memory) {
-                return QosCheckResult::Blocked(PendingReason::QosMaxMemoryPerJob);
-            }
+        let total_mem = effective_memory_mb(&job.spec, job.spec.num_nodes);
+        if max_tres.get(TresType::Memory) > 0 && total_mem > max_tres.get(TresType::Memory) {
+            return QosCheckResult::Blocked(PendingReason::QosMaxMemoryPerJob);
+        }
+
+        let job_gpus = effective_gpus(&job.spec, job.spec.num_nodes);
+        if max_tres.get(TresType::Gpu) > 0 && job_gpus > max_tres.get(TresType::Gpu) {
+            return QosCheckResult::Blocked(PendingReason::QosMaxGpuPerJobLimit);
         }
     }
 
@@ -84,6 +111,24 @@ pub fn check_qos_limits(
         let new_total_cpu = user_running_tres.get(TresType::Cpu) + job_cpus;
         if max_tres.get(TresType::Cpu) > 0 && new_total_cpu > max_tres.get(TresType::Cpu) {
             return QosCheckResult::Blocked(PendingReason::QosMaxCpuPerUserLimit);
+        }
+
+        let job_nodes = job.spec.num_nodes as u64;
+        let new_total_nodes = user_running_tres.get(TresType::Node) + job_nodes;
+        if max_tres.get(TresType::Node) > 0 && new_total_nodes > max_tres.get(TresType::Node) {
+            return QosCheckResult::Blocked(PendingReason::QosMaxNodePerUserLimit);
+        }
+
+        let job_mem = effective_memory_mb(&job.spec, job.spec.num_nodes);
+        let new_total_mem = user_running_tres.get(TresType::Memory) + job_mem;
+        if max_tres.get(TresType::Memory) > 0 && new_total_mem > max_tres.get(TresType::Memory) {
+            return QosCheckResult::Blocked(PendingReason::QosMaxMemoryPerUser);
+        }
+
+        let job_gpus = effective_gpus(&job.spec, job.spec.num_nodes);
+        let new_total_gpus = user_running_tres.get(TresType::Gpu) + job_gpus;
+        if max_tres.get(TresType::Gpu) > 0 && new_total_gpus > max_tres.get(TresType::Gpu) {
+            return QosCheckResult::Blocked(PendingReason::QosMaxGpuPerUserLimit);
         }
     }
 
@@ -102,23 +147,29 @@ pub fn check_qos_limits(
             return QosCheckResult::Blocked(PendingReason::QosGrpNodeLimit);
         }
 
-        if let Some(mem) = job.spec.memory_per_node_mb {
-            let job_mem = mem * job.spec.num_nodes as u64;
-            if grp.get(TresType::Memory) > 0
-                && qos_running_tres.get(TresType::Memory) + job_mem > grp.get(TresType::Memory)
-            {
-                return QosCheckResult::Blocked(PendingReason::QosGrpMemLimit);
-            }
+        let job_mem = effective_memory_mb(&job.spec, job.spec.num_nodes);
+        if grp.get(TresType::Memory) > 0
+            && qos_running_tres.get(TresType::Memory) + job_mem > grp.get(TresType::Memory)
+        {
+            return QosCheckResult::Blocked(PendingReason::QosGrpMemLimit);
+        }
+
+        let job_gpus = effective_gpus(&job.spec, job.spec.num_nodes);
+        if grp.get(TresType::Gpu) > 0
+            && qos_running_tres.get(TresType::Gpu) + job_gpus > grp.get(TresType::Gpu)
+        {
+            return QosCheckResult::Blocked(PendingReason::QosGrpGpuLimit);
         }
     }
 
     QosCheckResult::Allowed
 }
 
-/// Calculate effective priority including QOS priority adjustment.
+/// Add a QOS's flat priority delta on top of an already fairshare/age/tier
+/// weighted priority; applying it earlier would let those factors amplify it.
 pub fn qos_adjusted_priority(base_priority: u32, qos: &Qos) -> u32 {
     let adjusted = base_priority as i64 + qos.priority as i64;
-    adjusted.max(1) as u32
+    adjusted.clamp(1, u32::MAX as i64) as u32
 }
 
 #[cfg(test)]
@@ -234,6 +285,30 @@ mod tests {
     }
 
     #[test]
+    fn test_blocked_by_max_mem_per_job_with_mem_per_cpu() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Memory, 1024); // Max 1 GiB per job
+        let qos = Qos {
+            name: "restricted".into(),
+            limits: QosLimits {
+                max_tres_per_job: Some(tres),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // 4 tasks * 1 cpu/task * 512 MB/cpu == 2 GiB total, same as the
+        // memory_per_node_mb equivalent above.
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.memory_per_cpu_mb = Some(512);
+        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &TresRecord::new());
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosMaxMemoryPerJob)
+        );
+    }
+
+    #[test]
     fn test_blocked_by_max_cpu_per_user() {
         let mut tres = TresRecord::new();
         tres.set(TresType::Cpu, 8); // Max 8 CPUs across the user's running jobs
@@ -252,6 +327,79 @@ mod tests {
         assert_eq!(
             result,
             QosCheckResult::Blocked(PendingReason::QosMaxCpuPerUserLimit)
+        );
+    }
+
+    #[test]
+    fn test_blocked_by_max_node_per_user() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Node, 4); // Max 4 nodes across the user's running jobs
+        let qos = Qos {
+            name: "restricted".into(),
+            limits: QosLimits {
+                max_tres_per_user: Some(tres),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 3; // needs 3 nodes
+        let mut running = TresRecord::new();
+        running.set(TresType::Node, 2); // already using 2; 2 + 3 > 4
+        let result = check_qos_limits(&job, &qos, 0, 0, &running, &TresRecord::new());
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosMaxNodePerUserLimit)
+        );
+    }
+
+    #[test]
+    fn test_blocked_by_max_memory_per_user() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Memory, 4096); // Max 4 GiB across the user's running jobs
+        let qos = Qos {
+            name: "restricted".into(),
+            limits: QosLimits {
+                max_tres_per_user: Some(tres),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.memory_per_node_mb = Some(3000); // job needs 3 GiB
+        let mut running = TresRecord::new();
+        running.set(TresType::Memory, 2000); // already using 2 GiB; 2000 + 3000 > 4096
+        let result = check_qos_limits(&job, &qos, 0, 0, &running, &TresRecord::new());
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosMaxMemoryPerUser)
+        );
+    }
+
+    #[test]
+    fn test_blocked_by_max_memory_per_user_with_mem_per_cpu() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Memory, 4096); // Max 4 GiB across the user's running jobs
+        let qos = Qos {
+            name: "restricted".into(),
+            limits: QosLimits {
+                max_tres_per_user: Some(tres),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // 4 tasks * 1 cpu/task * 750 MB/cpu == 3 GiB, same as the
+        // memory_per_node_mb equivalent above.
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.memory_per_cpu_mb = Some(750);
+        let mut running = TresRecord::new();
+        running.set(TresType::Memory, 2000); // already using 2 GiB; 2000 + 3000 > 4096
+        let result = check_qos_limits(&job, &qos, 0, 0, &running, &TresRecord::new());
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosMaxMemoryPerUser)
         );
     }
 
@@ -291,6 +439,168 @@ mod tests {
         assert_eq!(
             result,
             QosCheckResult::Blocked(PendingReason::QosMaxNodePerJobLimit)
+        );
+    }
+
+    #[test]
+    fn test_blocked_by_max_gpu_per_job() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Gpu, 2); // max 2 GPUs per job
+        let qos = Qos {
+            name: "restricted".into(),
+            limits: QosLimits {
+                max_tres_per_job: Some(tres),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.gres = vec!["gpu:4".into()]; // needs 4 GPUs
+        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &TresRecord::new());
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosMaxGpuPerJobLimit)
+        );
+    }
+
+    #[test]
+    fn test_max_gpu_per_job_counts_all_nodes() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Gpu, 4); // max 4 GPUs per job
+        let qos = Qos {
+            name: "restricted".into(),
+            limits: QosLimits {
+                max_tres_per_job: Some(tres),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // gres is per-node, so 2 nodes * gpu:3 = 6 GPUs total > 4.
+        let mut job = make_test_job();
+        job.spec.num_nodes = 2;
+        job.spec.gres = vec!["gpu:3".into()];
+        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &TresRecord::new());
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosMaxGpuPerJobLimit)
+        );
+    }
+
+    #[test]
+    fn test_blocked_by_max_gpu_per_user() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Gpu, 8); // max 8 GPUs across the user's running jobs
+        let qos = Qos {
+            name: "restricted".into(),
+            limits: QosLimits {
+                max_tres_per_user: Some(tres),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.gres = vec!["gpu:4".into()]; // job needs 4
+        let mut running = TresRecord::new();
+        running.set(TresType::Gpu, 6); // already using 6; 6 + 4 > 8
+        let result = check_qos_limits(&job, &qos, 0, 0, &running, &TresRecord::new());
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosMaxGpuPerUserLimit)
+        );
+    }
+
+    #[test]
+    fn test_gpu_typed_gres_counts_toward_limit() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Gpu, 2);
+        let qos = Qos {
+            name: "restricted".into(),
+            limits: QosLimits {
+                max_tres_per_job: Some(tres),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // Typed request "gpu:mi300x:4" must still be counted as 4 GPUs.
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.gres = vec!["gpu:mi300x:4".into()];
+        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &TresRecord::new());
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosMaxGpuPerJobLimit)
+        );
+    }
+
+    #[test]
+    fn test_gpu_limit_ignores_non_gpu_gres() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Gpu, 1); // 1 GPU cap
+        let qos = Qos {
+            name: "restricted".into(),
+            limits: QosLimits {
+                max_tres_per_job: Some(tres),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // A non-gpu gres request must not be counted against the GPU cap.
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.gres = vec!["bandwidth:lustre:100".into()];
+        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &TresRecord::new());
+        assert_eq!(result, QosCheckResult::Allowed);
+    }
+
+    #[test]
+    fn test_gpu_exactly_at_cap_is_allowed() {
+        // The cap uses strict `>`, so a job requesting exactly the limit
+        // (per-job) with the user already at the boundary (per-user) passes.
+        let mut per_job = TresRecord::new();
+        per_job.set(TresType::Gpu, 4);
+        let mut per_user = TresRecord::new();
+        per_user.set(TresType::Gpu, 8);
+        let qos = Qos {
+            name: "boundary".into(),
+            limits: QosLimits {
+                max_tres_per_job: Some(per_job),
+                max_tres_per_user: Some(per_user),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.gres = vec!["gpu:4".into()]; // exactly the per-job cap
+        let mut running = TresRecord::new();
+        running.set(TresType::Gpu, 4); // 4 running + 4 new == 8, the per-user cap
+        let result = check_qos_limits(&job, &qos, 0, 0, &running, &TresRecord::new());
+        assert_eq!(result, QosCheckResult::Allowed);
+    }
+
+    #[test]
+    fn test_blocked_by_grp_gpu() {
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Gpu, 8); // QOS-wide cap 8 GPUs
+        let qos = Qos {
+            name: "grp".into(),
+            limits: QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.gres = vec!["gpu:4".into()];
+        let mut qos_running = TresRecord::new();
+        qos_running.set(TresType::Gpu, 6); // 6 already in the QOS; 6 + 4 > 8
+        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &qos_running);
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosGrpGpuLimit)
         );
     }
 
@@ -364,6 +674,32 @@ mod tests {
     }
 
     #[test]
+    fn test_blocked_by_grp_mem_with_mem_per_cpu() {
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Memory, 4096); // QOS-wide cap 4 GiB
+        let qos = Qos {
+            name: "grp".into(),
+            limits: QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // 4 tasks * 1 cpu/task * 750 MB/cpu == 3 GiB, same as the
+        // memory_per_node_mb equivalent above.
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.memory_per_cpu_mb = Some(750);
+        let mut qos_running = TresRecord::new();
+        qos_running.set(TresType::Memory, 2000); // 2 GiB already running; 2000 + 3000 > 4096
+        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &qos_running);
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosGrpMemLimit)
+        );
+    }
+
+    #[test]
     fn test_qos_priority_adjustment() {
         let qos = Qos {
             priority: 500,
@@ -385,5 +721,44 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(qos_adjusted_priority(1000, &qos), 1); // Floor at 1
+    }
+
+    #[test]
+    fn test_qos_priority_saturation() {
+        let qos = Qos {
+            priority: i32::MAX,
+            ..Default::default()
+        };
+        assert_eq!(qos_adjusted_priority(u32::MAX, &qos), u32::MAX); // Saturates instead of wrapping
+    }
+
+    #[test]
+    fn test_qos_preempt_override_off_is_none() {
+        let qos = Qos {
+            preempt_mode: QosPreemptMode::Off,
+            ..Default::default()
+        };
+        assert_eq!(qos_preempt_override(&qos), None);
+    }
+
+    #[test]
+    fn test_qos_preempt_override_maps_variants() {
+        let requeue = Qos {
+            preempt_mode: QosPreemptMode::Requeue,
+            ..Default::default()
+        };
+        assert_eq!(qos_preempt_override(&requeue), Some(PreemptMode::Requeue));
+
+        let cancel = Qos {
+            preempt_mode: QosPreemptMode::Cancel,
+            ..Default::default()
+        };
+        assert_eq!(qos_preempt_override(&cancel), Some(PreemptMode::Cancel));
+
+        let suspend = Qos {
+            preempt_mode: QosPreemptMode::Suspend,
+            ..Default::default()
+        };
+        assert_eq!(qos_preempt_override(&suspend), Some(PreemptMode::Suspend));
     }
 }

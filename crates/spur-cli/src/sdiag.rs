@@ -5,7 +5,6 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use spur_core::job::JobState as CoreJobState;
 use spur_core::node::NodeState as CoreNodeState;
-use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{JobMetrics, NodeMetrics, RpcOperationStats, RpcStats, SchedStats};
 
 /// Display scheduler diagnostics and statistics.
@@ -39,7 +38,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let channel = spur_client::connect_channel(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = SlurmControllerClient::new(channel);
+    let mut client = spur_proto::controller_client(channel);
 
     if args.reset {
         client

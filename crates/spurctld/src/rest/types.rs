@@ -121,6 +121,7 @@ pub struct JobsQuery {
     pub partition: Option<String>,
     pub state: Option<String>,
     pub account: Option<String>,
+    pub name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -156,11 +157,19 @@ pub struct SubmitJobFields {
     pub script: Option<String>,
     #[serde(default)]
     pub environment: HashMap<String, String>,
+    #[serde(default)]
+    pub gres: Vec<String>,
+    /// GPU requests ("4" or "mi300x:4"); at most one may be set.
+    pub gpus: Option<String>,
+    pub gpus_per_node: Option<String>,
+    pub gpus_per_task: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct SubmitResponse {
     pub job_id: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[cfg(test)]

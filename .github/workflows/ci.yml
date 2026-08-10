@@ -115,6 +115,51 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+  test-db:
+    name: DB tests (accounting)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:16@sha256:33f923b05f64ca54ac4401c01126a6b92afe839a0aa0a52bc5aeb5cc958e5f20
+        env:
+          POSTGRES_USER: spur_ci
+          POSTGRES_PASSWORD: spur_ci
+          POSTGRES_DB: spur_acct_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U spur_ci -d spur_acct_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install protobuf compiler
+        run: sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ github.job }}-
+            ${{ runner.os }}-cargo-
+
+      - name: Run accounting DB integration tests
+        env:
+          DATABASE_URL: postgres://spur_ci:spur_ci@localhost:5432/spur_acct_ci
+        run: cargo test --locked -p spurctld -- --ignored --test-threads=1
+
   coverage:
     runs-on: ubuntu-latest
     env:
@@ -246,7 +291,7 @@ jobs:
 
       - name: Upload SARIF to GitHub Security
         if: always() && steps.scan.outcome != 'skipped' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@v4.37.4
         with:
           sarif_file: trivy-image.sarif
           category: trivy-image
@@ -274,7 +319,7 @@ jobs:
 
       - name: Upload SARIF to GitHub Security
         if: always() && steps.scan.outcome != 'skipped' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@v4.37.4
         with:
           sarif_file: trivy-config.sarif
           category: trivy-config

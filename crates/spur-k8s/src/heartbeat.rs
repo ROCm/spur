@@ -62,6 +62,7 @@ impl HeartbeatManager {
                             free_memory_mb: 0,
                             running_jobs: vec![],
                             node_token: String::new(),
+                            wg_pubkey: String::new(), // virtual agents are not on the mesh
                         };
                         match client.heartbeat(req).await {
                             Ok(_) => debug!(node = %name, "heartbeat sent"),
@@ -81,7 +82,10 @@ async fn connect(addr: &str) -> anyhow::Result<SlurmControllerClient<tonic::tran
     } else {
         format!("http://{}", addr)
     };
-    Ok(SlurmControllerClient::connect(url).await?)
+    Ok(SlurmControllerClient::connect(url)
+        .await?
+        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+        .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE))
 }
 
 #[cfg(test)]

@@ -25,17 +25,17 @@ def _dead(cluster) -> str:
 class TestControllerFailover:
     def test_rotates_past_dead_first_endpoint(self, cluster):
         endpoints = f"{_dead(cluster)},{cluster.controller_addr}"
-        out = cluster.cli(["sinfo"], controller_addr=endpoints)
+        nodes = cluster.sinfo_nodes(controller_addr=endpoints)
         for name in cluster.node_names:
-            assert name in out, (
-                f"node {name} missing after rotating past dead endpoint:\n{out}"
+            assert name in nodes, (
+                f"node {name} missing after rotating past dead endpoint:\n{nodes}"
             )
 
     def test_live_first_endpoint_still_works(self, cluster):
         endpoints = f"{cluster.controller_addr},{_dead(cluster)}"
-        out = cluster.cli(["sinfo"], controller_addr=endpoints)
+        nodes = cluster.sinfo_nodes(controller_addr=endpoints)
         for name in cluster.node_names:
-            assert name in out, f"node {name} missing with live-first list:\n{out}"
+            assert name in nodes, f"node {name} missing with live-first list:\n{nodes}"
 
     def test_all_endpoints_down_fails_cleanly(self, cluster):
         endpoints = f"{_dead(cluster)},http://{cluster.nodes[0].host}:2"

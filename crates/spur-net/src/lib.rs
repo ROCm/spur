@@ -2,11 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod address;
+pub mod comm_addr;
 pub mod detect;
+pub mod image_layer;
+pub mod mesh;
 pub mod oci;
 pub mod wireguard;
 
 pub use address::{AddressPool, AddressSource, NodeAddress};
+pub use comm_addr::{
+    comm_addr_is_unusable, format_comm_http_url, format_comm_socket, normalize_comm_address,
+    normalized_comm_addr_is_unusable, validate_comm_address, CommAddressError,
+};
 pub use detect::detect_node_address;
+pub use mesh::{MeshMembership, MeshNode};
 pub use oci::{pull_image, ImageRef};
 pub use wireguard::{WgConfig, WgPeer};
