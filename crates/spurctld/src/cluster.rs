@@ -13063,7 +13063,9 @@ mod tests {
             phase: K0sPhase::Degraded,
             ..Default::default()
         };
-        assert!(!crate::cluster_k8s::reconcile_phase(&cm, &net, &degraded, &mut tokens, false).await);
+        assert!(
+            !crate::cluster_k8s::reconcile_phase(&cm, &net, &degraded, &mut tokens, false).await
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
