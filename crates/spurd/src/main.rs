@@ -323,7 +323,11 @@ async fn main() -> anyhow::Result<()> {
     // Re-adopt an already-running k0s unit (spurd restart leaves it running) so status/heal are
     // correct immediately, then spawn the heal loop.
     let k0s = agent_service.k0s();
-    reporter.set_k0s_status(k0s.node_state());
+    // Only report k0s node status when this node actually supervises a k0s unit, so non-k0s
+    // deployments don't emit spur_k8s_node_* series.
+    if cluster_config.enabled {
+        reporter.set_k0s_status(k0s.node_state());
+    }
     k0s.adopt_running_unit().await;
     tokio::spawn(k0s.supervise());
 

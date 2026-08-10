@@ -128,14 +128,6 @@ struct TransitionLabel {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-struct NodeLabel {
-    distribution: String,
-    cluster: String,
-    node: String,
-    role: String,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct NodeBaseLabel {
     distribution: String,
     cluster: String,
@@ -154,7 +146,7 @@ pub struct K8sMetrics {
     phase_transitions: Family<TransitionLabel, Counter>,
     reconcile_errors: Family<BaseLabel, Counter>,
     reconcile_duration: Family<BaseLabel, Histogram>,
-    node_up: Family<NodeLabel, Gauge>,
+    node_up: Family<NodeBaseLabel, Gauge>,
     node_restarts: Family<NodeBaseLabel, Counter>,
     node_install_duration: Family<NodeBaseLabel, Histogram>,
 }
@@ -229,14 +221,15 @@ impl K8sMetrics {
             .observe(seconds);
     }
 
-    /// Set a node's k0s unit up/down gauge (1 active, 0 otherwise).
-    pub fn set_node_up(&self, cluster: &str, node: &str, role: K0sRole, active: bool) {
+    /// Set a node's k0s unit up/down gauge (1 active, 0 otherwise). Role is intentionally not a
+    /// label here (it would churn/leak series on a role change); per-role counts live in the
+    /// fresh-per-scrape `spur_k8s_nodes_by_role` gauge.
+    pub fn set_node_up(&self, cluster: &str, node: &str, active: bool) {
         self.node_up
-            .get_or_create(&NodeLabel {
+            .get_or_create(&NodeBaseLabel {
                 distribution: DEFAULT_DISTRIBUTION.into(),
                 cluster: cluster.to_string(),
                 node: node.to_string(),
-                role: role_label(role).into(),
             })
             .set(i64::from(active));
     }

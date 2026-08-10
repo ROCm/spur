@@ -264,14 +264,9 @@ impl ControllerService {
 
     /// Feed a node's heartbeat-reported k0s status into the metric accumulator.
     fn record_k0s_node_status(&self, node: &str, status: &spur_proto::proto::K0sNodeStatus) {
-        let role = self
-            .cluster
-            .get_node(node)
-            .and_then(|n| n.k0s_role)
-            .unwrap_or(spur_core::k0s::K0sRole::Worker);
         let cluster = self.cluster.config().cluster_name.clone();
         let metrics = self.cluster.k8s_metrics();
-        metrics.set_node_up(&cluster, node, role, status.unit_active);
+        metrics.set_node_up(&cluster, node, status.unit_active);
         metrics.set_node_restart_total(&cluster, node, status.restart_count);
         if status.install_duration_seconds > 0.0 {
             metrics.observe_node_install_duration(&cluster, node, status.install_duration_seconds);

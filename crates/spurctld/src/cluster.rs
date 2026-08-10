@@ -2192,10 +2192,12 @@ impl ClusterManager {
             let cluster = self.config().cluster_name.clone();
             self.k8s_metrics
                 .record_phase_transition(&cluster, from, phase);
-            if phase == K0sPhase::Provisioning && from != K0sPhase::Provisioning {
+            if phase == K0sPhase::Provisioning {
                 self.k8s_metrics.record_provision_attempt(&cluster);
             }
-            if phase == K0sPhase::Degraded {
+            // Only a provisioning attempt that gives up counts as a provisioning failure; a
+            // Ready -> Degraded runtime fault does not.
+            if phase == K0sPhase::Degraded && from == K0sPhase::Provisioning {
                 self.k8s_metrics.record_provision_failure(&cluster);
             }
         }
@@ -12950,6 +12952,71 @@ mod tests {
         });
 
         assert!(cm.set_node_k0s_error("ghost", Some("x".into())).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_phase_reports_no_error_for_down_and_degraded() {
+        use spur_core::k0s::K0sPhase;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let net = crate::cluster_k8s::ClusterNetworking {
+            mesh_cidr: "10.44.0.0/16".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
+            cni: "kuberouter".into(),
+            control_plane_node: None,
+        };
+        let mut tokens = std::collections::HashMap::new();
+
+        let down = spur_core::k0s::K0sClusterState {
+            phase: K0sPhase::Down,
+            ..Default::default()
+        };
+        assert!(!crate::cluster_k8s::reconcile_phase(&cm, &net, &down, &mut tokens).await);
+
+        let degraded = spur_core::k0s::K0sClusterState {
+            phase: K0sPhase::Degraded,
+            ..Default::default()
+        };
+        assert!(!crate::cluster_k8s::reconcile_phase(&cm, &net, &degraded, &mut tokens).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_k0s_phase_counts_attempts_and_transitions() {
+        use spur_core::k0s::K0sPhase;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.set_k0s_phase(K0sPhase::Provisioning, Some("n1".into()), Vec::new(), false)
+            .unwrap();
+        wait_for("provisioning", || {
+            cm.k0s_state().phase == K0sPhase::Provisioning
+        });
+        cm.set_k0s_phase(K0sPhase::Ready, Some("n1".into()), Vec::new(), false)
+            .unwrap();
+        wait_for("ready", || cm.k0s_state().phase == K0sPhase::Ready);
+        // Re-provision: a second attempt.
+        cm.set_k0s_phase(K0sPhase::Provisioning, Some("n1".into()), Vec::new(), false)
+            .unwrap();
+        wait_for("provisioning again", || {
+            cm.k0s_state().phase == K0sPhase::Provisioning
+        });
+        // A no-op set to the same phase must not double-count.
+        cm.set_k0s_phase(K0sPhase::Provisioning, Some("n1".into()), Vec::new(), false)
+            .unwrap();
+
+        let body = spur_metrics::encode_k8s_metrics(&cm.k8s_cluster_metrics(), &cm.k8s_metrics());
+        assert!(body.contains(
+            "spur_k8s_provision_attempts_total{distribution=\"k0s\",cluster=\"test\"} 2\n"
+        ));
+        assert!(body.contains("from=\"down\",to=\"provisioning\"} 1\n"));
+        assert!(body.contains("from=\"provisioning\",to=\"ready\"} 1\n"));
+        assert!(body.contains("from=\"ready\",to=\"provisioning\"} 1\n"));
+        // Nothing set Degraded, so no provisioning failure was recorded.
+        assert!(body.contains(
+            "spur_k8s_provision_failures_total{distribution=\"k0s\",cluster=\"test\"} 0\n"
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

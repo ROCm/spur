@@ -163,7 +163,7 @@ mod tests {
         metrics.record_phase_transition("prod", K0sPhase::Down, K0sPhase::Provisioning);
         metrics.record_reconcile_error("prod");
         metrics.observe_reconcile_duration("prod", 0.02);
-        metrics.set_node_up("prod", "node-a", K0sRole::Worker, true);
+        metrics.set_node_up("prod", "node-a", true);
         metrics.set_node_restart_total("prod", "node-a", 2);
         metrics.observe_node_install_duration("prod", "node-a", 3.0);
 
@@ -180,7 +180,7 @@ mod tests {
         ));
         assert!(body.contains("spur_k8s_reconcile_duration_seconds_count"));
         assert!(body.contains(
-            "spur_k8s_node_up{distribution=\"k0s\",cluster=\"prod\",node=\"node-a\",role=\"worker\"} 1\n"
+            "spur_k8s_node_up{distribution=\"k0s\",cluster=\"prod\",node=\"node-a\"} 1\n"
         ));
         assert!(body.contains(
             "spur_k8s_node_restart_total{distribution=\"k0s\",cluster=\"prod\",node=\"node-a\"} 2\n"

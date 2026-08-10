@@ -378,6 +378,9 @@ Endpoints
    * - ``/metrics/scheduler``
      - Planned
      - Route exists but currently returns an empty body.
+   * - ``/metrics/k8s``
+     - Live
+     - Spur-managed k0s cluster lifecycle and per-node health (``spur_k8s_*``).
    * - ``/metrics/jobs-users-accts``
      - Planned
      - Per-user/per-account breakdown. Returns ``404`` until implemented, even
@@ -443,17 +446,51 @@ All gauges. Cluster-wide totals carry no labels; per-node gauges carry a
    * - ``spur_node_free_memory_bytes``
      - Free memory (bytes) reported by the node agent.
 
-k0s cluster metrics *(incoming)*
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+k0s metrics from spurctld — ``/metrics/k8s``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When Spur manages a k0s cluster (``spur k8s up``, see
+:doc:`/deployment/managed-kubernetes`), ``spurctld`` exports its own view of the
+cluster lifecycle and per-node health at ``/metrics/k8s``. Every series carries
+``distribution="k0s"`` and ``cluster="<cluster-name>"``.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 46 54
+
+   * - Metric
+     - Description
+   * - ``spur_k8s_cluster_phase{phase}``
+     - Current cluster phase as a one-hot set (``down``, ``provisioning``,
+       ``ready``, ``degraded``); value 1 on the active phase.
+   * - ``spur_k8s_cluster_up``
+     - 1 when the cluster phase is Ready (primary alerting signal).
+   * - ``spur_k8s_control_plane_replicas``
+     - Configured control-plane replica count.
+   * - ``spur_k8s_nodes_total`` / ``spur_k8s_nodes_by_role{role}``
+     - Total nodes with a k0s role, and the per-role count.
+   * - ``spur_k8s_provision_attempts_total`` / ``spur_k8s_provision_failures_total``
+     - Provisioning attempts and attempts that gave up before Ready.
+   * - ``spur_k8s_phase_transitions_total{from,to}``
+     - Phase transitions labeled by source and destination.
+   * - ``spur_k8s_reconcile_duration_seconds`` / ``spur_k8s_reconcile_errors_total``
+     - Reconcile-loop iteration wall time (histogram) and error count.
+   * - ``spur_k8s_node_up{node}``
+     - Whether a node's k0s systemd unit reports active.
+   * - ``spur_k8s_node_restart_total{node}`` / ``spur_k8s_install_duration_seconds{node}``
+     - Per-node k0s unit restarts and install time (histogram).
+
+k0s component metrics *(incoming)*
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. note::
 
-   The endpoints in this section are **incoming / in progress**. When Spur owns
-   a Kubernetes cluster (``spur k8s up``, see
-   :doc:`/deployment/managed-kubernetes`), the bundled k0s components each expose
-   their own upstream Kubernetes ``/metrics`` endpoint. Spur does not yet
-   aggregate or proxy these — the ports and paths below are the standard
-   Kubernetes surfaces documented here for planning a scrape configuration.
+   The endpoints in this section are **incoming / in progress** and are separate
+   from the ``spurctld`` ``/metrics/k8s`` surface above. The bundled k0s
+   components each expose their own upstream Kubernetes ``/metrics`` endpoint;
+   Spur does not yet aggregate or proxy these — the ports and paths below are the
+   standard Kubernetes surfaces documented here for planning a scrape
+   configuration.
 
 These endpoints are served by the k0s-managed components, not by ``spurctld``.
 Control-plane endpoints live on the control-plane node; the kubelet endpoints
