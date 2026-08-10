@@ -2150,19 +2150,21 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// set the cluster-wide k0s phase (+ optional control-plane node/set / reset flag). A `None`
-    /// `control_plane_node` or empty `control_plane_nodes` leaves the persisted value untouched.
+    /// set the cluster-wide k0s phase. A `None`/empty control-plane or `member_nodes` leaves the
+    /// persisted value untouched; the `Down` phase clears the member scope + control-plane set.
     pub fn set_k0s_phase(
         &self,
         phase: spur_core::k0s::K0sPhase,
         control_plane_node: Option<String>,
         control_plane_nodes: Vec<String>,
+        member_nodes: Vec<String>,
         reset_requested: bool,
     ) -> anyhow::Result<()> {
         self.propose(WalOperation::K0sSetPhase {
             phase,
             control_plane_node,
             control_plane_nodes,
+            member_nodes,
             reset_requested,
         })?;
         info!(?phase, "k0s cluster phase set");
@@ -4931,17 +4933,30 @@ impl ClusterManager {
                 phase,
                 control_plane_node,
                 control_plane_nodes,
+                member_nodes,
                 reset_requested,
             } => {
                 let mut k0s = self.k0s.write();
                 k0s.phase = *phase;
-                if control_plane_node.is_some() {
-                    k0s.control_plane_node = control_plane_node.clone();
-                }
-                if !control_plane_nodes.is_empty() {
-                    k0s.control_plane_nodes = control_plane_nodes.clone();
-                }
                 k0s.reset_requested = *reset_requested;
+                // Teardown resets cluster identity so the next `up` starts clean (no stale scope/CP);
+                // the branches are exclusive so a non-empty field passed alongside Down can't be set
+                // then immediately wiped.
+                if *phase == spur_core::k0s::K0sPhase::Down {
+                    k0s.member_nodes.clear();
+                    k0s.control_plane_node = None;
+                    k0s.control_plane_nodes.clear();
+                } else {
+                    if control_plane_node.is_some() {
+                        k0s.control_plane_node = control_plane_node.clone();
+                    }
+                    if !control_plane_nodes.is_empty() {
+                        k0s.control_plane_nodes = control_plane_nodes.clone();
+                    }
+                    if !member_nodes.is_empty() {
+                        k0s.member_nodes = member_nodes.clone();
+                    }
+                }
             }
             WalOperation::EvictTerminalJobs { job_ids } => {
                 // Re-check finalized: spare an id requeued between propose and
@@ -12622,8 +12637,14 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         cm.assign_node_k0s("n1", K0sRole::Worker, "10.44.0.2", "10.42.2.0/24")
             .unwrap();
-        cm.set_k0s_phase(K0sPhase::Ready, Some("head-node".into()), Vec::new(), false)
-            .unwrap();
+        cm.set_k0s_phase(
+            K0sPhase::Ready,
+            Some("head-node".into()),
+            Vec::new(),
+            Vec::new(),
+            false,
+        )
+        .unwrap();
         wait_for("k0s state applied", || {
             cm.k0s_state().phase == K0sPhase::Ready
                 && cm.get_node("n1").and_then(|n| n.k0s_role).is_some()
@@ -12750,8 +12771,14 @@ mod tests {
         register_node(&cm, "node-a", 4, 8000);
         wait_for("registered", || cm.get_node("node-a").is_some());
         // Cluster is Ready with the control plane already recorded, but node-a has no k0s role.
-        cm.set_k0s_phase(K0sPhase::Ready, Some("node-a".into()), Vec::new(), false)
-            .unwrap();
+        cm.set_k0s_phase(
+            K0sPhase::Ready,
+            Some("node-a".into()),
+            Vec::new(),
+            Vec::new(),
+            false,
+        )
+        .unwrap();
         wait_for("phase ready", || cm.k0s_state().phase == K0sPhase::Ready);
         assert!(cm.get_node("node-a").and_then(|n| n.k0s_role).is_none());
 
@@ -12811,6 +12838,100 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_only_roles_scoped_member_nodes() {
+        use spur_core::k0s::K0sPhase;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        for name in ["node-a", "node-b", "node-c"] {
+            register_node(&cm, name, 4, 8000);
+        }
+        wait_for("all registered", || {
+            ["node-a", "node-b", "node-c"]
+                .iter()
+                .all(|n| cm.get_node(n).is_some())
+        });
+        // Scope to a/b only; node-c is out of scope and must never get a role (stays schedulable).
+        cm.set_k0s_phase(
+            K0sPhase::Provisioning,
+            Some("node-a".into()),
+            vec!["node-a".into()],
+            vec!["node-a".into(), "node-b".into()],
+            false,
+        )
+        .unwrap();
+        wait_for("scope recorded", || cm.k0s_state().member_nodes.len() == 2);
+
+        let net = crate::cluster_k8s::ClusterNetworking {
+            mesh_cidr: "10.44.0.0/16".into(),
+            pod_cidr: "10.42.0.0/16".into(),
+            service_cidr: "10.43.0.0/16".into(),
+            cni_mtu: 1450,
+            cni: "kuberouter".into(),
+            control_plane_node: Some("node-a".into()),
+        };
+        crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
+        wait_for("scoped nodes assigned", || {
+            cm.get_node("node-a").and_then(|n| n.k0s_role).is_some()
+                && cm.get_node("node-b").and_then(|n| n.k0s_role).is_some()
+        });
+        assert!(
+            cm.get_node("node-c").and_then(|n| n.k0s_role).is_none(),
+            "out-of-scope node must stay un-roled and schedulable"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn down_clears_member_scope_and_control_plane() {
+        use spur_core::k0s::K0sPhase;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.set_k0s_phase(
+            K0sPhase::Provisioning,
+            Some("node-a".into()),
+            vec!["node-a".into()],
+            vec!["node-a".into(), "node-b".into()],
+            false,
+        )
+        .unwrap();
+        wait_for("scope recorded", || {
+            cm.k0s_state().member_nodes.len() == 2 && !cm.k0s_state().controllers().is_empty()
+        });
+        // A plain down (reset=false) must clear the recorded scope + control plane so the next up
+        // starts clean rather than silently reusing stale identity.
+        cm.set_k0s_phase(K0sPhase::Down, None, Vec::new(), Vec::new(), false)
+            .unwrap();
+        wait_for("state cleared on down", || {
+            let s = cm.k0s_state();
+            s.member_nodes.is_empty()
+                && s.control_plane_node.is_none()
+                && s.controllers().is_empty()
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn down_clears_even_if_wal_op_carries_stale_fields() {
+        use spur_core::k0s::K0sPhase;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        // No production caller passes non-empty fields alongside Down, but the WAL apply must not
+        // depend on that: it should clear unconditionally rather than set-then-clear.
+        cm.set_k0s_phase(
+            K0sPhase::Down,
+            Some("stale-cp".into()),
+            vec!["stale-cp".into()],
+            vec!["stale-a".into(), "stale-b".into()],
+            false,
+        )
+        .unwrap();
+        wait_for("state cleared despite non-empty op fields", || {
+            let s = cm.k0s_state();
+            s.member_nodes.is_empty()
+                && s.control_plane_node.is_none()
+                && s.controllers().is_empty()
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn provision_assigns_three_controllers_for_ha_set() {
         use spur_core::k0s::{K0sPhase, K0sRole};
         let dir = TempDir::new().unwrap();
@@ -12828,6 +12949,7 @@ mod tests {
             K0sPhase::Provisioning,
             Some("cp-a".into()),
             vec!["cp-a".into(), "cp-b".into(), "cp-c".into()],
+            Vec::new(),
             false,
         )
         .unwrap();
@@ -12891,6 +13013,7 @@ mod tests {
             K0sPhase::Provisioning,
             None,
             vec!["cp-b".into(), "cp-a".into(), "cp-c".into()],
+            Vec::new(),
             false,
         )
         .unwrap();

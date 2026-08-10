@@ -42,6 +42,16 @@ pub enum K8sCommand {
         /// Overrides --replicas.
         #[arg(long = "control-plane-nodes", value_delimiter = ',')]
         control_plane_nodes: Vec<String>,
+        /// Scope the cluster to a subset of nodes (hostlist, e.g. "gpu[01-08]"), unioned with
+        /// --partition/--selector; empty = whole inventory. Resolved once at up time (not re-evaluated).
+        #[arg(long)]
+        nodes: Option<String>,
+        /// Scope the cluster to a partition's nodes.
+        #[arg(long)]
+        partition: Option<String>,
+        /// Scope the cluster to nodes matching every key=value label (repeatable).
+        #[arg(long = "selector", value_parser = parse_key_val)]
+        selector: Vec<(String, String)>,
     },
     /// Tear the k0s cluster down.
     Down {
@@ -88,12 +98,18 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             control_plane_node,
             replicas,
             control_plane_nodes,
+            nodes,
+            partition,
+            selector,
         } => {
             cmd_up(
                 &controller,
                 control_plane_node,
                 replicas,
                 control_plane_nodes,
+                nodes,
+                partition,
+                selector,
             )
             .await
         }
@@ -110,6 +126,33 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
 fn effective_user() -> String {
     whoami::username().unwrap_or_else(|_| "unknown".into())
+}
+
+fn parse_key_val(s: &str) -> Result<(String, String), String> {
+    let (k, v) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected key=value, got {s}"))?;
+    if k.is_empty() {
+        return Err(format!("empty selector key in {s}"));
+    }
+    if v.is_empty() {
+        return Err(format!("empty selector value in {s}"));
+    }
+    Ok((k.to_string(), v.to_string()))
+}
+
+/// Fold repeated `--selector key=val` into a map, rejecting a duplicate key rather than silently
+/// dropping the earlier value (last-wins would change the intended AND scope).
+fn selector_map(
+    selector: Vec<(String, String)>,
+) -> Result<std::collections::HashMap<String, String>, anyhow::Error> {
+    let mut map = std::collections::HashMap::new();
+    for (k, v) in selector {
+        if map.insert(k.clone(), v).is_some() {
+            anyhow::bail!("duplicate --selector key {k}");
+        }
+    }
+    Ok(map)
 }
 
 async fn cmd_install_k0s(version: &str, path: &str, force: bool) -> Result<()> {
@@ -130,12 +173,17 @@ async fn cmd_install_k0s(version: &str, path: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_up(
     controller: &str,
     control_plane_node: Option<String>,
     replicas: Option<u32>,
     control_plane_nodes: Vec<String>,
+    nodes: Option<String>,
+    partition: Option<String>,
+    selector: Vec<(String, String)>,
 ) -> Result<()> {
+    let selector = selector_map(selector)?;
     let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
     let resp = client
         .cluster_up(ClusterUpRequest {
@@ -143,6 +191,9 @@ async fn cmd_up(
             control_plane_replicas: replicas,
             control_plane_nodes,
             caller: effective_user(),
+            nodes: nodes.unwrap_or_default(),
+            partition: partition.unwrap_or_default(),
+            selector,
         })
         .await?
         .into_inner();
@@ -186,6 +237,15 @@ async fn cmd_status(controller: &str) -> Result<()> {
     } else if !resp.control_plane_node.is_empty() {
         println!("control-plane: {}", resp.control_plane_node);
     }
+    // Teardown clears the recorded scope immediately, before node roles finish draining; showing
+    // "all nodes" here would misrepresent a cluster that's mid-teardown, not freshly scoped.
+    if resp.phase != "down" {
+        if resp.member_nodes.is_empty() {
+            println!("members: all nodes");
+        } else {
+            println!("members: {}", resp.member_nodes.join(", "));
+        }
+    }
     for n in resp.nodes {
         println!(
             "  {:<24} {:<11} {:<11} enabled={}",
@@ -223,6 +283,7 @@ mod tests {
                 control_plane_node,
                 replicas,
                 control_plane_nodes,
+                ..
             } => {
                 assert_eq!(control_plane_node.as_deref(), Some("head-node"));
                 assert_eq!(replicas, None);
@@ -230,6 +291,68 @@ mod tests {
             }
             _ => panic!("wrong command"),
         }
+    }
+
+    #[test]
+    fn parses_up_with_node_scope_flags() {
+        let args = K8sArgs::try_parse_from([
+            "k8s",
+            "up",
+            "--nodes",
+            "gpu[01-08]",
+            "--partition",
+            "batch",
+            "--selector",
+            "zone=z1",
+            "--selector",
+            "gpu=mi300",
+        ])
+        .unwrap();
+        match args.command {
+            K8sCommand::Up {
+                nodes,
+                partition,
+                selector,
+                ..
+            } => {
+                assert_eq!(nodes.as_deref(), Some("gpu[01-08]"));
+                assert_eq!(partition.as_deref(), Some("batch"));
+                assert_eq!(
+                    selector,
+                    vec![
+                        ("zone".to_string(), "z1".to_string()),
+                        ("gpu".to_string(), "mi300".to_string())
+                    ]
+                );
+            }
+            _ => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn selector_without_equals_is_rejected() {
+        assert!(K8sArgs::try_parse_from(["k8s", "up", "--selector", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn selector_with_empty_value_is_rejected() {
+        assert!(K8sArgs::try_parse_from(["k8s", "up", "--selector", "gpu="]).is_err());
+    }
+
+    #[test]
+    fn selector_map_rejects_duplicate_key() {
+        let dup = vec![
+            ("zone".to_string(), "z1".to_string()),
+            ("zone".to_string(), "z2".to_string()),
+        ];
+        let err = selector_map(dup).unwrap_err().to_string();
+        assert!(err.contains("duplicate --selector key zone"), "got: {err}");
+        let ok = selector_map(vec![
+            ("zone".to_string(), "z1".to_string()),
+            ("gpu".to_string(), "mi300".to_string()),
+        ])
+        .unwrap();
+        assert_eq!(ok.len(), 2);
     }
 
     #[test]

@@ -269,6 +269,8 @@ pub enum WalOperation {
         #[serde(default)]
         control_plane_nodes: Vec<String>,
         #[serde(default)]
+        member_nodes: Vec<String>,
+        #[serde(default)]
         reset_requested: bool,
     },
     NodeK0sClear {
@@ -807,6 +809,12 @@ mod deregistration_wal_tests {
             phase: K0sPhase::Ready,
             control_plane_node: Some("head-node".into()),
             control_plane_nodes: vec!["head-node".into(), "cp-2".into(), "cp-3".into()],
+            member_nodes: vec![
+                "head-node".into(),
+                "cp-2".into(),
+                "cp-3".into(),
+                "w-4".into(),
+            ],
             reset_requested: false,
         };
         let back: WalOperation =
@@ -816,11 +824,13 @@ mod deregistration_wal_tests {
                 phase,
                 control_plane_node,
                 control_plane_nodes,
+                member_nodes,
                 reset_requested,
             } => {
                 assert_eq!(phase, K0sPhase::Ready);
                 assert_eq!(control_plane_node.as_deref(), Some("head-node"));
                 assert_eq!(control_plane_nodes, vec!["head-node", "cp-2", "cp-3"]);
+                assert_eq!(member_nodes, vec!["head-node", "cp-2", "cp-3", "w-4"]);
                 assert!(!reset_requested);
             }
             _ => panic!("wrong variant"),
@@ -840,12 +850,35 @@ mod deregistration_wal_tests {
                 phase,
                 control_plane_node,
                 control_plane_nodes,
+                member_nodes,
                 reset_requested,
             } => {
                 assert_eq!(phase, K0sPhase::Ready);
                 assert_eq!(control_plane_node.as_deref(), Some("head-node"));
                 assert!(control_plane_nodes.is_empty());
+                assert!(member_nodes.is_empty());
                 assert!(!reset_requested);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // Frozen pre-member-scope K0sSetPhase entry (has control_plane_nodes, no member_nodes); must
+    // still deserialize with member_nodes defaulting empty (= whole inventory). Never regenerate.
+    #[test]
+    fn k0s_set_phase_pre_member_scope_payload_still_deserializes() {
+        const K0S_SET_PHASE_PRE_MEMBER_SCOPE: &str = r#"{"K0sSetPhase":{"phase":"ready","control_plane_node":"head-node","control_plane_nodes":["head-node","cp-2","cp-3"],"reset_requested":false}}"#;
+        let op: WalOperation = serde_json::from_str(K0S_SET_PHASE_PRE_MEMBER_SCOPE).expect(
+            "pre-member-scope K0sSetPhase must deserialize; member_nodes needs #[serde(default)]",
+        );
+        match op {
+            WalOperation::K0sSetPhase {
+                control_plane_nodes,
+                member_nodes,
+                ..
+            } => {
+                assert_eq!(control_plane_nodes, vec!["head-node", "cp-2", "cp-3"]);
+                assert!(member_nodes.is_empty());
             }
             _ => panic!("wrong variant"),
         }
