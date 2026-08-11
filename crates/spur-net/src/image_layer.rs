@@ -235,8 +235,21 @@ fn reconcile_entry_target(
     let parent = ensure_directory(root, path.parent().unwrap_or_else(|| Path::new("")))?;
     let target = parent.join(path.file_name().context("layer entry has no filename")?);
     match fs::symlink_metadata(&target) {
-        Ok(metadata) if incoming_is_directory && metadata.is_dir() => Ok(()),
-        Ok(_) => remove_path(&target),
+        Ok(metadata) => {
+            let existing_is_dir = metadata.is_dir();
+            let existing_is_symlink = metadata.file_type().is_symlink();
+            if incoming_is_directory {
+                if existing_is_dir {
+                    Ok(())
+                } else {
+                    remove_path(&target)
+                }
+            } else if existing_is_dir || existing_is_symlink {
+                remove_path(&target)
+            } else {
+                Ok(())
+            }
+        }
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error)
             .with_context(|| format!("failed to inspect layer target {}", target.display())),
