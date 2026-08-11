@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.8.0](https://github.com/ROCm/spur/compare/v0.7.0...v0.8.0) (2026-08-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* **spur-cli:** non-privileged users can no longer manage reservations via the CLI; scripts relying on the old permissive behavior will fail.
+
+### Features
+
+* **mpi:** multi-node PMIx prepare/join with TCP modex exchange ([#561](https://github.com/ROCm/spur/issues/561)) ([2eac05d](https://github.com/ROCm/spur/commit/2eac05d103999e759acef1e93514aa18590cb49f))
+* **spur-cli:** restrict reservation mgmt to root and sudo/wheel users ([#595](https://github.com/ROCm/spur/issues/595)) ([8849ce1](https://github.com/ROCm/spur/commit/8849ce1cf28fe6111376a8924b6e001f43bc6313))
+* **spur-cli:** runtime partition CRUD via Raft WAL with scontrol reconfigure ([#425](https://github.com/ROCm/spur/issues/425)) ([05cf9a6](https://github.com/ROCm/spur/commit/05cf9a6469b29e02c0b791d101b21d9a1c00cbc5))
+* **spurctld:** degrade k0s cluster on provisioning timeout ([#585](https://github.com/ROCm/spur/issues/585)) ([0487721](https://github.com/ROCm/spur/commit/04877214e1650827b1b8a9cce5cdb63a5551be44))
+* **spurctld:** export k0s cluster and node metrics at /metrics/k8s ([#606](https://github.com/ROCm/spur/issues/606)) ([857ad7e](https://github.com/ROCm/spur/commit/857ad7ec70d5cda9bca30fef85e539f6f226355e))
+* **spurctld:** scope k0s cluster to a subset of nodes ([#577](https://github.com/ROCm/spur/issues/577)) ([4b45256](https://github.com/ROCm/spur/commit/4b452568b31f976a1249ceca7a794dd4c1a4311c))
+
+
+### Bug Fixes
+
+* **spur-cli:** compress sinfo NODELIST as a Slurm-style hostlist ([#574](https://github.com/ROCm/spur/issues/574)) ([bce95e1](https://github.com/ROCm/spur/commit/bce95e1c36d3790c60c0412e762fb7634f8d8948))
+* **spur-cli:** reject unresolved usernames ([#569](https://github.com/ROCm/spur/issues/569)) ([0b10e08](https://github.com/ROCm/spur/commit/0b10e08c01fe689684c013bf0f8ec77a2466f55d))
+* **spur-net:** cache OCI layers under the resolved image directory ([#507](https://github.com/ROCm/spur/issues/507)) ([4f3fa31](https://github.com/ROCm/spur/commit/4f3fa31c412a3cf7812b189d059b54c41a82e7c8))
+* **spur-net:** support gzip, zstd, and uncompressed OCI layers ([#578](https://github.com/ROCm/spur/issues/578)) ([1f5f4c7](https://github.com/ROCm/spur/commit/1f5f4c75f30c57f8ee668a657c92318797e5af10))
+* **spur-sched:** allocate CPUs and cap nodes when tasks fewer than nodes ([#570](https://github.com/ROCm/spur/issues/570)) ([877b274](https://github.com/ROCm/spur/commit/877b2748e9876cfb4cca73d246c560ea501bf136))
+* **spurctld:** evict aged terminal jobs to bound controller memory ([#583](https://github.com/ROCm/spur/issues/583)) ([a261284](https://github.com/ROCm/spur/commit/a261284eb66541b9b99b558e7019b594965519d8))
+* **spurctld:** filter reservations by name in scontrol show ([#581](https://github.com/ROCm/spur/issues/581)) ([2bd8a4b](https://github.com/ROCm/spur/commit/2bd8a4b2826e95a038bdd5dbc080a4286ec912c3))
+* **spurctld:** report wall-time expiry as TIMEOUT ([#554](https://github.com/ROCm/spur/issues/554)) ([4b9a138](https://github.com/ROCm/spur/commit/4b9a138d6deb9ae3b745d5b31b90d6275fafa915))
+* **spurctld:** return unavailable when accounting startup fails ([#598](https://github.com/ROCm/spur/issues/598)) ([b81c26b](https://github.com/ROCm/spur/commit/b81c26b727e97c52853ccd161c920103cf15c9bf))
+* **spurd:** reclaim stranded interactive allocations via heartbeat ([#580](https://github.com/ROCm/spur/issues/580)) ([2dea550](https://github.com/ROCm/spur/commit/2dea5505fe23e2e286a7dc3966239ecaef979199))
+
 ## [0.7.0](https://github.com/ROCm/spur/compare/v0.6.0...v0.7.0) (2026-08-04)
 
 
