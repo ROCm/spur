@@ -31,12 +31,12 @@ nix = { workspace = true, features = ["user"] }
 libc = "0.2"
 crossterm = "0.29"
 tar = { workspace = true }
+tempfile = "3"
 shlex = "2"
 
 [dev-dependencies]
 flate2 = { workspace = true }
 serial_test = { workspace = true }
-tempfile = "3"
 zstd = { workspace = true }
 
 [lints]

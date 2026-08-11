@@ -1,9 +1,13 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io::Read;
+use std::fs;
+use std::io::{ErrorKind, Read};
+use std::path::{Component, Path, PathBuf};
 
+use anyhow::{bail, Context};
 use flate2::read::MultiGzDecoder;
+use tracing::debug;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LayerCompression {
@@ -40,6 +44,267 @@ pub fn decode<'a>(data: &'a [u8], media_type: Option<&str>) -> anyhow::Result<Bo
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryUnpackPolicy {
+    Strict,
+    SkipFailedEntries,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum Whiteout {
+    Remove(PathBuf),
+    Opaque(PathBuf),
+}
+
+pub fn extract(
+    data: &[u8],
+    media_type: Option<&str>,
+    dest: &Path,
+    policy: EntryUnpackPolicy,
+) -> anyhow::Result<()> {
+    let mut whiteouts = collect_whiteouts(data, media_type)?;
+    whiteouts.sort_by_key(Whiteout::application_order);
+    fs::create_dir_all(dest)
+        .with_context(|| format!("failed to create layer root {}", dest.display()))?;
+    let root = dest
+        .canonicalize()
+        .with_context(|| format!("failed to resolve layer root {}", dest.display()))?;
+
+    for whiteout in &whiteouts {
+        apply_whiteout(&root, whiteout)?;
+    }
+
+    unpack_entries(data, media_type, &root, policy)
+}
+
+fn collect_whiteouts(data: &[u8], media_type: Option<&str>) -> anyhow::Result<Vec<Whiteout>> {
+    let mut archive = tar::Archive::new(decode(data, media_type)?);
+    let mut whiteouts = Vec::new();
+
+    {
+        let entries = archive.entries().context("failed to read layer entries")?;
+        for entry in entries {
+            let mut entry = entry.context("failed to read layer entry")?;
+            let raw_path = entry.path_bytes().into_owned();
+            let entry_type = entry.header().entry_type();
+            if is_metadata_entry(entry_type) {
+                std::io::copy(&mut entry, &mut std::io::sink())
+                    .context("failed to read layer metadata entry")?;
+                continue;
+            }
+            let path = safe_relative_path(&entry.path().context("invalid layer entry path")?)?;
+            let whiteout = classify_whiteout(&path, &raw_path)?;
+            if whiteout.is_some()
+                && (!entry.header().entry_type().is_file() || entry.header().size()? != 0)
+            {
+                bail!("whiteout is not an empty regular file: {}", path.display());
+            }
+            std::io::copy(&mut entry, &mut std::io::sink())
+                .with_context(|| format!("failed to read layer entry {}", path.display()))?;
+            if let Some(whiteout) = whiteout {
+                whiteouts.push(whiteout);
+            }
+        }
+    }
+    std::io::copy(&mut archive.into_inner(), &mut std::io::sink())
+        .context("failed to finish reading layer")?;
+
+    Ok(whiteouts)
+}
+
+fn is_metadata_entry(entry_type: tar::EntryType) -> bool {
+    entry_type.is_pax_global_extensions()
+        || entry_type.is_pax_local_extensions()
+        || entry_type.is_gnu_longname()
+        || entry_type.is_gnu_longlink()
+}
+
+fn classify_whiteout(path: &Path, raw_path: &[u8]) -> anyhow::Result<Option<Whiteout>> {
+    let raw_filename = raw_path
+        .rsplit(|byte| *byte == b'/')
+        .find(|component| !component.is_empty())
+        .unwrap_or_default();
+    if !raw_filename.starts_with(b".wh.") {
+        return Ok(None);
+    }
+    let filename = std::str::from_utf8(raw_filename)
+        .with_context(|| format!("whiteout path is not valid UTF-8: {}", path.display()))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+
+    if filename == ".wh..wh..opq" {
+        return Ok(Some(Whiteout::Opaque(parent.to_path_buf())));
+    }
+
+    let Some(target) = filename.strip_prefix(".wh.") else {
+        return Ok(None);
+    };
+    let mut components = Path::new(target).components();
+    let Some(Component::Normal(target)) = components.next() else {
+        bail!("invalid whiteout path: {}", path.display());
+    };
+    if components.next().is_some() {
+        bail!("invalid whiteout path: {}", path.display());
+    }
+
+    Ok(Some(Whiteout::Remove(parent.join(target))))
+}
+
+impl Whiteout {
+    fn application_order(&self) -> (usize, u8) {
+        match self {
+            Self::Remove(path) => (path.components().count(), 0),
+            Self::Opaque(path) => (path.components().count(), 1),
+        }
+    }
+}
+
+fn safe_relative_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => safe.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("layer entry path escapes rootfs: {}", path.display());
+            }
+        }
+    }
+    Ok(safe)
+}
+
+fn apply_whiteout(root: &Path, whiteout: &Whiteout) -> anyhow::Result<()> {
+    match whiteout {
+        Whiteout::Remove(target) => {
+            let parent = target.parent().unwrap_or_else(|| Path::new(""));
+            let parent = ensure_directory(root, parent)?;
+            let name = target
+                .file_name()
+                .context("whiteout target has no filename")?;
+            remove_path(&parent.join(name))
+        }
+        Whiteout::Opaque(directory) => {
+            let directory = ensure_directory(root, directory)?;
+            for child in fs::read_dir(&directory).with_context(|| {
+                format!("failed to read opaque directory {}", directory.display())
+            })? {
+                remove_path(&child?.path())?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn ensure_directory(root: &Path, relative: &Path) -> anyhow::Result<PathBuf> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            bail!("invalid layer directory: {}", relative.display());
+        };
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if !metadata.is_dir() => {
+                remove_path(&current)?;
+                fs::create_dir(&current).with_context(|| {
+                    format!("failed to create layer directory {}", current.display())
+                })?;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                fs::create_dir(&current).with_context(|| {
+                    format!("failed to create layer directory {}", current.display())
+                })?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect layer directory {}", current.display())
+                });
+            }
+        }
+    }
+    Ok(current)
+}
+
+fn reconcile_entry_target(
+    root: &Path,
+    path: &Path,
+    incoming_is_directory: bool,
+) -> anyhow::Result<()> {
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let parent = ensure_directory(root, path.parent().unwrap_or_else(|| Path::new("")))?;
+    let target = parent.join(path.file_name().context("layer entry has no filename")?);
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) if incoming_is_directory && metadata.is_dir() => Ok(()),
+        Ok(_) => remove_path(&target),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect layer target {}", target.display())),
+    }
+}
+
+fn remove_path(path: &Path) -> anyhow::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect layer path {}", path.display()));
+        }
+    };
+
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+            .with_context(|| format!("failed to remove layer directory {}", path.display()))
+    } else {
+        fs::remove_file(path)
+            .with_context(|| format!("failed to remove layer path {}", path.display()))
+    }
+}
+
+fn unpack_entries(
+    data: &[u8],
+    media_type: Option<&str>,
+    dest: &Path,
+    policy: EntryUnpackPolicy,
+) -> anyhow::Result<()> {
+    let mut archive = tar::Archive::new(decode(data, media_type)?);
+    archive.set_overwrite(true);
+
+    for entry in archive.entries().context("failed to read layer entries")? {
+        let mut entry = entry.context("failed to read layer entry")?;
+        let entry_type = entry.header().entry_type();
+        if is_metadata_entry(entry_type) {
+            continue;
+        }
+        let raw_path = entry.path_bytes().into_owned();
+        let path = safe_relative_path(&entry.path().context("invalid layer entry path")?)?;
+        if classify_whiteout(&path, &raw_path)?.is_some() {
+            continue;
+        }
+        let incoming_is_directory = entry_type.is_dir()
+            || (entry.header().as_ustar().is_none() && raw_path.ends_with(b"/"));
+        reconcile_entry_target(dest, &path, incoming_is_directory)?;
+
+        let error = match entry.unpack_in(dest) {
+            Ok(true) => continue,
+            Ok(false) => anyhow::anyhow!("entry was rejected as unsafe"),
+            Err(error) => error.into(),
+        };
+        match policy {
+            EntryUnpackPolicy::Strict => {
+                return Err(error)
+                    .with_context(|| format!("failed to unpack layer entry {}", path.display()));
+            }
+            EntryUnpackPolicy::SkipFailedEntries => {
+                debug!(path = %path.display(), %error, "skipping layer entry");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
@@ -58,6 +323,78 @@ mod tests {
         let mut decoded = Vec::new();
         decode(data, media_type)?.read_to_end(&mut decoded)?;
         Ok(decoded)
+    }
+
+    fn tar_files(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut data = Vec::new();
+        let mut archive = tar::Builder::new(&mut data);
+        for (path, contents) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, path, *contents).unwrap();
+        }
+        archive.finish().unwrap();
+        drop(archive);
+        data
+    }
+
+    fn tar_file_with_literal_path(path: &[u8]) -> Vec<u8> {
+        assert!(path.len() < 100);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.as_mut_bytes()[..path.len()].copy_from_slice(path);
+        header.set_cksum();
+
+        let mut data = Vec::new();
+        let mut archive = tar::Builder::new(&mut data);
+        archive.append(&header, std::io::empty()).unwrap();
+        archive.finish().unwrap();
+        drop(archive);
+        data
+    }
+
+    fn tar_with_pax_global_header(path: &str) -> Vec<u8> {
+        let pax_record = b"18 comment=global\n";
+        let mut data = Vec::new();
+        let mut archive = tar::Builder::new(&mut data);
+
+        let mut pax_header = tar::Header::new_ustar();
+        pax_header.set_entry_type(tar::EntryType::XGlobalHeader);
+        pax_header.set_size(pax_record.len() as u64);
+        pax_header.set_mode(0o644);
+        pax_header.set_cksum();
+        archive
+            .append_data(&mut pax_header, path, pax_record.as_slice())
+            .unwrap();
+
+        let mut file_header = tar::Header::new_gnu();
+        file_header.set_size(7);
+        file_header.set_mode(0o644);
+        file_header.set_cksum();
+        archive
+            .append_data(&mut file_header, "current.txt", b"current".as_slice())
+            .unwrap();
+
+        archive.finish().unwrap();
+        drop(archive);
+        data
+    }
+
+    fn tar_with_legacy_directory(path: &str) -> Vec<u8> {
+        let mut data = Vec::new();
+        let mut archive = tar::Builder::new(&mut data);
+        let mut header = tar::Header::new_old();
+        header.set_path(path).unwrap();
+        header.set_size(0);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive.append(&header, std::io::empty()).unwrap();
+        archive.finish().unwrap();
+        drop(archive);
+        data
     }
 
     #[test]
@@ -167,6 +504,328 @@ mod tests {
         assert_eq!(
             read_layer(&layer, Some("application/octet-stream")).unwrap(),
             b"zstd payload"
+        );
+    }
+
+    #[test]
+    fn regular_whiteout_removes_lower_directory_and_preserves_same_layer_entry() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let removed = rootfs.path().join("nested/replaced/lower.txt");
+        let retained = rootfs.path().join("nested/retained.txt");
+        fs::create_dir_all(removed.parent().unwrap()).unwrap();
+        fs::write(&removed, b"lower").unwrap();
+        fs::write(&retained, b"retained").unwrap();
+        let layer = tar_files(&[
+            ("nested/replaced/current.txt", b"current"),
+            ("nested/.wh.replaced", b""),
+        ]);
+
+        extract(&layer, None, rootfs.path(), EntryUnpackPolicy::Strict).unwrap();
+
+        assert!(!removed.exists());
+        assert_eq!(
+            fs::read(rootfs.path().join("nested/replaced/current.txt")).unwrap(),
+            b"current"
+        );
+        assert_eq!(fs::read(retained).unwrap(), b"retained");
+        assert!(!rootfs.path().join("nested/.wh.replaced").exists());
+    }
+
+    #[test]
+    fn opaque_whiteout_preserves_same_layer_entries_on_both_sides_of_marker() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let directory = rootfs.path().join("nested");
+        fs::create_dir_all(directory.join("lower-dir")).unwrap();
+        fs::write(directory.join("lower.txt"), b"lower").unwrap();
+        fs::write(directory.join("lower-dir/child.txt"), b"lower").unwrap();
+        let layer = tar_files(&[
+            ("nested/before.txt", b"before"),
+            ("nested/.wh..wh..opq", b""),
+            ("nested/after.txt", b"after"),
+        ]);
+
+        extract(&layer, None, rootfs.path(), EntryUnpackPolicy::Strict).unwrap();
+
+        assert!(!directory.join("lower.txt").exists());
+        assert!(!directory.join("lower-dir").exists());
+        assert_eq!(fs::read(directory.join("before.txt")).unwrap(), b"before");
+        assert_eq!(fs::read(directory.join("after.txt")).unwrap(), b"after");
+        assert!(!directory.join(".wh..wh..opq").exists());
+    }
+
+    #[test]
+    fn whiteouts_replace_directories_and_non_directory_ancestors() {
+        let rootfs = tempfile::tempdir().unwrap();
+        fs::create_dir_all(rootfs.path().join("old-directory")).unwrap();
+        fs::write(rootfs.path().join("old-directory/lower.txt"), b"lower").unwrap();
+        fs::write(rootfs.path().join("old-file"), b"lower").unwrap();
+        let layer = tar_files(&[
+            ("old-directory", b"current file"),
+            (".wh.old-directory", b""),
+            ("old-file/current.txt", b"current directory"),
+            (".wh.old-file", b""),
+        ]);
+
+        extract(&layer, None, rootfs.path(), EntryUnpackPolicy::Strict).unwrap();
+
+        assert_eq!(
+            fs::read(rootfs.path().join("old-directory")).unwrap(),
+            b"current file"
+        );
+        assert_eq!(
+            fs::read(rootfs.path().join("old-file/current.txt")).unwrap(),
+            b"current directory"
+        );
+    }
+
+    #[test]
+    fn incoming_entries_reconcile_directory_and_file_types_without_whiteouts() {
+        let rootfs = tempfile::tempdir().unwrap();
+        fs::create_dir_all(rootfs.path().join("lower-directory")).unwrap();
+        fs::write(rootfs.path().join("lower-directory/child.txt"), b"lower").unwrap();
+        fs::write(rootfs.path().join("lower-file"), b"lower").unwrap();
+        let layer = tar_files(&[
+            ("lower-directory", b"current file"),
+            ("lower-file/current.txt", b"current directory"),
+        ]);
+
+        extract(&layer, None, rootfs.path(), EntryUnpackPolicy::Strict).unwrap();
+
+        assert_eq!(
+            fs::read(rootfs.path().join("lower-directory")).unwrap(),
+            b"current file"
+        );
+        assert_eq!(
+            fs::read(rootfs.path().join("lower-file/current.txt")).unwrap(),
+            b"current directory"
+        );
+    }
+
+    #[test]
+    fn pax_global_header_does_not_replace_colliding_lower_path() {
+        let rootfs = tempfile::tempdir().unwrap();
+        fs::write(rootfs.path().join("collision"), b"lower").unwrap();
+        let layer = tar_with_pax_global_header("collision");
+
+        extract(&layer, None, rootfs.path(), EntryUnpackPolicy::Strict).unwrap();
+
+        assert_eq!(fs::read(rootfs.path().join("collision")).unwrap(), b"lower");
+        assert_eq!(
+            fs::read(rootfs.path().join("current.txt")).unwrap(),
+            b"current"
+        );
+    }
+
+    #[test]
+    fn legacy_trailing_slash_directory_preserves_lower_children() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let lower = rootfs.path().join("legacy/lower.txt");
+        fs::create_dir_all(lower.parent().unwrap()).unwrap();
+        fs::write(&lower, b"lower").unwrap();
+        let layer = tar_with_legacy_directory("legacy/");
+
+        extract(&layer, None, rootfs.path(), EntryUnpackPolicy::Strict).unwrap();
+
+        assert_eq!(fs::read(lower).unwrap(), b"lower");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incoming_directory_replaces_symlink_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let base = tempfile::tempdir().unwrap();
+        let rootfs = base.path().join("rootfs");
+        let outside = base.path().join("outside");
+        fs::create_dir_all(&rootfs).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("victim"), b"safe").unwrap();
+        symlink(&outside, rootfs.join("replaced")).unwrap();
+        let layer = tar_files(&[("replaced/current.txt", b"current")]);
+
+        extract(&layer, None, &rootfs, EntryUnpackPolicy::Strict).unwrap();
+
+        assert_eq!(fs::read(outside.join("victim")).unwrap(), b"safe");
+        assert_eq!(
+            fs::read(rootfs.join("replaced/current.txt")).unwrap(),
+            b"current"
+        );
+        assert!(!rootfs
+            .join("replaced")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn opaque_whiteout_replaces_lower_file_with_directory() {
+        let rootfs = tempfile::tempdir().unwrap();
+        fs::write(rootfs.path().join("replaced"), b"lower").unwrap();
+        let layer = tar_files(&[
+            ("replaced/.wh..wh..opq", b""),
+            ("replaced/current.txt", b"current"),
+        ]);
+
+        extract(&layer, None, rootfs.path(), EntryUnpackPolicy::Strict).unwrap();
+
+        assert_eq!(
+            fs::read(rootfs.path().join("replaced/current.txt")).unwrap(),
+            b"current"
+        );
+        assert!(!rootfs.path().join("replaced/.wh..wh..opq").exists());
+    }
+
+    #[test]
+    fn ancestor_whiteout_runs_before_nested_opaque_whiteout() {
+        let rootfs = tempfile::tempdir().unwrap();
+        fs::write(rootfs.path().join("replaced"), b"lower file").unwrap();
+        let layer = tar_files(&[
+            ("replaced/.wh..wh..opq", b""),
+            (".wh.replaced", b""),
+            ("replaced/current.txt", b"current"),
+        ]);
+
+        extract(&layer, None, rootfs.path(), EntryUnpackPolicy::Strict).unwrap();
+
+        assert_eq!(
+            fs::read(rootfs.path().join("replaced/current.txt")).unwrap(),
+            b"current"
+        );
+        assert!(!rootfs.path().join("replaced/.wh..wh..opq").exists());
+    }
+
+    #[test]
+    fn degenerate_whiteout_targets_are_rejected() {
+        for marker in [".wh.", ".wh..", ".wh..."] {
+            let rootfs = tempfile::tempdir().unwrap();
+            let layer = tar_files(&[(marker, b"")]);
+
+            let error =
+                extract(&layer, None, rootfs.path(), EntryUnpackPolicy::Strict).unwrap_err();
+
+            assert!(error.to_string().contains("invalid whiteout path"));
+            assert!(!rootfs.path().join(marker).exists());
+        }
+    }
+
+    #[test]
+    fn invalid_later_marker_prevents_earlier_whiteout_deletion() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let victim = rootfs.path().join("victim");
+        fs::write(&victim, b"safe").unwrap();
+        let layer = tar_files(&[(".wh.victim", b""), (".wh.", b"")]);
+
+        let error = extract(&layer, None, rootfs.path(), EntryUnpackPolicy::Strict).unwrap_err();
+
+        assert!(error.to_string().contains("invalid whiteout path"));
+        assert_eq!(fs::read(victim).unwrap(), b"safe");
+    }
+
+    #[test]
+    fn nonempty_whiteout_is_rejected_before_deletion() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let victim = rootfs.path().join("victim");
+        fs::write(&victim, b"safe").unwrap();
+        let layer = tar_files(&[(".wh.victim", b"not empty")]);
+
+        let error = extract(&layer, None, rootfs.path(), EntryUnpackPolicy::Strict).unwrap_err();
+
+        assert!(error.to_string().contains("not an empty regular file"));
+        assert_eq!(fs::read(victim).unwrap(), b"safe");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_marker_shaped_path_is_rejected() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let layer = tar_file_with_literal_path(b".wh.\xff");
+
+        let error = extract(&layer, None, rootfs.path(), EntryUnpackPolicy::Strict).unwrap_err();
+
+        assert!(error.to_string().contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn marker_with_repeated_trailing_slashes_is_applied() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let victim = rootfs.path().join("victim");
+        fs::write(&victim, b"remove").unwrap();
+        let layer = tar_file_with_literal_path(b".wh.victim//");
+
+        extract(&layer, None, rootfs.path(), EntryUnpackPolicy::Strict).unwrap();
+
+        assert!(!victim.exists());
+        assert!(!rootfs.path().join(".wh.victim").exists());
+    }
+
+    #[test]
+    fn late_compression_error_prevents_whiteout_deletion() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let victim = rootfs.path().join("victim");
+        fs::write(&victim, b"safe").unwrap();
+        let mut layer = gzip(&tar_files(&[(".wh.victim", b"")]));
+        layer.truncate(layer.len() - 4);
+
+        let error = extract(&layer, None, rootfs.path(), EntryUnpackPolicy::Strict).unwrap_err();
+
+        assert!(error.to_string().contains("failed to finish reading layer"));
+        assert_eq!(fs::read(victim).unwrap(), b"safe");
+    }
+
+    #[test]
+    fn parent_path_whiteout_cannot_remove_file_outside_rootfs() {
+        let base = tempfile::tempdir().unwrap();
+        let rootfs = base.path().join("rootfs");
+        let victim = base.path().join("victim");
+        fs::write(&victim, b"safe").unwrap();
+        let layer = tar_file_with_literal_path(b"../.wh.victim");
+
+        let error = extract(&layer, None, &rootfs, EntryUnpackPolicy::Strict).unwrap_err();
+
+        assert!(error.to_string().contains("escapes rootfs"));
+        assert_eq!(fs::read(victim).unwrap(), b"safe");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_path_whiteout_cannot_remove_host_file() {
+        let base = tempfile::tempdir().unwrap();
+        let rootfs = base.path().join("rootfs");
+        let victim = base.path().join("victim");
+        fs::write(&victim, b"safe").unwrap();
+        let marker = base.path().join(".wh.victim");
+        let layer = tar_file_with_literal_path(marker.to_str().unwrap().as_bytes());
+
+        let error = extract(&layer, None, &rootfs, EntryUnpackPolicy::Strict).unwrap_err();
+
+        assert!(error.to_string().contains("escapes rootfs"));
+        assert_eq!(fs::read(victim).unwrap(), b"safe");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn whiteout_replaces_symlink_parent_without_touching_host_file() {
+        use std::os::unix::fs::symlink;
+
+        let base = tempfile::tempdir().unwrap();
+        let rootfs = base.path().join("rootfs");
+        let outside = base.path().join("outside");
+        fs::create_dir_all(&rootfs).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("victim"), b"safe").unwrap();
+        symlink(&outside, rootfs.join("escape")).unwrap();
+        let layer = tar_files(&[
+            ("escape/.wh..wh..opq", b""),
+            ("escape/current.txt", b"current"),
+        ]);
+
+        extract(&layer, None, &rootfs, EntryUnpackPolicy::Strict).unwrap();
+
+        assert_eq!(fs::read(outside.join("victim")).unwrap(), b"safe");
+        assert_eq!(
+            fs::read(rootfs.join("escape/current.txt")).unwrap(),
+            b"current"
         );
     }
 }
