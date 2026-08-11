@@ -19,8 +19,6 @@ tar = { workspace = true }
 zstd = { workspace = true }
 bytes = { workspace = true }
 base64 = { workspace = true }
-
-[dev-dependencies]
 tempfile = "3"
 
 [lints]

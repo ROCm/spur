@@ -256,6 +256,66 @@ fn reconcile_entry_target(
     }
 }
 
+fn replace_with_hardlink(root: &Path, path: &Path, link_name: &Path) -> anyhow::Result<()> {
+    let link_name = safe_relative_path(link_name)?;
+    if link_name.as_os_str().is_empty() {
+        bail!("hardlink source is empty");
+    }
+    let source = root.join(&link_name);
+    let resolved_source = source
+        .canonicalize()
+        .with_context(|| format!("failed to resolve hardlink source {}", link_name.display()))?;
+    if !resolved_source.starts_with(root) {
+        bail!("hardlink source escapes rootfs: {}", link_name.display());
+    }
+
+    let parent = ensure_directory(root, path.parent().unwrap_or_else(|| Path::new("")))?;
+    let target = parent.join(path.file_name().context("layer entry has no filename")?);
+    let staging = tempfile::Builder::new()
+        .prefix(".spur-layer-link-")
+        .tempdir_in(&parent)
+        .with_context(|| format!("failed to stage hardlink for {}", path.display()))?;
+    let staged_link = staging.path().join("link");
+    fs::hard_link(&source, &staged_link).with_context(|| {
+        format!(
+            "failed to stage hardlink {} to {}",
+            link_name.display(),
+            path.display()
+        )
+    })?;
+
+    match fs::symlink_metadata(&target) {
+        Ok(_) => {
+            let backup = staging.path().join("backup");
+            fs::rename(&target, &backup)
+                .with_context(|| format!("failed to back up layer target {}", path.display()))?;
+            if let Err(error) = fs::rename(&staged_link, &target) {
+                if let Err(restore_error) = fs::rename(&backup, &target) {
+                    let recovery_directory = staging.keep();
+                    bail!(
+                        "failed to replace layer target {}: {error}; failed to restore it: \
+                         {restore_error}; recovery files retained at {}",
+                        path.display(),
+                        recovery_directory.display()
+                    );
+                }
+                return Err(error)
+                    .with_context(|| format!("failed to replace layer target {}", path.display()));
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            fs::rename(&staged_link, &target)
+                .with_context(|| format!("failed to install hardlink {}", path.display()))?;
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect layer target {}", path.display()));
+        }
+    }
+
+    Ok(())
+}
+
 fn remove_path(path: &Path) -> anyhow::Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -294,6 +354,30 @@ fn unpack_entries(
         let path = safe_relative_path(&entry.path().context("invalid layer entry path")?)?;
         if classify_whiteout(&path, &raw_path)?.is_some() {
             continue;
+        }
+        if entry_type.is_hard_link() {
+            let result = (|| -> anyhow::Result<()> {
+                let link_name = entry
+                    .link_name()
+                    .context("failed to read hardlink source")?
+                    .context("hardlink source is missing")?;
+                replace_with_hardlink(dest, &path, &link_name)
+            })();
+            let error = match result {
+                Ok(()) => continue,
+                Err(error) => error,
+            };
+            match policy {
+                EntryUnpackPolicy::Strict => {
+                    return Err(error).with_context(|| {
+                        format!("failed to unpack layer entry {}", path.display())
+                    });
+                }
+                EntryUnpackPolicy::SkipFailedEntries => {
+                    debug!(path = %path.display(), %error, "skipping layer entry");
+                    continue;
+                }
+            }
         }
         let incoming_is_directory = entry_type.is_dir()
             || (entry.header().as_ustar().is_none() && raw_path.ends_with(b"/"));
@@ -408,6 +492,53 @@ mod tests {
         archive.finish().unwrap();
         drop(archive);
         data
+    }
+
+    fn tar_with_file_and_hardlink(source: &str, target: &str) -> Vec<u8> {
+        let mut data = Vec::new();
+        let mut archive = tar::Builder::new(&mut data);
+
+        let mut file_header = tar::Header::new_gnu();
+        file_header.set_size(7);
+        file_header.set_mode(0o644);
+        file_header.set_cksum();
+        archive
+            .append_data(&mut file_header, source, b"current".as_slice())
+            .unwrap();
+
+        let mut link_header = tar::Header::new_gnu();
+        link_header.set_entry_type(tar::EntryType::hard_link());
+        link_header.set_size(0);
+        link_header.set_mode(0o644);
+        archive
+            .append_link(&mut link_header, target, source)
+            .unwrap();
+
+        archive.finish().unwrap();
+        drop(archive);
+        data
+    }
+
+    fn tar_hardlink(source: &str, target: &str) -> Vec<u8> {
+        let mut data = Vec::new();
+        let mut archive = tar::Builder::new(&mut data);
+        let mut link_header = tar::Header::new_gnu();
+        link_header.set_entry_type(tar::EntryType::hard_link());
+        link_header.set_size(0);
+        link_header.set_mode(0o644);
+        archive
+            .append_link(&mut link_header, target, source)
+            .unwrap();
+        archive.finish().unwrap();
+        drop(archive);
+        data
+    }
+
+    fn assert_failed_entry_result(result: anyhow::Result<()>, policy: EntryUnpackPolicy) {
+        match policy {
+            EntryUnpackPolicy::Strict => assert!(result.is_err()),
+            EntryUnpackPolicy::SkipFailedEntries => result.unwrap(),
+        }
     }
 
     #[test]
@@ -612,6 +743,142 @@ mod tests {
             fs::read(rootfs.path().join("lower-file/current.txt")).unwrap(),
             b"current directory"
         );
+    }
+
+    #[test]
+    fn hardlink_replaces_lower_file_for_all_unpack_policies() {
+        let layer = tar_with_file_and_hardlink("source", "replaced");
+
+        for policy in [
+            EntryUnpackPolicy::Strict,
+            EntryUnpackPolicy::SkipFailedEntries,
+        ] {
+            let rootfs = tempfile::tempdir().unwrap();
+            fs::write(rootfs.path().join("replaced"), b"lower").unwrap();
+
+            extract(&layer, None, rootfs.path(), policy).unwrap();
+
+            assert_eq!(
+                fs::read(rootfs.path().join("replaced")).unwrap(),
+                b"current"
+            );
+            fs::write(rootfs.path().join("source"), b"updated").unwrap();
+            assert_eq!(
+                fs::read(rootfs.path().join("replaced")).unwrap(),
+                b"updated"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlink_preserves_in_root_symlink_source_semantics() {
+        use std::os::unix::fs::symlink;
+
+        let layer = tar_hardlink("source", "replaced");
+
+        for policy in [
+            EntryUnpackPolicy::Strict,
+            EntryUnpackPolicy::SkipFailedEntries,
+        ] {
+            let rootfs = tempfile::tempdir().unwrap();
+            fs::write(rootfs.path().join("source-target"), b"current").unwrap();
+            symlink("source-target", rootfs.path().join("source")).unwrap();
+            fs::write(rootfs.path().join("replaced"), b"lower").unwrap();
+
+            extract(&layer, None, rootfs.path(), policy).unwrap();
+
+            assert!(fs::symlink_metadata(rootfs.path().join("replaced"))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(
+                fs::read_link(rootfs.path().join("replaced")).unwrap(),
+                Path::new("source-target")
+            );
+        }
+    }
+
+    #[test]
+    fn missing_hardlink_source_preserves_lower_target_for_all_unpack_policies() {
+        let layer = tar_hardlink("missing", "replaced");
+
+        for policy in [
+            EntryUnpackPolicy::Strict,
+            EntryUnpackPolicy::SkipFailedEntries,
+        ] {
+            let rootfs = tempfile::tempdir().unwrap();
+            let replaced = rootfs.path().join("replaced");
+            fs::write(&replaced, b"lower").unwrap();
+
+            assert_failed_entry_result(extract(&layer, None, rootfs.path(), policy), policy);
+
+            assert_eq!(fs::read(replaced).unwrap(), b"lower");
+        }
+    }
+
+    #[test]
+    fn unusable_hardlink_source_preserves_lower_target_for_all_unpack_policies() {
+        let layer = tar_hardlink("source", "replaced");
+
+        for policy in [
+            EntryUnpackPolicy::Strict,
+            EntryUnpackPolicy::SkipFailedEntries,
+        ] {
+            let rootfs = tempfile::tempdir().unwrap();
+            let replaced = rootfs.path().join("replaced");
+            fs::create_dir(rootfs.path().join("source")).unwrap();
+            fs::write(&replaced, b"lower").unwrap();
+
+            assert_failed_entry_result(extract(&layer, None, rootfs.path(), policy), policy);
+
+            assert_eq!(fs::read(replaced).unwrap(), b"lower");
+        }
+    }
+
+    #[test]
+    fn parent_relative_hardlink_source_preserves_lower_target_for_all_unpack_policies() {
+        let layer = tar_hardlink("../outside", "replaced");
+
+        for policy in [
+            EntryUnpackPolicy::Strict,
+            EntryUnpackPolicy::SkipFailedEntries,
+        ] {
+            let rootfs = tempfile::tempdir().unwrap();
+            let replaced = rootfs.path().join("replaced");
+            fs::write(&replaced, b"lower").unwrap();
+
+            assert_failed_entry_result(extract(&layer, None, rootfs.path(), policy), policy);
+
+            assert_eq!(fs::read(replaced).unwrap(), b"lower");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_hardlink_source_preserves_lower_target_for_all_unpack_policies() {
+        use std::os::unix::fs::symlink;
+
+        let layer = tar_hardlink("escape", "replaced");
+
+        for policy in [
+            EntryUnpackPolicy::Strict,
+            EntryUnpackPolicy::SkipFailedEntries,
+        ] {
+            let base = tempfile::tempdir().unwrap();
+            let rootfs = base.path().join("rootfs");
+            let outside = base.path().join("outside");
+            fs::create_dir(&rootfs).unwrap();
+            fs::write(&outside, b"outside").unwrap();
+            symlink(&outside, rootfs.join("escape")).unwrap();
+            let replaced = rootfs.join("replaced");
+            fs::write(&replaced, b"lower").unwrap();
+
+            assert_failed_entry_result(extract(&layer, None, &rootfs, policy), policy);
+
+            assert_eq!(fs::read(replaced).unwrap(), b"lower");
+            assert_eq!(fs::read(&outside).unwrap(), b"outside");
+        }
     }
 
     #[test]
