@@ -449,7 +449,7 @@ impl ClusterManager {
             &self.qos_cache,
             &config.accounting,
         )?;
-        self.validate_partition(&spec)?;
+        self.validate_partition(&spec, &partitions)?;
 
         // Fewer tasks than nodes cannot use the surplus nodes; cap at the task
         // count so reported node/GPU counts match the allocation (unless a
@@ -479,7 +479,7 @@ impl ClusterManager {
 
         // Reject a node count outside the partition's bounds at submit, matching
         // Slurm, instead of accepting a job that would pend forever.
-        self.validate_partition_node_bounds(&spec)?;
+        self.validate_partition_node_bounds(&spec, &partitions)?;
 
         // Reject an over-MaxTime wall-time at submit when EnforcePartLimits is on
         // (default off keeps Slurm's admit-and-pend behavior). Only a
@@ -541,12 +541,15 @@ impl ClusterManager {
     /// bounds of every requested partition. Matches Slurm, which rejects such
     /// jobs at submit rather than leaving them permanently pending. A partition
     /// list is accepted if any one partition can hold the request.
-    fn validate_partition_node_bounds(&self, spec: &JobSpec) -> Result<(), SubmitError> {
+    fn validate_partition_node_bounds(
+        &self,
+        spec: &JobSpec,
+        partitions: &[Partition],
+    ) -> Result<(), SubmitError> {
         let Some(partition_spec) = spec.partition.as_deref().filter(|p| !p.is_empty()) else {
             return Ok(());
         };
 
-        let partitions = self.partitions.read();
         let requested: Vec<&Partition> = requested_partition_names(Some(partition_spec))
             .filter_map(|name| partitions.iter().find(|part| part.name == name))
             .collect();
@@ -577,13 +580,16 @@ impl ClusterManager {
     }
 
     /// Validate partition constraints: access control and node limits.
-    pub(crate) fn validate_partition(&self, spec: &JobSpec) -> Result<(), SubmitError> {
+    pub(crate) fn validate_partition(
+        &self,
+        spec: &JobSpec,
+        partitions: &[Partition],
+    ) -> Result<(), SubmitError> {
         let partition_spec = match spec.partition.as_deref() {
             Some(p) if !p.is_empty() => p,
             _ => return Ok(()), // Unset or empty partition name — nothing to validate
         };
 
-        let partitions = self.partitions.read();
         let requested = requested_partition_names(Some(partition_spec))
             .map(|name| {
                 partitions
@@ -5379,9 +5385,8 @@ fn partition_block(job: &Job, partitions: &[Partition]) -> Option<spur_core::job
     })
 }
 
-/// Reject a job whose (user-requested) wall-time exceeds a requested partition's
-/// `MaxTime`, per `EnforcePartLimits`. `All` requires every requested partition
-/// to fit; `Any` requires at least one. `No` never rejects.
+/// Reject a user-requested wall-time exceeding a requested `Up` partition's
+/// `MaxTime`, per `EnforcePartLimits` (`All` = all must fit, `Any` = one).
 fn validate_partition_time_limit(
     spec: &JobSpec,
     mode: EnforcePartLimits,
@@ -5397,8 +5402,14 @@ fn validate_partition_time_limit(
         return Ok(());
     };
 
-    // Existence was already checked in validate_partition.
-    let requested = spur_core::partition::matched_partitions(Some(partition_spec), partitions);
+    // Only Up partitions can schedule the job, so enforce against those alone
+    // (matching partition_block); a Down partition's MaxTime must not reject a
+    // job that would just pend. Existence was already checked in validate_partition.
+    let requested: Vec<&Partition> =
+        spur_core::partition::matched_partitions(Some(partition_spec), partitions)
+            .into_iter()
+            .filter(|p| p.state == spur_core::partition::PartitionState::Up)
+            .collect();
     if requested.is_empty() {
         return Ok(());
     }
@@ -14009,6 +14020,101 @@ mod tests {
     }
 
     #[test]
+    fn apply_default_time_limit_multi_partition_uses_min_across_default_times() {
+        // Two partitions each with a distinct DefaultTime: the smaller wins so
+        // the auto-default fits both.
+        let mut spec = basic_spec("j");
+        spec.partition = Some("a,b".into());
+        spec.time_limit = None;
+        let partitions = vec![
+            Partition {
+                name: "a".into(),
+                default_time_minutes: Some(45),
+                ..Default::default()
+            },
+            Partition {
+                name: "b".into(),
+                default_time_minutes: Some(20),
+                ..Default::default()
+            },
+        ];
+        super::apply_default_time_limit(&mut spec, &partitions, 0);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(20)));
+    }
+
+    #[test]
+    fn validate_partition_time_limit_ignores_down_partitions() {
+        // Under ALL, a Down partition's smaller MaxTime must not reject a job
+        // that fits the Up partition; the job pends on the Up one instead.
+        let mut spec = basic_spec("j");
+        spec.partition = Some("up_big,down_small".into());
+        spec.time_limit = Some(chrono::Duration::minutes(90));
+        let partitions = vec![
+            Partition {
+                name: "up_big".into(),
+                state: spur_core::partition::PartitionState::Up,
+                max_time_minutes: Some(120),
+                ..Default::default()
+            },
+            Partition {
+                name: "down_small".into(),
+                state: spur_core::partition::PartitionState::Down,
+                max_time_minutes: Some(10),
+                ..Default::default()
+            },
+        ];
+        assert!(super::validate_partition_time_limit(
+            &spec,
+            spur_core::config::EnforcePartLimits::All,
+            &partitions,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn validate_partition_time_limit_ok_when_all_requested_inactive() {
+        // Every requested partition is Down: nothing schedulable here, so enforce
+        // nothing at submit and let it pend (PartitionInactive) instead of
+        // printing a misleading "exceeds MaxTime".
+        let mut spec = basic_spec("j");
+        spec.partition = Some("down_small".into());
+        spec.time_limit = Some(chrono::Duration::minutes(90));
+        let partitions = vec![Partition {
+            name: "down_small".into(),
+            state: spur_core::partition::PartitionState::Down,
+            max_time_minutes: Some(10),
+            ..Default::default()
+        }];
+        assert!(super::validate_partition_time_limit(
+            &spec,
+            spur_core::config::EnforcePartLimits::All,
+            &partitions,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn validate_partition_time_limit_rejects_over_limit_up_partition() {
+        // The Up filter must not weaken enforcement: an over-limit Up partition
+        // still rejects under ALL.
+        let mut spec = basic_spec("j");
+        spec.partition = Some("up_small".into());
+        spec.time_limit = Some(chrono::Duration::minutes(90));
+        let partitions = vec![Partition {
+            name: "up_small".into(),
+            state: spur_core::partition::PartitionState::Up,
+            max_time_minutes: Some(10),
+            ..Default::default()
+        }];
+        assert!(super::validate_partition_time_limit(
+            &spec,
+            spur_core::config::EnforcePartLimits::All,
+            &partitions,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn apply_default_partition_falls_back_to_first() {
         let mut spec = basic_spec("j");
         spec.partition = None;
@@ -16432,7 +16538,7 @@ mod tests {
         spec.partition = Some("restricted".into());
         spec.qos = Some("cheap".into());
         assert!(
-            cm.validate_partition(&spec).is_err(),
+            cm.validate_partition(&spec, &cm.get_partitions()).is_err(),
             "QoS not in allow_qos must fail validation"
         );
 
@@ -16441,7 +16547,7 @@ mod tests {
         spec.partition = Some("restricted".into());
         spec.qos = Some("premium".into());
         assert!(
-            cm.validate_partition(&spec).is_ok(),
+            cm.validate_partition(&spec, &cm.get_partitions()).is_ok(),
             "QoS in allow_qos must pass validation"
         );
 
@@ -16450,7 +16556,7 @@ mod tests {
         spec.partition = Some("restricted".into());
         spec.qos = None;
         assert!(
-            cm.validate_partition(&spec).is_err(),
+            cm.validate_partition(&spec, &cm.get_partitions()).is_err(),
             "absent QoS must fail when allow_qos is non-empty"
         );
     }
@@ -16476,7 +16582,7 @@ mod tests {
         spec.partition = Some("nodebug".into());
         spec.qos = Some("debug".into());
         assert!(
-            cm.validate_partition(&spec).is_err(),
+            cm.validate_partition(&spec, &cm.get_partitions()).is_err(),
             "denied QoS must fail validation"
         );
 
@@ -16485,7 +16591,7 @@ mod tests {
         spec.partition = Some("nodebug".into());
         spec.qos = Some("premium".into());
         assert!(
-            cm.validate_partition(&spec).is_ok(),
+            cm.validate_partition(&spec, &cm.get_partitions()).is_ok(),
             "non-denied QoS must pass validation"
         );
 
@@ -16494,7 +16600,7 @@ mod tests {
         spec.partition = Some("nodebug".into());
         spec.qos = None;
         assert!(
-            cm.validate_partition(&spec).is_ok(),
+            cm.validate_partition(&spec, &cm.get_partitions()).is_ok(),
             "absent QoS must not be blocked by deny_qos"
         );
     }
@@ -16519,7 +16625,7 @@ mod tests {
         spec.partition = Some("open".into());
         spec.qos = Some("whatever".into());
         assert!(
-            cm.validate_partition(&spec).is_ok(),
+            cm.validate_partition(&spec, &cm.get_partitions()).is_ok(),
             "empty allow_qos must not restrict any QoS"
         );
     }

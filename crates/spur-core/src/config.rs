@@ -433,10 +433,8 @@ impl Default for AccountingConfig {
     }
 }
 
-/// Submit-time enforcement of partition wall-time limits (Slurm's
-/// `EnforcePartLimits`). `No` (default) admits over-limit jobs to pend; `All`
-/// rejects unless the job fits every requested partition; `Any` rejects only
-/// when it fits none.
+/// Submit-time enforcement of partition wall-time (Slurm `EnforcePartLimits`):
+/// `No` admits over-limit jobs to pend, `All` needs all fit, `Any` needs one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum EnforcePartLimits {
@@ -479,10 +477,8 @@ pub struct SchedulerConfig {
     /// Fair-share decay half-life (days).
     #[serde(default = "default_halflife")]
     pub fairshare_halflife_days: u32,
-    /// Cluster-wide fallback wall-time (minutes) for a job that sets no `-t`
-    /// and lands on a partition with no `DefaultTime`. `0` (the default)
-    /// disables the fallback, leaving such jobs unbounded (prior behavior).
-    /// Set > 0 to bound otherwise-unlimited jobs so they cannot run forever.
+    /// Cluster-wide fallback wall-time (minutes) for a `-t`-less job on a partition
+    /// with no `DefaultTime`. `0` (default) leaves such jobs unbounded; > 0 bounds them.
     #[serde(default = "default_time_limit")]
     pub default_time_limit_minutes: u32,
     /// Whether to reject over-limit jobs at submit (Slurm `EnforcePartLimits`).
@@ -1290,11 +1286,27 @@ impl SlurmConfig {
         // treating them as UNLIMITED (a typo like "1 hour" must fail, not
         // remove the cap).
         for pc in &self.partitions {
-            if let Some(ref t) = pc.max_time {
-                parse_partition_time(&format!("partitions.{}.max_time", pc.name), t)?;
-            }
-            if let Some(ref t) = pc.default_time {
-                parse_partition_time(&format!("partitions.{}.default_time", pc.name), t)?;
+            let max = pc
+                .max_time
+                .as_ref()
+                .map(|t| parse_partition_time(&format!("partitions.{}.max_time", pc.name), t))
+                .transpose()?
+                .flatten();
+            let default = pc
+                .default_time
+                .as_ref()
+                .map(|t| parse_partition_time(&format!("partitions.{}.default_time", pc.name), t))
+                .transpose()?
+                .flatten();
+            // A finite DefaultTime above the partition's finite MaxTime would hand
+            // a -t-less job a limit its own partition rejects, so it pends forever.
+            if let (Some(max), Some(default)) = (max, default) {
+                if default > max {
+                    return Err(ConfigError::InvalidValue {
+                        field: format!("partitions.{}.default_time", pc.name),
+                        value: format!("{default}m exceeds max_time {max}m"),
+                    });
+                }
             }
         }
         Ok(())
@@ -1437,12 +1449,9 @@ fn parse_slurm_time_seconds(s: &str) -> Option<u64> {
     }
 }
 
-/// Parse a suffixed duration like "90m", "1h", "1h40m", "2d12h", "30s".
-///
-/// Sum a suffixed duration like `1h40m` or `2d12h` to seconds. Units `d/h/m/s`
-/// (case-insensitive); requires at least one unit and must consume the whole
-/// string, so a bare number or trailing digits fail (the Slurm grammar owns
-/// bare numbers).
+/// Sum a suffixed duration like `90m`, `1h40m`, `2d12h`, or `30s` to seconds.
+/// Units `d/h/m/s` (case-insensitive); a bare number or trailing digits fail
+/// (the Slurm grammar owns bare numbers).
 fn parse_suffix_duration_seconds(s: &str) -> Option<u64> {
     let mut total: u64 = 0;
     let mut num: Option<u64> = None;
@@ -2068,6 +2077,57 @@ default_time = "INFINITE"
         let parts = config.build_partitions();
         assert_eq!(parts[0].max_time_minutes, None);
         assert_eq!(parts[0].default_time_minutes, None);
+    }
+
+    #[test]
+    fn load_rejects_default_time_above_max_time() {
+        // A finite DefaultTime over MaxTime would auto-fill a -t-less job past the
+        // partition's own cap, pending it forever. Reject at load.
+        let toml = r#"
+cluster_name = "test"
+
+[[partitions]]
+name = "gpu"
+max_time = "01:00:00"
+default_time = "02:00:00"
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { ref field, .. } if field.contains("default_time")),
+            "expected InvalidValue for default_time, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_accepts_default_time_equal_to_max_time() {
+        let toml = r#"
+cluster_name = "test"
+
+[[partitions]]
+name = "gpu"
+max_time = "01:00:00"
+default_time = "01:00:00"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        let parts = config.build_partitions();
+        assert_eq!(parts[0].default_time_minutes, Some(60));
+    }
+
+    #[test]
+    fn load_accepts_default_time_with_unlimited_max_time() {
+        // UNLIMITED MaxTime caps nothing, so any finite DefaultTime is coherent.
+        let toml = r#"
+cluster_name = "test"
+
+[[partitions]]
+name = "gpu"
+max_time = "UNLIMITED"
+default_time = "02:00:00"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        let parts = config.build_partitions();
+        assert_eq!(parts[0].max_time_minutes, None);
+        assert_eq!(parts[0].default_time_minutes, Some(120));
     }
 
     #[test]
