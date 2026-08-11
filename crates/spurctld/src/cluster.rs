@@ -2392,11 +2392,12 @@ impl ClusterManager {
                     }
                 }
                 HealthAction::Recover { name, old_state } => {
-                    info!(node = %name, "node recovered (heartbeat resumed)");
+                    let recovered_state = recovered_node_state(self.get_node(&name).as_ref());
+                    info!(node = %name, state = ?recovered_state, "node recovered (heartbeat resumed)");
                     if let Err(e) = self.propose(WalOperation::NodeStateChange {
                         name,
                         old_state,
-                        new_state: NodeState::Idle,
+                        new_state: recovered_state,
                         reason: None,
                         admin_locked: false,
                     }) {
@@ -5882,6 +5883,16 @@ pub(crate) enum HealthAction {
         name: String,
         old_state: NodeState,
     },
+}
+
+pub(crate) fn recovered_node_state(node: Option<&Node>) -> NodeState {
+    let Some(node) = node else {
+        return NodeState::Idle;
+    };
+    let mut recovered = node.clone();
+    recovered.state = NodeState::Idle;
+    recovered.update_state_from_alloc();
+    recovered.state
 }
 
 pub(crate) fn evaluate_node_health(
@@ -14505,6 +14516,27 @@ mod tests {
                 admin_locked: false,
             }]
         );
+    }
+
+    #[test]
+    fn recovered_allocated_node_stays_allocated() {
+        let mut node = make_health_node(
+            "n1",
+            NodeState::Down,
+            false,
+            Some(Utc::now() - chrono::Duration::seconds(10)),
+        );
+        node.total_resources.cpus = 8;
+        node.alloc_resources.cpus = 8;
+        assert_eq!(
+            super::recovered_node_state(Some(&node)),
+            NodeState::Allocated
+        );
+    }
+
+    #[test]
+    fn recovered_missing_node_is_idle() {
+        assert_eq!(super::recovered_node_state(None), NodeState::Idle);
     }
 
     #[test]
