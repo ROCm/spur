@@ -45,6 +45,8 @@ pub struct NodeReporter {
     /// Job ids this node holds, reported each heartbeat so the controller can
     /// reclaim allocations it no longer tracks. Shares the agent's running map.
     held_jobs: Arc<dyn HeldJobs>,
+    /// k0s node status the heartbeat carries; wired once after the K0sAgent is built.
+    k0s_status: std::sync::OnceLock<Arc<crate::cluster::K0sNodeState>>,
 }
 
 impl NodeReporter {
@@ -71,7 +73,14 @@ impl NodeReporter {
             wg_iface,
             node_token: RwLock::new(String::new()),
             held_jobs,
+            k0s_status: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Wire the k0s node-status source so heartbeats carry `spur_k8s_node_*` fields. Called once,
+    /// after the K0sAgent is constructed. No-op on a node without k0s (field stays unset).
+    pub fn set_k0s_status(&self, status: Arc<crate::cluster::K0sNodeState>) {
+        let _ = self.k0s_status.set(status);
     }
 
     /// This node's current WireGuard mesh public key (empty if the interface has no key / no mesh).
@@ -171,6 +180,15 @@ impl NodeReporter {
                             running_jobs,
                             node_token: current_token,
                             wg_pubkey: self.wg_pubkey(),
+                            k0s_status: self.k0s_status.get().map(|s| {
+                                let (unit_active, restart_count, install_secs) =
+                                    s.take_for_heartbeat();
+                                spur_proto::proto::K0sNodeStatus {
+                                    unit_active,
+                                    restart_count,
+                                    install_duration_seconds: install_secs,
+                                }
+                            }),
                         })
                         .await
                     {

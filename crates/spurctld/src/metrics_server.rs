@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use spur_metrics::{
-    encode_job_metrics, encode_jobs_users_accts_metrics, encode_nodes_metrics,
+    encode_job_metrics, encode_jobs_users_accts_metrics, encode_k8s_metrics, encode_nodes_metrics,
     encode_partitions_metrics, encode_rpc_metrics, encode_scheduler_metrics, CONTENT_TYPE,
 };
 use tracing::info;
@@ -51,6 +51,7 @@ pub async fn serve(
         .route("/metrics/partitions", get(metrics_partitions))
         .route("/metrics/rpc", get(metrics_rpc))
         .route("/metrics/scheduler", get(metrics_scheduler))
+        .route("/metrics/k8s", get(metrics_k8s))
         .route("/metrics/jobs-users-accts", get(metrics_jobs_users_accts))
         .with_state(state);
 
@@ -96,6 +97,16 @@ async fn metrics_scheduler(State(state): State<Arc<MetricsState>>) -> Response {
         return not_leader_response();
     }
     metrics_response(encode_scheduler_metrics(&state.sched_stats.snapshot()))
+}
+
+async fn metrics_k8s(State(state): State<Arc<MetricsState>>) -> Response {
+    if !state.raft.is_leader() {
+        return not_leader_response();
+    }
+    metrics_response(encode_k8s_metrics(
+        &state.cluster.k8s_cluster_metrics(),
+        &state.cluster.k8s_metrics(),
+    ))
 }
 
 async fn metrics_jobs_users_accts(State(state): State<Arc<MetricsState>>) -> Response {
@@ -213,6 +224,7 @@ mod tests {
             .route("/metrics/partitions", get(metrics_partitions))
             .route("/metrics/rpc", get(metrics_rpc))
             .route("/metrics/scheduler", get(metrics_scheduler))
+            .route("/metrics/k8s", get(metrics_k8s))
             .route("/metrics/jobs-users-accts", get(metrics_jobs_users_accts))
             .with_state(state);
         (app, dir)
@@ -358,6 +370,31 @@ mod tests {
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
             CONTENT_TYPE
         );
+    }
+
+    #[tokio::test]
+    async fn metrics_k8s_returns_ok_with_expected_series() {
+        let (app, _dir) = test_app().await;
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/metrics/k8s")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            CONTENT_TYPE
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("spur_k8s_cluster_phase{distribution=\"k0s\",cluster=\"test\""));
+        assert!(text.contains("spur_k8s_cluster_up{distribution=\"k0s\",cluster=\"test\"}"));
+        assert!(text.contains("spur_k8s_provision_attempts_total"));
+        assert!(text.contains("spur_k8s_reconcile_duration_seconds_count"));
+        assert!(text.ends_with("# EOF\n"));
     }
 
     #[tokio::test]

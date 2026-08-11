@@ -102,7 +102,15 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>, net: Clust
         }
         last_mesh = mesh.nodes.clone();
 
-        reconcile_phase(&cluster, &net, &state, &mut join_tokens, timed_out).await;
+        let started = Instant::now();
+        let errored = reconcile_phase(&cluster, &net, &state, &mut join_tokens, timed_out).await;
+        let cluster_name = cluster.config().cluster_name.clone();
+        cluster
+            .k8s_metrics()
+            .observe_reconcile_duration(&cluster_name, started.elapsed().as_secs_f64());
+        if errored {
+            cluster.k8s_metrics().record_reconcile_error(&cluster_name);
+        }
     }
 }
 
@@ -136,22 +144,29 @@ pub(crate) async fn reconcile_phase(
     state: &K0sClusterState,
     join_tokens: &mut HashMap<String, String>,
     timed_out: bool,
-) {
+) -> bool {
     match state.phase {
         K0sPhase::Ready | K0sPhase::Provisioning => {
             if let Err(e) = provision_assignments(cluster, net, state) {
                 warn!(error = %e, "k0s provisioning assignment failed; will retry next tick");
-                return;
+                return true;
             }
-            converge_provisioning(cluster, net, join_tokens).await;
+            let errors = converge_provisioning(cluster, net, join_tokens).await;
             // converge may have flipped us to Ready this tick; only degrade a still-provisioning
             // cluster that has blown its deadline.
             if timed_out && cluster.k0s_state().phase == K0sPhase::Provisioning {
                 degrade_stuck_cluster(cluster, net, join_tokens).await;
             }
+            errors > 0
         }
-        K0sPhase::Down => stop_all_components(cluster, state.reset_requested).await,
-        K0sPhase::Degraded => warn!("k0s cluster degraded"),
+        K0sPhase::Down => {
+            stop_all_components(cluster, state.reset_requested).await;
+            false
+        }
+        K0sPhase::Degraded => {
+            warn!("k0s cluster degraded");
+            false
+        }
     }
 }
 
@@ -660,11 +675,14 @@ fn controller_k0s_config(net: &ClusterNetworking, node: &spur_core::node::Node) 
 
 /// Start any assigned component that is not yet active; when all are active, mark the cluster Ready.
 /// `join_tokens` caches each worker's minted join token across ticks so we mint once per join.
+/// Returns the number of errors encountered this iteration (currently join-token mint failures),
+/// so the reconcile loop can surface them via `spur_k8s_reconcile_errors_total`.
 async fn converge_provisioning(
     cluster: &ClusterManager,
     net: &ClusterNetworking,
     join_tokens: &mut HashMap<String, String>,
-) {
+) -> u64 {
+    let mut errors = 0u64;
     let assigned: Vec<_> = cluster
         .get_nodes()
         .into_iter()
@@ -672,7 +690,7 @@ async fn converge_provisioning(
         .collect();
     if assigned.is_empty() {
         join_tokens.clear();
-        return;
+        return errors;
     }
     let bootstrap = cluster.k0s_state().bootstrap();
     let mut all_active = true;
@@ -702,7 +720,7 @@ async fn converge_provisioning(
     // Don't touch secondary CPs / workers until the bootstrap's etcd is seeded and its API answers:
     // a controller token minted before then would race the quorum. Retry on the next tick.
     if !bootstrap_active {
-        return;
+        return errors;
     }
     // Secondary CPs join the etcd quorum with a `controller` token, then workers with a `worker`
     // token; both mint from a healthy CP agent, and a minting error just retries next tick.
@@ -746,6 +764,7 @@ async fn converge_provisioning(
                 }
                 Err(e) => {
                     warn!(node = %node.name, error = %e, "could not mint {token_role} join token yet; will retry");
+                    errors += 1;
                     continue;
                 }
             },
@@ -760,6 +779,7 @@ async fn converge_provisioning(
             Err(e) => warn!(error = %e, "failed to mark k0s cluster Ready"),
         }
     }
+    errors
 }
 
 /// Drop a node's stale degrade reason once it is healthy again, so status reports honestly on retry.

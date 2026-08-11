@@ -678,6 +678,16 @@ message HeartbeatRequest {
   // learns a key that appears/changes after registration (late mesh, spur0 recreated) and can
   // include the node in ApplyMesh without a spurd restart. Empty when the node has no mesh key.
   string wg_pubkey = 6;
+  // k0s supervision status; present only when the node runs a k0s unit ([cluster].enabled).
+  optional K0sNodeStatus k0s_status = 7;
+}
+
+// Per-node k0s supervision status, reported on the heartbeat for spur_k8s_node_* metrics.
+message K0sNodeStatus {
+  bool unit_active = 1;               // node's k0s systemd unit currently reports active
+  // systemd NRestarts for the k0s unit: persists across spurd restarts, resets when the unit is recreated.
+  uint64 restart_count = 2;
+  double install_duration_seconds = 3; // install-to-active seconds, reported once after an install
 }
 
 message RunningJobStatus {
