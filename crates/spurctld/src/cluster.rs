@@ -5402,10 +5402,8 @@ fn validate_partition_time_limit(
         return Ok(());
     };
 
-    // Slurm validates every requested partition's configured limits regardless of
-    // current state, so a DOWN/DRAINED partition's MaxTime still counts; this keeps
-    // the outcome deterministic at submit instead of dependent on transient state.
-    // Existence was already checked in validate_partition.
+    // Check every requested partition regardless of state (Slurm parity), so the
+    // outcome doesn't depend on transient Down/Drain. Existence checked upstream.
     let requested = spur_core::partition::matched_partitions(Some(partition_spec), partitions);
     if requested.is_empty() {
         return Ok(());
