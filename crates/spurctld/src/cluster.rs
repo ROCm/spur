@@ -5385,8 +5385,8 @@ fn partition_block(job: &Job, partitions: &[Partition]) -> Option<spur_core::job
     })
 }
 
-/// Reject a user-requested wall-time exceeding a requested `Up` partition's
-/// `MaxTime`, per `EnforcePartLimits` (`All` = all must fit, `Any` = one).
+/// Reject a user-requested wall-time exceeding a requested partition's `MaxTime`,
+/// per `EnforcePartLimits` (`All` = all must fit, `Any` = at least one).
 fn validate_partition_time_limit(
     spec: &JobSpec,
     mode: EnforcePartLimits,
@@ -5402,14 +5402,11 @@ fn validate_partition_time_limit(
         return Ok(());
     };
 
-    // Only Up partitions can schedule the job, so enforce against those alone
-    // (matching partition_block); a Down partition's MaxTime must not reject a
-    // job that would just pend. Existence was already checked in validate_partition.
-    let requested: Vec<&Partition> =
-        spur_core::partition::matched_partitions(Some(partition_spec), partitions)
-            .into_iter()
-            .filter(|p| p.state == spur_core::partition::PartitionState::Up)
-            .collect();
+    // Slurm validates every requested partition's configured limits regardless of
+    // current state, so a DOWN/DRAINED partition's MaxTime still counts; this keeps
+    // the outcome deterministic at submit instead of dependent on transient state.
+    // Existence was already checked in validate_partition.
+    let requested = spur_core::partition::matched_partitions(Some(partition_spec), partitions);
     if requested.is_empty() {
         return Ok(());
     }
@@ -14043,9 +14040,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_partition_time_limit_ignores_down_partitions() {
-        // Under ALL, a Down partition's smaller MaxTime must not reject a job
-        // that fits the Up partition; the job pends on the Up one instead.
+    fn validate_partition_time_limit_enforces_down_partitions_under_all() {
+        // Slurm parity: under ALL, a requested Down partition's stricter MaxTime
+        // still rejects, regardless of its state (deterministic at submit).
         let mut spec = basic_spec("j");
         spec.partition = Some("up_big,down_small".into());
         spec.time_limit = Some(chrono::Duration::minutes(90));
@@ -14068,25 +14065,35 @@ mod tests {
             spur_core::config::EnforcePartLimits::All,
             &partitions,
         )
-        .is_ok());
+        .is_err());
     }
 
     #[test]
-    fn validate_partition_time_limit_ok_when_all_requested_inactive() {
-        // Every requested partition is Down: nothing schedulable here, so enforce
-        // nothing at submit and let it pend (PartitionInactive) instead of
-        // printing a misleading "exceeds MaxTime".
-        let mut spec = basic_spec("j");
-        spec.partition = Some("down_small".into());
-        spec.time_limit = Some(chrono::Duration::minutes(90));
+    fn validate_partition_time_limit_enforces_inactive_only_request() {
+        // A request naming only a Down partition is still checked (not silently
+        // admitted): an over-limit `-t` is rejected, a within-limit one passes.
         let partitions = vec![Partition {
             name: "down_small".into(),
             state: spur_core::partition::PartitionState::Down,
             max_time_minutes: Some(10),
             ..Default::default()
         }];
+
+        let mut over = basic_spec("over");
+        over.partition = Some("down_small".into());
+        over.time_limit = Some(chrono::Duration::minutes(90));
         assert!(super::validate_partition_time_limit(
-            &spec,
+            &over,
+            spur_core::config::EnforcePartLimits::All,
+            &partitions,
+        )
+        .is_err());
+
+        let mut within = basic_spec("within");
+        within.partition = Some("down_small".into());
+        within.time_limit = Some(chrono::Duration::minutes(5));
+        assert!(super::validate_partition_time_limit(
+            &within,
             spur_core::config::EnforcePartLimits::All,
             &partitions,
         )
@@ -14095,8 +14102,6 @@ mod tests {
 
     #[test]
     fn validate_partition_time_limit_rejects_over_limit_up_partition() {
-        // The Up filter must not weaken enforcement: an over-limit Up partition
-        // still rejects under ALL.
         let mut spec = basic_spec("j");
         spec.partition = Some("up_small".into());
         spec.time_limit = Some(chrono::Duration::minutes(90));
