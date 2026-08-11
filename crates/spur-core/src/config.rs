@@ -1264,7 +1264,8 @@ impl SlurmConfig {
                 ),
             });
         }
-        // Bounded so `Instant::now() + cooldown` cannot overflow and panic.
+        // Capped at the same 1-day ceiling as max_launch_backoff_secs — a longer
+        // dispatch cooldown has no legitimate operational use.
         if self.controller.dispatch_reject_cooldown_secs > MAX_LAUNCH_BACKOFF_SECS {
             return Err(ConfigError::InvalidValue {
                 field: "controller.dispatch_reject_cooldown_secs".into(),
@@ -2460,8 +2461,8 @@ terminal_job_retention_secs = {MAX_TERMINAL_JOB_RETENTION_SECS}
 
     #[test]
     fn controller_config_rejects_out_of_range_dispatch_reject_cooldown_secs() {
-        // Past this bound `Instant::now() + cooldown` overflows and panics, so
-        // it must be refused at load. Zero is valid (disables the cooldown).
+        // Past this bound load must reject rather than accept an unbounded
+        // dispatch cooldown. Zero is valid (disables the cooldown).
         let toml = format!(
             r#"
 cluster_name = "test"

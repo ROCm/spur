@@ -152,7 +152,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let reservations = cluster.get_reservations();
 
         if nodes.is_empty() {
-            debug!("no nodes registered, skipping scheduling cycle");
+            debug!("no schedulable nodes, skipping scheduling cycle");
             continue;
         }
 
