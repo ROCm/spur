@@ -200,13 +200,12 @@ pub fn require_secure_hook_file(_script_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Read a hook script, checking ownership/permissions on the open handle
-/// (fstat) rather than a separate path check, closing the check-then-open race.
+/// Open and validate a hook script's ownership/permissions on the handle
+/// (fstat), closing the check-then-open/exec race a path-based check leaves.
 #[cfg(unix)]
-pub fn read_secure_hook_file(script_path: &str) -> anyhow::Result<String> {
-    use std::io::Read;
+pub fn open_secure_hook_file(script_path: &str) -> anyhow::Result<std::fs::File> {
     use std::os::unix::fs::MetadataExt;
-    let mut file = std::fs::File::open(script_path)
+    let file = std::fs::File::open(script_path)
         .with_context(|| format!("job_submit hook not found: {script_path}"))?;
     let meta = file
         .metadata()
@@ -220,6 +219,13 @@ pub fn read_secure_hook_file(script_path: &str) -> anyhow::Result<String> {
     if meta.mode() & 0o022 != 0 {
         anyhow::bail!("job_submit hook must not be group- or world-writable: {script_path}");
     }
+    Ok(file)
+}
+
+#[cfg(unix)]
+pub fn read_secure_hook_file(script_path: &str) -> anyhow::Result<String> {
+    use std::io::Read;
+    let mut file = open_secure_hook_file(script_path)?;
     let mut source = String::new();
     file.read_to_string(&mut source)
         .with_context(|| format!("job_submit lua script unreadable: {script_path}"))?;
@@ -253,6 +259,11 @@ pub async fn run_submit_hook(
     ctx: &SubmitHookContext,
 ) -> anyhow::Result<SubmitHookOutcome> {
     require_absolute_hook_path(script_path)?;
+    // Exec the fd the security check just validated (via /proc/self/fd),
+    // not a fresh path lookup, so a swap in between can't slip through.
+    #[cfg(unix)]
+    let hook_file = open_secure_hook_file(script_path)?;
+    #[cfg(not(unix))]
     require_secure_hook_file(script_path)?;
     info!(
         target: "audit",
@@ -271,6 +282,27 @@ pub async fn run_submit_hook(
     env.set("SPUR_JOB_GID", ctx.gid);
     env.set("SPUR_SCRIPT_CONTEXT", "job_submit");
 
+    #[cfg(unix)]
+    let mut cmd = {
+        use std::os::unix::io::AsRawFd;
+        let fd = hook_file.as_raw_fd();
+        let mut c = Command::new(format!("/proc/self/fd/{fd}"));
+        // A shebang interpreter re-opens argv[0] itself, so the fd must survive
+        // exec, not just resolve during it. SAFETY: the closure only calls fcntl.
+        unsafe {
+            c.pre_exec(move || {
+                let borrowed = std::os::fd::BorrowedFd::borrow_raw(fd);
+                nix::fcntl::fcntl(
+                    borrowed,
+                    nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+                )
+                .map_err(std::io::Error::from)?;
+                Ok(())
+            });
+        }
+        c
+    };
+    #[cfg(not(unix))]
     let mut cmd = Command::new(script_path);
     for (k, v) in env.into_map() {
         cmd.env(k, v);
@@ -1067,6 +1099,19 @@ mod tests {
         let capped = cap_hook_reason(&long);
         assert!(capped.len() < long.len());
         assert!(capped.starts_with("[reason truncated]"));
+    }
+
+    #[test]
+    fn cap_hook_reason_snaps_off_a_split_multibyte_char() {
+        // A naive `reason.len() - MAX` byte index here lands inside the 4-byte
+        // emoji, which would panic on slicing without the boundary walk.
+        let prefix = "a".repeat(SUBMIT_HOOK_MAX_REASON_BYTES - 1);
+        let suffix = "b".repeat(SUBMIT_HOOK_MAX_REASON_BYTES - 3);
+        let long = format!("{prefix}\u{1F4A5}{suffix}");
+        assert_eq!(
+            cap_hook_reason(&long),
+            format!("[reason truncated] …{suffix}")
+        );
     }
 
     // A group/world-writable hook is an arbitrary-code / QoS-escalation surface
