@@ -137,6 +137,7 @@ async fn main_with_args_and_user_resolver(
             partition,
             selector,
         } => {
+            let selector = selector_map(selector)?;
             let caller = current_user()?;
             cmd_up(
                 &controller,
@@ -231,9 +232,8 @@ async fn cmd_up(
     control_plane_nodes: Vec<String>,
     nodes: Option<String>,
     partition: Option<String>,
-    selector: Vec<(String, String)>,
+    selector: std::collections::HashMap<String, String>,
 ) -> Result<()> {
-    let selector = selector_map(selector)?;
     let mut client = SlurmControllerClient::new(crate::authclient::connect(controller).await?);
     let resp = client
         .cluster_up(ClusterUpRequest {
@@ -590,6 +590,35 @@ mod tests {
             assert_eq!(error.to_string(), "failed to determine current username");
         }
 
+        assert!(capture.k8s_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_selectors_fail_before_user_resolution_and_dispatch() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let resolutions = std::cell::Cell::new(0);
+
+        let error = main_with_args_and_user_resolver(
+            vec![
+                "k8s".into(),
+                "--controller".into(),
+                format!("http://{addr}"),
+                "up".into(),
+                "--selector".into(),
+                "zone=z1".into(),
+                "--selector".into(),
+                "zone=z2".into(),
+            ],
+            || {
+                resolutions.set(resolutions.get() + 1);
+                Ok("fixture-user".into())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "duplicate --selector key zone");
+        assert_eq!(resolutions.get(), 0);
         assert!(capture.k8s_requests().is_empty());
     }
 
