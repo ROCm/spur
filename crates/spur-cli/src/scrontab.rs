@@ -63,8 +63,8 @@ fn crontab_file(user: Option<&str>) -> PathBuf {
     }
 }
 
-fn effective_user() -> String {
-    whoami::username().unwrap_or_else(|_| "unknown".into())
+fn effective_user() -> Result<String> {
+    crate::interactive::current_user()
 }
 
 fn list_crontab(path: &PathBuf) -> Result<()> {
@@ -75,12 +75,12 @@ fn list_crontab(path: &PathBuf) -> Result<()> {
                 .lines()
                 .all(|l| l.trim().is_empty() || l.starts_with('#'))
         {
-            eprintln!("no crontab entries for {}", effective_user());
+            eprintln!("no crontab entries for {}", effective_user()?);
         } else {
             print!("{}", content);
         }
     } else {
-        eprintln!("no crontab for {}", effective_user());
+        eprintln!("no crontab for {}", effective_user()?);
     }
     Ok(())
 }
@@ -117,11 +117,12 @@ fn edit_crontab(path: &PathBuf) -> Result<()> {
 }
 
 fn remove_crontab(path: &PathBuf) -> Result<()> {
+    let user = effective_user()?;
     if path.exists() {
         std::fs::remove_file(path)?;
-        eprintln!("crontab for {} removed", effective_user());
+        eprintln!("crontab for {user} removed");
     } else {
-        eprintln!("no crontab for {}", effective_user());
+        eprintln!("no crontab for {user}");
     }
     Ok(())
 }
