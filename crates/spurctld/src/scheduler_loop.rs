@@ -1732,11 +1732,24 @@ async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHan
     // touches it); lost on restart, which merely restarts the grace.
     let mut signaled: HashMap<JobId, DateTime<Utc>> = HashMap::new();
 
+    // Neither map is tied to a leadership term, so reset them on a
+    // follower -> leader transition (below) to drop a prior stint's stale state.
+    let mut was_leader = false;
+
     loop {
         interval.tick().await;
 
         if !raft.is_leader() {
+            was_leader = false;
             continue;
+        }
+
+        if !was_leader {
+            // (Re)gained leadership: drop stale timers so the reap check below
+            // reseeds every running allocation to a full grace window.
+            signaled.clear();
+            cluster.reset_interactive_last_seen();
+            was_leader = true;
         }
 
         let limit_secs = cluster.config().scheduler.inactive_limit_secs;

@@ -1721,6 +1721,12 @@ impl ClusterManager {
         self.interactive_last_seen.write().insert(job_id, at);
     }
 
+    /// Clear keepalive last-seen on leadership (re)gain: a follower records
+    /// none, so carried-over stale entries would otherwise reap live allocations.
+    pub(crate) fn reset_interactive_last_seen(&self) {
+        self.interactive_last_seen.write().clear();
+    }
+
     #[cfg(test)]
     pub(crate) fn keepalive_last_seen(&self, job_id: JobId) -> Option<DateTime<Utc>> {
         self.interactive_last_seen.read().get(&job_id).copied()
@@ -6110,6 +6116,34 @@ mod tests {
         // and is not immediately reaped despite the original stale timestamp.
         let later = t0 + chrono::Duration::seconds(3600);
         assert!(cm.interactive_reap_candidates(&[1], later, 60).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reset_interactive_last_seen_reseeds_on_leadership_regain() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let t0 = Utc::now();
+
+        // A prior stint's timestamp for a still-running allocation, frozen at
+        // t0 because a follower records no keepalives.
+        cm.record_job_keepalive_at(1, t0);
+
+        // On regain the stale entry is present, so seed-to-now can't correct
+        // it and the live allocation looks idle past the limit.
+        let later = t0 + chrono::Duration::seconds(3600);
+        assert_eq!(
+            cm.interactive_reap_candidates(&[1], later, 60),
+            vec![1],
+            "a stale carried-over entry would reap a live allocation"
+        );
+
+        // The reaper's follower -> leader reset clears the map, so the next
+        // check reseeds job 1 to `now` and exempts it.
+        cm.reset_interactive_last_seen();
+        assert!(
+            cm.interactive_reap_candidates(&[1], later, 60).is_empty(),
+            "after reset, a live allocation is reseeded and not reaped"
+        );
     }
 
     fn basic_spec(name: &str) -> JobSpec {
