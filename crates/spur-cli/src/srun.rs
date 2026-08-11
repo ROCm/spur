@@ -210,14 +210,16 @@ pub async fn main() -> Result<()> {
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let matches = SrunArgs::command().try_get_matches_from(&args)?;
     let mut args = SrunArgs::from_arg_matches(&matches)?;
+
+    if args.jobid.is_some() && !args.overlap {
+        anyhow::bail!("--jobid requires --overlap");
+    }
+
     resolve_srun_env(&matches, &mut args)?;
     args.nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
 
     // --jobid --overlap: exec into a running job (interactive PTY session)
     if let Some(job_id) = args.jobid {
-        if !args.overlap {
-            anyhow::bail!("--jobid requires --overlap");
-        }
         let node = first_node(args.nodelist.as_deref().unwrap_or_default());
         let user = crate::interactive::current_user()?;
         let exit_code =
