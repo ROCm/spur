@@ -243,6 +243,17 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - integer
      - ``300``
      - Maximum seconds a job may sit in COMPLETING before it is force-finished.
+   * - ``inactive_limit_secs``
+     - integer
+     - ``0``
+     - Reap an interactive allocation (``salloc``/``srun``) whose client has sent
+       no keepalive for this many seconds, freeing the nodes. ``0`` (the default)
+       disables reaping. Mirrors Slurm's ``InactiveLimit``. Once enabled, *every*
+       interactive allocation is subject to reaping regardless of client version:
+       a client too old to send keepalives is reaped once idle past the limit, so
+       upgrade all ``spur`` CLI clients before enabling this. Must be at least
+       twice the client keepalive interval (60 seconds); smaller non-zero values
+       are rejected at startup so a live client is never reaped between pings.
    * - ``resv_overrun_minutes``
      - integer
      - ``0``

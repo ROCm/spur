@@ -402,6 +402,10 @@ pub struct ClusterManager {
     /// Wake signal for the scheduler loop.
     pub(crate) scheduler_notify: Arc<Notify>,
     sched_stats: OnceLock<Arc<SchedStatsCollector>>,
+    /// Last keepalive time per interactive allocation, used by the InactiveLimit
+    /// reaper. Ephemeral soft state (like `Node::last_heartbeat`): keepalives
+    /// arrive too often to persist, and on failover the reaper reseeds lazily.
+    interactive_last_seen: RwLock<HashMap<JobId, DateTime<Utc>>>,
 }
 
 struct PendingJobClassification {
@@ -464,6 +468,7 @@ impl ClusterManager {
             association_cache,
             scheduler_notify: Arc::new(Notify::new()),
             sched_stats: OnceLock::new(),
+            interactive_last_seen: RwLock::new(HashMap::new()),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -1766,6 +1771,53 @@ impl ClusterManager {
         } else {
             false
         }
+    }
+
+    /// Record a keepalive from an interactive allocation's client. In-memory
+    /// soft state, mirroring `update_heartbeat`; the InactiveLimit reaper reads
+    /// it to detect an abandoned allocation.
+    pub fn record_job_keepalive(&self, job_id: JobId) {
+        self.record_job_keepalive_at(job_id, Utc::now());
+    }
+
+    fn record_job_keepalive_at(&self, job_id: JobId, at: DateTime<Utc>) {
+        self.interactive_last_seen.write().insert(job_id, at);
+    }
+
+    /// Clear keepalive last-seen on leadership (re)gain: a follower records
+    /// none, so carried-over stale entries would otherwise reap live allocations.
+    pub(crate) fn reset_interactive_last_seen(&self) {
+        self.interactive_last_seen.write().clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn keepalive_last_seen(&self, job_id: JobId) -> Option<DateTime<Utc>> {
+        self.interactive_last_seen.read().get(&job_id).copied()
+    }
+
+    /// Prune the keepalive map to the given live interactive allocations and
+    /// return those idle past `limit_secs`. A missing entry is seeded to `now`
+    /// (so a just-promoted leader or a newly-seen allocation gets a full window
+    /// before it can be reaped). `limit_secs == 0` disables reaping: the map is
+    /// still pruned, but nothing is returned.
+    pub(crate) fn interactive_reap_candidates(
+        &self,
+        running_ids: &[JobId],
+        now: DateTime<Utc>,
+        limit_secs: u32,
+    ) -> Vec<JobId> {
+        let live: HashSet<JobId> = running_ids.iter().copied().collect();
+        let mut seen = self.interactive_last_seen.write();
+        seen.retain(|id, _| live.contains(id));
+        if limit_secs == 0 {
+            return Vec::new();
+        }
+        let limit = chrono::Duration::seconds(i64::from(limit_secs));
+        running_ids
+            .iter()
+            .copied()
+            .filter(|id| now - *seen.entry(*id).or_insert(now) > limit)
+            .collect()
     }
 
     /// Update a node's WireGuard mesh public key from a heartbeat when it appears or changes (mesh
@@ -6187,6 +6239,72 @@ mod tests {
             .expect("single-node raft did not self-elect within 5s");
         cm.set_raft(handle.raft);
         cm
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interactive_reap_candidates_reaps_only_idle_allocations() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let t0 = Utc::now();
+
+        // First sighting seeds each allocation's timer; nothing is reaped yet.
+        assert!(cm.interactive_reap_candidates(&[1, 2], t0, 60).is_empty());
+
+        // Job 2 pings recently; job 1 stays silent past the limit.
+        cm.record_job_keepalive_at(2, t0 + chrono::Duration::seconds(55));
+        let later = t0 + chrono::Duration::seconds(61);
+        assert_eq!(cm.interactive_reap_candidates(&[1, 2], later, 60), vec![1]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interactive_reap_candidates_disabled_only_prunes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let t0 = Utc::now();
+
+        // A stale entry exists, but with the limit disabled it is pruned (the
+        // allocation is no longer running) rather than reaped.
+        cm.record_job_keepalive_at(1, t0);
+        assert!(cm.interactive_reap_candidates(&[], t0, 0).is_empty());
+        // The prune actually happened: job 1's timer is gone, not just skipped
+        // by the disabled early return.
+        assert!(
+            cm.interactive_last_seen.read().is_empty(),
+            "pruning must drop entries for allocations no longer running"
+        );
+
+        // Because the old entry was pruned, job 1 reappearing reseeds to `now`
+        // and is not immediately reaped despite the original stale timestamp.
+        let later = t0 + chrono::Duration::seconds(3600);
+        assert!(cm.interactive_reap_candidates(&[1], later, 60).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reset_interactive_last_seen_reseeds_on_leadership_regain() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let t0 = Utc::now();
+
+        // A prior stint's timestamp for a still-running allocation, frozen at
+        // t0 because a follower records no keepalives.
+        cm.record_job_keepalive_at(1, t0);
+
+        // On regain the stale entry is present, so seed-to-now can't correct
+        // it and the live allocation looks idle past the limit.
+        let later = t0 + chrono::Duration::seconds(3600);
+        assert_eq!(
+            cm.interactive_reap_candidates(&[1], later, 60),
+            vec![1],
+            "a stale carried-over entry would reap a live allocation"
+        );
+
+        // The reaper's follower -> leader reset clears the map, so the next
+        // check reseeds job 1 to `now` and exempts it.
+        cm.reset_interactive_last_seen();
+        assert!(
+            cm.interactive_reap_candidates(&[1], later, 60).is_empty(),
+            "after reset, a live allocation is reseeded and not reaped"
+        );
     }
 
     fn basic_spec(name: &str) -> JobSpec {

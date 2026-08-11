@@ -854,6 +854,9 @@ async fn run_standalone_srun(
     eprintln!("srun: Pending job allocation {}...", job_id);
 
     let ctrl_c_handle = install_ctrl_c_cancel(client.clone(), job_id, user.clone());
+    // Guard drops (and stops pinging) on every return path, including `?`.
+    let _keepalive =
+        crate::interactive::spawn_keepalive(client.clone(), job_id, user.clone(), "srun");
 
     let nodelist = wait_for_job_running(&mut client, job_id).await?;
     if !nodelist.is_empty() {

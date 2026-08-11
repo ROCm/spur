@@ -472,7 +472,17 @@ pub struct SchedulerConfig {
     /// Grace minutes after a reservation ends before cancelling its running jobs.
     #[serde(default)]
     pub resv_overrun_minutes: u32,
+    /// Reap an interactive allocation (salloc/srun) whose client has sent no
+    /// keepalive for this many seconds. `0` (the default) disables reaping, so
+    /// abandoned allocations behave as before. Mirrors Slurm's `InactiveLimit`.
+    #[serde(default)]
+    pub inactive_limit_secs: u32,
 }
+
+/// How often an interactive client (`salloc`/`srun`) pings the controller to
+/// keep its allocation attended. Shared with the CLI so `inactive_limit_secs`
+/// can be validated against it.
+pub const KEEPALIVE_INTERVAL_SECS: u64 = 30;
 
 fn default_scheduler_plugin() -> String {
     "backfill".into()
@@ -500,6 +510,7 @@ impl Default for SchedulerConfig {
             default_time_limit_minutes: 60,
             complete_wait_secs: 300,
             resv_overrun_minutes: 0,
+            inactive_limit_secs: 0,
         }
     }
 }
@@ -1199,6 +1210,18 @@ impl SlurmConfig {
                 value: format!(
                     "{} (must be at most {})",
                     self.controller.terminal_job_retention_secs, MAX_TERMINAL_JOB_RETENTION_SECS
+                ),
+            });
+        }
+        // A limit below the client's ping interval would reap a live client
+        // between its own keepalives. Require at least two intervals of slack.
+        let inactive = self.scheduler.inactive_limit_secs;
+        if inactive > 0 && u64::from(inactive) < 2 * KEEPALIVE_INTERVAL_SECS {
+            return Err(ConfigError::InvalidValue {
+                field: "scheduler.inactive_limit_secs".into(),
+                value: format!(
+                    "{inactive} (0 disables reaping; otherwise must be >= {})",
+                    2 * KEEPALIVE_INTERVAL_SECS
                 ),
             });
         }
@@ -1909,6 +1932,35 @@ max_batch_requeue = 7
 "#;
         let config = SlurmConfig::load_from_str(toml).unwrap();
         assert_eq!(config.controller.max_batch_requeue, 7);
+    }
+
+    #[test]
+    fn scheduler_config_rejects_inactive_limit_below_floor() {
+        let toml = r#"
+cluster_name = "test"
+
+[scheduler]
+inactive_limit_secs = 20
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("inactive_limit_secs"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn scheduler_config_accepts_disabled_or_ample_inactive_limit() {
+        // 0 disables reaping and is always allowed.
+        SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[scheduler]\ninactive_limit_secs = 0\n",
+        )
+        .expect("0 (disabled) must be accepted");
+        // A value at the floor (2x the keepalive interval) is accepted.
+        SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[scheduler]\ninactive_limit_secs = 60\n",
+        )
+        .expect("a value at the floor must be accepted");
     }
 
     #[test]

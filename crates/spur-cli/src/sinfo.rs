@@ -500,6 +500,7 @@ mod tests {
         get_job(pb::GetJobRequest) -> pb::JobInfo;
         cancel_job(pb::CancelJobRequest) -> ();
         complete_job(pb::CompleteJobRequest) -> ();
+        job_keepalive(pb::JobKeepaliveRequest) -> pb::JobKeepaliveResponse;
         suspend_job(pb::SuspendJobRequest) -> ();
         resume_job(pb::ResumeJobRequest) -> ();
         update_job(pb::UpdateJobRequest) -> ();
