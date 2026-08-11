@@ -1721,6 +1721,11 @@ impl ClusterManager {
         self.interactive_last_seen.write().insert(job_id, at);
     }
 
+    #[cfg(test)]
+    pub(crate) fn keepalive_last_seen(&self, job_id: JobId) -> Option<DateTime<Utc>> {
+        self.interactive_last_seen.read().get(&job_id).copied()
+    }
+
     /// Prune the keepalive map to the given live interactive allocations and
     /// return those idle past `limit_secs`. A missing entry is seeded to `now`
     /// (so a just-promoted leader or a newly-seen allocation gets a full window

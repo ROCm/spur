@@ -29,6 +29,10 @@ use crate::raft::RaftHandle;
 /// unreachable agent.
 const CANCEL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Grace between SIGTERM and SIGKILL when force-finishing a job. The time-limit
+/// and inactive-limit watchdogs share it so the two windows can't drift apart.
+const GRACE_PERIOD_SECS: i64 = 30;
+
 fn node_comm_socket(node: &Node) -> Option<String> {
     let host = node.comm_addr()?;
     Some(spur_net::format_comm_socket(host, node.port))
@@ -1617,8 +1621,6 @@ async fn confirm_dispatch_on_nodes(
 ///
 /// Runs every 10 seconds.
 async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
-    const GRACE_PERIOD_SECS: i64 = 30;
-
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
 
     loop {
@@ -1723,7 +1725,6 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
 async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     use spur_core::job::{JobId, JobState};
 
-    const GRACE_PERIOD_SECS: i64 = 30;
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
 
     // Jobs that were sent SIGTERM and are in their grace window, keyed by

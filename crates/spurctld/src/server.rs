@@ -3952,6 +3952,20 @@ mod tests {
 
     /// Submit and start a single-node job owned by `owner`, returning its id.
     async fn running_job_owned_by(svc: &ControllerService, owner: &str) -> u32 {
+        running_job_owned_by_inner(svc, owner, false).await
+    }
+
+    /// Like `running_job_owned_by`, but flags the job as interactive so the
+    /// keepalive handler treats it as reapable (and thus records last-seen).
+    async fn running_interactive_job_owned_by(svc: &ControllerService, owner: &str) -> u32 {
+        running_job_owned_by_inner(svc, owner, true).await
+    }
+
+    async fn running_job_owned_by_inner(
+        svc: &ControllerService,
+        owner: &str,
+        interactive: bool,
+    ) -> u32 {
         use spur_core::resource::{ResourceAllocations, ResourceSet};
 
         svc.cluster
@@ -3985,6 +3999,7 @@ mod tests {
             num_tasks: 1,
             cpus_per_task: 1,
             work_dir: "/tmp".into(),
+            interactive,
             ..Default::default()
         };
         let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
@@ -4091,6 +4106,49 @@ mod tests {
             .expect_err("an empty user must be rejected, not treated as authorized");
 
         assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_keepalive_records_interactive() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_interactive_job_owned_by(&svc, "ubuntu").await;
+
+        assert!(
+            svc.cluster.keepalive_last_seen(job_id).is_none(),
+            "no keepalive recorded before the RPC"
+        );
+
+        svc.job_keepalive(Request::new(JobKeepaliveRequest {
+            job_id,
+            user: "ubuntu".into(),
+        }))
+        .await
+        .expect("owner keepalive on an interactive job must succeed");
+
+        assert!(
+            svc.cluster.keepalive_last_seen(job_id).is_some(),
+            "a successful keepalive must record last-seen for the reaper"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_keepalive_skips_non_interactive() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        svc.job_keepalive(Request::new(JobKeepaliveRequest {
+            job_id,
+            user: "ubuntu".into(),
+        }))
+        .await
+        .expect("keepalive on a non-interactive job must not error");
+
+        assert!(
+            svc.cluster.keepalive_last_seen(job_id).is_none(),
+            "a non-interactive job must not be tracked for reaping"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
