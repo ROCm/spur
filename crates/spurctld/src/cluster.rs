@@ -4028,7 +4028,8 @@ impl ClusterManager {
     }
 
     /// Logs (never rewrites, which would mask the gap) any pending job stuck at
-    /// `Reason=None`; holds/deadlines/begin-time holds are legitimately None.
+    /// `Reason=None`. Holds, deadlines, begin-time holds, and array-throttled
+    /// tasks are legitimately None and skipped.
     pub(crate) fn warn_untagged_pending(&self) -> Vec<JobId> {
         let now = Utc::now();
         let jobs = self.jobs.read();
@@ -4037,6 +4038,7 @@ impl ClusterManager {
             if job.state != JobState::Pending
                 || job.pending_reason != PendingReason::None
                 || job.is_begin_held(now)
+                || job.spec.array_max_concurrent.is_some()
             {
                 continue;
             }
@@ -12892,6 +12894,31 @@ mod tests {
         let untagged = cm.warn_untagged_pending();
         assert!(untagged.is_empty(), "begin-held job must not be flagged");
         assert_eq!(cm.get_job(id).unwrap().pending_reason, PendingReason::None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warn_untagged_pending_ignores_array_throttled() {
+        // A task held back by array_max_concurrent sits at None by design (its
+        // reason is tracked separately); the check must not flag it as a gap.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let mut spec = basic_spec("arr");
+        spec.array_spec = Some("0-1%1".into());
+        let parent_id = cm.submit_job(spec).unwrap().job_id;
+        let t1 = parent_id + 1;
+        let t2 = parent_id + 2;
+        wait_for("array tasks", || {
+            cm.get_job(t1).is_some() && cm.get_job(t2).is_some()
+        });
+        start_job_on(&cm, t1, "n1");
+        settle(&cm, t1, JobState::Running);
+
+        assert_eq!(cm.get_job(t2).unwrap().pending_reason, PendingReason::None);
+        assert!(
+            !cm.warn_untagged_pending().contains(&t2),
+            "throttled array task must not be flagged as a classifier gap"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
