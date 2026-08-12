@@ -944,6 +944,14 @@ impl ClusterManager {
         self.next_job_id.load(Ordering::Relaxed)
     }
 
+    /// Whether `node` is part of the job's current allocation.
+    pub fn job_holds_node(&self, job_id: JobId, node: &str) -> bool {
+        self.jobs
+            .read()
+            .get(&job_id)
+            .is_some_and(|j| j.allocated_nodes.iter().any(|n| n == node))
+    }
+
     /// Get a job by ID, synthesizing an aggregate record for an array *parent*
     /// id (which has no stored job — Spur stores only per-task jobs) so
     /// `scontrol show job <array_parent>` matches Slurm instead of returning
