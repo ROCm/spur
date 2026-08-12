@@ -236,9 +236,24 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - Fairshare usage decay half-life, in days.
    * - ``default_time_limit_minutes``
      - integer
-     - ``60``
-     - Default job time limit (minutes) when neither the job nor its partition sets
-       one.
+     - ``0``
+     - Cluster-wide fallback wall-time (minutes) for a job that sets no ``-t`` and
+       lands on a partition with no ``DefaultTime``. ``0`` disables the fallback,
+       leaving such jobs unbounded. Set > 0 to bound otherwise-unlimited jobs.
+       When enabled, a ``-t``-less job on a partition that has a finite ``MaxTime``
+       but no ``DefaultTime`` defaults to that partition's ``MaxTime`` (for a
+       multi-partition request, the smallest ``MaxTime`` among them), not this
+       flat value. Prior to this release the setting was inert (never applied);
+       it now takes effect, and its default changed from ``60`` to ``0`` so
+       ``-t``-less jobs stay unbounded exactly as before. A site that had set it
+       expecting an effect will now see that effect.
+   * - ``enforce_part_limits``
+     - string
+     - ``NO``
+     - Whether partition wall-time limits are enforced at submit. ``NO`` admits
+       over-limit jobs and lets them pend with a ``PartitionTimeLimit`` reason.
+       ``ALL`` rejects unless the job fits every requested partition; ``ANY``
+       rejects only when it fits none. Mirrors Slurm's ``EnforcePartLimits``.
    * - ``complete_wait_secs``
      - integer
      - ``300``
@@ -334,7 +349,8 @@ is the union of the ``nodes`` hostlist pattern and the ``selector`` label match.
      - string
      - UNLIMITED
      - Maximum wall time. Slurm format: ``"72:00:00"``, ``"7-00:00:00"``, ``"60"``
-       (minutes), or ``INFINITE`` / ``UNLIMITED``.
+       (minutes), or ``INFINITE`` / ``UNLIMITED``. Suffixed durations are also
+       accepted: ``"1h"``, ``"90m"``, ``"1h40m"``, ``"2d12h"``, ``"30s"``.
    * - ``default_time``
      - string
      - UNLIMITED
