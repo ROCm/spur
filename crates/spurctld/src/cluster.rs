@@ -574,7 +574,7 @@ impl ClusterManager {
         // bounded whitelist fields, so this still measures what gets persisted.
         check_submission_size(&spec)?;
 
-        self.run_job_submit_hook(&mut spec)?;
+        self.run_job_submit_hook(&mut spec, &partitions)?;
 
         // Reject unknown/malformed dependency types up front so users get a
         // clear error instead of a silently-deadlocked job (e.g. `expand:N`).
@@ -658,7 +658,11 @@ impl ClusterManager {
     /// maps to an invalid-argument error; modify applies whitelisted changes.
     /// The shell hook runs first, then the Lua hook, each on the evolving spec
     /// (mirroring Slurm's config-ordered plugin chain).
-    fn run_job_submit_hook(&self, spec: &mut JobSpec) -> Result<(), SubmitError> {
+    fn run_job_submit_hook(
+        &self,
+        spec: &mut JobSpec,
+        partitions: &[Partition],
+    ) -> Result<(), SubmitError> {
         let config = self.config();
         let shell = config.hooks.job_submit.as_deref();
         let lua = config.hooks.job_submit_lua.as_deref();
@@ -673,7 +677,7 @@ impl ClusterManager {
                     .block_on(async { spur_core::hooks::run_submit_hook(script, &ctx).await })
             })
             .map_err(|e| SubmitError::internal(format!("job_submit hook failed: {e}")))?;
-            self.apply_submit_outcome(spec, "job_submit", outcome)?;
+            self.apply_submit_outcome(spec, "job_submit", outcome, partitions)?;
         }
 
         if let Some(script) = lua {
@@ -685,7 +689,7 @@ impl ClusterManager {
                     .map_err(|e| {
                         SubmitError::internal(format!("job_submit lua hook failed: {e}"))
                     })?;
-            self.apply_submit_outcome(spec, "job_submit_lua", outcome)?;
+            self.apply_submit_outcome(spec, "job_submit_lua", outcome, partitions)?;
         }
 
         Ok(())
@@ -716,6 +720,7 @@ impl ClusterManager {
         spec: &mut JobSpec,
         hook: &str,
         outcome: spur_core::hooks::SubmitHookOutcome,
+        partitions: &[Partition],
     ) -> Result<(), SubmitError> {
         match outcome {
             spur_core::hooks::SubmitHookOutcome::Accept => {
@@ -748,7 +753,7 @@ impl ClusterManager {
                 );
                 if changes.partition.is_some() || changes.account.is_some() {
                     validate_user_account(spec, &self.association_cache)?;
-                    self.validate_partition_node_bounds(spec)?;
+                    self.validate_partition_node_bounds(spec, partitions)?;
                 }
                 // Existence is enforced first: an unknown QOS silently resolves
                 // to the limitless default, which would bypass QOS limits.
@@ -764,7 +769,7 @@ impl ClusterManager {
                 // the three re-checks both against the already-applied spec.
                 if changes.partition.is_some() || changes.account.is_some() || changes.qos.is_some()
                 {
-                    self.validate_partition(spec)?;
+                    self.validate_partition(spec, partitions)?;
                     if let Some(qos) = spec.qos.as_deref().filter(|q| !q.is_empty()) {
                         if let Some(account) = spec.account.as_deref().filter(|a| !a.is_empty()) {
                             self.association_cache
