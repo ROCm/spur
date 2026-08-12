@@ -4027,14 +4027,8 @@ impl ClusterManager {
         }
     }
 
-    /// Detects the classifier-invariant violation where a pending job that is
-    /// not a hold, deadline, or begin-time hold is left at `Reason=None`. This
-    /// should never happen; if it does, it is a classifier gap. Log it loudly
-    /// with the job id so operators can find and fix it, but deliberately do
-    /// NOT rewrite the reason: inventing a plausible cause (e.g. `Priority`)
-    /// would assert something false and mask the very gap we want surfaced. The
-    /// honest `None` stands until the classifier is fixed. Returns the offending
-    /// ids for tests and metrics.
+    /// Logs (never rewrites, which would mask the gap) any pending job stuck at
+    /// `Reason=None`; holds/deadlines/begin-time holds are legitimately None.
     pub(crate) fn warn_untagged_pending(&self) -> Vec<JobId> {
         let now = Utc::now();
         let jobs = self.jobs.read();
@@ -5637,11 +5631,8 @@ fn retain_unblocked(
     });
 }
 
-/// Like [`retain_unblocked`], but for the consumable gates that reserve
-/// aggregate headroom within a pass. Not-yet-`scheduling_eligible` candidates
-/// are kept untouched for a later gate to classify; `block` may reserve headroom
-/// on the keep path. Every eligible candidate it rejects is dropped *and*
-/// recorded, so a job removed from the schedulable set always carries a reason.
+/// Like [`retain_unblocked`], but skips not-yet-eligible candidates and lets
+/// `block` reserve in-pass headroom on the keep path. Drops are always recorded.
 fn retain_eligible(
     candidates: &mut Vec<PendingJobCandidate>,
     blocked: &mut Vec<(JobId, PendingReason)>,
@@ -5724,9 +5715,7 @@ fn license_block(job: &Job, pool: &HashMap<String, u64>) -> Option<spur_core::jo
 }
 
 /// `Some(reason)` if the job would exceed a QOS group/per-user cap. `reserved`
-/// folds in headroom already claimed by higher-priority jobs earlier in the
-/// same scheduling pass, so a single pass can't over-subscribe a cap. Caller
-/// resolves the `Qos`.
+/// folds in headroom claimed earlier this pass so it can't over-subscribe.
 fn qos_block_with(
     job: &Job,
     qos: &Qos,
@@ -5782,12 +5771,8 @@ fn qos_block_with(
     }
 }
 
-/// `Some(reason)` if the job would exceed an account group/association cap.
-/// Looks up the job's (user, account) association limits from
-/// `AssociationCache`; a job with no account (or an association the cache has no
-/// limits for) is unconstrained. `reserved` folds in headroom already claimed
-/// by higher-priority jobs earlier in the same scheduling pass, so a single
-/// pass can't over-subscribe an account group cap.
+/// `Some(reason)` if the job would exceed its (user, account) association cap (no
+/// account means unconstrained). `reserved` folds in this pass's claimed headroom.
 fn account_block_with(
     job: &Job,
     assoc_cache: &AssociationCache,
@@ -12790,10 +12775,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn in_pass_qos_grp_node_block_tags_reason_not_none() {
-        // Two pending 1-node jobs, QOS capped at grp_tres node=1, nothing
-        // running. The first reserves the slot in-pass; the second is blocked
-        // only by that in-pass reservation and must surface QosGrpNodeLimit, not
-        // the bare None this drop used to leave.
+        // Two 1-node jobs, QOS grp_tres node=1, nothing running: the second is
+        // blocked only by the first's in-pass reservation. Expect QosGrpNodeLimit.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 8, 16000);
@@ -12825,9 +12808,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn in_pass_account_grp_node_block_tags_reason_not_none() {
-        // Same in-pass reservation drop, one layer up: two pending 1-node jobs
-        // in an account capped at grp_tres node=1. The second is blocked only by
-        // the first's in-pass reservation and must surface AssocGrpNodeLimit.
+        // Account grp_tres node=1: the second job is blocked only by the first's
+        // in-pass reservation. Expect AssocGrpNodeLimit, not None.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 8, 16000);
@@ -12859,10 +12841,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn in_pass_bb_exhaustion_tags_reason_not_none() {
-        // Two pending jobs each want 60GB from a 100GB burst-buffer pool. In a
-        // single pass the first reserves capacity and is selected for stage-in;
-        // the second, blocked only by that in-pass reservation, must surface
-        // BurstBufferResources instead of None.
+        // Two jobs want 60GB from a 100GB BB pool: the second, blocked only by
+        // the first's in-pass reservation, must surface BurstBufferResources.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 8, 16000);
@@ -12884,10 +12864,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn warn_untagged_pending_detects_leak_without_rewriting_reason() {
-        // A pending job left at None (a classifier gap) is detected and returned
-        // so it gets logged, but the reason is not overwritten: fabricating a
-        // cause would assert something false and hide the gap. No node is
-        // registered, so no scheduler cycle tags it first.
+        // A leaked-None pending job is detected and returned, but its reason is
+        // left None, not rewritten. No node registered, so nothing tags it first.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         let id = submit_and_wait(&cm, basic_spec("leak"));
@@ -12904,8 +12882,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn warn_untagged_pending_ignores_begin_held() {
-        // A begin-time hold with reason None is a separate, tracked case, not a
-        // classifier gap: it must not be flagged.
+        // A begin-time hold at None is legitimate, not a gap: must not be flagged.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         let mut spec = basic_spec("held");
@@ -13223,9 +13200,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pending_jobs_does_not_overallocate_licenses_within_one_pass() {
-        // Two pending jobs each request fluent:1 from a pool of 1. One is
-        // admitted; the loser waits on Licenses (not None), since from its view
-        // it is waiting for a license regardless of contention vs shortage.
+        // Two jobs each request fluent:1 from a pool of 1: the loser waits on
+        // Licenses (not None), the same as an outright shortage.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 8, 16000);
