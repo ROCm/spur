@@ -4027,30 +4027,32 @@ impl ClusterManager {
         }
     }
 
-    /// Safety net for a classifier gap: a pending job that is not a hold,
-    /// deadline, or begin-time hold should never be left at `None`. Any that is
-    /// gets logged and defaulted to `Priority` so the gap is visible in logs
-    /// rather than surfacing as a bare `Reason=None`. Returns the patched ids.
-    pub(crate) fn backstop_untagged_pending(&self) -> Vec<JobId> {
+    /// Detects the classifier-invariant violation where a pending job that is
+    /// not a hold, deadline, or begin-time hold is left at `Reason=None`. This
+    /// should never happen; if it does, it is a classifier gap. Log it loudly
+    /// with the job id so operators can find and fix it, but deliberately do
+    /// NOT rewrite the reason: inventing a plausible cause (e.g. `Priority`)
+    /// would assert something false and mask the very gap we want surfaced. The
+    /// honest `None` stands until the classifier is fixed. Returns the offending
+    /// ids for tests and metrics.
+    pub(crate) fn warn_untagged_pending(&self) -> Vec<JobId> {
         let now = Utc::now();
-        let mut jobs = self.jobs.write();
-        let mut patched = Vec::new();
-        for job in jobs.values_mut() {
+        let jobs = self.jobs.read();
+        let mut untagged = Vec::new();
+        for job in jobs.values() {
             if job.state != JobState::Pending
                 || job.pending_reason != PendingReason::None
-                || job.pending_reason.is_scheduling_hold()
                 || job.is_begin_held(now)
             {
                 continue;
             }
             warn!(
                 job_id = job.job_id,
-                "pending job left with Reason=None after classification; defaulting to Priority (classifier gap)"
+                "pending job left with Reason=None after classification (classifier gap)"
             );
-            job.set_pending_reason(PendingReason::Priority);
-            patched.push(job.job_id);
+            untagged.push(job.job_id);
         }
-        patched
+        untagged
     }
 
     /// Send a job event notification via webhook (if configured).
@@ -12881,35 +12883,37 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn backstop_defaults_leaked_none_pending_job_to_priority() {
-        // Safety net: a pending job that reaches the backstop still at None (a
-        // classifier gap) is defaulted to Priority so the CLI never shows a bare
-        // None. No node is registered, so no scheduler cycle tags it first.
+    async fn warn_untagged_pending_detects_leak_without_rewriting_reason() {
+        // A pending job left at None (a classifier gap) is detected and returned
+        // so it gets logged, but the reason is not overwritten: fabricating a
+        // cause would assert something false and hide the gap. No node is
+        // registered, so no scheduler cycle tags it first.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         let id = submit_and_wait(&cm, basic_spec("leak"));
         assert_eq!(cm.get_job(id).unwrap().pending_reason, PendingReason::None);
 
-        let patched = cm.backstop_untagged_pending();
-        assert_eq!(patched, vec![id]);
+        let untagged = cm.warn_untagged_pending();
+        assert_eq!(untagged, vec![id]);
         assert_eq!(
             cm.get_job(id).unwrap().pending_reason,
-            PendingReason::Priority
+            PendingReason::None,
+            "the reason must stay the honest None, not be rewritten"
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn backstop_leaves_begin_held_none_alone() {
-        // A begin-time hold with reason None is a separate, tracked case. The
-        // backstop must not mislabel it as Priority (that would hide the hold).
+    async fn warn_untagged_pending_ignores_begin_held() {
+        // A begin-time hold with reason None is a separate, tracked case, not a
+        // classifier gap: it must not be flagged.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         let mut spec = basic_spec("held");
         spec.begin_time = Some(Utc::now() + chrono::Duration::hours(1));
         let id = submit_and_wait(&cm, spec);
 
-        let patched = cm.backstop_untagged_pending();
-        assert!(patched.is_empty(), "begin-held job must be left alone");
+        let untagged = cm.warn_untagged_pending();
+        assert!(untagged.is_empty(), "begin-held job must not be flagged");
         assert_eq!(cm.get_job(id).unwrap().pending_reason, PendingReason::None);
     }
 

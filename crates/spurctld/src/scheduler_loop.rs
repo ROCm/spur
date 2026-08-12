@@ -225,9 +225,9 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             }
         }
 
-        // Safety net for any pending job the passes above left at Reason=None:
-        // log it and apply a fallback so the gap is visible, not silent.
-        cluster.backstop_untagged_pending();
+        // Invariant check: warn loudly if any pending job the passes above left
+        // at Reason=None slipped through, so a classifier gap surfaces in logs.
+        cluster.warn_untagged_pending();
 
         let cycle_time_us = cycle_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
         cluster.record_sched_cycle(
