@@ -19,7 +19,7 @@ How it works
 ------------
 
 The exporter watches a directory (default ``/var/run/exporter/``) for files
-named after a GPU's render ID (``0``, ``1``, ...). Each file is a small JSON
+named after the render ID of a GPU (``0``, ``1``, ...). Each file is a small JSON
 document describing the job currently using that GPU. The exporter's watcher
 is scheduler-agnostic in behavior but not in **field names** — it always reads
 these five JSON keys, regardless of which scheduler wrote the file:
@@ -308,9 +308,9 @@ Verifying the integration
 
    ``spur image import`` requires the full ``docker://docker.io/<repo>:<tag>``
    form for Docker Hub images. A bare ``<namespace>/<repo>:<tag>`` (e.g.
-   ``rocm/dev-ubuntu-22.04:latest``) is misparsed as a private registry host
-   named ``rocm``, and the import fails with ``Error: failed to fetch
-   manifest``.
+   ``rocm/dev-ubuntu-22.04:latest``) is parsed incorrectly as a private
+   registry host named ``rocm``, and the import fails with ``Error: failed to
+   fetch manifest``.
 
 Troubleshooting
 -----------------
