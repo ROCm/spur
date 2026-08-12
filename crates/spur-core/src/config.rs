@@ -254,6 +254,12 @@ pub struct HooksConfig {
     pub srun_prolog: Option<String>,
     /// Script run on the srun invocation node after step completion (Slurm `SrunEpilog`).
     pub srun_epilog: Option<String>,
+    /// Script run on the controller at submission to accept/reject/modify a job.
+    /// Receives the resolved spec as JSON on stdin (Slurm `job_submit.lua` analog).
+    pub job_submit: Option<String>,
+    /// Lua script defining `slurm_job_submit(job_desc, submit_uid)`, run in a
+    /// sandbox at submission. Slurm `job_submit/lua` parity. Runs after `job_submit`.
+    pub job_submit_lua: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -449,6 +455,36 @@ impl Default for AccountingConfig {
     }
 }
 
+/// Submit-time enforcement of partition wall-time (Slurm `EnforcePartLimits`):
+/// `No` admits over-limit jobs to pend, `All` needs all fit, `Any` needs one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum EnforcePartLimits {
+    #[default]
+    No,
+    All,
+    Any,
+}
+
+// Case-insensitive, and accepts Slurm's `YES` alias for `ALL`, so a value like
+// `enforce_part_limits = "all"` in spur.conf does not fail controller startup.
+impl<'de> Deserialize<'de> for EnforcePartLimits {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.trim().to_ascii_uppercase().as_str() {
+            "NO" => Ok(Self::No),
+            "ALL" | "YES" => Ok(Self::All),
+            "ANY" => Ok(Self::Any),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid enforce_part_limits '{other}' (expected NO, ALL, or ANY)"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerConfig {
     /// Scheduler plugin name.
@@ -463,16 +499,30 @@ pub struct SchedulerConfig {
     /// Fair-share decay half-life (days).
     #[serde(default = "default_halflife")]
     pub fairshare_halflife_days: u32,
-    /// Default job time limit (minutes), if not set per-partition.
+    /// Cluster-wide fallback wall-time (minutes) for a `-t`-less job on a partition
+    /// with no `DefaultTime`. `0` (default) leaves such jobs unbounded; > 0 bounds them.
     #[serde(default = "default_time_limit")]
     pub default_time_limit_minutes: u32,
+    /// Whether to reject over-limit jobs at submit (Slurm `EnforcePartLimits`).
+    #[serde(default)]
+    pub enforce_part_limits: EnforcePartLimits,
     /// Max seconds to wait in COMPLETING before force-finishing the job.
     #[serde(default = "default_complete_wait")]
     pub complete_wait_secs: u32,
     /// Grace minutes after a reservation ends before cancelling its running jobs.
     #[serde(default)]
     pub resv_overrun_minutes: u32,
+    /// Reap an interactive allocation (salloc/srun) whose client has sent no
+    /// keepalive for this many seconds. `0` (the default) disables reaping, so
+    /// abandoned allocations behave as before. Mirrors Slurm's `InactiveLimit`.
+    #[serde(default)]
+    pub inactive_limit_secs: u32,
 }
+
+/// How often an interactive client (`salloc`/`srun`) pings the controller to
+/// keep its allocation attended. Shared with the CLI so `inactive_limit_secs`
+/// can be validated against it.
+pub const KEEPALIVE_INTERVAL_SECS: u64 = 30;
 
 fn default_scheduler_plugin() -> String {
     "backfill".into()
@@ -484,7 +534,7 @@ fn default_halflife() -> u32 {
     14
 }
 fn default_time_limit() -> u32 {
-    60
+    0
 }
 fn default_complete_wait() -> u32 {
     300
@@ -497,9 +547,11 @@ impl Default for SchedulerConfig {
             interval_secs: 1,
             max_jobs_per_cycle: 10000,
             fairshare_halflife_days: 14,
-            default_time_limit_minutes: 60,
+            default_time_limit_minutes: 0,
+            enforce_part_limits: EnforcePartLimits::No,
             complete_wait_secs: 300,
             resv_overrun_minutes: 0,
+            inactive_limit_secs: 0,
         }
     }
 }
@@ -1202,6 +1254,18 @@ impl SlurmConfig {
                 ),
             });
         }
+        // A limit below the client's ping interval would reap a live client
+        // between its own keepalives. Require at least two intervals of slack.
+        let inactive = self.scheduler.inactive_limit_secs;
+        if inactive > 0 && u64::from(inactive) < 2 * KEEPALIVE_INTERVAL_SECS {
+            return Err(ConfigError::InvalidValue {
+                field: "scheduler.inactive_limit_secs".into(),
+                value: format!(
+                    "{inactive} (0 disables reaping; otherwise must be >= {})",
+                    2 * KEEPALIVE_INTERVAL_SECS
+                ),
+            });
+        }
         if self.cluster.enabled {
             if self.cluster.distro != "k0s" {
                 return Err(ConfigError::InvalidValue {
@@ -1309,10 +1373,40 @@ impl SlurmConfig {
                 }
             }
         }
+
+        // Reject malformed partition time strings at load rather than silently
+        // treating them as UNLIMITED (a typo like "1 hour" must fail, not
+        // remove the cap).
+        for pc in &self.partitions {
+            let max = pc
+                .max_time
+                .as_ref()
+                .map(|t| parse_partition_time(&format!("partitions.{}.max_time", pc.name), t))
+                .transpose()?
+                .flatten();
+            let default = pc
+                .default_time
+                .as_ref()
+                .map(|t| parse_partition_time(&format!("partitions.{}.default_time", pc.name), t))
+                .transpose()?
+                .flatten();
+            // A finite DefaultTime above the partition's finite MaxTime would hand
+            // a -t-less job a limit its own partition rejects, so it pends forever.
+            if let (Some(max), Some(default)) = (max, default) {
+                if default > max {
+                    return Err(ConfigError::InvalidValue {
+                        field: format!("partitions.{}.default_time", pc.name),
+                        value: format!("{default}m exceeds max_time {max}m"),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
-    /// Convert partition configs to Partition structs.
+    /// Convert partition configs to Partition structs. Time strings are assumed
+    /// valid here; [`Self::validate`] rejects malformed ones at load, so a stray
+    /// `None` below only ever means UNLIMITED, never a swallowed parse error.
     pub fn build_partitions(&self) -> Vec<Partition> {
         self.partitions
             .iter()
@@ -1349,13 +1443,39 @@ impl SlurmConfig {
     }
 }
 
-/// Parse a time string like "72:00:00", "4-00:00:00", "INFINITE", "60" (minutes).
+/// Parse a partition time field, distinguishing UNLIMITED from a parse error:
+/// `INFINITE`/`UNLIMITED` -> `Ok(None)`, a valid duration -> `Ok(Some(minutes))`,
+/// anything else -> `Err`. Unlike [`parse_time_minutes`], a typo like `"1 hour"`
+/// fails loudly instead of collapsing to UNLIMITED.
+pub fn parse_partition_time(field: &str, s: &str) -> Result<Option<u32>, ConfigError> {
+    let trimmed = s.trim();
+    if trimmed.eq_ignore_ascii_case("INFINITE") || trimmed.eq_ignore_ascii_case("UNLIMITED") {
+        return Ok(None);
+    }
+    match parse_time_minutes(trimmed) {
+        Some(minutes) => Ok(Some(minutes)),
+        None => Err(ConfigError::InvalidValue {
+            field: field.into(),
+            value: s.into(),
+        }),
+    }
+}
+
+/// Parse a time string to minutes: Slurm grammar (`60`, `H:MM`, `H:MM:SS`,
+/// `D-HH:MM:SS`, `INFINITE`/`UNLIMITED`) or a suffixed duration (`90m`, `1h`,
+/// `2d12h`, `30s`). Sub-minute remainders round up.
 pub fn parse_time_minutes(s: &str) -> Option<u32> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("INFINITE") || s.eq_ignore_ascii_case("UNLIMITED") {
         return None; // No limit
     }
+    parse_slurm_time_minutes(s).or_else(|| {
+        let secs = parse_suffix_duration_seconds(s)?;
+        u32::try_from(secs.div_ceil(60)).ok()
+    })
+}
 
+fn parse_slurm_time_minutes(s: &str) -> Option<u32> {
     // days-hours:minutes:seconds
     if let Some((days, rest)) = s.split_once('-') {
         let days: u32 = days.parse().ok()?;
@@ -1372,21 +1492,25 @@ pub fn parse_time_minutes(s: &str) -> Option<u32> {
             let m: u32 = parts[1].parse().ok()?;
             Some(h * 60 + m)
         }
-        3 => Some(parse_hms(s)?),
+        3 => parse_hms(s),
         _ => None,
     }
 }
 
 /// Parse a time string to total seconds (not minutes).
 ///
-/// Same Slurm-compatible format as `parse_time_minutes` but with second
-/// granularity: "N" → N minutes, "H:MM" → hours+minutes, "H:MM:SS" → exact.
+/// Same accepted formats as [`parse_time_minutes`] (Slurm grammar plus suffixed
+/// durations), but with second granularity: "N" → N minutes, "H:MM" →
+/// hours+minutes, "H:MM:SS" → exact, "90s" → 90 seconds.
 pub fn parse_time_seconds(s: &str) -> Option<u64> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("INFINITE") || s.eq_ignore_ascii_case("UNLIMITED") {
         return None;
     }
+    parse_slurm_time_seconds(s).or_else(|| parse_suffix_duration_seconds(s))
+}
 
+fn parse_slurm_time_seconds(s: &str) -> Option<u64> {
     // days-hours:minutes:seconds
     if let Some((days, rest)) = s.split_once('-') {
         let days: u64 = days.parse().ok()?;
@@ -1415,6 +1539,40 @@ pub fn parse_time_seconds(s: &str) -> Option<u64> {
         }
         _ => None,
     }
+}
+
+/// Sum a suffixed duration like `90m`, `1h40m`, `2d12h`, or `30s` to seconds.
+/// Units `d/h/m/s` (case-insensitive); a bare number or trailing digits fail
+/// (the Slurm grammar owns bare numbers).
+fn parse_suffix_duration_seconds(s: &str) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut num: Option<u64> = None;
+    let mut saw_unit = false;
+    for c in s.chars() {
+        if let Some(digit) = c.to_digit(10) {
+            num = Some(
+                num.unwrap_or(0)
+                    .checked_mul(10)?
+                    .checked_add(digit as u64)?,
+            );
+            continue;
+        }
+        let unit_secs: u64 = match c.to_ascii_lowercase() {
+            'd' => 86_400,
+            'h' => 3_600,
+            'm' => 60,
+            's' => 1,
+            _ => return None,
+        };
+        let value = num.take()?;
+        total = total.checked_add(value.checked_mul(unit_secs)?)?;
+        saw_unit = true;
+    }
+    // Trailing digits without a unit, or no unit at all, is not a duration.
+    if num.is_some() || !saw_unit {
+        return None;
+    }
+    Some(total)
 }
 
 fn parse_hms_seconds(s: &str) -> Option<u64> {
@@ -1462,6 +1620,26 @@ pub fn format_time(total_minutes: Option<u32>) -> String {
                 format!("{}-{:02}:{:02}:00", days, hours, minutes)
             } else {
                 format!("{:02}:{:02}:00", hours, minutes)
+            }
+        }
+    }
+}
+
+/// Format seconds as D-HH:MM:SS or HH:MM:SS. Unlike [`format_time`] this keeps
+/// second precision, so a sub-minute request is not rounded when reported.
+pub fn format_time_seconds(total_seconds: Option<i64>) -> String {
+    match total_seconds {
+        None => "UNLIMITED".into(),
+        Some(secs) => {
+            let secs = secs.max(0);
+            let days = secs / 86_400;
+            let hours = (secs % 86_400) / 3_600;
+            let minutes = (secs % 3_600) / 60;
+            let seconds = secs % 60;
+            if days > 0 {
+                format!("{days}-{hours:02}:{minutes:02}:{seconds:02}")
+            } else {
+                format!("{hours:02}:{minutes:02}:{seconds:02}")
             }
         }
     }
@@ -1759,6 +1937,8 @@ task_prolog = "/etc/spur/task_prolog.sh"
 task_epilog = "/etc/spur/task_epilog.sh"
 srun_prolog = "/etc/spur/srun_prolog.sh"
 srun_epilog = "/etc/spur/srun_epilog.sh"
+job_submit = "/etc/spur/job_submit.sh"
+job_submit_lua = "/etc/spur/job_submit.lua"
 "#;
         let config = SlurmConfig::load_from_str(toml).unwrap();
         assert_eq!(config.hooks.prolog.as_deref(), Some("/etc/spur/prolog.sh"));
@@ -1787,6 +1967,14 @@ srun_epilog = "/etc/spur/srun_epilog.sh"
             config.hooks.srun_epilog.as_deref(),
             Some("/etc/spur/srun_epilog.sh")
         );
+        assert_eq!(
+            config.hooks.job_submit.as_deref(),
+            Some("/etc/spur/job_submit.sh")
+        );
+        assert_eq!(
+            config.hooks.job_submit_lua.as_deref(),
+            Some("/etc/spur/job_submit.lua")
+        );
         // metrics section omitted — should keep defaults
         assert!(config.metrics.enabled);
     }
@@ -1802,6 +1990,8 @@ srun_epilog = "/etc/spur/srun_epilog.sh"
         assert!(config.hooks.task_epilog.is_none());
         assert!(config.hooks.srun_prolog.is_none());
         assert!(config.hooks.srun_epilog.is_none());
+        assert!(config.hooks.job_submit.is_none());
+        assert!(config.hooks.job_submit_lua.is_none());
         // hooks section omitted — metrics should keep defaults
         assert!(config.metrics.enabled);
         assert_eq!(config.metrics.listen_addr, "[::]:6822");
@@ -1859,6 +2049,197 @@ memory_mb = 1024000
     }
 
     #[test]
+    fn parse_partition_time_distinguishes_unlimited_from_invalid() {
+        assert_eq!(
+            parse_partition_time("p.max_time", "UNLIMITED").unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_partition_time("p.max_time", "infinite").unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_partition_time("p.max_time", "01:00:00").unwrap(),
+            Some(60)
+        );
+        // Suffixed durations are accepted (honor intent instead of failing).
+        assert_eq!(parse_partition_time("p.max_time", "1h").unwrap(), Some(60));
+        assert_eq!(parse_partition_time("p.max_time", "90m").unwrap(), Some(90));
+        // A genuine typo still fails loudly.
+        assert!(parse_partition_time("p.max_time", "1 hour").is_err());
+        assert!(parse_partition_time("p.max_time", "banana").is_err());
+    }
+
+    #[test]
+    fn enforce_part_limits_parses_case_insensitively_and_yes_alias() {
+        #[derive(serde::Deserialize)]
+        struct W {
+            v: EnforcePartLimits,
+        }
+        let parse = |v: &str| toml::from_str::<W>(&format!("v = \"{v}\"")).unwrap().v;
+        assert_eq!(parse("no"), EnforcePartLimits::No);
+        assert_eq!(parse("all"), EnforcePartLimits::All);
+        assert_eq!(parse("ALL"), EnforcePartLimits::All);
+        assert_eq!(parse("Yes"), EnforcePartLimits::All);
+        assert_eq!(parse("any"), EnforcePartLimits::Any);
+        assert_eq!(parse("ANY"), EnforcePartLimits::Any);
+    }
+
+    #[test]
+    fn enforce_part_limits_rejects_unknown_value() {
+        #[derive(serde::Deserialize)]
+        struct W {
+            #[allow(dead_code)]
+            v: EnforcePartLimits,
+        }
+        assert!(toml::from_str::<W>("v = \"sometimes\"").is_err());
+    }
+
+    #[test]
+    fn format_time_seconds_keeps_second_precision() {
+        assert_eq!(format_time_seconds(Some(630)), "00:10:30");
+        assert_eq!(format_time_seconds(Some(3600)), "01:00:00");
+        assert_eq!(format_time_seconds(Some(90_061)), "1-01:01:01");
+        assert_eq!(format_time_seconds(None), "UNLIMITED");
+    }
+
+    #[test]
+    fn parse_time_minutes_accepts_suffixed_durations() {
+        assert_eq!(parse_time_minutes("1h"), Some(60));
+        assert_eq!(parse_time_minutes("90m"), Some(90));
+        assert_eq!(parse_time_minutes("1h40m"), Some(100));
+        assert_eq!(parse_time_minutes("2d"), Some(2880));
+        assert_eq!(parse_time_minutes("1d12h30m"), Some(2190));
+        // Sub-minute remainders round up, matching the "H:MM:SS" seconds rule.
+        assert_eq!(parse_time_minutes("30s"), Some(1));
+        assert_eq!(parse_time_minutes("1h15s"), Some(61));
+        // Slurm grammar is unchanged and still takes precedence.
+        assert_eq!(parse_time_minutes("60"), Some(60));
+        assert_eq!(parse_time_minutes("01:00:00"), Some(60));
+        assert_eq!(parse_time_minutes("1-00:00:00"), Some(1440));
+        // Non-durations are rejected, not silently accepted.
+        assert_eq!(parse_time_minutes("1 hour"), None);
+        assert_eq!(parse_time_minutes("1.5h"), None);
+        assert_eq!(parse_time_minutes("1h30"), None);
+        assert_eq!(parse_time_minutes("h"), None);
+        assert_eq!(parse_time_minutes("1x"), None);
+    }
+
+    #[test]
+    fn parse_time_seconds_accepts_suffixed_durations() {
+        assert_eq!(parse_time_seconds("1h"), Some(3600));
+        assert_eq!(parse_time_seconds("90m"), Some(5400));
+        assert_eq!(parse_time_seconds("30s"), Some(30));
+        assert_eq!(parse_time_seconds("1h30m15s"), Some(5415));
+        // Slurm grammar unchanged.
+        assert_eq!(parse_time_seconds("60"), Some(3600));
+        assert_eq!(parse_time_seconds("00:00:30"), Some(30));
+    }
+
+    #[test]
+    fn load_accepts_suffixed_partition_max_time() {
+        // "1h" is honored as a 60-minute cap rather than failing or silently
+        // becoming UNLIMITED.
+        let toml = r#"
+cluster_name = "test"
+
+[[partitions]]
+name = "gpu"
+max_time = "1h"
+default_time = "30m"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        let parts = config.build_partitions();
+        assert_eq!(parts[0].max_time_minutes, Some(60));
+        assert_eq!(parts[0].default_time_minutes, Some(30));
+    }
+
+    #[test]
+    fn load_rejects_invalid_partition_max_time() {
+        // A value that is neither Slurm grammar nor a suffixed duration must
+        // fail loudly rather than silently becoming UNLIMITED.
+        let toml = r#"
+cluster_name = "test"
+
+[[partitions]]
+name = "gpu"
+max_time = "1 hour"
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { ref field, .. } if field.contains("max_time")),
+            "expected InvalidValue for max_time, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_accepts_unlimited_partition_max_time() {
+        let toml = r#"
+cluster_name = "test"
+
+[[partitions]]
+name = "gpu"
+max_time = "UNLIMITED"
+default_time = "INFINITE"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        let parts = config.build_partitions();
+        assert_eq!(parts[0].max_time_minutes, None);
+        assert_eq!(parts[0].default_time_minutes, None);
+    }
+
+    #[test]
+    fn load_rejects_default_time_above_max_time() {
+        // A finite DefaultTime over MaxTime would auto-fill a -t-less job past the
+        // partition's own cap, pending it forever. Reject at load.
+        let toml = r#"
+cluster_name = "test"
+
+[[partitions]]
+name = "gpu"
+max_time = "01:00:00"
+default_time = "02:00:00"
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { ref field, .. } if field.contains("default_time")),
+            "expected InvalidValue for default_time, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_accepts_default_time_equal_to_max_time() {
+        let toml = r#"
+cluster_name = "test"
+
+[[partitions]]
+name = "gpu"
+max_time = "01:00:00"
+default_time = "01:00:00"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        let parts = config.build_partitions();
+        assert_eq!(parts[0].default_time_minutes, Some(60));
+    }
+
+    #[test]
+    fn load_accepts_default_time_with_unlimited_max_time() {
+        // UNLIMITED MaxTime caps nothing, so any finite DefaultTime is coherent.
+        let toml = r#"
+cluster_name = "test"
+
+[[partitions]]
+name = "gpu"
+max_time = "UNLIMITED"
+default_time = "02:00:00"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        let parts = config.build_partitions();
+        assert_eq!(parts[0].max_time_minutes, None);
+        assert_eq!(parts[0].default_time_minutes, Some(120));
+    }
+
+    #[test]
     fn build_partitions_propagates_partition_access_control() {
         let toml = r#"
 cluster_name = "test"
@@ -1909,6 +2290,35 @@ max_batch_requeue = 7
 "#;
         let config = SlurmConfig::load_from_str(toml).unwrap();
         assert_eq!(config.controller.max_batch_requeue, 7);
+    }
+
+    #[test]
+    fn scheduler_config_rejects_inactive_limit_below_floor() {
+        let toml = r#"
+cluster_name = "test"
+
+[scheduler]
+inactive_limit_secs = 20
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("inactive_limit_secs"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn scheduler_config_accepts_disabled_or_ample_inactive_limit() {
+        // 0 disables reaping and is always allowed.
+        SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[scheduler]\ninactive_limit_secs = 0\n",
+        )
+        .expect("0 (disabled) must be accepted");
+        // A value at the floor (2x the keepalive interval) is accepted.
+        SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[scheduler]\ninactive_limit_secs = 60\n",
+        )
+        .expect("a value at the floor must be accepted");
     }
 
     #[test]

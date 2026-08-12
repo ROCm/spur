@@ -1093,3 +1093,43 @@ class TestReconfigure:
             # Restore conf so later tests see the original config on disk.
             node.write_file(conf_path, original)
             cluster.scontrol("reconfigure")
+
+
+class TestEnforcePartLimits:
+    """With EnforcePartLimits=ALL, an over-MaxTime request is rejected at
+    submit (Slurm parity) instead of being admitted and left pending."""
+
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return {"scheduler": {"enforce_part_limits": "ALL"}}
+
+    def test_over_maxtime_rejected_at_submit(self, cluster):
+        name = _unique("capped")
+        node = cluster.node_names[0]
+        cluster.scontrol(
+            "create-partition",
+            f"--name={name}",
+            f"--nodes={node}",
+            "--state=UP",
+            "--max-time=00:01:00",
+        )
+
+        with pytest.raises(RuntimeError) as exc:
+            cluster.sbatch(["-p", name, "-t", "01:00:00", "--wrap", "true"])
+        assert "Requested time limit is invalid" in str(exc.value)
+
+    def test_within_maxtime_accepted(self, cluster):
+        name = _unique("capped-ok")
+        node = cluster.node_names[0]
+        cluster.scontrol(
+            "create-partition",
+            f"--name={name}",
+            f"--nodes={node}",
+            "--state=UP",
+            "--max-time=01:00:00",
+        )
+
+        job_id = parse_job_id(
+            cluster.sbatch(["-p", name, "-t", "00:05:00", "--wrap", "true"])
+        )
+        assert job_id, "within-limit job must be accepted at submit"

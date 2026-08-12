@@ -1,11 +1,11 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tracing::{debug, error, info, warn};
 
 use spur_core::node::{Node, NodeSource};
@@ -28,6 +28,10 @@ use crate::raft::RaftHandle;
 /// awaits delivery. Best-effort cleanup must not stall eviction on an
 /// unreachable agent.
 const CANCEL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Grace between SIGTERM and SIGKILL when force-finishing a job. The time-limit
+/// and inactive-limit watchdogs share it so the two windows can't drift apart.
+const GRACE_PERIOD_SECS: i64 = 30;
 
 fn node_comm_socket(node: &Node) -> Option<String> {
     let host = node.comm_addr()?;
@@ -55,6 +59,11 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     let power_raft = raft.clone();
     tokio::spawn(async move {
         manage_power(power_cluster, power_raft).await;
+    });
+    let inactive_cluster = cluster.clone();
+    let inactive_raft = raft.clone();
+    tokio::spawn(async move {
+        enforce_inactive_limits(inactive_cluster, inactive_raft).await;
     });
     // Captured once at loop start: the tick interval, per-cycle job cap, and
     // topology tree are baked into loop-local state and are NOT picked up by
@@ -1612,8 +1621,6 @@ async fn confirm_dispatch_on_nodes(
 ///
 /// Runs every 10 seconds.
 async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
-    const GRACE_PERIOD_SECS: i64 = 30;
-
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
 
     loop {
@@ -1707,6 +1714,111 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
             }
 
             send_cancel_to_agents(&cluster, job, 9).await; // SIGKILL
+        }
+    }
+}
+
+/// Reap interactive allocations (salloc/srun) whose client stopped sending
+/// keepalives, mirroring Slurm's `InactiveLimit`. Idle allocations get a
+/// SIGTERM -> grace -> SIGKILL sequence (like `enforce_time_limits`) and are
+/// finalized via the TIMEOUT path. Disabled when `inactive_limit_secs == 0`.
+async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
+    use spur_core::job::{JobId, JobState};
+
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+
+    // Jobs that were sent SIGTERM and are in their grace window, keyed by
+    // job id -> when SIGTERM was sent. Local to this task (only the reaper
+    // touches it); lost on restart, which merely restarts the grace.
+    let mut signaled: HashMap<JobId, DateTime<Utc>> = HashMap::new();
+
+    // Neither map is tied to a leadership term, so reset them on a
+    // follower -> leader transition (below) to drop a prior stint's stale state.
+    let mut was_leader = false;
+
+    loop {
+        interval.tick().await;
+
+        if !raft.is_leader() {
+            was_leader = false;
+            continue;
+        }
+
+        if !was_leader {
+            // (Re)gained leadership: drop stale timers so the reap check below
+            // reseeds every running allocation to a full grace window.
+            signaled.clear();
+            cluster.reset_interactive_last_seen();
+            was_leader = true;
+        }
+
+        let limit_secs = cluster.config().scheduler.inactive_limit_secs;
+        let now = Utc::now();
+
+        let running: Vec<_> = cluster
+            .get_jobs(&[JobState::Running], None, None, None, None, &[])
+            .into_iter()
+            .filter(|j| j.spec.interactive || j.spec.srun_job)
+            .collect();
+        let ids: Vec<JobId> = running.iter().map(|j| j.job_id).collect();
+
+        // Prunes the keepalive map every tick; returns candidates only when
+        // the limit is enabled.
+        let stale = cluster.interactive_reap_candidates(&ids, now, limit_secs);
+        let stale_set: HashSet<JobId> = stale.iter().copied().collect();
+        // Drop grace timers for jobs that recovered (pinged again) or are gone,
+        // so a client that comes back during the grace aborts the kill.
+        signaled.retain(|id, _| stale_set.contains(id));
+
+        let by_id: HashMap<JobId, &spur_core::job::Job> =
+            running.iter().map(|j| (j.job_id, j)).collect();
+
+        for job_id in stale {
+            let Some(job) = by_id.get(&job_id) else {
+                continue;
+            };
+
+            match signaled.get(&job_id) {
+                None => {
+                    info!(
+                        job_id,
+                        limit_secs,
+                        grace_secs = GRACE_PERIOD_SECS,
+                        "interactive allocation idle past InactiveLimit — sending SIGTERM, grace period starts"
+                    );
+                    send_cancel_to_agents(&cluster, job, 15).await; // SIGTERM
+                    signaled.insert(job_id, now);
+                }
+                Some(signaled_at) if (now - *signaled_at).num_seconds() < GRACE_PERIOD_SECS => {}
+                Some(_) => {
+                    // Re-fetch before finalizing: if the job was requeued and
+                    // redispatched as a new run under the same id since the
+                    // snapshot, `complete_job`'s terminal-state guard would not
+                    // catch it and the SIGKILL could hit the new run.
+                    let Some(fresh) = cluster.get_job(job_id) else {
+                        signaled.remove(&job_id);
+                        continue;
+                    };
+                    if fresh.state != JobState::Running || fresh.run_attempt != job.run_attempt {
+                        signaled.remove(&job_id);
+                        continue;
+                    }
+
+                    info!(
+                        job_id,
+                        "InactiveLimit grace expired — force-killing allocation"
+                    );
+
+                    if let Err(e) = cluster.complete_job(job_id, -1, JobState::Timeout) {
+                        warn!(job_id, error = %e, "failed to reap inactive allocation");
+                        continue;
+                    }
+
+                    // SIGKILL on the run's current nodes, not the stale snapshot.
+                    send_cancel_to_nodes(&cluster, job_id, &fresh.allocated_nodes, 9).await;
+                    signaled.remove(&job_id);
+                }
+            }
         }
     }
 }

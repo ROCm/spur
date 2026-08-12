@@ -230,6 +230,12 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     env.set_with_slurm_twin("SPUR_CPUS_PER_TASK", job_info.cpus_per_task);
     env.set_with_slurm_twin("SPUR_SUBMIT_DIR", &job_info.work_dir);
 
+    // Keep the allocation attended while the shell is open: absence of these
+    // pings past the controller's InactiveLimit is what lets it reap an
+    // abandoned allocation. The guard stops the pings on drop.
+    let _keepalive =
+        crate::interactive::spawn_keepalive(client.clone(), job_id, user.clone(), "salloc");
+
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let mut cmd = tokio::process::Command::new(&shell);
     for (k, v) in env.into_map() {
@@ -242,6 +248,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .status()
         .await
         .context("failed to spawn shell")?;
+
+    drop(_keepalive);
 
     // Shell exited — cancel allocation
     eprintln!("salloc: Relinquishing job allocation {}", job_id);

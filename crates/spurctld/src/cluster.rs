@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use spur_core::account_limits::{check_account_limits, AccountCheckResult};
 use spur_core::accounting::{Qos, TresRecord, TresType};
 use spur_core::burst_buffer::BbStageState;
-use spur_core::config::SlurmConfig;
+use spur_core::config::{EnforcePartLimits, SlurmConfig};
 use spur_core::job::{
     effective_gpus, effective_memory_mb, Job, JobId, JobSpec, JobState, NodeCompleteError,
     PendingReason, TransitionOutcome, DEFAULT_PRIORITY,
@@ -402,6 +402,10 @@ pub struct ClusterManager {
     /// Wake signal for the scheduler loop.
     pub(crate) scheduler_notify: Arc<Notify>,
     sched_stats: OnceLock<Arc<SchedStatsCollector>>,
+    /// Last keepalive time per interactive allocation, used by the InactiveLimit
+    /// reaper. Ephemeral soft state (like `Node::last_heartbeat`): keepalives
+    /// arrive too often to persist, and on failover the reaper reseeds lazily.
+    interactive_last_seen: RwLock<HashMap<JobId, DateTime<Utc>>>,
 }
 
 struct PendingJobClassification {
@@ -464,6 +468,7 @@ impl ClusterManager {
             association_cache,
             scheduler_notify: Arc::new(Notify::new()),
             sched_stats: OnceLock::new(),
+            interactive_last_seen: RwLock::new(HashMap::new()),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -480,11 +485,31 @@ impl ClusterManager {
 
     /// Submit a new job. If it has an array spec, expand into individual tasks.
     pub fn submit_job(&self, mut spec: JobSpec) -> Result<SubmitOutcome, SubmitError> {
-        apply_default_partition(&mut spec, &self.partitions.read());
-        apply_default_time_limit(&mut spec, &self.partitions.read());
+        // One config/partitions snapshot for the whole submit path, so defaulting
+        // and enforcement can't observe a concurrent reconfigure() mid-submit.
+        let config = self.config();
+        let partitions = self.partitions.read().clone();
+
+        apply_default_partition(&mut spec, &partitions);
+
+        // EnforcePartLimits mirrors Slurm: only a wall-time the user actually
+        // requested is subject to submit-time rejection, never one we auto-fill.
+        let user_requested_time = spec.time_limit.is_some();
+        if let Some(tl) = spec.time_limit.as_ref() {
+            if tl.num_seconds() < 0 {
+                return Err(SubmitError::invalid(
+                    "requested time limit must not be negative",
+                ));
+            }
+        }
+
+        apply_default_time_limit(
+            &mut spec,
+            &partitions,
+            config.scheduler.default_time_limit_minutes,
+        );
         apply_default_account(&mut spec, &self.association_cache);
         validate_user_account(&spec, &self.association_cache)?;
-        let config = self.config();
         // Default QoS must resolve before the partition ACL, or `allow_qos` sees
         // an empty QoS and wrongly rejects a user's inherited default.
         apply_default_qos(
@@ -493,7 +518,7 @@ impl ClusterManager {
             &self.qos_cache,
             &config.accounting,
         )?;
-        self.validate_partition(&spec)?;
+        self.validate_partition(&spec, &partitions)?;
 
         // Fewer tasks than nodes cannot use the surplus nodes; cap at the task
         // count so reported node/GPU counts match the allocation (unless a
@@ -523,7 +548,18 @@ impl ClusterManager {
 
         // Reject a node count outside the partition's bounds at submit, matching
         // Slurm, instead of accepting a job that would pend forever.
-        self.validate_partition_node_bounds(&spec)?;
+        self.validate_partition_node_bounds(&spec, &partitions)?;
+
+        // Reject an over-MaxTime wall-time at submit when EnforcePartLimits is on
+        // (default off keeps Slurm's admit-and-pend behavior). Only a
+        // user-requested `-t` is enforced; an auto-filled default never rejects.
+        if user_requested_time {
+            validate_partition_time_limit(
+                &spec,
+                config.scheduler.enforce_part_limits,
+                &partitions,
+            )?;
+        }
 
         let mpi = spec.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
         pmix_dispatch::validate_multi_node_pmix_nodelist(
@@ -534,10 +570,11 @@ impl ClusterManager {
         )
         .map_err(SubmitError::invalid)?;
 
-        // Checked after defaults are applied so we measure the final spec.
-        // Array expansion only adds bounded integer metadata per task, so a
-        // single pre-expansion check still bounds each Raft log entry.
+        // Bound the spec before the hook forks/parses it; the hook only edits
+        // bounded whitelist fields, so this still measures what gets persisted.
         check_submission_size(&spec)?;
+
+        self.run_job_submit_hook(&mut spec, &partitions)?;
 
         // Reject unknown/malformed dependency types up front so users get a
         // clear error instead of a silently-deadlocked job (e.g. `expand:N`).
@@ -579,12 +616,15 @@ impl ClusterManager {
     /// bounds of every requested partition. Matches Slurm, which rejects such
     /// jobs at submit rather than leaving them permanently pending. A partition
     /// list is accepted if any one partition can hold the request.
-    fn validate_partition_node_bounds(&self, spec: &JobSpec) -> Result<(), SubmitError> {
+    fn validate_partition_node_bounds(
+        &self,
+        spec: &JobSpec,
+        partitions: &[Partition],
+    ) -> Result<(), SubmitError> {
         let Some(partition_spec) = spec.partition.as_deref().filter(|p| !p.is_empty()) else {
             return Ok(());
         };
 
-        let partitions = self.partitions.read();
         let requested: Vec<&Partition> = requested_partition_names(Some(partition_spec))
             .filter_map(|name| partitions.iter().find(|part| part.name == name))
             .collect();
@@ -614,14 +654,157 @@ impl ClusterManager {
         )))
     }
 
+    /// Run the configured job-submission hooks against the resolved spec: reject
+    /// maps to an invalid-argument error; modify applies whitelisted changes.
+    /// The shell hook runs first, then the Lua hook, each on the evolving spec
+    /// (mirroring Slurm's config-ordered plugin chain).
+    fn run_job_submit_hook(
+        &self,
+        spec: &mut JobSpec,
+        partitions: &[Partition],
+    ) -> Result<(), SubmitError> {
+        let config = self.config();
+        let shell = config.hooks.job_submit.as_deref();
+        let lua = config.hooks.job_submit_lua.as_deref();
+        if shell.is_none() && lua.is_none() {
+            return Ok(());
+        }
+
+        if let Some(script) = shell {
+            let ctx = self.submit_hook_ctx(spec)?;
+            let outcome = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(async { spur_core::hooks::run_submit_hook(script, &ctx).await })
+            })
+            .map_err(|e| SubmitError::internal(format!("job_submit hook failed: {e}")))?;
+            self.apply_submit_outcome(spec, "job_submit", outcome, partitions)?;
+        }
+
+        if let Some(script) = lua {
+            let ctx = self.submit_hook_ctx(spec)?;
+            // The Lua VM runs synchronously; block_in_place keeps it off the async
+            // worker, matching the shell path and the `propose()` convention.
+            let outcome =
+                tokio::task::block_in_place(|| crate::hooks::run_submit_hook_lua(script, &ctx))
+                    .map_err(|e| {
+                        SubmitError::internal(format!("job_submit lua hook failed: {e}"))
+                    })?;
+            self.apply_submit_outcome(spec, "job_submit_lua", outcome, partitions)?;
+        }
+
+        Ok(())
+    }
+
+    fn submit_hook_ctx(
+        &self,
+        spec: &JobSpec,
+    ) -> Result<spur_core::hooks::SubmitHookContext, SubmitError> {
+        let spec_json = serde_json::to_string(spec).map_err(|e| {
+            SubmitError::internal(format!(
+                "failed to encode job spec for job_submit hook: {e}"
+            ))
+        })?;
+        Ok(spur_core::hooks::SubmitHookContext {
+            spec_json,
+            user: spec.user.clone(),
+            uid: spec.uid,
+            gid: spec.gid,
+            partition: spec.partition.clone().unwrap_or_default(),
+        })
+    }
+
+    /// Apply one hook's outcome: reject fails the submission; modify applies
+    /// whitelisted changes, then re-validates partition/account ACLs and QOS.
+    fn apply_submit_outcome(
+        &self,
+        spec: &mut JobSpec,
+        hook: &str,
+        outcome: spur_core::hooks::SubmitHookOutcome,
+        partitions: &[Partition],
+    ) -> Result<(), SubmitError> {
+        match outcome {
+            spur_core::hooks::SubmitHookOutcome::Accept => {
+                info!(target: "audit", hook, user = %spec.user, uid = spec.uid, "job_submit hook accepted");
+                Ok(())
+            }
+            spur_core::hooks::SubmitHookOutcome::Reject(reason) => {
+                info!(target: "audit", hook, user = %spec.user, uid = spec.uid, reason = %reason, "job_submit hook rejected");
+                Err(SubmitError::invalid(reason))
+            }
+            spur_core::hooks::SubmitHookOutcome::Modify(changes) => {
+                let modified = spur_core::hooks::apply_submit_changes(spec, &changes);
+                // An empty change set is an accept, not a modify (no bogus audit line).
+                if modified.is_empty() {
+                    info!(target: "audit", hook, user = %spec.user, uid = spec.uid, "job_submit hook accepted");
+                    return Ok(());
+                }
+                // comment/constraint/gres are unbounded strings; re-enforce the
+                // Raft entry size cap the hook could otherwise grow past.
+                check_submission_size(spec)?;
+                info!(
+                    target: "audit",
+                    hook,
+                    user = %spec.user,
+                    uid = spec.uid,
+                    partition = %spec.partition.clone().unwrap_or_default(),
+                    gpus = spur_core::job::effective_gpus(spec, spec.num_nodes),
+                    modified = ?modified,
+                    "job_submit hook modified spec"
+                );
+                if changes.partition.is_some() || changes.account.is_some() {
+                    validate_user_account(spec, &self.association_cache)?;
+                    self.validate_partition_node_bounds(spec, partitions)?;
+                }
+                // Existence is enforced first: an unknown QOS silently resolves
+                // to the limitless default, which would bypass QOS limits.
+                if let Some(name) = changes.qos.as_deref().filter(|n| !n.is_empty()) {
+                    if self.qos_cache.get(name).is_none() {
+                        return Err(SubmitError::invalid(format!(
+                            "job_submit hook set unknown QOS '{name}'"
+                        )));
+                    }
+                }
+                // partition/account/qos all feed the partition's allow_qos/deny_qos
+                // ACL and the submitter's association-level authorization, so any of
+                // the three re-checks both against the already-applied spec.
+                if changes.partition.is_some() || changes.account.is_some() || changes.qos.is_some()
+                {
+                    self.validate_partition(spec, partitions)?;
+                    if let Some(qos) = spec.qos.as_deref().filter(|q| !q.is_empty()) {
+                        if let Some(account) = spec.account.as_deref().filter(|a| !a.is_empty()) {
+                            self.association_cache
+                                .check_qos_authorized(&spec.user, account, qos)
+                                .map_err(SubmitError::invalid)?;
+                        }
+                    }
+                }
+                // A hook-set gres conflicting with an explicit --gpus request would
+                // otherwise surface only at schedule time; reject it at submit.
+                if changes.gres.is_some() {
+                    spur_core::gpu_request::resolve_gpu_demand_for(spec, spec.num_nodes).map_err(
+                        |e| {
+                            SubmitError::invalid(format!(
+                                "job_submit hook set a conflicting gres request: {e}"
+                            ))
+                        },
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Validate partition constraints: access control and node limits.
-    pub(crate) fn validate_partition(&self, spec: &JobSpec) -> Result<(), SubmitError> {
+    pub(crate) fn validate_partition(
+        &self,
+        spec: &JobSpec,
+        partitions: &[Partition],
+    ) -> Result<(), SubmitError> {
         let partition_spec = match spec.partition.as_deref() {
             Some(p) if !p.is_empty() => p,
             _ => return Ok(()), // Unset or empty partition name — nothing to validate
         };
 
-        let partitions = self.partitions.read();
         let requested = requested_partition_names(Some(partition_spec))
             .map(|name| {
                 partitions
@@ -1766,6 +1949,53 @@ impl ClusterManager {
         } else {
             false
         }
+    }
+
+    /// Record a keepalive from an interactive allocation's client. In-memory
+    /// soft state, mirroring `update_heartbeat`; the InactiveLimit reaper reads
+    /// it to detect an abandoned allocation.
+    pub fn record_job_keepalive(&self, job_id: JobId) {
+        self.record_job_keepalive_at(job_id, Utc::now());
+    }
+
+    fn record_job_keepalive_at(&self, job_id: JobId, at: DateTime<Utc>) {
+        self.interactive_last_seen.write().insert(job_id, at);
+    }
+
+    /// Clear keepalive last-seen on leadership (re)gain: a follower records
+    /// none, so carried-over stale entries would otherwise reap live allocations.
+    pub(crate) fn reset_interactive_last_seen(&self) {
+        self.interactive_last_seen.write().clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn keepalive_last_seen(&self, job_id: JobId) -> Option<DateTime<Utc>> {
+        self.interactive_last_seen.read().get(&job_id).copied()
+    }
+
+    /// Prune the keepalive map to the given live interactive allocations and
+    /// return those idle past `limit_secs`. A missing entry is seeded to `now`
+    /// (so a just-promoted leader or a newly-seen allocation gets a full window
+    /// before it can be reaped). `limit_secs == 0` disables reaping: the map is
+    /// still pruned, but nothing is returned.
+    pub(crate) fn interactive_reap_candidates(
+        &self,
+        running_ids: &[JobId],
+        now: DateTime<Utc>,
+        limit_secs: u32,
+    ) -> Vec<JobId> {
+        let live: HashSet<JobId> = running_ids.iter().copied().collect();
+        let mut seen = self.interactive_last_seen.write();
+        seen.retain(|id, _| live.contains(id));
+        if limit_secs == 0 {
+            return Vec::new();
+        }
+        let limit = chrono::Duration::seconds(i64::from(limit_secs));
+        running_ids
+            .iter()
+            .copied()
+            .filter(|id| now - *seen.entry(*id).or_insert(now) > limit)
+            .collect()
     }
 
     /// Update a node's WireGuard mesh public key from a heartbeat when it appears or changes (mesh
@@ -3181,6 +3411,9 @@ impl ClusterManager {
             anyhow::bail!("reconfigure requires a config file path, but none is configured");
         };
         let new_config = spur_core::config::SlurmConfig::load_from_file(path)?;
+        // Reject a broken submit hook before it goes live, so reconfigure can't
+        // silently swap in a hook that fails every subsequent submission.
+        crate::hooks::validate_submit_hooks(&new_config.hooks)?;
         let conf_partitions = new_config.build_partitions();
 
         let conf_names: std::collections::HashSet<String> =
@@ -5585,9 +5818,10 @@ fn account_block_with(
 }
 
 /// For a partition OR-list, returns `None` when any requested partition is Up
-/// and permits the request. Unknown names and limits rejected by every Up
-/// alternative return `PartitionConfig`; all-inactive alternatives return
-/// `PartitionInactive`.
+/// and permits the request. When every Up alternative rejects it, returns that
+/// block reason (`PartitionTimeLimit` for a wall-time cap, else
+/// `PartitionConfig`); unknown names return `PartitionConfig` and all-inactive
+/// alternatives return `PartitionInactive`.
 fn partition_block(job: &Job, partitions: &[Partition]) -> Option<spur_core::job::PendingReason> {
     use spur_core::job::PendingReason;
     use spur_core::partition::PartitionState;
@@ -5608,38 +5842,104 @@ fn partition_block(job: &Job, partitions: &[Partition]) -> Option<spur_core::job
     }
 
     let mut has_up_partition = false;
+    let mut block_reason: Option<PendingReason> = None;
     for part in requested {
         if part.state != PartitionState::Up {
             continue;
         }
         has_up_partition = true;
-        if partition_limits_allow(job, part) {
-            return None;
+        match partition_limit_block(job, part) {
+            None => return None,
+            Some(reason) => {
+                block_reason.get_or_insert(reason);
+            }
         }
     }
 
     Some(if has_up_partition {
-        PendingReason::PartitionConfig
+        block_reason.unwrap_or(PendingReason::PartitionConfig)
     } else {
         PendingReason::PartitionInactive
     })
 }
 
-fn partition_limits_allow(job: &Job, part: &Partition) -> bool {
+/// Reject a user-requested wall-time exceeding a requested partition's `MaxTime`,
+/// per `EnforcePartLimits` (`All` = all must fit, `Any` = at least one).
+fn validate_partition_time_limit(
+    spec: &JobSpec,
+    mode: EnforcePartLimits,
+    partitions: &[Partition],
+) -> Result<(), SubmitError> {
+    if mode == EnforcePartLimits::No {
+        return Ok(());
+    }
+    let Some(time_limit) = spec.time_limit.as_ref() else {
+        return Ok(());
+    };
+    let Some(partition_spec) = spec.partition.as_deref().filter(|p| !p.is_empty()) else {
+        return Ok(());
+    };
+
+    // Check every requested partition regardless of state (Slurm parity), so the
+    // outcome doesn't depend on transient Down/Drain. Existence checked upstream.
+    let requested = spur_core::partition::matched_partitions(Some(partition_spec), partitions);
+    if requested.is_empty() {
+        return Ok(());
+    }
+
+    let allows = |part: &&Partition| partition_time_allows(part, Some(time_limit));
+    let satisfied = if mode == EnforcePartLimits::All {
+        requested.iter().all(allows)
+    } else {
+        requested.iter().any(allows)
+    };
+    if satisfied {
+        return Ok(());
+    }
+
+    let offending = requested
+        .iter()
+        .find(|p| !allows(p))
+        .unwrap_or(&requested[0]);
+    let requested_str =
+        spur_core::config::format_time_seconds(Some(time_limit.num_seconds().max(0)));
+    let max_str = spur_core::config::format_time_seconds(
+        offending.max_time_minutes.map(|m| i64::from(m) * 60),
+    );
+    Err(SubmitError::invalid(format!(
+        "Requested time limit is invalid (missing or exceeds some limit): \
+         {requested_str} exceeds MaxTime {max_str} of partition '{}'",
+        offending.name
+    )))
+}
+
+/// True when a job's wall-time fits the partition's `MaxTime`. `None` `MaxTime`
+/// (UNLIMITED) or `None` time limit always fits. Compared at second precision so
+/// a request just over the cap is not truncated down to an allowed minute.
+fn partition_time_allows(part: &Partition, time_limit: Option<&chrono::Duration>) -> bool {
+    match (part.max_time_minutes, time_limit) {
+        (Some(max_mins), Some(tl)) => tl.num_seconds() <= i64::from(max_mins) * 60,
+        _ => true,
+    }
+}
+
+/// The reason a partition cannot ever schedule this job (static limits), or
+/// `None` if it can. Node-count violations report `PartitionConfig`; wall-time
+/// violations report the more specific `PartitionTimeLimit` (Slurm parity).
+fn partition_limit_block(job: &Job, part: &Partition) -> Option<spur_core::job::PendingReason> {
+    use spur_core::job::PendingReason;
     if let Some(max) = part.max_nodes {
         if job.spec.num_nodes > max {
-            return false;
+            return Some(PendingReason::PartitionConfig);
         }
     }
     if part.min_nodes > 0 && job.spec.num_nodes < part.min_nodes {
-        return false;
+        return Some(PendingReason::PartitionConfig);
     }
-    if let (Some(max_mins), Some(tl)) = (part.max_time_minutes, &job.spec.time_limit) {
-        if tl.num_minutes() > i64::from(max_mins) {
-            return false;
-        }
+    if !partition_time_allows(part, job.spec.time_limit.as_ref()) {
+        return Some(PendingReason::PartitionTimeLimit);
     }
-    true
+    None
 }
 
 fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> TresRecord {
@@ -5897,18 +6197,63 @@ fn apply_default_partition(spec: &mut JobSpec, partitions: &[Partition]) {
     }
 }
 
-fn apply_default_time_limit(spec: &mut JobSpec, partitions: &[Partition]) {
+/// Fill in a job's wall-time when none was requested. Each requested partition
+/// resolves to `DefaultTime`, else (only when `cluster_default_minutes > 0`) its
+/// `MaxTime`, else the cluster fallback. The smallest resulting limit is chosen
+/// so the default fits every requested partition; if any requested partition
+/// resolves to no bound the job stays unbounded (unchanged upgrade behavior).
+fn apply_default_time_limit(
+    spec: &mut JobSpec,
+    partitions: &[Partition],
+    cluster_default_minutes: u32,
+) {
     if spec.time_limit.is_some() {
         return;
     }
-    let partition = spec
+
+    // A job may list several partitions (e.g. "gpu,cpu"); fall back to the
+    // default/first partition when the field is unset or names nothing known.
+    let matched = spec
         .partition
         .as_deref()
-        .and_then(|name| partitions.iter().find(|p| p.name == name))
-        .or_else(|| partitions.iter().find(|p| p.is_default))
-        .or_else(|| partitions.first());
-    if let Some(minutes) = partition.and_then(|p| p.default_time_minutes) {
-        spec.time_limit = Some(chrono::Duration::minutes(minutes as i64));
+        .map(|p| spur_core::partition::matched_partitions(Some(p), partitions))
+        .unwrap_or_default();
+    let requested: Vec<&Partition> = if matched.is_empty() {
+        partitions
+            .iter()
+            .find(|p| p.is_default)
+            .or_else(|| partitions.first())
+            .into_iter()
+            .collect()
+    } else {
+        matched
+    };
+    if requested.is_empty() {
+        return;
+    }
+
+    let resolve = |part: &Partition| -> Option<u32> {
+        if let Some(minutes) = part.default_time_minutes {
+            return Some(minutes);
+        }
+        // Opt-in reclamation: only bound the job when a cluster fallback is set.
+        if cluster_default_minutes == 0 {
+            return None;
+        }
+        Some(part.max_time_minutes.unwrap_or(cluster_default_minutes))
+    };
+
+    let mut chosen: Option<u32> = None;
+    for part in &requested {
+        match resolve(part) {
+            // An unbounded requested partition means the job may run unlimited
+            // there, so don't impose a default.
+            None => return,
+            Some(minutes) => chosen = Some(chosen.map_or(minutes, |c| c.min(minutes))),
+        }
+    }
+    if let Some(minutes) = chosen {
+        spec.time_limit = Some(chrono::Duration::minutes(i64::from(minutes)));
     }
 }
 
@@ -6201,6 +6546,72 @@ mod tests {
         cm
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interactive_reap_candidates_reaps_only_idle_allocations() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let t0 = Utc::now();
+
+        // First sighting seeds each allocation's timer; nothing is reaped yet.
+        assert!(cm.interactive_reap_candidates(&[1, 2], t0, 60).is_empty());
+
+        // Job 2 pings recently; job 1 stays silent past the limit.
+        cm.record_job_keepalive_at(2, t0 + chrono::Duration::seconds(55));
+        let later = t0 + chrono::Duration::seconds(61);
+        assert_eq!(cm.interactive_reap_candidates(&[1, 2], later, 60), vec![1]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interactive_reap_candidates_disabled_only_prunes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let t0 = Utc::now();
+
+        // A stale entry exists, but with the limit disabled it is pruned (the
+        // allocation is no longer running) rather than reaped.
+        cm.record_job_keepalive_at(1, t0);
+        assert!(cm.interactive_reap_candidates(&[], t0, 0).is_empty());
+        // The prune actually happened: job 1's timer is gone, not just skipped
+        // by the disabled early return.
+        assert!(
+            cm.interactive_last_seen.read().is_empty(),
+            "pruning must drop entries for allocations no longer running"
+        );
+
+        // Because the old entry was pruned, job 1 reappearing reseeds to `now`
+        // and is not immediately reaped despite the original stale timestamp.
+        let later = t0 + chrono::Duration::seconds(3600);
+        assert!(cm.interactive_reap_candidates(&[1], later, 60).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reset_interactive_last_seen_reseeds_on_leadership_regain() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let t0 = Utc::now();
+
+        // A prior stint's timestamp for a still-running allocation, frozen at
+        // t0 because a follower records no keepalives.
+        cm.record_job_keepalive_at(1, t0);
+
+        // On regain the stale entry is present, so seed-to-now can't correct
+        // it and the live allocation looks idle past the limit.
+        let later = t0 + chrono::Duration::seconds(3600);
+        assert_eq!(
+            cm.interactive_reap_candidates(&[1], later, 60),
+            vec![1],
+            "a stale carried-over entry would reap a live allocation"
+        );
+
+        // The reaper's follower -> leader reset clears the map, so the next
+        // check reseeds job 1 to `now` and exempts it.
+        cm.reset_interactive_last_seen();
+        assert!(
+            cm.interactive_reap_candidates(&[1], later, 60).is_empty(),
+            "after reset, a live allocation is reseeded and not reaped"
+        );
+    }
+
     fn basic_spec(name: &str) -> JobSpec {
         JobSpec {
             name: name.into(),
@@ -6449,6 +6860,418 @@ mod tests {
         assert_eq!(job.spec.name, "test-job");
         assert_eq!(job.state, JobState::Pending);
         assert!(cm.next_job_id.load(Ordering::Relaxed) >= 2);
+    }
+
+    fn write_hook_script(dir: &TempDir, body: &str) -> String {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.path().join("job_submit.sh");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "#!/bin/bash\n{body}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_rejects() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(
+            &dir,
+            "echo 'denied by policy' >&2\nexit 1",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("blocked")).unwrap_err();
+        assert_eq!(err, SubmitError::invalid("denied by policy"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_modifies_spec() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"qos":"high"}'"#));
+        let cm = test_cluster_with_config(&dir, config).await;
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 5000,
+            ..Default::default()
+        });
+
+        let id = submit_and_wait(&cm, basic_spec("modme"));
+        assert_eq!(cm.get_job(id).unwrap().spec.qos.as_deref(), Some("high"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_modify_to_invalid_partition_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"partition":"nope"}'"#));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("bad-part")).unwrap_err();
+        assert_eq!(err, SubmitError::invalid("partition 'nope' not found"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_modify_to_unknown_qos_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"qos":"ghost"}'"#));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("bad-qos")).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid("job_submit hook set unknown QOS 'ghost'")
+        );
+    }
+
+    // A hook-set qos must still respect the partition's own deny_qos ACL, not
+    // just cluster-wide existence, or it reopens the hole partition/account
+    // modify already gets re-checked for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_modify_to_denied_qos_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].deny_qos = vec!["high".into()];
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"qos":"high"}'"#));
+        let cm = test_cluster_with_config(&dir, config).await;
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 5000,
+            ..Default::default()
+        });
+
+        let err = cm.submit_job(basic_spec("denied-qos")).unwrap_err();
+        assert!(
+            err.to_string().contains("denied on partition"),
+            "expected a partition QoS-ACL rejection, got: {err:?}"
+        );
+    }
+
+    // A hook that sets gres conflicting with an explicit --gpus request is
+    // rejected at submit time, not silently deferred to schedule time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_gres_conflict_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(
+            &dir,
+            r#"echo '{"gres":["gpu:mi300x:2"]}'"#,
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("gres-conflict");
+        spec.gpus = Some(spur_core::gpu_request::GpuRequest {
+            count: 4,
+            gpu_type: None,
+        });
+        let err = cm.submit_job(spec).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("conflicting gres"),
+            "expected a gres-conflict rejection, got: {err:?}"
+        );
+    }
+
+    // A hook can grow an unbounded field (comment/constraint/gres) past the
+    // pre-hook size cap; the post-modify re-check must catch that.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_modify_reenforces_size_cap() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        let huge_comment = "c".repeat(200 * 1024);
+        config.hooks.job_submit = Some(write_hook_script(
+            &dir,
+            &format!(r#"echo '{{"comment":"{huge_comment}"}}'"#),
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("size-bypass");
+        spec.script = Some("x".repeat(MAX_JOB_SPEC_SIZE - 100 * 1024));
+        let err = cm.submit_job(spec).unwrap_err();
+        assert!(
+            err.to_string().contains("too large"),
+            "expected a size-cap rejection, got: {err:?}"
+        );
+    }
+
+    // A hook-set partition must be re-validated for node-count bounds too,
+    // not just ACLs, or it reopens the pend-forever hole this check closes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_modify_partition_bypasses_node_bounds_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions.push(spur_core::config::PartitionConfig {
+            name: "small".into(),
+            default: false,
+            state: "UP".into(),
+            nodes: "ALL".into(),
+            selector: Default::default(),
+            max_time: None,
+            default_time: None,
+            max_nodes: Some(1),
+            min_nodes: 1,
+            allow_accounts: Vec::new(),
+            allow_groups: Vec::new(),
+            deny_accounts: Vec::new(),
+            deny_qos: Vec::new(),
+            allow_qos: Vec::new(),
+            priority_tier: 1,
+            preempt_mode: String::new(),
+        });
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"partition":"small"}'"#));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("bounds-bypass");
+        spec.num_nodes = 2;
+        spec.num_tasks = 2;
+        let err = cm.submit_job(spec).unwrap_err();
+        assert!(
+            err.to_string().contains("outside partition"),
+            "expected a node-bounds rejection, got: {err:?}"
+        );
+    }
+
+    fn write_lua_script(dir: &TempDir, body: &str) -> String {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.path().join("job_submit.lua");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "{body}").unwrap();
+        // The runner refuses a group/world-writable hook; a permissive umask
+        // would otherwise trip that check on the temp file.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_hook_rejects() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  slurm.log_user('denied by lua')\n  return slurm.ERROR\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("blocked-lua")).unwrap_err();
+        assert_eq!(err, SubmitError::invalid("denied by lua"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_hook_modifies_spec() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  j.comment = 'lua-tagged'\n  return slurm.SUCCESS\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let id = submit_and_wait(&cm, basic_spec("lua-mod"));
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.comment.as_deref(),
+            Some("lua-tagged")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_modify_to_invalid_partition_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  j.partition = 'nope'\n  return slurm.SUCCESS\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("lua-bad-part")).unwrap_err();
+        assert_eq!(err, SubmitError::invalid("partition 'nope' not found"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_modify_to_unknown_qos_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  j.qos = 'ghost'\n  return slurm.SUCCESS\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("lua-bad-qos")).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid("job_submit hook set unknown QOS 'ghost'")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_modify_to_denied_qos_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].deny_qos = vec!["high".into()];
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  j.qos = 'high'\n  return slurm.SUCCESS\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 5000,
+            ..Default::default()
+        });
+
+        let err = cm.submit_job(basic_spec("lua-denied-qos")).unwrap_err();
+        assert!(
+            err.to_string().contains("denied on partition"),
+            "expected a partition QoS-ACL rejection, got: {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_gres_conflict_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  j.gres = {'gpu:mi300x:2'}\n  return slurm.SUCCESS\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("lua-gres-conflict");
+        spec.gpus = Some(spur_core::gpu_request::GpuRequest {
+            count: 4,
+            gpu_type: None,
+        });
+        let err = cm.submit_job(spec).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("conflicting gres"),
+            "expected a gres-conflict rejection, got: {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_modify_reenforces_size_cap() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        let huge_comment = "c".repeat(200 * 1024);
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            &format!(
+                "function slurm_job_submit(j, u)\n  j.comment = string.rep('c', {})\n  return slurm.SUCCESS\nend",
+                huge_comment.len()
+            ),
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("lua-size-bypass");
+        spec.script = Some("x".repeat(MAX_JOB_SPEC_SIZE - 100 * 1024));
+        let err = cm.submit_job(spec).unwrap_err();
+        assert!(
+            err.to_string().contains("too large"),
+            "expected a size-cap rejection, got: {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_modify_partition_bypasses_node_bounds_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions.push(spur_core::config::PartitionConfig {
+            name: "small".into(),
+            default: false,
+            state: "UP".into(),
+            nodes: "ALL".into(),
+            selector: Default::default(),
+            max_time: None,
+            default_time: None,
+            max_nodes: Some(1),
+            min_nodes: 1,
+            allow_accounts: Vec::new(),
+            allow_groups: Vec::new(),
+            deny_accounts: Vec::new(),
+            deny_qos: Vec::new(),
+            allow_qos: Vec::new(),
+            priority_tier: 1,
+            preempt_mode: String::new(),
+        });
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  j.partition = 'small'\n  return slurm.SUCCESS\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("lua-bounds-bypass");
+        spec.num_nodes = 2;
+        spec.num_tasks = 2;
+        let err = cm.submit_job(spec).unwrap_err();
+        assert!(
+            err.to_string().contains("outside partition"),
+            "expected a node-bounds rejection, got: {err:?}"
+        );
+    }
+
+    // Shell runs first, then Lua, each on the evolving spec.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_shell_then_lua_chain() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"priority": 100}'"#));
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  j.comment = 'chained'\n  return slurm.SUCCESS\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let id = submit_and_wait(&cm, basic_spec("chain"));
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.spec.priority, Some(100));
+        assert_eq!(job.spec.comment.as_deref(), Some("chained"));
+    }
+
+    // A shell rejection short-circuits the chain: the Lua hook never runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_shell_reject_skips_lua() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(&dir, "echo 'shell says no' >&2\nexit 1"));
+        // If this Lua ran it would mkdir a marker; assert the file never appears.
+        let marker = dir.path().join("lua-ran");
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            &format!(
+                "function slurm_job_submit(j, u)\n  j.comment = '{}'\n  return slurm.SUCCESS\nend",
+                marker.display()
+            ),
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("shell-first")).unwrap_err();
+        assert_eq!(err, SubmitError::invalid("shell says no"));
+    }
+
+    // When both hooks set the same field, Lua (second) wins on the evolving spec.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_overrides_shell_field() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(
+            &dir,
+            r#"echo '{"comment": "from-shell"}'"#,
+        ));
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  j.comment = 'from-lua'\n  return slurm.SUCCESS\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let id = submit_and_wait(&cm, basic_spec("override"));
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.comment.as_deref(),
+            Some("from-lua")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9751,16 +10574,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tag_blocked_sets_partition_config_for_time_and_min_nodes() {
-        // max_time and min_nodes are independent PartitionConfig triggers.
+    async fn tag_blocked_sets_time_limit_and_config_reasons() {
+        // A max_time violation reports the specific PartitionTimeLimit reason;
+        // a min_nodes violation reports the generic PartitionConfig reason.
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.partitions[0].max_time = Some("00:10:00".into()); // 10 min cap
         config.partitions[0].min_nodes = 2;
         let cm = test_cluster_with_config(&dir, config).await;
 
-        // Meets min_nodes but exceeds max_time: the time cap is not a
-        // submit-time bound, so this is admitted and pends with PartitionConfig.
+        // Meets min_nodes but exceeds max_time: with EnforcePartLimits off
+        // (the default) the time cap is not a submit-time bound, so this is
+        // admitted and pends with the specific PartitionTimeLimit reason.
         let mut over_time = basic_spec("overtime");
         over_time.partition = Some("default".into());
         over_time.num_nodes = 2;
@@ -9783,8 +10608,8 @@ mod tests {
         cm.tag_blocked_pending_reasons();
         assert_eq!(
             cm.get_job(t_id).unwrap().pending_reason,
-            PendingReason::PartitionConfig,
-            "time_limit over partition max_time -> PartitionConfig"
+            PendingReason::PartitionTimeLimit,
+            "time_limit over partition max_time -> PartitionTimeLimit"
         );
         assert_eq!(
             cm.get_job(n_id).unwrap().pending_reason,
@@ -9932,6 +10757,155 @@ mod tests {
 
         let spec = basic_spec("defaultacct");
         assert!(cm.submit_job(spec).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_admits_over_maxtime_when_enforcement_off() {
+        // Default EnforcePartLimits=No: an over-MaxTime job is admitted (and
+        // will pend with PartitionTimeLimit), not rejected at submit.
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.partitions[0].max_time = Some("00:10:00".into());
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        let mut spec = basic_spec("overtime");
+        spec.time_limit = Some(chrono::Duration::hours(1));
+        assert!(cm.submit_job(spec).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_rejects_over_maxtime_when_enforcement_all() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.partitions[0].max_time = Some("00:10:00".into());
+        cfg.scheduler.enforce_part_limits = EnforcePartLimits::All;
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        let mut spec = basic_spec("overtime");
+        spec.time_limit = Some(chrono::Duration::hours(1));
+        let err = cm.submit_job(spec).unwrap_err();
+        let SubmitError::InvalidArgument(msg) = err else {
+            panic!("expected InvalidArgument, got {err:?}");
+        };
+        assert!(
+            msg.contains("Requested time limit is invalid"),
+            "expected Slurm-style message, got: {msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_accepts_within_maxtime_when_enforcement_all() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.partitions[0].max_time = Some("01:00:00".into());
+        cfg.scheduler.enforce_part_limits = EnforcePartLimits::All;
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        let mut spec = basic_spec("withintime");
+        spec.time_limit = Some(chrono::Duration::minutes(30));
+        assert!(cm.submit_job(spec).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_unlimited_partition_accepts_any_time_under_enforcement() {
+        // UNLIMITED MaxTime imposes no cap even with enforcement on (Slurm parity).
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.partitions[0].max_time = Some("UNLIMITED".into());
+        cfg.scheduler.enforce_part_limits = EnforcePartLimits::All;
+        // Disable the cluster fallback so the huge request survives to submit.
+        cfg.scheduler.default_time_limit_minutes = 0;
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        let mut spec = basic_spec("yearlong");
+        spec.time_limit = Some(chrono::Duration::days(365));
+        assert!(cm.submit_job(spec).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_enforcement_any_rejects_when_no_partition_fits() {
+        // ANY rejects only when the request fits none of the requested
+        // partitions; the error names the offending partition.
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.partitions[0].max_time = Some("00:10:00".into());
+        let mut other = cfg.partitions[0].clone();
+        other.name = "other".into();
+        other.default = false;
+        other.max_time = Some("00:20:00".into());
+        cfg.partitions.push(other);
+        cfg.scheduler.enforce_part_limits = EnforcePartLimits::Any;
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        let mut spec = basic_spec("toolong");
+        spec.partition = Some("default,other".into());
+        spec.time_limit = Some(chrono::Duration::hours(1));
+        let err = cm.submit_job(spec).unwrap_err();
+        let SubmitError::InvalidArgument(msg) = err else {
+            panic!("expected InvalidArgument, got {err:?}");
+        };
+        assert!(
+            msg.contains("Requested time limit is invalid") && msg.contains("partition"),
+            "error must name the offending partition: {msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_enforcement_any_accepts_if_one_partition_fits() {
+        // Two partitions: one 10-min cap, one 2-hour cap. A 1-hour job fits the
+        // second, so ANY admits it; ALL would reject it.
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.partitions[0].max_time = Some("00:10:00".into());
+        let mut roomy = cfg.partitions[0].clone();
+        roomy.name = "roomy".into();
+        roomy.default = false;
+        roomy.max_time = Some("02:00:00".into());
+        cfg.partitions.push(roomy);
+        cfg.scheduler.enforce_part_limits = EnforcePartLimits::Any;
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        let mut spec = basic_spec("multi");
+        spec.partition = Some("default,roomy".into());
+        spec.time_limit = Some(chrono::Duration::hours(1));
+        assert!(cm.submit_job(spec).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_multi_partition_all_admits_untimed_job() {
+        // Regression: a `-t`-less job to two partitions under ALL must not be
+        // rejected by a wall-time we auto-assign. The default is derived from the
+        // smaller MaxTime so it fits both, and an auto-default is never enforced.
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.partitions[0].max_time = Some("02:00:00".into());
+        let mut small = cfg.partitions[0].clone();
+        small.name = "small".into();
+        small.default = false;
+        small.max_time = Some("01:00:00".into());
+        cfg.partitions.push(small);
+        cfg.scheduler.enforce_part_limits = EnforcePartLimits::All;
+        cfg.scheduler.default_time_limit_minutes = 90;
+        let cm = test_cluster_with_config(&dir, cfg).await;
+
+        let mut spec = basic_spec("untimed");
+        spec.partition = Some("default,small".into());
+        spec.time_limit = None;
+        assert!(cm.submit_job(spec).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_rejects_negative_time_limit() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, test_config()).await;
+
+        let mut spec = basic_spec("neg");
+        spec.time_limit = Some(chrono::Duration::minutes(-5));
+        let err = cm.submit_job(spec).unwrap_err();
+        let SubmitError::InvalidArgument(msg) = err else {
+            panic!("expected InvalidArgument, got {err:?}");
+        };
+        assert!(msg.contains("negative"), "got: {msg}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14682,7 +15656,7 @@ mod tests {
             default_time_minutes: Some(30),
             ..Default::default()
         }];
-        super::apply_default_time_limit(&mut spec, &partitions);
+        super::apply_default_time_limit(&mut spec, &partitions, 0);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(30)));
     }
 
@@ -14695,7 +15669,7 @@ mod tests {
             default_time_minutes: Some(30),
             ..Default::default()
         }];
-        super::apply_default_time_limit(&mut spec, &partitions);
+        super::apply_default_time_limit(&mut spec, &partitions, 0);
         assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(5)));
     }
 
@@ -14709,8 +15683,227 @@ mod tests {
             default_time_minutes: None,
             ..Default::default()
         }];
-        super::apply_default_time_limit(&mut spec, &partitions);
+        super::apply_default_time_limit(&mut spec, &partitions, 0);
         assert!(spec.time_limit.is_none());
+    }
+
+    #[test]
+    fn apply_default_time_limit_falls_back_to_partition_max_time() {
+        // No DefaultTime but a finite MaxTime: Slurm uses MaxTime as the default.
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: None,
+            max_time_minutes: Some(120),
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions, 60);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(120)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_falls_back_to_cluster_default_on_unlimited() {
+        // UNLIMITED partition (no DefaultTime, no MaxTime): the cluster-wide
+        // default bounds the job so it cannot run forever.
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: None,
+            max_time_minutes: None,
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions, 60);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(60)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_unlimited_when_cluster_default_disabled() {
+        // cluster default 0 = disabled: an UNLIMITED partition leaves the job
+        // with no wall-time (opt-out escape hatch).
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: None,
+            max_time_minutes: None,
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions, 0);
+        assert!(spec.time_limit.is_none());
+    }
+
+    #[test]
+    fn apply_default_time_limit_multi_partition_uses_min_across_requested() {
+        // A `-t`-less job to two partitions gets the smaller MaxTime so the
+        // default fits both (and would pass EnforcePartLimits=ALL).
+        let mut spec = basic_spec("j");
+        spec.partition = Some("big,small".into());
+        spec.time_limit = None;
+        let partitions = vec![
+            Partition {
+                name: "big".into(),
+                default_time_minutes: None,
+                max_time_minutes: Some(120),
+                ..Default::default()
+            },
+            Partition {
+                name: "small".into(),
+                default_time_minutes: None,
+                max_time_minutes: Some(60),
+                ..Default::default()
+            },
+        ];
+        super::apply_default_time_limit(&mut spec, &partitions, 60);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(60)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_unbounded_partition_leaves_job_unbounded() {
+        // With the cluster fallback disabled, a requested partition that resolves
+        // to no bound keeps the whole job unbounded even if a sibling is bounded.
+        let mut spec = basic_spec("j");
+        spec.partition = Some("bounded,unlimited".into());
+        spec.time_limit = None;
+        let partitions = vec![
+            Partition {
+                name: "bounded".into(),
+                default_time_minutes: Some(30),
+                ..Default::default()
+            },
+            Partition {
+                name: "unlimited".into(),
+                default_time_minutes: None,
+                max_time_minutes: None,
+                ..Default::default()
+            },
+        ];
+        super::apply_default_time_limit(&mut spec, &partitions, 0);
+        assert!(spec.time_limit.is_none());
+    }
+
+    #[test]
+    fn apply_default_time_limit_prefers_default_over_smaller_max_time() {
+        // DefaultTime wins the fallback chain even when MaxTime is smaller and a
+        // cluster default is set.
+        let mut spec = basic_spec("j");
+        spec.partition = Some("gpu".into());
+        spec.time_limit = None;
+        let partitions = vec![Partition {
+            name: "gpu".into(),
+            default_time_minutes: Some(45),
+            max_time_minutes: Some(30),
+            ..Default::default()
+        }];
+        super::apply_default_time_limit(&mut spec, &partitions, 60);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(45)));
+    }
+
+    #[test]
+    fn apply_default_time_limit_multi_partition_uses_min_across_default_times() {
+        // Two partitions each with a distinct DefaultTime: the smaller wins so
+        // the auto-default fits both.
+        let mut spec = basic_spec("j");
+        spec.partition = Some("a,b".into());
+        spec.time_limit = None;
+        let partitions = vec![
+            Partition {
+                name: "a".into(),
+                default_time_minutes: Some(45),
+                ..Default::default()
+            },
+            Partition {
+                name: "b".into(),
+                default_time_minutes: Some(20),
+                ..Default::default()
+            },
+        ];
+        super::apply_default_time_limit(&mut spec, &partitions, 0);
+        assert_eq!(spec.time_limit, Some(chrono::Duration::minutes(20)));
+    }
+
+    #[test]
+    fn validate_partition_time_limit_enforces_down_partitions_under_all() {
+        // Slurm parity: under ALL, a requested Down partition's stricter MaxTime
+        // still rejects, regardless of its state (deterministic at submit).
+        let mut spec = basic_spec("j");
+        spec.partition = Some("up_big,down_small".into());
+        spec.time_limit = Some(chrono::Duration::minutes(90));
+        let partitions = vec![
+            Partition {
+                name: "up_big".into(),
+                state: spur_core::partition::PartitionState::Up,
+                max_time_minutes: Some(120),
+                ..Default::default()
+            },
+            Partition {
+                name: "down_small".into(),
+                state: spur_core::partition::PartitionState::Down,
+                max_time_minutes: Some(10),
+                ..Default::default()
+            },
+        ];
+        assert!(super::validate_partition_time_limit(
+            &spec,
+            spur_core::config::EnforcePartLimits::All,
+            &partitions,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn validate_partition_time_limit_enforces_inactive_only_request() {
+        // A request naming only a Down partition is still checked (not silently
+        // admitted): an over-limit `-t` is rejected, a within-limit one passes.
+        let partitions = vec![Partition {
+            name: "down_small".into(),
+            state: spur_core::partition::PartitionState::Down,
+            max_time_minutes: Some(10),
+            ..Default::default()
+        }];
+
+        let mut over = basic_spec("over");
+        over.partition = Some("down_small".into());
+        over.time_limit = Some(chrono::Duration::minutes(90));
+        assert!(super::validate_partition_time_limit(
+            &over,
+            spur_core::config::EnforcePartLimits::All,
+            &partitions,
+        )
+        .is_err());
+
+        let mut within = basic_spec("within");
+        within.partition = Some("down_small".into());
+        within.time_limit = Some(chrono::Duration::minutes(5));
+        assert!(super::validate_partition_time_limit(
+            &within,
+            spur_core::config::EnforcePartLimits::All,
+            &partitions,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn validate_partition_time_limit_rejects_over_limit_up_partition() {
+        let mut spec = basic_spec("j");
+        spec.partition = Some("up_small".into());
+        spec.time_limit = Some(chrono::Duration::minutes(90));
+        let partitions = vec![Partition {
+            name: "up_small".into(),
+            state: spur_core::partition::PartitionState::Up,
+            max_time_minutes: Some(10),
+            ..Default::default()
+        }];
+        assert!(super::validate_partition_time_limit(
+            &spec,
+            spur_core::config::EnforcePartLimits::All,
+            &partitions,
+        )
+        .is_err());
     }
 
     #[test]
@@ -17142,7 +18335,7 @@ mod tests {
         spec.partition = Some("restricted".into());
         spec.qos = Some("cheap".into());
         assert!(
-            cm.validate_partition(&spec).is_err(),
+            cm.validate_partition(&spec, &cm.get_partitions()).is_err(),
             "QoS not in allow_qos must fail validation"
         );
 
@@ -17151,7 +18344,7 @@ mod tests {
         spec.partition = Some("restricted".into());
         spec.qos = Some("premium".into());
         assert!(
-            cm.validate_partition(&spec).is_ok(),
+            cm.validate_partition(&spec, &cm.get_partitions()).is_ok(),
             "QoS in allow_qos must pass validation"
         );
 
@@ -17160,7 +18353,7 @@ mod tests {
         spec.partition = Some("restricted".into());
         spec.qos = None;
         assert!(
-            cm.validate_partition(&spec).is_err(),
+            cm.validate_partition(&spec, &cm.get_partitions()).is_err(),
             "absent QoS must fail when allow_qos is non-empty"
         );
     }
@@ -17186,7 +18379,7 @@ mod tests {
         spec.partition = Some("nodebug".into());
         spec.qos = Some("debug".into());
         assert!(
-            cm.validate_partition(&spec).is_err(),
+            cm.validate_partition(&spec, &cm.get_partitions()).is_err(),
             "denied QoS must fail validation"
         );
 
@@ -17195,7 +18388,7 @@ mod tests {
         spec.partition = Some("nodebug".into());
         spec.qos = Some("premium".into());
         assert!(
-            cm.validate_partition(&spec).is_ok(),
+            cm.validate_partition(&spec, &cm.get_partitions()).is_ok(),
             "non-denied QoS must pass validation"
         );
 
@@ -17204,7 +18397,7 @@ mod tests {
         spec.partition = Some("nodebug".into());
         spec.qos = None;
         assert!(
-            cm.validate_partition(&spec).is_ok(),
+            cm.validate_partition(&spec, &cm.get_partitions()).is_ok(),
             "absent QoS must not be blocked by deny_qos"
         );
     }
@@ -17229,7 +18422,7 @@ mod tests {
         spec.partition = Some("open".into());
         spec.qos = Some("whatever".into());
         assert!(
-            cm.validate_partition(&spec).is_ok(),
+            cm.validate_partition(&spec, &cm.get_partitions()).is_ok(),
             "empty allow_qos must not restrict any QoS"
         );
     }
