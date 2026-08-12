@@ -539,10 +539,11 @@ impl ClusterManager {
         )
         .map_err(SubmitError::invalid)?;
 
-        // Checked after defaults are applied so we measure the final spec.
-        // Array expansion only adds bounded integer metadata per task, so a
-        // single pre-expansion check still bounds each Raft log entry.
+        // Bound the spec before the hook forks/parses it; the hook only edits
+        // bounded whitelist fields, so this still measures what gets persisted.
         check_submission_size(&spec)?;
+
+        self.run_job_submit_hook(&mut spec)?;
 
         // Reject unknown/malformed dependency types up front so users get a
         // clear error instead of a silently-deadlocked job (e.g. `expand:N`).
@@ -617,6 +618,141 @@ impl ClusterManager {
             "requested node count {nodes} is outside partition '{}' limits (min {}, max {})",
             part.name, part.min_nodes, max
         )))
+    }
+
+    /// Run the configured job-submission hooks against the resolved spec: reject
+    /// maps to an invalid-argument error; modify applies whitelisted changes.
+    /// The shell hook runs first, then the Lua hook, each on the evolving spec
+    /// (mirroring Slurm's config-ordered plugin chain).
+    fn run_job_submit_hook(&self, spec: &mut JobSpec) -> Result<(), SubmitError> {
+        let config = self.config();
+        let shell = config.hooks.job_submit.as_deref();
+        let lua = config.hooks.job_submit_lua.as_deref();
+        if shell.is_none() && lua.is_none() {
+            return Ok(());
+        }
+
+        if let Some(script) = shell {
+            let ctx = self.submit_hook_ctx(spec)?;
+            let outcome = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(async { spur_core::hooks::run_submit_hook(script, &ctx).await })
+            })
+            .map_err(|e| SubmitError::internal(format!("job_submit hook failed: {e}")))?;
+            self.apply_submit_outcome(spec, "job_submit", outcome)?;
+        }
+
+        if let Some(script) = lua {
+            let ctx = self.submit_hook_ctx(spec)?;
+            // The Lua VM runs synchronously; block_in_place keeps it off the async
+            // worker, matching the shell path and the `propose()` convention.
+            let outcome =
+                tokio::task::block_in_place(|| crate::hooks::run_submit_hook_lua(script, &ctx))
+                    .map_err(|e| {
+                        SubmitError::internal(format!("job_submit lua hook failed: {e}"))
+                    })?;
+            self.apply_submit_outcome(spec, "job_submit_lua", outcome)?;
+        }
+
+        Ok(())
+    }
+
+    fn submit_hook_ctx(
+        &self,
+        spec: &JobSpec,
+    ) -> Result<spur_core::hooks::SubmitHookContext, SubmitError> {
+        let spec_json = serde_json::to_string(spec).map_err(|e| {
+            SubmitError::internal(format!(
+                "failed to encode job spec for job_submit hook: {e}"
+            ))
+        })?;
+        Ok(spur_core::hooks::SubmitHookContext {
+            spec_json,
+            user: spec.user.clone(),
+            uid: spec.uid,
+            gid: spec.gid,
+            partition: spec.partition.clone().unwrap_or_default(),
+        })
+    }
+
+    /// Apply one hook's outcome: reject fails the submission; modify applies
+    /// whitelisted changes, then re-validates partition/account ACLs and QOS.
+    fn apply_submit_outcome(
+        &self,
+        spec: &mut JobSpec,
+        hook: &str,
+        outcome: spur_core::hooks::SubmitHookOutcome,
+    ) -> Result<(), SubmitError> {
+        match outcome {
+            spur_core::hooks::SubmitHookOutcome::Accept => {
+                info!(target: "audit", hook, user = %spec.user, uid = spec.uid, "job_submit hook accepted");
+                Ok(())
+            }
+            spur_core::hooks::SubmitHookOutcome::Reject(reason) => {
+                info!(target: "audit", hook, user = %spec.user, uid = spec.uid, reason = %reason, "job_submit hook rejected");
+                Err(SubmitError::invalid(reason))
+            }
+            spur_core::hooks::SubmitHookOutcome::Modify(changes) => {
+                let modified = spur_core::hooks::apply_submit_changes(spec, &changes);
+                // An empty change set is an accept, not a modify (no bogus audit line).
+                if modified.is_empty() {
+                    info!(target: "audit", hook, user = %spec.user, uid = spec.uid, "job_submit hook accepted");
+                    return Ok(());
+                }
+                // comment/constraint/gres are unbounded strings; re-enforce the
+                // Raft entry size cap the hook could otherwise grow past.
+                check_submission_size(spec)?;
+                info!(
+                    target: "audit",
+                    hook,
+                    user = %spec.user,
+                    uid = spec.uid,
+                    partition = %spec.partition.clone().unwrap_or_default(),
+                    gpus = spur_core::job::effective_gpus(spec, spec.num_nodes),
+                    modified = ?modified,
+                    "job_submit hook modified spec"
+                );
+                if changes.partition.is_some() || changes.account.is_some() {
+                    validate_user_account(spec, &self.association_cache)?;
+                    self.validate_partition_node_bounds(spec)?;
+                }
+                // Existence is enforced first: an unknown QOS silently resolves
+                // to the limitless default, which would bypass QOS limits.
+                if let Some(name) = changes.qos.as_deref().filter(|n| !n.is_empty()) {
+                    if self.qos_cache.get(name).is_none() {
+                        return Err(SubmitError::invalid(format!(
+                            "job_submit hook set unknown QOS '{name}'"
+                        )));
+                    }
+                }
+                // partition/account/qos all feed the partition's allow_qos/deny_qos
+                // ACL and the submitter's association-level authorization, so any of
+                // the three re-checks both against the already-applied spec.
+                if changes.partition.is_some() || changes.account.is_some() || changes.qos.is_some()
+                {
+                    self.validate_partition(spec)?;
+                    if let Some(qos) = spec.qos.as_deref().filter(|q| !q.is_empty()) {
+                        if let Some(account) = spec.account.as_deref().filter(|a| !a.is_empty()) {
+                            self.association_cache
+                                .check_qos_authorized(&spec.user, account, qos)
+                                .map_err(SubmitError::invalid)?;
+                        }
+                    }
+                }
+                // A hook-set gres conflicting with an explicit --gpus request would
+                // otherwise surface only at schedule time; reject it at submit.
+                if changes.gres.is_some() {
+                    spur_core::gpu_request::resolve_gpu_demand_for(spec, spec.num_nodes).map_err(
+                        |e| {
+                            SubmitError::invalid(format!(
+                                "job_submit hook set a conflicting gres request: {e}"
+                            ))
+                        },
+                    )?;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Validate partition constraints: access control and node limits.
@@ -3233,6 +3369,9 @@ impl ClusterManager {
             anyhow::bail!("reconfigure requires a config file path, but none is configured");
         };
         let new_config = spur_core::config::SlurmConfig::load_from_file(path)?;
+        // Reject a broken submit hook before it goes live, so reconfigure can't
+        // silently swap in a hook that fails every subsequent submission.
+        crate::hooks::validate_submit_hooks(&new_config.hooks)?;
         let conf_partitions = new_config.build_partitions();
 
         let conf_names: std::collections::HashSet<String> =
@@ -6566,6 +6705,418 @@ mod tests {
         assert_eq!(job.spec.name, "test-job");
         assert_eq!(job.state, JobState::Pending);
         assert!(cm.next_job_id.load(Ordering::Relaxed) >= 2);
+    }
+
+    fn write_hook_script(dir: &TempDir, body: &str) -> String {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.path().join("job_submit.sh");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "#!/bin/bash\n{body}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_rejects() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(
+            &dir,
+            "echo 'denied by policy' >&2\nexit 1",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("blocked")).unwrap_err();
+        assert_eq!(err, SubmitError::invalid("denied by policy"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_modifies_spec() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"qos":"high"}'"#));
+        let cm = test_cluster_with_config(&dir, config).await;
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 5000,
+            ..Default::default()
+        });
+
+        let id = submit_and_wait(&cm, basic_spec("modme"));
+        assert_eq!(cm.get_job(id).unwrap().spec.qos.as_deref(), Some("high"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_modify_to_invalid_partition_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"partition":"nope"}'"#));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("bad-part")).unwrap_err();
+        assert_eq!(err, SubmitError::invalid("partition 'nope' not found"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_modify_to_unknown_qos_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"qos":"ghost"}'"#));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("bad-qos")).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid("job_submit hook set unknown QOS 'ghost'")
+        );
+    }
+
+    // A hook-set qos must still respect the partition's own deny_qos ACL, not
+    // just cluster-wide existence, or it reopens the hole partition/account
+    // modify already gets re-checked for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_modify_to_denied_qos_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].deny_qos = vec!["high".into()];
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"qos":"high"}'"#));
+        let cm = test_cluster_with_config(&dir, config).await;
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 5000,
+            ..Default::default()
+        });
+
+        let err = cm.submit_job(basic_spec("denied-qos")).unwrap_err();
+        assert!(
+            err.to_string().contains("denied on partition"),
+            "expected a partition QoS-ACL rejection, got: {err:?}"
+        );
+    }
+
+    // A hook that sets gres conflicting with an explicit --gpus request is
+    // rejected at submit time, not silently deferred to schedule time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_gres_conflict_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(
+            &dir,
+            r#"echo '{"gres":["gpu:mi300x:2"]}'"#,
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("gres-conflict");
+        spec.gpus = Some(spur_core::gpu_request::GpuRequest {
+            count: 4,
+            gpu_type: None,
+        });
+        let err = cm.submit_job(spec).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("conflicting gres"),
+            "expected a gres-conflict rejection, got: {err:?}"
+        );
+    }
+
+    // A hook can grow an unbounded field (comment/constraint/gres) past the
+    // pre-hook size cap; the post-modify re-check must catch that.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_modify_reenforces_size_cap() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        let huge_comment = "c".repeat(200 * 1024);
+        config.hooks.job_submit = Some(write_hook_script(
+            &dir,
+            &format!(r#"echo '{{"comment":"{huge_comment}"}}'"#),
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("size-bypass");
+        spec.script = Some("x".repeat(MAX_JOB_SPEC_SIZE - 100 * 1024));
+        let err = cm.submit_job(spec).unwrap_err();
+        assert!(
+            err.to_string().contains("too large"),
+            "expected a size-cap rejection, got: {err:?}"
+        );
+    }
+
+    // A hook-set partition must be re-validated for node-count bounds too,
+    // not just ACLs, or it reopens the pend-forever hole this check closes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_modify_partition_bypasses_node_bounds_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions.push(spur_core::config::PartitionConfig {
+            name: "small".into(),
+            default: false,
+            state: "UP".into(),
+            nodes: "ALL".into(),
+            selector: Default::default(),
+            max_time: None,
+            default_time: None,
+            max_nodes: Some(1),
+            min_nodes: 1,
+            allow_accounts: Vec::new(),
+            allow_groups: Vec::new(),
+            deny_accounts: Vec::new(),
+            deny_qos: Vec::new(),
+            allow_qos: Vec::new(),
+            priority_tier: 1,
+            preempt_mode: String::new(),
+        });
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"partition":"small"}'"#));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("bounds-bypass");
+        spec.num_nodes = 2;
+        spec.num_tasks = 2;
+        let err = cm.submit_job(spec).unwrap_err();
+        assert!(
+            err.to_string().contains("outside partition"),
+            "expected a node-bounds rejection, got: {err:?}"
+        );
+    }
+
+    fn write_lua_script(dir: &TempDir, body: &str) -> String {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.path().join("job_submit.lua");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "{body}").unwrap();
+        // The runner refuses a group/world-writable hook; a permissive umask
+        // would otherwise trip that check on the temp file.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_hook_rejects() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  slurm.log_user('denied by lua')\n  return slurm.ERROR\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("blocked-lua")).unwrap_err();
+        assert_eq!(err, SubmitError::invalid("denied by lua"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_hook_modifies_spec() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  j.comment = 'lua-tagged'\n  return slurm.SUCCESS\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let id = submit_and_wait(&cm, basic_spec("lua-mod"));
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.comment.as_deref(),
+            Some("lua-tagged")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_modify_to_invalid_partition_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  j.partition = 'nope'\n  return slurm.SUCCESS\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("lua-bad-part")).unwrap_err();
+        assert_eq!(err, SubmitError::invalid("partition 'nope' not found"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_modify_to_unknown_qos_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  j.qos = 'ghost'\n  return slurm.SUCCESS\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("lua-bad-qos")).unwrap_err();
+        assert_eq!(
+            err,
+            SubmitError::invalid("job_submit hook set unknown QOS 'ghost'")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_modify_to_denied_qos_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].deny_qos = vec!["high".into()];
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  j.qos = 'high'\n  return slurm.SUCCESS\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 5000,
+            ..Default::default()
+        });
+
+        let err = cm.submit_job(basic_spec("lua-denied-qos")).unwrap_err();
+        assert!(
+            err.to_string().contains("denied on partition"),
+            "expected a partition QoS-ACL rejection, got: {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_gres_conflict_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  j.gres = {'gpu:mi300x:2'}\n  return slurm.SUCCESS\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("lua-gres-conflict");
+        spec.gpus = Some(spur_core::gpu_request::GpuRequest {
+            count: 4,
+            gpu_type: None,
+        });
+        let err = cm.submit_job(spec).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("conflicting gres"),
+            "expected a gres-conflict rejection, got: {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_modify_reenforces_size_cap() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        let huge_comment = "c".repeat(200 * 1024);
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            &format!(
+                "function slurm_job_submit(j, u)\n  j.comment = string.rep('c', {})\n  return slurm.SUCCESS\nend",
+                huge_comment.len()
+            ),
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("lua-size-bypass");
+        spec.script = Some("x".repeat(MAX_JOB_SPEC_SIZE - 100 * 1024));
+        let err = cm.submit_job(spec).unwrap_err();
+        assert!(
+            err.to_string().contains("too large"),
+            "expected a size-cap rejection, got: {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_modify_partition_bypasses_node_bounds_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions.push(spur_core::config::PartitionConfig {
+            name: "small".into(),
+            default: false,
+            state: "UP".into(),
+            nodes: "ALL".into(),
+            selector: Default::default(),
+            max_time: None,
+            default_time: None,
+            max_nodes: Some(1),
+            min_nodes: 1,
+            allow_accounts: Vec::new(),
+            allow_groups: Vec::new(),
+            deny_accounts: Vec::new(),
+            deny_qos: Vec::new(),
+            allow_qos: Vec::new(),
+            priority_tier: 1,
+            preempt_mode: String::new(),
+        });
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  j.partition = 'small'\n  return slurm.SUCCESS\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let mut spec = basic_spec("lua-bounds-bypass");
+        spec.num_nodes = 2;
+        spec.num_tasks = 2;
+        let err = cm.submit_job(spec).unwrap_err();
+        assert!(
+            err.to_string().contains("outside partition"),
+            "expected a node-bounds rejection, got: {err:?}"
+        );
+    }
+
+    // Shell runs first, then Lua, each on the evolving spec.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_shell_then_lua_chain() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"priority": 100}'"#));
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  j.comment = 'chained'\n  return slurm.SUCCESS\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let id = submit_and_wait(&cm, basic_spec("chain"));
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.spec.priority, Some(100));
+        assert_eq!(job.spec.comment.as_deref(), Some("chained"));
+    }
+
+    // A shell rejection short-circuits the chain: the Lua hook never runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_shell_reject_skips_lua() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(&dir, "echo 'shell says no' >&2\nexit 1"));
+        // If this Lua ran it would mkdir a marker; assert the file never appears.
+        let marker = dir.path().join("lua-ran");
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            &format!(
+                "function slurm_job_submit(j, u)\n  j.comment = '{}'\n  return slurm.SUCCESS\nend",
+                marker.display()
+            ),
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let err = cm.submit_job(basic_spec("shell-first")).unwrap_err();
+        assert_eq!(err, SubmitError::invalid("shell says no"));
+    }
+
+    // When both hooks set the same field, Lua (second) wins on the evolving spec.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_lua_overrides_shell_field() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.hooks.job_submit = Some(write_hook_script(
+            &dir,
+            r#"echo '{"comment": "from-shell"}'"#,
+        ));
+        config.hooks.job_submit_lua = Some(write_lua_script(
+            &dir,
+            "function slurm_job_submit(j, u)\n  j.comment = 'from-lua'\n  return slurm.SUCCESS\nend",
+        ));
+        let cm = test_cluster_with_config(&dir, config).await;
+
+        let id = submit_and_wait(&cm, basic_spec("override"));
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.comment.as_deref(),
+            Some("from-lua")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

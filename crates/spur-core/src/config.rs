@@ -254,6 +254,12 @@ pub struct HooksConfig {
     pub srun_prolog: Option<String>,
     /// Script run on the srun invocation node after step completion (Slurm `SrunEpilog`).
     pub srun_epilog: Option<String>,
+    /// Script run on the controller at submission to accept/reject/modify a job.
+    /// Receives the resolved spec as JSON on stdin (Slurm `job_submit.lua` analog).
+    pub job_submit: Option<String>,
+    /// Lua script defining `slurm_job_submit(job_desc, submit_uid)`, run in a
+    /// sandbox at submission. Slurm `job_submit/lua` parity. Runs after `job_submit`.
+    pub job_submit_lua: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1782,6 +1788,8 @@ task_prolog = "/etc/spur/task_prolog.sh"
 task_epilog = "/etc/spur/task_epilog.sh"
 srun_prolog = "/etc/spur/srun_prolog.sh"
 srun_epilog = "/etc/spur/srun_epilog.sh"
+job_submit = "/etc/spur/job_submit.sh"
+job_submit_lua = "/etc/spur/job_submit.lua"
 "#;
         let config = SlurmConfig::load_from_str(toml).unwrap();
         assert_eq!(config.hooks.prolog.as_deref(), Some("/etc/spur/prolog.sh"));
@@ -1810,6 +1818,14 @@ srun_epilog = "/etc/spur/srun_epilog.sh"
             config.hooks.srun_epilog.as_deref(),
             Some("/etc/spur/srun_epilog.sh")
         );
+        assert_eq!(
+            config.hooks.job_submit.as_deref(),
+            Some("/etc/spur/job_submit.sh")
+        );
+        assert_eq!(
+            config.hooks.job_submit_lua.as_deref(),
+            Some("/etc/spur/job_submit.lua")
+        );
         // metrics section omitted — should keep defaults
         assert!(config.metrics.enabled);
     }
@@ -1825,6 +1841,8 @@ srun_epilog = "/etc/spur/srun_epilog.sh"
         assert!(config.hooks.task_epilog.is_none());
         assert!(config.hooks.srun_prolog.is_none());
         assert!(config.hooks.srun_epilog.is_none());
+        assert!(config.hooks.job_submit.is_none());
+        assert!(config.hooks.job_submit_lua.is_none());
         // hooks section omitted — metrics should keep defaults
         assert!(config.metrics.enabled);
         assert_eq!(config.metrics.listen_addr, "[::]:6822");
