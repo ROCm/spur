@@ -18,11 +18,9 @@ as the job runs.
 How it works
 ------------
 
-The exporter watches a directory (default ``/var/run/exporter/``) for files
-named after the render ID of a GPU (``0``, ``1``, ...). Each file is a small JSON
-document describing the job currently using that GPU. The exporter's watcher
-is scheduler-agnostic in behavior but not in **field names** — it always reads
-these five JSON keys, regardless of which scheduler wrote the file:
+The exporter watches a directory (default ``/var/run/exporter``) for files
+named after the render ID of a GPU (``0``, ``1``, ...). Each file is a small
+JSON document describing the job currently using that GPU:
 
 .. list-table::
    :header-rows: 1
@@ -36,27 +34,24 @@ these five JSON keys, regardless of which scheduler wrote the file:
      - the ``job_user`` metric label
    * - ``SLURM_JOB_PARTITION``
      - the ``job_partition`` metric label
-   * - ``SLURM_CLUSTER_NAME``
-     - reserved; Spur's hook context does not populate a cluster-name value,
-       so this is always empty under Spur
    * - ``CUDA_VISIBLE_DEVICES``
      - which GPU render ID(s) the file's content applies to
 
 A Spur ``prolog`` hook writes this file when a job starts on a GPU; the
-matching ``epilog`` hook deletes it when the job ends. Spur's own hook
-environment does **not** set ``SLURM_JOB_ID`` or ``CUDA_VISIBLE_DEVICES`` — it
-sets ``SPUR_JOB_ID``, ``SPUR_JOB_USER``, ``SPUR_JOB_PARTITION``, and
-``SPUR_JOB_GPUS`` instead (see :ref:`hooks-config` below). The integration
-scripts below read the ``SPUR_*`` values Spur actually provides, then write
-them back out under the ``SLURM_*`` JSON keys the exporter actually parses.
+matching ``epilog`` hook deletes it when the job ends. Spur's hook
+environment already twins ``SPUR_JOB_ID``/``SPUR_JOB_PARTITION`` into
+``SLURM_JOB_ID``/``SLURM_JOB_PARTITION`` automatically, so the scripts below
+can use those directly. ``SLURM_JOB_USER`` and ``CUDA_VISIBLE_DEVICES`` have
+no such twin — they're built from ``SPUR_JOB_USER`` and ``SPUR_JOB_GPUS``
+(see :ref:`hooks-config` below).
 
 .. important::
 
    Do not rename the JSON keys to ``SPUR_*`` when adapting these scripts. The
    exporter's parser looks for the literal strings ``SLURM_JOB_ID``,
-   ``SLURM_JOB_USER``, ``SLURM_JOB_PARTITION``, ``SLURM_CLUSTER_NAME``, and
-   ``CUDA_VISIBLE_DEVICES`` — a file using any other key names is parsed
-   successfully but the labels are left empty, with no error logged.
+   ``SLURM_JOB_USER``, ``SLURM_JOB_PARTITION``, and ``CUDA_VISIBLE_DEVICES`` —
+   a file using any other key names is parsed successfully but the labels are
+   left empty, with no error logged.
 
 .. _hooks-config:
 
@@ -74,23 +69,16 @@ scripts:
 
 See :doc:`configuration` for the full ``[hooks]`` reference — these are the
 node-level ``prolog``/``epilog`` fields (Slurm's ``Prolog``/``Epilog``), not
-the controller-side ``prolog_slurmctld``/``epilog_slurmctld``.
+the controller-side ``prolog_slurmctld``/``epilog_slurmctld``. ``spur.conf``
+must exist at the path ``spurd`` loads (``/etc/spur/spur.conf`` by default,
+or wherever ``-f`` points) and contain this ``[hooks]`` block.
 
-The scripts must be:
-
-- **fully-qualified paths** — Spur does not search ``$PATH`` for hook scripts
-- **executable** and owned appropriately for the agent's ``spurd`` process
-  (``chmod 0755``, ``root:root`` is sufficient when ``spurd`` runs as root)
+The scripts must be **fully-qualified paths** (Spur does not search ``$PATH``
+for hook scripts) and **executable**:
 
 .. code-block:: bash
 
    sudo chmod 0755 /usr/share/exporter/slurm-prolog.sh /usr/share/exporter/slurm-epilog.sh
-
-``spurd`` must be started with an explicit config path (``-f
-/path/to/spur.conf``) for hooks to take effect — without ``-f`` it falls back
-to the (usually absent) ``/etc/spur/spur.conf`` default and silently runs with
-no hooks configured. Check ``journalctl -u spurd`` for a ``loaded spur.conf
-path=...`` line to confirm the right file was picked up.
 
 Restart ``spurd`` after editing ``spur.conf`` — hooks are only read at agent
 startup:
@@ -102,9 +90,8 @@ startup:
 Example scripts
 ----------------
 
-These are the exact scripts validated end-to-end against a running Spur
-cluster and the exporter's Prometheus output. Adjust ``EXPORT_DIR`` only if
-the exporter container mounts a different host path.
+Adjust ``EXPORT_DIR`` only if the exporter container mounts a different host
+path.
 
 ``slurm-prolog.sh``
 ~~~~~~~~~~~~~~~~~~~~
@@ -117,57 +104,29 @@ the exporter container mounts a different host path.
    # SPDX-License-Identifier: Apache-2.0
    #
 
-   EXPORT_DIR="/var/run/exporter/"
-   mod128_array() {
-       local arr_str="$1"
-       local arr result
+   EXPORT_DIR="/var/run/exporter"
 
-       # convert string to array using comma as delimiter
-       IFS=',' read -ra arr <<< "$arr_str"
+   # AMD GPU render-node minor numbers start at 128, while SPUR_JOB_GPUS
+   # reports the 0-based logical device index Spur schedules against.
+   IFS=',' read -ra GPU_IDS <<< "${SPUR_JOB_GPUS}"
+   RENDER_IDS=()
+   for gpu in "${GPU_IDS[@]}"; do
+       RENDER_IDS+=("$((gpu % 128))")
+   done
+   CUDA_VISIBLE_DEVICES=$(IFS=','; echo "${RENDER_IDS[*]}")
 
-       # modulo 128 to each element
-       for i in "${!arr[@]}"; do
-           arr[i]=$(( ${arr[i]} % 128 ))
-       done
-
-       # join array back into a comma-separated string
-       result=$(IFS=','; echo "${arr[*]}")
-
-       echo "$result"
-   }
-   AMDGPU_DEVICES=$(mod128_array "${CUDA_VISIBLE_DEVICES}")
-   AMD_SPUR_GPUS=$(mod128_array "${SPUR_JOB_GPUS}")
-   # CUDA_VISIBLE_DEVICES is empty on AMD hardware; fall back to SPUR_JOB_GPUS so
-   # job_id/job_user labels are still attached to the GPU metrics.
-   [ -z "${AMDGPU_DEVICES}" ] && AMDGPU_DEVICES="${AMD_SPUR_GPUS}"
-   # The device-metrics-exporter's Slurm watcher (pkg/exporter/scheduler/slurm.go)
-   # hardcodes these JSON key names (SLURM_*, CUDA_VISIBLE_DEVICES) regardless of
-   # scheduler — values are sourced from Spur's SPUR_* env vars, but the keys must
-   # stay SLURM_* or the exporter silently leaves job_id/job_user/job_partition empty.
-   MSG=$(
-       cat <<EOF
-       {
-       "SLURM_JOB_ID": "${SPUR_JOB_ID}",
-       "SLURM_JOB_USER": "${SPUR_JOB_USER}",
-       "SLURM_JOB_PARTITION": "${SPUR_JOB_PARTITION}",
-       "SLURM_CLUSTER_NAME": "${SPUR_CLUSTER_NAME}",
-       "SLURM_JOB_GPUS": "${AMD_SPUR_GPUS}",
-       "CUDA_VISIBLE_DEVICES": "${AMDGPU_DEVICES}",
-       "SLURM_SCRIPT_CONTEXT": "${SPUR_SCRIPT_CONTEXT}"
-      }
-   EOF
-   )
-   [ -d ${EXPORT_DIR} ] || exit 0
-   GPUS=$(echo ${AMDGPU_DEVICES} | tr "," "\n")
-   for GPUID in ${GPUS}; do
-       echo ${MSG} >${EXPORT_DIR}/${GPUID}
+   [ -d "${EXPORT_DIR}" ] || exit 0
+   for id in "${RENDER_IDS[@]}"; do
+       printf '{"SLURM_JOB_ID":"%s","SLURM_JOB_USER":"%s","SLURM_JOB_PARTITION":"%s","CUDA_VISIBLE_DEVICES":"%s"}' \
+           "${SLURM_JOB_ID}" "${SPUR_JOB_USER}" "${SLURM_JOB_PARTITION}" "${CUDA_VISIBLE_DEVICES}" \
+           > "${EXPORT_DIR}/${id}"
    done
 
 ``slurm-epilog.sh``
 ~~~~~~~~~~~~~~~~~~~~
 
-Identical to the prolog except for the final loop, which removes the file
-instead of writing it:
+Identical GPU ID derivation as the prolog; removes the tracking file instead
+of writing it:
 
 .. code-block:: bash
 
@@ -177,39 +136,12 @@ instead of writing it:
    # SPDX-License-Identifier: Apache-2.0
    #
 
-   EXPORT_DIR="/var/run/exporter/"
-   mod128_array() {
-       local arr_str="$1"
-       local arr result
-       IFS=',' read -ra arr <<< "$arr_str"
-       for i in "${!arr[@]}"; do
-           arr[i]=$(( ${arr[i]} % 128 ))
-       done
-       result=$(IFS=','; echo "${arr[*]}")
-       echo "$result"
-   }
-   AMDGPU_DEVICES=$(mod128_array "${CUDA_VISIBLE_DEVICES}")
-   AMD_SPUR_GPUS=$(mod128_array "${SPUR_JOB_GPUS}")
-   # CUDA_VISIBLE_DEVICES is empty on AMD hardware; fall back to SPUR_JOB_GPUS so
-   # the per-GPU job tracking files are cleaned up correctly on job exit.
-   [ -z "${AMDGPU_DEVICES}" ] && AMDGPU_DEVICES="${AMD_SPUR_GPUS}"
-   MSG=$(
-       cat <<EOF
-       {
-       "SLURM_JOB_ID": "${SPUR_JOB_ID}",
-       "SLURM_JOB_USER": "${SPUR_JOB_USER}",
-       "SLURM_JOB_PARTITION": "${SPUR_JOB_PARTITION}",
-       "SLURM_CLUSTER_NAME": "${SPUR_CLUSTER_NAME}",
-       "SLURM_JOB_GPUS": "${AMD_SPUR_GPUS}",
-       "CUDA_VISIBLE_DEVICES": "${AMDGPU_DEVICES}",
-       "SLURM_SCRIPT_CONTEXT": "${SPUR_SCRIPT_CONTEXT}"
-      }
-   EOF
-   )
-   [ -d ${EXPORT_DIR} ] || exit 0
-   GPUS=$(echo ${AMDGPU_DEVICES} | tr "," "\n")
-   for GPUID in ${GPUS}; do
-       rm -f ${EXPORT_DIR}/${GPUID}
+   EXPORT_DIR="/var/run/exporter"
+
+   IFS=',' read -ra GPU_IDS <<< "${SPUR_JOB_GPUS}"
+   [ -d "${EXPORT_DIR}" ] || exit 0
+   for gpu in "${GPU_IDS[@]}"; do
+       rm -f "${EXPORT_DIR}/$((gpu % 128))"
    done
 
 Running the exporter container
@@ -233,108 +165,34 @@ of the exporter's default mandatory label set.
 Verifying the integration
 ---------------------------
 
-1. Confirm the hook scripts are wired up and executable:
+Submit a GPU job and, while it is running, check both the tracking file and
+the live metric:
 
-   .. code-block:: bash
+.. code-block:: bash
 
-      sudo journalctl -u spurd -b --no-pager | grep 'loaded spur.conf'
-      stat -c '%U:%G %a %n' /usr/share/exporter/slurm-prolog.sh /usr/share/exporter/slurm-epilog.sh
+   sbatch --partition=gpu --gpus=1 --wrap="sleep 30"
 
-2. Submit a GPU job and, while it is running, check both the tracking file
-   and the live metric:
+   # while the job is RUNNING:
+   cat /var/run/exporter/0
+   docker exec dme curl -s localhost:5000/metrics | grep gfx_activity
 
-   .. code-block:: bash
+Expected file content (values will match your job):
 
-      sbatch --partition=gpu --gpus=1 --wrap="sleep 30"
+.. code-block:: text
 
-      # while the job is RUNNING:
-      cat /var/run/exporter/0
-      docker exec dme curl -s localhost:5000/metrics | grep gfx_activity
+   {"SLURM_JOB_ID":"8","SLURM_JOB_USER":"user","SLURM_JOB_PARTITION":"gpu","CUDA_VISIBLE_DEVICES":"0"}
 
-   Expected file content (values will match your job):
+Expected metric line, with the job's real ID/user/partition populated:
 
-   .. code-block:: text
+.. code-block:: text
 
-      { "SLURM_JOB_ID": "8", "SLURM_JOB_USER": "user", "SLURM_JOB_PARTITION": "gpu", "SLURM_CLUSTER_NAME": "", "SLURM_JOB_GPUS": "0", "CUDA_VISIBLE_DEVICES": "0", "SLURM_SCRIPT_CONTEXT": "prolog_slurmd" }
+   gpu_gfx_activity{...,job_id="8",job_partition="gpu",job_user="user",...} 0
 
-   Expected metric line, with the job's real ID/user/partition populated:
+After the job completes, confirm cleanup — the tracking file should be gone
+and the labels should reset to empty:
 
-   .. code-block:: text
+.. code-block:: bash
 
-      gpu_gfx_activity{...,job_id="8",job_partition="gpu",job_user="user",...} 0
-
-   ``gfx_activity`` reads ``0`` here because ``sleep`` does no GPU compute —
-   the labels are what this step is checking. To see the value itself spike,
-   run an actual compute-bound kernel (see below).
-
-3. After the job completes, confirm cleanup — the tracking file should be
-   gone and the labels should reset to empty:
-
-   .. code-block:: bash
-
-      ls /var/run/exporter/
-      docker exec dme curl -s localhost:5000/metrics | grep gfx_activity
-      # gpu_gfx_activity{...,job_id="",job_partition="",job_user="",...} 0
-
-4. To confirm ``gfx_activity`` itself tracks real GPU load (not just static
-   labels), submit a job that runs an actual compute kernel inside a Spur
-   container job and sample the metric while it runs:
-
-   .. code-block:: bash
-
-      spur image import docker://docker.io/rocm/dev-ubuntu-22.04:latest
-
-      cat > hip_stress.sh <<'EOF'
-      #!/bin/bash
-      #SBATCH --partition=gpu
-      #SBATCH --gpus=1
-      #SBATCH --container-image=docker.io/rocm/dev-ubuntu-22.04:latest
-      #SBATCH --container-mounts=/tmp:/workspace
-      export LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH
-      /opt/rocm/bin/hipcc /workspace/hip_stress.cpp -o /workspace/hip_stress
-      /workspace/hip_stress
-      EOF
-      sbatch hip_stress.sh
-
-      # while RUNNING:
-      docker exec dme curl -s localhost:5000/metrics | grep gfx_activity
-      # gpu_gfx_activity{...,job_id="10",job_partition="gpu",job_user="root",...} 100
-
-   ``gfx_activity`` jumps to a nonzero value (up to ``100``) for the duration
-   of the kernel and drops back to ``0`` — with correct job labels throughout
-   — once the job finishes and the epilog removes the tracking file.
-
-.. note::
-
-   ``spur image import`` requires the full ``docker://docker.io/<repo>:<tag>``
-   form for Docker Hub images. A bare ``<namespace>/<repo>:<tag>`` (e.g.
-   ``rocm/dev-ubuntu-22.04:latest``) is parsed incorrectly as a private
-   registry host named ``rocm``, and the import fails with ``Error: failed to
-   fetch manifest``.
-
-Troubleshooting
------------------
-
-.. list-table::
-   :header-rows: 1
-   :widths: 40 60
-
-   * - Symptom
-     - Cause / fix
-   * - Labels always empty, tracking file has the right values
-     - JSON keys in the file don't match ``SLURM_*`` — check for a
-       find-and-replace that renamed them to ``SPUR_*``. Keys must stay
-       ``SLURM_*``; only the values should come from ``$SPUR_*`` variables.
-   * - Tracking file never appears
-     - ``spurd`` is running without ``-f <config>`` and loaded no
-       ``[hooks]`` block (check ``journalctl -u spurd`` for a ``failed to
-       load spur.conf`` warning), or the hook scripts aren't executable.
-   * - Tracking file appears but exporter shows nothing in its logs
-     - The exporter watches ``/var/run/exporter/`` as configured by
-       ``SlurmDir`` in its own build — confirm the container's bind mount
-       target matches the path the prolog/epilog scripts write to exactly.
-   * - Tracking file left behind after a job ends
-     - The epilog hook didn't run — check ``journalctl -u spurd`` for a
-       ``epilog_slurmd`` hook failure, or for a job that was killed in a way
-       that bypassed normal termination (see :doc:`/user-guide/monitoring-jobs`
-       for job state semantics).
+   ls /var/run/exporter/
+   docker exec dme curl -s localhost:5000/metrics | grep gfx_activity
+   # gpu_gfx_activity{...,job_id="",job_partition="",job_user="",...} 0
