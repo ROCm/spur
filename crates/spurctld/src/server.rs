@@ -228,8 +228,8 @@ impl ControllerService {
         Err(self.not_leader_status())
     }
 
-    /// Re-send a terminal-job cancel to a node still reporting it on heartbeat,
-    /// freeing an allocation whose terminal cancel never landed. Spawned, best-effort.
+    /// Re-send a cancel to a node still reporting a job the controller considers
+    /// finished, freeing an allocation whose cancel never landed. Best-effort.
     fn reclaim_stale_agent_jobs(&self, node: &str, reported: &[RunningJobStatus]) {
         let stale = stale_reported_jobs(&self.cluster, reported);
         if stale.is_empty() {
@@ -241,13 +241,13 @@ impl ControllerService {
             for job_id in stale {
                 // Re-check: a requeue since the snapshot above would otherwise
                 // send an unguarded cancel into the job's new run.
-                if !is_still_terminal(&cluster, job_id) {
+                if !is_reclaimable(&cluster, job_id) {
                     continue;
                 }
                 warn!(
                     job_id,
                     node = %node,
-                    "agent still holds a terminal job — re-sending cancel to reclaim its allocation"
+                    "agent still holds a job the controller no longer tracks — re-sending cancel to reclaim its allocation"
                 );
                 // Signal 0 = graceful release, no-op on an unknown id. Not
                 // epoch-gated — a requeue racing this send is still possible.
@@ -404,18 +404,21 @@ fn is_k0s_admin(cache: &crate::association_cache::AssociationCache, caller: &str
     caller == "root" || cache.is_admin(caller)
 }
 
-/// Whether the controller still considers `job_id` terminal right now — guards
-/// the spawned reclaim loop against a requeue landing after its stale snapshot.
-fn is_still_terminal(cluster: &ClusterManager, job_id: u32) -> bool {
-    cluster.job_state(job_id).is_some_and(|s| s.is_terminal())
+/// Reclaimable when terminal, or untracked but below the next id this controller
+/// would assign — an aged-out job otherwise strands its allocation forever.
+fn is_reclaimable(cluster: &ClusterManager, job_id: u32) -> bool {
+    match cluster.job_state(job_id) {
+        Some(state) => state.is_terminal(),
+        None => job_id < cluster.peek_next_job_id(),
+    }
 }
 
-/// Reported ids the controller's own record marks terminal. Non-terminal (incl.
-/// Pending mid-dispatch) and unknown ids are spared, so no live job is reclaimed.
+/// Reported ids the controller considers reclaimable; non-terminal (incl.
+/// Pending mid-dispatch) and never-issued ids are spared.
 fn stale_reported_jobs(cluster: &ClusterManager, reported: &[RunningJobStatus]) -> Vec<u32> {
     reported
         .iter()
-        .filter_map(|r| is_still_terminal(cluster, r.job_id).then_some(r.job_id))
+        .filter_map(|r| is_reclaimable(cluster, r.job_id).then_some(r.job_id))
         .collect()
 }
 
@@ -3708,14 +3711,109 @@ mod tests {
         assert_eq!(
             stale,
             vec![12],
-            "only the terminal job is reclaimed; Pending/Running/Completing/Suspended/Preempted/unknown are spared"
+            "terminal is reclaimed; Pending/Running/Completing/Suspended/Preempted spared, and 999 was never issued"
+        );
+    }
+
+    /// GATE: a terminal job aged out of the job map must stay reclaimable, or an
+    /// agent still holding it keeps that allocation forever.
+    #[tokio::test]
+    async fn stale_reported_jobs_reclaims_job_evicted_from_memory() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState};
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                cluster.as_ref(),
+                op,
+            );
+        };
+
+        apply(&WalOperation::JobSubmit {
+            job_id: 20,
+            spec: Box::new(JobSpec {
+                name: "evicted".into(),
+                user: "alice".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            }),
+        });
+        apply(&WalOperation::job_state_change(
+            20,
+            JobState::Pending,
+            JobState::Cancelled,
+        ));
+        apply(&WalOperation::EvictTerminalJobs { job_ids: vec![20] });
+
+        assert_eq!(cluster.job_state(20), None, "eviction drops the record");
+        let issued = cluster.peek_next_job_id();
+        assert!(20 < issued, "id 20 was issued by this controller");
+
+        let reported: Vec<RunningJobStatus> = [20, issued, issued + 5]
+            .into_iter()
+            .map(|job_id| RunningJobStatus {
+                job_id,
+                ..Default::default()
+            })
+            .collect();
+
+        assert_eq!(
+            stale_reported_jobs(&cluster, &reported),
+            vec![20],
+            "the evicted id is reclaimed; ids at or above next_job_id were never issued here"
+        );
+    }
+
+    /// Pins a known false positive: an array parent id is consumed but never
+    /// stored, so it reads as reclaimable. Agents only report dispatched tasks.
+    #[tokio::test]
+    async fn reclaimable_reports_true_for_a_consumed_but_unstored_id() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::JobSpec;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+
+        for task_id in [31, 32] {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                cluster.as_ref(),
+                &WalOperation::JobSubmit {
+                    job_id: task_id,
+                    spec: Box::new(JobSpec {
+                        name: "array-task".into(),
+                        user: "alice".into(),
+                        num_nodes: 1,
+                        num_tasks: 1,
+                        cpus_per_task: 1,
+                        work_dir: "/tmp".into(),
+                        array_job_id: Some(30),
+                        ..Default::default()
+                    }),
+                },
+            );
+        }
+
+        assert_eq!(cluster.job_state(30), None, "parent id is never stored");
+        assert!(30 < cluster.peek_next_job_id());
+        assert!(
+            is_reclaimable(&cluster, 30),
+            "an unstored id below the watermark is reclaimable — reachable only if an agent reports it"
         );
     }
 
     /// GATE: a job requeued (Timeout -> Pending) between the reclaim snapshot
     /// and the spawned loop's send must fail the re-check, not just the snapshot.
     #[tokio::test]
-    async fn is_still_terminal_false_after_requeue_race() {
+    async fn is_reclaimable_false_after_requeue_race() {
         use crate::raft::StateMachineApply;
         use spur_core::job::{JobSpec, JobState};
         use spur_core::wal::WalOperation;
@@ -3766,7 +3864,7 @@ mod tests {
             JobState::Running,
             JobState::Timeout,
         ));
-        assert!(is_still_terminal(&cluster, 77), "snapshot sees Timeout");
+        assert!(is_reclaimable(&cluster, 77), "snapshot sees Timeout");
 
         // Concurrent requeue lands before the reclaim loop's re-check.
         apply(&WalOperation::job_state_change(
@@ -3776,7 +3874,7 @@ mod tests {
         ));
 
         assert!(
-            !is_still_terminal(&cluster, 77),
+            !is_reclaimable(&cluster, 77),
             "re-check must skip a job requeued since the snapshot"
         );
     }
