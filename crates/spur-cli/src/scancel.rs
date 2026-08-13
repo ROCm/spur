@@ -113,6 +113,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 account: args.account.unwrap_or_default(),
                 job_ids: Vec::new(),
                 name: args.name.unwrap_or_default(),
+                nodes: Vec::new(),
             })
             .await
             .context("failed to get jobs")?;

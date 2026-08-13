@@ -41,6 +41,10 @@ pub struct SqueueArgs {
     #[arg(short = 'n', long)]
     pub name: Option<String>,
 
+    /// Show only jobs allocated on these nodes (hostlist expression)
+    #[arg(short = 'w', long = "nodelist")]
+    pub nodelist: Option<String>,
+
     /// Output format string
     #[arg(short = 'o', long)]
     pub format: Option<String>,
@@ -112,6 +116,13 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         })
         .unwrap_or_default();
 
+    // Expand the -w node filter before any network I/O so a bad hostlist
+    // surfaces its own error rather than a downstream connect failure.
+    let nodes = match args.nodelist.as_deref() {
+        Some(s) => expand_node_filter(s)?,
+        None => Vec::new(),
+    };
+
     // Connect and fetch
     let channel = spur_client::connect_channel(&args.controller)
         .await
@@ -126,6 +137,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             account: args.account.unwrap_or_default(),
             job_ids,
             name: args.name.unwrap_or_default(),
+            nodes,
         })
         .await
         .context("failed to get jobs")?;
@@ -369,6 +381,23 @@ fn parse_states_arg(s: &str) -> Result<Vec<spur_proto::proto::JobState>> {
     Ok(states)
 }
 
+/// Expand `-w` / `--nodelist` into concrete node names. Accepts every Slurm
+/// hostlist form (`node1,node2`, `node[001-003]`, `node[1,3,5-7]`,
+/// `gpu[01-04],cpu[01-02]`). An empty or whitespace-only value is rejected
+/// rather than sent as a filter that would silently match nothing.
+fn expand_node_filter(s: &str) -> Result<Vec<String>> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Invalid node name specified: (empty)");
+    }
+    let nodes = spur_core::hostlist::expand(trimmed)
+        .map_err(|e| anyhow::anyhow!("Invalid node name specified: {e}"))?;
+    if nodes.is_empty() {
+        anyhow::bail!("Invalid node name specified: {trimmed}");
+    }
+    Ok(nodes)
+}
+
 fn format_runtime(job: &spur_proto::proto::JobInfo) -> String {
     if let Some(ref rt) = job.run_time {
         format_duration_hms(rt.seconds)
@@ -445,6 +474,41 @@ mod tests {
         assert!(states.contains(&P::JobRunning));
         assert!(states.contains(&P::JobSuspended));
         assert!(states.contains(&P::JobCompleting));
+    }
+
+    #[test]
+    fn expand_node_filter_plain_comma_list() {
+        assert_eq!(
+            expand_node_filter("node1,node2").unwrap(),
+            ["node1", "node2"]
+        );
+    }
+
+    #[test]
+    fn expand_node_filter_compacted_range_preserves_padding() {
+        assert_eq!(
+            expand_node_filter("node[001-003]").unwrap(),
+            ["node001", "node002", "node003"]
+        );
+    }
+
+    #[test]
+    fn expand_node_filter_mixed_and_multi_term() {
+        assert_eq!(
+            expand_node_filter("node[1,3,5-7]").unwrap(),
+            ["node1", "node3", "node5", "node6", "node7"]
+        );
+        assert_eq!(
+            expand_node_filter("gpu[01-04],cpu[01-02]").unwrap(),
+            ["gpu01", "gpu02", "gpu03", "gpu04", "cpu01", "cpu02"]
+        );
+    }
+
+    #[test]
+    fn expand_node_filter_rejects_empty_and_invalid() {
+        assert!(expand_node_filter("").is_err());
+        assert!(expand_node_filter("   ").is_err());
+        assert!(expand_node_filter("node[1-").is_err());
     }
 
     #[test]

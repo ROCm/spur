@@ -46,9 +46,14 @@ pub async fn get_jobs(
     let account = query.account.as_deref();
     let name = query.name.as_deref();
 
-    let jobs = state
-        .cluster
-        .get_jobs(&states, user, partition, account, name, &[]);
+    let jobs = state.cluster.get_jobs(&crate::cluster::JobFilter {
+        states: &states,
+        user,
+        partition,
+        account,
+        name,
+        ..Default::default()
+    });
     let json_jobs: Vec<serde_json::Value> = jobs.iter().map(job_to_json).collect();
 
     Ok(ApiResponse::ok(JobsData { jobs: json_jobs }))

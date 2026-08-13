@@ -21,7 +21,7 @@ use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::slurm_controller_server::SlurmController;
 use spur_proto::proto::*;
 
-use crate::cluster::{ClusterManager, PartitionError, ReservationError};
+use crate::cluster::{ClusterManager, JobFilter, PartitionError, ReservationError};
 use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
 use crate::rpc_middleware::RpcStatsLayer;
@@ -491,9 +491,15 @@ impl SlurmController for ControllerService {
             Some(req.name.as_str())
         };
 
-        let jobs = self
-            .cluster
-            .get_jobs(&states, user, partition, account, name, &req.job_ids);
+        let jobs = self.cluster.get_jobs(&JobFilter {
+            states: &states,
+            user,
+            partition,
+            account,
+            name,
+            job_ids: &req.job_ids,
+            nodes: &req.nodes,
+        });
 
         let proto_jobs: Vec<JobInfo> = jobs.iter().map(job_to_proto).collect();
 
