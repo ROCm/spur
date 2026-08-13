@@ -11,7 +11,7 @@ use tracing::{error, info, warn};
 
 use spur_core::job::{Job, JobId, JobState};
 
-use crate::cluster::ClusterManager;
+use crate::cluster::{ClusterManager, JobFilter};
 use crate::raft::RaftHandle;
 
 use super::db::{self, AccountingRowState};
@@ -54,7 +54,7 @@ pub fn spawn_loop(
 /// not candidates.
 async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
     let candidates: Vec<Job> = cluster
-        .get_jobs(&[], None, None, None, None, &[])
+        .get_jobs(&JobFilter::default())
         .into_iter()
         .filter(|j| j.start_time.is_some())
         .collect();

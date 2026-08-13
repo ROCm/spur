@@ -420,6 +420,22 @@ struct PendingJobCandidate {
     tag_reason: bool,
 }
 
+/// Filters for [`ClusterManager::get_jobs`]. Every field is optional: an empty
+/// slice or `None` disables that dimension, so `JobFilter::default()` returns
+/// all jobs.
+#[derive(Debug, Default, Clone)]
+pub struct JobFilter<'a> {
+    pub states: &'a [JobState],
+    pub user: Option<&'a str>,
+    pub partition: Option<&'a str>,
+    pub account: Option<&'a str>,
+    pub name: Option<&'a str>,
+    pub job_ids: &'a [JobId],
+    /// Concrete node names (already hostlist-expanded); keeps only jobs
+    /// allocated on at least one of them.
+    pub nodes: &'a [String],
+}
+
 impl ClusterManager {
     #[cfg(test)]
     pub fn new(config: SlurmConfig, state_dir: &Path) -> anyhow::Result<Self> {
@@ -988,35 +1004,40 @@ impl ClusterManager {
     }
 
     /// Get jobs matching filters.
-    pub fn get_jobs(
-        &self,
-        states: &[JobState],
-        user: Option<&str>,
-        partition: Option<&str>,
-        account: Option<&str>,
-        name: Option<&str>,
-        job_ids: &[JobId],
-    ) -> Vec<Job> {
+    pub fn get_jobs(&self, filter: &JobFilter) -> Vec<Job> {
+        // Built once per call so the per-job node check is O(allocated_nodes)
+        // rather than O(allocated_nodes * filter.nodes) for large hostlists.
+        let node_set: std::collections::HashSet<&str> =
+            filter.nodes.iter().map(String::as_str).collect();
+
         let matches = |j: &Job| -> bool {
-            if !states.is_empty() && !states.contains(&j.state) {
+            if !filter.states.is_empty() && !filter.states.contains(&j.state) {
                 return false;
             }
-            if let Some(u) = user {
+            if !node_set.is_empty()
+                && !j
+                    .allocated_nodes
+                    .iter()
+                    .any(|n| node_set.contains(n.as_str()))
+            {
+                return false;
+            }
+            if let Some(u) = filter.user {
                 if !u.is_empty() && j.spec.user != u {
                     return false;
                 }
             }
-            if let Some(p) = partition {
+            if let Some(p) = filter.partition {
                 if !p.is_empty() && j.spec.partition.as_deref() != Some(p) {
                     return false;
                 }
             }
-            if let Some(a) = account {
+            if let Some(a) = filter.account {
                 if !a.is_empty() && j.spec.account.as_deref() != Some(a) {
                     return false;
                 }
             }
-            if let Some(n) = name {
+            if let Some(n) = filter.name {
                 if !n.is_empty() && !n.split(',').any(|pat| pat.trim() == j.spec.name) {
                     return false;
                 }
@@ -1028,7 +1049,7 @@ impl ClusterManager {
             let jobs = self.jobs.read();
             jobs.values()
                 .filter(|j| {
-                    if !job_ids.is_empty() && !job_ids.contains(&j.job_id) {
+                    if !filter.job_ids.is_empty() && !filter.job_ids.contains(&j.job_id) {
                         return false;
                     }
                     matches(j)
@@ -1039,8 +1060,8 @@ impl ClusterManager {
 
         // Requested ids with no stored job may be array parents — synthesize
         // their aggregate. Read lock above is released before get_job_for_display.
-        if !job_ids.is_empty() {
-            for &id in job_ids {
+        if !filter.job_ids.is_empty() {
+            for &id in filter.job_ids {
                 if result.iter().any(|j| j.job_id == id) {
                     continue;
                 }
@@ -7954,14 +7975,10 @@ mod tests {
         cm.suspend_job(id, "testuser").unwrap();
         settle(&cm, id, JobState::Suspended);
 
-        let scanned = cm.get_jobs(
-            &[JobState::Running, JobState::Completing],
-            None,
-            None,
-            None,
-            None,
-            &[],
-        );
+        let scanned = cm.get_jobs(&JobFilter {
+            states: &[JobState::Running, JobState::Completing],
+            ..Default::default()
+        });
         assert!(
             !scanned.iter().any(|j| j.job_id == id),
             "suspended job must not appear in the enforcer's Running/Completing scan"
@@ -9175,8 +9192,7 @@ mod tests {
         assert_eq!(m.running_cpus, 0);
 
         // Snapshot matches a full scan of the job map.
-        let expected =
-            JobMetricsSnapshot::collect(cm.get_jobs(&[], None, None, None, None, &[]).iter());
+        let expected = JobMetricsSnapshot::collect(cm.get_jobs(&JobFilter::default()).iter());
         assert_eq!(cm.job_metrics(), expected);
     }
 
@@ -16709,19 +16725,30 @@ mod tests {
         submit_array_task(&cm, 12, 10, 1);
 
         // Query the parent id explicitly.
-        let got = cm.get_jobs(&[], None, None, None, None, &[10]);
+        let got = cm.get_jobs(&JobFilter {
+            job_ids: &[10],
+            ..Default::default()
+        });
         assert_eq!(got.len(), 1, "parent id should synthesize one record");
         assert_eq!(got[0].job_id, 10);
         assert_eq!(got[0].state, JobState::Pending);
         assert_eq!(got[0].spec.array_job_id, Some(10));
 
         // Querying a real task id still returns that task, not the parent.
-        let got_task = cm.get_jobs(&[], None, None, None, None, &[11]);
+        let got_task = cm.get_jobs(&JobFilter {
+            job_ids: &[11],
+            ..Default::default()
+        });
         assert_eq!(got_task.len(), 1);
         assert_eq!(got_task[0].job_id, 11);
 
         // Unknown id → empty.
-        assert!(cm.get_jobs(&[], None, None, None, None, &[999]).is_empty());
+        assert!(cm
+            .get_jobs(&JobFilter {
+                job_ids: &[999],
+                ..Default::default()
+            })
+            .is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -16733,24 +16760,90 @@ mod tests {
         submit_and_wait(&cm, basic_spec("beta"));
         submit_and_wait(&cm, basic_spec("alpha"));
 
-        let all = cm.get_jobs(&[], None, None, None, None, &[]);
+        let by_name = |name: Option<&str>| {
+            cm.get_jobs(&JobFilter {
+                name,
+                ..Default::default()
+            })
+        };
+
+        let all = by_name(None);
         assert_eq!(all.len(), 3);
 
-        let alphas = cm.get_jobs(&[], None, None, None, Some("alpha"), &[]);
+        let alphas = by_name(Some("alpha"));
         assert_eq!(alphas.len(), 2);
         assert!(alphas.iter().all(|j| j.spec.name == "alpha"));
 
-        let betas = cm.get_jobs(&[], None, None, None, Some("beta"), &[]);
+        let betas = by_name(Some("beta"));
         assert_eq!(betas.len(), 1);
 
-        let multi = cm.get_jobs(&[], None, None, None, Some("alpha,beta"), &[]);
+        let multi = by_name(Some("alpha,beta"));
         assert_eq!(multi.len(), 3);
 
-        let none = cm.get_jobs(&[], None, None, None, Some("nonexistent"), &[]);
+        let none = by_name(Some("nonexistent"));
         assert!(none.is_empty());
 
-        let empty = cm.get_jobs(&[], None, None, None, Some(""), &[]);
+        let empty = by_name(Some(""));
         assert_eq!(empty.len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_jobs_filters_by_node() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+        let res = scalar_alloc(2, 4000);
+
+        let id1 = submit_and_wait(&cm, basic_spec("on-n1"));
+        cm.start_job(
+            id1,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res.clone()),
+        )
+        .unwrap();
+        settle(&cm, id1, JobState::Running);
+
+        let id2 = submit_and_wait(&cm, basic_spec("on-n2"));
+        cm.start_job(
+            id2,
+            vec!["n2".into()],
+            res.clone(),
+            per_node_for(&["n2"], res.clone()),
+        )
+        .unwrap();
+        settle(&cm, id2, JobState::Running);
+
+        // Pending job has no allocated nodes and must never match a node filter.
+        let id3 = submit_and_wait(&cm, basic_spec("pending"));
+
+        let by_nodes = |nodes: &[String]| {
+            cm.get_jobs(&JobFilter {
+                nodes,
+                ..Default::default()
+            })
+        };
+
+        // Empty node filter is a no-op.
+        assert_eq!(cm.get_jobs(&JobFilter::default()).len(), 3);
+
+        let on_n1 = by_nodes(&["n1".to_string()]);
+        assert_eq!(on_n1.len(), 1);
+        assert_eq!(on_n1[0].job_id, id1);
+
+        // Filtering by n2 excludes the running n1 job and the pending job.
+        let on_n2 = by_nodes(&["n2".to_string()]);
+        assert_eq!(on_n2.len(), 1);
+        assert_eq!(on_n2[0].job_id, id2);
+
+        // Union of both nodes returns both running jobs, never the pending one.
+        let both = by_nodes(&["n1".to_string(), "n2".to_string()]);
+        assert_eq!(both.len(), 2);
+        assert!(!both.iter().any(|j| j.job_id == id3));
+
+        // Unknown node matches nothing.
+        assert!(by_nodes(&["n3".to_string()]).is_empty());
     }
 
     // --- Partition matching tests ---

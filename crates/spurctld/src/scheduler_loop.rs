@@ -20,7 +20,7 @@ use spur_proto::proto::{
 use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::traits::{ClusterState, Scheduler};
 
-use crate::cluster::ClusterManager;
+use crate::cluster::{ClusterManager, JobFilter};
 use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
 
@@ -558,7 +558,10 @@ pub(crate) async fn try_preempt(
     };
 
     let mut running: Vec<spur_core::job::Job> = cluster
-        .get_jobs(&[JobState::Running], None, None, None, None, &[])
+        .get_jobs(&JobFilter {
+            states: &[JobState::Running],
+            ..Default::default()
+        })
         .into_iter()
         .collect();
     // Resolve once, reuse for both the priority recompute and the
@@ -1634,14 +1637,10 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
 
         // Deadline enforcement: mark pending jobs whose deadline has passed
         {
-            let pending = cluster.get_jobs(
-                &[spur_core::job::JobState::Pending],
-                None,
-                None,
-                None,
-                None,
-                &[],
-            );
+            let pending = cluster.get_jobs(&JobFilter {
+                states: &[spur_core::job::JobState::Pending],
+                ..Default::default()
+            });
             for job in &pending {
                 if let Some(deadline) = job.spec.deadline {
                     if now > deadline {
@@ -1653,17 +1652,13 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
             }
         }
 
-        let running = cluster.get_jobs(
-            &[
+        let running = cluster.get_jobs(&JobFilter {
+            states: &[
                 spur_core::job::JobState::Running,
                 spur_core::job::JobState::Completing,
             ],
-            None,
-            None,
-            None,
-            None,
-            &[],
-        );
+            ..Default::default()
+        });
 
         for job in &running {
             if job.state == spur_core::job::JobState::Completing {
@@ -1756,7 +1751,10 @@ async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHan
         let now = Utc::now();
 
         let running: Vec<_> = cluster
-            .get_jobs(&[JobState::Running], None, None, None, None, &[])
+            .get_jobs(&JobFilter {
+                states: &[JobState::Running],
+                ..Default::default()
+            })
             .into_iter()
             .filter(|j| j.spec.interactive || j.spec.srun_job)
             .collect();
@@ -1837,14 +1835,10 @@ async fn enforce_completing_timeout(cluster: Arc<ClusterManager>, raft: Arc<Raft
         let now = Utc::now();
         let wait = chrono::Duration::seconds(cluster.config().scheduler.complete_wait_secs as i64);
 
-        let completing = cluster.get_jobs(
-            &[spur_core::job::JobState::Completing],
-            None,
-            None,
-            None,
-            None,
-            &[],
-        );
+        let completing = cluster.get_jobs(&JobFilter {
+            states: &[spur_core::job::JobState::Completing],
+            ..Default::default()
+        });
 
         for job in completing {
             let Some(completing_since) = job.end_time else {

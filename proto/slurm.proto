@@ -476,6 +476,8 @@ message GetJobsRequest {
   string account = 4;
   repeated uint32 job_ids = 5;
   string name = 6;
+  // Filter: only jobs allocated on any of these nodes (expanded hostlist).
+  repeated string nodes = 7;
 }
 
 message GetJobsResponse {
