@@ -264,6 +264,21 @@ The question of when vPoDs are created and destroyed determines the isolation mo
 
 **Transition window:** When a vPoD is destroyed, GPUs pass through an unassigned state before returning to the system vPoD or entering a new vPoD. During this window, GPUs are unreachable at the fabric level. The scheduler must account for this: a GPU finishing one job is not immediately assignable to the next. How long this window lasts in practice is hardware-dependent and must be measured.
 
+### Choosing the right granularity: isolation boundary first
+
+The choice between cluster, partition, reservation, and job as the FabricDomain granularity is not primarily a performance or operational decision — it is a question of where the isolation boundary needs to be drawn.
+
+A vPoD creation programs exactly two isolation primitives: a dedicated VLAN on the switch fabric and a unique set of AES-GCM-256 encryption keys distributed to every GPU in the domain. These are the only mechanisms that prevent one workload from reaching another's GPU memory or intercepting its traffic at the fabric layer. Everything else — scheduling locality, topology hints, env var injection — is informational. The VLAN and the keys are the boundary.
+
+This means: **every entity that shares a vPoD shares an isolation boundary.** If two jobs run in the same vPoD, they are on the same VLAN (their GPUs can reach each other at L2) and encrypt traffic with the same keys (a compromised process in one job could potentially access fabric traffic from the other). Whether that is acceptable depends entirely on the trust model between those jobs:
+
+- **Cluster-level vPoD (option 1):** All jobs in the cluster share one isolation boundary. Acceptable only when all users fully trust each other — equivalent to a single-tenant dedicated cluster.
+- **Partition-level vPoD (options 2, 4):** All jobs in a partition share one isolation boundary. Acceptable when a partition maps to a single team or project whose members mutually trust each other, but different partitions are isolated from each other.
+- **Reservation-level vPoD (option 7):** All jobs within a reservation share one isolation boundary. Acceptable when a reservation is always booked by a single user or tightly-coupled workflow, and the advance booking window is used to amortize creation cost.
+- **Job-level vPoD (options 3, 5):** Each job has its own isolation boundary — its own VLAN and its own encryption keys. Required for true multi-tenant security where jobs from different users may run concurrently on the same rack.
+
+The right granularity is therefore determined by asking: "who do I need to isolate from whom?" The answer to that question selects the option; dispatch latency and operational complexity are secondary considerations that inform the implementation but should not override the isolation requirement.
+
 ---
 
 ## Modeling Fabric Resources in Spur: The FabricDomain
