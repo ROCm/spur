@@ -2854,15 +2854,15 @@ impl ClusterManager {
                 if let Some(reason) =
                     account_block_with(job, &self.association_cache, &jobs, &reserved)
                 {
-                    return Some(reason);
+                    return GateOutcome::Block(reason);
                 }
                 if let Some(reason) =
                     qos_block_with(job, &qos_by_job[&job.job_id], &jobs, &reserved)
                 {
-                    return Some(reason);
+                    return GateOutcome::Block(reason);
                 }
                 reserved.reserve(job);
-                None
+                GateOutcome::Keep
             });
         }
 
@@ -2871,7 +2871,7 @@ impl ClusterManager {
             let mut remaining = available.clone();
             retain_eligible(&mut candidates, &mut blocked, |job| {
                 if let Some(reason) = license_block(job, &available) {
-                    return Some(reason);
+                    return GateOutcome::Block(reason);
                 }
                 let req = extract_license_requirements(&job.spec);
                 // In-pass contention counts as a license wait, same as a shortage.
@@ -2879,14 +2879,14 @@ impl ClusterManager {
                     .iter()
                     .any(|(lic, n)| remaining.get(lic).copied().unwrap_or(0) < *n)
                 {
-                    return Some(PendingReason::Licenses);
+                    return GateOutcome::Block(PendingReason::Licenses);
                 }
                 for (lic, n) in &req {
                     if let Some(avail) = remaining.get_mut(lic) {
                         *avail = avail.saturating_sub(*n);
                     }
                 }
-                None
+                GateOutcome::Keep
             });
         }
 
@@ -2894,36 +2894,29 @@ impl ClusterManager {
         {
             let available = self.available_bb_with(&jobs);
             let mut remaining = available;
-            candidates.retain(|candidate| {
-                if !candidate.scheduling_eligible {
-                    return true;
-                }
-                let job = &candidate.job;
+            retain_eligible(&mut candidates, &mut blocked, |job| {
                 if job.bb_stage_state == BbStageState::Staging {
-                    record_blocked(&mut blocked, candidate, PendingReason::BurstBufferStageIn);
-                    return false;
+                    return GateOutcome::Block(PendingReason::BurstBufferStageIn);
                 }
                 if let Some(reason) = burst_buffer_block(job, available) {
-                    record_blocked(&mut blocked, candidate, reason);
-                    return false;
+                    return GateOutcome::Block(reason);
                 }
                 let req = extract_bb_requirement(&job.spec);
                 if req == 0 {
-                    return true;
+                    return GateOutcome::Keep;
                 }
                 if job.bb_stage_state == BbStageState::Ready {
-                    return true;
+                    return GateOutcome::Keep;
                 }
                 // In-pass contention counts as a BB wait, same as a shortage.
                 if req > remaining {
-                    record_blocked(&mut blocked, candidate, PendingReason::BurstBufferResources);
-                    return false;
+                    return GateOutcome::Block(PendingReason::BurstBufferResources);
                 }
-                // Not a block: capacity is reserved and stage-in scheduled, so the
-                // job leaves the schedulable set and shows BurstBufferStageIn next.
+                // Capacity reserved and stage-in scheduled, so the job leaves the
+                // schedulable set and shows BurstBufferStageIn next cycle.
                 remaining = remaining.saturating_sub(req);
                 bb_stage_candidates.push(job.job_id);
-                false
+                GateOutcome::DropUntagged
             });
         }
 
@@ -5609,23 +5602,41 @@ fn retain_unblocked(
     });
 }
 
+/// Outcome of an eligibility gate for one candidate. Exhaustive so every gate
+/// branch must name an outcome: a silent drop is a compile error.
+enum GateOutcome {
+    /// Keep the candidate in the schedulable set.
+    Keep,
+    /// Drop and record `reason` (a no-op tag for already-tagged candidates).
+    Block(PendingReason),
+    /// Drop without recording a reason. Only the burst-buffer stage-in handoff
+    /// uses this: the gate reserved capacity and enqueued the job for staging,
+    /// so it is tagged `BurstBufferStageIn` on the next cycle. Do not use this
+    /// to bypass tagging in any other gate.
+    DropUntagged,
+}
+
 /// Like [`retain_unblocked`], but skips not-yet-eligible candidates and lets
-/// `block` reserve in-pass headroom on the keep path. Eligible drops are
-/// recorded via `record_blocked` (a no-op for already-tagged candidates).
+/// `gate` reserve in-pass headroom on the keep path. A [`GateOutcome::Block`]
+/// drop is recorded via `record_blocked` (a no-op for already-tagged
+/// candidates); [`GateOutcome::DropUntagged`] drops without a reason.
 fn retain_eligible(
     candidates: &mut Vec<PendingJobCandidate>,
     blocked: &mut Vec<(JobId, PendingReason)>,
-    mut block: impl FnMut(&Job) -> Option<PendingReason>,
+    mut gate: impl FnMut(&Job) -> GateOutcome,
 ) {
     candidates.retain(|candidate| {
         if !candidate.scheduling_eligible {
             return true;
         }
-        let Some(reason) = block(&candidate.job) else {
-            return true;
-        };
-        record_blocked(blocked, candidate, reason);
-        false
+        match gate(&candidate.job) {
+            GateOutcome::Keep => true,
+            GateOutcome::Block(reason) => {
+                record_blocked(blocked, candidate, reason);
+                false
+            }
+            GateOutcome::DropUntagged => false,
+        }
     });
 }
 
