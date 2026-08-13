@@ -1005,15 +1005,20 @@ impl ClusterManager {
 
     /// Get jobs matching filters.
     pub fn get_jobs(&self, filter: &JobFilter) -> Vec<Job> {
+        // Built once per call so the per-job node check is O(allocated_nodes)
+        // rather than O(allocated_nodes * filter.nodes) for large hostlists.
+        let node_set: std::collections::HashSet<&str> =
+            filter.nodes.iter().map(String::as_str).collect();
+
         let matches = |j: &Job| -> bool {
             if !filter.states.is_empty() && !filter.states.contains(&j.state) {
                 return false;
             }
-            if !filter.nodes.is_empty()
+            if !node_set.is_empty()
                 && !j
                     .allocated_nodes
                     .iter()
-                    .any(|n| filter.nodes.iter().any(|f| f == n))
+                    .any(|n| node_set.contains(n.as_str()))
             {
                 return false;
             }
