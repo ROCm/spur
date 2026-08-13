@@ -6940,10 +6940,7 @@ mod tests {
             let retry = err.retryable();
             let status = node_complete_to_status(err);
             assert_eq!(status.code(), want_code);
-            let agent_retryable = matches!(
-                status.code(),
-                Code::Unavailable | Code::Internal | Code::DeadlineExceeded | Code::Unknown
-            );
+            let agent_retryable = spur_proto::controller_rpc_retryable(&status);
             assert_eq!(retry, agent_retryable, "{status:?}");
         }
     }

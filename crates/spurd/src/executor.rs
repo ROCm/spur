@@ -755,10 +755,9 @@ async fn spawn_job_process(
         });
     }
 
-    // Join the cgroup pre-exec, not from the parent after spawn: the rootful path
-    // runs under `unshare --fork`, whose forked workload only inherits the cgroup
-    // if we join before exec. A parent-side move races that fork and can leave the
-    // job unconstrained. Must precede the privilege drop -- only root writes here.
+    // Join the cgroup pre-exec, not parent-side after spawn: under `unshare
+    // --fork` the workload inherits the cgroup only if we join before exec, and a
+    // parent-side move races that fork. Precedes priv drop -- only root writes here.
     let cgroup_procs = cgroup_path
         .as_ref()
         .and_then(|p| CString::new(p.join("cgroup.procs").as_os_str().as_bytes()).ok());
@@ -1479,6 +1478,11 @@ async fn launch_container_job(
     let container_env = config.container_env.clone();
     let entrypoint = config.entrypoint.clone();
 
+    // Precomputed before fork; the forked child joins the cgroup itself (below).
+    let cgroup_procs = cgroup_path
+        .as_ref()
+        .and_then(|p| CString::new(p.join("cgroup.procs").as_os_str().as_bytes()).ok());
+
     match unsafe { nix::unistd::fork().context("fork for container job")? } {
         nix::unistd::ForkResult::Child => {
             // === CHILD PROCESS ===
@@ -1503,6 +1507,13 @@ async fn launch_container_job(
 
             // RLIMIT_MEMLOCK: raise while still root, before container_init drops privileges.
             apply_memlock(cfg.memlock);
+
+            // Join the cgroup here, before container_init's pivot_root hides the
+            // host cgroupfs and its priv drop revokes write access. A parent-side
+            // write would race this child's execve and leave the job unconstrained.
+            if let Some(ref procs) = cgroup_procs {
+                join_cgroup_self(procs);
+            }
 
             // Run container init: namespaces, mounts, pivot_root, priv drop
             let hook_env = match crate::container::container_init(config, &rootfs) {
@@ -1572,9 +1583,8 @@ async fn launch_container_job(
 
             let child_pid = child.as_raw();
 
-            if let Some(ref cgroup) = cgroup_path {
-                let _ = std::fs::write(cgroup.join("cgroup.procs"), child_pid.to_string());
-            }
+            // Cgroup placement already happened in the child before exec; a
+            // parent-side write here would race the container's execve.
 
             // pidfd prevents PID recycling; falls back gracefully on kernels < 5.3
             let pidfd = pidfd_open(child_pid).ok();

@@ -54,8 +54,8 @@ pub struct JobControllerCtx {
     pub ctrl_client: Mutex<SlurmControllerClient<Channel>>,
     /// Track multi-pod completion: job_id → (expected_count, completed_count, any_failed)
     pub(crate) pod_tracker: Mutex<HashMap<u32, PodTracker>>,
-    /// Consecutive reconcile failures per SpurJob, driving the retry delay.
-    /// Std mutex because `error_policy` is synchronous.
+    /// Consecutive reconcile failures per SpurJob (keyed by [`failure_key`]),
+    /// driving the retry delay. Std mutex because `error_policy` is synchronous.
     pub(crate) failures: StdMutex<HashMap<String, u32>>,
 }
 
@@ -64,6 +64,16 @@ fn object_key(job: &SpurJob) -> String {
         "{}/{}",
         job.metadata.namespace.as_deref().unwrap_or_default(),
         job.metadata.name.as_deref().unwrap_or_default()
+    )
+}
+
+/// Map key for the failure counter. Includes the UID so a delete+recreate under
+/// the same name starts a fresh backoff sequence instead of inheriting the count.
+fn failure_key(job: &SpurJob) -> String {
+    format!(
+        "{}/{}",
+        object_key(job),
+        job.metadata.uid.as_deref().unwrap_or("")
     )
 }
 
@@ -120,7 +130,7 @@ async fn reconcile(
         .clone()
         .ok_or_else(|| ReconcileError::Other("SpurJob has no namespace".into()))?;
     let api: Api<SpurJob> = Api::namespaced(ctx.client.clone(), &ns);
-    let key = object_key(&job);
+    let key = failure_key(&job);
 
     let result = finalizer(&api, FINALIZER, job, |event| {
         let api = api.clone();
@@ -135,8 +145,8 @@ async fn reconcile(
     .await
     .map_err(map_finalizer_err);
 
-    // A clean pass ends the retry sequence; cleanup also lands here, so the
-    // entry is dropped when the SpurJob goes away.
+    // A clean pass ends the retry sequence; a successful cleanup lands here too,
+    // reaping the entry on delete so it does not outlive the SpurJob.
     if result.is_ok() {
         ctx.clear_backoff(&key);
     }
@@ -161,16 +171,7 @@ fn should_submit(status: &SpurJobStatus) -> bool {
     status.spur_job_id.is_none()
 }
 
-/// Whether a failed submit is worth another attempt. Only "no controller
-/// answered" codes qualify; anything else faults the spec itself and would be
-/// rejected identically forever. Matches the agent's controller-RPC rule.
-fn submit_is_retryable(status: &tonic::Status) -> bool {
-    use tonic::Code;
-    matches!(
-        status.code(),
-        Code::Unavailable | Code::Internal | Code::DeadlineExceeded | Code::Unknown
-    )
-}
+use spur_proto::controller_rpc_retryable;
 
 enum SubmitOutcome {
     Submitted,
@@ -216,7 +217,7 @@ async fn submit_to_controller(
         .await
     {
         Ok(resp) => resp.into_inner().job_id,
-        Err(e) if submit_is_retryable(&e) => {
+        Err(e) if controller_rpc_retryable(&e) => {
             error!(spurjob = %name, error = %e, "failed to submit SpurJob");
             return Err(ReconcileError::Grpc(e));
         }
@@ -372,7 +373,7 @@ async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action
 }
 
 fn error_policy(job: Arc<SpurJob>, error: &ReconcileError, ctx: Arc<JobControllerCtx>) -> Action {
-    let delay = ctx.next_backoff(&object_key(&job));
+    let delay = ctx.next_backoff(&failure_key(&job));
     error!(
         spurjob = %object_key(&job),
         error = %error,
@@ -981,6 +982,25 @@ mod tests {
     }
 
     #[test]
+    fn failure_key_distinguishes_recreated_objects() {
+        let recreate = |uid: &str| -> SpurJob {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "spur.amd.com/v1",
+                "kind": "SpurJob",
+                "metadata": { "namespace": "ns", "name": "job", "uid": uid },
+                "spec": { "name": "job", "image": "img" },
+            }))
+            .unwrap()
+        };
+        let old = recreate("uid-a");
+        let new = recreate("uid-b");
+
+        // Same name, but a recreate gets its own backoff sequence.
+        assert_eq!(object_key(&old), object_key(&new));
+        assert_ne!(failure_key(&old), failure_key(&new));
+    }
+
+    #[test]
     fn test_cleared_object_restarts_backoff() {
         let failures = FailureCounts::default();
         record_failure(&failures, "ns/a");
@@ -1020,33 +1040,6 @@ mod tests {
         assert!(!is_terminal("Suspended"));
         assert!(!is_terminal("Unknown"));
         assert!(!is_terminal(""));
-    }
-
-    // --- submit_is_retryable ---
-
-    #[test]
-    fn a_spec_rejection_is_not_retried() {
-        // What spurctld returns for an unknown partition or a denied account.
-        assert!(!submit_is_retryable(&tonic::Status::invalid_argument(
-            "partition 'gpu' not found"
-        )));
-        assert!(!submit_is_retryable(&tonic::Status::permission_denied(
-            "account denied"
-        )));
-    }
-
-    #[test]
-    fn a_controller_that_did_not_answer_is_retried() {
-        // "not the Raft leader" and a failed Raft propose are both transient.
-        assert!(submit_is_retryable(&tonic::Status::unavailable(
-            "not the Raft leader"
-        )));
-        assert!(submit_is_retryable(&tonic::Status::internal(
-            "raft propose failed"
-        )));
-        assert!(submit_is_retryable(&tonic::Status::deadline_exceeded(
-            "timed out"
-        )));
     }
 
     // --- resolve_reporting_node ---
