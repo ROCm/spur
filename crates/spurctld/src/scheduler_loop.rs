@@ -147,7 +147,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         }
         let hit_depth_limit = pending.len() > max_jobs;
 
-        let nodes = cluster.schedulable_nodes();
+        let nodes = cluster.schedulable_nodes(&pending);
         let partitions = cluster.get_partitions();
         let reservations = cluster.get_reservations();
 

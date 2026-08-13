@@ -2101,13 +2101,23 @@ impl ClusterManager {
     }
 
     /// Nodes eligible for new placement this tick: all nodes minus those within
-    /// a dispatch cooldown after a resources-unavailable reject.
-    pub fn schedulable_nodes(&self) -> Vec<Node> {
+    /// a dispatch cooldown after a resources-unavailable reject — except a
+    /// cooling node explicitly named by a pending job's `--nodelist`, which has
+    /// nowhere else to go and would otherwise starve for the cooldown's
+    /// duration instead of being retried, the outcome the cooldown exists to
+    /// avoid only for jobs that actually have an alternative.
+    pub fn schedulable_nodes(&self, pending: &[Job]) -> Vec<Node> {
         let cooling = self.nodes_on_dispatch_cooldown();
+        let pinned: HashSet<String> = pending
+            .iter()
+            .filter_map(|j| j.spec.nodelist.as_deref())
+            .filter_map(|nl| spur_core::hostlist::expand(nl).ok())
+            .flatten()
+            .collect();
         self.nodes
             .read()
             .values()
-            .filter(|n| !cooling.contains(&n.name))
+            .filter(|n| !cooling.contains(&n.name) || pinned.contains(&n.name))
             .cloned()
             .collect()
     }
@@ -6820,7 +6830,11 @@ mod tests {
         assert!(cm.nodes_on_dispatch_cooldown().contains("worker1"));
 
         // The scheduler's node view excludes the cooled node, keeps the other.
-        let names: HashSet<String> = cm.schedulable_nodes().into_iter().map(|n| n.name).collect();
+        let names: HashSet<String> = cm
+            .schedulable_nodes(&[])
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
         assert!(
             !names.contains("worker1"),
             "cooled node excluded from scheduling"
@@ -6834,7 +6848,9 @@ mod tests {
         );
         assert!(!cm.nodes_on_dispatch_cooldown().contains("worker1"));
         assert!(
-            cm.schedulable_nodes().iter().any(|n| n.name == "worker1"),
+            cm.schedulable_nodes(&[])
+                .iter()
+                .any(|n| n.name == "worker1"),
             "expired cooldown makes the node schedulable again"
         );
 
@@ -6844,6 +6860,47 @@ mod tests {
         let cm0 = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
         cm0.cool_down_node("worker1");
         assert!(cm0.nodes_on_dispatch_cooldown().is_empty());
+    }
+
+    /// GATE: a job's `--nodelist` pin is its only possible placement — cooling
+    /// that node down must not starve it for the whole cooldown window, or a
+    /// preempt-then-redispatch race against the same node (chronic preemption)
+    /// can never make progress within a job's own retry budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn schedulable_nodes_exempts_a_cooling_node_pinned_by_a_pending_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+
+        cm.cool_down_node("n1");
+        assert!(cm.nodes_on_dispatch_cooldown().contains("n1"));
+
+        let mut spec = basic_spec("pinned");
+        spec.nodelist = Some("n1".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let pinned_job = cm.get_job(job_id).unwrap();
+
+        let names: HashSet<String> = cm
+            .schedulable_nodes(std::slice::from_ref(&pinned_job))
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        assert!(
+            names.contains("n1"),
+            "n1 is the pinned job's only candidate — must stay schedulable despite cooling"
+        );
+
+        // No pending job names the cooling node: back to excluded, as normal.
+        let names: HashSet<String> = cm
+            .schedulable_nodes(&[])
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        assert!(
+            !names.contains("n1"),
+            "n1 must stay excluded when nothing pins to it"
+        );
     }
 
     /// Consumer-driven: `maybe_requeue` must honor the new `max_batch_requeue`
