@@ -4027,30 +4027,6 @@ impl ClusterManager {
         }
     }
 
-    /// Logs (never rewrites, which would mask the gap) any pending job stuck at
-    /// `Reason=None`. Holds, deadlines, begin-time holds, and array-throttled
-    /// tasks are legitimately None and skipped.
-    pub(crate) fn warn_untagged_pending(&self) -> Vec<JobId> {
-        let now = Utc::now();
-        let jobs = self.jobs.read();
-        let mut untagged = Vec::new();
-        for job in jobs.values() {
-            if job.state != JobState::Pending
-                || job.pending_reason != PendingReason::None
-                || job.is_begin_held(now)
-                || job.spec.array_max_concurrent.is_some()
-            {
-                continue;
-            }
-            warn!(
-                job_id = job.job_id,
-                "pending job left with Reason=None after classification (classifier gap)"
-            );
-            untagged.push(job.job_id);
-        }
-        untagged
-    }
-
     /// Send a job event notification via webhook (if configured).
     ///
     /// Uses `curl` as a subprocess to avoid pulling in an HTTP client dependency.
@@ -5634,7 +5610,8 @@ fn retain_unblocked(
 }
 
 /// Like [`retain_unblocked`], but skips not-yet-eligible candidates and lets
-/// `block` reserve in-pass headroom on the keep path. Drops are always recorded.
+/// `block` reserve in-pass headroom on the keep path. Eligible drops are
+/// recorded via `record_blocked` (a no-op for already-tagged candidates).
 fn retain_eligible(
     candidates: &mut Vec<PendingJobCandidate>,
     blocked: &mut Vec<(JobId, PendingReason)>,
@@ -12861,63 +12838,6 @@ mod tests {
         assert_eq!(
             cm.get_job(j2).unwrap().pending_reason,
             PendingReason::BurstBufferResources
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn warn_untagged_pending_detects_leak_without_rewriting_reason() {
-        // A leaked-None pending job is detected and returned, but its reason is
-        // left None, not rewritten. No node registered, so nothing tags it first.
-        let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir).await;
-        let id = submit_and_wait(&cm, basic_spec("leak"));
-        assert_eq!(cm.get_job(id).unwrap().pending_reason, PendingReason::None);
-
-        let untagged = cm.warn_untagged_pending();
-        assert_eq!(untagged, vec![id]);
-        assert_eq!(
-            cm.get_job(id).unwrap().pending_reason,
-            PendingReason::None,
-            "the reason must stay the honest None, not be rewritten"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn warn_untagged_pending_ignores_begin_held() {
-        // A begin-time hold at None is legitimate, not a gap: must not be flagged.
-        let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir).await;
-        let mut spec = basic_spec("held");
-        spec.begin_time = Some(Utc::now() + chrono::Duration::hours(1));
-        let id = submit_and_wait(&cm, spec);
-
-        let untagged = cm.warn_untagged_pending();
-        assert!(untagged.is_empty(), "begin-held job must not be flagged");
-        assert_eq!(cm.get_job(id).unwrap().pending_reason, PendingReason::None);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn warn_untagged_pending_ignores_array_throttled() {
-        // A task held back by array_max_concurrent sits at None by design (its
-        // reason is tracked separately); the check must not flag it as a gap.
-        let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir).await;
-        register_node(&cm, "n1", 8, 16000);
-        let mut spec = basic_spec("arr");
-        spec.array_spec = Some("0-1%1".into());
-        let parent_id = cm.submit_job(spec).unwrap().job_id;
-        let t1 = parent_id + 1;
-        let t2 = parent_id + 2;
-        wait_for("array tasks", || {
-            cm.get_job(t1).is_some() && cm.get_job(t2).is_some()
-        });
-        start_job_on(&cm, t1, "n1");
-        settle(&cm, t1, JobState::Running);
-
-        assert_eq!(cm.get_job(t2).unwrap().pending_reason, PendingReason::None);
-        assert!(
-            !cm.warn_untagged_pending().contains(&t2),
-            "throttled array task must not be flagged as a classifier gap"
         );
     }
 
