@@ -504,6 +504,7 @@ mod tests {
         suspend_job(pb::SuspendJobRequest) -> ();
         resume_job(pb::ResumeJobRequest) -> ();
         update_job(pb::UpdateJobRequest) -> ();
+        requeue_job(pb::RequeueJobRequest) -> ();
         get_node(pb::GetNodeRequest) -> pb::NodeInfo;
         update_node(pb::UpdateNodeRequest) -> ();
         drain_node(pb::DrainNodeRequest) -> pb::DrainNodeResponse;

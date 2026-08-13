@@ -1146,7 +1146,7 @@ def parse_job_id(sbatch_output: str) -> int | None:
 
 def job_state(squeue_output: str, job_id: int) -> str | None:
     """Parse job state from squeue -t all output."""
-    valid_states = {"PD", "R", "CD", "CG", "F", "CA", "TO", "NF", "PR", "S"}
+    valid_states = {"PD", "R", "CD", "CG", "F", "CA", "TO", "NF", "PR", "S", "RQ"}
     id_str = str(job_id)
     for line in squeue_output.splitlines()[1:]:
         fields = line.split()

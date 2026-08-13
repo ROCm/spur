@@ -1185,6 +1185,135 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Admin requeue (`scontrol requeue` / `requeuehold`), keeping the `job_id`.
+    /// A bare array-parent id (no job record of its own) fans out to every task.
+    /// Returns snapshots of the jobs that were Running/Suspended so the caller
+    /// can kill their old processes.
+    pub fn requeue_job_by_user(
+        &self,
+        job_id: JobId,
+        user: &str,
+        hold: bool,
+    ) -> anyhow::Result<Vec<Job>> {
+        let (targets, is_array) = {
+            let jobs = self.jobs.read();
+            if jobs.contains_key(&job_id) {
+                (vec![job_id], false)
+            } else {
+                let mut tasks: Vec<JobId> = jobs
+                    .values()
+                    .filter(|j| j.spec.array_job_id == Some(job_id))
+                    .map(|j| j.job_id)
+                    .collect();
+                tasks.sort_unstable();
+                (tasks, true)
+            }
+        };
+        if targets.is_empty() {
+            anyhow::bail!("job {} not found", job_id);
+        }
+
+        // A single, explicitly named job propagates its error verbatim so the
+        // user sees exactly why (not owner, interactive, already pending, ...).
+        if !is_array {
+            return Ok(self
+                .requeue_one_job(targets[0], user, hold)?
+                .into_iter()
+                .collect());
+        }
+
+        // Array fan-out: requeue every task that can be, collecting per-task
+        // failures. Only fail outright if no task could be requeued at all.
+        let total = targets.len();
+        let mut killed = Vec::new();
+        let mut errors = Vec::new();
+        for id in targets {
+            match self.requeue_one_job(id, user, hold) {
+                Ok(Some(job)) => killed.push(job),
+                Ok(None) => {}
+                Err(e) => errors.push(format!("task {id}: {e}")),
+            }
+        }
+        if killed.is_empty() && errors.len() == total {
+            anyhow::bail!(
+                "no tasks of array {} could be requeued: {}",
+                job_id,
+                errors.join("; ")
+            );
+        }
+        // Partial success is reported as success (some tasks requeued), so make
+        // the skipped tasks visible rather than swallowing them silently.
+        if !errors.is_empty() {
+            warn!(
+                array_job_id = job_id,
+                "some array tasks were not requeued: {}",
+                errors.join("; ")
+            );
+        }
+        Ok(killed)
+    }
+
+    /// Requeue exactly one job/task. Returns its pre-requeue snapshot when the
+    /// job was Running/Suspended (so its processes must be killed on the nodes).
+    fn requeue_one_job(
+        &self,
+        job_id: JobId,
+        user: &str,
+        hold: bool,
+    ) -> anyhow::Result<Option<Job>> {
+        let snapshot = {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            Self::check_job_owner(user, &job.spec.user, "requeue")?;
+            // Interactive/srun allocations have no batch script to re-run.
+            if job.spec.interactive || job.spec.srun_job || job.spec.pty {
+                anyhow::bail!("job {} is interactive and cannot be requeued", job_id);
+            }
+            match job.state {
+                JobState::Pending => anyhow::bail!("job {} is already pending", job_id),
+                JobState::Completing => {
+                    anyhow::bail!("job {} is completing; cannot requeue", job_id)
+                }
+                JobState::Preempted | JobState::Requeued => {
+                    anyhow::bail!("job {} is already being requeued", job_id)
+                }
+                _ => {}
+            }
+            matches!(job.state, JobState::Running | JobState::Suspended).then(|| job.clone())
+        };
+
+        // Defer a live, non-held requeue's eligibility so the scheduler can't
+        // re-dispatch it into its own in-flight cancel (same guard as preemption
+        // requeue). Held/terminal requeues can't hit that race. Computed on the
+        // leader so every replica applies one instant.
+        let begin_time = match (&snapshot, hold) {
+            (Some(job), false) => {
+                let hold_secs = (self.scheduler_interval_secs as i64 * 2 + 3).max(5);
+                let deferred = Utc::now() + chrono::Duration::seconds(hold_secs);
+                Some(
+                    job.spec
+                        .begin_time
+                        .map_or(deferred, |user| user.max(deferred)),
+                )
+            }
+            _ => None,
+        };
+
+        let resp = self.propose(WalOperation::JobUserRequeue {
+            job_id,
+            hold,
+            begin_time,
+        })?;
+        // Fires accounting-end + epilog for the finalized run (live path only;
+        // an already-terminal job emits no finalized entry here).
+        self.run_all_finalized_side_effects(&resp);
+        self.scheduler_notify.notify_one();
+        info!(job_id, hold, "job requeued by admin");
+        Ok(snapshot)
+    }
+
     /// Complete a standalone srun allocation after its step finishes.
     pub fn finish_srun_job(
         &self,
@@ -4371,6 +4500,14 @@ impl ClusterManager {
         Self::clear_run_state_for_requeue(job);
     }
 
+    /// Requeue by admin action (`scontrol requeue`): tracked separately since it
+    /// is an operator decision, never a failure, and must never contribute to
+    /// the `max_batch_requeue` hold.
+    fn reset_job_for_user_requeue(job: &mut Job) {
+        job.user_requeue_count += 1;
+        Self::clear_run_state_for_requeue(job);
+    }
+
     /// Evict a single job by ID: transition to NodeFail, then free its
     /// allocations on every node it spans. Transition is validated first
     /// so allocations are never freed for a job that can't be evicted.
@@ -4621,6 +4758,109 @@ impl ClusterManager {
                     }],
                     ..Default::default()
                 };
+            }
+            WalOperation::JobUserRequeue {
+                job_id,
+                hold,
+                begin_time,
+            } => {
+                // A live job is finalized once (routed through Requeued so
+                // accounting/steps see a finished run) then re-pended; an
+                // already-terminal job re-pends with no second finalization to
+                // avoid double-counting. NoOp on replay / non-requeuable states.
+                let was_live;
+                let freed_nodes;
+                let allocated_resources;
+                let per_node_map;
+                {
+                    let Some(job) = jobs.get_mut(job_id) else {
+                        return ClientResponse::default();
+                    };
+                    match job.state {
+                        JobState::Running | JobState::Suspended => {
+                            was_live = true;
+                            if let Some(since) = job.suspended_at.take() {
+                                job.suspended_secs += (timestamp - since).num_seconds().max(0);
+                            }
+                            if let Err(e) = job.transition(JobState::Requeued) {
+                                warn!(job_id = *job_id, error = %e, "invalid requeue finalize transition in WAL apply");
+                                return ClientResponse::default();
+                            }
+                            job.exit_code = Some(-1);
+                            job.end_time = Some(timestamp);
+                        }
+                        s if s.is_terminal() => {
+                            was_live = false;
+                        }
+                        _ => {
+                            // Pending, Completing, or an in-flight finalized
+                            // state: nothing to requeue.
+                            return ClientResponse::default();
+                        }
+                    }
+                    freed_nodes = job.allocated_nodes.clone();
+                    allocated_resources = job.allocated_resources.clone();
+                    per_node_map = job.per_node_alloc.clone();
+                    job.node_completions.clear();
+
+                    if let Err(e) = job.transition(JobState::Pending) {
+                        warn!(job_id = *job_id, error = %e, "invalid requeue transition in WAL apply");
+                        return ClientResponse::default();
+                    }
+                    Self::reset_job_for_user_requeue(job);
+                    if *hold {
+                        job.priority = 0;
+                        job.set_pending_reason(PendingReason::Held);
+                    } else if let Some(bt) = begin_time {
+                        // Leader-computed hold against re-dispatch into the cancel.
+                        job.spec.begin_time = Some(*bt);
+                        job.set_pending_reason(PendingReason::BeginTime);
+                    } else {
+                        job.set_pending_reason(PendingReason::None);
+                    }
+                }
+                // Only the live path has allocations to free; for a terminal job
+                // `allocated_resources` is already None and this is skipped.
+                if let Some(ref total) = allocated_resources {
+                    let node_count = freed_nodes.len().max(1) as u32;
+                    for name in &freed_nodes {
+                        if let Some(node) = nodes.get_mut(name) {
+                            let slice = per_node_map.get(name).cloned().unwrap_or_else(|| {
+                                warn!(job_id = *job_id, node = %name, "per_node_alloc missing at requeue deallocation, using scalar fallback");
+                                ResourceAllocations::with_scalar(
+                                    total.cpus / node_count,
+                                    total.memory_mb / node_count as u64,
+                                )
+                            });
+                            node.alloc_resources.subtract(&slice);
+                            node.update_state_from_alloc();
+                            if node.state == NodeState::Draining
+                                && node.alloc_resources.cpus == 0
+                                && !node.alloc_resources.has_devices()
+                            {
+                                node.state = NodeState::Drain;
+                            }
+                        }
+                    }
+                }
+                drop(jobs);
+                drop(nodes);
+                self.next_job_id.store(next_id, Ordering::Relaxed);
+                if was_live {
+                    // Complete steps and fire accounting-end for the terminated
+                    // run as REQUEUED; the terminal path already did this at its
+                    // real completion, so it emits nothing here (no double-count).
+                    self.complete_job_steps(job_id, -1, timestamp);
+                    return ClientResponse {
+                        jobs_finalized: vec![JobFinalized {
+                            job_id: *job_id,
+                            state: JobState::Requeued,
+                            exit_code: -1,
+                        }],
+                        ..Default::default()
+                    };
+                }
+                return ClientResponse::default();
             }
             WalOperation::JobPreemptCancel { job_id } => {
                 let freed_nodes;
@@ -9590,6 +9830,325 @@ mod tests {
         .unwrap();
         settle(cm, job_id, JobState::Running);
         job_id
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_requeue_running_job_frees_nodes_and_repends() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "requeue-me", "worker1");
+        assert_eq!(cm.node_metrics().alloc_cpus, 2);
+
+        let killed = cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+        assert_eq!(
+            killed.len(),
+            1,
+            "a running job must be reported for agent kill"
+        );
+        settle(&cm, job_id, JobState::Pending);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.allocated_nodes.is_empty());
+        assert_eq!(cm.node_metrics().alloc_cpus, 0, "nodes must be freed");
+        assert_eq!(job.user_requeue_count, 1);
+        assert_eq!(
+            job.requeue_count, 0,
+            "manual requeue must not touch the batch cap"
+        );
+        // A live job carries a short begin_time hold so the scheduler cannot
+        // re-dispatch it into its own in-flight cancel.
+        assert_eq!(job.pending_reason, PendingReason::BeginTime);
+        let begin = job
+            .spec
+            .begin_time
+            .expect("live requeue sets a begin_time hold");
+        assert!(begin > Utc::now(), "begin_time hold must be in the future");
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "held-by-begin-time job must not be eligible yet"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_requeue_suspended_job_repends() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "suspend-requeue", "worker1");
+        cm.suspend_job(job_id, "testuser").unwrap();
+        settle(&cm, job_id, JobState::Suspended);
+
+        let killed = cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+        assert_eq!(killed.len(), 1);
+        settle(&cm, job_id, JobState::Pending);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert!(job.allocated_nodes.is_empty());
+        assert_eq!(cm.node_metrics().alloc_cpus, 0, "nodes must be freed");
+        assert_eq!(job.user_requeue_count, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_requeue_completed_job_repends_without_extra_finalize() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "completed-requeue", "worker1");
+        cm.complete_job(job_id, 0, JobState::Completed).unwrap();
+        settle(&cm, job_id, JobState::Completed);
+
+        // An already-terminal job has no live processes to kill.
+        let killed = cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+        assert!(killed.is_empty(), "terminal job needs no agent kill");
+        settle(&cm, job_id, JobState::Pending);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.user_requeue_count, 1);
+        assert!(job.end_time.is_none(), "re-pended job clears end_time");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_requeue_all_terminal_states_repend() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 32, 64000);
+
+        // Every terminal state must re-pend, so the leader's acceptance and the
+        // apply-side transition never disagree (no "requeued" print without effect).
+        for state in [
+            JobState::Failed,
+            JobState::Timeout,
+            JobState::NodeFail,
+            JobState::OutOfMemory,
+        ] {
+            let job_id = run_job_on(&cm, &format!("term-{state:?}"), "worker1");
+            cm.complete_job(job_id, -1, state).unwrap();
+            settle(&cm, job_id, state);
+
+            cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+            settle(&cm, job_id, JobState::Pending);
+            assert_eq!(cm.get_job(job_id).unwrap().user_requeue_count, 1);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_requeue_finalizes_only_live_jobs() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        // Live path finalizes once (REQUEUED); the terminal path emits none, so
+        // a completed job is never accounted twice.
+        let live = run_job_on(&cm, "finalize-live", "worker1");
+        let resp = cm.apply_operation(&WalOperation::JobUserRequeue {
+            job_id: live,
+            hold: false,
+            begin_time: None,
+        });
+        assert_eq!(resp.jobs_finalized.len(), 1);
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Requeued);
+
+        let done = run_job_on(&cm, "finalize-done", "worker1");
+        cm.complete_job(done, 0, JobState::Completed).unwrap();
+        settle(&cm, done, JobState::Completed);
+        let resp = cm.apply_operation(&WalOperation::JobUserRequeue {
+            job_id: done,
+            hold: false,
+            begin_time: None,
+        });
+        assert!(
+            resp.jobs_finalized.is_empty(),
+            "an already-terminal job must not be finalized again"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_requeue_hold_parks_job_held() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "requeue-hold", "worker1");
+        cm.requeue_job_by_user(job_id, "testuser", true).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.priority, 0, "held job sits at priority 0");
+        assert_eq!(job.pending_reason, PendingReason::Held);
+        assert!(job.pending_reason.is_scheduling_hold());
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
+            "held job must not be eligible for dispatch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_requeue_rejects_interactive_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = submit_and_wait(&cm, srun_spec("interactive"));
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            resources.clone(),
+            per_node_for(&["worker1"], resources),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        let err = cm
+            .requeue_job_by_user(job_id, "testuser", false)
+            .expect_err("interactive jobs cannot be requeued");
+        assert!(err.to_string().contains("interactive"), "got: {err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_requeue_rejects_already_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = submit_and_wait(&cm, basic_spec("pending"));
+
+        let err = cm
+            .requeue_job_by_user(job_id, "testuser", false)
+            .expect_err("a pending job cannot be requeued");
+        assert!(err.to_string().contains("already pending"), "got: {err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_requeue_rejects_wrong_user() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "owned-by-testuser", "worker1");
+
+        let err = cm
+            .requeue_job_by_user(job_id, "bob", false)
+            .expect_err("a non-owner non-root user must be denied");
+        assert!(
+            err.downcast_ref::<spur_core::auth::AuthError>().is_some(),
+            "got: {err}"
+        );
+        // root may requeue any job.
+        cm.requeue_job_by_user(job_id, "root", false).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_requeue_array_parent_fans_out_to_all_tasks() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let mut spec = basic_spec("array-requeue");
+        spec.array_spec = Some("0-1".into());
+        let parent = cm.submit_job(spec).unwrap().job_id;
+
+        // Collect the task ids and run each to completion so they are requeue-able.
+        wait_for("array tasks applied", || {
+            cm.get_jobs(&JobFilter::default())
+                .iter()
+                .filter(|j| j.spec.array_job_id == Some(parent))
+                .count()
+                == 2
+        });
+        let task_ids: Vec<JobId> = cm
+            .get_jobs(&JobFilter::default())
+            .iter()
+            .filter(|j| j.spec.array_job_id == Some(parent))
+            .map(|j| j.job_id)
+            .collect();
+        for &id in &task_ids {
+            let resources = scalar_alloc(2, 4000);
+            cm.start_job(
+                id,
+                vec!["worker1".into()],
+                resources.clone(),
+                per_node_for(&["worker1"], resources),
+            )
+            .unwrap();
+            settle(&cm, id, JobState::Running);
+            cm.complete_job(id, 0, JobState::Completed).unwrap();
+            settle(&cm, id, JobState::Completed);
+        }
+
+        // Requeuing the bare array-parent id fans out to every task.
+        cm.requeue_job_by_user(parent, "testuser", false).unwrap();
+        for &id in &task_ids {
+            settle(&cm, id, JobState::Pending);
+            assert_eq!(cm.get_job(id).unwrap().user_requeue_count, 1);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_requeue_apply_is_idempotent_on_replay() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "replay", "worker1");
+
+        cm.apply_operation(&WalOperation::JobUserRequeue {
+            job_id,
+            hold: false,
+            begin_time: None,
+        });
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
+        assert_eq!(cm.get_job(job_id).unwrap().user_requeue_count, 1);
+
+        // Re-applying the same entry (follower catch-up / replay) is a NoOp:
+        // the job is already Pending, so the counter must not double-bump.
+        cm.apply_operation(&WalOperation::JobUserRequeue {
+            job_id,
+            hold: false,
+            begin_time: None,
+        });
+        assert_eq!(
+            cm.get_job(job_id).unwrap().user_requeue_count,
+            1,
+            "replay must not double-count a requeue"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_requeue_never_holds_at_max_batch_requeue() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "repeat-requeue", "worker1");
+
+        let max = cm.config().controller.max_batch_requeue;
+        for n in 0..(max + 2) {
+            // Re-dispatch then requeue again; the batch cap must never trigger.
+            if cm.get_job(job_id).unwrap().state == JobState::Pending {
+                let resources = scalar_alloc(2, 4000);
+                cm.start_job(
+                    job_id,
+                    vec!["worker1".into()],
+                    resources.clone(),
+                    per_node_for(&["worker1"], resources),
+                )
+                .unwrap();
+                settle(&cm, job_id, JobState::Running);
+            }
+            cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+            settle(&cm, job_id, JobState::Pending);
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.user_requeue_count, n + 1);
+            assert_eq!(job.requeue_count, 0);
+            assert_ne!(
+                job.pending_reason,
+                PendingReason::JobHoldMaxRequeue,
+                "manual requeue must never trip the batch-requeue hold"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

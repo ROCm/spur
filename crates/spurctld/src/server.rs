@@ -914,6 +914,43 @@ impl SlurmController for ControllerService {
         Ok(Response::new(()))
     }
 
+    async fn requeue_job(
+        &self,
+        request: Request<RequeueJobRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.requeue_job(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward requeue_job to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+
+        let req = request.into_inner();
+        let killed = self
+            .cluster
+            .requeue_job_by_user(req.job_id, &req.user, req.hold)
+            .map_err(cluster_err_to_precondition_status)?;
+
+        // Kill the old processes for jobs that were Running/Suspended; the
+        // requeue already freed their allocations and re-pended them.
+        for job in killed {
+            let cluster = self.cluster.clone();
+            tokio::spawn(async move {
+                crate::scheduler_loop::send_cancel_to_agents(&cluster, &job, 0).await;
+            });
+        }
+
+        Ok(Response::new(()))
+    }
+
     async fn get_nodes(
         &self,
         request: Request<GetNodesRequest>,

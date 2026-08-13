@@ -75,8 +75,14 @@ pub enum ScontrolCommand {
         /// Job ID
         job_id: u32,
     },
-    /// Requeue a job
+    /// Requeue a job (return it to PENDING with the same spec)
     Requeue {
+        /// Job ID
+        job_id: u32,
+    },
+    /// Requeue a job and leave it in a held state
+    #[command(name = "requeuehold", alias = "requeue-hold")]
+    RequeueHold {
         /// Job ID
         job_id: u32,
     },
@@ -329,23 +335,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             )
             .await
         }
-        ScontrolCommand::Requeue { job_id } => {
-            // Requeue = cancel + resubmit, simplified for now
-            let channel = crate::authclient::connect(&args.controller)
-                .await
-                .context("failed to connect to spurctld")?;
-            let mut client = spur_proto::controller_client(channel);
-            client
-                .cancel_job(spur_proto::proto::CancelJobRequest {
-                    job_id,
-                    signal: 0,
-                    user: crate::interactive::current_user()?,
-                })
-                .await
-                .context("requeue failed")?;
-            println!("job {} requeued (cancelled for resubmission)", job_id);
-            Ok(())
-        }
+        ScontrolCommand::Requeue { job_id } => requeue(&args.controller, job_id, false).await,
+        ScontrolCommand::RequeueHold { job_id } => requeue(&args.controller, job_id, true).await,
         ScontrolCommand::Suspend { job_id } => {
             let channel = crate::authclient::connect(&args.controller)
                 .await
@@ -883,6 +874,27 @@ fn format_ts(ts: Option<&prost_types::Timestamp>) -> String {
         }
         _ => "N/A".into(),
     }
+}
+
+async fn requeue(controller: &str, job_id: u32, hold: bool) -> Result<()> {
+    let channel = spur_client::connect_channel(controller)
+        .await
+        .context("failed to connect to spurctld")?;
+    let mut client = spur_proto::controller_client(channel);
+    client
+        .requeue_job(spur_proto::proto::RequeueJobRequest {
+            job_id,
+            user: crate::interactive::current_user()?,
+            hold,
+        })
+        .await
+        .context("requeue failed")?;
+    if hold {
+        println!("job {} requeued and held", job_id);
+    } else {
+        println!("job {} requeued", job_id);
+    }
+    Ok(())
 }
 
 async fn send_job_update(controller: &str, req: spur_proto::proto::UpdateJobRequest) -> Result<()> {

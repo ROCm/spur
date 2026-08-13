@@ -46,7 +46,8 @@ pub fn aggregate_array_state(task_states: &[JobState]) -> Option<JobState> {
         | JobState::Running
         | JobState::Completing
         | JobState::Suspended
-        | JobState::Preempted => 0,
+        | JobState::Preempted
+        | JobState::Requeued => 0,
     };
     task_states
         .iter()

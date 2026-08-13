@@ -375,13 +375,14 @@ mod tests {
     }
 
     #[test]
-    fn t50_37_requeue_from_completed_fails() {
+    fn t50_37_requeue_from_completed_succeeds() {
         let mut job = make_job("requeue-completed");
         assert_transition_ok(&mut job, JobState::Running);
         assert_transition_ok(&mut job, JobState::Completed);
-        // Completed → Pending should fail (Completed is not retriable)
-        assert_transition_err(&mut job, JobState::Pending);
-        assert_job_state(&job, JobState::Completed);
+        // Admin requeue (`scontrol requeue`) puts a finished job back in the
+        // queue: Completed → Pending is a legal transition.
+        assert_transition_ok(&mut job, JobState::Pending);
+        assert_job_state(&job, JobState::Pending);
     }
 
     // ── T50.38–40: Drain / Draining node behavior ──────────────
@@ -451,14 +452,16 @@ mod tests {
         assert_eq!(node.state, NodeState::Error);
     }
 
-    // ── T50.42–43: Requeue does not reset from Cancelled ───────
+    // ── T50.42–43: Admin requeue can reset from Cancelled ──────
 
     #[test]
-    fn t50_42_requeue_from_cancelled_fails() {
+    fn t50_42_requeue_from_cancelled_succeeds() {
         let mut job = make_job("requeue-cancelled");
         assert_transition_ok(&mut job, JobState::Cancelled);
-        // Cancelled → Pending should fail
-        assert_transition_err(&mut job, JobState::Pending);
+        // Admin requeue (`scontrol requeue`) can put a cancelled job back into
+        // the queue: Cancelled → Pending is a legal transition.
+        assert_transition_ok(&mut job, JobState::Pending);
+        assert_job_state(&job, JobState::Pending);
     }
 
     #[test]
