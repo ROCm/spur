@@ -18,6 +18,79 @@ static STEP_LAUNCH_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?:^|[\s;&|])(?:/.*/)?(srun|mpirun|mpiexec)\b").expect("valid step-launch regex")
 });
 
+/// Split a shell line into spans outside single/double quotes. Stops at an
+/// unquoted `#` (inline comment). Used to avoid treating launcher names inside
+/// string literals as real invocations.
+fn unquoted_shell_segments(line: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut segment_start = 0;
+    let mut i = 0;
+    let bytes = line.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+                segment_start = i + 1;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_double = false;
+                segment_start = i + 1;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '\'' {
+            if segment_start < i {
+                segments.push(&line[segment_start..i]);
+            }
+            segment_start = i + 1;
+            in_single = true;
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            if segment_start < i {
+                segments.push(&line[segment_start..i]);
+            }
+            segment_start = i + 1;
+            in_double = true;
+            i += 1;
+            continue;
+        }
+        if c == '#' {
+            if segment_start < i {
+                segments.push(&line[segment_start..i]);
+            }
+            return segments;
+        }
+        if c == '\\' {
+            escaped = true;
+        }
+        i += 1;
+    }
+
+    if !in_single && !in_double && segment_start < line.len() {
+        segments.push(&line[segment_start..]);
+    }
+    segments
+}
+
 /// True when a batch script delegates rank fan-out to an inner step launcher.
 pub fn batch_script_uses_step_launch(script: &str) -> bool {
     for line in script.lines() {
@@ -25,8 +98,10 @@ pub fn batch_script_uses_step_launch(script: &str) -> bool {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        if STEP_LAUNCH_RE.is_match(trimmed) {
-            return true;
+        for segment in unquoted_shell_segments(trimmed) {
+            if STEP_LAUNCH_RE.is_match(segment.trim()) {
+                return true;
+            }
         }
     }
     false
@@ -711,6 +786,28 @@ mod tests {
             "#SBATCH --mpi=pmix\n/tmp/a\n"
         ));
         assert!(!batch_script_uses_step_launch("# srun hidden in comment\n"));
+    }
+
+    #[test]
+    fn batch_script_uses_step_launch_ignores_launchers_in_quotes() {
+        assert!(!batch_script_uses_step_launch(
+            "echo \"this job launches no steps, but the word srun appears in this string\"\n",
+        ));
+        assert!(!batch_script_uses_step_launch(
+            "echo \"token=use srun here\"\n"
+        ));
+        assert!(!batch_script_uses_step_launch(
+            "echo \"token=prefixsrunsuffix\"\n"
+        ));
+        assert!(!batch_script_uses_step_launch(
+            "echo 'srun is only in single quotes'\n"
+        ));
+        assert!(batch_script_uses_step_launch(
+            "echo \"quoted\"; srun -n 2 hostname\n"
+        ));
+        assert!(batch_script_uses_step_launch(
+            "srun hostname # real invocation, srun in comment ignored\n",
+        ));
     }
 
     #[test]
