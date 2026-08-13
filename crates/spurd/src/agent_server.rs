@@ -554,13 +554,7 @@ impl Drop for LaunchReservationGuard {
     }
 }
 
-fn controller_rpc_retryable(status: &tonic::Status) -> bool {
-    use tonic::Code;
-    matches!(
-        status.code(),
-        Code::Unavailable | Code::Internal | Code::DeadlineExceeded | Code::Unknown
-    )
-}
+use spur_proto::controller_rpc_retryable;
 
 const CONTROLLER_RPC_ATTEMPTS: u32 = 3;
 const CONTROLLER_RPC_RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(1);
