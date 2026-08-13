@@ -18,77 +18,69 @@ static STEP_LAUNCH_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?:^|[\s;&|])(?:/.*/)?(srun|mpirun|mpiexec)\b").expect("valid step-launch regex")
 });
 
-/// Split a shell line into spans outside single/double quotes. Stops at an
-/// unquoted `#` (inline comment). Used to avoid treating launcher names inside
-/// string literals as real invocations.
-fn unquoted_shell_segments(line: &str) -> Vec<&str> {
-    let mut segments = Vec::new();
-    let mut segment_start = 0;
-    let mut i = 0;
+/// Placeholder for a quoted span when sanitizing a line for step-launcher detection.
+/// Must not be whitespace or a shell command separator so word adjacency is preserved.
+const QUOTED_SPAN_PLACEHOLDER: char = 'x';
+
+fn hash_starts_shell_comment(line: &str, hash_index: usize) -> bool {
+    if hash_index == 0 {
+        return true;
+    }
+    let prev = line.as_bytes()[hash_index - 1] as char;
+    matches!(prev, ' ' | '\t' | ';' | '&' | '|' | '(' | ')')
+}
+
+/// Build a sanitized copy of a shell line for step-launcher regex matching: quoted
+/// spans collapse to a single placeholder (preserving adjacency with neighbors),
+/// and `#` starts a comment only at a word boundary.
+fn sanitize_shell_line_for_step_launch(line: &str) -> String {
+    let mut sanitized = String::with_capacity(line.len());
     let bytes = line.as_bytes();
+    let mut i = 0;
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
 
     while i < bytes.len() {
         let c = bytes[i] as char;
-        if escaped {
-            escaped = false;
-            i += 1;
-            continue;
-        }
         if in_single {
             if c == '\'' {
                 in_single = false;
-                segment_start = i + 1;
+                sanitized.push(QUOTED_SPAN_PLACEHOLDER);
             }
             i += 1;
             continue;
         }
         if in_double {
-            if c == '\\' {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
                 escaped = true;
             } else if c == '"' {
                 in_double = false;
-                segment_start = i + 1;
+                sanitized.push(QUOTED_SPAN_PLACEHOLDER);
             }
             i += 1;
             continue;
         }
         if c == '\'' {
-            if segment_start < i {
-                segments.push(&line[segment_start..i]);
-            }
-            segment_start = i + 1;
             in_single = true;
             i += 1;
             continue;
         }
         if c == '"' {
-            if segment_start < i {
-                segments.push(&line[segment_start..i]);
-            }
-            segment_start = i + 1;
             in_double = true;
             i += 1;
             continue;
         }
-        if c == '#' {
-            if segment_start < i {
-                segments.push(&line[segment_start..i]);
-            }
-            return segments;
+        if c == '#' && hash_starts_shell_comment(line, i) {
+            break;
         }
-        if c == '\\' {
-            escaped = true;
-        }
+        sanitized.push(c);
         i += 1;
     }
 
-    if !in_single && !in_double && segment_start < line.len() {
-        segments.push(&line[segment_start..]);
-    }
-    segments
+    sanitized
 }
 
 /// True when a batch script delegates rank fan-out to an inner step launcher.
@@ -98,10 +90,9 @@ pub fn batch_script_uses_step_launch(script: &str) -> bool {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        for segment in unquoted_shell_segments(trimmed) {
-            if STEP_LAUNCH_RE.is_match(segment.trim()) {
-                return true;
-            }
+        let sanitized = sanitize_shell_line_for_step_launch(trimmed);
+        if STEP_LAUNCH_RE.is_match(sanitized.trim()) {
+            return true;
         }
     }
     false
@@ -807,6 +798,17 @@ mod tests {
         ));
         assert!(batch_script_uses_step_launch(
             "srun hostname # real invocation, srun in comment ignored\n",
+        ));
+        assert!(!batch_script_uses_step_launch("echo \"x\"srun\n"));
+        assert!(!batch_script_uses_step_launch("foo|\"x\"srun\n"));
+        assert!(!batch_script_uses_step_launch("\"$VAR\"srun\n"));
+        assert!(batch_script_uses_step_launch(
+            "echo foo#bar; srun -n 2 hostname\n"
+        ));
+        assert!(!batch_script_uses_step_launch("echo ${VAR#prefix}\n"));
+        // Unclosed quotes: remainder of line is treated as quoted; not full shell parsing.
+        assert!(!batch_script_uses_step_launch(
+            "echo \"unclosed; srun -n 2 hostname\n"
         ));
     }
 
