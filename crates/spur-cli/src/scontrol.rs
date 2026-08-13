@@ -236,7 +236,7 @@ pub enum ScontrolCommand {
         /// Start time (ISO 8601 or "now")
         #[arg(long, default_value = "now")]
         start_time: String,
-        /// Duration: whole minutes, Slurm time (H:MM, H:MM:SS, D-HH:MM:SS), or suffixed (90m, 1h30m, 30s)
+        /// Duration: whole minutes, Slurm time (H:MM, H:MM:SS, D-HH:MM:SS), or suffixed (90m, 1h30m, 30s); UNLIMITED/INFINITE not supported
         #[arg(long)]
         duration: String,
         /// Comma-separated node names
@@ -258,7 +258,7 @@ pub enum ScontrolCommand {
         /// Reservation name
         #[arg(long)]
         name: String,
-        /// New duration: whole minutes, Slurm time (01:00:00, 30-00:00:00), or suffixed (90m, 1h30m); any zero-length value (e.g. 0, 00:00:00) leaves it unchanged
+        /// New duration: whole minutes, Slurm time (01:00:00, 30-00:00:00), or suffixed (90m, 1h30m); any zero-length value (e.g. 0, 00:00:00) leaves it unchanged; UNLIMITED/INFINITE not supported
         #[arg(long, default_value = "0")]
         duration: String,
         /// Comma-separated nodes to add
@@ -1523,7 +1523,7 @@ async fn reconfigure(controller: &str) -> Result<()> {
 fn parse_reservation_duration(s: &str) -> Result<u32> {
     spur_core::config::parse_time_minutes(s).ok_or_else(|| {
         anyhow::anyhow!(
-            "invalid reservation duration '{s}'; use whole minutes, Slurm time (01:00:00, 30-00:00:00), or suffixed (90m, 1h30m)"
+            "invalid reservation duration '{s}'; use whole minutes, Slurm time (01:00:00, 30-00:00:00), or suffixed (90m, 1h30m); UNLIMITED/INFINITE not supported"
         )
     })
 }
@@ -1540,8 +1540,7 @@ async fn create_reservation(
     users: &str,
     flags: &str,
 ) -> Result<()> {
-    // Callers gate privilege before parsing so format/privilege errors are
-    // reported in a consistent order; this stays as the last input guard.
+    // Privilege is gated by callers; this is the last input guard.
     if duration == 0 {
         bail!("reservation duration must be positive; e.g. --duration=01:00:00 or Duration=30-00:00:00");
     }
@@ -1804,6 +1803,14 @@ mod tests {
         assert!(parse_reservation_duration("notatime").is_err());
         assert!(parse_reservation_duration("").is_err());
         assert!(parse_reservation_duration("1.5h").is_err());
+    }
+
+    #[test]
+    fn parse_reservation_duration_rejects_unbounded() {
+        // Reservations store a concrete end_time, so there is no unbounded
+        // representation; UNLIMITED/INFINITE are rejected, not silently mapped.
+        assert!(parse_reservation_duration("UNLIMITED").is_err());
+        assert!(parse_reservation_duration("INFINITE").is_err());
     }
 
     #[test]
