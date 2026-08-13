@@ -19,6 +19,7 @@ subtrees:
           - entries:
               - file: admin-guide/configuration
               - file: admin-guide/accounting
+              - file: admin-guide/dme-integration
       - file: deployment/index
         subtrees:
           - entries:
