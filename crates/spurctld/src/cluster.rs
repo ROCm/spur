@@ -6138,6 +6138,7 @@ pub(crate) fn recovered_node_state(node: Option<&Node>) -> NodeState {
         return NodeState::Idle;
     };
     let mut recovered = node.clone();
+    // Clear the transient failure state so allocation state can be recomputed.
     recovered.state = NodeState::Idle;
     recovered.update_state_from_alloc();
     recovered.state
@@ -15013,6 +15014,39 @@ mod tests {
         });
         let node = cm.get_node("stale").unwrap();
         assert_eq!(node.state, NodeState::Down);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn check_node_health_recovers_allocated_node_as_allocated() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "recovering", 4, 8000);
+
+        let id = submit_and_wait(&cm, basic_spec("running-job"));
+        let alloc = scalar_alloc(4, 8000);
+        cm.start_job(
+            id,
+            vec!["recovering".into()],
+            alloc.clone(),
+            per_node_for(&["recovering"], alloc),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+
+        if let Some(node) = cm.nodes.write().get_mut("recovering") {
+            node.state = NodeState::Down;
+            node.last_heartbeat = Some(Utc::now());
+        }
+
+        cm.check_node_health(90);
+        wait_for("node recovery applied", || {
+            cm.get_node("recovering")
+                .is_some_and(|node| node.state == NodeState::Allocated)
+        });
+        assert_eq!(
+            cm.get_node("recovering").unwrap().state,
+            NodeState::Allocated
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
