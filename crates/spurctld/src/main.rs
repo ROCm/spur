@@ -280,12 +280,15 @@ async fn main() -> anyhow::Result<()> {
     let health_raft = raft_handle.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        let mut grace = cluster::LeadershipGrace::new(std::time::Duration::from_secs(hb_timeout));
         loop {
             interval.tick().await;
-            if !health_raft.is_leader() {
+            let is_leader = health_raft.is_leader();
+            let mark_down = grace.observe(is_leader, std::time::Instant::now());
+            if !is_leader {
                 continue;
             }
-            let evicted = health_cluster.check_node_health(hb_timeout);
+            let evicted = health_cluster.check_node_health(hb_timeout, mark_down);
             for fin in &evicted {
                 if let Some(job) = health_cluster.get_job(fin.job_id) {
                     let c = health_cluster.clone();

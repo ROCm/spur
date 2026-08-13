@@ -2550,12 +2550,27 @@ impl ClusterManager {
     /// Reconcile node liveness state with heartbeat data.
     /// Marks stale nodes Down and recovers nodes whose heartbeat has resumed.
     /// Returns finalized jobs from eviction so callers can send cancel RPCs.
-    pub fn check_node_health(&self, timeout_secs: u64) -> Vec<JobFinalized> {
-        let actions = {
+    pub fn check_node_health(
+        &self,
+        timeout_secs: u64,
+        mark_down: MarkDownPolicy,
+    ) -> Vec<JobFinalized> {
+        let mut actions = {
             let nodes = self.nodes.read();
             let refs: Vec<&Node> = nodes.values().collect();
             evaluate_node_health(&refs, Utc::now(), timeout_secs)
         };
+        if mark_down == MarkDownPolicy::Suppressed {
+            let before = actions.len();
+            actions.retain(|a| !matches!(a, HealthAction::MarkDown { .. }));
+            let deferred = before - actions.len();
+            if deferred > 0 {
+                info!(
+                    nodes = deferred,
+                    "deferring node DOWN during leadership grace period"
+                );
+            }
+        }
         self.apply_health_actions(actions)
     }
 
@@ -2591,14 +2606,19 @@ impl ClusterManager {
                     }
                 }
                 HealthAction::Recover { name, old_state } => {
-                    let recovered_state = recovered_node_state(self.get_node(&name).as_ref());
+                    let node = self.get_node(&name);
+                    let admin_locked = node.as_ref().is_some_and(|n| n.admin_locked);
+                    let recovered_state = recovered_node_state(node.as_ref());
+                    // An admin hold applied since the action was computed keeps its reason;
+                    // otherwise recovery clears the liveness reason it is replacing.
+                    let reason = node.and_then(|n| n.state_reason).filter(|_| admin_locked);
                     info!(node = %name, state = ?recovered_state, "node recovered (heartbeat resumed)");
                     if let Err(e) = self.propose(WalOperation::NodeStateChange {
                         name,
                         old_state,
                         new_state: recovered_state,
-                        reason: None,
-                        admin_locked: false,
+                        reason,
+                        admin_locked,
                     }) {
                         warn!(error = %e, "failed to propose node recovery");
                     }
@@ -6164,6 +6184,42 @@ pub(crate) fn node_config_matches(
     matches_names || matches_selector
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkDownPolicy {
+    Allowed,
+    Suppressed,
+}
+
+/// Withholds DOWN marking for one heartbeat timeout after this process acquires
+/// leadership: a non-leader never records heartbeats, so every `last_heartbeat`
+/// is as stale as the leaderless window and live agents need time to re-register.
+pub struct LeadershipGrace {
+    grace: std::time::Duration,
+    leader_since: Option<std::time::Instant>,
+}
+
+impl LeadershipGrace {
+    pub fn new(grace: std::time::Duration) -> Self {
+        Self {
+            grace,
+            leader_since: None,
+        }
+    }
+
+    pub fn observe(&mut self, is_leader: bool, now: std::time::Instant) -> MarkDownPolicy {
+        if !is_leader {
+            self.leader_since = None;
+            return MarkDownPolicy::Suppressed;
+        }
+        let since = *self.leader_since.get_or_insert(now);
+        if now.saturating_duration_since(since) >= self.grace {
+            MarkDownPolicy::Allowed
+        } else {
+            MarkDownPolicy::Suppressed
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum HealthAction {
     MarkDown {
@@ -6181,6 +6237,15 @@ pub(crate) fn recovered_node_state(node: Option<&Node>) -> NodeState {
     let Some(node) = node else {
         return NodeState::Idle;
     };
+    // The node may have entered an admin hold after the action was computed, so
+    // re-derive from allocation only while recovery is still a valid transition.
+    if node
+        .state
+        .transition(&NodeEvent::HeartbeatRecovered, node.admin_locked)
+        .is_none()
+    {
+        return node.state;
+    }
     let mut recovered = node.clone();
     // Clear the transient failure state so allocation state can be recomputed.
     recovered.state = NodeState::Idle;
@@ -12466,7 +12531,7 @@ mod tests {
         if let Some(node) = cm.nodes.write().get_mut("n1") {
             node.last_heartbeat = Some(Utc::now() - chrono::Duration::seconds(200));
         }
-        cm.check_node_health(90);
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
         settle(&cm, job_id, JobState::Pending);
 
         let job = cm.get_job(job_id).unwrap();
@@ -15262,7 +15327,7 @@ mod tests {
             node.last_heartbeat = Some(Utc::now() - chrono::Duration::seconds(200));
         }
 
-        cm.check_node_health(90);
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
         wait_for("health check applied", || {
             cm.get_node("stale")
                 .is_some_and(|n| n.state == NodeState::Down)
@@ -15293,7 +15358,7 @@ mod tests {
             node.last_heartbeat = Some(Utc::now());
         }
 
-        cm.check_node_health(90);
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
         wait_for("node recovery applied", || {
             cm.get_node("recovering")
                 .is_some_and(|node| node.state == NodeState::Allocated)
@@ -15302,6 +15367,146 @@ mod tests {
             cm.get_node("recovering").unwrap().state,
             NodeState::Allocated
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suppressed_mark_down_spares_a_stale_node_then_allowed_marks_it() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "stale", 4, 8000);
+        if let Some(node) = cm.nodes.write().get_mut("stale") {
+            node.last_heartbeat = Some(Utc::now() - chrono::Duration::seconds(200));
+        }
+
+        cm.check_node_health(90, super::MarkDownPolicy::Suppressed);
+        assert_eq!(
+            cm.get_node("stale").unwrap().state,
+            NodeState::Idle,
+            "stale node must survive the leadership grace window"
+        );
+
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        wait_for("down applied after grace", || {
+            cm.get_node("stale")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suppressed_mark_down_does_not_evict_running_jobs() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("keep-running"));
+        let alloc = scalar_alloc(4, 8000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            alloc.clone(),
+            per_node_for(&["n1"], alloc),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+
+        if let Some(node) = cm.nodes.write().get_mut("n1") {
+            node.last_heartbeat = Some(Utc::now() - chrono::Duration::seconds(200));
+        }
+
+        let evicted = cm.check_node_health(90, super::MarkDownPolicy::Suppressed);
+        assert!(evicted.is_empty(), "grace window must not evict jobs");
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        assert_eq!(
+            cm.get_job(id).unwrap().allocated_nodes,
+            vec!["n1".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_preserves_an_admin_drain_raced_against_the_health_check() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        cm.apply_health_actions(vec![super::HealthAction::MarkDown {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            admin_locked: false,
+        }]);
+        wait_for("down applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+
+        cm.update_node_state("n1", NodeState::Drain, Some("hw swap".into()))
+            .unwrap();
+        wait_for("drain applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Drain)
+        });
+
+        cm.apply_health_actions(vec![super::HealthAction::Recover {
+            name: "n1".into(),
+            old_state: NodeState::Down,
+        }]);
+
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(
+            node.state,
+            NodeState::Drain,
+            "recovery must not un-drain an administratively drained node"
+        );
+        assert!(node.admin_locked);
+        assert_eq!(node.state_reason, Some("hw swap".into()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_clears_the_liveness_reason_on_an_unlocked_node() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        cm.apply_health_actions(vec![super::HealthAction::MarkDown {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            admin_locked: false,
+        }]);
+        wait_for("down applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+
+        cm.apply_health_actions(vec![super::HealthAction::Recover {
+            name: "n1".into(),
+            old_state: NodeState::Down,
+        }]);
+        wait_for("recovery applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Idle)
+        });
+        let node = cm.get_node("n1").unwrap();
+        assert!(!node.admin_locked);
+        assert_eq!(node.state_reason, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_restores_allocated_state_rather_than_idle() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        if let Some(node) = cm.nodes.write().get_mut("n1") {
+            node.state = NodeState::Down;
+            node.alloc_resources.cpus = 4;
+        }
+
+        cm.apply_health_actions(vec![super::HealthAction::Recover {
+            name: "n1".into(),
+            old_state: NodeState::Down,
+        }]);
+        wait_for("recovery applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state != NodeState::Down)
+        });
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Allocated);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -15335,7 +15540,7 @@ mod tests {
         if let Some(node) = cm.nodes.write().get_mut("locked") {
             node.last_heartbeat = Some(Utc::now() - chrono::Duration::seconds(200));
         }
-        cm.check_node_health(90);
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
         wait_for("health check applied", || {
             cm.get_node("locked")
                 .is_some_and(|n| n.state == NodeState::Down)
@@ -15682,6 +15887,72 @@ mod tests {
     #[test]
     fn recovered_missing_node_is_idle() {
         assert_eq!(super::recovered_node_state(None), NodeState::Idle);
+    }
+
+    #[test]
+    fn recovered_non_down_admin_hold_is_preserved() {
+        for state in [NodeState::Drain, NodeState::Draining, NodeState::Suspended] {
+            let mut node = make_health_node("n1", state, true, None);
+            node.total_resources.cpus = 8;
+            assert_eq!(super::recovered_node_state(Some(&node)), state, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn recovered_admin_locked_down_node_stays_down() {
+        let node = make_health_node("n1", NodeState::Down, true, None);
+        assert_eq!(super::recovered_node_state(Some(&node)), NodeState::Down);
+    }
+
+    #[test]
+    fn recovered_unlocked_error_node_returns_to_idle() {
+        let node = make_health_node("n1", NodeState::Error, false, None);
+        assert_eq!(super::recovered_node_state(Some(&node)), NodeState::Idle);
+    }
+
+    #[test]
+    fn leadership_grace_suppresses_until_the_window_elapses() {
+        let grace = std::time::Duration::from_secs(90);
+        let mut gate = super::LeadershipGrace::new(grace);
+        let t0 = std::time::Instant::now();
+
+        assert_eq!(
+            gate.observe(true, t0),
+            super::MarkDownPolicy::Suppressed,
+            "leadership just acquired"
+        );
+        assert_eq!(
+            gate.observe(true, t0 + std::time::Duration::from_secs(89)),
+            super::MarkDownPolicy::Suppressed
+        );
+        assert_eq!(
+            gate.observe(true, t0 + grace),
+            super::MarkDownPolicy::Allowed
+        );
+    }
+
+    #[test]
+    fn leadership_grace_restarts_after_losing_leadership() {
+        let grace = std::time::Duration::from_secs(90);
+        let mut gate = super::LeadershipGrace::new(grace);
+        let t0 = std::time::Instant::now();
+        assert_eq!(gate.observe(true, t0), super::MarkDownPolicy::Suppressed);
+        assert_eq!(
+            gate.observe(true, t0 + grace),
+            super::MarkDownPolicy::Allowed
+        );
+
+        let lost = t0 + std::time::Duration::from_secs(200);
+        assert_eq!(gate.observe(false, lost), super::MarkDownPolicy::Suppressed);
+        assert_eq!(
+            gate.observe(true, lost + std::time::Duration::from_secs(1)),
+            super::MarkDownPolicy::Suppressed,
+            "re-acquiring leadership restarts the grace window"
+        );
+        assert_eq!(
+            gate.observe(true, lost + std::time::Duration::from_secs(1) + grace),
+            super::MarkDownPolicy::Allowed
+        );
     }
 
     #[test]
