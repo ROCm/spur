@@ -2547,9 +2547,8 @@ impl ClusterManager {
         )
     }
 
-    /// Reconcile node liveness state with heartbeat data.
-    /// Marks stale nodes Down and recovers nodes whose heartbeat has resumed.
-    /// Returns finalized jobs from eviction so callers can send cancel RPCs.
+    /// Marks stale nodes Down unless `mark_down` is `Suppressed`, and recovers
+    /// nodes whose heartbeat resumed. Returns finalized jobs for cancel RPCs.
     pub fn check_node_health(
         &self,
         timeout_secs: u64,
@@ -6190,9 +6189,8 @@ pub enum MarkDownPolicy {
     Suppressed,
 }
 
-/// Withholds DOWN marking for one heartbeat timeout after this process acquires
-/// leadership: a non-leader never records heartbeats, so every `last_heartbeat`
-/// is as stale as the leaderless window and live agents need time to re-register.
+/// Withholds DOWN marking for `grace` after leadership is first observed: a
+/// non-leader records no heartbeats, so every `last_heartbeat` is outage-stale.
 pub struct LeadershipGrace {
     grace: std::time::Duration,
     leader_since: Option<std::time::Instant>,
@@ -6237,8 +6235,8 @@ pub(crate) fn recovered_node_state(node: Option<&Node>) -> NodeState {
     let Some(node) = node else {
         return NodeState::Idle;
     };
-    // The node may have entered an admin hold after the action was computed, so
-    // re-derive from allocation only while recovery is still a valid transition.
+    // The node may have changed state since the action was computed, so re-derive
+    // from allocation only while recovery is still a valid transition for it.
     if node
         .state
         .transition(&NodeEvent::HeartbeatRecovered, node.admin_locked)
@@ -15389,6 +15387,31 @@ mod tests {
         wait_for("down applied after grace", || {
             cm.get_node("stale")
                 .is_some_and(|n| n.state == NodeState::Down)
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suppressed_mark_down_still_recovers_a_node_whose_heartbeat_returned() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "back", 4, 8000);
+        cm.apply_health_actions(vec![super::HealthAction::MarkDown {
+            name: "back".into(),
+            old_state: NodeState::Idle,
+            admin_locked: false,
+        }]);
+        wait_for("down applied", || {
+            cm.get_node("back")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+        if let Some(node) = cm.nodes.write().get_mut("back") {
+            node.last_heartbeat = Some(Utc::now());
+        }
+
+        cm.check_node_health(90, super::MarkDownPolicy::Suppressed);
+        wait_for("recovered during grace", || {
+            cm.get_node("back")
+                .is_some_and(|n| n.state == NodeState::Idle)
         });
     }
 
