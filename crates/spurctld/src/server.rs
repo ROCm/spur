@@ -228,8 +228,9 @@ impl ControllerService {
         Err(self.not_leader_status())
     }
 
-    /// Re-send a cancel to a node still reporting a job the controller considers
-    /// finished, freeing an allocation whose cancel never landed. Best-effort.
+    /// Re-send a cancel to a node still holding an allocation the controller no
+    /// longer believes belongs to it there — job finished, job moved to
+    /// another node, or an id older than any this controller issued. Best-effort.
     fn reclaim_stale_agent_jobs(&self, node: &str, reported: &[RunningJobStatus]) {
         let stale = stale_reported_jobs(&self.cluster, node, reported);
         if stale.is_empty() {
@@ -247,7 +248,7 @@ impl ControllerService {
                 warn!(
                     job_id,
                     node = %node,
-                    "agent still holds a job the controller no longer tracks — re-sending cancel to reclaim its allocation"
+                    "agent still holds an allocation the controller no longer believes belongs to it there — re-sending cancel to reclaim it"
                 );
                 // Signal 0 = graceful release, no-op on an unknown id. Not
                 // epoch-gated — a requeue racing this send is still possible.
@@ -407,11 +408,17 @@ fn is_k0s_admin(cache: &crate::association_cache::AssociationCache, caller: &str
 /// Whether `node` may release what it holds for `job_id`: the run is over, the
 /// job is active elsewhere, or the id is untracked but was issued by us.
 fn is_reclaimable(cluster: &ClusterManager, node: &str, job_id: u32) -> bool {
-    match cluster.job_state(job_id) {
-        Some(state) if state.is_terminal() => true,
-        // Only an active job has an authoritative nodelist; anything earlier may
-        // be mid-dispatch to this very node, so spare it.
-        Some(state) => state.is_active() && !cluster.job_holds_node(job_id, node),
+    match cluster.get_job(job_id) {
+        Some(job) if job.state.is_terminal() => true,
+        // An active job's nodelist is authoritative only once populated: state
+        // and allocation commit as two separate WAL entries, so a job can be
+        // observed as Running with `allocated_nodes` still empty. Spare it, same
+        // as a job earlier than active that may be mid-dispatch to this node.
+        Some(job) => {
+            job.state.is_active()
+                && !job.allocated_nodes.is_empty()
+                && !job.allocated_nodes.iter().any(|n| n == node)
+        }
         None => job_id < cluster.peek_next_job_id(),
     }
 }
@@ -3394,6 +3401,10 @@ mod tests {
     use spur_core::reservation::ReservationFlags;
     use tonic::Code;
 
+    fn job_state(cluster: &crate::cluster::ClusterManager, job_id: u32) -> Option<JobState> {
+        cluster.get_job(job_id).map(|j| j.state)
+    }
+
     #[test]
     fn resolve_registration_comm_addr_normalizes_explicit_ip() {
         assert_eq!(
@@ -3699,12 +3710,12 @@ mod tests {
             JobState::Preempted,
         ));
 
-        assert_eq!(cluster.job_state(10), Some(JobState::Pending));
-        assert_eq!(cluster.job_state(11), Some(JobState::Running));
-        assert!(cluster.job_state(12).unwrap().is_terminal());
-        assert_eq!(cluster.job_state(13), Some(JobState::Completing));
-        assert_eq!(cluster.job_state(14), Some(JobState::Suspended));
-        assert_eq!(cluster.job_state(15), Some(JobState::Preempted));
+        assert_eq!(job_state(&cluster, 10), Some(JobState::Pending));
+        assert_eq!(job_state(&cluster, 11), Some(JobState::Running));
+        assert!(job_state(&cluster, 12).unwrap().is_terminal());
+        assert_eq!(job_state(&cluster, 13), Some(JobState::Completing));
+        assert_eq!(job_state(&cluster, 14), Some(JobState::Suspended));
+        assert_eq!(job_state(&cluster, 15), Some(JobState::Preempted));
 
         let reported: Vec<RunningJobStatus> = [10, 11, 12, 13, 14, 15, 999]
             .into_iter()
@@ -3759,7 +3770,7 @@ mod tests {
         ));
         apply(&WalOperation::EvictTerminalJobs { job_ids: vec![20] });
 
-        assert_eq!(cluster.job_state(20), None, "eviction drops the record");
+        assert_eq!(job_state(&cluster, 20), None, "eviction drops the record");
         let issued = cluster.peek_next_job_id();
         assert!(20 < issued, "id 20 was issued by this controller");
 
@@ -3809,7 +3820,7 @@ mod tests {
             );
         }
 
-        assert_eq!(cluster.job_state(30), None, "parent id is never stored");
+        assert_eq!(job_state(&cluster, 30), None, "parent id is never stored");
         assert!(30 < cluster.peek_next_job_id());
         assert!(
             is_reclaimable(&cluster, "n1", 30),
@@ -3917,6 +3928,50 @@ mod tests {
         assert!(
             stale_reported_jobs(&cluster, "n1", &reported).is_empty(),
             "a Pending job the agent already holds is mid-launch, not stale"
+        );
+    }
+
+    /// A job's Running state and its nodelist commit as two separate WAL
+    /// entries; a heartbeat landing between them must not read the empty
+    /// nodelist as authoritative and tell the launching node to release.
+    #[tokio::test]
+    async fn stale_reported_jobs_spares_running_job_before_job_start_lands() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState};
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+
+        <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+            cluster.as_ref(),
+            &WalOperation::JobSubmit {
+                job_id: 60,
+                spec: Box::new(JobSpec {
+                    name: "starting".into(),
+                    user: "alice".into(),
+                    num_nodes: 1,
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    work_dir: "/tmp".into(),
+                    ..Default::default()
+                }),
+            },
+        );
+        <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+            cluster.as_ref(),
+            &WalOperation::job_state_change(60, JobState::Pending, JobState::Running),
+        );
+
+        assert_eq!(job_state(&cluster, 60), Some(JobState::Running));
+        let reported = vec![RunningJobStatus {
+            job_id: 60,
+            ..Default::default()
+        }];
+        assert!(
+            stale_reported_jobs(&cluster, "n1", &reported).is_empty(),
+            "Running with no nodelist yet is not authoritative — the node accepting the launch must be spared"
         );
     }
 
