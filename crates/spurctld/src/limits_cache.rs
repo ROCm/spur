@@ -4,7 +4,7 @@
 //! Controller-side cache of QoS definitions loaded from the accounting database.
 //!
 //! Mirrors `fairshare_cache`: an `RwLock<HashMap>` refreshed on a background
-//! loop that retains stale data on error. The scheduler's `qos_block_for` reads
+//! loop that retains stale data on error. The scheduler's `qos_block_with` reads
 //! this cache so the dormant `QOS*` pending-reasons fire against real limits.
 
 use std::collections::HashMap;

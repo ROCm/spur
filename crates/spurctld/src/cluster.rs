@@ -2850,57 +2850,43 @@ impl ClusterManager {
 
         {
             let mut reserved = PassReservations::default();
-            candidates.retain(|candidate| {
-                if !candidate.scheduling_eligible {
-                    return true;
-                }
-                let job = &candidate.job;
+            retain_eligible(&mut candidates, &mut blocked, |job| {
                 if let Some(reason) =
                     account_block_with(job, &self.association_cache, &jobs, &reserved)
                 {
-                    if account_block_for(job, &self.association_cache, &jobs).is_some() {
-                        record_blocked(&mut blocked, candidate, reason);
-                    }
-                    return false;
+                    return GateOutcome::Block(reason);
                 }
                 if let Some(reason) =
                     qos_block_with(job, &qos_by_job[&job.job_id], &jobs, &reserved)
                 {
-                    if qos_block_for(job, &qos_by_job[&job.job_id], &jobs).is_some() {
-                        record_blocked(&mut blocked, candidate, reason);
-                    }
-                    return false;
+                    return GateOutcome::Block(reason);
                 }
                 reserved.reserve(job);
-                true
+                GateOutcome::Keep
             });
         }
 
         {
             let available = self.available_licenses_with(&jobs);
             let mut remaining = available.clone();
-            candidates.retain(|candidate| {
-                if !candidate.scheduling_eligible {
-                    return true;
-                }
-                let job = &candidate.job;
+            retain_eligible(&mut candidates, &mut blocked, |job| {
                 if let Some(reason) = license_block(job, &available) {
-                    record_blocked(&mut blocked, candidate, reason);
-                    return false;
+                    return GateOutcome::Block(reason);
                 }
                 let req = extract_license_requirements(&job.spec);
+                // In-pass contention counts as a license wait, same as a shortage.
                 if req
                     .iter()
                     .any(|(lic, n)| remaining.get(lic).copied().unwrap_or(0) < *n)
                 {
-                    return false;
+                    return GateOutcome::Block(PendingReason::Licenses);
                 }
                 for (lic, n) in &req {
                     if let Some(avail) = remaining.get_mut(lic) {
                         *avail = avail.saturating_sub(*n);
                     }
                 }
-                true
+                GateOutcome::Keep
             });
         }
 
@@ -2908,32 +2894,29 @@ impl ClusterManager {
         {
             let available = self.available_bb_with(&jobs);
             let mut remaining = available;
-            candidates.retain(|candidate| {
-                if !candidate.scheduling_eligible {
-                    return true;
-                }
-                let job = &candidate.job;
+            retain_eligible(&mut candidates, &mut blocked, |job| {
                 if job.bb_stage_state == BbStageState::Staging {
-                    record_blocked(&mut blocked, candidate, PendingReason::BurstBufferStageIn);
-                    return false;
+                    return GateOutcome::Block(PendingReason::BurstBufferStageIn);
                 }
                 if let Some(reason) = burst_buffer_block(job, available) {
-                    record_blocked(&mut blocked, candidate, reason);
-                    return false;
+                    return GateOutcome::Block(reason);
                 }
                 let req = extract_bb_requirement(&job.spec);
                 if req == 0 {
-                    return true;
+                    return GateOutcome::Keep;
                 }
                 if job.bb_stage_state == BbStageState::Ready {
-                    return true;
+                    return GateOutcome::Keep;
                 }
+                // In-pass contention counts as a BB wait, same as a shortage.
                 if req > remaining {
-                    return false;
+                    return GateOutcome::Block(PendingReason::BurstBufferResources);
                 }
+                // Capacity reserved and stage-in scheduled, so the job leaves the
+                // schedulable set and shows BurstBufferStageIn next cycle.
                 remaining = remaining.saturating_sub(req);
                 bb_stage_candidates.push(job.job_id);
-                false
+                GateOutcome::DropUntagged
             });
         }
 
@@ -5619,6 +5602,44 @@ fn retain_unblocked(
     });
 }
 
+/// Outcome of an eligibility gate for one candidate. Exhaustive so every gate
+/// branch must name an outcome: a silent drop is a compile error.
+enum GateOutcome {
+    /// Keep the candidate in the schedulable set.
+    Keep,
+    /// Drop and record `reason` (a no-op tag for already-tagged candidates).
+    Block(PendingReason),
+    /// Drop without recording a reason. Only the burst-buffer stage-in handoff
+    /// uses this: the gate reserved capacity and enqueued the job for staging,
+    /// so it is tagged `BurstBufferStageIn` on the next cycle. Do not use this
+    /// to bypass tagging in any other gate.
+    DropUntagged,
+}
+
+/// Like [`retain_unblocked`], but skips not-yet-eligible candidates and lets
+/// `gate` reserve in-pass headroom on the keep path. A [`GateOutcome::Block`]
+/// drop is recorded via `record_blocked` (a no-op for already-tagged
+/// candidates); [`GateOutcome::DropUntagged`] drops without a reason.
+fn retain_eligible(
+    candidates: &mut Vec<PendingJobCandidate>,
+    blocked: &mut Vec<(JobId, PendingReason)>,
+    mut gate: impl FnMut(&Job) -> GateOutcome,
+) {
+    candidates.retain(|candidate| {
+        if !candidate.scheduling_eligible {
+            return true;
+        }
+        match gate(&candidate.job) {
+            GateOutcome::Keep => true,
+            GateOutcome::Block(reason) => {
+                record_blocked(blocked, candidate, reason);
+                false
+            }
+            GateOutcome::DropUntagged => false,
+        }
+    });
+}
+
 fn record_blocked(
     blocked: &mut Vec<(JobId, PendingReason)>,
     candidate: &PendingJobCandidate,
@@ -5683,18 +5704,8 @@ fn license_block(job: &Job, pool: &HashMap<String, u64>) -> Option<spur_core::jo
     None
 }
 
-/// Caller resolves the `Qos`.
-fn qos_block_for(
-    job: &Job,
-    qos: &Qos,
-    jobs: &HashMap<JobId, Job>,
-) -> Option<spur_core::job::PendingReason> {
-    qos_block_with(job, qos, jobs, &PassReservations::default())
-}
-
-/// Like [`qos_block_for`] but folds `reserved` (headroom already claimed by
-/// higher-priority jobs earlier in the same scheduling pass) into the running
-/// aggregates, so a single pass can't over-subscribe a QOS group/per-user cap.
+/// `Some(reason)` if the job would exceed a QOS group/per-user cap. `reserved`
+/// folds in headroom claimed earlier this pass so it can't over-subscribe.
 fn qos_block_with(
     job: &Job,
     qos: &Qos,
@@ -5750,20 +5761,8 @@ fn qos_block_with(
     }
 }
 
-/// Looks up the job's (user, account) association limits from
-/// `AssociationCache`; a job with no account (or an association the cache has
-/// no limits for) is unconstrained.
-fn account_block_for(
-    job: &Job,
-    assoc_cache: &AssociationCache,
-    jobs: &HashMap<JobId, Job>,
-) -> Option<spur_core::job::PendingReason> {
-    account_block_with(job, assoc_cache, jobs, &PassReservations::default())
-}
-
-/// Like [`account_block_for`] but folds `reserved` (headroom already claimed by
-/// higher-priority jobs earlier in the same scheduling pass) into the running
-/// aggregates, so a single pass can't over-subscribe an account group cap.
+/// `Some(reason)` if the job would exceed its (user, account) association cap (no
+/// account means unconstrained). `reserved` folds in this pass's claimed headroom.
 fn account_block_with(
     job: &Job,
     assoc_cache: &AssociationCache,
@@ -12446,7 +12445,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
         // Seed the cache with a QoS that caps wall time at 1 min, then submit a
         // job to that QoS asking for more — the specific QOS reason must surface
-        // through resolve_qos -> qos_block_for (not the old limitless default).
+        // through resolve_qos -> qos_block_with (not the old limitless default).
         cm.qos_cache().insert(Qos {
             name: "short".into(),
             limits: spur_core::accounting::QosLimits {
@@ -12766,6 +12765,95 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_pass_qos_grp_node_block_tags_reason_not_none() {
+        // Two 1-node jobs, QOS grp_tres node=1, nothing running: the second is
+        // blocked only by the first's in-pass reservation. Expect QosGrpNodeLimit.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 1);
+        cm.qos_cache().insert(Qos {
+            name: "capped".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut s1 = basic_spec("q1");
+        s1.qos = Some("capped".into());
+        let j1 = submit_and_wait(&cm, s1);
+        let mut s2 = basic_spec("q2");
+        s2.qos = Some("capped".into());
+        let j2 = submit_and_wait(&cm, s2);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(cm.get_job(j1).unwrap().pending_reason, PendingReason::None);
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::QosGrpNodeLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_pass_account_grp_node_block_tags_reason_not_none() {
+        // Account grp_tres node=1: the second job is blocked only by the first's
+        // in-pass reservation. Expect AssocGrpNodeLimit, not None.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 1);
+        cm.association_cache().insert_limits(
+            "testuser",
+            "research",
+            spur_core::accounting::AccountLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+        );
+
+        let mut s1 = basic_spec("a1");
+        s1.account = Some("research".into());
+        let j1 = submit_and_wait(&cm, s1);
+        let mut s2 = basic_spec("a2");
+        s2.account = Some("research".into());
+        let j2 = submit_and_wait(&cm, s2);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(cm.get_job(j1).unwrap().pending_reason, PendingReason::None);
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::AssocGrpNodeLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_pass_bb_exhaustion_tags_reason_not_none() {
+        // Two jobs want 60GB from a 100GB BB pool: the second, blocked only by
+        // the first's in-pass reservation, must surface BurstBufferResources.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        *cm.burst_buffer_total_gb.write() = 100;
+
+        let mut s1 = basic_spec("bb1");
+        s1.burst_buffer = Some("capacity=60".into());
+        let _j1 = submit_and_wait(&cm, s1);
+        let mut s2 = basic_spec("bb2");
+        s2.burst_buffer = Some("capacity=60".into());
+        let j2 = submit_and_wait(&cm, s2);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::BurstBufferResources
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn account_limits_do_not_block_jobs_without_an_account() {
         // A job with no account can't be constrained by an association it
         // doesn't belong to.
@@ -13071,9 +13159,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pending_jobs_does_not_overallocate_licenses_within_one_pass() {
-        // Two pending jobs each request fluent:1 but the pool holds only 1.
-        // A single classification must not return both or label the greedy
-        // contention drop as an absolute license shortage.
+        // Two jobs each request fluent:1 from a pool of 1: the loser waits on
+        // Licenses (not None), the same as an outright shortage.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 8, 16000);
@@ -13096,12 +13183,12 @@ mod tests {
             granted, 1,
             "pending_jobs() returned {granted} fluent jobs but the pool holds only 1"
         );
-        for id in [a, b] {
-            assert_ne!(
-                cm.get_job(id).unwrap().pending_reason,
-                PendingReason::Licenses
-            );
-        }
+        let loser = [a, b].into_iter().find(|id| !pending.contains(id)).unwrap();
+        assert_eq!(
+            cm.get_job(loser).unwrap().pending_reason,
+            PendingReason::Licenses,
+            "the job that lost the single license must wait on Licenses, not None"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
