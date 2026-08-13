@@ -132,27 +132,46 @@ class TestRequeueHold:
             _cleanup(cluster, job_id)
 
 
+def _wait_named_running(cluster, name, want=1, timeout=90):
+    """Poll until at least `want` tasks named `name` are RUNNING; return their
+    ids. Array tasks carry their own job ids (the parent id is not a stored
+    job), so observe them by name rather than by the parent id."""
+    deadline = time.time() + timeout
+    ids = []
+    while time.time() < deadline:
+        ids = cluster.running_job_ids_by_name(name)
+        if len(ids) >= want:
+            return ids
+        time.sleep(1)
+    return ids
+
+
 class TestRequeueArray:
     def test_requeue_array_parent_fans_out(self, cluster):
-        """Requeuing the array parent id returns every task to the queue."""
-        parent = None
+        """Requeuing the bare array-parent id returns every task to the queue."""
+        name = "rqarr"
         try:
             body = "#!/bin/bash\necho STARTED\nsleep 600\n"
             script = cluster.write_file("rq-array.sh", body)
             parent = parse_job_id(
-                cluster.sbatch(["-J", "rq-array", "-N", "1", "-a", "0-1", script])
+                cluster.sbatch(["-J", name, "-N", "1", "-a", "0-1", script])
             )
             assert parent is not None
-            # At least one task should reach RUNNING before we requeue the array.
-            assert _wait_state(cluster, parent, "R", timeout=90) or _wait_state(
-                cluster, parent, "PD", timeout=1
-            ), "no array task became active"
+            assert _wait_named_running(cluster, name), "no array task reached RUNNING"
 
+            # The bare parent id (not a stored job) must fan out to the tasks,
+            # not be rejected as unknown.
             out = cluster.scontrol("requeue", str(parent))
-            # The command must be accepted (fan-out) rather than "not found".
             assert "not found" not in out.lower(), out
+
+            # Tasks re-pend and run again under their own ids.
+            assert _wait_named_running(cluster, name), (
+                "array tasks did not return to RUNNING after requeue"
+            )
         finally:
-            _cleanup(cluster, parent)
+            # The parent id is not a stored job, so scancel <parent> would error
+            # and leak the tasks; cancel by name instead.
+            cluster.cli_allow_fail(["scancel", "-n", name])
 
 
 class TestRequeueCliGuards:
