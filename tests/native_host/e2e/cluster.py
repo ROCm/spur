@@ -1023,7 +1023,10 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
     def _start_postgres(self):
         """Bring up Postgres (Docker) on node 0. Accounting runs inside spurctld."""
         node = self.nodes[0]
-        node.exec_allow_fail(f"docker rm -f '{self._pg_container}' 2>/dev/null || true")
+        node.exec_allow_fail(
+            "c=$(docker ps -aq --filter name=spur-e2e-pg-); "
+            "[ -n \"$c\" ] && docker rm -f $c || true"
+        )
         node.exec(
             f"docker run -d --name '{self._pg_container}' "
             f"-e POSTGRES_USER=spur -e POSTGRES_PASSWORD=spur -e POSTGRES_DB=spur "
