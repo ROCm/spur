@@ -236,9 +236,9 @@ pub enum ScontrolCommand {
         /// Start time (ISO 8601 or "now")
         #[arg(long, default_value = "now")]
         start_time: String,
-        /// Duration in minutes
+        /// Duration: whole minutes, Slurm time (H:MM, H:MM:SS, D-HH:MM:SS), or suffixed (90m, 1h30m, 30s)
         #[arg(long)]
-        duration: u32,
+        duration: String,
         /// Comma-separated node names
         #[arg(long)]
         nodes: String,
@@ -258,9 +258,9 @@ pub enum ScontrolCommand {
         /// Reservation name
         #[arg(long)]
         name: String,
-        /// New duration in minutes (0 = no change)
+        /// New duration: whole minutes, Slurm time (01:00:00, 30-00:00:00), or suffixed (90m, 1h30m); any zero-length value (e.g. 0, 00:00:00) leaves it unchanged
         #[arg(long, default_value = "0")]
-        duration: u32,
+        duration: String,
         /// Comma-separated nodes to add
         #[arg(long, default_value = "")]
         add_nodes: String,
@@ -488,6 +488,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             users,
             flags,
         } => {
+            crate::privilege::require_privileged("manage reservations")?;
+            let duration = parse_reservation_duration(&duration)?;
             create_reservation(
                 &args.controller,
                 &name,
@@ -512,6 +514,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         } => {
             crate::privilege::require_privileged("manage reservations")?;
 
+            // Any zero-length value (default "0", or an explicit "00:00:00" etc.)
+            // resolves to 0, which the controller treats as "leave duration
+            // unchanged"; there is no zero-length reservation to set.
+            let duration = parse_reservation_duration(&duration)?;
             let channel = spur_client::connect_channel(&args.controller)
                 .await
                 .context("failed to connect to spurctld")?;
@@ -1018,11 +1024,24 @@ async fn parse_and_create_partition(controller: &str, params: &[String]) -> Resu
     Ok(())
 }
 
-/// Parse Slurm key=value pairs and call create_reservation.
-async fn parse_and_create_reservation(controller: &str, params: &[String]) -> Result<()> {
+/// Parsed inputs for a Slurm-inline `scontrol create ReservationName=...`.
+#[derive(Debug)]
+struct ReservationCreateParams {
+    name: String,
+    start_time: String,
+    duration_minutes: u32,
+    nodes: String,
+    accounts: String,
+    users: String,
+    flags: String,
+}
+
+/// Pure parse+validate of Slurm key=value pairs, split from the privileged
+/// network call so the required-field and duration rules are unit-testable.
+fn parse_reservation_create_params(params: &[String]) -> Result<ReservationCreateParams> {
     let mut name = String::new();
     let mut start_time = "now".to_string();
-    let mut duration: u32 = 0;
+    let mut duration: Option<String> = None;
     let mut nodes = String::new();
     let mut accounts = String::new();
     let mut users = String::new();
@@ -1033,7 +1052,7 @@ async fn parse_and_create_reservation(controller: &str, params: &[String]) -> Re
             match key.to_lowercase().as_str() {
                 "reservationname" => name = value.into(),
                 "starttime" => start_time = value.into(),
-                "duration" => duration = value.parse().unwrap_or(0),
+                "duration" => duration = Some(value.into()),
                 "nodes" => nodes = value.into(),
                 "accounts" => accounts = value.into(),
                 "users" => users = value.into(),
@@ -1047,15 +1066,36 @@ async fn parse_and_create_reservation(controller: &str, params: &[String]) -> Re
         anyhow::bail!("scontrol create: ReservationName= is required");
     }
 
+    let duration_minutes = match duration {
+        Some(d) => parse_reservation_duration(&d)?,
+        None => anyhow::bail!("scontrol create: Duration= is required"),
+    };
+
+    Ok(ReservationCreateParams {
+        name,
+        start_time,
+        duration_minutes,
+        nodes,
+        accounts,
+        users,
+        flags,
+    })
+}
+
+/// Parse Slurm key=value pairs and call create_reservation.
+async fn parse_and_create_reservation(controller: &str, params: &[String]) -> Result<()> {
+    crate::privilege::require_privileged("manage reservations")?;
+
+    let p = parse_reservation_create_params(params)?;
     create_reservation(
         controller,
-        &name,
-        &start_time,
-        duration,
-        &nodes,
-        &accounts,
-        &users,
-        &flags,
+        &p.name,
+        &p.start_time,
+        p.duration_minutes,
+        &p.nodes,
+        &p.accounts,
+        &p.users,
+        &p.flags,
     )
     .await
 }
@@ -1476,6 +1516,18 @@ async fn reconfigure(controller: &str) -> Result<()> {
     Ok(())
 }
 
+/// Parse a reservation duration into minutes via the shared `--time` grammar
+/// (whole minutes, `HH:MM:SS`, `D-HH:MM:SS`, `90m`); rejects INFINITE. Quirk of
+/// that grammar: a bare `MM:SS` is read as `HH:MM` and bare `days-hours` is
+/// rejected, so prefer the unambiguous colon forms.
+fn parse_reservation_duration(s: &str) -> Result<u32> {
+    spur_core::config::parse_time_minutes(s).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid reservation duration '{s}'; use whole minutes, Slurm time (01:00:00, 30-00:00:00), or suffixed (90m, 1h30m)"
+        )
+    })
+}
+
 /// Create a reservation via the controller.
 #[allow(clippy::too_many_arguments)]
 async fn create_reservation(
@@ -1488,7 +1540,11 @@ async fn create_reservation(
     users: &str,
     flags: &str,
 ) -> Result<()> {
-    crate::privilege::require_privileged("manage reservations")?;
+    // Callers gate privilege before parsing so format/privilege errors are
+    // reported in a consistent order; this stays as the last input guard.
+    if duration == 0 {
+        bail!("reservation duration must be positive; e.g. --duration=01:00:00 or Duration=30-00:00:00");
+    }
 
     let channel = spur_client::connect_channel(controller)
         .await
@@ -1726,5 +1782,65 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(capture.update_node_names().is_empty());
+    }
+
+    #[test]
+    fn parse_reservation_duration_accepts_minutes_and_slurm_formats() {
+        assert_eq!(parse_reservation_duration("60").unwrap(), 60);
+        assert_eq!(parse_reservation_duration("01:00:00").unwrap(), 60);
+        assert_eq!(
+            parse_reservation_duration("30-00:00:00").unwrap(),
+            30 * 24 * 60
+        );
+        assert_eq!(parse_reservation_duration("90m").unwrap(), 90);
+        // Zero (and any zero-length encoding) is update-reservation's "no
+        // change" sentinel; the create path rejects it via its own guard.
+        assert_eq!(parse_reservation_duration("0").unwrap(), 0);
+        assert_eq!(parse_reservation_duration("00:00:00").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_reservation_duration_rejects_unparseable() {
+        assert!(parse_reservation_duration("notatime").is_err());
+        assert!(parse_reservation_duration("").is_err());
+        assert!(parse_reservation_duration("1.5h").is_err());
+    }
+
+    #[test]
+    fn parse_reservation_create_params_rejects_bad_duration() {
+        let params = p(&[
+            "ReservationName=r1",
+            "StartTime=now",
+            "Duration=notatime",
+            "Nodes=n1",
+        ]);
+        let err = parse_reservation_create_params(&params).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid reservation duration"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_reservation_create_params_requires_duration() {
+        let params = p(&["ReservationName=r1", "StartTime=now", "Nodes=n1"]);
+        let err = parse_reservation_create_params(&params).unwrap_err();
+        assert!(
+            err.to_string().contains("Duration= is required"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_reservation_create_params_accepts_slurm_duration() {
+        let params = p(&[
+            "ReservationName=r1",
+            "StartTime=now",
+            "Duration=30-00:00:00",
+            "Nodes=n1",
+        ]);
+        let parsed = parse_reservation_create_params(&params).unwrap();
+        assert_eq!(parsed.name, "r1");
+        assert_eq!(parsed.duration_minutes, 30 * 24 * 60);
     }
 }

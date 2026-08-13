@@ -3519,6 +3519,11 @@ impl ClusterManager {
 
     /// Create a new reservation (validated, persisted via Raft).
     pub fn create_reservation(&self, mut res: Reservation) -> Result<(), ReservationError> {
+        if res.end_time <= res.start_time {
+            return Err(ReservationError::invalid(
+                "reservation duration must be positive",
+            ));
+        }
         if self.reservations.read().iter().any(|r| r.name == res.name) {
             return Err(ReservationError::already_exists(format!(
                 "reservation '{}' already exists",
@@ -3581,6 +3586,14 @@ impl ClusterManager {
         if duration_minutes > 0 {
             preview.end_time =
                 preview.start_time + chrono::Duration::minutes(duration_minutes as i64);
+        }
+        // Unreachable today (start_time is immutable and create rejects zero
+        // spans), but guard explicitly so a future editable start_time can't
+        // silently reintroduce a zero-length, instantly-purged reservation.
+        if preview.end_time <= preview.start_time {
+            return Err(ReservationError::invalid(
+                "reservation duration must be positive",
+            ));
         }
         let known: std::collections::HashSet<String> = self.nodes.read().keys().cloned().collect();
         let mut add_expanded = Vec::new();
@@ -11755,6 +11768,38 @@ mod tests {
         assert!(
             cm.get_reservations().is_empty(),
             "owner delete must succeed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_reservation_rejects_non_positive_span() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+
+        // A zero-length span (duration 0) would be created but is immediately
+        // expired, so the scheduler purge loop would drop it before it is ever
+        // visible. Reject it up front instead.
+        let err = cm
+            .create_reservation(Reservation {
+                name: "zero".into(),
+                start_time: now,
+                end_time: now,
+                nodes: vec!["n1".into()],
+                accounts: Vec::new(),
+                users: Vec::new(),
+                flags: Default::default(),
+                owner: "root".into(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, ReservationError::InvalidArgument(_)),
+            "zero-length reservation must be rejected, got {err:?}"
+        );
+        assert!(
+            cm.get_reservations().is_empty(),
+            "rejected reservation must not persist"
         );
     }
 
