@@ -422,9 +422,31 @@ Implementations: `AmdAfmPlugin` (calls AFM REST API per rack), `NvidiaImexPlugin
 
 **Partial failure:** If step 5 succeeds on rack1 but AFM_rack2 is unreachable, the domain stays in `Creating`. The controller retries rack2's segment. If retries are exhausted, domain transitions to `Failed`: rack1's vPoD is destroyed, the job is marked failed or requeued, and GPUs return to the system vPoD on each rack. A partially-ready FabricDomain is never handed to a job.
 
+### Partition as the fabric policy anchor
+
+Every job in Spur is always associated with a partition — there are no partition-less jobs. When a user submits without `--partition`, `apply_default_partition()` assigns the partition marked `is_default = true` in config, falling back to the first partition if none is marked. This is enforced at submit time in `spurctld` before the job enters the scheduling queue.
+
+This makes the partition the natural and complete anchor for fabric policy. Every job that reaches the scheduler already has a partition, so the fabric `isolation` mode on that partition is always reachable — no edge cases.
+
+Nodes that register without matching any explicit partition hostlist are automatically assigned to the default partition, inheriting its fabric policy. This means the default partition effectively sets the cluster-wide fabric default for all unmanaged nodes.
+
+**The default partition is where cluster-wide isolation policy is set.** On a multi-tenant Helios cluster where per-job isolation is the safe default:
+
+```toml
+[[partitions]]
+name = "default"
+default = true
+nodes = "ALL"            # accepts every registered node
+
+[partitions.fabric]
+isolation = "job"        # every job gets its own FabricDomain via AFM
+```
+
+Users who submit without `--partition` get per-job isolation automatically. Users who need a different isolation model submit to a named partition explicitly.
+
 ### Config
 
-Each rack has its own AFM controller. The cluster config expresses this as a list of rack entries; the scheduler maps each scheduled node to its rack to derive the `FabricDomainSpec`:
+Each rack has its own AFM controller. The cluster config defines racks separately from partitions — racks express physical fabric topology, partitions express scheduling and isolation policy. The scheduler joins them at dispatch time by mapping each scheduled node to its rack:
 
 ```toml
 [fabric]
@@ -441,16 +463,86 @@ nodes = "node[9-16]"
 afm_endpoint = "http://afm.rack2.cluster:8080"
 ```
 
-A partition's fabric behavior is determined by which racks its nodes belong to. No separate per-partition fabric config is required — the rack mapping is sufficient for the scheduler to build the correct `FabricDomainSpec` at dispatch time.
-
-For pre-created or externally managed vPoDs (lifecycle options 1 and 2), the rack entry carries the pre-existing vPoD ID instead of an AFM endpoint:
+Partitions declare their isolation scope independently of the rack config:
 
 ```toml
-[[fabric.rack]]
-name = "rack1"
+# Default partition — per-job isolation for all unspecified jobs
+[[partitions]]
+name = "default"
+default = true
+nodes = "ALL"
+[partitions.fabric]
+isolation = "job"
+
+# Shared partition — one FabricDomain per partition, all jobs share it
+# Spur still creates this via AFM; it is created when the first job
+# arrives and destroyed when the partition goes idle
+[[partitions]]
+name = "gpu-shared"
 nodes = "node[1-8]"
-vpod_id = "vpod-precreated-abc"    # externally managed; Spur does not call AFM
+[partitions.fabric]
+isolation = "partition"
+
+# Reservation partition — FabricDomain created at reservation time
+[[partitions]]
+name = "gpu-reserved"
+nodes = "node[9-16]"
+[partitions.fabric]
+isolation = "reservation"
+
+# Externally managed — Spur uses the pre-existing vPoD ID as-is, calls no AFM
+[[partitions]]
+name = "gpu-external"
+nodes = "node[17-24]"
+[partitions.fabric]
+vpod_id = "vpod-precreated-abc"
+
+# No fabric — CPU-only or scale-out-only nodes
+[[partitions]]
+name = "cpu"
+nodes = "cpu[1-32]"
+# no [partitions.fabric] section
 ```
+
+When a job is scheduled, the controller looks up the partition's `isolation` mode, derives the `FabricDomainSpec` from the scheduled nodes and their rack memberships, and calls the appropriate `FabricPlugin` method. The `isolation = "partition"` case creates the domain lazily on first job and reuses it for subsequent jobs in that partition; `isolation = "job"` creates and destroys a domain for every job.
+
+### User-facing visibility
+
+**`sinfo`** — fabric mode is shown as a partition attribute so users know the isolation model before submitting:
+
+```
+PARTITION      AVAIL  NODES  FABRIC_ISOLATION  FABRIC_DOMAIN
+default        up     32     job               (per-job)
+gpu-shared     up     8      partition         fd-p1q2r3
+gpu-reserved   up     8      reservation       (per-reservation)
+gpu-external   up     8      external          vpod-abc123
+cpu            up     32     none              -
+```
+
+**`squeue`** — fabric domain is shown per running job so users can verify what isolation they have:
+
+```
+JOBID  PARTITION    USER   ST  NODES  FABRIC_DOMAIN   ISOLATION
+1234   default      alice  R   4      fd-x7y8z9       job
+1235   gpu-shared   bob    R   2      fd-p1q2r3       partition (shared)
+1236   gpu-shared   carol  R   4      fd-p1q2r3       partition (shared)
+1237   gpu-reserved dave   R   8      fd-r4s5t6       reservation
+```
+
+Jobs 1235 and 1236 are explicitly shown sharing the same FabricDomain — no ambiguity. Job 1234 has its own.
+
+### Asserting isolation requirements at submit time
+
+A user who needs per-job isolation can assert it defensively with `--fabric-isolation=required`:
+
+```bash
+sbatch --partition=gpu-shared --fabric-isolation=required job.sh
+# error: partition gpu-shared provides partition-level fabric isolation.
+#        Per-job isolation requires isolation=job or isolation=reservation.
+#        Use --partition=default or request a reservation.
+```
+
+This prevents the silent failure mode where a user submits to the wrong partition and gets no isolation. The flag causes a hard rejection at submit time with a clear message, rather than the job running unprotected.
 
 ### Environment injection
 
