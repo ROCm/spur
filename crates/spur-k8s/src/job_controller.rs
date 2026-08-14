@@ -29,6 +29,7 @@ const FINALIZER: &str = "spur.amd.com/cleanup";
 const INITIAL_BACKOFF_SECS: u64 = 1;
 const MAX_BACKOFF_SECS: u64 = 60;
 const LABEL_PATCH_BUDGET: Duration = Duration::from_secs(3);
+const STATUS_PATCH_BUDGET: Duration = Duration::from_secs(3);
 
 fn is_transient_kube_error(err: &kube::Error) -> bool {
     match err {
@@ -229,8 +230,9 @@ async fn submit_to_controller(
                 ..fresh_status.clone()
             };
             // Rejected returns await_change(), so a dropped write here can't
-            // self-heal; propagate it and let error_policy retry with backoff.
-            patch_status(api, name, &new_status)
+            // self-heal. Retry the write in place rather than propagating, which
+            // would re-run submit_job on the next pass for an already-doomed spec.
+            patch_terminal_status(api, name, &new_status)
                 .await
                 .map_err(ReconcileError::Kube)?;
             return Ok(SubmitOutcome::Rejected);
@@ -840,6 +842,40 @@ async fn patch_status(
     api.patch_status(name, &pp, &Patch::Merge(&patch))
         .await
         .map(|_| ())
+}
+
+/// Write a terminal status, retrying transient API errors within a budget. The
+/// submit that produced this state is already spent, so a dropped write must not
+/// fall back to re-running submit on the next reconcile.
+async fn patch_terminal_status(
+    api: &Api<SpurJob>,
+    name: &str,
+    status: &SpurJobStatus,
+) -> Result<(), kube::Error> {
+    tokio::time::timeout(
+        STATUS_PATCH_BUDGET,
+        (|| async { patch_status(api, name, status).await })
+            .retry(
+                ExponentialBuilder::default()
+                    .with_min_delay(Duration::from_millis(200))
+                    .with_max_delay(Duration::from_secs(1))
+                    .without_max_times(),
+            )
+            .when(is_transient_kube_error),
+    )
+    .await
+    .unwrap_or_else(|_elapsed| {
+        Err(kube::Error::Api(Box::new(
+            kube::core::Status::failure(
+                "TimedOut",
+                &format!(
+                    "status patch timed out after {}s",
+                    STATUS_PATCH_BUDGET.as_secs()
+                ),
+            )
+            .with_code(504),
+        )))
+    })
 }
 
 fn is_terminal(state: &str) -> bool {
