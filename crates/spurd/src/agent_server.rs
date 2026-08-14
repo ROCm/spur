@@ -731,6 +731,28 @@ fn build_one_shot_command_script(command: &[String]) -> Result<String, Status> {
     Ok(format!("#!/bin/bash\nexec {joined}\n"))
 }
 
+/// Build the argument vector passed to `nsenter` (everything after the
+/// `nsenter` program name) for entering a running job and executing `command`.
+///
+/// The namespace is entered as root; privilege is dropped *inside* the target
+/// via `setpriv --init-groups` when `priv_drop` is set, which is the only way
+/// to initialise supplementary groups after nsenter (nsenter's own
+/// --setuid/--setgid skip setgroups). Root jobs pass `priv_drop = None` and run
+/// the command directly.
+fn build_nsenter_argv(
+    entry: &crate::job_entry::JobEntry,
+    priv_drop: Option<&crate::privdrop::PrivDrop>,
+    command: &[String],
+) -> Vec<String> {
+    let mut args = entry.nsenter_args();
+    args.push("--".into());
+    if let Some(pd) = priv_drop {
+        args.extend(pd.setpriv_prefix());
+    }
+    args.extend(command.iter().cloned());
+    args
+}
+
 fn cleanup_step_scripts(dir: &std::path::Path, paths: &[&std::path::Path]) {
     for path in paths {
         let _ = std::fs::remove_file(path);
@@ -1680,19 +1702,7 @@ impl SlurmAgent for AgentService {
 
         let mut cmd = if entry.has_namespaces() && entry.pid > 0 {
             let mut c = tokio::process::Command::new("nsenter");
-            for arg in entry.nsenter_args() {
-                c.arg(arg);
-            }
-            if let Some(ref pd) = priv_drop {
-                for arg in pd.nsenter_args() {
-                    c.arg(arg);
-                }
-            }
-            c.arg("--");
-            c.arg(&req.command[0]);
-            for arg in &req.command[1..] {
-                c.arg(arg);
-            }
+            c.args(build_nsenter_argv(&entry, priv_drop.as_ref(), &req.command));
             c
         } else {
             let mut c = tokio::process::Command::new(&req.command[0]);
@@ -2963,12 +2973,7 @@ impl AgentService {
 
         let use_nsenter = entry.has_namespaces() && entry.pid > 0;
         let (launch_cmd, launch_args, apply_priv_in_child) = if use_nsenter {
-            let mut args = entry.nsenter_args();
-            if let Some(ref pd) = priv_drop {
-                args.extend(pd.nsenter_args());
-            }
-            args.push("--".into());
-            args.extend(shell);
+            let args = build_nsenter_argv(entry, priv_drop.as_ref(), &shell);
             ("nsenter".to_string(), args, false)
         } else {
             (shell[0].clone(), shell[1..].to_vec(), true)
@@ -3153,6 +3158,96 @@ mod tests {
     use super::*;
     use spur_core::resource::ResourceSet;
     use tonic::Request;
+
+    fn nsenter_job_entry(uid: u32, gid: u32) -> crate::job_entry::JobEntry {
+        crate::job_entry::JobEntry {
+            pid: 1234,
+            has_pid_namespace: true,
+            has_user_namespace: false,
+            has_mount_namespace: true,
+            uid,
+            gid,
+            work_dir: "/home/user".into(),
+        }
+    }
+
+    #[test]
+    fn build_nsenter_argv_non_root_wraps_with_setpriv_init_groups() {
+        let entry = nsenter_job_entry(1000, 1000);
+        let pd = crate::privdrop::PrivDrop::for_test(1000, 1000);
+        let argv = build_nsenter_argv(&entry, Some(&pd), &["id".to_string()]);
+
+        // nsenter itself must not carry uid/gid: it enters as root so it can
+        // read /proc/<pid>/ns/*; priv drop happens inside via setpriv.
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--setuid=")),
+            "nsenter portion must not use --setuid: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--setgid=")),
+            "nsenter portion must not use --setgid: {argv:?}"
+        );
+
+        let sep = argv.iter().position(|a| a == "--").expect("missing --");
+        assert_eq!(
+            &argv[sep..],
+            &[
+                "--",
+                "setpriv",
+                "--reuid=1000",
+                "--regid=1000",
+                "--init-groups",
+                "--",
+                "id"
+            ]
+        );
+    }
+
+    #[test]
+    fn build_nsenter_argv_pty_shell_wraps_with_setpriv_init_groups() {
+        // spawn_pty_in_job passes the resolved shell as the command.
+        let entry = nsenter_job_entry(1000, 1000);
+        let pd = crate::privdrop::PrivDrop::for_test(1000, 1000);
+        let argv = build_nsenter_argv(&entry, Some(&pd), &["/bin/bash".to_string()]);
+
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--setuid=")),
+            "PTY nsenter portion must not use --setuid: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--setgid=")),
+            "PTY nsenter portion must not use --setgid: {argv:?}"
+        );
+        let sep = argv.iter().position(|a| a == "--").expect("missing --");
+        assert_eq!(
+            &argv[sep..],
+            &[
+                "--",
+                "setpriv",
+                "--reuid=1000",
+                "--regid=1000",
+                "--init-groups",
+                "--",
+                "/bin/bash"
+            ]
+        );
+    }
+
+    #[test]
+    fn build_nsenter_argv_root_job_runs_command_directly() {
+        let entry = nsenter_job_entry(0, 0);
+        // Root job: resolve_if_needed returns None → no setpriv prefix.
+        let pd = crate::privdrop::PrivDrop::resolve_if_needed(0, 0);
+        assert!(pd.is_none());
+        let argv = build_nsenter_argv(&entry, pd.as_ref(), &["id".to_string()]);
+
+        assert!(
+            !argv.iter().any(|a| a == "setpriv"),
+            "root job must not invoke setpriv: {argv:?}"
+        );
+        let sep = argv.iter().position(|a| a == "--").expect("missing --");
+        assert_eq!(&argv[sep..], &["--", "id"]);
+    }
 
     #[test]
     fn build_job_script_uses_explicit_script_verbatim() {

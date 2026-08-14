@@ -86,12 +86,32 @@ impl PrivDrop {
         Ok(())
     }
 
-    /// Return nsenter --setuid/--setgid args for the namespace path.
-    pub fn nsenter_args(&self) -> Vec<String> {
+    /// Args to drop privilege *after* namespace entry, initialising the full
+    /// supplementary group set. nsenter's --setuid/--setgid call only
+    /// setuid/setgid (never setgroups), so groups gated on /dev/kfd (render,
+    /// video) are lost; `setpriv --init-groups` resolves them via NSS inside
+    /// the target namespace, mirroring the batch wrapper.
+    pub fn setpriv_prefix(&self) -> Vec<String> {
         vec![
-            format!("--setuid={}", self.uid),
-            format!("--setgid={}", self.gid),
+            "setpriv".into(),
+            format!("--reuid={}", self.uid),
+            format!("--regid={}", self.gid),
+            "--init-groups".into(),
+            "--".into(),
         ]
+    }
+}
+
+#[cfg(test)]
+impl PrivDrop {
+    /// Construct with explicit credentials, bypassing the root/NSS resolution
+    /// in `resolve_if_needed` so arg-construction can be tested off-host.
+    pub(crate) fn for_test(uid: u32, gid: u32) -> Self {
+        Self {
+            uid: Uid::from_raw(uid),
+            gid: Gid::from_raw(gid),
+            groups: vec![Gid::from_raw(gid)],
+        }
     }
 }
 
@@ -135,5 +155,25 @@ mod root_execution_tests {
                 assert!(check_root_execution_allowed(1000, allow, is_root).is_ok());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setpriv_prefix_emits_init_groups() {
+        let pd = PrivDrop::for_test(1000, 1000);
+        assert_eq!(
+            pd.setpriv_prefix(),
+            vec![
+                "setpriv",
+                "--reuid=1000",
+                "--regid=1000",
+                "--init-groups",
+                "--"
+            ]
+        );
     }
 }
