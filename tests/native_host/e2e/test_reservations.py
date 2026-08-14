@@ -358,6 +358,134 @@ class TestReservations:
             # A leaked reservation fences a node for an hour; best-effort cleanup.
             cluster.cli_as_user("root", ["scontrol", "delete-reservation", res_name])
 
+    def test_reservation_duration_formats(self, cluster):
+        """Duration accepts whole minutes and Slurm time (HH:MM:SS, D-HH:MM:SS)
+        via both the subcommand and inline syntax. A positive duration must
+        survive the scheduler's expired-reservation purge; an unparseable, zero,
+        or omitted duration is rejected up front, not silently created then
+        purged (SPUR-182)."""
+        node = cluster.node_names[0]
+
+        def create(name, kind, duration):
+            if kind == "subcommand":
+                args = [
+                    "scontrol",
+                    "create-reservation",
+                    f"--name={name}",
+                    "--start-time=now",
+                    f"--duration={duration}",
+                    f"--nodes={node}",
+                    "--flags=ignore_jobs",
+                ]
+            else:
+                args = [
+                    "scontrol",
+                    "create",
+                    f"ReservationName={name}",
+                    "StartTime=now",
+                    f"Duration={duration}",
+                    f"Nodes={node}",
+                    "Flags=IGNORE_JOBS",
+                ]
+            return cluster.cli_as_user("root", args)
+
+        def classify(name):
+            # Exit code alone can't tell a definitive "not found" from a
+            # transient error (both non-zero), so match the message; that lets
+            # callers retry hiccups instead of misreading them as a purge.
+            out = cluster.cli_allow_fail(["scontrol", "show", "reservation", name])
+            if f"ReservationName={name}" in out:
+                return "present"
+            if f"Reservation {name} not found" in out:
+                return "absent"
+            return "error"
+
+        def assert_survives_purge(name, window=5.0, step=0.5):
+            # Must stay listed across a purge cycle (~1s): fail on a definitive
+            # "not found", tolerate transient errors, and require one real
+            # sighting so a run of errors can't pass vacuously.
+            deadline = time.time() + window
+            seen = False
+            while time.time() < deadline:
+                state = classify(name)
+                if state == "present":
+                    seen = True
+                elif state == "absent":
+                    raise AssertionError(f"reservation {name} was purged unexpectedly")
+                time.sleep(step)
+            assert seen, f"reservation {name} was never observed present within {window}s"
+
+        def assert_never_created(name, window=3.0, step=0.5):
+            # A rejected create must leave nothing: require a definitive "not
+            # found", retrying past transient errors; fail if it ever appears.
+            deadline = time.time() + window
+            confirmed_absent = False
+            while time.time() < deadline:
+                state = classify(name)
+                if state == "present":
+                    raise AssertionError(f"reservation {name} must not have been created")
+                if state == "absent":
+                    confirmed_absent = True
+                    break
+                time.sleep(step)
+            assert confirmed_absent, f"could not confirm reservation {name} absent within {window}s"
+
+        # Positive durations across both entry points and all accepted formats.
+        # 30-00:00:00 is the exact reported case (30 days).
+        valid_cases = [
+            ("subcommand", "30-00:00:00"),
+            ("inline", "30-00:00:00"),
+            ("inline", "01:00:00"),
+            ("subcommand", "60"),
+        ]
+        for idx, (kind, duration) in enumerate(valid_cases):
+            name = f"res-dur-{idx}-{int(time.time())}"
+            try:
+                out = create(name, kind, duration)
+                assert "created" in out.lower(), f"{kind} {duration} create failed: {out}"
+                assert_survives_purge(name)
+            finally:
+                cluster.cli_as_user("root", ["scontrol", "delete-reservation", name])
+
+        # Unique names keep an unexpectedly-successful case isolated (no
+        # cascading "already exists") and cleaned up on its own.
+        rejection_cases = [
+            ("subcommand", "notatime"),
+            ("inline", "notatime"),
+            ("subcommand", "0"),
+            ("inline", "0"),
+        ]
+        for idx, (kind, duration) in enumerate(rejection_cases):
+            name = f"res-dur-rej-{idx}-{int(time.time())}"
+            try:
+                out = create(name, kind, duration)
+                assert "created" not in out.lower(), f"{kind} {duration} should be rejected: {out}"
+                assert_never_created(name)
+            finally:
+                # Defensive cleanup if a bug let the create through; a leaked
+                # reservation fences a node.
+                cluster.cli_as_user("root", ["scontrol", "delete-reservation", name])
+
+        # Omitting Duration in the inline path is rejected too.
+        omit_name = f"res-dur-omit-{int(time.time())}"
+        try:
+            omit_out = cluster.cli_as_user(
+                "root",
+                [
+                    "scontrol",
+                    "create",
+                    f"ReservationName={omit_name}",
+                    "StartTime=now",
+                    f"Nodes={node}",
+                ],
+            )
+            assert "created" not in omit_out.lower(), (
+                f"omitted duration should be rejected: {omit_out}"
+            )
+            assert_never_created(omit_name)
+        finally:
+            cluster.cli_as_user("root", ["scontrol", "delete-reservation", omit_name])
+
     def test_non_owner_cannot_delete_or_update_reservation(self, cluster):
         """A reservation is owned by its creator; a different user must not be
         able to delete or update it, but the owner still can. Exercises the
