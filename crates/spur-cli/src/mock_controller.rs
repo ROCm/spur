@@ -144,7 +144,7 @@ mock_controller_impl! {
         suspend_job(proto::SuspendJobRequest) -> ();
         resume_job(proto::ResumeJobRequest) -> ();
         update_job(proto::UpdateJobRequest) -> ();
-        requeue_job(proto::RequeueJobRequest) -> ();
+        requeue_job(proto::RequeueJobRequest) -> proto::RequeueJobResponse;
         get_nodes(proto::GetNodesRequest) -> proto::GetNodesResponse;
         get_node(proto::GetNodeRequest) -> proto::NodeInfo;
         drain_node(proto::DrainNodeRequest) -> proto::DrainNodeResponse;

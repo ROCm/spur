@@ -439,6 +439,15 @@ pub struct JobFilter<'a> {
     pub nodes: &'a [String],
 }
 
+/// Result of an admin requeue: `killed` are Running/Suspended snapshots whose
+/// old processes must be cancelled; `skipped` lists array tasks not requeued.
+#[derive(Debug, Default)]
+pub struct RequeueOutcome {
+    pub requeued: u32,
+    pub killed: Vec<Job>,
+    pub skipped: Vec<String>,
+}
+
 impl ClusterManager {
     #[cfg(test)]
     pub fn new(config: SlurmConfig, state_dir: &Path) -> anyhow::Result<Self> {
@@ -1187,14 +1196,12 @@ impl ClusterManager {
 
     /// Admin requeue (`scontrol requeue` / `requeuehold`), keeping the `job_id`.
     /// A bare array-parent id (no job record of its own) fans out to every task.
-    /// Returns snapshots of the jobs that were Running/Suspended so the caller
-    /// can kill their old processes.
     pub fn requeue_job_by_user(
         &self,
         job_id: JobId,
         user: &str,
         hold: bool,
-    ) -> anyhow::Result<Vec<Job>> {
+    ) -> anyhow::Result<RequeueOutcome> {
         let (targets, is_array) = {
             let jobs = self.jobs.read();
             if jobs.contains_key(&job_id) {
@@ -1216,41 +1223,39 @@ impl ClusterManager {
         // A single, explicitly named job propagates its error verbatim so the
         // user sees exactly why (not owner, interactive, already pending, ...).
         if !is_array {
-            return Ok(self
+            let killed: Vec<Job> = self
                 .requeue_one_job(targets[0], user, hold)?
                 .into_iter()
-                .collect());
+                .collect();
+            return Ok(RequeueOutcome {
+                requeued: 1,
+                killed,
+                skipped: Vec::new(),
+            });
         }
 
         // Array fan-out: requeue every task that can be, collecting per-task
         // failures. Only fail outright if no task could be requeued at all.
         let total = targets.len();
-        let mut killed = Vec::new();
-        let mut errors = Vec::new();
+        let mut outcome = RequeueOutcome::default();
         for id in targets {
             match self.requeue_one_job(id, user, hold) {
-                Ok(Some(job)) => killed.push(job),
-                Ok(None) => {}
-                Err(e) => errors.push(format!("task {id}: {e}")),
+                Ok(Some(job)) => {
+                    outcome.requeued += 1;
+                    outcome.killed.push(job);
+                }
+                Ok(None) => outcome.requeued += 1,
+                Err(e) => outcome.skipped.push(format!("job {id}: {e}")),
             }
         }
-        if killed.is_empty() && errors.len() == total {
+        if outcome.requeued == 0 && outcome.skipped.len() == total {
             anyhow::bail!(
                 "no tasks of array {} could be requeued: {}",
                 job_id,
-                errors.join("; ")
+                outcome.skipped.join("; ")
             );
         }
-        // Partial success is reported as success (some tasks requeued), so make
-        // the skipped tasks visible rather than swallowing them silently.
-        if !errors.is_empty() {
-            warn!(
-                array_job_id = job_id,
-                "some array tasks were not requeued: {}",
-                errors.join("; ")
-            );
-        }
-        Ok(killed)
+        Ok(outcome)
     }
 
     /// Requeue exactly one job/task. Returns its pre-requeue snapshot when the
@@ -1295,7 +1300,7 @@ impl ClusterManager {
                 Some(
                     job.spec
                         .begin_time
-                        .map_or(deferred, |user| user.max(deferred)),
+                        .map_or(deferred, |user_begin| user_begin.max(deferred)),
                 )
             }
             _ => None,
@@ -4461,6 +4466,45 @@ impl ClusterManager {
         .map_err(|e| anyhow::anyhow!("raft propose failed: {}", e))
     }
 
+    /// Return a finished job's per-node slice to each node it held, skipping any
+    /// in `already_deallocated`; pass `allocated_resources = None` if freed already.
+    fn deallocate_job_slices(
+        nodes: &mut HashMap<String, Node>,
+        freed_nodes: &[String],
+        allocated_resources: Option<&ResourceAllocations>,
+        per_node_alloc: &HashMap<String, ResourceAllocations>,
+        already_deallocated: &[String],
+        job_id: JobId,
+    ) {
+        let Some(total) = allocated_resources else {
+            return;
+        };
+        let node_count = freed_nodes.len().max(1) as u32;
+        for name in freed_nodes {
+            if already_deallocated.iter().any(|n| n == name) {
+                continue;
+            }
+            let Some(node) = nodes.get_mut(name) else {
+                continue;
+            };
+            let slice = per_node_alloc.get(name).cloned().unwrap_or_else(|| {
+                warn!(job_id, node = %name, "per_node_alloc missing at deallocation, using scalar fallback");
+                ResourceAllocations::with_scalar(
+                    total.cpus / node_count,
+                    total.memory_mb / node_count as u64,
+                )
+            });
+            node.alloc_resources.subtract(&slice);
+            node.update_state_from_alloc();
+            if node.state == NodeState::Draining
+                && node.alloc_resources.cpus == 0
+                && !node.alloc_resources.has_devices()
+            {
+                node.state = NodeState::Drain;
+            }
+        }
+    }
+
     /// Clear a job's run-state fields so it's schedulable again after requeue.
     /// Does not bump either counter; callers do that based on why they're requeuing.
     fn clear_run_state_for_requeue(job: &mut Job) {
@@ -4536,35 +4580,14 @@ impl ClusterManager {
         let already_deallocated: Vec<String> = job.node_completions.keys().cloned().collect();
         job.node_completions.clear();
 
-        let alloc_nodes = job.allocated_nodes.clone();
-        if let Some(ref total) = job.allocated_resources {
-            let node_count = alloc_nodes.len().max(1) as u32;
-            for alloc_node in &alloc_nodes {
-                if already_deallocated.iter().any(|n| n == alloc_node) {
-                    continue;
-                }
-                if let Some(node) = nodes.get_mut(alloc_node) {
-                    let slice = job
-                        .per_node_alloc
-                        .get(alloc_node)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            ResourceAllocations::with_scalar(
-                                total.cpus / node_count,
-                                total.memory_mb / node_count as u64,
-                            )
-                        });
-                    node.alloc_resources.subtract(&slice);
-                    node.update_state_from_alloc();
-                    if node.state == NodeState::Draining
-                        && node.alloc_resources.cpus == 0
-                        && !node.alloc_resources.has_devices()
-                    {
-                        node.state = NodeState::Drain;
-                    }
-                }
-            }
-        }
+        Self::deallocate_job_slices(
+            nodes,
+            &job.allocated_nodes,
+            job.allocated_resources.as_ref(),
+            &job.per_node_alloc,
+            &already_deallocated,
+            job_id,
+        );
 
         Some(JobFinalized {
             job_id,
@@ -4722,32 +4745,18 @@ impl ClusterManager {
                     job.spec.begin_time = Some(*begin_time);
                     job.set_pending_reason(PendingReason::BeginTime);
                 }
-                if let Some(ref total) = allocated_resources {
-                    let node_count = freed_nodes.len().max(1) as u32;
-                    for name in &freed_nodes {
-                        if let Some(node) = nodes.get_mut(name) {
-                            let slice = per_node_map.get(name).cloned().unwrap_or_else(|| {
-                                warn!(job_id = *job_id, node = %name, "per_node_alloc missing at preempt deallocation, using scalar fallback");
-                                ResourceAllocations::with_scalar(
-                                    total.cpus / node_count,
-                                    total.memory_mb / node_count as u64,
-                                )
-                            });
-                            node.alloc_resources.subtract(&slice);
-                            node.update_state_from_alloc();
-                            if node.state == NodeState::Draining
-                                && node.alloc_resources.cpus == 0
-                                && !node.alloc_resources.has_devices()
-                            {
-                                node.state = NodeState::Drain;
-                            }
-                        }
-                    }
-                }
+                Self::deallocate_job_slices(
+                    &mut nodes,
+                    &freed_nodes,
+                    allocated_resources.as_ref(),
+                    &per_node_map,
+                    &[],
+                    *job_id,
+                );
                 drop(jobs);
                 drop(nodes);
-                // Complete steps and fire accounting for the terminated run as
-                // PREEMPTED, even though the job itself is now Pending-with-hold.
+                // Fire accounting for the terminated run as PREEMPTED, even
+                // though the job itself is now Pending-with-hold.
                 self.complete_job_steps(job_id, -1, timestamp);
                 self.next_job_id.store(next_id, Ordering::Relaxed);
                 return ClientResponse {
@@ -4788,9 +4797,20 @@ impl ClusterManager {
                             }
                             job.exit_code = Some(-1);
                             job.end_time = Some(timestamp);
+                            // The live run still holds its allocation; capture it
+                            // to free below.
+                            freed_nodes = job.allocated_nodes.clone();
+                            allocated_resources = job.allocated_resources.clone();
+                            per_node_map = job.per_node_alloc.clone();
+                            job.node_completions.clear();
                         }
                         s if s.is_terminal() => {
+                            // The slice was already freed at completion; freeing
+                            // again would double-subtract on any shared node.
                             was_live = false;
+                            freed_nodes = Vec::new();
+                            allocated_resources = None;
+                            per_node_map = HashMap::new();
                         }
                         _ => {
                             // Pending, Completing, or an in-flight finalized
@@ -4798,10 +4818,6 @@ impl ClusterManager {
                             return ClientResponse::default();
                         }
                     }
-                    freed_nodes = job.allocated_nodes.clone();
-                    allocated_resources = job.allocated_resources.clone();
-                    per_node_map = job.per_node_alloc.clone();
-                    job.node_completions.clear();
 
                     if let Err(e) = job.transition(JobState::Pending) {
                         warn!(job_id = *job_id, error = %e, "invalid requeue transition in WAL apply");
@@ -4819,30 +4835,16 @@ impl ClusterManager {
                         job.set_pending_reason(PendingReason::None);
                     }
                 }
-                // Only the live path has allocations to free; for a terminal job
-                // `allocated_resources` is already None and this is skipped.
-                if let Some(ref total) = allocated_resources {
-                    let node_count = freed_nodes.len().max(1) as u32;
-                    for name in &freed_nodes {
-                        if let Some(node) = nodes.get_mut(name) {
-                            let slice = per_node_map.get(name).cloned().unwrap_or_else(|| {
-                                warn!(job_id = *job_id, node = %name, "per_node_alloc missing at requeue deallocation, using scalar fallback");
-                                ResourceAllocations::with_scalar(
-                                    total.cpus / node_count,
-                                    total.memory_mb / node_count as u64,
-                                )
-                            });
-                            node.alloc_resources.subtract(&slice);
-                            node.update_state_from_alloc();
-                            if node.state == NodeState::Draining
-                                && node.alloc_resources.cpus == 0
-                                && !node.alloc_resources.has_devices()
-                            {
-                                node.state = NodeState::Drain;
-                            }
-                        }
-                    }
-                }
+                // Live path only; the terminal path passes an empty allocation so
+                // this is a no-op (its slice was already freed at completion).
+                Self::deallocate_job_slices(
+                    &mut nodes,
+                    &freed_nodes,
+                    allocated_resources.as_ref(),
+                    &per_node_map,
+                    &[],
+                    *job_id,
+                );
                 drop(jobs);
                 drop(nodes);
                 self.next_job_id.store(next_id, Ordering::Relaxed);
@@ -5189,36 +5191,19 @@ impl ClusterManager {
                 } else {
                     return ClientResponse::default();
                 }
-                // Deallocate node resources not already freed during COMPLETING
+                // Deallocate node resources not already freed during COMPLETING.
                 let per_node_map = jobs
                     .get(job_id)
                     .map(|j| j.per_node_alloc.clone())
                     .unwrap_or_default();
-                if let Some(ref total) = allocated_resources {
-                    let node_count = freed_nodes.len().max(1) as u32;
-                    for name in &freed_nodes {
-                        if already_deallocated.iter().any(|n| n == name) {
-                            continue;
-                        }
-                        if let Some(node) = nodes.get_mut(name) {
-                            let slice = per_node_map.get(name).cloned().unwrap_or_else(|| {
-                                warn!(job_id = *job_id, node = %name, "per_node_alloc missing at deallocation, using scalar fallback");
-                                ResourceAllocations::with_scalar(
-                                    total.cpus / node_count,
-                                    total.memory_mb / node_count as u64,
-                                )
-                            });
-                            node.alloc_resources.subtract(&slice);
-                            node.update_state_from_alloc();
-                            if node.state == NodeState::Draining
-                                && node.alloc_resources.cpus == 0
-                                && !node.alloc_resources.has_devices()
-                            {
-                                node.state = NodeState::Drain;
-                            }
-                        }
-                    }
-                }
+                Self::deallocate_job_slices(
+                    &mut nodes,
+                    &freed_nodes,
+                    allocated_resources.as_ref(),
+                    &per_node_map,
+                    &already_deallocated,
+                    *job_id,
+                );
                 drop(jobs);
                 drop(nodes);
                 self.complete_job_steps(job_id, *exit_code, timestamp);
@@ -9841,9 +9826,9 @@ mod tests {
         let job_id = run_job_on(&cm, "requeue-me", "worker1");
         assert_eq!(cm.node_metrics().alloc_cpus, 2);
 
-        let killed = cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+        let outcome = cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
         assert_eq!(
-            killed.len(),
+            outcome.killed.len(),
             1,
             "a running job must be reported for agent kill"
         );
@@ -9882,8 +9867,8 @@ mod tests {
         cm.suspend_job(job_id, "testuser").unwrap();
         settle(&cm, job_id, JobState::Suspended);
 
-        let killed = cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
-        assert_eq!(killed.len(), 1);
+        let outcome = cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+        assert_eq!(outcome.killed.len(), 1);
         settle(&cm, job_id, JobState::Pending);
 
         let job = cm.get_job(job_id).unwrap();
@@ -9903,8 +9888,12 @@ mod tests {
         settle(&cm, job_id, JobState::Completed);
 
         // An already-terminal job has no live processes to kill.
-        let killed = cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
-        assert!(killed.is_empty(), "terminal job needs no agent kill");
+        let outcome = cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+        assert!(
+            outcome.killed.is_empty(),
+            "terminal job needs no agent kill"
+        );
+        assert_eq!(outcome.requeued, 1);
         settle(&cm, job_id, JobState::Pending);
 
         let job = cm.get_job(job_id).unwrap();
@@ -9926,6 +9915,7 @@ mod tests {
             JobState::Timeout,
             JobState::NodeFail,
             JobState::OutOfMemory,
+            JobState::Cancelled,
         ] {
             let job_id = run_job_on(&cm, &format!("term-{state:?}"), "worker1");
             cm.complete_job(job_id, -1, state).unwrap();
@@ -9935,6 +9925,35 @@ mod tests {
             settle(&cm, job_id, JobState::Pending);
             assert_eq!(cm.get_job(job_id).unwrap().user_requeue_count, 1);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_requeue_terminal_job_does_not_double_free_shared_node() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let a = run_job_on(&cm, "share-a", "worker1");
+        let _b = run_job_on(&cm, "share-b", "worker1");
+        assert_eq!(cm.node_metrics().alloc_cpus, 4);
+
+        cm.complete_job(a, 0, JobState::Completed).unwrap();
+        settle(&cm, a, JobState::Completed);
+        assert_eq!(
+            cm.node_metrics().alloc_cpus,
+            2,
+            "A's slice freed once at completion"
+        );
+
+        // Requeuing already-terminal A must not free its slice a second time, or
+        // B's accounting on the shared node would be corrupted.
+        cm.requeue_job_by_user(a, "testuser", false).unwrap();
+        settle(&cm, a, JobState::Pending);
+        assert_eq!(
+            cm.node_metrics().alloc_cpus,
+            2,
+            "terminal requeue must not double-free the shared node"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9989,12 +10008,69 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn user_requeue_rejects_interactive_job() {
+    async fn user_requeue_rejects_interactive_jobs() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        // Each of the three non-batch markers must be rejected (the check runs
+        // before the state match, so a Pending allocation is enough to exercise
+        // it). srun/salloc/--pty have no batch script to re-run.
+        for (name, apply) in [
+            (
+                "srun",
+                (|s: &mut JobSpec| s.srun_job = true) as fn(&mut JobSpec),
+            ),
+            ("interactive", |s: &mut JobSpec| s.interactive = true),
+            ("pty", |s: &mut JobSpec| s.pty = true),
+        ] {
+            let mut spec = basic_spec(name);
+            apply(&mut spec);
+            let job_id = submit_and_wait(&cm, spec);
+            let err = cm
+                .requeue_job_by_user(job_id, "testuser", false)
+                .expect_err("interactive jobs cannot be requeued");
+            assert!(err.to_string().contains("interactive"), "{name}: {err}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_requeue_hold_then_release_reschedules() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "worker1", 8, 16000);
 
-        let job_id = submit_and_wait(&cm, srun_spec("interactive"));
+        let job_id = run_job_on(&cm, "hold-release", "worker1");
+        cm.requeue_job_by_user(job_id, "testuser", true).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+        assert!(cm
+            .get_job(job_id)
+            .unwrap()
+            .pending_reason
+            .is_scheduling_hold());
+
+        // Releasing the held requeue makes it schedulable again.
+        cm.release_job(job_id).unwrap();
+        wait_for("released", || {
+            cm.get_job(job_id)
+                .is_some_and(|j| !j.pending_reason.is_scheduling_hold())
+        });
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.priority, DEFAULT_PRIORITY);
+        assert!(cm.pending_jobs().iter().any(|j| j.job_id == job_id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_requeue_preserves_later_user_begin() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        // A user --begin further out than the requeue's own hold must win, so
+        // the requeue never shortens the operator's constraint.
+        let user_begin = Utc::now() + chrono::Duration::hours(1);
+        let mut spec = basic_spec("user-begin-requeue");
+        spec.begin_time = Some(user_begin);
+        let job_id = submit_and_wait(&cm, spec);
         let resources = scalar_alloc(2, 4000);
         cm.start_job(
             job_id,
@@ -10005,10 +10081,45 @@ mod tests {
         .unwrap();
         settle(&cm, job_id, JobState::Running);
 
-        let err = cm
-            .requeue_job_by_user(job_id, "testuser", false)
-            .expect_err("interactive jobs cannot be requeued");
-        assert!(err.to_string().contains("interactive"), "got: {err}");
+        cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().spec.begin_time,
+            Some(user_begin),
+            "user --begin beyond the requeue hold must be preserved"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_requeue_preserves_run_attempt_fencing() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        // First run is epoch 1.
+        let job_id = run_job_on(&cm, "epoch", "worker1");
+        assert_eq!(cm.get_job(job_id).unwrap().run_attempt, 1);
+
+        cm.requeue_job_by_user(job_id, "testuser", false).unwrap();
+        settle(&cm, job_id, JobState::Pending);
+
+        // Re-dispatch bumps the epoch to 2 (requeue must not have reset it).
+        let alloc = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            alloc.clone(),
+            per_node_for(&["worker1"], alloc),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+        assert_eq!(cm.get_job(job_id).unwrap().run_attempt, 2);
+
+        // A late completion from the killed run (epoch 1) must be dropped so the
+        // old cancel can never finalize the fresh run.
+        let res = cm.node_complete(job_id, "worker1", 0, 9, 1).unwrap();
+        assert!(matches!(res, NodeCompleteResult::StaleReport));
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Running);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10081,11 +10192,63 @@ mod tests {
         }
 
         // Requeuing the bare array-parent id fans out to every task.
-        cm.requeue_job_by_user(parent, "testuser", false).unwrap();
+        let outcome = cm.requeue_job_by_user(parent, "testuser", false).unwrap();
+        assert_eq!(outcome.requeued, task_ids.len() as u32);
+        assert!(outcome.skipped.is_empty());
         for &id in &task_ids {
             settle(&cm, id, JobState::Pending);
             assert_eq!(cm.get_job(id).unwrap().user_requeue_count, 1);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_requeue_array_partial_reports_skipped_tasks() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let mut spec = basic_spec("array-partial");
+        spec.array_spec = Some("0-1".into());
+        let parent = cm.submit_job(spec).unwrap().job_id;
+        wait_for("array tasks applied", || {
+            cm.get_jobs(&JobFilter::default())
+                .iter()
+                .filter(|j| j.spec.array_job_id == Some(parent))
+                .count()
+                == 2
+        });
+        let mut task_ids: Vec<JobId> = cm
+            .get_jobs(&JobFilter::default())
+            .iter()
+            .filter(|j| j.spec.array_job_id == Some(parent))
+            .map(|j| j.job_id)
+            .collect();
+        task_ids.sort_unstable();
+
+        // Run only the first task; leave the second Pending so the fan-out
+        // requeues one and skips the other ("already pending").
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            task_ids[0],
+            vec!["worker1".into()],
+            resources.clone(),
+            per_node_for(&["worker1"], resources),
+        )
+        .unwrap();
+        settle(&cm, task_ids[0], JobState::Running);
+
+        let outcome = cm.requeue_job_by_user(parent, "testuser", false).unwrap();
+        assert_eq!(outcome.requeued, 1, "only the running task is requeued");
+        assert_eq!(
+            outcome.skipped.len(),
+            1,
+            "the pending task is surfaced as skipped"
+        );
+        assert!(
+            outcome.skipped[0].contains("already pending"),
+            "got: {:?}",
+            outcome.skipped
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -319,7 +319,7 @@ service SlurmController {
   rpc UpdateJob(UpdateJobRequest) returns (google.protobuf.Empty);
   // Requeue a running/suspended or finished batch job back to PENDING,
   // keeping the same job_id and spec. `hold` parks it in a held state.
-  rpc RequeueJob(RequeueJobRequest) returns (google.protobuf.Empty);
+  rpc RequeueJob(RequeueJobRequest) returns (RequeueJobResponse);
 
   // Node management
   rpc GetNodes(GetNodesRequest) returns (GetNodesResponse);
@@ -548,6 +548,11 @@ message RequeueJobRequest {
   uint32 job_id = 1;   // Array parent id fans out to every task.
   string user = 2;     // For authorization (owner or root).
   bool hold = 3;       // Requeue into a held state (requeuehold).
+}
+
+message RequeueJobResponse {
+  uint32 requeued = 1;         // Jobs/array tasks returned to the queue.
+  repeated string skipped = 2; // "job N: reason" for tasks that could not be requeued (array fan-out).
 }
 
 message GetNodesRequest {

@@ -39,12 +39,12 @@ def _show_field(cluster, job_id, key):
 
 
 def _wait_finished(cluster, job_id, timeout=60):
-    """Poll until the job is finished: either shown COMPLETED or gone from the
-    active queue. Avoids racing on the RUNNING window for very short jobs."""
+    """Poll until the job is shown COMPLETED. Waits for CD specifically (not
+    absence) so a purged job doesn't masquerade as finished and then fail the
+    subsequent requeue with a spurious 'not found'."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        state = job_state(cluster.squeue_all(), job_id)
-        if state in ("CD", None):
+        if job_state(cluster.squeue_all(), job_id) == "CD":
             return True
         time.sleep(1)
     return False
@@ -177,7 +177,7 @@ class TestRequeueArray:
 class TestRequeueCliGuards:
     def test_requeue_unknown_job_errors(self, cluster):
         out = cluster.cli_allow_fail(["scontrol", "requeue", "999999"])
-        assert out.strip(), "expected an error message for unknown job id"
+        assert "not found" in out.lower(), f"expected a not-found error, got:\n{out}"
 
     def test_requeue_pending_job_rejected(self, cluster):
         """Requeuing an already-PENDING (held) job is rejected."""
@@ -190,6 +190,9 @@ class TestRequeueCliGuards:
             assert job_id is not None
             assert _wait_state(cluster, job_id, "PD", timeout=30)
             out = cluster.cli_allow_fail(["scontrol", "requeue", str(job_id)])
+            assert "already pending" in out.lower(), (
+                f"expected an already-pending rejection, got:\n{out}"
+            )
             assert job_state(cluster.squeue_all(), job_id) == "PD", (
                 f"job should still be PENDING; cli said:\n{out}"
             )

@@ -881,18 +881,25 @@ async fn requeue(controller: &str, job_id: u32, hold: bool) -> Result<()> {
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
-    client
+    let resp = client
         .requeue_job(spur_proto::proto::RequeueJobRequest {
             job_id,
             user: crate::interactive::current_user()?,
             hold,
         })
         .await
-        .context("requeue failed")?;
-    if hold {
-        println!("job {} requeued and held", job_id);
+        .context("requeue failed")?
+        .into_inner();
+    let held = if hold { " and held" } else { "" };
+    // A single job (or non-array) requeues exactly one record; only an array
+    // fan-out reports a count and any skipped tasks.
+    if resp.requeued <= 1 && resp.skipped.is_empty() {
+        println!("job {} requeued{}", job_id, held);
     } else {
-        println!("job {} requeued", job_id);
+        println!("requeued {} task(s){}", resp.requeued, held);
+        for skipped in &resp.skipped {
+            eprintln!("scontrol: skipped {}", skipped);
+        }
     }
     Ok(())
 }
