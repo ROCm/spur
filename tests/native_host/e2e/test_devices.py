@@ -79,10 +79,10 @@ def _render_video_user(cluster: SpurCluster) -> str | None:
     """Return a non-root user that is a member of both the render and video
     groups on node 0, or None if none exists.
 
-    SPUR-172 only manifests when the job runs as a non-root user with
-    supplementary GPU groups (so PrivDrop engages and the nsenter paths must
-    reinitialise the group set). Root jobs bypass PrivDrop entirely, so they
-    cannot exercise the regression.
+    The supplementary-group loss on nsenter entry only manifests when the job
+    runs as a non-root user with GPU groups, so PrivDrop engages and the
+    nsenter paths must reinitialise the group set. Root jobs bypass PrivDrop
+    entirely, so they cannot exercise this path.
     """
     script = (
         "for g in render video; do getent group \"$g\"; done | "
@@ -650,15 +650,14 @@ def _parse_groups(id_output: str) -> set[str]:
 
 
 class TestNsenterSupplementaryGroups:
-    """SPUR-172: commands entering a running job via nsenter (`spur exec`,
+    """Commands entering a running job via nsenter (`spur exec`,
     `spur run --overlap`) must carry the job user's full supplementary group
     set, matching the batch path. Without it, GPU device nodes gated on the
     render/video groups (e.g. /dev/kfd, root:render) are unopenable.
 
     Unit tests in spurd cover the nsenter argv construction; only an end-to-end
     run against a real namespaced job exercises the runtime priv-drop
-    (`setpriv --init-groups`) inside the entered pid/mount namespace, which is
-    where the two defects behind SPUR-172 actually surfaced.
+    (`setpriv --init-groups`) inside the entered pid/mount namespace.
     """
 
     @pytest.mark.rootful
@@ -696,7 +695,7 @@ class TestNsenterSupplementaryGroups:
             exec_id = cluster.cli_as_user(user, ["spur", "exec", str(job_id), "id"])
             exec_groups = _parse_groups(exec_id)
             assert {"render", "video"} <= exec_groups, (
-                f"spur exec lost supplementary groups (SPUR-172): "
+                f"spur exec lost supplementary groups: "
                 f"groups={sorted(exec_groups)}\nraw: {exec_id}"
             )
 
@@ -713,7 +712,7 @@ class TestNsenterSupplementaryGroups:
                 ],
             )
             assert "KFD_READABLE" in exec_kfd, (
-                f"/dev/kfd not readable via spur exec (SPUR-172):\n{exec_kfd}"
+                f"/dev/kfd not readable via spur exec:\n{exec_kfd}"
             )
 
             # Control: the plain-step path was never broken; assert it still
