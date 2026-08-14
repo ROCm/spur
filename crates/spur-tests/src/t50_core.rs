@@ -375,13 +375,16 @@ mod tests {
     }
 
     #[test]
-    fn t50_37_requeue_from_completed_succeeds() {
+    fn t50_37_requeue_from_completed_is_guarded() {
         let mut job = make_job("requeue-completed");
         assert_transition_ok(&mut job, JobState::Running);
         assert_transition_ok(&mut job, JobState::Completed);
-        // Admin requeue (`scontrol requeue`) puts a finished job back in the
-        // queue: Completed → Pending is a legal transition.
-        assert_transition_ok(&mut job, JobState::Pending);
+        // The general state machine must NOT resurrect a finished job; only the
+        // guarded admin path (`Job::requeue_to_pending`) may.
+        assert_transition_err(&mut job, JobState::Pending);
+        assert_job_state(&job, JobState::Completed);
+        job.requeue_to_pending()
+            .expect("admin requeue re-pends a completed job");
         assert_job_state(&job, JobState::Pending);
     }
 
@@ -452,15 +455,17 @@ mod tests {
         assert_eq!(node.state, NodeState::Error);
     }
 
-    // ── T50.42–43: Admin requeue can reset from Cancelled ──────
+    // ── T50.42–43: Cancelled re-pend is admin-guarded ─────────
 
     #[test]
-    fn t50_42_requeue_from_cancelled_succeeds() {
+    fn t50_42_requeue_from_cancelled_is_guarded() {
         let mut job = make_job("requeue-cancelled");
         assert_transition_ok(&mut job, JobState::Cancelled);
-        // Admin requeue (`scontrol requeue`) can put a cancelled job back into
-        // the queue: Cancelled → Pending is a legal transition.
-        assert_transition_ok(&mut job, JobState::Pending);
+        // The general machine rejects Cancelled → Pending; only the guarded
+        // admin requeue path re-pends it.
+        assert_transition_err(&mut job, JobState::Pending);
+        job.requeue_to_pending()
+            .expect("admin requeue re-pends a cancelled job");
         assert_job_state(&job, JobState::Pending);
     }
 

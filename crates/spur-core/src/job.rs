@@ -1213,7 +1213,6 @@ impl Job {
             (JobState::Running, JobState::Preempted) => true,
             (JobState::Running, JobState::Suspended) => true,
             (JobState::Running, JobState::OutOfMemory) => true,
-            (JobState::Running, JobState::Requeued) => true,
             (JobState::Completing, JobState::Completed) => true,
             (JobState::Completing, JobState::Failed) => true,
             (JobState::Completing, JobState::Cancelled) => true,
@@ -1235,21 +1234,14 @@ impl Job {
             (JobState::Suspended, JobState::Timeout) => true,
             (JobState::Suspended, JobState::NodeFail) => true,
             (JobState::Suspended, JobState::OutOfMemory) => true,
-            (JobState::Suspended, JobState::Requeued) => true,
-            // Requeue transitions: terminal → Pending (for --requeue jobs)
+            // Only failure/preempt states auto-requeue here; a finished or live
+            // run re-pends only via the admin `requeue_to_pending`, so nothing
+            // else can resurrect a finished job.
             (JobState::Timeout, JobState::Pending) => true,
             (JobState::Preempted, JobState::Pending) => true,
             (JobState::Preempted, JobState::Cancelled) => true,
             (JobState::NodeFail, JobState::Pending) => true,
             (JobState::Failed, JobState::Pending) => true,
-            // Admin requeue (`scontrol requeue`): the killed run is finalized as
-            // Requeued and returns to Pending; any terminal batch job can be put
-            // back into the queue with the same spec.
-            (JobState::Requeued, JobState::Pending) => true,
-            (JobState::Completed, JobState::Pending) => true,
-            (JobState::Cancelled, JobState::Pending) => true,
-            (JobState::Deadline, JobState::Pending) => true,
-            (JobState::OutOfMemory, JobState::Pending) => true,
             _ => false,
         };
 
@@ -1269,6 +1261,23 @@ impl Job {
                 to,
             })
         }
+    }
+
+    /// Admin requeue (`scontrol requeue`): return a live or terminal job to
+    /// Pending. Kept off the general `transition()` machine so nothing else can
+    /// resurrect a finished run.
+    pub fn requeue_to_pending(&mut self) -> Result<(), JobTransitionError> {
+        let ok = self.state.is_terminal()
+            || matches!(self.state, JobState::Running | JobState::Suspended);
+        if !ok {
+            return Err(JobTransitionError::Invalid {
+                from: self.state,
+                to: JobState::Pending,
+            });
+        }
+        self.state = JobState::Pending;
+        self.end_time = None;
+        Ok(())
     }
 
     /// WAL-apply transition: a move to the current state is a `NoOp` (replay /
@@ -1946,40 +1955,52 @@ mod tests {
     }
 
     #[test]
-    fn admin_requeue_transitions_are_allowed() {
-        // Live job finalized as Requeued, then re-pended.
+    fn requeue_to_pending_covers_live_and_terminal_states() {
+        // A live run finalizes through Requeued to Pending.
         let mut job = make_job();
         job.transition(JobState::Running).unwrap();
-        job.transition(JobState::Requeued).unwrap();
-        job.transition(JobState::Pending).unwrap();
+        job.requeue_to_pending().unwrap();
         assert_eq!(job.state, JobState::Pending);
         assert!(job.end_time.is_none(), "re-pend clears end_time");
 
-        // A completed job can be put back into the queue.
-        let mut done = make_job();
-        done.transition(JobState::Running).unwrap();
-        done.transition(JobState::Completed).unwrap();
-        done.transition(JobState::Pending).unwrap();
-        assert_eq!(done.state, JobState::Pending);
+        // Every terminal batch state can be put back in the queue.
+        for terminal in [
+            JobState::Completed,
+            JobState::Cancelled,
+            JobState::Failed,
+            JobState::Timeout,
+            JobState::NodeFail,
+            JobState::OutOfMemory,
+            JobState::Deadline,
+        ] {
+            let mut j = make_job();
+            j.state = terminal;
+            j.requeue_to_pending()
+                .unwrap_or_else(|e| panic!("{terminal:?} must be requeue-able: {e}"));
+            assert_eq!(j.state, JobState::Pending);
+        }
+    }
 
-        // As can a cancelled one.
-        let mut cancelled = make_job();
-        cancelled.transition(JobState::Cancelled).unwrap();
-        cancelled.transition(JobState::Pending).unwrap();
-        assert_eq!(cancelled.state, JobState::Pending);
-
-        // Every other terminal batch state is requeue-able too, so the leader's
-        // acceptance and the state machine never disagree (no false success).
-        let mut oom = make_job();
-        oom.transition(JobState::Running).unwrap();
-        oom.transition(JobState::OutOfMemory).unwrap();
-        oom.transition(JobState::Pending).unwrap();
-        assert_eq!(oom.state, JobState::Pending);
-
-        let mut deadline = make_job();
-        deadline.transition(JobState::Deadline).unwrap();
-        deadline.transition(JobState::Pending).unwrap();
-        assert_eq!(deadline.state, JobState::Pending);
+    #[test]
+    fn general_transition_never_resurrects_a_finished_job() {
+        // The invariant the guarded requeue path preserves: no ordinary
+        // `transition()` caller can move a finished run back to Pending.
+        for terminal in [
+            JobState::Completed,
+            JobState::Cancelled,
+            JobState::OutOfMemory,
+            JobState::Deadline,
+        ] {
+            let mut j = make_job();
+            j.state = terminal;
+            assert!(
+                j.transition(JobState::Pending).is_err(),
+                "{terminal:?} -> Pending must not be a general transition"
+            );
+        }
+        // Requeuing a Pending or Completing job is likewise rejected.
+        let mut pending = make_job();
+        assert!(pending.requeue_to_pending().is_err());
     }
 
     #[test]

@@ -1223,14 +1223,22 @@ impl ClusterManager {
         // A single, explicitly named job propagates its error verbatim so the
         // user sees exactly why (not owner, interactive, already pending, ...).
         if !is_array {
-            let killed: Vec<Job> = self
-                .requeue_one_job(targets[0], user, hold)?
-                .into_iter()
-                .collect();
-            return Ok(RequeueOutcome {
-                requeued: 1,
-                killed,
-                skipped: Vec::new(),
+            let id = targets[0];
+            let (requeued, killed) = self.requeue_one_job(id, user, hold)?;
+            return Ok(if requeued {
+                RequeueOutcome {
+                    requeued: 1,
+                    killed: killed.into_iter().collect(),
+                    skipped: Vec::new(),
+                }
+            } else {
+                // Raced to a non-requeuable state after the pre-check; report it
+                // honestly rather than claiming success.
+                RequeueOutcome {
+                    requeued: 0,
+                    killed: Vec::new(),
+                    skipped: vec![format!("job {id}: state changed before requeue")],
+                }
             });
         }
 
@@ -1240,11 +1248,13 @@ impl ClusterManager {
         let mut outcome = RequeueOutcome::default();
         for id in targets {
             match self.requeue_one_job(id, user, hold) {
-                Ok(Some(job)) => {
+                Ok((true, killed)) => {
                     outcome.requeued += 1;
-                    outcome.killed.push(job);
+                    outcome.killed.extend(killed);
                 }
-                Ok(None) => outcome.requeued += 1,
+                Ok((false, _)) => outcome
+                    .skipped
+                    .push(format!("job {id}: state changed before requeue")),
                 Err(e) => outcome.skipped.push(format!("job {id}: {e}")),
             }
         }
@@ -1258,14 +1268,16 @@ impl ClusterManager {
         Ok(outcome)
     }
 
-    /// Requeue exactly one job/task. Returns its pre-requeue snapshot when the
-    /// job was Running/Suspended (so its processes must be killed on the nodes).
+    /// Requeue exactly one job/task. Returns `(requeued, killed)`: `requeued` is
+    /// false if the job raced to a non-requeuable state between the pre-check and
+    /// the apply (nothing changed); `killed` is the pre-requeue snapshot when it
+    /// was live and its processes must be cancelled on the nodes.
     fn requeue_one_job(
         &self,
         job_id: JobId,
         user: &str,
         hold: bool,
-    ) -> anyhow::Result<Option<Job>> {
+    ) -> anyhow::Result<(bool, Option<Job>)> {
         let snapshot = {
             let jobs = self.jobs.read();
             let job = jobs
@@ -1314,9 +1326,22 @@ impl ClusterManager {
         // Fires accounting-end + epilog for the finalized run (live path only;
         // an already-terminal job emits no finalized entry here).
         self.run_all_finalized_side_effects(&resp);
+
+        // The apply arm NoOps if the job raced out of a requeuable state (e.g. to
+        // Completing) in the propose window; confirm it really re-pended before
+        // reporting success or cancelling. Read before notify so no re-dispatch yet.
+        let repended = self
+            .jobs
+            .read()
+            .get(&job_id)
+            .is_some_and(|j| j.state == JobState::Pending);
+        if !repended {
+            debug!(job_id, "requeue raced a concurrent state change; no-op");
+            return Ok((false, None));
+        }
         self.scheduler_notify.notify_one();
         info!(job_id, hold, "job requeued by admin");
-        Ok(snapshot)
+        Ok((true, snapshot))
     }
 
     /// Complete a standalone srun allocation after its step finishes.
@@ -4513,6 +4538,7 @@ impl ClusterManager {
         job.allocated_nodes.clear();
         job.allocated_resources = None;
         job.per_node_alloc.clear();
+        job.node_completions.clear();
         job.time_limit_signaled_at = None;
         job.pending_reason = PendingReason::None;
         job.pending_reason_desc = None;
@@ -4791,18 +4817,11 @@ impl ClusterManager {
                             if let Some(since) = job.suspended_at.take() {
                                 job.suspended_secs += (timestamp - since).num_seconds().max(0);
                             }
-                            if let Err(e) = job.transition(JobState::Requeued) {
-                                warn!(job_id = *job_id, error = %e, "invalid requeue finalize transition in WAL apply");
-                                return ClientResponse::default();
-                            }
-                            job.exit_code = Some(-1);
-                            job.end_time = Some(timestamp);
                             // The live run still holds its allocation; capture it
-                            // to free below.
+                            // to free below (reset clears node_completions).
                             freed_nodes = job.allocated_nodes.clone();
                             allocated_resources = job.allocated_resources.clone();
                             per_node_map = job.per_node_alloc.clone();
-                            job.node_completions.clear();
                         }
                         s if s.is_terminal() => {
                             // The slice was already freed at completion; freeing
@@ -4819,7 +4838,9 @@ impl ClusterManager {
                         }
                     }
 
-                    if let Err(e) = job.transition(JobState::Pending) {
+                    // Guarded re-pend: a live run finalizes as Requeued first,
+                    // then returns to Pending (terminal jobs go straight back).
+                    if let Err(e) = job.requeue_to_pending() {
                         warn!(job_id = *job_id, error = %e, "invalid requeue transition in WAL apply");
                         return ClientResponse::default();
                     }
@@ -10199,6 +10220,50 @@ mod tests {
             settle(&cm, id, JobState::Pending);
             assert_eq!(cm.get_job(id).unwrap().user_requeue_count, 1);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_requeue_array_all_pending_errors() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        // No node registered, so both tasks stay Pending; requeuing them is
+        // rejected per task, and with none requeue-able the whole call errors.
+        let mut spec = basic_spec("array-all-pending");
+        spec.array_spec = Some("0-1".into());
+        let parent = cm.submit_job(spec).unwrap().job_id;
+        wait_for("array tasks applied", || {
+            cm.get_jobs(&JobFilter::default())
+                .iter()
+                .filter(|j| j.spec.array_job_id == Some(parent))
+                .count()
+                == 2
+        });
+
+        let err = cm
+            .requeue_job_by_user(parent, "testuser", false)
+            .expect_err("all-pending array requeue must error");
+        assert!(err.to_string().contains("no tasks of array"), "got: {err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_requeue_rejects_completing_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "completing", "worker1");
+        cm.apply_operation(&WalOperation::job_state_change(
+            job_id,
+            JobState::Running,
+            JobState::Completing,
+        ));
+        settle(&cm, job_id, JobState::Completing);
+
+        let err = cm
+            .requeue_job_by_user(job_id, "testuser", false)
+            .expect_err("a completing job cannot be requeued");
+        assert!(err.to_string().contains("completing"), "got: {err}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
