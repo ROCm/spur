@@ -8,8 +8,9 @@
 //! ephemeral localhost port, serve a hand-written service on it, and hand the
 //! caller back the address plus a shared record of what the server observed.
 //! Only a handful of RPCs are implemented (`CreateJobStep`, `RunStep`,
-//! `GetNodes`, `UpdateNode`); every other RPC reports `unimplemented` so an
-//! unexpected call fails loudly instead of silently returning a default.
+//! `GetNodes`, `UpdateNode`, `DrainNode`, `DeregisterNode`); every other RPC
+//! reports `unimplemented` so an unexpected call fails loudly instead of
+//! silently returning a default.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -35,6 +36,8 @@ pub(crate) struct StepCapture {
     run_step_calls: Arc<AtomicU32>,
     get_node_names: Arc<Mutex<Vec<String>>>,
     update_node_names: Arc<Mutex<Vec<String>>>,
+    drain_node_names: Arc<Mutex<Vec<String>>>,
+    deregister_node_calls: Arc<Mutex<Vec<(String, bool)>>>,
     /// Node names that `update_node` should reject with `NotFound`.
     update_node_fail_names: Arc<Mutex<HashSet<String>>>,
 }
@@ -61,6 +64,14 @@ impl StepCapture {
 
     pub(crate) fn update_node_names(&self) -> Vec<String> {
         self.update_node_names.lock().unwrap().clone()
+    }
+
+    pub(crate) fn drain_node_names(&self) -> Vec<String> {
+        self.drain_node_names.lock().unwrap().clone()
+    }
+
+    pub(crate) fn deregister_node_calls(&self) -> Vec<(String, bool)> {
+        self.deregister_node_calls.lock().unwrap().clone()
     }
 
     pub(crate) fn set_update_node_fail_names(&self, names: HashSet<String>) {
@@ -156,6 +167,31 @@ mock_controller_impl! {
                 .collect();
             Ok(tonic::Response::new(proto::GetNodesResponse { nodes }))
         }
+
+        async fn drain_node(
+            &self,
+            request: tonic::Request<proto::DrainNodeRequest>,
+        ) -> Result<tonic::Response<proto::DrainNodeResponse>, tonic::Status> {
+            self.capture
+                .drain_node_names
+                .lock()
+                .unwrap()
+                .push(request.into_inner().name);
+            Ok(tonic::Response::new(proto::DrainNodeResponse::default()))
+        }
+
+        async fn deregister_node(
+            &self,
+            request: tonic::Request<proto::DeregisterNodeRequest>,
+        ) -> Result<tonic::Response<proto::DeregisterNodeResponse>, tonic::Status> {
+            let request = request.into_inner();
+            self.capture
+                .deregister_node_calls
+                .lock()
+                .unwrap()
+                .push((request.name, request.force));
+            Ok(tonic::Response::new(proto::DeregisterNodeResponse::default()))
+        }
     }
     unimplemented {
         submit_job(proto::SubmitJobRequest) -> proto::SubmitJobResponse;
@@ -169,8 +205,6 @@ mock_controller_impl! {
         update_job(proto::UpdateJobRequest) -> ();
         requeue_job(proto::RequeueJobRequest) -> proto::RequeueJobResponse;
         get_node(proto::GetNodeRequest) -> proto::NodeInfo;
-        drain_node(proto::DrainNodeRequest) -> proto::DrainNodeResponse;
-        deregister_node(proto::DeregisterNodeRequest) -> proto::DeregisterNodeResponse;
         deregister_agent(proto::DeregisterAgentRequest) -> ();
         get_partitions(proto::GetPartitionsRequest) -> proto::GetPartitionsResponse;
         create_partition(proto::CreatePartitionRequest) -> ();

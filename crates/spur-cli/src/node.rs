@@ -350,6 +350,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drain_all_resolves_registered_nodes() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_get_node_names(vec!["n1".into(), "n2".into()]);
+
+        main_with_args(vec![
+            "node".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "drain".into(),
+            "ALL".into(),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(capture.drain_node_names(), vec!["n1", "n2"]);
+    }
+
+    #[tokio::test]
+    async fn remove_all_forces_every_registered_node() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_get_node_names(vec!["n1".into(), "n2".into()]);
+
+        main_with_args(vec![
+            "node".into(),
+            "--controller".into(),
+            format!("http://{addr}"),
+            "remove".into(),
+            "ALL".into(),
+            "--force".into(),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(
+            capture.deregister_node_calls(),
+            vec![("n1".to_string(), true), ("n2".to_string(), true)]
+        );
+    }
+
+    #[tokio::test]
     async fn label_all_rejects_an_empty_cluster() {
         let (addr, capture) = crate::mock_controller::spawn().await;
         let err = main_with_args(vec![
