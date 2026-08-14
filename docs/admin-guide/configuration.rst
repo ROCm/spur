@@ -935,7 +935,7 @@ fields mirror ``ConstrainSwapSpace`` and ``AllowedSwapSpace`` in Slurm's
      - ``0``
      - Swap a job may use, as a percentage (0-100) of its memory allocation.
        Only consulted when ``constrain_swap_space`` is set; ``0`` denies swap
-       outright. A value above 100 errors at parse time.
+       outright. A value above 100 is rejected when spurd starts.
 
 .. note::
 

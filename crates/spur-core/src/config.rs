@@ -1315,10 +1315,8 @@ impl MpiConfig {
     }
 }
 
-/// cgroup constraints applied to a job's processes (Slurm's `cgroup.conf`).
-///
-/// The limits themselves come from the allocation; this section only sets how
-/// they are enforced.
+/// cgroup enforcement settings for a job's processes (Slurm's `cgroup.conf`).
+/// See `docs/admin-guide/configuration.rst` for the semantics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CgroupConfig {
     /// Cap a job's swap alongside its memory (Slurm's `ConstrainSwapSpace`).
