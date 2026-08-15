@@ -11,9 +11,33 @@ pub(crate) struct PrivDrop {
     groups: Vec<Gid>,
 }
 
+/// Refuse to execute work as uid 0 unless the operator opted in.
+///
+/// `PrivDrop::resolve_if_needed` returns `None` for uid 0, which means "no privilege drop" — so a
+/// request carrying `uid: 0` does not fail, it runs with spurd's own (root) credentials. Since the
+/// uid arrives on the wire as part of the job spec and no RPC authenticates its caller, that turns
+/// reachability of the agent into root on the node. Callers must run this check BEFORE spawning any
+/// child, on every execution path (batch jobs, steps, container jobs).
+///
+/// Returns `Err` with an operator-facing message when the request must be refused.
+pub(crate) fn check_root_execution_allowed(uid: u32, allow_root_jobs: bool) -> Result<(), String> {
+    if uid != 0 || allow_root_jobs || !nix::unistd::geteuid().is_root() {
+        return Ok(());
+    }
+    Err(
+        "refusing to execute as uid 0: the job requested root and spurd is running as root, but \
+         [auth] allow_root_jobs is false. Submit as an unprivileged user, or set \
+         allow_root_jobs = true if every submitter on this cluster is trusted with root."
+            .to_string(),
+    )
+}
+
 impl PrivDrop {
     /// Resolve credentials if privilege drop is needed. Returns None if
     /// spurd is not root or the job user is already root.
+    ///
+    /// SECURITY: `None` here means "run with spurd's credentials". For uid 0 that is root, so every
+    /// caller must first gate on [`check_root_execution_allowed`].
     pub fn resolve_if_needed(uid: u32, gid: u32) -> Option<Self> {
         if uid == 0 || !nix::unistd::geteuid().is_root() {
             return None;
@@ -54,5 +78,37 @@ impl PrivDrop {
             format!("--setuid={}", self.uid),
             format!("--setgid={}", self.gid),
         ]
+    }
+}
+
+#[cfg(test)]
+mod root_execution_tests {
+    use super::check_root_execution_allowed;
+
+    #[test]
+    fn non_root_uid_is_always_allowed() {
+        assert!(check_root_execution_allowed(1000, false).is_ok());
+        assert!(check_root_execution_allowed(1000, true).is_ok());
+    }
+
+    #[test]
+    fn opt_in_allows_root() {
+        assert!(check_root_execution_allowed(0, true).is_ok());
+    }
+
+    #[test]
+    fn uid_zero_is_refused_by_default_when_spurd_is_root() {
+        // Only meaningful as root: a non-root spurd cannot grant root anyway, and the guard
+        // deliberately stays quiet there so unprivileged test/dev runs are unaffected.
+        let res = check_root_execution_allowed(0, false);
+        if nix::unistd::geteuid().is_root() {
+            let msg = res.expect_err("uid 0 must be refused by default on a root spurd");
+            assert!(msg.contains("allow_root_jobs"), "actionable message: {msg}");
+        } else {
+            assert!(
+                res.is_ok(),
+                "non-root spurd cannot escalate; guard is a no-op"
+            );
+        }
     }
 }

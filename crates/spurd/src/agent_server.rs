@@ -208,6 +208,8 @@ pub struct AgentService {
     k0s: Arc<crate::cluster::K0sAgent>,
     /// In-flight srun steps keyed by `(job_id, step_id)`.
     active_steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
+    /// `[auth] allow_root_jobs` — when false (default) this agent refuses to execute as uid 0.
+    allow_root_jobs: bool,
 }
 
 impl AgentService {
@@ -228,6 +230,7 @@ impl AgentService {
             memlock,
             MpiConfig::default(),
             new_running_jobs(),
+            spur_core::config::AuthConfig::default().allow_root_jobs,
         )
     }
 
@@ -242,6 +245,7 @@ impl AgentService {
         memlock: spur_core::config::MemlockLimit,
         mpi: MpiConfig,
         running: RunningJobs,
+        allow_root_jobs: bool,
     ) -> Self {
         let allocation = NodeAllocation::new(
             hostname::get()
@@ -305,6 +309,7 @@ impl AgentService {
             device_registry,
             k0s: Arc::new(crate::cluster::K0sAgent::from_config(cluster)),
             active_steps: Arc::new(Mutex::new(HashMap::new())),
+            allow_root_jobs,
         }
     }
 
@@ -953,6 +958,16 @@ impl SlurmAgent for AgentService {
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
+
+        // The uid is part of the (user-supplied) job spec and no RPC authenticates its caller, so
+        // refuse root execution here — before anything is spawned — rather than relying on the
+        // privilege drop, which treats uid 0 as "nothing to drop".
+        if let Err(msg) =
+            crate::privdrop::check_root_execution_allowed(spec.uid, self.allow_root_jobs)
+        {
+            warn!(job_id, uid = spec.uid, "{msg}");
+            return Err(Status::permission_denied(msg));
+        }
 
         info!(
             job_id,
@@ -1782,6 +1797,13 @@ impl SlurmAgent for AgentService {
         let req = request.into_inner();
         if req.command.is_empty() {
             return Err(Status::invalid_argument("no command specified"));
+        }
+        // Steps carry their own uid straight from the wire — gate them exactly like a batch launch.
+        if let Err(msg) =
+            crate::privdrop::check_root_execution_allowed(req.uid, self.allow_root_jobs)
+        {
+            warn!(job_id = req.job_id, uid = req.uid, "{msg}");
+            return Err(Status::permission_denied(msg));
         }
 
         let work_dir = if req.work_dir.is_empty() {
@@ -4510,6 +4532,7 @@ mod tests {
             spur_core::config::MemlockLimit::Unlimited,
             MpiConfig::default(),
             running,
+            false, // allow_root_jobs
         );
 
         assert!(

@@ -391,7 +391,16 @@ fn resolve_user_namespace_sa(
 /// Whether `caller` may perform k0s cluster-admin ops: empty/root always, else accounting `Admin`.
 /// Fails closed when accounting is off (cache reports no admins), leaving only root/internal.
 fn is_k0s_admin(cache: &crate::association_cache::AssociationCache, caller: &str) -> bool {
-    caller.is_empty() || caller == "root" || cache.is_admin(caller)
+    // NOTE: `caller` is supplied by the client and is not authenticated, so this check is an
+    // operator-error guard, not a security boundary. Anything that hands out a credential must
+    // carry its own opt-in (see `cluster.allow_admin_kubeconfig`) until user auth is enforced.
+    //
+    // The former `caller.is_empty()` bypass is gone: nothing in-tree sends an empty caller (the CLI
+    // always fills it, falling back to "unknown"), so it granted admin to a two-character forgery
+    // and bought nothing. `root` is retained deliberately — with accounting disabled the cache
+    // reports no admins at all, and removing it would strand `spur k8s up` on every cluster that
+    // does not run accounting.
+    caller == "root" || cache.is_admin(caller)
 }
 
 /// Whether the controller still considers `job_id` terminal right now — guards
@@ -2618,6 +2627,18 @@ impl SlurmController for ControllerService {
         let is_admin = is_k0s_admin(self.cluster.association_cache(), &req.caller);
 
         if req.admin {
+            // Serving the cluster-admin credential is gated on an explicit opt-in, not just on the
+            // admin check above: `caller` is client-supplied and unauthenticated, so without this
+            // any peer that can reach the controller could ask for a cluster-admin kubeconfig by
+            // claiming to be root. Off by default; get it on the control-plane node instead.
+            if !self.cluster.config().cluster.allow_admin_kubeconfig {
+                return Err(Status::permission_denied(
+                    "serving the cluster-admin kubeconfig over RPC is disabled \
+                     ([cluster] allow_admin_kubeconfig = false). Run `k0s kubeconfig admin` on the \
+                     control-plane node, or enable the option if the control-plane port is already \
+                     restricted to administrators.",
+                ));
+            }
             if !is_admin {
                 return Err(Status::permission_denied(
                     "the cluster-admin kubeconfig requires cluster admin",
@@ -3434,9 +3455,12 @@ mod tests {
     }
 
     #[test]
-    fn is_k0s_admin_root_and_empty_always_admin_even_cold_cache() {
+    fn is_k0s_admin_rejects_empty_caller_but_still_allows_root() {
         let cache = crate::association_cache::AssociationCache::new();
-        assert!(is_k0s_admin(&cache, ""));
+        // An omitted caller must NOT be admin: the field is client-supplied, so treating "unset" as
+        // admin made the check bypassable by simply leaving it out.
+        assert!(!is_k0s_admin(&cache, ""));
+        // `root` is still accepted so accounting-less clusters can manage k0s at all.
         assert!(is_k0s_admin(&cache, "root"));
     }
 
@@ -3837,9 +3861,17 @@ mod tests {
     }
 
     async fn test_service(dir: &tempfile::TempDir) -> ControllerService {
+        test_service_with(dir, step_test_config()).await
+    }
+
+    /// `test_service` with an explicit config, so a test can exercise a config-gated code path
+    /// (e.g. `[cluster] allow_admin_kubeconfig`).
+    async fn test_service_with(
+        dir: &tempfile::TempDir,
+        config: spur_core::config::SlurmConfig,
+    ) -> ControllerService {
         use crate::cluster::ClusterManager;
-        let cluster =
-            std::sync::Arc::new(ClusterManager::new(step_test_config(), dir.path()).unwrap());
+        let cluster = std::sync::Arc::new(ClusterManager::new(config, dir.path()).unwrap());
         let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cluster.clone())
             .await
             .unwrap();
@@ -4325,7 +4357,11 @@ mod tests {
         assign_ha_control_plane(&svc).await;
 
         let resp = svc
-            .cluster_up(Request::new(ClusterUpRequest::default()))
+            .cluster_up(Request::new(ClusterUpRequest {
+                // explicit admin caller: an empty caller is no longer treated as admin
+                caller: "root".into(),
+                ..Default::default()
+            }))
             .await
             .expect("bare re-up of an assigned HA cluster must be accepted")
             .into_inner();
@@ -4341,6 +4377,8 @@ mod tests {
 
         let err = svc
             .cluster_up(Request::new(ClusterUpRequest {
+                // explicit admin caller: an empty caller is no longer treated as admin
+                caller: "root".into(),
                 control_plane_replicas: Some(1),
                 ..Default::default()
             }))
@@ -4448,6 +4486,8 @@ mod tests {
         }
         let resp = svc
             .cluster_up(Request::new(ClusterUpRequest {
+                // explicit admin caller: an empty caller is no longer treated as admin
+                caller: "root".into(),
                 nodes: "node-a,node-b".into(),
                 ..Default::default()
             }))
@@ -4470,6 +4510,8 @@ mod tests {
         }
         let err = svc
             .cluster_up(Request::new(ClusterUpRequest {
+                // explicit admin caller: an empty caller is no longer treated as admin
+                caller: "root".into(),
                 nodes: "node-a,node-b".into(),
                 control_plane_nodes: vec!["node-c".into()],
                 ..Default::default()
@@ -4508,7 +4550,11 @@ mod tests {
         let svc = test_service(&dir).await;
         scoped_assigned_cluster(&svc).await;
         let resp = svc
-            .cluster_up(Request::new(ClusterUpRequest::default()))
+            .cluster_up(Request::new(ClusterUpRequest {
+                // explicit admin caller: an empty caller is no longer treated as admin
+                caller: "root".into(),
+                ..Default::default()
+            }))
             .await
             .expect("bare re-up accepted")
             .into_inner();
@@ -4527,6 +4573,8 @@ mod tests {
         // Same scope expressed again (not a bare re-up) must not rewrite the recorded state.
         let resp = svc
             .cluster_up(Request::new(ClusterUpRequest {
+                // explicit admin caller: an empty caller is no longer treated as admin
+                caller: "root".into(),
                 nodes: "node-a,node-b".into(),
                 ..Default::default()
             }))
@@ -4548,6 +4596,8 @@ mod tests {
         scoped_assigned_cluster(&svc).await;
         let err = svc
             .cluster_up(Request::new(ClusterUpRequest {
+                // explicit admin caller: an empty caller is no longer treated as admin
+                caller: "root".into(),
                 nodes: "node-a,node-c".into(),
                 ..Default::default()
             }))
@@ -4573,7 +4623,11 @@ mod tests {
             )
             .unwrap();
         let err = svc
-            .cluster_up(Request::new(ClusterUpRequest::default()))
+            .cluster_up(Request::new(ClusterUpRequest {
+                // explicit admin caller: an empty caller is no longer treated as admin
+                caller: "root".into(),
+                ..Default::default()
+            }))
             .await
             .expect_err("re-up during teardown must be rejected");
         assert_eq!(err.code(), Code::FailedPrecondition);
@@ -4655,7 +4709,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cluster_kubeconfig_admin_flag_allowed_for_admin_level_caller() {
+    async fn cluster_kubeconfig_admin_flag_denied_when_not_explicitly_enabled() {
+        // Default posture: serving the cluster-admin credential over RPC is off, so even a caller
+        // the association cache calls Admin is refused. `caller` is unauthenticated, so the opt-in —
+        // not the admin check — is what protects this credential.
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
         svc.cluster
@@ -4668,8 +4725,46 @@ mod tests {
                 ..Default::default()
             }))
             .await
+            .expect_err("admin kubeconfig is disabled by default");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_kubeconfig_admin_flag_allowed_for_admin_level_caller_when_enabled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = step_test_config();
+        config.cluster.allow_admin_kubeconfig = true;
+        let svc = test_service_with(&dir, config).await;
+        svc.cluster
+            .association_cache()
+            .insert_admin_level("carol", "Admin");
+        let err = svc
+            .cluster_kubeconfig(Request::new(ClusterKubeconfigRequest {
+                caller: "carol".into(),
+                admin: true,
+                ..Default::default()
+            }))
+            .await
             .expect_err("no control-plane agent is running in this test");
+        // Unavailable (not PermissionDenied) proves it passed both the opt-in and the admin check.
         assert_eq!(err.code(), Code::Unavailable);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_kubeconfig_admin_flag_denied_for_non_admin_even_when_enabled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = step_test_config();
+        config.cluster.allow_admin_kubeconfig = true;
+        let svc = test_service_with(&dir, config).await;
+        let err = svc
+            .cluster_kubeconfig(Request::new(ClusterKubeconfigRequest {
+                caller: "mallory".into(),
+                admin: true,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("non-admin must not receive the cluster-admin kubeconfig");
+        assert_eq!(err.code(), Code::PermissionDenied);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

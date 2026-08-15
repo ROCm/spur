@@ -326,6 +326,14 @@ async fn main() -> anyhow::Result<()> {
 
     if config.rest_api.enabled {
         let rest_addr: std::net::SocketAddr = config.controller.rest_addr.parse()?;
+        if !rest_addr.ip().is_loopback() {
+            tracing::warn!(
+                addr = %rest_addr,
+                "REST API is enabled on a non-loopback address and performs NO authentication: \
+                 any peer that can reach it can submit and cancel jobs. Restrict it to loopback or \
+                 front it with an authenticating proxy."
+            );
+        }
         let rest_cluster = cluster.clone();
         let rest_raft = raft_handle.clone();
         tokio::spawn(async move {
@@ -336,7 +344,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start gRPC server
-    let addr = listen_addr.parse()?;
+    let addr: std::net::SocketAddr = listen_addr.parse()?;
+    // Be explicit about the posture rather than letting `plugin = "jwt"` imply a control that does
+    // not run: no RPC authenticates the calling user yet, so the listening port IS the trust
+    // boundary. Warn once at startup when that boundary is the network.
+    if !addr.ip().is_loopback() {
+        tracing::warn!(
+            %addr,
+            "spurctld does not authenticate RPC callers: the user identity used for authorization \
+             is supplied by the client. Treat this port as an administrative boundary — restrict \
+             it to trusted hosts. ([auth] plugin is not enforced yet.)"
+        );
+    }
     info!(%addr, "gRPC server listening");
     server::serve(
         addr,

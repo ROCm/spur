@@ -306,6 +306,18 @@ async fn main() -> anyhow::Result<()> {
         .map(|c| c.cluster.clone())
         .unwrap_or_default();
     let mpi_config = config.as_ref().map(|c| c.mpi.clone()).unwrap_or_default();
+    // Default-deny root execution: the job uid arrives on the wire and no RPC authenticates its
+    // caller, so a uid-0 request must be refused unless the operator opted in.
+    let allow_root_jobs = config
+        .as_ref()
+        .map(|c| c.auth.allow_root_jobs)
+        .unwrap_or(false);
+    if allow_root_jobs {
+        warn!(
+            "[auth] allow_root_jobs is true: this node will execute jobs as root when asked. \
+             Only safe if every submitter is already trusted with root on this node."
+        );
+    }
     let agent_service = agent_server::AgentService::with_cluster_config(
         reporter.clone(),
         hooks_config,
@@ -314,6 +326,7 @@ async fn main() -> anyhow::Result<()> {
         memlock,
         mpi_config,
         running_jobs,
+        allow_root_jobs,
     );
 
     // the RPC-driven k0s component owner is idle until the controller sends
