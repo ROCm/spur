@@ -23,7 +23,7 @@ pub struct RestState {
     pub raft: Arc<RaftHandle>,
 }
 
-fn routes() -> Router<Arc<RestState>> {
+pub(crate) fn routes() -> Router<Arc<RestState>> {
     Router::new()
         .route("/ping", get(handlers::ping))
         .route("/jobs", get(handlers::get_jobs))

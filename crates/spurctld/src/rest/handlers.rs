@@ -273,19 +273,65 @@ mod tests {
         assert!(msg.contains("gres"));
     }
 
-    #[test]
-    fn submit_job_rejects_missing_user() {
+    /// Build a minimal Axum app wired to a real (in-memory) cluster + Raft, so handler tests
+    /// exercise the actual code path rather than calling helpers directly.
+    async fn test_app() -> axum::Router {
+        use crate::cluster::ClusterManager;
+        use crate::raft::start_raft;
+        use crate::rest::RestState;
+        use std::sync::Arc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = spur_core::config::SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n\
+             [controller]\nfirst_job_id = 1\n\
+             [[partitions]]\nname = \"default\"\ndefault = true\nnodes = \"ALL\"\n",
+        )
+        .unwrap();
+        let cluster = Arc::new(ClusterManager::new(config, dir.path()).unwrap());
+        let handle = start_raft(1, &["[::1]:0".into()], dir.path(), cluster.clone())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .unwrap();
+        cluster.set_raft(handle.raft.clone());
+        let raft = Arc::new(handle);
+        let state = Arc::new(RestState { cluster, raft });
+        super::super::routes().with_state(state)
+    }
+
+    #[tokio::test]
+    async fn submit_job_rejects_missing_user() {
         // An absent or empty `job.user` would fall through to `..Default::default()`, setting
         // uid: 0 on the JobSpec. The agent now refuses uid 0, but only after the job has been
         // accepted, queued, and dispatched — with no error surfaced back to the HTTP caller.
-        // This guard fails fast before the job touches the queue.
-        use axum::http::StatusCode;
+        // This guard calls bad_request_response before the job touches the queue.
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
 
-        let err = bad_request_response(
-            "job.user is required: the REST API cannot resolve a uid without a username",
+        let app = test_app().await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/job/submit")
+            .header("content-type", "application/json")
+            .body(Body::from(r##"{"job":{"script":"#!/bin/bash"}}"##))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("job.user is required"),
+            "expected error mentioning 'job.user is required', got: {text}"
         );
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert!(!err.1 .0.errors.is_empty());
-        assert!(err.1 .0.errors[0].error.contains("job.user is required"));
     }
 }
