@@ -3410,22 +3410,22 @@ impl ClusterManager {
     /// `config()`): `[[partitions]]`, `[[nodes]]` features/weight, `licenses`,
     /// `burst_buffer`, `scheduler` tunables (`complete_wait`, `resv_overrun`),
     /// `controller.max_batch_requeue`, `hooks`, `notifications`, `federation`,
-    /// `power` suspend/resume commands, `admission.mode`, and
-    /// `metrics.high_cardinality`.
+    /// `power` suspend/resume commands, and `metrics.high_cardinality`.
     ///
     /// Restart-only (baked in at startup — mirrors Slurm's restart-required set
     /// of ports/plugins/StateSaveLocation/AuthType): bind addresses and ports
     /// (`controller.listen_addr`, `metrics`/`rest_api` listeners), the
     /// accounting database pool (`accounting.database_url`), Raft identity/peers,
-    /// `controller.first_job_id`, `auth.jwt_key` (swapping it live would
-    /// instantly invalidate every outstanding node token), and the scheduler
-    /// loop cadence (`scheduler.interval_secs`, `max_jobs_per_cycle`,
-    /// `topology`).
+    /// `controller.first_job_id`, node admission state (`admission.mode`,
+    /// `auth.jwt_key`), and the scheduler loop cadence
+    /// (`scheduler.interval_secs`, `max_jobs_per_cycle`, `topology`).
     pub fn reconfigure(&self) -> Result<(), anyhow::Error> {
         let Some(ref path) = self.config_path else {
             anyhow::bail!("reconfigure requires a config file path, but none is configured");
         };
-        let new_config = spur_core::config::SlurmConfig::load_from_file(path)?;
+        let mut new_config = spur_core::config::SlurmConfig::load_from_file(path)?;
+        // Admission policy and the node-token signing key must change together at restart.
+        new_config.admission.mode = self.config().admission.mode.clone();
         // Reject a broken submit hook before it goes live, so reconfigure can't
         // silently swap in a hook that fails every subsequent submission.
         crate::hooks::validate_submit_hooks(&new_config.hooks)?;
@@ -3528,7 +3528,7 @@ impl ClusterManager {
             self.reconcile_partitions(&mut nodes);
         }
 
-        info!("reconfigure: applied spur.conf on this leader (followers converge on restart); restart-only sections (listen ports, accounting DB, raft peers, jwt_key, scheduler cadence) unchanged until controller restart");
+        info!("reconfigure: applied spur.conf on this leader (followers converge on restart); restart-only sections (listen ports, accounting DB, raft peers, admission mode/jwt_key, scheduler cadence) unchanged until controller restart");
         Ok(())
     }
 

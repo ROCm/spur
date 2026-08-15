@@ -99,8 +99,8 @@ runtime-only changes not reflected in the file are overwritten.
 to match the file), ``[[nodes]]`` features and weight, ``licenses``,
 ``burst_buffer``, controller-side ``[hooks]`` (``prolog_slurmctld``,
 ``epilog_slurmctld``), ``[notifications]``, ``[federation]``,
-``[power]`` suspend/resume commands, ``[admission]`` mode, and the
-``[scheduler]`` tunables ``complete_wait_secs`` and ``resv_overrun_minutes``.
+``[power]`` suspend/resume commands, and the ``[scheduler]`` tunables
+``complete_wait_secs`` and ``resv_overrun_minutes``.
 Node-side hooks (the per-node prolog/epilog run by ``spurd``), the device
 registry, and memlock are read by the node agent at its own startup;
 ``reconfigure`` does not reach compute nodes, so those need a ``spurd`` restart.
@@ -108,8 +108,8 @@ registry, and memlock are read by the node agent at its own startup;
 **Restart-only**: settings baked in when the daemon starts — listen addresses
 and ports (``[controller]``, ``[metrics]``, ``[rest_api]``), the accounting
 database (``[accounting]``), Raft identity and peers, ``first_job_id``,
-``auth.jwt_key`` (swapping the node-token signing key live would immediately
-invalidate every outstanding node token), and the scheduler loop cadence
+``admission.mode`` and ``auth.jwt_key`` (the node admission policy and token
+signing key change together at restart), and the scheduler loop cadence
 (``interval_secs``, ``max_jobs_per_cycle``, topology). ``reconfigure`` reads
 these but does not apply them; a full controller restart is required. This
 mirrors Slurm, where a documented subset of parameters (ports,

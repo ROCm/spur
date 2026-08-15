@@ -595,7 +595,9 @@ Controls which nodes may register with the controller.
      - string
      - ``"open"``
      - Node admission mode. ``open`` lets any node register; ``token`` requires a
-       registering ``spurd`` to present a valid admission token.
+       registering ``spurd`` to present a valid admission token. Changing this
+       field requires restarting every controller; ``scontrol reconfigure``
+       keeps the mode selected at startup.
 
 See :doc:`accounting` for managing admission tokens with ``spur token``.
 
