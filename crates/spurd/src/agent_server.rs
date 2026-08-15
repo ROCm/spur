@@ -3444,6 +3444,25 @@ mod tests {
         (svc, job_id)
     }
 
+    /// Build an AgentService that will actually spawn scripts as root.
+    ///
+    /// Tests that call `launch_job` with a real script must run as the current uid, which in CI
+    /// is root. `AgentService::new` defaults `allow_root_jobs` to false, so those tests would be
+    /// refused by the guard. This helper opts in explicitly, mirroring the production escape
+    /// hatch (`[auth] allow_root_jobs = true`).
+    fn agent_service_for_script_tests() -> AgentService {
+        AgentService::with_cluster_config(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            &spur_core::config::ClusterConfig::default(),
+            spur_core::config::MemlockLimit::Unlimited,
+            MpiConfig::default(),
+            new_running_jobs(),
+            true, // allow_root_jobs: tests run as root and use uid 0
+        )
+    }
+
     fn test_gpu_registry() -> DeviceRegistry {
         use spur_devices::cdi::cache::CdiCache;
         use spur_devices::{GresCache, GresEntry};
@@ -3580,14 +3599,18 @@ mod tests {
         // only string-match. The agent itself neither drains nor reports a
         // completion: pairing the drain with the hold is the controller's job.
         let prolog = failing_hook_script(1);
-        let svc = AgentService::new(
+        let svc = AgentService::with_cluster_config(
             test_reporter(),
             HooksConfig {
                 prolog: Some(prolog.to_str().unwrap().to_string()),
                 ..Default::default()
             },
             Arc::new(Mutex::new(DeviceRegistry::new())),
+            &spur_core::config::ClusterConfig::default(),
             spur_core::config::MemlockLimit::Unlimited,
+            MpiConfig::default(),
+            new_running_jobs(),
+            true, // allow_root_jobs: test runs as root
         );
 
         let resp = svc
@@ -3625,14 +3648,18 @@ mod tests {
         // Issue 520: `{e}` renders only the outermost context, reducing this to
         // "prolog_slurmd script failed to execute: ..." and dropping the errno
         // that says whether the script is missing, unreadable or not executable.
-        let svc = AgentService::new(
+        let svc = AgentService::with_cluster_config(
             test_reporter(),
             HooksConfig {
                 prolog: Some("/nonexistent/prolog.sh".into()),
                 ..Default::default()
             },
             Arc::new(Mutex::new(DeviceRegistry::new())),
+            &spur_core::config::ClusterConfig::default(),
             spur_core::config::MemlockLimit::Unlimited,
+            MpiConfig::default(),
+            new_running_jobs(),
+            true, // allow_root_jobs: test runs as root
         );
 
         let resp = svc
@@ -3844,8 +3871,8 @@ mod tests {
         let (svc, job_id) = run_command_test_setup().await;
         let req = Request::new(RunCommandRequest {
             command: vec!["echo".into(), "hello-from-agent".into()],
-            uid: 0,
-            gid: 0,
+            uid: 1000,
+            gid: 1000,
             work_dir: String::new(),
             environment: HashMap::new(),
             job_id,
@@ -3862,8 +3889,8 @@ mod tests {
         let (svc, job_id) = run_command_test_setup().await;
         let req = Request::new(RunCommandRequest {
             command: vec!["false".into()],
-            uid: 0,
-            gid: 0,
+            uid: 1000,
+            gid: 1000,
             work_dir: String::new(),
             environment: HashMap::new(),
             job_id,
@@ -3880,8 +3907,8 @@ mod tests {
         env.insert("SPUR_TEST_VAR".into(), "step-dispatched".into());
         let req = Request::new(RunCommandRequest {
             command: vec!["/bin/sh".into(), "-c".into(), "echo $SPUR_TEST_VAR".into()],
-            uid: 0,
-            gid: 0,
+            uid: 1000,
+            gid: 1000,
             work_dir: String::new(),
             environment: env,
             job_id,
@@ -3902,8 +3929,8 @@ mod tests {
         );
         let req = Request::new(RunCommandRequest {
             command: vec![],
-            uid: 0,
-            gid: 0,
+            uid: 1000,
+            gid: 1000,
             work_dir: String::new(),
             environment: HashMap::new(),
             job_id: 0,
@@ -3923,8 +3950,8 @@ mod tests {
         );
         let req = Request::new(RunCommandRequest {
             command: vec!["echo".into(), "hi".into()],
-            uid: 0,
-            gid: 0,
+            uid: 1000,
+            gid: 1000,
             work_dir: String::new(),
             environment: HashMap::new(),
             job_id: 0,
@@ -3944,8 +3971,8 @@ mod tests {
         );
         let req = Request::new(RunCommandRequest {
             command: vec!["echo".into(), "hi".into()],
-            uid: 0,
-            gid: 0,
+            uid: 1000,
+            gid: 1000,
             work_dir: String::new(),
             environment: HashMap::new(),
             job_id: 999,
@@ -3968,8 +3995,8 @@ mod tests {
         let tmp_canonical = std::fs::canonicalize(&tmp).unwrap_or(tmp.clone());
         let req = Request::new(RunCommandRequest {
             command: vec!["pwd".into()],
-            uid: 0,
-            gid: 0,
+            uid: 1000,
+            gid: 1000,
             work_dir: tmp_canonical.to_string_lossy().into_owned(),
             environment: HashMap::new(),
             job_id,
@@ -4013,8 +4040,8 @@ mod tests {
             svc_run
                 .run_command(Request::new(RunCommandRequest {
                     command: vec!["sleep".into(), "60".into()],
-                    uid: 0,
-                    gid: 0,
+                    uid: 1000,
+                    gid: 1000,
                     work_dir: String::new(),
                     environment: HashMap::new(),
                     job_id,
@@ -4204,12 +4231,7 @@ mod tests {
     // agent defaults to spur-<id>.out anchored to the job's work_dir.
     #[tokio::test]
     async fn launch_reports_resolved_output_paths() {
-        let svc = AgentService::new(
-            test_reporter(),
-            HooksConfig::default(),
-            Arc::new(Mutex::new(DeviceRegistry::new())),
-            spur_core::config::MemlockLimit::Unlimited,
-        );
+        let svc = agent_service_for_script_tests();
 
         let work_dir = tempfile::tempdir().unwrap();
         let work_dir_str = work_dir.path().to_string_lossy().to_string();
@@ -4303,12 +4325,7 @@ mod tests {
     // collides when run more than once concurrently.
     #[tokio::test]
     async fn sbatch_script_runs_exactly_once_regardless_of_ntasks_per_node() {
-        let svc = AgentService::new(
-            test_reporter(),
-            HooksConfig::default(),
-            Arc::new(Mutex::new(DeviceRegistry::new())),
-            spur_core::config::MemlockLimit::Unlimited,
-        );
+        let svc = agent_service_for_script_tests();
 
         let work_dir = tempfile::tempdir().unwrap();
         let work_dir_str = work_dir.path().to_string_lossy().to_string();
@@ -4361,12 +4378,7 @@ mod tests {
     // srun semantics that must not regress into running only once.
     #[tokio::test]
     async fn task_fanout_dispatch_still_replicates_per_ntasks_per_node() {
-        let svc = AgentService::new(
-            test_reporter(),
-            HooksConfig::default(),
-            Arc::new(Mutex::new(DeviceRegistry::new())),
-            spur_core::config::MemlockLimit::Unlimited,
-        );
+        let svc = agent_service_for_script_tests();
 
         let work_dir = tempfile::tempdir().unwrap();
         let work_dir_str = work_dir.path().to_string_lossy().to_string();
@@ -4456,12 +4468,7 @@ mod tests {
     // batch-level PMIx; the step owns PMIx setup.
     #[tokio::test]
     async fn sbatch_mpi_pmix_inner_srun_runs_without_batch_pmix_plan() {
-        let svc = AgentService::new(
-            test_reporter(),
-            HooksConfig::default(),
-            Arc::new(Mutex::new(DeviceRegistry::new())),
-            spur_core::config::MemlockLimit::Unlimited,
-        );
+        let svc = agent_service_for_script_tests();
 
         let work_dir = tempfile::tempdir().unwrap();
         let work_dir_str = work_dir.path().to_string_lossy().to_string();
@@ -5024,8 +5031,8 @@ mod tests {
                 "-c".into(),
                 "echo ROCR=$ROCR_VISIBLE_DEVICES CUDA=$CUDA_VISIBLE_DEVICES".into(),
             ],
-            uid: 0,
-            gid: 0,
+            uid: 1000,
+            gid: 1000,
             work_dir: String::new(),
             environment: HashMap::new(),
             job_id,

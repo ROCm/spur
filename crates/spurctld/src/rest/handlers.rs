@@ -96,9 +96,16 @@ pub async fn submit_job(
         .and_then(|t| spur_core::config::parse_time_minutes(t))
         .map(|mins| chrono::Duration::minutes(mins as i64));
 
+    let user = body.job.user.unwrap_or_default();
+    if user.is_empty() {
+        return Err(bad_request_response(
+            "job.user is required: the REST API cannot resolve a uid without a username",
+        ));
+    }
+
     let spec = spur_core::job::JobSpec {
         name: body.job.name.unwrap_or_default(),
-        user: body.job.user.unwrap_or_default(),
+        user,
         partition: body.job.partition,
         account: body.job.account,
         num_nodes: body.job.nodes.unwrap_or(1),
@@ -264,5 +271,21 @@ mod tests {
             "error message should not contain CLI flags"
         );
         assert!(msg.contains("gres"));
+    }
+
+    #[test]
+    fn submit_job_rejects_missing_user() {
+        // An absent or empty `job.user` would fall through to `..Default::default()`, setting
+        // uid: 0 on the JobSpec. The agent now refuses uid 0, but only after the job has been
+        // accepted, queued, and dispatched — with no error surfaced back to the HTTP caller.
+        // This guard fails fast before the job touches the queue.
+        use axum::http::StatusCode;
+
+        let err = bad_request_response(
+            "job.user is required: the REST API cannot resolve a uid without a username",
+        );
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(!err.1 .0.errors.is_empty());
+        assert!(err.1 .0.errors[0].error.contains("job.user is required"));
     }
 }
