@@ -9,7 +9,7 @@
 //! `ClusterManager::propose()` and applied through `StateMachineApply`.
 
 use std::collections::BTreeMap;
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -275,42 +275,40 @@ impl SpurStore {
         })
     }
 
+    fn log_dir(&self) -> PathBuf {
+        self.raft_dir.join("log")
+    }
+
+    /// Flush the log directory so that entry files created or removed since the
+    /// last call survive a crash. Called once per append/truncate/purge rather
+    /// than once per entry file.
+    fn sync_log_dir(&self) -> Result<(), StorageError<NodeId>> {
+        sync_dir(&self.log_dir()).map_err(|e| {
+            StorageError::from_io_error(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
+        })
+    }
+
     fn persist_last_purged(&self, log_id: &LogId<NodeId>) -> Result<(), std::io::Error> {
-        let path = self.raft_dir.join("purged.json");
-        let tmp = self.raft_dir.join("purged.json.tmp");
-        let data = serde_json::to_vec(log_id)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        // Write-then-rename: a crash mid-write must never corrupt purged.json.
-        std::fs::write(&tmp, &data)
-            .map_err(|e| std::io::Error::new(e.kind(), format!("{tmp:?}: {e}")))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| std::io::Error::new(e.kind(), format!("{path:?}: {e}")))
+        atomic_write_json(&self.raft_dir.join("purged.json"), log_id)?;
+        sync_dir(&self.raft_dir)
     }
 
     fn persist_vote(&self, vote: &Vote<NodeId>) -> Result<(), std::io::Error> {
-        let path = self.raft_dir.join("vote.json");
-        let data = serde_json::to_vec(vote)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&path, &data)
-            .map_err(|e| std::io::Error::new(e.kind(), format!("{path:?}: {e}")))
+        atomic_write_json(&self.raft_dir.join("vote.json"), vote)?;
+        sync_dir(&self.raft_dir)
     }
 
     fn persist_log_entry(&self, entry: &Entry<SpurTypeConfig>) -> Result<(), std::io::Error> {
+        // Contents only: the caller flushes the log directory once per append
+        // batch rather than once per entry.
         let path = self
-            .raft_dir
-            .join("log")
+            .log_dir()
             .join(format!("{:020}.json", entry.log_id.index));
-        let data = serde_json::to_vec(entry)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&path, &data)
-            .map_err(|e| std::io::Error::new(e.kind(), format!("{path:?}: {e}")))
+        atomic_write_json(&path, entry)
     }
 
     fn remove_log_entry(&self, index: u64) {
-        let path = self
-            .raft_dir
-            .join("log")
-            .join(format!("{:020}.json", index));
+        let path = self.log_dir().join(format!("{:020}.json", index));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -323,11 +321,8 @@ impl SpurStore {
             meta: meta.clone(),
             data: data.to_vec(),
         };
-        let path = self.raft_dir.join("snapshot.json");
-        let json = serde_json::to_vec(&ps)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&path, &json)
-            .map_err(|e| std::io::Error::new(e.kind(), format!("{path:?}: {e}")))
+        atomic_write_json(&self.raft_dir.join("snapshot.json"), &ps)?;
+        sync_dir(&self.raft_dir)
     }
 
     fn load_persisted_snapshot(&self) -> Option<PersistedSnapshot> {
@@ -339,6 +334,54 @@ impl SpurStore {
             .ok()
             .and_then(|data| serde_json::from_str(&data).ok())
     }
+}
+
+/// Serialize `value` to `path` so that a crash leaves either the previous file
+/// or the complete new one, and so the new contents are on disk when this
+/// returns.
+///
+/// Both halves are required, and `std::fs::write` provides neither. It truncates
+/// the target first, so a crash mid-write leaves a half-length JSON file that
+/// `SpurStore::new` then refuses to parse — the node will not start at all in
+/// the default strict recovery mode. And it returns once the bytes are in the
+/// page cache, which a power loss or kernel panic discards even though openraft
+/// was told the write succeeded: `RaftStorage::save_vote` is documented as "the
+/// vote must be persisted on disk before returning", and losing a vote lets this
+/// node grant its vote twice in the same term.
+fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), std::io::Error> {
+    let data = serde_json::to_vec(value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    let tmp = path.with_extension("json.tmp");
+    let mut file = std::fs::File::create(&tmp)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{tmp:?}: {e}")))?;
+    file.write_all(&data)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{tmp:?}: {e}")))?;
+    file.sync_all()
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{tmp:?}: {e}")))?;
+    drop(file);
+
+    std::fs::rename(&tmp, path)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{path:?}: {e}")))
+}
+
+/// Flush a directory so that files created or renamed inside it survive a crash.
+///
+/// Flushing a file's contents is not enough for a file that was just created or
+/// renamed into place: its directory entry lives in the parent directory, and
+/// until that is flushed the file can be missing entirely after a power loss.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> Result<(), std::io::Error> {
+    std::fs::File::open(dir)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{dir:?}: {e}")))
+}
+
+/// Windows cannot fsync a directory handle; `MoveFileEx` is ordered enough there
+/// once the file's own contents have been flushed.
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> Result<(), std::io::Error> {
+    Ok(())
 }
 
 impl RaftLogReader<SpurTypeConfig> for Arc<SpurStore> {
@@ -434,6 +477,10 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
             })?;
             inner.log.insert(entry.log_id.index, entry);
         }
+        // One directory flush for the whole batch: each entry's contents are
+        // already on disk, but a newly created file is not durable until the
+        // directory holding its name is flushed too.
+        self.sync_log_dir()?;
         Ok(())
     }
 
@@ -447,6 +494,10 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
             inner.log.remove(&k);
             self.remove_log_entry(k);
         }
+        // The deletions must be durable before this returns: a crash that loses
+        // them resurrects the conflicting tail, and `get_log_state` would then
+        // report a last_log_id this node never accepted from the leader.
+        self.sync_log_dir()?;
         Ok(())
     }
 
@@ -460,6 +511,7 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
             inner.log.remove(&k);
             self.remove_log_entry(k);
         }
+        self.sync_log_dir()?;
         inner.last_purged = Some(log_id);
         Ok(())
     }
