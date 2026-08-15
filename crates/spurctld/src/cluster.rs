@@ -3424,7 +3424,7 @@ impl ClusterManager {
             anyhow::bail!("reconfigure requires a config file path, but none is configured");
         };
         let mut new_config = spur_core::config::SlurmConfig::load_from_file(path)?;
-        // Admission policy and the node-token signing key must change together at restart.
+        // Admission mode is restart-only; keep the startup value across reconfigure to avoid stranding existing agents.
         new_config.admission.mode = self.config().admission.mode.clone();
         // Reject a broken submit hook before it goes live, so reconfigure can't
         // silently swap in a hook that fails every subsequent submission.
