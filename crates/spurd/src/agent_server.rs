@@ -1646,6 +1646,17 @@ impl SlurmAgent for AgentService {
             "exec into running job"
         );
 
+        // Defense in depth: the uid here comes from the tracked job (validated at launch), not the
+        // wire, so this is only reachable for a job that was already running when allow_root_jobs
+        // was turned off. Checking anyway keeps the invariant total — spurd never executes as uid 0
+        // unless the operator opted in — instead of true only at the wire entry points.
+        if let Err(msg) =
+            crate::privdrop::check_root_execution_allowed(entry.uid, self.allow_root_jobs)
+        {
+            warn!(job_id = req.job_id, uid = entry.uid, "{msg}");
+            return Err(Status::permission_denied(msg));
+        }
+
         let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(entry.uid, entry.gid);
 
         let mut cmd = if entry.has_namespaces() && entry.pid > 0 {
@@ -2279,6 +2290,16 @@ impl SlurmAgent for AgentService {
         });
 
         let argv: Vec<String> = init.argv.clone();
+
+        // Same defense-in-depth gate as exec_in_job: the uid comes from the tracked job, but an
+        // interactive PTY into a root job must obey allow_root_jobs too. Checked here rather than
+        // inside spawn_pty_in_job, which is a static helper with no access to the agent config.
+        if let Err(msg) =
+            crate::privdrop::check_root_execution_allowed(entry.uid, self.allow_root_jobs)
+        {
+            warn!(job_id = init.job_id, uid = entry.uid, "{msg}");
+            return Err(Status::permission_denied(msg));
+        }
 
         let (master_fd, child, child_pid) =
             Self::spawn_pty_in_job(&entry, &argv, init.job_id, winsize.as_ref())?;

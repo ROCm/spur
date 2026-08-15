@@ -2627,6 +2627,15 @@ impl SlurmController for ControllerService {
         let is_admin = is_k0s_admin(self.cluster.association_cache(), &req.caller);
 
         if req.admin {
+            // Admin check first, opt-in second — deliberately in that order. Both must pass, so the
+            // ordering costs nothing, but it keeps the "feature is disabled" detail from leaking to
+            // callers who were not entitled to the credential in the first place; they simply learn
+            // they are not admin.
+            if !is_admin {
+                return Err(Status::permission_denied(
+                    "the cluster-admin kubeconfig requires cluster admin",
+                ));
+            }
             // Serving the cluster-admin credential is gated on an explicit opt-in, not just on the
             // admin check above: `caller` is client-supplied and unauthenticated, so without this
             // any peer that can reach the controller could ask for a cluster-admin kubeconfig by
@@ -2637,11 +2646,6 @@ impl SlurmController for ControllerService {
                      ([cluster] allow_admin_kubeconfig = false). Run `k0s kubeconfig admin` on the \
                      control-plane node, or enable the option if the control-plane port is already \
                      restricted to administrators.",
-                ));
-            }
-            if !is_admin {
-                return Err(Status::permission_denied(
-                    "the cluster-admin kubeconfig requires cluster admin",
                 ));
             }
             // Cluster-admin kubeconfig (`k0s kubeconfig admin` on the control-plane agent).

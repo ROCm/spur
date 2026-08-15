@@ -114,6 +114,21 @@ pub async fn submit_job(
         ..Default::default()
     };
 
+    // The REST body carries no uid, so the spec inherits `JobSpec::default()`'s uid 0. The agent
+    // refuses to execute as root, but that rejection lands only after the job has been accepted,
+    // queued and dispatched — the caller would get a job_id back and discover the failure late, or
+    // not at all. Reject here, while we can still answer 400.
+    //
+    // This is a stopgap: the class disappears once callers are authenticated and uid is derived
+    // server-side from the verified identity instead of defaulted (#636).
+    if spec.uid == 0 {
+        return Err(bad_request_response(
+            "REST job submission cannot attribute a uid to the caller, so the job would run as \
+             root and is refused. Submit via `sbatch`/gRPC, which carries the submitting user's \
+             credentials, until authenticated REST submission is available (see #636).",
+        ));
+    }
+
     // GPU demand is validated in submit_job after node-count normalization.
     let outcome = state.cluster.submit_job(spec).map_err(submit_rest_error)?;
 
