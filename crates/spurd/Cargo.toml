@@ -20,6 +20,9 @@ spur-spank = { path = "../spur-spank" }
 spur-devices = { path = "../spur-devices" }
 tokio = { workspace = true }
 tonic = { workspace = true }
+# agent-side auth middleware (Tower layer over the gRPC surface)
+http = "1"
+tower = { workspace = true }
 prost-types = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

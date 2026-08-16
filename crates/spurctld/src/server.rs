@@ -2151,8 +2151,6 @@ impl SlurmController for ControllerService {
             }
         }
 
-        use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
-
         let __identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
@@ -2185,7 +2183,7 @@ impl SlurmController for ControllerService {
             .ok_or_else(|| Status::not_found(format!("node {} not found", node_name)))?;
         let agent_addr = node_comm_http_url(&node, &node_name)?;
 
-        let mut agent = SlurmAgentClient::connect(agent_addr.clone())
+        let mut agent = crate::agent_client::connect(agent_addr.clone())
             .await
             .map_err(|e| {
                 Status::unavailable(format!("cannot reach agent at {}: {}", agent_addr, e))
@@ -2218,8 +2216,6 @@ impl SlurmController for ControllerService {
             let fwd = Self::forward_request(request);
             return client.run_step(fwd).await;
         }
-
-        use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 
         let req = request.into_inner();
         let job_id = req.job_id;
@@ -2429,7 +2425,7 @@ impl SlurmController for ControllerService {
             let environment = environment.clone();
             let step_mpi = mpi.clone();
             set.spawn(async move {
-                let mut agent = SlurmAgentClient::connect(agent_addr.clone())
+                let mut agent = crate::agent_client::connect(agent_addr.clone())
                     .await
                     .map_err(|e| {
                         Status::unavailable(format!("cannot reach agent at {}: {}", agent_addr, e))

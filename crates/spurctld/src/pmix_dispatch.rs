@@ -6,7 +6,6 @@
 use tracing::{error, warn};
 
 use spur_core::node::NodeSource;
-use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::{PreparePmixRequest, ReleasePmixRequest};
 
 pub const MULTI_NODE_PMIX_K8S_UNSUPPORTED: &str =
@@ -58,7 +57,7 @@ pub async fn prepare_pmix_on_agent(
     run_attempt: u32,
     pmix_plan: spur_proto::proto::PmixLaunchPlan,
 ) -> Result<(), String> {
-    let mut client = SlurmAgentClient::connect(agent_addr.to_string())
+    let mut client = crate::agent_client::connect(agent_addr.to_string())
         .await
         .map_err(|e| format!("connect failed: {e}"))?
         .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
@@ -83,7 +82,7 @@ pub async fn prepare_pmix_on_agent(
 
 pub async fn release_pmix_on_agent(agent_addr: &str, job_id: u32) {
     let result = async {
-        let mut client = SlurmAgentClient::connect(agent_addr.to_string())
+        let mut client = crate::agent_client::connect(agent_addr.to_string())
             .await
             .map_err(|e| tonic::Status::unavailable(e.to_string()))?
             .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)

@@ -553,7 +553,7 @@ fn agent_endpoint(cluster: &ClusterManager, node: &str) -> Option<String> {
 /// control-plane node is assigned yet or none is reachable.
 async fn connect_control_plane(
     cluster: &ClusterManager,
-) -> anyhow::Result<SlurmAgentClient<tonic::transport::Channel>> {
+) -> anyhow::Result<SlurmAgentClient<crate::agent_client::AgentChannel>> {
     let state = cluster.k0s_state();
     let mut candidates = state.controllers();
     if candidates.is_empty() {
@@ -571,7 +571,7 @@ async fn connect_control_plane(
             last_err = format!("control-plane node {cp} has no agent address");
             continue;
         };
-        match tokio::time::timeout(AGENT_TIMEOUT, SlurmAgentClient::connect(endpoint)).await {
+        match tokio::time::timeout(AGENT_TIMEOUT, crate::agent_client::connect(endpoint)).await {
             Ok(Ok(client)) => return Ok(client),
             Ok(Err(e)) => last_err = format!("connect to control-plane agent {cp} failed: {e}"),
             Err(_) => last_err = format!("connect to control-plane agent {cp} timed out"),
@@ -632,7 +632,7 @@ pub async fn fetch_user_kubeconfig(
 async fn fetch_component_status(cluster: &ClusterManager, node: &str) -> Option<(String, bool)> {
     let endpoint = agent_endpoint(cluster, node)?;
     let fut = async {
-        let mut client = SlurmAgentClient::connect(endpoint).await.ok()?;
+        let mut client = crate::agent_client::connect(endpoint).await.ok()?;
         let resp = client
             .get_cluster_component_status(GetClusterComponentStatusRequest {})
             .await
@@ -865,7 +865,7 @@ fn spawn_start_component(
     let node = node.to_string();
     let role = role_str(role);
     tokio::spawn(async move {
-        match SlurmAgentClient::connect(endpoint).await {
+        match crate::agent_client::connect(endpoint).await {
             Ok(mut client) => {
                 let req = StartClusterComponentRequest {
                     role,
@@ -889,7 +889,7 @@ fn spawn_stop_component(cluster: &ClusterManager, node: &str, reset: bool) {
     };
     let node = node.to_string();
     tokio::spawn(async move {
-        match SlurmAgentClient::connect(endpoint).await {
+        match crate::agent_client::connect(endpoint).await {
             Ok(mut client) => {
                 match client
                     .stop_cluster_component(StopClusterComponentRequest { reset })
@@ -947,7 +947,7 @@ fn spawn_apply_mesh(cluster: &ClusterManager, node: &str, mesh: &MeshMembership)
         // Bound connect + RPC so a hung/blackholed agent can't leak accumulating detached tasks
         // (this fires every reconcile tick).
         let fut = async {
-            let mut client = SlurmAgentClient::connect(endpoint)
+            let mut client = crate::agent_client::connect(endpoint)
                 .await
                 .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
             client.apply_mesh(proto).await

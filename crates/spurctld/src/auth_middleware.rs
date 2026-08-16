@@ -21,7 +21,7 @@ use http::{Request, Response};
 use tower::{Layer, Service};
 use tracing::warn;
 
-use spur_core::auth::{verify_token, Identity};
+use spur_core::auth::BearerOutcome;
 use spur_core::config::AuthMode;
 
 /// Marker inserted alongside the identity so handlers can tell "verified" from "asserted" without
@@ -69,57 +69,15 @@ pub struct AuthMiddleware<S> {
     config: Arc<AuthConfig>,
 }
 
-/// Outcome of inspecting one request's credential.
-enum Decision {
-    /// Verified; carry this identity to the handler.
-    Authenticated(Box<Identity>),
-    /// No credential presented, and the mode tolerates that.
-    Anonymous,
-    /// Reject with this gRPC status message.
-    Reject(String),
-}
-
-fn decide(config: &AuthConfig, header: Option<&str>) -> Decision {
-    let token = match header {
-        Some(h) => match h
-            .strip_prefix("Bearer ")
-            .or_else(|| h.strip_prefix("bearer "))
-        {
-            Some(t) if !t.trim().is_empty() => t.trim(),
-            // A malformed header is a client bug, not an anonymous call — say so rather than
-            // silently downgrading to unauthenticated.
-            _ => {
-                return Decision::Reject(
-                    "malformed authorization header: expected 'Bearer <token>'".into(),
-                )
-            }
-        },
-        None => {
-            return match config.mode {
-                AuthMode::Required => Decision::Reject(
-                    "authentication required: pass a token (see `spur auth token`)".into(),
-                ),
-                _ => Decision::Anonymous,
-            }
-        }
-    };
-
-    if config.mode == AuthMode::Disabled {
-        // Do not verify what we have declared we do not enforce; treating a token as authoritative
-        // here would make `disabled` quietly stricter than it claims.
-        return Decision::Anonymous;
-    }
-    if config.jwt_key.is_empty() {
-        return Decision::Reject("a token was presented but no auth.jwt_key is configured".into());
-    }
-
-    match verify_token(token, &config.jwt_key) {
-        Ok(identity) => Decision::Authenticated(Box::new(identity)),
-        // An invalid token is always a rejection, even in `permissive`: permissive tolerates the
-        // ABSENCE of a credential, never a bad one. Otherwise a forged token would be strictly
-        // better for an attacker than sending none.
-        Err(e) => Decision::Reject(format!("invalid credential: {e}")),
-    }
+/// The ruling itself lives in `spur_core::auth` so the controller and the agent cannot drift apart
+/// on a security decision; this module only supplies the Tower plumbing.
+fn decide(config: &AuthConfig, header: Option<&str>) -> BearerOutcome {
+    spur_core::auth::authenticate_bearer(
+        config.mode,
+        &config.jwt_key,
+        header,
+        "pass a token (see `spur token user`)",
+    )
 }
 
 impl<S, B> Service<Request<B>> for AuthMiddleware<S>
@@ -147,11 +105,11 @@ where
             .map(str::to_owned);
 
         match decide(&config, header.as_deref()) {
-            Decision::Authenticated(identity) => {
+            BearerOutcome::Authenticated(identity) => {
                 req.extensions_mut().insert(*identity);
                 req.extensions_mut().insert(Verified);
             }
-            Decision::Anonymous => {
+            BearerOutcome::Anonymous => {
                 if config.mode == AuthMode::Permissive {
                     // Name the caller so an operator rolling out credentials can see exactly who is
                     // still unauthenticated instead of guessing.
@@ -162,7 +120,7 @@ where
                     );
                 }
             }
-            Decision::Reject(msg) => {
+            BearerOutcome::Reject(msg) => {
                 let resp = tonic::Status::unauthenticated(msg).into_http();
                 return Box::pin(async move { Ok(resp) });
             }
@@ -193,7 +151,7 @@ mod tests {
     fn required_rejects_a_missing_credential() {
         assert!(matches!(
             decide(&cfg(AuthMode::Required, "k"), None),
-            Decision::Reject(_)
+            BearerOutcome::Reject(_)
         ));
     }
 
@@ -201,7 +159,7 @@ mod tests {
     fn permissive_allows_a_missing_credential() {
         assert!(matches!(
             decide(&cfg(AuthMode::Permissive, "k"), None),
-            Decision::Anonymous
+            BearerOutcome::Anonymous
         ));
     }
 
@@ -210,7 +168,7 @@ mod tests {
         let t = token("k");
         let header = format!("Bearer {t}");
         match decide(&cfg(AuthMode::Required, "k"), Some(&header)) {
-            Decision::Authenticated(id) => {
+            BearerOutcome::Authenticated(id) => {
                 assert_eq!(id.user, "alice");
                 assert_eq!(id.uid, 1000);
                 assert!(!id.is_admin);
@@ -226,7 +184,7 @@ mod tests {
         let forged = format!("Bearer {}", token("attacker-key"));
         assert!(matches!(
             decide(&cfg(AuthMode::Permissive, "real-key"), Some(&forged)),
-            Decision::Reject(_)
+            BearerOutcome::Reject(_)
         ));
     }
 
@@ -236,7 +194,7 @@ mod tests {
             assert!(
                 matches!(
                     decide(&cfg(AuthMode::Permissive, "k"), Some(h)),
-                    Decision::Reject(_)
+                    BearerOutcome::Reject(_)
                 ),
                 "header {h:?} must be rejected"
             );
@@ -249,7 +207,7 @@ mod tests {
         let header = format!("Bearer {t}");
         assert!(matches!(
             decide(&cfg(AuthMode::Disabled, "k"), Some(&header)),
-            Decision::Anonymous
+            BearerOutcome::Anonymous
         ));
     }
 
@@ -258,7 +216,7 @@ mod tests {
         let header = format!("Bearer {}", token("k"));
         assert!(matches!(
             decide(&cfg(AuthMode::Permissive, ""), Some(&header)),
-            Decision::Reject(_)
+            BearerOutcome::Reject(_)
         ));
     }
 }

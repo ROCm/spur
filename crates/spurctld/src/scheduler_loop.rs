@@ -11,7 +11,6 @@ use tracing::{debug, error, info, warn};
 use spur_core::node::{Node, NodeSource};
 use spur_core::partition::requested_partition_names;
 use spur_core::task_launch::batch_dispatched_multi_node_pmix;
-use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
     AgentCancelJobRequest, AgentSuspendJobRequest, JobSpec as ProtoJobSpec, LaunchJobRequest,
@@ -898,7 +897,7 @@ async fn dispatch_to_agent(
     agent_addr: &str,
     params: &AgentDispatchParams<'_>,
 ) -> Result<LaunchOutcome, DispatchError> {
-    let mut client = SlurmAgentClient::connect(agent_addr.to_string())
+    let mut client = crate::agent_client::connect(agent_addr.to_string())
         .await?
         .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
         .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
@@ -1116,7 +1115,7 @@ async fn register_allocation_to_agent(
     agent_addr: &str,
     params: &AllocationRegisterParams,
 ) -> anyhow::Result<()> {
-    let mut client = SlurmAgentClient::connect(agent_addr.to_string())
+    let mut client = crate::agent_client::connect(agent_addr.to_string())
         .await?
         .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
         .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
@@ -2066,7 +2065,7 @@ async fn cancel_one_step_agent(
     use spur_proto::proto::CancelStepRequest;
 
     let attempt = async {
-        match SlurmAgentClient::connect(agent_addr.clone())
+        match crate::agent_client::connect(agent_addr.clone())
             .await
             .map(|c| {
                 c.max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
@@ -2155,7 +2154,7 @@ fn cancel_agent_addrs(
 /// must not block the caller past the timeout.
 async fn cancel_one_agent(agent_addr: String, job_id: spur_core::job::JobId, signal: i32) {
     let attempt = async {
-        match SlurmAgentClient::connect(agent_addr.clone())
+        match crate::agent_client::connect(agent_addr.clone())
             .await
             .map(|c| {
                 c.max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
@@ -2224,7 +2223,7 @@ pub async fn send_suspend_to_agents(
         };
         let job_id = job.job_id;
         tokio::spawn(async move {
-            match SlurmAgentClient::connect(agent_addr.clone())
+            match crate::agent_client::connect(agent_addr.clone())
                 .await
                 .map(|c| {
                     c.max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)

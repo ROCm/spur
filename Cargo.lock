@@ -3881,6 +3881,7 @@ dependencies = [
  "chrono",
  "clap",
  "hostname",
+ "http",
  "libc",
  "libloading",
  "nix",
@@ -3900,6 +3901,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

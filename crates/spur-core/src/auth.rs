@@ -191,6 +191,71 @@ pub fn verify_token(token: &str, secret: &[u8]) -> Result<Identity, AuthError> {
     })
 }
 
+/// What to do with one request's `Authorization` header.
+///
+/// Shared by both daemons so the controller and the agent cannot drift apart on a security
+/// decision: they wrap this in their own Tower layer, but the ruling itself lives here.
+#[derive(Debug)]
+pub enum BearerOutcome {
+    /// Verified; carry this identity to the handler.
+    Authenticated(Box<Identity>),
+    /// No credential presented, and the mode tolerates that.
+    Anonymous,
+    /// Refuse the request with this message.
+    Reject(String),
+}
+
+/// Rule the `Authorization` header against the configured mode.
+///
+/// Deliberate properties:
+/// * an INVALID credential is rejected in every mode that verifies — `permissive` tolerates the
+///   *absence* of a credential, never a bad one, or forging would beat sending none;
+/// * a malformed header is rejected rather than silently downgraded to anonymous;
+/// * `disabled` ignores even a valid token, so it cannot be quietly stricter than it claims.
+pub fn authenticate_bearer(
+    mode: crate::config::AuthMode,
+    jwt_key: &[u8],
+    header: Option<&str>,
+    missing_credential_hint: &str,
+) -> BearerOutcome {
+    use crate::config::AuthMode;
+
+    let token = match header {
+        Some(h) => match h
+            .strip_prefix("Bearer ")
+            .or_else(|| h.strip_prefix("bearer "))
+        {
+            Some(t) if !t.trim().is_empty() => t.trim(),
+            _ => {
+                return BearerOutcome::Reject(
+                    "malformed authorization header: expected 'Bearer <token>'".into(),
+                )
+            }
+        },
+        None => {
+            return match mode {
+                AuthMode::Required => BearerOutcome::Reject(format!(
+                    "authentication required: {missing_credential_hint}"
+                )),
+                _ => BearerOutcome::Anonymous,
+            }
+        }
+    };
+
+    if mode == AuthMode::Disabled {
+        return BearerOutcome::Anonymous;
+    }
+    if jwt_key.is_empty() {
+        return BearerOutcome::Reject(
+            "a token was presented but no auth.jwt_key is configured".into(),
+        );
+    }
+    match verify_token(token, jwt_key) {
+        Ok(identity) => BearerOutcome::Authenticated(Box::new(identity)),
+        Err(e) => BearerOutcome::Reject(format!("invalid credential: {e}")),
+    }
+}
+
 /// "none" auth — always returns an identity based on UNIX user.
 pub fn auth_none() -> Identity {
     Identity {
