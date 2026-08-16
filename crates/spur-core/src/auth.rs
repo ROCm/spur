@@ -368,4 +368,120 @@ mod tests {
         assert!(user.require_admin().is_err());
         assert!(Identity::admin().require_admin().is_ok());
     }
+
+    // --- authenticate_bearer ---
+    //
+    // The function is the shared ruling used by both the controller and the agent. Testing it
+    // directly (not just through the middleware wrappers) ensures the contract holds at the source
+    // so neither daemon can silently diverge.
+
+    fn bearer(key: &[u8]) -> String {
+        format!(
+            "Bearer {}",
+            generate_token("alice", 1000, false, key, 3600).unwrap()
+        )
+    }
+
+    #[test]
+    fn required_rejects_missing_credential() {
+        assert!(matches!(
+            authenticate_bearer(
+                crate::config::AuthMode::Required,
+                TEST_SECRET,
+                None,
+                "hint"
+            ),
+            BearerOutcome::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn permissive_allows_missing_credential() {
+        assert!(matches!(
+            authenticate_bearer(
+                crate::config::AuthMode::Permissive,
+                TEST_SECRET,
+                None,
+                "hint"
+            ),
+            BearerOutcome::Anonymous
+        ));
+    }
+
+    #[test]
+    fn disabled_allows_missing_credential() {
+        assert!(matches!(
+            authenticate_bearer(crate::config::AuthMode::Disabled, TEST_SECRET, None, "hint"),
+            BearerOutcome::Anonymous
+        ));
+    }
+
+    #[test]
+    fn valid_token_is_authenticated_in_required_mode() {
+        let h = bearer(TEST_SECRET);
+        match authenticate_bearer(
+            crate::config::AuthMode::Required,
+            TEST_SECRET,
+            Some(&h),
+            "hint",
+        ) {
+            BearerOutcome::Authenticated(id) => {
+                assert_eq!(id.user, "alice");
+                assert_eq!(id.uid, 1000);
+            }
+            other => panic!("expected Authenticated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forged_token_rejected_in_permissive_mode() {
+        // permissive tolerates absence of a credential, never a bad one.
+        let forged = bearer(b"attacker-key");
+        assert!(matches!(
+            authenticate_bearer(
+                crate::config::AuthMode::Permissive,
+                TEST_SECRET,
+                Some(&forged),
+                "hint"
+            ),
+            BearerOutcome::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn malformed_header_always_rejected() {
+        for bad in &["token-without-bearer-prefix", "Bearer ", "bearer", ""] {
+            assert!(
+                matches!(
+                    authenticate_bearer(
+                        crate::config::AuthMode::Permissive,
+                        TEST_SECRET,
+                        Some(bad),
+                        "hint"
+                    ),
+                    BearerOutcome::Reject(_)
+                ),
+                "header {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_ignores_a_valid_token() {
+        // disabled must not silently verify — that would make `disabled` secretly stricter.
+        let h = bearer(TEST_SECRET);
+        assert!(matches!(
+            authenticate_bearer(crate::config::AuthMode::Disabled, TEST_SECRET, Some(&h), "hint"),
+            BearerOutcome::Anonymous
+        ));
+    }
+
+    #[test]
+    fn token_presented_but_no_key_configured_is_rejected() {
+        let h = bearer(TEST_SECRET);
+        assert!(matches!(
+            authenticate_bearer(crate::config::AuthMode::Required, b"", Some(&h), "hint"),
+            BearerOutcome::Reject(_)
+        ));
+    }
 }

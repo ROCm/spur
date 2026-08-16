@@ -65,16 +65,23 @@ pub fn spawn_keepalive(
     KeepaliveGuard(handle)
 }
 
-/// Connect to a spurd agent, applying the standard gRPC size limits.
-pub async fn connect_agent(addr: &str) -> Result<SlurmAgentClient<tonic::transport::Channel>> {
-    // Raw channel: the agent does not authenticate its callers yet (tracked separately), so there
-    // is nothing to present a controller credential to.
+/// Connect to a spurd agent, presenting the caller's credential if one is available.
+///
+/// The agent authenticates callers with the same JWT mechanism as the controller. A user token
+/// from `$SPUR_AUTH_TOKEN` / `~/.spur/token` is signed with the cluster key and will be accepted.
+/// Without a token the connection still succeeds against agents in `permissive` mode, but will be
+/// refused in `required` mode.
+pub async fn connect_agent(
+    addr: &str,
+) -> Result<SlurmAgentClient<crate::authclient::AuthChannel>> {
     let channel = spur_client::connect_channel(addr)
         .await
         .context("cannot connect to agent")?;
-    Ok(SlurmAgentClient::new(channel)
-        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE))
+    Ok(
+        SlurmAgentClient::new(crate::authclient::wrap(channel))
+            .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE),
+    )
 }
 
 /// Local username sent with authenticated job requests.
@@ -106,7 +113,7 @@ pub struct InteractiveSessionHandle {
 ///
 /// Returns `Err(tonic::Status)` on RPC failure.
 pub async fn open_interactive_session(
-    agent: &mut SlurmAgentClient<tonic::transport::Channel>,
+    agent: &mut SlurmAgentClient<crate::authclient::AuthChannel>,
     job_id: u32,
     step_id: u32,
     argv: Vec<String>,
@@ -235,7 +242,7 @@ pub async fn drive_interactive_session(handle: InteractiveSessionHandle) -> Resu
 /// Run a full interactive PTY session over the InteractiveSession RPC.
 /// Returns the remote exit code.
 pub async fn run_interactive_session(
-    agent: &mut SlurmAgentClient<tonic::transport::Channel>,
+    agent: &mut SlurmAgentClient<crate::authclient::AuthChannel>,
     job_id: u32,
     step_id: u32,
     argv: Vec<String>,
