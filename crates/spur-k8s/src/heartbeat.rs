@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{HeartbeatRequest, RegisterAgentRequest};
 
-// Matches spurctld's check_node_health(90) timeout and spurd's 30 s interval.
+// Matches spurd's 30 s interval, well inside `controller.heartbeat_timeout_secs`.
 const INTERVAL_SECS: u64 = 30;
 
 /// Tracks the set of active K8s nodes and sends periodic `Heartbeat` RPCs

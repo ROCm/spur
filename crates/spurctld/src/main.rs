@@ -275,17 +275,29 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start node health checker (only on leader).
+    const HEALTH_TICK_SECS: u64 = 30;
     let hb_timeout = config.controller.heartbeat_timeout_secs.unwrap_or(90);
     let health_cluster = cluster.clone();
     let health_raft = raft_handle.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        let mut interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(HEALTH_TICK_SECS));
+        // Floored at one tick because `LeadershipGrace::observe` is itself only
+        // called once per tick: a grace shorter than that can lapse before the
+        // first post-election check even runs, leaving the fleet exposed to a
+        // mass DOWN before any agent heartbeat lands.
+        let mut grace = cluster::LeadershipGrace::new(std::time::Duration::from_secs(
+            hb_timeout.max(HEALTH_TICK_SECS),
+        ));
         loop {
             interval.tick().await;
-            if !health_raft.is_leader() {
+            let is_leader = health_raft.is_leader();
+            // Observed before the non-leader bail so a lost term restarts the window.
+            let mark_down = grace.observe(is_leader, std::time::Instant::now());
+            if !is_leader {
                 continue;
             }
-            let evicted = health_cluster.check_node_health(hb_timeout);
+            let evicted = health_cluster.check_node_health(hb_timeout, mark_down);
             for fin in &evicted {
                 if let Some(job) = health_cluster.get_job(fin.job_id) {
                     let c = health_cluster.clone();
