@@ -268,7 +268,7 @@ fn split_top_level(s: &str) -> Vec<&str> {
     for (i, c) in s.char_indices() {
         match c {
             '[' => depth += 1,
-            ']' => depth -= 1,
+            ']' => depth = (depth - 1).max(0),
             ',' if depth == 0 => {
                 parts.push(&s[start..i]);
                 start = i + 1;
@@ -603,5 +603,21 @@ mod tests {
         assert!(expand("a]b[1-2]").is_err());
         assert!(expand("][").is_err());
         assert!(expand("node]1").is_ok()); // ']' with no '[' is a plain hostname
+    }
+
+    #[test]
+    fn stray_bracket_before_comma_now_splits() {
+        assert_eq!(expand("x],y").unwrap(), vec!["x]", "y"]);
+        assert_eq!(expand("node01],node02").unwrap(), vec!["node01]", "node02"]);
+    }
+
+    #[test]
+    fn lone_stray_bracket_stays_literal() {
+        assert_eq!(expand("x]").unwrap(), vec!["x]"]);
+    }
+
+    #[test]
+    fn recursive_suffix_bracket_order_rejected() {
+        assert!(expand("node[1-2]a]b[3-4]").is_err());
     }
 }
