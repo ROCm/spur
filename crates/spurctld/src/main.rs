@@ -282,10 +282,12 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_secs(HEALTH_TICK_SECS));
-        // Floored because a grace shorter than a couple of ticks can lapse before
-        // any agent heartbeat lands, leaving the fleet exposed to a mass DOWN.
+        // Floored at one tick because `LeadershipGrace::observe` is itself only
+        // called once per tick: a grace shorter than that can lapse before the
+        // first post-election check even runs, leaving the fleet exposed to a
+        // mass DOWN before any agent heartbeat lands.
         let mut grace = cluster::LeadershipGrace::new(std::time::Duration::from_secs(
-            hb_timeout.max(HEALTH_TICK_SECS * 2),
+            hb_timeout.max(HEALTH_TICK_SECS),
         ));
         loop {
             interval.tick().await;
