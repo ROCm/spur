@@ -191,6 +191,11 @@ class TestDownNodeFailsJobs:
         cluster = multi_node_cluster
         node0 = cluster.node_names[0]
 
+        # A freshly-elected leader withholds DOWN-marking for up to two health
+        # ticks (30s each); wait that out so detection below measures normal
+        # operation, not the startup grace window.
+        time.sleep(65)
+
         script = cluster.write_file(
             "down_sleep.sh", "#!/bin/bash\nsleep 600\n"
         )
