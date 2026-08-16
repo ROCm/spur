@@ -5729,4 +5729,96 @@ mod tests {
             .reservations;
         assert!(none.is_empty());
     }
+
+    // --- authoritative_user ---
+
+    #[test]
+    fn authoritative_user_leaves_field_alone_when_no_identity() {
+        let mut user = "alice".to_string();
+        ControllerService::authoritative_user(&mut user, None);
+        assert_eq!(user, "alice");
+    }
+
+    #[test]
+    fn authoritative_user_overwrites_with_authenticated_user() {
+        let mut user = "alice".to_string();
+        let id = spur_core::auth::Identity {
+            user: "bob".to_string(),
+            uid: 1001,
+            gid: 1001,
+            is_admin: false,
+        };
+        ControllerService::authoritative_user(&mut user, Some(&id));
+        assert_eq!(user, "bob");
+    }
+
+    #[test]
+    fn authoritative_user_fills_an_empty_field() {
+        let mut user = String::new();
+        let id = spur_core::auth::Identity {
+            user: "carol".to_string(),
+            uid: 1002,
+            gid: 1002,
+            is_admin: false,
+        };
+        ControllerService::authoritative_user(&mut user, Some(&id));
+        assert_eq!(user, "carol");
+    }
+
+    // --- bind_spec_to_identity ---
+
+    fn spec_for(user: &str, uid: u32, gid: u32) -> spur_core::job::JobSpec {
+        spur_core::job::JobSpec {
+            user: user.to_string(),
+            uid,
+            gid,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn bind_spec_leaves_spec_alone_when_no_identity() {
+        let mut spec = spec_for("alice", 9999, 9999);
+        ControllerService::bind_spec_to_identity(&mut spec, None).unwrap();
+        assert_eq!(spec.user, "alice");
+        assert_eq!(spec.uid, 9999);
+        assert_eq!(spec.gid, 9999);
+    }
+
+    #[test]
+    fn bind_spec_overwrites_user_uid_gid_from_nss() {
+        // Uses "root" — always present in /etc/passwd so NSS resolves it everywhere.
+        let mut spec = spec_for("impersonated", 9999, 9999);
+        let id = spur_core::auth::Identity {
+            user: "root".to_string(),
+            uid: 9999,
+            gid: 9999,
+            is_admin: true,
+        };
+        ControllerService::bind_spec_to_identity(&mut spec, Some(&id)).unwrap();
+        assert_eq!(spec.user, "root");
+        // uid/gid must come from NSS, not from the wire spec or the token's uid field.
+        assert_eq!(spec.uid, 0, "root's uid is 0 per NSS");
+        assert_eq!(spec.gid, 0, "root's gid is 0 per NSS");
+    }
+
+    #[test]
+    fn bind_spec_fails_closed_for_unknown_user() {
+        let mut spec = spec_for("alice", 1000, 1000);
+        let id = spur_core::auth::Identity {
+            user: "this_user_does_not_exist_in_nss_7f3a".to_string(),
+            uid: 0,
+            gid: 0,
+            is_admin: false,
+        };
+        let err = ControllerService::bind_spec_to_identity(&mut spec, Some(&id)).unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::FailedPrecondition,
+            "unknown user must fail closed, not fall back to wire uid"
+        );
+        // Spec must not be partially mutated.
+        assert_eq!(spec.user, "alice");
+        assert_eq!(spec.uid, 1000);
+    }
 }
