@@ -27,7 +27,7 @@ impl Drop for KeepaliveGuard {
 /// traffic, so without these pings the controller's InactiveLimit reaper would
 /// reclaim a live allocation.
 pub fn spawn_keepalive(
-    client: SlurmControllerClient<tonic::transport::Channel>,
+    client: SlurmControllerClient<crate::authclient::AuthChannel>,
     job_id: u32,
     user: String,
     tool: &'static str,
@@ -67,6 +67,8 @@ pub fn spawn_keepalive(
 
 /// Connect to a spurd agent, applying the standard gRPC size limits.
 pub async fn connect_agent(addr: &str) -> Result<SlurmAgentClient<tonic::transport::Channel>> {
+    // Raw channel: the agent does not authenticate its callers yet (tracked separately), so there
+    // is nothing to present a controller credential to.
     let channel = spur_client::connect_channel(addr)
         .await
         .context("cannot connect to agent")?;

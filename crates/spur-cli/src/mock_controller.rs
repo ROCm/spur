@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{self, slurm_controller_server};
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Endpoint;
 
 /// Step id the mock hands back from `CreateJobStep`. Distinctive so tests can
 /// prove it is threaded into the follow-up `RunStep` rather than defaulted.
@@ -199,8 +199,10 @@ pub(crate) async fn spawn() -> (SocketAddr, StepCapture) {
 }
 
 /// Dial the mock through the same helper production code uses.
-pub(crate) async fn client(addr: SocketAddr) -> SlurmControllerClient<Channel> {
-    let channel = spur_client::connect_channel(&format!("http://{addr}"))
+pub(crate) async fn client(
+    addr: SocketAddr,
+) -> SlurmControllerClient<crate::authclient::AuthChannel> {
+    let channel = crate::authclient::connect(&format!("http://{addr}"))
         .await
         .expect("connect to mock controller");
     spur_proto::controller_client(channel)
@@ -208,11 +210,13 @@ pub(crate) async fn client(addr: SocketAddr) -> SlurmControllerClient<Channel> {
 
 /// A client whose channel is created without dialing, so the first RPC is what
 /// fails. Lets tests drive the RPC-failure path without a server.
-pub(crate) fn lazy_client(addr: SocketAddr) -> SlurmControllerClient<Channel> {
+pub(crate) fn lazy_client(
+    addr: SocketAddr,
+) -> SlurmControllerClient<crate::authclient::AuthChannel> {
     let channel = Endpoint::from_shared(format!("http://{addr}"))
         .expect("valid endpoint")
         .connect_lazy();
-    spur_proto::controller_client(channel)
+    spur_proto::controller_client(crate::authclient::wrap(channel))
 }
 
 /// Reserve a localhost port and release it, so connecting to it is refused

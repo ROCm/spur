@@ -80,7 +80,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     // Built before connecting so an invalid `-t` fails without a round-trip.
     let nodes_req = build_get_nodes_request(&args)?;
 
-    let channel = spur_client::connect_channel(&args.controller)
+    let channel = crate::authclient::connect(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
