@@ -406,6 +406,9 @@ pub struct ClusterManager {
     /// reaper. Ephemeral soft state (like `Node::last_heartbeat`): keepalives
     /// arrive too often to persist, and on failover the reaper reseeds lazily.
     interactive_last_seen: RwLock<HashMap<JobId, DateTime<Utc>>>,
+    /// Nodes skipped for new dispatch until the given instant after a
+    /// resources-unavailable reject. Leader-local and transient, never persisted.
+    node_dispatch_cooldowns: RwLock<HashMap<String, std::time::Instant>>,
 }
 
 struct PendingJobClassification {
@@ -485,6 +488,7 @@ impl ClusterManager {
             scheduler_notify: Arc::new(Notify::new()),
             sched_stats: OnceLock::new(),
             interactive_last_seen: RwLock::new(HashMap::new()),
+            node_dispatch_cooldowns: RwLock::new(HashMap::new()),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -497,6 +501,27 @@ impl ClusterManager {
     /// from their point of view.
     pub fn config(&self) -> Arc<SlurmConfig> {
         self.config.read().clone()
+    }
+
+    /// Skip a node for new dispatch for the configured cooldown after it rejected
+    /// one as resources-unavailable, so the scheduler stops re-picking it each tick.
+    pub fn cool_down_node(&self, name: &str) {
+        let secs = self.config().controller.dispatch_reject_cooldown_secs;
+        if secs == 0 {
+            return;
+        }
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        self.node_dispatch_cooldowns
+            .write()
+            .insert(name.to_string(), until);
+    }
+
+    /// Names still within their dispatch cooldown, pruning any that have expired.
+    pub fn nodes_on_dispatch_cooldown(&self) -> HashSet<String> {
+        let now = std::time::Instant::now();
+        let mut cooldowns = self.node_dispatch_cooldowns.write();
+        cooldowns.retain(|_, &mut until| until > now);
+        cooldowns.keys().cloned().collect()
     }
 
     /// Submit a new job. If it has an array spec, expand into individual tasks.
@@ -2073,6 +2098,28 @@ impl ClusterManager {
     /// Get all nodes.
     pub fn get_nodes(&self) -> Vec<Node> {
         self.nodes.read().values().cloned().collect()
+    }
+
+    /// Nodes eligible for new placement this tick: all nodes minus those on a
+    /// dispatch cooldown, except a cooling node pinned by a pending job's
+    /// `--nodelist` (its only option). Exclusion is resource-agnostic by design.
+    pub fn nodes_off_dispatch_cooldown(&self, pending: &[Job]) -> Vec<Node> {
+        let cooling = self.nodes_on_dispatch_cooldown();
+        if cooling.is_empty() {
+            return self.nodes.read().values().cloned().collect();
+        }
+        let pinned: HashSet<String> = pending
+            .iter()
+            .filter_map(|j| j.spec.nodelist.as_deref())
+            .filter_map(|nl| spur_core::hostlist::expand(nl).ok())
+            .flatten()
+            .collect();
+        self.nodes
+            .read()
+            .values()
+            .filter(|n| !cooling.contains(&n.name) || pinned.contains(&n.name))
+            .cloned()
+            .collect()
     }
 
     /// Get a node by name.
@@ -6768,6 +6815,92 @@ mod tests {
             .expect("single-node raft did not self-elect within 5s");
         cm.set_raft(handle.raft);
         (cm, conf_path)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_cooldown_marks_then_expires_and_respects_disable() {
+        let dir = TempDir::new().unwrap();
+
+        // Enabled (default 30s): a cooled node is reported until it expires.
+        let cm = test_cluster_with_config(&dir, test_config()).await;
+        register_node(&cm, "worker1", 8, 16000);
+        register_node(&cm, "worker2", 8, 16000);
+        assert!(cm.nodes_on_dispatch_cooldown().is_empty());
+        cm.cool_down_node("worker1");
+        assert!(cm.nodes_on_dispatch_cooldown().contains("worker1"));
+
+        // The scheduler's node view excludes the cooled node, keeps the other.
+        let names: HashSet<String> = cm
+            .nodes_off_dispatch_cooldown(&[])
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        assert!(
+            !names.contains("worker1"),
+            "cooled node excluded from scheduling"
+        );
+        assert!(names.contains("worker2"), "healthy node still schedulable");
+
+        // A past instant is pruned on read, so an expired cooldown clears.
+        cm.node_dispatch_cooldowns.write().insert(
+            "worker1".into(),
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        );
+        assert!(!cm.nodes_on_dispatch_cooldown().contains("worker1"));
+        assert!(
+            cm.nodes_off_dispatch_cooldown(&[])
+                .iter()
+                .any(|n| n.name == "worker1"),
+            "expired cooldown makes the node schedulable again"
+        );
+
+        // Disabled (0s): cool_down_node is a no-op.
+        let mut cfg = test_config();
+        cfg.controller.dispatch_reject_cooldown_secs = 0;
+        let cm0 = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
+        cm0.cool_down_node("worker1");
+        assert!(cm0.nodes_on_dispatch_cooldown().is_empty());
+    }
+
+    /// GATE: a job's `--nodelist` pin is its only possible placement — cooling
+    /// that node down must not starve it for the whole cooldown window, or a
+    /// preempt-then-redispatch race against the same node (chronic preemption)
+    /// can never make progress within a job's own retry budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nodes_off_dispatch_cooldown_exempts_a_cooling_node_pinned_by_a_pending_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+
+        cm.cool_down_node("n1");
+        assert!(cm.nodes_on_dispatch_cooldown().contains("n1"));
+
+        let mut spec = basic_spec("pinned");
+        spec.nodelist = Some("n1".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let pinned_job = cm.get_job(job_id).unwrap();
+
+        let names: HashSet<String> = cm
+            .nodes_off_dispatch_cooldown(std::slice::from_ref(&pinned_job))
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        assert!(
+            names.contains("n1"),
+            "n1 is the pinned job's only candidate — must stay schedulable despite cooling"
+        );
+
+        // No pending job names the cooling node: back to excluded, as normal.
+        let names: HashSet<String> = cm
+            .nodes_off_dispatch_cooldown(&[])
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        assert!(
+            !names.contains("n1"),
+            "n1 must stay excluded when nothing pins to it"
+        );
     }
 
     /// Consumer-driven: `maybe_requeue` must honor the new `max_batch_requeue`
