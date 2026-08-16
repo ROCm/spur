@@ -3752,27 +3752,13 @@ mod tests {
         );
     }
 
-    /// GATE: `auth.jwt_key` is captured at startup and must NOT change on
-    /// `reconfigure`. Swapping it live would instantly invalidate every
-    /// outstanding node token. This drives the real capture path
-    /// (`resolve_startup_jwt_key`) and the real `reconfigure`, then proves the
-    /// running controller still verifies a token minted with the startup key.
-    #[tokio::test]
-    async fn reconfigure_does_not_adopt_new_jwt_key() {
-        use spur_core::admission::{generate_node_token, verify_node_token};
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let conf_path = dir.path().join("spur.conf");
-        std::fs::write(
-            &conf_path,
-            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\njwt_key = \"old-secret\"\n",
-        )
-        .unwrap();
-
-        let config = spur_core::config::SlurmConfig::load_from_file(&conf_path).unwrap();
+    async fn test_service_from_config(
+        dir: &tempfile::TempDir,
+        config: spur_core::config::SlurmConfig,
+        config_path: Option<std::path::PathBuf>,
+    ) -> ControllerService {
         let cluster = Arc::new(
-            ClusterManager::new_with_config_path(config, dir.path(), Some(conf_path.clone()))
-                .unwrap(),
+            ClusterManager::new_with_config_path(config, dir.path(), config_path).unwrap(),
         );
         let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cluster.clone())
             .await
@@ -3783,40 +3769,140 @@ mod tests {
             .metrics(|m| m.current_leader == Some(1), "leader elected")
             .await
             .unwrap();
-        cluster.set_raft(handle.raft);
+        cluster.set_raft(handle.raft.clone());
+        let raft = Arc::new(handle);
+        let jwt_key = resolve_startup_jwt_key(&cluster.config());
+        ControllerService {
+            cluster,
+            raft: raft.clone(),
+            leader_proxy: LeaderProxy::new(raft, BTreeMap::new()),
+            client_addrs: BTreeMap::new(),
+            rpc_stats: Arc::new(RpcStatsCollector::new()),
+            sched_stats: Arc::new(SchedStatsCollector::new("backfill")),
+            control_plane_replicas: 1,
+            jwt_key,
+        }
+    }
 
-        // The controller captures the signing key exactly here, at startup.
-        let startup_key = resolve_startup_jwt_key(&cluster.config());
-        assert_eq!(startup_key, "old-secret");
-        let token = generate_node_token("node-1", startup_key.as_bytes()).unwrap();
+    async fn test_service_with_conf_file(
+        dir: &tempfile::TempDir,
+        contents: &str,
+    ) -> (ControllerService, std::path::PathBuf) {
+        let conf_path = dir.path().join("spur.conf");
+        std::fs::write(&conf_path, contents).unwrap();
+        let config = spur_core::config::SlurmConfig::load_from_file(&conf_path).unwrap();
+        let service = test_service_from_config(dir, config, Some(conf_path.clone())).await;
+        (service, conf_path)
+    }
 
-        // Operator edits jwt_key and reconfigures.
+    /// Node tokens outlive a config reload, so the service must retain its startup key.
+    #[tokio::test]
+    async fn reconfigure_does_not_adopt_new_jwt_key() {
+        use spur_core::admission::{generate_node_token, verify_node_token};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, conf_path) = test_service_with_conf_file(
+            &dir,
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\njwt_key = \"old-secret\"\n",
+        )
+        .await;
+        let token = generate_node_token("node-1", service.jwt_key.as_bytes()).unwrap();
+
         std::fs::write(
             &conf_path,
             "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\njwt_key = \"new-secret\"\n",
         )
         .unwrap();
-        cluster.reconfigure().unwrap();
+        service.cluster.reconfigure().unwrap();
 
-        // The live config reflects the new key (proving reconfigure did swap
-        // config)...
         assert_eq!(
-            cluster.config().auth.jwt_key.as_deref(),
+            service.cluster.config().auth.jwt_key.as_deref(),
             Some("new-secret"),
             "reconfigure must swap the live config"
         );
-        // ...but the controller's captured key is unchanged, so tokens minted
-        // with the startup key still verify. A live-reloaded key would reject
-        // this token.
-        assert_eq!(startup_key, "old-secret", "captured key must not change");
+        assert_eq!(service.jwt_key, "old-secret");
         assert!(
-            verify_node_token(&token, startup_key.as_bytes()).is_ok(),
+            verify_node_token(&token, service.jwt_key.as_bytes()).is_ok(),
             "outstanding node token must still verify against the startup key"
         );
         assert!(
             verify_node_token(&token, b"new-secret").is_err(),
             "sanity: the token would fail under the new key (proving the key matters)"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_does_not_enable_token_admission() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, conf_path) = test_service_with_conf_file(
+            &dir,
+            "cluster_name = \"test\"\n[scheduler]\ncomplete_wait_secs = 30\n[admission]\nmode = \"open\"\n",
+        )
+        .await;
+
+        std::fs::write(
+            &conf_path,
+            "cluster_name = \"test\"\n[scheduler]\ncomplete_wait_secs = 90\n[auth]\nplugin = \"jwt\"\njwt_key = \"new-secret\"\n[admission]\nmode = \"token\"\n",
+        )
+        .unwrap();
+        service.cluster.reconfigure().unwrap();
+
+        let registration = service
+            .register_agent(Request::new(RegisterAgentRequest {
+                hostname: "node-1".into(),
+                address: "127.0.0.1".into(),
+                port: 6818,
+                ..Default::default()
+            }))
+            .await
+            .expect("the startup open policy must still accept a tokenless agent")
+            .into_inner();
+        assert!(registration.node_token.is_empty());
+        service
+            .heartbeat(Request::new(HeartbeatRequest {
+                hostname: "node-1".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect("the startup open policy must still accept a tokenless heartbeat");
+        assert_eq!(service.cluster.config().scheduler.complete_wait_secs, 90);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_does_not_disable_token_admission() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, conf_path) = test_service_with_conf_file(
+            &dir,
+            "cluster_name = \"test\"\n[scheduler]\ncomplete_wait_secs = 30\n[auth]\nplugin = \"jwt\"\njwt_key = \"old-secret\"\n[admission]\nmode = \"token\"\n",
+        )
+        .await;
+
+        std::fs::write(
+            &conf_path,
+            "cluster_name = \"test\"\n[scheduler]\ncomplete_wait_secs = 90\n[admission]\nmode = \"open\"\n",
+        )
+        .unwrap();
+        service.cluster.reconfigure().unwrap();
+
+        let registration_error = service
+            .register_agent(Request::new(RegisterAgentRequest {
+                hostname: "node-1".into(),
+                address: "127.0.0.1".into(),
+                port: 6818,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("the startup token policy must still reject a tokenless agent");
+        assert_eq!(registration_error.code(), Code::Unauthenticated);
+        let heartbeat_error = service
+            .heartbeat(Request::new(HeartbeatRequest {
+                hostname: "node-1".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("the startup token policy must still reject a tokenless heartbeat");
+        assert_eq!(heartbeat_error.code(), Code::Unauthenticated);
+        assert_eq!(service.cluster.config().scheduler.complete_wait_secs, 90);
     }
 
     #[test]
@@ -3837,30 +3923,7 @@ mod tests {
     }
 
     async fn test_service(dir: &tempfile::TempDir) -> ControllerService {
-        use crate::cluster::ClusterManager;
-        let cluster =
-            std::sync::Arc::new(ClusterManager::new(step_test_config(), dir.path()).unwrap());
-        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cluster.clone())
-            .await
-            .unwrap();
-        handle
-            .raft
-            .wait(Some(std::time::Duration::from_secs(5)))
-            .metrics(|m| m.current_leader == Some(1), "leader elected")
-            .await
-            .unwrap();
-        cluster.set_raft(handle.raft.clone());
-        let raft = std::sync::Arc::new(handle);
-        ControllerService {
-            cluster,
-            raft: raft.clone(),
-            leader_proxy: LeaderProxy::new(raft, BTreeMap::new()),
-            client_addrs: BTreeMap::new(),
-            rpc_stats: std::sync::Arc::new(RpcStatsCollector::new()),
-            sched_stats: std::sync::Arc::new(SchedStatsCollector::new("backfill")),
-            control_plane_replicas: 1,
-            jwt_key: String::new(),
-        }
+        test_service_from_config(dir, step_test_config(), None).await
     }
 
     // A step must NOT be created when the target node is allocated but unregistered: address
