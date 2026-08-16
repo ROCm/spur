@@ -210,6 +210,9 @@ pub struct AgentService {
     active_steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
     /// `[auth] allow_root_jobs` — when false (default) this agent refuses to execute as uid 0.
     allow_root_jobs: bool,
+    /// Whether spurd runs as root. Stored (not queried per call) so tests can drive the refusal
+    /// path through a real RPC on an unprivileged runner.
+    spurd_is_root: bool,
 }
 
 impl AgentService {
@@ -232,6 +235,9 @@ impl AgentService {
             new_running_jobs(),
             spur_core::config::AuthConfig::default().allow_root_jobs,
         )
+        // Deterministic regardless of whether the test runner is root: a root runner would
+        // otherwise make every launch test (which uses the default uid 0) hit the refusal.
+        .with_root_override(false)
     }
 
     /// Construct with the `[cluster]` config so this node's K0sAgent honors the operator's k0s
@@ -310,7 +316,16 @@ impl AgentService {
             k0s: Arc::new(crate::cluster::K0sAgent::from_config(cluster)),
             active_steps: Arc::new(Mutex::new(HashMap::new())),
             allow_root_jobs,
+            spurd_is_root: crate::privdrop::spurd_runs_as_root(),
         }
+    }
+
+    /// Pretend spurd is (or is not) root, so a test can drive the uid-0 refusal through a real RPC
+    /// on an unprivileged runner. Production always uses the value read at construction.
+    #[cfg(test)]
+    fn with_root_override(mut self, is_root: bool) -> Self {
+        self.spurd_is_root = is_root;
+        self
     }
 
     /// Handle to the RPC-driven k0s component owner. spurd `main()` spawns its supervise loop.
@@ -962,9 +977,11 @@ impl SlurmAgent for AgentService {
         // The uid is part of the (user-supplied) job spec and no RPC authenticates its caller, so
         // refuse root execution here — before anything is spawned — rather than relying on the
         // privilege drop, which treats uid 0 as "nothing to drop".
-        if let Err(msg) =
-            crate::privdrop::check_root_execution_allowed(spec.uid, self.allow_root_jobs)
-        {
+        if let Err(msg) = crate::privdrop::check_root_execution_allowed(
+            spec.uid,
+            self.allow_root_jobs,
+            self.spurd_is_root,
+        ) {
             warn!(job_id, uid = spec.uid, "{msg}");
             return Err(Status::permission_denied(msg));
         }
@@ -1650,9 +1667,11 @@ impl SlurmAgent for AgentService {
         // wire, so this is only reachable for a job that was already running when allow_root_jobs
         // was turned off. Checking anyway keeps the invariant total — spurd never executes as uid 0
         // unless the operator opted in — instead of true only at the wire entry points.
-        if let Err(msg) =
-            crate::privdrop::check_root_execution_allowed(entry.uid, self.allow_root_jobs)
-        {
+        if let Err(msg) = crate::privdrop::check_root_execution_allowed(
+            entry.uid,
+            self.allow_root_jobs,
+            self.spurd_is_root,
+        ) {
             warn!(job_id = req.job_id, uid = entry.uid, "{msg}");
             return Err(Status::permission_denied(msg));
         }
@@ -1810,9 +1829,11 @@ impl SlurmAgent for AgentService {
             return Err(Status::invalid_argument("no command specified"));
         }
         // Steps carry their own uid straight from the wire — gate them exactly like a batch launch.
-        if let Err(msg) =
-            crate::privdrop::check_root_execution_allowed(req.uid, self.allow_root_jobs)
-        {
+        if let Err(msg) = crate::privdrop::check_root_execution_allowed(
+            req.uid,
+            self.allow_root_jobs,
+            self.spurd_is_root,
+        ) {
             warn!(job_id = req.job_id, uid = req.uid, "{msg}");
             return Err(Status::permission_denied(msg));
         }
@@ -2294,9 +2315,11 @@ impl SlurmAgent for AgentService {
         // Same defense-in-depth gate as exec_in_job: the uid comes from the tracked job, but an
         // interactive PTY into a root job must obey allow_root_jobs too. Checked here rather than
         // inside spawn_pty_in_job, which is a static helper with no access to the agent config.
-        if let Err(msg) =
-            crate::privdrop::check_root_execution_allowed(entry.uid, self.allow_root_jobs)
-        {
+        if let Err(msg) = crate::privdrop::check_root_execution_allowed(
+            entry.uid,
+            self.allow_root_jobs,
+            self.spurd_is_root,
+        ) {
             warn!(job_id = init.job_id, uid = entry.uid, "{msg}");
             return Err(Status::permission_denied(msg));
         }
@@ -3262,6 +3285,84 @@ mod tests {
         let path = f.into_temp_path();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    /// The refusal driven through the real RPC entry point, not just the helper: a launch asking to
+    /// run as root on a root spurd must be denied before anything is spawned. `with_root_override`
+    /// makes this deterministic on an unprivileged runner, where the guard would otherwise be inert.
+    #[tokio::test]
+    async fn launch_job_refuses_uid_zero_when_spurd_is_root_and_not_opted_in() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_root_override(true);
+
+        let err = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 4242,
+                spec: Some(JobSpec {
+                    // uid 0 is the default, but state it so the test's subject is unmissable.
+                    uid: 0,
+                    name: "root-job".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a uid-0 launch must be refused, not accepted");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            err.message().contains("allow_root_jobs"),
+            "the refusal should tell the operator which option governs it: {}",
+            err.message()
+        );
+    }
+
+    /// The same launch is accepted once the operator opts in, so the test above is measuring the
+    /// policy rather than some unrelated rejection.
+    #[tokio::test]
+    async fn launch_job_permits_uid_zero_when_opted_in() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_root_override(true);
+        let svc = AgentService {
+            allow_root_jobs: true,
+            ..svc
+        };
+
+        let resp = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 4243,
+                spec: Some(JobSpec {
+                    uid: 0,
+                    name: "root-job".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await;
+        assert!(
+            resp.is_ok(),
+            "with allow_root_jobs the guard must not reject: {resp:?}"
+        );
     }
 
     #[tokio::test]

@@ -114,18 +114,20 @@ pub async fn submit_job(
         ..Default::default()
     };
 
-    // The REST body carries no uid, so the spec inherits `JobSpec::default()`'s uid 0. The agent
-    // refuses to execute as root, but that rejection lands only after the job has been accepted,
-    // queued and dispatched — the caller would get a job_id back and discover the failure late, or
-    // not at all. Reject here, while we can still answer 400.
+    // REST job submission is not supported yet, and this is where that becomes visible.
     //
-    // This is a stopgap: the class disappears once callers are authenticated and uid is derived
-    // server-side from the verified identity instead of defaulted (#636).
+    // The request body carries no uid, so the spec always inherits `JobSpec::default()`'s uid 0 —
+    // i.e. every REST submission would ask to run as root, which the agent refuses. Without this
+    // check the refusal lands only after the job has been accepted, queued and dispatched, so the
+    // caller gets a job_id back and discovers the failure late, or never. Reject up front instead.
+    //
+    // Supporting it means deriving the uid server-side from an authenticated caller rather than
+    // defaulting it; until then the honest answer is that this endpoint cannot submit work.
     if spec.uid == 0 {
         return Err(bad_request_response(
-            "REST job submission cannot attribute a uid to the caller, so the job would run as \
-             root and is refused. Submit via `sbatch`/gRPC, which carries the submitting user's \
-             credentials, until authenticated REST submission is available (see #636).",
+            "REST job submission is not supported yet: the request carries no authenticated \
+             caller, so a job could only be attributed to uid 0 (root), which is refused. Submit \
+             via `sbatch`/`srun`, which carry the submitting user's credentials.",
         ));
     }
 

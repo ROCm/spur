@@ -11,6 +11,12 @@ pub(crate) struct PrivDrop {
     groups: Vec<Gid>,
 }
 
+/// Whether this spurd process runs as root — the production input to
+/// [`check_root_execution_allowed`].
+pub(crate) fn spurd_runs_as_root() -> bool {
+    nix::unistd::geteuid().is_root()
+}
+
 /// Refuse to execute work as uid 0 unless the operator opted in.
 ///
 /// `PrivDrop::resolve_if_needed` returns `None` for uid 0, which means "no privilege drop" — so a
@@ -19,9 +25,17 @@ pub(crate) struct PrivDrop {
 /// reachability of the agent into root on the node. Callers must run this check BEFORE spawning any
 /// child, on every execution path (batch jobs, steps, container jobs).
 ///
+/// `spurd_is_root` is a parameter rather than a `geteuid()` call inside, so the refusal branch is
+/// testable on an unprivileged CI runner — otherwise the security-critical `Err` path would only
+/// execute when the test process happened to be root, i.e. never where it normally runs.
+///
 /// Returns `Err` with an operator-facing message when the request must be refused.
-pub(crate) fn check_root_execution_allowed(uid: u32, allow_root_jobs: bool) -> Result<(), String> {
-    if uid != 0 || allow_root_jobs || !nix::unistd::geteuid().is_root() {
+pub(crate) fn check_root_execution_allowed(
+    uid: u32,
+    allow_root_jobs: bool,
+    spurd_is_root: bool,
+) -> Result<(), String> {
+    if uid != 0 || allow_root_jobs || !spurd_is_root {
         return Ok(());
     }
     Err(
@@ -87,28 +101,39 @@ mod root_execution_tests {
 
     #[test]
     fn non_root_uid_is_always_allowed() {
-        assert!(check_root_execution_allowed(1000, false).is_ok());
-        assert!(check_root_execution_allowed(1000, true).is_ok());
+        assert!(check_root_execution_allowed(1000, false, true).is_ok());
+        assert!(check_root_execution_allowed(1000, true, true).is_ok());
     }
 
     #[test]
     fn opt_in_allows_root() {
-        assert!(check_root_execution_allowed(0, true).is_ok());
+        assert!(check_root_execution_allowed(0, true, true).is_ok());
+    }
+
+    // The security-critical branch, exercised regardless of whether the test runner is root.
+    #[test]
+    fn uid_zero_is_refused_by_default_when_spurd_is_root() {
+        let msg = check_root_execution_allowed(0, false, true)
+            .expect_err("uid 0 must be refused by default on a root spurd");
+        assert!(msg.contains("allow_root_jobs"), "actionable message: {msg}");
     }
 
     #[test]
-    fn uid_zero_is_refused_by_default_when_spurd_is_root() {
-        // Only meaningful as root: a non-root spurd cannot grant root anyway, and the guard
-        // deliberately stays quiet there so unprivileged test/dev runs are unaffected.
-        let res = check_root_execution_allowed(0, false);
-        if nix::unistd::geteuid().is_root() {
-            let msg = res.expect_err("uid 0 must be refused by default on a root spurd");
-            assert!(msg.contains("allow_root_jobs"), "actionable message: {msg}");
-        } else {
-            assert!(
-                res.is_ok(),
-                "non-root spurd cannot escalate; guard is a no-op"
-            );
+    fn a_non_root_spurd_cannot_escalate_so_the_guard_is_a_no_op() {
+        assert!(check_root_execution_allowed(0, false, false).is_ok());
+    }
+
+    #[test]
+    fn opt_in_permits_root_even_on_a_root_spurd() {
+        assert!(check_root_execution_allowed(0, true, true).is_ok());
+    }
+
+    #[test]
+    fn a_normal_uid_is_never_refused() {
+        for is_root in [true, false] {
+            for allow in [true, false] {
+                assert!(check_root_execution_allowed(1000, allow, is_root).is_ok());
+            }
         }
     }
 }

@@ -388,8 +388,9 @@ fn resolve_user_namespace_sa(
     ))
 }
 
-/// Whether `caller` may perform k0s cluster-admin ops: empty/root always, else accounting `Admin`.
-/// Fails closed when accounting is off (cache reports no admins), leaving only root/internal.
+/// Whether `caller` may perform k0s cluster-admin ops: `root` always, otherwise an accounting
+/// `Admin`. An empty caller is NOT privileged. Fails closed when accounting is off (the cache
+/// reports no admins), leaving only `root`.
 fn is_k0s_admin(cache: &crate::association_cache::AssociationCache, caller: &str) -> bool {
     // NOTE: `caller` is supplied by the client and is not authenticated, so this check is an
     // operator-error guard, not a security boundary. Anything that hands out a credential must
