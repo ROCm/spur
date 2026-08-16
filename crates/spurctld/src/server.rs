@@ -290,6 +290,7 @@ impl ControllerService {
     /// Ok/NotFound; a handler with a real error (e.g. InvalidArgument) masks it.
     async fn forward_read_optional<T, R, F, Fut>(
         &self,
+        meta: tonic::metadata::MetadataMap,
         payload: Option<T>,
         rpc: &str,
         call: F,
@@ -301,13 +302,10 @@ impl ControllerService {
         let payload = payload?;
         let client = self.leader_proxy.try_get_leader_client().await?;
         let mut fwd = Request::new(payload);
-        // NOTE: callers consume the request before reaching here, so the original credential is not
-        // available to preserve (unlike `forward_request`). Under `auth.mode = required` the leader
-        // therefore rejects this hop and the error is swallowed below, degrading to a local read —
-        // safe (this helper is documented as best-effort), but it means reads stop being routed to
-        // the leader once auth is enforced. Threading the metadata through these callers is a
-        // follow-up.
-        *fwd.metadata_mut() = Self::forwarded_metadata();
+        // Carry the caller's credential, so a forwarded read is authorized as the original caller
+        // rather than arriving anonymous — otherwise `auth.mode = required` would reject every hop
+        // and silently degrade these reads to local (stale) answers.
+        *fwd.metadata_mut() = Self::forwarded_metadata_preserving(&meta);
         match call(client, fwd).await {
             Ok(resp) => Some(resp),
             Err(e) => {
@@ -572,11 +570,13 @@ impl SlurmController for ControllerService {
         request: Request<GetJobsRequest>,
     ) -> Result<Response<GetJobsResponse>, Status> {
         let forward = self.read_should_forward(&request);
+        let meta = request.metadata().clone();
         let __identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
         if let Some(resp) = self
             .forward_read_optional(
+                meta,
                 forward.then(|| req.clone()),
                 "get_jobs",
                 |mut c, r| async move { c.get_jobs(r).await },
@@ -630,11 +630,15 @@ impl SlurmController for ControllerService {
 
     async fn get_job(&self, request: Request<GetJobRequest>) -> Result<Response<JobInfo>, Status> {
         let forward = self.read_should_forward(&request);
+        let meta = request.metadata().clone();
         let req = request.into_inner();
         if let Some(resp) = self
-            .forward_read_optional(forward.then_some(req), "get_job", |mut c, r| async move {
-                c.get_job(r).await
-            })
+            .forward_read_optional(
+                meta,
+                forward.then_some(req),
+                "get_job",
+                |mut c, r| async move { c.get_job(r).await },
+            )
             .await
         {
             return Ok(resp);
@@ -915,9 +919,11 @@ impl SlurmController for ControllerService {
         request: Request<GetNodesRequest>,
     ) -> Result<Response<GetNodesResponse>, Status> {
         let forward = self.read_should_forward(&request);
+        let meta = request.metadata().clone();
         let req = request.into_inner();
         if let Some(resp) = self
             .forward_read_optional(
+                meta,
                 forward.then(|| req.clone()),
                 "get_nodes",
                 |mut c, r| async move { c.get_nodes(r).await },
@@ -955,9 +961,11 @@ impl SlurmController for ControllerService {
         request: Request<GetNodeRequest>,
     ) -> Result<Response<NodeInfo>, Status> {
         let forward = self.read_should_forward(&request);
+        let meta = request.metadata().clone();
         let req = request.into_inner();
         if let Some(resp) = self
             .forward_read_optional(
+                meta,
                 forward.then(|| req.clone()),
                 "get_node",
                 |mut c, r| async move { c.get_node(r).await },
@@ -1144,8 +1152,10 @@ impl SlurmController for ControllerService {
         request: Request<GetPartitionsRequest>,
     ) -> Result<Response<GetPartitionsResponse>, Status> {
         let forward = self.read_should_forward(&request);
+        let meta = request.metadata().clone();
         if let Some(resp) = self
             .forward_read_optional(
+                meta,
                 forward.then(|| request.into_inner()),
                 "get_partitions",
                 |mut c, r| async move { c.get_partitions(r).await },
@@ -1184,8 +1194,10 @@ impl SlurmController for ControllerService {
 
     async fn get_job_metrics(&self, request: Request<()>) -> Result<Response<JobMetrics>, Status> {
         let forward = self.read_should_forward(&request);
+        let meta = request.metadata().clone();
         if let Some(resp) = self
             .forward_read_optional(
+                meta,
                 forward.then_some(()),
                 "get_job_metrics",
                 |mut c, r| async move { c.get_job_metrics(r).await },
@@ -1206,8 +1218,10 @@ impl SlurmController for ControllerService {
         request: Request<()>,
     ) -> Result<Response<NodeMetrics>, Status> {
         let forward = self.read_should_forward(&request);
+        let meta = request.metadata().clone();
         if let Some(resp) = self
             .forward_read_optional(
+                meta,
                 forward.then_some(()),
                 "get_node_metrics",
                 |mut c, r| async move { c.get_node_metrics(r).await },
@@ -1603,9 +1617,11 @@ impl SlurmController for ControllerService {
         request: Request<GetJobStepsRequest>,
     ) -> Result<Response<GetJobStepsResponse>, Status> {
         let forward = self.read_should_forward(&request);
+        let meta = request.metadata().clone();
         let req = request.into_inner();
         if let Some(resp) = self
             .forward_read_optional(
+                meta,
                 forward.then_some(req),
                 "get_job_steps",
                 |mut c, r| async move { c.get_job_steps(r).await },
@@ -2086,9 +2102,11 @@ impl SlurmController for ControllerService {
         request: Request<ListReservationsRequest>,
     ) -> Result<Response<ListReservationsResponse>, Status> {
         let forward = self.read_should_forward(&request);
+        let meta = request.metadata().clone();
         let req = request.into_inner();
         if let Some(resp) = self
             .forward_read_optional(
+                meta,
                 forward.then(|| req.clone()),
                 "list_reservations",
                 |mut c, r| async move { c.list_reservations(r).await },
@@ -3577,6 +3595,34 @@ mod tests {
         let (namespace, sa) = resolve_user_namespace_sa(&cache, "alice").unwrap();
         assert_eq!(namespace, "spur-acct-physics");
         assert_eq!(sa, "spur-user-alice");
+    }
+
+    #[test]
+    fn forwarded_metadata_carries_the_callers_credential_to_the_leader() {
+        // The leader authorizes the request, so a forwarded hop must arrive as the ORIGINAL caller.
+        // Building fresh metadata (the old behaviour) dropped the credential, which would make every
+        // forwarded call anonymous the moment HA + `auth.mode = required` were both on.
+        let mut orig = tonic::metadata::MetadataMap::new();
+        orig.insert("authorization", "Bearer tok123".parse().unwrap());
+
+        let fwd = ControllerService::forwarded_metadata_preserving(&orig);
+        assert_eq!(
+            fwd.get("authorization").map(|v| v.to_str().unwrap()),
+            Some("Bearer tok123"),
+            "the caller's credential must survive forwarding"
+        );
+        assert!(
+            fwd.get(FORWARDED_HEADER).is_some(),
+            "the loop-breaker header is still set"
+        );
+    }
+
+    #[test]
+    fn forwarding_an_unauthenticated_request_adds_no_credential() {
+        let fwd =
+            ControllerService::forwarded_metadata_preserving(&tonic::metadata::MetadataMap::new());
+        assert!(fwd.get("authorization").is_none());
+        assert!(fwd.get(FORWARDED_HEADER).is_some());
     }
 
     #[test]
