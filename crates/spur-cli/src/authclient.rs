@@ -98,21 +98,26 @@ pub async fn connect(endpoints: &str) -> Result<AuthChannel, tonic::transport::E
 mod tests {
     use super::*;
 
+    /// Both env cases live in ONE test on purpose: the variable is process-global, so two tests
+    /// mutating it run concurrently under the default test harness and race each other.
     #[test]
-    fn env_token_takes_precedence_and_is_trimmed() {
-        // SAFETY: single-threaded test process for this variable.
+    fn env_token_is_trimmed_and_blank_is_not_a_credential() {
+        // SAFETY: this is the only test that touches TOKEN_ENV, so no other thread reads it here.
         unsafe { std::env::set_var(TOKEN_ENV, "  abc123\n") };
-        assert_eq!(load_token().as_deref(), Some("abc123"));
-        unsafe { std::env::remove_var(TOKEN_ENV) };
-    }
+        assert_eq!(
+            load_token().as_deref(),
+            Some("abc123"),
+            "the env credential wins and is trimmed"
+        );
 
-    #[test]
-    fn an_empty_env_token_is_not_a_credential() {
         unsafe { std::env::set_var(TOKEN_ENV, "   ") };
-        // Falls through to the file (absent in the test environment) rather than sending "Bearer ".
-        let t = load_token();
+        // Blank falls through to the file rather than sending a literal "Bearer " with no token.
+        let blank = load_token();
         unsafe { std::env::remove_var(TOKEN_ENV) };
-        assert!(t.is_none() || !t.unwrap().is_empty());
+        assert!(
+            blank.as_deref() != Some(""),
+            "a blank env value must not become an empty credential"
+        );
     }
 
     #[test]
