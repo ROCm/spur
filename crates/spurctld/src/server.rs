@@ -344,6 +344,25 @@ impl ControllerService {
         request.extensions().get::<spur_core::auth::Identity>()
     }
 
+    /// Replace a client-asserted identity field with the authenticated one.
+    ///
+    /// Applied at handler entry so every downstream read of that field (ownership checks, admin
+    /// checks, accounting attribution) sees the verified user without each call site having to know
+    /// about authentication. A `None` identity leaves the field alone: that is an unauthenticated
+    /// caller under `permissive`/`disabled`, and `required` never reaches a handler unauthenticated
+    /// because the auth layer rejects first.
+    fn authoritative_user(asserted: &mut String, identity: Option<&spur_core::auth::Identity>) {
+        let Some(id) = identity else { return };
+        if !asserted.is_empty() && *asserted != id.user {
+            warn!(
+                claimed = %asserted,
+                authenticated = %id.user,
+                "request asserted a different user than its credential; using the authenticated one"
+            );
+        }
+        *asserted = id.user.clone();
+    }
+
     /// Bind a submitted spec to the authenticated caller.
     ///
     /// Overwrites `user`/`uid`/`gid` from the verified identity rather than trusting what the client
@@ -553,7 +572,9 @@ impl SlurmController for ControllerService {
         request: Request<GetJobsRequest>,
     ) -> Result<Response<GetJobsResponse>, Status> {
         let forward = self.read_should_forward(&request);
-        let req = request.into_inner();
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, __identity.as_ref());
         if let Some(resp) = self
             .forward_read_optional(
                 forward.then(|| req.clone()),
@@ -643,7 +664,9 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let req = request.into_inner();
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job_id = req.job_id;
 
         // Snapshot the job before cancelling so we have allocated_nodes
@@ -682,7 +705,9 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let req = request.into_inner();
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job = self
             .cluster
             .finish_srun_job(req.job_id, req.exit_code, &req.user)
@@ -738,7 +763,9 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let req = request.into_inner();
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, __identity.as_ref());
         // A real keepalive always carries the caller's username. Reject an empty
         // one explicitly: `check_job_owner` treats empty as authorized, which
         // would let anyone hold any allocation open forever.
@@ -780,7 +807,9 @@ impl SlurmController for ControllerService {
                 }
             }
         }
-        let req = request.into_inner();
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job_id = req.job_id;
         // Unknown job ids are NOT_FOUND (consistent with get_job), not a
         // precondition failure. Snapshot up-front for agent dispatch.
@@ -812,7 +841,9 @@ impl SlurmController for ControllerService {
                 }
             }
         }
-        let req = request.into_inner();
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job_id = req.job_id;
         // Unknown job ids are NOT_FOUND (consistent with get_job), not a
         // precondition failure. Allocation is retained across resume, so this
@@ -1617,7 +1648,9 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let req = request.into_inner();
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job_id = req.job_id;
 
         let job = self
@@ -1948,7 +1981,9 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let req = request.into_inner();
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, __identity.as_ref());
 
         let start_time = if req.start_time.is_empty() || req.start_time.eq_ignore_ascii_case("now")
         {
@@ -2000,7 +2035,9 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let req = request.into_inner();
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, __identity.as_ref());
         self.cluster
             .update_reservation(
                 &req.name,
@@ -2035,7 +2072,9 @@ impl SlurmController for ControllerService {
             }
         }
 
-        let req = request.into_inner();
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, __identity.as_ref());
         self.cluster
             .delete_reservation(&req.name, &req.user)
             .map_err(reservation_rpc_status)?;
@@ -2096,7 +2135,9 @@ impl SlurmController for ControllerService {
 
         use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 
-        let req = request.into_inner();
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job_id = req.job_id;
 
         let job = self
@@ -2506,7 +2547,9 @@ impl SlurmController for ControllerService {
                 }
             }
         }
-        let req = request.into_inner();
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.caller, __identity.as_ref());
         if !is_k0s_admin(self.cluster.association_cache(), &req.caller) {
             return Err(Status::permission_denied(
                 "k0s cluster up requires cluster admin",
@@ -2635,7 +2678,9 @@ impl SlurmController for ControllerService {
                 }
             }
         }
-        let req = request.into_inner();
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.caller, __identity.as_ref());
         if !is_k0s_admin(self.cluster.association_cache(), &req.caller) {
             return Err(Status::permission_denied(
                 "k0s cluster down requires cluster admin",
@@ -2685,7 +2730,9 @@ impl SlurmController for ControllerService {
             let fwd = Self::forward_request(request);
             return client.cluster_kubeconfig(fwd).await;
         }
-        let req = request.into_inner();
+        let __identity = Self::verified_identity(&request).cloned();
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.caller, __identity.as_ref());
         let is_admin = is_k0s_admin(self.cluster.association_cache(), &req.caller);
 
         if req.admin {

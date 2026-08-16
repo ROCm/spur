@@ -38,6 +38,28 @@ pub enum TokenCommand {
         /// Token ID to revoke.
         token_id: String,
     },
+    /// Mint a USER credential for authenticating RPCs (distinct from the admission tokens above,
+    /// which admit a node to the cluster).
+    ///
+    /// Signed locally from `[auth] jwt_key` in the config, so it needs read access to that file —
+    /// run it on the controller host. Local signing is deliberate: under `[auth] mode = required`
+    /// an RPC-based mint would need a credential to obtain a credential.
+    ///
+    /// Write the output to `~/.spur/token` (mode 0600) or export it as `SPUR_AUTH_TOKEN`.
+    User {
+        /// Username the token authenticates as.
+        #[arg(long)]
+        user: String,
+        /// Mark the token as a cluster admin.
+        #[arg(long)]
+        admin: bool,
+        /// Token time-to-live (e.g. "24h", "7d", "3600s"). Default 24h.
+        #[arg(long)]
+        ttl: Option<String>,
+        /// Config file to read `[auth] jwt_key` from.
+        #[arg(long, default_value = "/etc/spur/spur.conf")]
+        config: String,
+    },
 }
 
 pub async fn main() -> Result<()> {
@@ -51,7 +73,46 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         TokenCommand::Create { ttl } => cmd_create(&controller, ttl).await,
         TokenCommand::List => cmd_list(&controller).await,
         TokenCommand::Revoke { token_id } => cmd_revoke(&controller, &token_id).await,
+        TokenCommand::User {
+            user,
+            admin,
+            ttl,
+            config,
+        } => cmd_user_token(&user, admin, ttl, &config),
     }
+}
+
+/// Mint a user credential locally from the configured signing key.
+fn cmd_user_token(user: &str, admin: bool, ttl: Option<String>, config_path: &str) -> Result<()> {
+    let ttl_secs = match ttl.as_deref() {
+        Some(t) => parse_ttl(t)? as u64,
+        None => 86_400,
+    };
+    let cfg = spur_core::config::SlurmConfig::load_from_file(std::path::Path::new(config_path))
+        .map_err(|e| anyhow::anyhow!("read {config_path}: {e}"))?;
+    let key = cfg.auth.jwt_key.as_deref().unwrap_or_default();
+    if key.is_empty() {
+        anyhow::bail!(
+            "[auth] jwt_key is not set in {config_path}; a signing key is required to mint user \
+             credentials (the same key is used for node admission)"
+        );
+    }
+    // uid is carried for reference only — the controller re-resolves uid/gid from the username
+    // through NSS, so a stale or wrong uid here cannot influence what a job runs as.
+    let uid = spur_core::auth::resolve_unix_credentials(user)
+        .map(|(uid, _)| uid)
+        .unwrap_or(0);
+    let token = spur_core::auth::generate_token(user, uid, admin, key.as_bytes(), ttl_secs)
+        .map_err(|e| anyhow::anyhow!("mint token: {e}"))?;
+    // stdout = the token alone, so it can be redirected straight into ~/.spur/token.
+    println!("{token}");
+    eprintln!(
+        "minted a {} credential for {user}, valid {}h. Store it as ~/.spur/token (chmod 600) or \
+         export SPUR_AUTH_TOKEN.",
+        if admin { "cluster-admin" } else { "user" },
+        ttl_secs / 3600
+    );
+    Ok(())
 }
 
 fn parse_ttl(s: &str) -> Result<u32> {
