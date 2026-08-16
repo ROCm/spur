@@ -2583,11 +2583,17 @@ impl ClusterManager {
                     admin_locked,
                 } => {
                     warn!(node = %name, "node marked DOWN (heartbeat timeout)");
+                    // An admin hold's reason takes precedence over the liveness
+                    // reason it would otherwise be marked with.
+                    let reason = admin_locked
+                        .then(|| self.get_node(&name).and_then(|n| n.state_reason))
+                        .flatten()
+                        .or_else(|| Some("Not responding".into()));
                     match self.propose(WalOperation::NodeStateChange {
                         name: name.clone(),
                         old_state,
                         new_state: NodeState::Down,
-                        reason: Some("Not responding".into()),
+                        reason,
                         admin_locked,
                     }) {
                         Ok(resp) => {
@@ -15509,6 +15515,69 @@ mod tests {
         let node = cm.get_node("n1").unwrap();
         assert!(!node.admin_locked);
         assert_eq!(node.state_reason, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mark_down_preserves_an_admin_drain_reason_when_heartbeat_also_times_out() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("draining"));
+        let alloc = scalar_alloc(4, 8000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            alloc.clone(),
+            per_node_for(&["n1"], alloc),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+
+        cm.update_node_state("n1", NodeState::Drain, Some("hw swap".into()))
+            .unwrap();
+        wait_for("draining applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Draining)
+        });
+
+        cm.apply_health_actions(vec![super::HealthAction::MarkDown {
+            name: "n1".into(),
+            old_state: NodeState::Draining,
+            admin_locked: true,
+        }]);
+        wait_for("down applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(
+            node.state_reason,
+            Some("hw swap".into()),
+            "a heartbeat timeout must not overwrite the operator's drain reason"
+        );
+        assert!(node.admin_locked);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mark_down_uses_a_liveness_reason_on_an_unlocked_node() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        cm.apply_health_actions(vec![super::HealthAction::MarkDown {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            admin_locked: false,
+        }]);
+        wait_for("down applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.state_reason, Some("Not responding".into()));
+        assert!(!node.admin_locked);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
