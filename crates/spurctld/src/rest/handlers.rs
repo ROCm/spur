@@ -114,6 +114,23 @@ pub async fn submit_job(
         ..Default::default()
     };
 
+    // REST job submission is not supported yet, and this is where that becomes visible.
+    //
+    // The request body carries no uid, so the spec always inherits `JobSpec::default()`'s uid 0 —
+    // i.e. every REST submission would ask to run as root, which the agent refuses. Without this
+    // check the refusal lands only after the job has been accepted, queued and dispatched, so the
+    // caller gets a job_id back and discovers the failure late, or never. Reject up front instead.
+    //
+    // Supporting it means deriving the uid server-side from an authenticated caller rather than
+    // defaulting it; until then the honest answer is that this endpoint cannot submit work.
+    if spec.uid == 0 {
+        return Err(bad_request_response(
+            "REST job submission is not supported yet: the request carries no authenticated \
+             caller, so a job could only be attributed to uid 0 (root), which is refused. Submit \
+             via `sbatch`/`srun`, which carry the submitting user's credentials.",
+        ));
+    }
+
     // GPU demand is validated in submit_job after node-count normalization.
     let outcome = state.cluster.submit_job(spec).map_err(submit_rest_error)?;
 

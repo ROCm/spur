@@ -218,17 +218,16 @@ impl MetricsConfig {
 }
 
 /// REST API settings for spurctld (Slurm-compatible HTTP on a separate port).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RestApiConfig {
     /// When false, spurctld does not start the REST server.
-    #[serde(default = "default_true_fn")]
+    ///
+    /// Defaults to FALSE: the REST surface performs no authentication, and its submit handler builds
+    /// a job spec directly from the request body, so enabling it on a reachable address exposes
+    /// unauthenticated job submission. Enable it only behind an authenticating proxy or on a
+    /// loopback/administrative interface.
+    #[serde(default)]
     pub enabled: bool,
-}
-
-impl Default for RestApiConfig {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
 }
 
 /// Prolog and epilog hook script configuration.
@@ -559,9 +558,22 @@ impl Default for SchedulerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
     /// Auth plugin: "jwt", "munge", "none".
+    ///
+    /// NOTE: this selector is not yet enforced — spurctld does not authenticate the calling user on
+    /// any RPC, and the identity used for authorization is a client-supplied field. Treat the
+    /// control-plane ports as an administrative boundary until that lands.
     pub plugin: String,
-    /// JWT secret key (file path or inline).
+    /// JWT secret key (file path or inline). Currently used only to sign/verify NODE admission
+    /// tokens, not user identity.
     pub jwt_key: Option<String>,
+    /// Allow jobs to execute as uid 0 (root).
+    ///
+    /// Default false, and deliberately so: `uid` arrives on the wire as part of the job spec, and a
+    /// job requesting uid 0 previously *skipped* the privilege drop rather than failing it, so any
+    /// peer that could reach the controller could obtain root on a compute node. Enable only on a
+    /// cluster where every submitter is already trusted with root.
+    #[serde(default)]
+    pub allow_root_jobs: bool,
 }
 
 impl Default for AuthConfig {
@@ -569,6 +581,7 @@ impl Default for AuthConfig {
         Self {
             plugin: "jwt".into(),
             jwt_key: None,
+            allow_root_jobs: false,
         }
     }
 }
@@ -794,6 +807,15 @@ pub struct ClusterConfig {
     /// download plus multi-node join.
     #[serde(default = "default_k8s_provisioning_timeout_secs")]
     pub k8s_provisioning_timeout_secs: u64,
+    /// Allow `spur k8s kubeconfig --admin` to serve the k0s CLUSTER-ADMIN kubeconfig over RPC.
+    ///
+    /// Default false. The admin check it sits behind compares a client-supplied caller string, so
+    /// while user authentication is unenforced this RPC would hand a cluster-admin credential to any
+    /// peer that can reach the controller. With this off, obtain the admin kubeconfig on the
+    /// control-plane node itself (`k0s kubeconfig admin`); per-user scoped kubeconfigs are
+    /// unaffected.
+    #[serde(default)]
+    pub allow_admin_kubeconfig: bool,
 }
 
 fn default_cluster_distro() -> String {
@@ -846,6 +868,7 @@ impl Default for ClusterConfig {
             storage_provisioner: default_storage_provisioner(),
             local_path_dir: default_local_path_dir(),
             k8s_provisioning_timeout_secs: default_k8s_provisioning_timeout_secs(),
+            allow_admin_kubeconfig: false,
         }
     }
 }
