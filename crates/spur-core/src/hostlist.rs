@@ -287,6 +287,13 @@ fn expand_single(pattern: &str, results: &mut Vec<String>) -> Result<(), Hostlis
             .find(']')
             .ok_or_else(|| HostlistError::InvalidPattern("unmatched [".into()))?;
 
+        // ']' before '[' would make the slice below reversed (start > end) and panic.
+        if bracket_end < bracket_start {
+            return Err(HostlistError::InvalidPattern(format!(
+                "']' before '[': {pattern}"
+            )));
+        }
+
         let prefix = &pattern[..bracket_start];
         let range_str = &pattern[bracket_start + 1..bracket_end];
         let suffix = &pattern[bracket_end + 1..];
@@ -588,5 +595,13 @@ mod tests {
         round_tripped.sort();
 
         assert_eq!(round_tripped, expected);
+    }
+
+    #[test]
+    fn test_closing_bracket_before_opening() {
+        assert!(expand("n]ode[1-2]").is_err());
+        assert!(expand("a]b[1-2]").is_err());
+        assert!(expand("][").is_err());
+        assert!(expand("node]1").is_ok()); // ']' with no '[' is a plain hostname
     }
 }
