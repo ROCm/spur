@@ -2100,14 +2100,14 @@ impl ClusterManager {
         self.nodes.read().values().cloned().collect()
     }
 
-    /// Nodes eligible for new placement this tick: all nodes minus those within
-    /// a dispatch cooldown after a resources-unavailable reject — except a
-    /// cooling node explicitly named by a pending job's `--nodelist`, which has
-    /// nowhere else to go and would otherwise starve for the cooldown's
-    /// duration instead of being retried, the outcome the cooldown exists to
-    /// avoid only for jobs that actually have an alternative.
-    pub fn schedulable_nodes(&self, pending: &[Job]) -> Vec<Node> {
+    /// Nodes eligible for new placement this tick: all nodes minus those on a
+    /// dispatch cooldown, except a cooling node pinned by a pending job's
+    /// `--nodelist` (its only option). Exclusion is resource-agnostic by design.
+    pub fn nodes_off_dispatch_cooldown(&self, pending: &[Job]) -> Vec<Node> {
         let cooling = self.nodes_on_dispatch_cooldown();
+        if cooling.is_empty() {
+            return self.nodes.read().values().cloned().collect();
+        }
         let pinned: HashSet<String> = pending
             .iter()
             .filter_map(|j| j.spec.nodelist.as_deref())
@@ -6831,7 +6831,7 @@ mod tests {
 
         // The scheduler's node view excludes the cooled node, keeps the other.
         let names: HashSet<String> = cm
-            .schedulable_nodes(&[])
+            .nodes_off_dispatch_cooldown(&[])
             .into_iter()
             .map(|n| n.name)
             .collect();
@@ -6848,7 +6848,7 @@ mod tests {
         );
         assert!(!cm.nodes_on_dispatch_cooldown().contains("worker1"));
         assert!(
-            cm.schedulable_nodes(&[])
+            cm.nodes_off_dispatch_cooldown(&[])
                 .iter()
                 .any(|n| n.name == "worker1"),
             "expired cooldown makes the node schedulable again"
@@ -6867,7 +6867,7 @@ mod tests {
     /// preempt-then-redispatch race against the same node (chronic preemption)
     /// can never make progress within a job's own retry budget.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn schedulable_nodes_exempts_a_cooling_node_pinned_by_a_pending_job() {
+    async fn nodes_off_dispatch_cooldown_exempts_a_cooling_node_pinned_by_a_pending_job() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 4, 8000);
@@ -6882,7 +6882,7 @@ mod tests {
         let pinned_job = cm.get_job(job_id).unwrap();
 
         let names: HashSet<String> = cm
-            .schedulable_nodes(std::slice::from_ref(&pinned_job))
+            .nodes_off_dispatch_cooldown(std::slice::from_ref(&pinned_job))
             .into_iter()
             .map(|n| n.name)
             .collect();
@@ -6893,7 +6893,7 @@ mod tests {
 
         // No pending job names the cooling node: back to excluded, as normal.
         let names: HashSet<String> = cm
-            .schedulable_nodes(&[])
+            .nodes_off_dispatch_cooldown(&[])
             .into_iter()
             .map(|n| n.name)
             .collect();
