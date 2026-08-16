@@ -250,8 +250,8 @@ impl ControllerService {
                     node = %node,
                     "agent still holds an allocation the controller no longer believes belongs to it there — re-sending cancel to reclaim it"
                 );
-                // Signal 0 = graceful release, no-op on an unknown id. Not
-                // epoch-gated — a requeue racing this send is still possible.
+                // Signal 0 is a no-op on an unknown id, but SIGTERM/SIGKILLs a
+                // live process for the active-elsewhere case. Not epoch-gated.
                 crate::scheduler_loop::cancel_job_on_nodes(
                     &cluster,
                     job_id,
