@@ -337,17 +337,8 @@ impl SpurStore {
 }
 
 /// Serialize `value` to `path` so that a crash leaves either the previous file
-/// or the complete new one, and so the new contents are on disk when this
-/// returns.
-///
-/// Both halves are required, and `std::fs::write` provides neither. It truncates
-/// the target first, so a crash mid-write leaves a half-length JSON file that
-/// `SpurStore::new` then refuses to parse — the node will not start at all in
-/// the default strict recovery mode. And it returns once the bytes are in the
-/// page cache, which a power loss or kernel panic discards even though openraft
-/// was told the write succeeded: `RaftStorage::save_vote` is documented as "the
-/// vote must be persisted on disk before returning", and losing a vote lets this
-/// node grant its vote twice in the same term.
+/// or the complete new one, and so the contents are on disk when this returns:
+/// openraft requires a vote to be durable before `save_vote` returns.
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), std::io::Error> {
     let data = serde_json::to_vec(value)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -365,11 +356,8 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), std::io
         .map_err(|e| std::io::Error::new(e.kind(), format!("{path:?}: {e}")))
 }
 
-/// Flush a directory so that files created or renamed inside it survive a crash.
-///
-/// Flushing a file's contents is not enough for a file that was just created or
-/// renamed into place: its directory entry lives in the parent directory, and
-/// until that is flushed the file can be missing entirely after a power loss.
+/// Flush a directory so that files created or renamed inside it survive a crash:
+/// flushing a file's own contents leaves its directory entry unflushed.
 #[cfg(unix)]
 fn sync_dir(dir: &Path) -> Result<(), std::io::Error> {
     std::fs::File::open(dir)
