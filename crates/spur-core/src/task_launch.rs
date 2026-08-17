@@ -224,12 +224,32 @@ pub fn apply_gpu_bind_env(
             .join(","),
     };
     if visible.is_empty() {
+        gpu_deny_visibility(target);
         return;
     }
     target.insert("SPUR_JOB_GPUS".into(), visible.clone());
     target.insert("ROCR_VISIBLE_DEVICES".into(), visible.clone());
     target.insert("CUDA_VISIBLE_DEVICES".into(), visible.clone());
     target.insert("GPU_DEVICE_ORDINAL".into(), visible);
+}
+
+/// Hide all GPUs from the common vendor runtimes for a zero-GPU job.
+///
+/// Unset/empty isn't reliably "no devices", so each selector gets a deny token:
+/// `-1` for the ROCm/CUDA/Level-Zero index selectors, `void` for
+/// nvidia-container-runtime, empty for Spur's own `SPUR_JOB_GPUS`. Advisory.
+pub fn gpu_deny_visibility(target: &mut HashMap<String, String>) {
+    for var in [
+        "ROCR_VISIBLE_DEVICES",
+        "HIP_VISIBLE_DEVICES",
+        "CUDA_VISIBLE_DEVICES",
+        "GPU_DEVICE_ORDINAL",
+        "ZE_AFFINITY_MASK",
+    ] {
+        target.insert(var.to_string(), "-1".to_string());
+    }
+    target.insert("NVIDIA_VISIBLE_DEVICES".to_string(), "void".to_string());
+    target.insert("SPUR_JOB_GPUS".to_string(), String::new());
 }
 
 /// True when env requests CPU bind that the single-`mpirun` PMIx wrapper does not apply.
@@ -922,6 +942,48 @@ mod tests {
         apply_gpu_bind_env(&mut target, &env, &[0, 1]);
         assert_eq!(target.get("ROCR_VISIBLE_DEVICES").unwrap(), "2,3");
         assert_eq!(target.get("SPUR_JOB_GPUS").unwrap(), "2,3");
+    }
+
+    #[test]
+    fn gpu_deny_visibility_sets_no_device_sentinels() {
+        let mut env = HashMap::new();
+        gpu_deny_visibility(&mut env);
+        for var in [
+            "ROCR_VISIBLE_DEVICES",
+            "HIP_VISIBLE_DEVICES",
+            "CUDA_VISIBLE_DEVICES",
+            "GPU_DEVICE_ORDINAL",
+            "ZE_AFFINITY_MASK",
+        ] {
+            assert_eq!(
+                env.get(var).map(String::as_str),
+                Some("-1"),
+                "{var} must be -1 (invalid index = no devices)"
+            );
+        }
+        // nvidia-container-runtime has its own no-GPU token, not an index.
+        assert_eq!(
+            env.get("NVIDIA_VISIBLE_DEVICES").map(String::as_str),
+            Some("void")
+        );
+        // Spur's own allocated-GPU list: empty is "none", not a device index.
+        assert_eq!(env.get("SPUR_JOB_GPUS").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn apply_gpu_bind_env_denies_when_no_gpus_allocated() {
+        let mut target = HashMap::new();
+        let mut source = HashMap::new();
+        source.insert("SPUR_GPU_BIND".to_string(), "closest".to_string());
+        apply_gpu_bind_env(&mut target, &source, &[]);
+        assert_eq!(
+            target.get("ROCR_VISIBLE_DEVICES").map(String::as_str),
+            Some("-1")
+        );
+        assert_eq!(
+            target.get("CUDA_VISIBLE_DEVICES").map(String::as_str),
+            Some("-1")
+        );
     }
 
     #[test]
