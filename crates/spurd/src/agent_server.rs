@@ -731,6 +731,67 @@ fn build_one_shot_command_script(command: &[String]) -> Result<String, Status> {
     Ok(format!("#!/bin/bash\nexec {joined}\n"))
 }
 
+/// Build the argument vector passed to `nsenter` (everything after the
+/// `nsenter` program name) for entering a running job and executing `command`.
+///
+/// The namespace is entered as root; privilege is dropped *inside* the target
+/// via `setpriv --init-groups` when `priv_drop` is set, which is the only way
+/// to initialise supplementary groups after nsenter (nsenter's own
+/// --setuid/--setgid skip setgroups). Root jobs pass `priv_drop = None` and run
+/// the command directly.
+fn build_nsenter_argv(
+    entry: &crate::job_entry::JobEntry,
+    priv_drop: Option<&crate::privdrop::PrivDrop>,
+    command: &[String],
+) -> Vec<String> {
+    let mut args = entry.nsenter_args();
+    args.push("--".into());
+    if let Some(pd) = priv_drop {
+        args.extend(pd.setpriv_prefix());
+    }
+    args.extend(command.iter().cloned());
+    args
+}
+
+/// How to launch `command` for a job: the program to spawn, its arguments, and
+/// whether the privilege drop must still be applied in the spawned child.
+struct LaunchPlan {
+    program: String,
+    args: Vec<String>,
+    /// True only for the direct-spawn path, where the caller must run
+    /// `PrivDrop::apply()` in a `pre_exec` hook. On the nsenter path the drop
+    /// happens inside the entered namespace via `setpriv`, so the child hook is
+    /// skipped.
+    apply_priv_in_child: bool,
+}
+
+/// Decide how to enter a job and run `command`, shared by `exec_in_job` and
+/// `spawn_pty_in_job`.
+///
+/// When the job has live namespaces, enter them with `nsenter` and drop
+/// privilege inside via `setpriv` (see [`build_nsenter_argv`]); the child hook
+/// is not used. Otherwise spawn the command directly and let the caller drop
+/// privilege in a `pre_exec` hook.
+fn build_launch_plan(
+    entry: &crate::job_entry::JobEntry,
+    priv_drop: Option<&crate::privdrop::PrivDrop>,
+    command: &[String],
+) -> LaunchPlan {
+    if entry.has_namespaces() && entry.pid > 0 {
+        LaunchPlan {
+            program: "nsenter".to_string(),
+            args: build_nsenter_argv(entry, priv_drop, command),
+            apply_priv_in_child: false,
+        }
+    } else {
+        LaunchPlan {
+            program: command[0].clone(),
+            args: command[1..].to_vec(),
+            apply_priv_in_child: true,
+        }
+    }
+}
+
 fn cleanup_step_scripts(dir: &std::path::Path, paths: &[&std::path::Path]) {
     for path in paths {
         let _ = std::fs::remove_file(path);
@@ -1678,39 +1739,23 @@ impl SlurmAgent for AgentService {
 
         let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(entry.uid, entry.gid);
 
-        let mut cmd = if entry.has_namespaces() && entry.pid > 0 {
-            let mut c = tokio::process::Command::new("nsenter");
-            for arg in entry.nsenter_args() {
-                c.arg(arg);
-            }
-            if let Some(ref pd) = priv_drop {
-                for arg in pd.nsenter_args() {
-                    c.arg(arg);
-                }
-            }
-            c.arg("--");
-            c.arg(&req.command[0]);
-            for arg in &req.command[1..] {
-                c.arg(arg);
-            }
-            c
-        } else {
-            let mut c = tokio::process::Command::new(&req.command[0]);
-            for arg in &req.command[1..] {
-                c.arg(arg);
-            }
-            c.current_dir(&entry.work_dir);
+        let plan = build_launch_plan(&entry, priv_drop.as_ref(), &req.command);
+        let mut cmd = tokio::process::Command::new(&plan.program);
+        cmd.args(&plan.args);
+        // Direct-spawn path drops privilege in the child; the nsenter path
+        // already does it inside the namespace via setpriv.
+        if plan.apply_priv_in_child {
+            cmd.current_dir(&entry.work_dir);
             if let Some(pd) = priv_drop {
                 unsafe {
-                    c.pre_exec(move || {
+                    cmd.pre_exec(move || {
                         pd.apply()
                             .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
                         Ok(())
                     });
                 }
             }
-            c
-        };
+        }
 
         let output = cmd
             .output()
@@ -2961,18 +3006,10 @@ impl AgentService {
 
         let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(entry.uid, entry.gid);
 
-        let use_nsenter = entry.has_namespaces() && entry.pid > 0;
-        let (launch_cmd, launch_args, apply_priv_in_child) = if use_nsenter {
-            let mut args = entry.nsenter_args();
-            if let Some(ref pd) = priv_drop {
-                args.extend(pd.nsenter_args());
-            }
-            args.push("--".into());
-            args.extend(shell);
-            ("nsenter".to_string(), args, false)
-        } else {
-            (shell[0].clone(), shell[1..].to_vec(), true)
-        };
+        let plan = build_launch_plan(entry, priv_drop.as_ref(), &shell);
+        let launch_cmd = plan.program;
+        let launch_args = plan.args;
+        let apply_priv_in_child = plan.apply_priv_in_child;
 
         let mut cmd = tokio::process::Command::new(&launch_cmd);
         let work_dir = if entry.work_dir.is_empty() {
@@ -3153,6 +3190,177 @@ mod tests {
     use super::*;
     use spur_core::resource::ResourceSet;
     use tonic::Request;
+
+    fn nsenter_job_entry(uid: u32, gid: u32) -> crate::job_entry::JobEntry {
+        crate::job_entry::JobEntry {
+            pid: 1234,
+            has_pid_namespace: true,
+            has_user_namespace: false,
+            has_mount_namespace: true,
+            uid,
+            gid,
+            work_dir: "/home/user".into(),
+        }
+    }
+
+    #[test]
+    fn build_nsenter_argv_non_root_wraps_with_setpriv_init_groups() {
+        let entry = nsenter_job_entry(1000, 1000);
+        let pd = crate::privdrop::PrivDrop::for_test(1000, 1000);
+        let argv = build_nsenter_argv(&entry, Some(&pd), &["id".to_string()]);
+
+        // nsenter itself must not carry uid/gid: it enters as root so it can
+        // read /proc/<pid>/ns/*; priv drop happens inside via setpriv.
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--setuid=")),
+            "nsenter portion must not use --setuid: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--setgid=")),
+            "nsenter portion must not use --setgid: {argv:?}"
+        );
+
+        let sep = argv.iter().position(|a| a == "--").expect("missing --");
+        assert_eq!(
+            &argv[sep..],
+            &[
+                "--",
+                "setpriv",
+                "--reuid=1000",
+                "--regid=1000",
+                "--init-groups",
+                "--",
+                "id"
+            ]
+        );
+    }
+
+    #[test]
+    fn build_nsenter_argv_pty_shell_wraps_with_setpriv_init_groups() {
+        // spawn_pty_in_job passes the resolved shell as the command.
+        let entry = nsenter_job_entry(1000, 1000);
+        let pd = crate::privdrop::PrivDrop::for_test(1000, 1000);
+        let argv = build_nsenter_argv(&entry, Some(&pd), &["/bin/bash".to_string()]);
+
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--setuid=")),
+            "PTY nsenter portion must not use --setuid: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--setgid=")),
+            "PTY nsenter portion must not use --setgid: {argv:?}"
+        );
+        let sep = argv.iter().position(|a| a == "--").expect("missing --");
+        assert_eq!(
+            &argv[sep..],
+            &[
+                "--",
+                "setpriv",
+                "--reuid=1000",
+                "--regid=1000",
+                "--init-groups",
+                "--",
+                "/bin/bash"
+            ]
+        );
+    }
+
+    #[test]
+    fn build_nsenter_argv_root_job_runs_command_directly() {
+        let entry = nsenter_job_entry(0, 0);
+        // Root job: resolve_if_needed returns None → no setpriv prefix.
+        let pd = crate::privdrop::PrivDrop::resolve_if_needed(0, 0);
+        assert!(pd.is_none());
+        let argv = build_nsenter_argv(&entry, pd.as_ref(), &["id".to_string()]);
+
+        assert!(
+            !argv.iter().any(|a| a == "setpriv"),
+            "root job must not invoke setpriv: {argv:?}"
+        );
+        let sep = argv.iter().position(|a| a == "--").expect("missing --");
+        assert_eq!(&argv[sep..], &["--", "id"]);
+    }
+
+    #[test]
+    fn build_launch_plan_namespaced_job_uses_nsenter_no_child_drop() {
+        let entry = nsenter_job_entry(1000, 1000);
+        let pd = crate::privdrop::PrivDrop::for_test(1000, 1000);
+        let plan = build_launch_plan(&entry, Some(&pd), &["id".to_string()]);
+
+        assert_eq!(plan.program, "nsenter");
+        // Privilege is dropped inside the namespace via setpriv, so the child
+        // pre_exec hook must be skipped.
+        assert!(!plan.apply_priv_in_child);
+        assert_eq!(
+            plan.args,
+            build_nsenter_argv(&entry, Some(&pd), &["id".to_string()])
+        );
+    }
+
+    #[test]
+    fn build_launch_plan_no_namespaces_spawns_directly_with_child_drop() {
+        let entry = crate::job_entry::JobEntry {
+            pid: 0,
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
+            uid: 1000,
+            gid: 1000,
+            work_dir: "/home/user".into(),
+        };
+        let pd = crate::privdrop::PrivDrop::for_test(1000, 1000);
+        let plan = build_launch_plan(&entry, Some(&pd), &["echo".to_string(), "hi".to_string()]);
+
+        // No namespaces → spawn the command directly and drop privilege in the
+        // child via pre_exec.
+        assert_eq!(plan.program, "echo");
+        assert_eq!(plan.args, vec!["hi".to_string()]);
+        assert!(plan.apply_priv_in_child);
+    }
+
+    #[tokio::test]
+    async fn spawn_pty_in_job_direct_spawn_runs_command() {
+        // Drives the real spawn_pty_in_job handler (not just the pure planner)
+        // on the direct-spawn path: no namespaces, uid 0 so no privilege drop.
+        // This exercises the build_launch_plan call site inside the handler.
+        let entry = crate::job_entry::JobEntry {
+            pid: 0,
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
+            uid: 0,
+            gid: 0,
+            work_dir: "/tmp".into(),
+        };
+        let (master, mut child, pid) =
+            AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 7, None)
+                .expect("spawn_pty_in_job should succeed for a direct /usr/bin/true");
+        assert!(pid > 0);
+        let status = child.wait().await.expect("child should be reapable");
+        assert!(status.success(), "`true` should exit 0");
+        drop(master);
+    }
+
+    #[test]
+    fn build_launch_plan_namespaced_but_no_pid_spawns_directly() {
+        // has_namespaces() is true but pid is 0 (no live process to enter):
+        // fall back to a direct spawn rather than a broken nsenter.
+        let entry = crate::job_entry::JobEntry {
+            pid: 0,
+            has_pid_namespace: true,
+            has_user_namespace: false,
+            has_mount_namespace: true,
+            uid: 1000,
+            gid: 1000,
+            work_dir: "/home/user".into(),
+        };
+        let pd = crate::privdrop::PrivDrop::for_test(1000, 1000);
+        let plan = build_launch_plan(&entry, Some(&pd), &["id".to_string()]);
+
+        assert_eq!(plan.program, "id");
+        assert!(plan.args.is_empty());
+        assert!(plan.apply_priv_in_child);
+    }
 
     #[test]
     fn build_job_script_uses_explicit_script_verbatim() {
