@@ -933,9 +933,10 @@ impl ClusterManager {
         self.jobs.read().get(&job_id).cloned()
     }
 
-    /// A job's state by ID, without cloning the whole `Job`.
-    pub fn job_state(&self, job_id: JobId) -> Option<JobState> {
-        self.jobs.read().get(&job_id).map(|j| j.state)
+    /// Next id this controller would assign. Ids at or above it were never
+    /// issued here; ids below it were not necessarily issued either.
+    pub fn peek_next_job_id(&self) -> JobId {
+        self.next_job_id.load(Ordering::Relaxed)
     }
 
     /// Get a job by ID, synthesizing an aggregate record for an array *parent*
@@ -5628,6 +5629,8 @@ impl StateMachineApply for ClusterManager {
         // (NOT config-derived like license_pool/burst_buffer) — restore them.
         *self.k0s.write() = snap.k0s;
 
+        // Must stay inside the `jobs` write guard: a reader seeing the cleared
+        // map with this watermark would treat every live job as reclaimable.
         self.next_job_id.store(next_id, Ordering::Relaxed);
 
         // Re-evaluate partition membership and NodeConfig policy

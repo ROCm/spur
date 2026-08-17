@@ -181,7 +181,10 @@ class TestAgentSelfDeregistration:
 class TestDownNodeFailsJobs:
     """Verify the bug fix: jobs on downed nodes transition to NODE_FAIL."""
 
-    HB_TIMEOUT = 10
+    # Agents heartbeat every 30s (hardcoded in spurd); a value at or below
+    # that makes a live node's heartbeat look stale to most health ticks and
+    # it never recovers. Keep well above 30s so only a truly dead agent trips it.
+    HB_TIMEOUT = 60
 
     @pytest.fixture
     def cluster_config_overrides(self):
@@ -190,6 +193,12 @@ class TestDownNodeFailsJobs:
     def test_down_node_fails_jobs(self, multi_node_cluster):
         cluster = multi_node_cluster
         node0 = cluster.node_names[0]
+
+        # A freshly-elected leader withholds DOWN-marking until HB_TIMEOUT has
+        # elapsed since leadership was observed, and that observation can miss
+        # the first health tick — wait it out so detection below measures
+        # normal operation, not the startup grace window.
+        time.sleep(2 * self.HB_TIMEOUT)
 
         script = cluster.write_file(
             "down_sleep.sh", "#!/bin/bash\nsleep 600\n"
