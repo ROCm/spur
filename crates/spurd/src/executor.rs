@@ -1414,7 +1414,6 @@ async fn launch_container_job(
     let cgroup_path = setup_cgroup(job_id, cfg.cpus, cfg.memory_mb, &cfg.cpu_ids)?;
 
     // Sync pipe: child writes status, parent reads.
-    // Convert OwnedFd to raw fds for manual lifecycle management across fork.
     let (pipe_r, pipe_w) = nix::unistd::pipe().context("create sync pipe")?;
     // Prevent read end from leaking into exec'd process
     nix::fcntl::fcntl(
@@ -1424,9 +1423,6 @@ async fn launch_container_job(
     .ok();
     let ready_r = pipe_r.as_raw_fd();
     let ready_w = pipe_w.as_raw_fd();
-    // Keep OwnedFd alive so the fds aren't closed prematurely
-    let _pipe_r_owner = pipe_r;
-    let _pipe_w_owner = pipe_w;
 
     // Snapshot raw I/O fds before fork — the Copy JobIoRaw can be used
     // in the child without owning the fds (parent's OwnedFds keep them alive
@@ -1444,9 +1440,7 @@ async fn launch_container_job(
         nix::unistd::ForkResult::Child => {
             // === CHILD PROCESS ===
             // CRITICAL: synchronous code only. Tokio runtime is broken after fork.
-            unsafe {
-                libc::close(ready_r);
-            }
+            drop(pipe_r);
 
             // Reset signal handlers
             unsafe {
@@ -1482,8 +1476,8 @@ async fn launch_container_job(
             // Signal parent: setup complete
             unsafe {
                 libc::write(ready_w, b"OK".as_ptr() as *const _, 2);
-                libc::close(ready_w);
             }
+            drop(pipe_w);
 
             // Build final environment: base + container_env + hook environ.d
             let mut final_env = env_snapshot;
@@ -1528,9 +1522,7 @@ async fn launch_container_job(
         }
 
         nix::unistd::ForkResult::Parent { child } => {
-            unsafe {
-                libc::close(ready_w);
-            }
+            drop(pipe_w);
 
             // Drop the slave fd immediately so the master gets EOF when the child exits.
             let pty_master = job_io.into_master();
@@ -1550,9 +1542,7 @@ async fn launch_container_job(
             let mut buf = [0u8; 512];
             let n = unsafe { libc::read(ready_r, buf.as_mut_ptr() as *mut _, buf.len()) };
             let n = n.max(0) as usize;
-            unsafe {
-                libc::close(ready_r);
-            }
+            drop(pipe_r);
 
             if n < 2 || &buf[..2] != b"OK" {
                 let msg = String::from_utf8_lossy(&buf[..n]);
