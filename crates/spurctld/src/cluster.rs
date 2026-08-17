@@ -2922,12 +2922,8 @@ impl ClusterManager {
             let fair_share = self
                 .fairshare_cache
                 .get(&job.spec.user, job.spec.account.as_deref().unwrap_or(""));
-            job.priority = compute_effective_priority(
-                job.priority,
-                fair_share,
-                age_minutes,
-                partition_tier,
-            );
+            job.priority =
+                compute_effective_priority(job.priority, fair_share, age_minutes, partition_tier);
         }
         drop(partitions);
 
@@ -4297,11 +4293,7 @@ impl ClusterManager {
     /// `priority` is stale). Takes `qos` pre-resolved so it can be reused,
     /// and `partitions` so callers iterating over multiple jobs don't pay
     /// for a separate lock acquisition per call.
-    pub(crate) fn current_effective_priority(
-        &self,
-        job: &Job,
-        partitions: &[Partition],
-    ) -> u32 {
+    pub(crate) fn current_effective_priority(&self, job: &Job, partitions: &[Partition]) -> u32 {
         let now = Utc::now();
         let age_minutes = (now - job.submit_time).num_minutes().max(0);
         let partition_tier =
@@ -10255,7 +10247,10 @@ mod tests {
 
         let burst_job = cm.get_job(burst_id).unwrap();
         let primus_job = cm.get_job(primus_id).unwrap();
-        assert_eq!(burst_job.priority, 100, "burst job base priority must equal qos.priority");
+        assert_eq!(
+            burst_job.priority, 100,
+            "burst job base priority must equal qos.priority"
+        );
         assert_eq!(
             primus_job.priority, 10000,
             "primus job base priority must equal qos.priority"
@@ -11837,8 +11832,7 @@ mod tests {
             },
         );
 
-        let priority =
-            cm.current_effective_priority(&job, &cm.get_partitions());
+        let priority = cm.current_effective_priority(&job, &cm.get_partitions());
         assert_eq!(
             priority, 9000,
             "multi-partition job should use the highest matched priority_tier (9), \
