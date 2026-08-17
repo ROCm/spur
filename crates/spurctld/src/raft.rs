@@ -339,9 +339,8 @@ impl SpurStore {
     }
 }
 
-/// Serialize `value` to `path` so that a crash leaves either the previous file
-/// or the complete new one, and so the contents are on disk when this returns:
-/// openraft requires a vote to be durable before `save_vote` returns.
+/// Leaves either the previous file or the complete new one after a crash, and
+/// returns only once the contents are on disk.
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), io::Error> {
     let data =
         serde_json::to_vec(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -371,8 +370,7 @@ fn sync_dir(dir: &Path) -> Result<(), io::Error> {
         .map_err(|e| io::Error::new(e.kind(), format!("{dir:?}: {e}")))
 }
 
-/// Windows has no directory handle to fsync, so a rename there is best-effort:
-/// NTFS metadata ordering without an explicit flush is not a stated guarantee.
+/// Windows has no directory handle to fsync, so a rename there is best-effort;
 /// spurctld is built and tested on unix only.
 #[cfg(not(unix))]
 fn sync_dir(_dir: &Path) -> Result<(), io::Error> {
