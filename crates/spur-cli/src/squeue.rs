@@ -57,6 +57,11 @@ pub struct SqueueArgs {
     #[arg(short = 'h', long)]
     pub noheader: bool,
 
+    /// Report values without unit conversion. Accepted for Slurm compatibility:
+    /// Spur already emits unconverted values, so there is nothing to suppress.
+    #[arg(long)]
+    pub noconvert: bool,
+
     /// Print help
     #[arg(long, action = clap::ArgAction::Help)]
     pub help: Option<bool>,
@@ -458,6 +463,27 @@ mod tests {
         // -h is reclaimed for --noheader, but --help must still print help.
         let err = SqueueArgs::try_parse_from(["squeue", "--help"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn noconvert_is_accepted() {
+        // Slurm scripts pass --noconvert to keep output machine-parseable.
+        let args = SqueueArgs::try_parse_from(["squeue", "--noconvert"]).unwrap();
+        assert!(args.noconvert);
+    }
+
+    #[test]
+    fn noconvert_changes_nothing_else() {
+        // Spur never humanizes units, so the flag has nothing to suppress. If unit
+        // conversion is ever added, this is what should force the flag to be honoured.
+        let plain = SqueueArgs::try_parse_from(["squeue", "-h", "-o", "%i %m"]).unwrap();
+        let flagged =
+            SqueueArgs::try_parse_from(["squeue", "-h", "-o", "%i %m", "--noconvert"]).unwrap();
+        assert_eq!(plain.format, flagged.format);
+        assert_eq!(plain.noheader, flagged.noheader);
+        assert_eq!(plain.long, flagged.long);
+        assert!(!plain.noconvert);
+        assert!(flagged.noconvert);
     }
 
     #[test]
