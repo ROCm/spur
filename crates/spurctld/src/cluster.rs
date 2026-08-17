@@ -3462,38 +3462,9 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Re-read spur.conf and apply it to the running controller.
-    ///
-    /// Makes the config file authoritative, matching `scontrol reconfigure`
-    /// semantics in Slurm: runtime-only changes not reflected in the conf are
-    /// overwritten by the incoming conf values.
-    ///
-    /// **Leader-only.** The command is forwarded to the Raft leader, and this
-    /// swaps only the leader's in-memory config — no WAL entry carries the new
-    /// config. Followers keep the config they read at startup until they
-    /// restart (in Kubernetes they re-read the same ConfigMap). Do not rely on
-    /// reconfigured non-partition state surviving an immediate failover.
-    /// Partition edits DO propagate (via partition WAL ops), but a follower
-    /// re-runs `reconcile_partitions` against its own stale `config().nodes`,
-    /// so after a partition edit followers pick up new partition membership but
-    /// keep old node features until restart. WAL-propagating config is a
-    /// planned follow-up.
-    ///
-    /// Reloaded live on the leader (readers take a fresh snapshot via
-    /// `config()`): `[[partitions]]`, `[[nodes]]` features/weight, `licenses`,
-    /// `burst_buffer`, `scheduler` tunables (`complete_wait`, `resv_overrun`),
-    /// `controller.max_batch_requeue`, `hooks`, `notifications`, `federation`,
-    /// `power` suspend/resume commands, `admission.mode`, and
-    /// `metrics.high_cardinality`.
-    ///
-    /// Restart-only (baked in at startup — mirrors Slurm's restart-required set
-    /// of ports/plugins/StateSaveLocation/AuthType): bind addresses and ports
-    /// (`controller.listen_addr`, `metrics`/`rest_api` listeners), the
-    /// accounting database pool (`accounting.database_url`), Raft identity/peers,
-    /// `controller.first_job_id`, `auth.jwt_key` (swapping it live would
-    /// instantly invalidate every outstanding node token), and the scheduler
-    /// loop cadence (`scheduler.interval_secs`, `max_jobs_per_cycle`,
-    /// `topology`).
+    /// Re-read spur.conf and apply it to the running controller. Leader-only, and
+    /// the swap is in-memory here — no WAL entry carries it, so followers keep
+    /// their startup config. Per-field scope: docs/admin-guide/configuration.rst.
     pub fn reconfigure(&self) -> Result<(), anyhow::Error> {
         let Some(ref path) = self.config_path else {
             anyhow::bail!("reconfigure requires a config file path, but none is configured");

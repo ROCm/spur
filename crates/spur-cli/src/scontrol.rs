@@ -222,10 +222,9 @@ pub enum ScontrolCommand {
         #[arg(long)]
         name: String,
     },
-    /// Re-read spur.conf and apply it live on the leader (partitions, nodes,
-    /// licenses, controller hooks, complete_wait_secs/resv_overrun_minutes, etc.).
-    /// Ports/DB/raft/jwt_key, the scheduler loop cadence, and node-side settings
-    /// need a restart; followers converge on restart.
+    /// Re-read spur.conf and apply it live on the leader. Ports, accounting DB,
+    /// raft, jwt_key, the scheduler loop cadence, and node-side settings need a
+    /// restart; followers converge on restart.
     Reconfigure,
     /// Create a reservation
     #[command(name = "create-reservation")]
@@ -1511,7 +1510,7 @@ async fn reconfigure(controller: &str) -> Result<()> {
     client.reconfigure(()).await.context("reconfigure failed")?;
 
     println!(
-        "Reconfiguration complete on the leader (followers converge on restart; listen ports, accounting DB, raft peers, and jwt_key still require a controller restart)"
+        "Reconfiguration complete on the leader. Followers converge on restart. Some settings are not reloadable: listen ports, accounting DB, Raft peers, jwt_key, and the scheduler loop cadence need a controller restart; node-side settings need a spurd restart."
     );
     Ok(())
 }

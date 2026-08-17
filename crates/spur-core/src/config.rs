@@ -168,8 +168,8 @@ pub struct MetricsConfig {
     /// `loopback` binds 127.0.0.1; `all` uses `listen_addr` as-is.
     #[serde(default)]
     pub bind: MetricsBind,
-    /// Reserved for `/metrics/jobs-users-accts` (high cardinality; off by default).
-    /// Route exists but returns 404 until a follow-up PR implements the exporter.
+    /// Serves `/metrics/jobs-users-accts`, which 404s while false. Off by default
+    /// because each job, user, and account becomes its own series.
     #[serde(default)]
     pub high_cardinality: bool,
 }
