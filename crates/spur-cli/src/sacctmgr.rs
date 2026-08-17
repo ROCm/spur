@@ -177,8 +177,8 @@ fn reject_unknown_keys(
     Ok(())
 }
 
-async fn connect(addr: &str) -> Result<SlurmAccountingClient<tonic::transport::Channel>> {
-    let channel = spur_client::connect_channel(addr)
+async fn connect(addr: &str) -> Result<SlurmAccountingClient<crate::authclient::AuthChannel>> {
+    let channel = crate::authclient::connect(addr)
         .await
         .context("failed to connect to controller")?;
     Ok(spur_proto::accounting_client(channel))

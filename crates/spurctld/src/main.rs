@@ -3,6 +3,7 @@
 
 mod accounting;
 mod association_cache;
+mod auth_middleware;
 mod cluster;
 mod cluster_k8s;
 mod fairshare_cache;
@@ -357,15 +358,32 @@ async fn main() -> anyhow::Result<()> {
 
     // Start gRPC server
     let addr: std::net::SocketAddr = listen_addr.parse()?;
-    // Be explicit about the posture rather than letting `plugin = "jwt"` imply a control that does
-    // not run: no RPC authenticates the calling user yet, so the listening port IS the trust
-    // boundary. Warn once at startup when that boundary is the network.
-    if !addr.ip().is_loopback() {
+    // State the authentication posture explicitly at startup: it determines whether the listening
+    // port is the trust boundary or merely the transport.
+    match config.auth.mode {
+        spur_core::config::AuthMode::Required => {
+            info!(
+                mode = "required",
+                "RPC callers must present a valid credential"
+            )
+        }
+        spur_core::config::AuthMode::Permissive => tracing::warn!(
+            mode = "permissive",
+            "RPC callers are authenticated WHEN they present a credential, and trusted on their \
+             own assertion when they do not. Unauthenticated callers are logged — roll credentials \
+             out (`spur token user`), then set [auth] mode = \"required\"."
+        ),
+        spur_core::config::AuthMode::Disabled => tracing::warn!(
+            mode = "disabled",
+            "RPC callers are NOT authenticated: the identity used for authorization is supplied by \
+             the client. Treat this port as an administrative boundary."
+        ),
+    }
+    if !addr.ip().is_loopback() && config.auth.mode != spur_core::config::AuthMode::Required {
         tracing::warn!(
             %addr,
-            "spurctld does not authenticate RPC callers: the user identity used for authorization \
-             is supplied by the client. Treat this port as an administrative boundary — restrict \
-             it to trusted hosts. ([auth] plugin is not enforced yet.)"
+            "listening on a non-loopback address without required authentication — restrict this \
+             port to trusted hosts."
         );
     }
     info!(%addr, "gRPC server listening");

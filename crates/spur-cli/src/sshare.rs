@@ -41,7 +41,7 @@ pub async fn main() -> Result<()> {
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = SshareArgs::try_parse_from(&args)?;
 
-    let channel = spur_client::connect_channel(&args.controller)
+    let channel = crate::authclient::connect(&args.controller)
         .await
         .context("failed to connect to controller")?;
     let mut client = spur_proto::accounting_client(channel);

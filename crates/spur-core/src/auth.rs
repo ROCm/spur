@@ -25,6 +25,25 @@ pub enum AuthError {
         owner: String,
         action: String,
     },
+    #[error("no such user on this host: {0}")]
+    UnknownUser(String),
+}
+
+/// Resolve a username to its UNIX credentials through NSS.
+///
+/// The controller derives uid/gid from the *authenticated* username rather than accepting them from
+/// the wire: `TokenClaims` carries no gid at all, and a client-supplied uid is what allowed a job to
+/// run as an arbitrary user (see the `allow_root_jobs` guard in spurd). Fails closed — an
+/// unresolvable user is an error, never a fallback to uid 0.
+pub fn resolve_unix_credentials(user: &str) -> Result<(u32, u32), AuthError> {
+    if user.is_empty() {
+        return Err(AuthError::UnknownUser("<empty>".into()));
+    }
+    match nix::unistd::User::from_name(user) {
+        Ok(Some(u)) => Ok((u.uid.as_raw(), u.gid.as_raw())),
+        Ok(None) => Err(AuthError::UnknownUser(user.to_string())),
+        Err(e) => Err(AuthError::UnknownUser(format!("{user}: {e}"))),
+    }
 }
 
 /// Authenticated identity extracted from a token or peer credentials.

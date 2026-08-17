@@ -105,7 +105,7 @@ fn parse_label_args(label_args: &[String]) -> Result<(HashMap<String, String>, V
 async fn cmd_label(controller: &str, node_pattern: String, label_args: Vec<String>) -> Result<()> {
     let (set_labels, remove_labels) = parse_label_args(&label_args)?;
     let nodes = expand_node_pattern(&node_pattern)?;
-    let mut client = spur_proto::controller_client(spur_client::connect_channel(controller).await?);
+    let mut client = spur_proto::controller_client(crate::authclient::connect(controller).await?);
 
     let mut failed: Vec<String> = Vec::new();
     for node in &nodes {
@@ -147,7 +147,7 @@ async fn cmd_label(controller: &str, node_pattern: String, label_args: Vec<Strin
 
 async fn cmd_drain(controller: &str, node_pattern: String, reason: Option<String>) -> Result<()> {
     let nodes = expand_node_pattern(&node_pattern)?;
-    let mut client = spur_proto::controller_client(spur_client::connect_channel(controller).await?);
+    let mut client = spur_proto::controller_client(crate::authclient::connect(controller).await?);
 
     let mut failed: Vec<String> = Vec::new();
     for node in &nodes {
@@ -197,7 +197,7 @@ async fn cmd_remove(
     reason: Option<String>,
 ) -> Result<()> {
     let nodes = expand_node_pattern(&node_pattern)?;
-    let mut client = spur_proto::controller_client(spur_client::connect_channel(controller).await?);
+    let mut client = spur_proto::controller_client(crate::authclient::connect(controller).await?);
 
     let mut failed: Vec<String> = Vec::new();
     for node in &nodes {

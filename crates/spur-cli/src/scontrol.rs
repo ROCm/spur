@@ -332,7 +332,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         }
         ScontrolCommand::Requeue { job_id } => {
             // Requeue = cancel + resubmit, simplified for now
-            let channel = spur_client::connect_channel(&args.controller)
+            let channel = crate::authclient::connect(&args.controller)
                 .await
                 .context("failed to connect to spurctld")?;
             let mut client = spur_proto::controller_client(channel);
@@ -348,7 +348,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             Ok(())
         }
         ScontrolCommand::Suspend { job_id } => {
-            let channel = spur_client::connect_channel(&args.controller)
+            let channel = crate::authclient::connect(&args.controller)
                 .await
                 .context("failed to connect to spurctld")?;
             let mut client = spur_proto::controller_client(channel);
@@ -363,7 +363,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             Ok(())
         }
         ScontrolCommand::Resume { job_id } => {
-            let channel = spur_client::connect_channel(&args.controller)
+            let channel = crate::authclient::connect(&args.controller)
                 .await
                 .context("failed to connect to spurctld")?;
             let mut client = spur_proto::controller_client(channel);
@@ -518,7 +518,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             // resolves to 0, which the controller treats as "leave duration
             // unchanged"; there is no zero-length reservation to set.
             let duration = parse_reservation_duration(&duration)?;
-            let channel = spur_client::connect_channel(&args.controller)
+            let channel = crate::authclient::connect(&args.controller)
                 .await
                 .context("failed to connect to spurctld")?;
             let mut client = spur_proto::controller_client(channel);
@@ -546,7 +546,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 }
 
 async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> {
-    let channel = spur_client::connect_channel(controller)
+    let channel = crate::authclient::connect(controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
@@ -847,7 +847,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
 }
 
 async fn ping(controller: &str) -> Result<()> {
-    let channel = spur_client::connect_channel(controller)
+    let channel = crate::authclient::connect(controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
@@ -889,7 +889,7 @@ fn format_ts(ts: Option<&prost_types::Timestamp>) -> String {
 async fn send_job_update(controller: &str, req: spur_proto::proto::UpdateJobRequest) -> Result<()> {
     let hold = req.hold;
     let job_id = req.job_id;
-    let channel = spur_client::connect_channel(controller)
+    let channel = crate::authclient::connect(controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
@@ -1169,7 +1169,7 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
     if let Some(node_pattern) = node_name {
         let proto_state = node_state.as_deref().map(parse_node_state).transpose()?;
 
-        let channel = spur_client::connect_channel(controller)
+        let channel = crate::authclient::connect(controller)
             .await
             .context("failed to connect to spurctld")?;
         let mut client = spur_proto::controller_client(channel);
@@ -1225,7 +1225,7 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
 /// Supports Slurm-compatible hostlist expressions (`node[1-3]`),
 /// comma-separated lists (`node1,node2`), and the `ALL` keyword.
 async fn resolve_node_names(
-    client: &mut SlurmControllerClient<tonic::transport::Channel>,
+    client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     pattern: &str,
 ) -> Result<Vec<String>> {
     if pattern.eq_ignore_ascii_case("ALL") {
@@ -1360,7 +1360,7 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
 
 /// Update a node's state via the controller.
 async fn update_node(
-    client: &mut SlurmControllerClient<tonic::transport::Channel>,
+    client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     name: &str,
     state: Option<i32>,
     reason: Option<String>,
@@ -1430,7 +1430,7 @@ async fn create_partition(
     priority_tier: u32,
     preempt_mode: &str,
 ) -> Result<()> {
-    let channel = spur_client::connect_channel(controller)
+    let channel = crate::authclient::connect(controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
@@ -1468,7 +1468,7 @@ async fn update_partition(
     controller: &str,
     req: spur_proto::proto::UpdatePartitionRequest,
 ) -> Result<()> {
-    let channel = spur_client::connect_channel(controller)
+    let channel = crate::authclient::connect(controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
@@ -1485,7 +1485,7 @@ async fn update_partition(
 
 /// Delete a partition via the controller.
 async fn delete_partition(controller: &str, name: &str) -> Result<()> {
-    let channel = spur_client::connect_channel(controller)
+    let channel = crate::authclient::connect(controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
@@ -1503,7 +1503,7 @@ async fn delete_partition(controller: &str, name: &str) -> Result<()> {
 
 /// Reload spur.conf and reconcile partition state to match it.
 async fn reconfigure(controller: &str) -> Result<()> {
-    let channel = spur_client::connect_channel(controller)
+    let channel = crate::authclient::connect(controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
@@ -1545,7 +1545,7 @@ async fn create_reservation(
         bail!("reservation duration must be positive; e.g. --duration=01:00:00 or Duration=30-00:00:00");
     }
 
-    let channel = spur_client::connect_channel(controller)
+    let channel = crate::authclient::connect(controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
@@ -1593,7 +1593,7 @@ async fn create_reservation(
 async fn delete_reservation(controller: &str, name: &str) -> Result<()> {
     crate::privilege::require_privileged("manage reservations")?;
 
-    let channel = spur_client::connect_channel(controller)
+    let channel = crate::authclient::connect(controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
