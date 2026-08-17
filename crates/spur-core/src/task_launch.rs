@@ -213,6 +213,12 @@ pub fn apply_gpu_bind_env(
     else {
         return;
     };
+    // Zero allocated GPUs is authoritative: deny regardless of bind mode, so a
+    // map_gpu/mask_gpu cannot name a device the job was not granted.
+    if allocated.is_empty() {
+        gpu_deny_visibility(target);
+        return;
+    }
     let bind = bind_str.parse::<GpuBind>().unwrap_or(GpuBind::None);
     let visible = match bind {
         GpuBind::Map(ids) => ids,
@@ -975,6 +981,22 @@ mod tests {
         let mut target = HashMap::new();
         let mut source = HashMap::new();
         source.insert("SPUR_GPU_BIND".to_string(), "closest".to_string());
+        apply_gpu_bind_env(&mut target, &source, &[]);
+        assert_eq!(
+            target.get("ROCR_VISIBLE_DEVICES").map(String::as_str),
+            Some("-1")
+        );
+        assert_eq!(
+            target.get("CUDA_VISIBLE_DEVICES").map(String::as_str),
+            Some("-1")
+        );
+    }
+
+    #[test]
+    fn apply_gpu_bind_env_denies_map_gpu_when_no_gpus_allocated() {
+        let mut target = HashMap::new();
+        let mut source = HashMap::new();
+        source.insert("SPUR_GPU_BIND".to_string(), "map_gpu:0".to_string());
         apply_gpu_bind_env(&mut target, &source, &[]);
         assert_eq!(
             target.get("ROCR_VISIBLE_DEVICES").map(String::as_str),

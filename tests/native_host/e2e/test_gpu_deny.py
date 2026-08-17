@@ -58,6 +58,15 @@ class TestGpuVisibilityDeny:
         assert code == 0, f"srun step failed (exit {code}):\n{output}"
         _assert_all_denied(output, f"exit {code}\noutput:\n{output}")
 
+    def test_zero_gpu_srun_gpu_bind_map_denies_visibility(self, cluster):
+        # --gpu-bind=map_gpu:0 names a device directly; a zero-GPU step must
+        # still be denied rather than exposing GPU 0.
+        code, output = cluster.srun_with_exit(
+            ["-N", "1", "--gpu-bind=map_gpu:0", "bash", "-c", _probe_body()]
+        )
+        assert code == 0, f"srun step failed (exit {code}):\n{output}"
+        _assert_all_denied(output, f"exit {code}\noutput:\n{output}")
+
     def test_zero_gpu_container_denies_user_container_env(self, cluster, tmp_path):
         # --container-env is layered over the base env at launch, so a zero-GPU
         # job must not be able to re-enable GPUs by setting it.
