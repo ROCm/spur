@@ -280,9 +280,8 @@ impl SpurStore {
         self.raft_dir.join("log")
     }
 
-    /// Flush the log directory so that entry files created or removed since the
-    /// last call survive a crash. Called once per append/truncate/purge rather
-    /// than once per entry file.
+    /// Flushes the log dir once per append/truncate/purge rather than once per
+    /// entry file.
     // The error type is openraft's, and every caller is a `RaftStorage` method
     // that must return it anyway; boxing it here would only unbox at the call.
     #[allow(clippy::result_large_err)]
@@ -473,9 +472,7 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
             })?;
             inner.log.insert(entry.log_id.index, entry);
         }
-        // One directory flush for the whole batch: each entry's contents are
-        // already on disk, but a newly created file is not durable until the
-        // directory holding its name is flushed too.
+        // A newly created file is not durable until its directory is flushed.
         self.sync_log_dir()?;
         Ok(())
     }
@@ -490,9 +487,7 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
             inner.log.remove(&k);
             self.remove_log_entry(k);
         }
-        // The deletions must be durable before this returns: a crash that loses
-        // them resurrects the conflicting tail, and `get_log_state` would then
-        // report a last_log_id this node never accepted from the leader.
+        // A crash that loses these deletions resurrects the conflicting tail.
         self.sync_log_dir()?;
         Ok(())
     }
