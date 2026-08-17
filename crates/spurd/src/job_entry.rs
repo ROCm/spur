@@ -19,6 +19,17 @@ impl JobEntry {
     ///
     /// Returns the arguments to pass between `nsenter` and `--`.
     /// The caller prepends `nsenter` and appends `-- <command>`.
+    ///
+    /// `self.pid` is the process that called `unshare(CLONE_NEWPID)` (the batch
+    /// wrapper or container parent). That process stays in its *original* pid
+    /// namespace — only its children, and the `/proc` mounted inside the job,
+    /// live in the new pid namespace. Entering via `/proc/<pid>/ns/pid` would
+    /// therefore land in the wrong (host) pid namespace, where `/proc` does not
+    /// match: any tool that reads `/proc/self/*` (e.g. `setpriv` activating
+    /// capabilities) then fails with ENOENT. Enter through `pid_for_children`,
+    /// which points at the job's real pid namespace. (For a process already
+    /// settled inside a namespace, `pid_for_children` equals its own pid ns, so
+    /// this is correct in every case.)
     pub fn nsenter_args(&self) -> Vec<String> {
         let mut args = vec!["--target".to_string(), self.pid.to_string()];
 
@@ -29,7 +40,7 @@ impl JobEntry {
             args.push("--mount".to_string());
         }
         if self.has_pid_namespace {
-            args.push("--pid".to_string());
+            args.push(format!("--pid=/proc/{}/ns/pid_for_children", self.pid));
         }
 
         args
@@ -65,7 +76,15 @@ mod tests {
             work_dir: "/home/user".into(),
         };
         let args = entry.nsenter_args();
-        assert_eq!(args, vec!["--target", "1234", "--mount", "--pid"]);
+        assert_eq!(
+            args,
+            vec![
+                "--target",
+                "1234",
+                "--mount",
+                "--pid=/proc/1234/ns/pid_for_children"
+            ]
+        );
     }
 
     #[test]
@@ -80,7 +99,16 @@ mod tests {
             work_dir: "/".into(),
         };
         let args = entry.nsenter_args();
-        assert_eq!(args, vec!["--target", "5678", "--user", "--mount", "--pid"]);
+        assert_eq!(
+            args,
+            vec![
+                "--target",
+                "5678",
+                "--user",
+                "--mount",
+                "--pid=/proc/5678/ns/pid_for_children"
+            ]
+        );
     }
 
     #[test]
@@ -111,7 +139,16 @@ mod tests {
             work_dir: "/".into(),
         };
         let args = entry.nsenter_args();
-        assert_eq!(args, vec!["--target", "4444", "--user", "--mount", "--pid"]);
+        assert_eq!(
+            args,
+            vec![
+                "--target",
+                "4444",
+                "--user",
+                "--mount",
+                "--pid=/proc/4444/ns/pid_for_children"
+            ]
+        );
         assert!(entry.has_namespaces());
     }
 }
