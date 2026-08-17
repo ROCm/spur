@@ -359,10 +359,20 @@ QOS keys
      - Free-text description.
    * - ``priority``
      - ``0``
-     - Scheduling priority; higher runs sooner.
+     - Base priority seed for jobs submitted under this QOS. When a job is
+       submitted without an explicit ``--priority``, this value becomes the
+       job's base priority and is amplified by the multiplicative scheduling
+       formula (fair-share × age × partition tier). Higher values run sooner
+       and are more likely to preempt lower-priority running jobs. ``0``
+       leaves the job at the scheduler default (1000).
    * - ``preemptmode``
      - ``off``
-     - Preemption behavior: ``off``, ``cancel``, ``requeue``, or ``suspend``.
+     - Preemption behavior when this QOS's jobs are the victim:
+       ``cancel`` (job ends in ``PREEMPTED``), ``requeue`` (returned to
+       pending), ``suspend``, or ``off`` (not preemptable).
+       A job from a higher-``priority`` QOS can preempt a running job from a
+       lower-``priority`` QOS when its effective priority exceeds twice the
+       victim's.
    * - ``usagefactor``
      - ``1.0``
      - Multiplier applied to usage charged under this QOS.
