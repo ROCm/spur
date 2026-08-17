@@ -1429,6 +1429,9 @@ impl SlurmAgent for AgentService {
 
         if let Some(ref mut cfg) = container_config {
             cfg.environment = env.clone();
+            // container_env (user `--container-env`) is layered over environment
+            // at launch, so a zero-GPU job could re-enable visibility through it.
+            maybe_deny_gpu_env(&mut cfg.container_env, &allocated_device_ids);
         }
 
         let cpu_ids: Vec<u32> = alloc_result.cpu_ids.clone();

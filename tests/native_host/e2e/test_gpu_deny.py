@@ -57,3 +57,25 @@ class TestGpuVisibilityDeny:
         code, output = cluster.srun_with_exit(["-N", "1", "bash", "-c", _probe_body()])
         assert code == 0, f"srun step failed (exit {code}):\n{output}"
         _assert_all_denied(output, f"exit {code}\noutput:\n{output}")
+
+    def test_zero_gpu_container_denies_user_container_env(self, cluster, tmp_path):
+        # --container-env is layered over the base env at launch, so a zero-GPU
+        # job must not be able to re-enable GPUs by setting it.
+        cluster.container_preflight()
+        img = cluster.build_container_image(tmp_path)
+        script = cluster.write_file("gpu-deny-ctr.sh", f"#!/bin/bash\n{_probe_body()}")
+        out_path = f"{cluster.remote_dir}/gpu-deny-ctr.out"
+
+        sb = cluster.sbatch([
+            "-J", "gpu-deny-ctr", "-N", "1",
+            f"--container-image={img}",
+            "--container-env", "CUDA_VISIBLE_DEVICES=0",
+            "--container-env", "NVIDIA_VISIBLE_DEVICES=all",
+            "-o", out_path, script,
+        ])
+        job_id = parse_job_id(sb)
+        assert job_id is not None, f"sbatch failed: {sb}"
+
+        wait_job(cluster, job_id, timeout=120)
+        content = cluster.wait_output(out_path, "DENY_OK", timeout=120)
+        _assert_all_denied(content, f"{cluster.debug_job(job_id)}\noutput:\n{content}")
