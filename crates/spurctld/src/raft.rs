@@ -1547,6 +1547,100 @@ mod tests {
         assert!(store.inner.read().vote.is_none());
     }
 
+    /// A crash between `File::create` and `rename` leaves a `<name>.json.tmp`
+    /// on disk. Recovery must skip those rather than parse them as records.
+    #[test]
+    fn store_recovery_ignores_stale_tmp_files() {
+        let dir = TempDir::new().unwrap();
+        let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
+
+        let leader_id = openraft::LeaderId {
+            term: 4,
+            node_id: 1,
+        };
+        let vote = Vote {
+            leader_id,
+            committed: true,
+        };
+        store.persist_vote(&vote).unwrap();
+
+        let entry = Entry {
+            log_id: LogId {
+                leader_id,
+                index: 7,
+            },
+            payload: EntryPayload::Blank,
+        };
+        store.persist_log_entry(&entry).unwrap();
+
+        let raft_dir = dir.path().join("raft");
+        let stale = [
+            raft_dir.join("vote.json.tmp"),
+            raft_dir.join("snapshot.json.tmp"),
+            raft_dir.join("purged.json.tmp"),
+            raft_dir.join("log").join("00000000000000000008.json.tmp"),
+        ];
+        for path in stale {
+            std::fs::write(&path, "{\"log_id\":{\"lead").unwrap();
+        }
+
+        let store2 = SpurStore::new(dir.path(), noop_applier()).unwrap();
+        let inner = store2.inner.read();
+        assert_eq!(inner.vote, Some(vote));
+        let indexes: Vec<u64> = inner.log.keys().copied().collect();
+        assert_eq!(indexes, vec![7]);
+        assert_eq!(inner.log[&7].log_id, entry.log_id);
+        assert_eq!(inner.last_purged, None);
+        assert_eq!(inner.last_applied, None);
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_tmp_sibling() {
+        let dir = TempDir::new().unwrap();
+        let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
+
+        let leader_id = openraft::LeaderId {
+            term: 2,
+            node_id: 1,
+        };
+        let log_id = LogId {
+            leader_id,
+            index: 42,
+        };
+        let vote = Vote {
+            leader_id,
+            committed: true,
+        };
+        store.persist_vote(&vote).unwrap();
+        store.persist_last_purged(&log_id).unwrap();
+
+        let entry = Entry {
+            log_id,
+            payload: EntryPayload::Blank,
+        };
+        store.persist_log_entry(&entry).unwrap();
+
+        let meta = SnapshotMeta {
+            last_log_id: Some(log_id),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "snap-42".into(),
+        };
+        store.persist_snapshot(&meta, b"payload").unwrap();
+
+        let raft_dir = dir.path().join("raft");
+        let written = [
+            raft_dir.join("vote.json"),
+            raft_dir.join("purged.json"),
+            raft_dir.join("snapshot.json"),
+            raft_dir.join("log").join("00000000000000000042.json"),
+        ];
+        for path in written {
+            assert!(path.exists(), "{path:?} was not created");
+            let tmp = path.with_extension("json.tmp");
+            assert!(!tmp.exists(), "{tmp:?} was left behind");
+        }
+    }
+
     struct FailingRestoreApplier;
     impl StateMachineApply for FailingRestoreApplier {
         fn apply_operation(&self, _op: &WalOperation) -> ClientResponse {
