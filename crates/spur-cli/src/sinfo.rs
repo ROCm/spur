@@ -45,6 +45,11 @@ pub struct SinfoArgs {
     #[arg(short = 'h', long)]
     pub noheader: bool,
 
+    /// Report values without unit conversion. Accepted for Slurm compatibility:
+    /// Spur already emits unconverted values, so there is nothing to suppress.
+    #[arg(long)]
+    pub noconvert: bool,
+
     /// Controller address
     #[arg(
         long,
@@ -387,6 +392,26 @@ mod tests {
         let args = parse_sinfo_args(&["sinfo", "-t", "idle"]);
         let req = build_get_nodes_request(&args).unwrap();
         assert_eq!(req.states, vec![NodeState::NodeIdle as i32]);
+    }
+
+    #[test]
+    fn noconvert_is_accepted() {
+        // Slurm scripts pass --noconvert to keep output machine-parseable.
+        let args = parse_sinfo_args(&["sinfo", "--noconvert"]);
+        assert!(args.noconvert);
+    }
+
+    #[test]
+    fn noconvert_changes_nothing_else() {
+        // Spur never humanizes units, so the flag has nothing to suppress. If unit
+        // conversion is ever added, this is what should force the flag to be honoured.
+        let plain = parse_sinfo_args(&["sinfo", "-N", "-h", "-o", "%n %m"]);
+        let flagged = parse_sinfo_args(&["sinfo", "-N", "-h", "-o", "%n %m", "--noconvert"]);
+        assert_eq!(plain.format, flagged.format);
+        assert_eq!(plain.noheader, flagged.noheader);
+        assert_eq!(plain.node_oriented, flagged.node_oriented);
+        assert!(!plain.noconvert);
+        assert!(flagged.noconvert);
     }
 
     #[test]
