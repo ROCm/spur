@@ -578,7 +578,7 @@ pub(crate) async fn try_preempt(
         .map(|j| {
             (
                 j.job_id,
-                cluster.current_effective_priority_with_qos(j, &running_qos[&j.job_id], partitions),
+                cluster.current_effective_priority(j, partitions),
             )
         })
         .collect();

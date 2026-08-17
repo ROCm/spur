@@ -127,6 +127,12 @@ pub enum WalOperation {
         job_id: JobId,
         begin_time: chrono::DateTime<chrono::Utc>,
     },
+    /// Preempt a running job with cancel (job ends in PREEMPTED, not requeued).
+    /// Single atomic entry so a leadership change cannot strand the job running
+    /// with its allocations held.
+    JobPreemptCancel {
+        job_id: JobId,
+    },
     JobSuspend {
         job_id: JobId,
         /// Controller-stamped instant of suspension (for replay-deterministic accounting).
