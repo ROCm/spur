@@ -9,7 +9,8 @@
 //! `ClusterManager::propose()` and applied through `StateMachineApply`.
 
 use std::collections::BTreeMap;
-use std::io::{Cursor, Write};
+use std::fs;
+use std::io::{self, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -291,17 +292,17 @@ impl SpurStore {
         })
     }
 
-    fn persist_last_purged(&self, log_id: &LogId<NodeId>) -> Result<(), std::io::Error> {
+    fn persist_last_purged(&self, log_id: &LogId<NodeId>) -> Result<(), io::Error> {
         atomic_write_json(&self.raft_dir.join("purged.json"), log_id)?;
         sync_dir(&self.raft_dir)
     }
 
-    fn persist_vote(&self, vote: &Vote<NodeId>) -> Result<(), std::io::Error> {
+    fn persist_vote(&self, vote: &Vote<NodeId>) -> Result<(), io::Error> {
         atomic_write_json(&self.raft_dir.join("vote.json"), vote)?;
         sync_dir(&self.raft_dir)
     }
 
-    fn persist_log_entry(&self, entry: &Entry<SpurTypeConfig>) -> Result<(), std::io::Error> {
+    fn persist_log_entry(&self, entry: &Entry<SpurTypeConfig>) -> Result<(), io::Error> {
         // Contents only: the caller flushes the log directory once per append
         // batch rather than once per entry.
         let path = self
@@ -312,14 +313,14 @@ impl SpurStore {
 
     fn remove_log_entry(&self, index: u64) {
         let path = self.log_dir().join(format!("{:020}.json", index));
-        let _ = std::fs::remove_file(&path);
+        let _ = fs::remove_file(&path);
     }
 
     fn persist_snapshot(
         &self,
         meta: &SnapshotMeta<NodeId, BasicNode>,
         data: &[u8],
-    ) -> Result<(), std::io::Error> {
+    ) -> Result<(), io::Error> {
         let ps = PersistedSnapshot {
             meta: meta.clone(),
             data: data.to_vec(),
@@ -342,40 +343,40 @@ impl SpurStore {
 /// Serialize `value` to `path` so that a crash leaves either the previous file
 /// or the complete new one, and so the contents are on disk when this returns:
 /// openraft requires a vote to be durable before `save_vote` returns.
-fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), std::io::Error> {
-    let data = serde_json::to_vec(value)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), io::Error> {
+    let data =
+        serde_json::to_vec(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     let tmp = path.with_extension("json.tmp");
     // A failed attempt must not leave its temp file behind: a sustained
     // disk-full condition would otherwise accumulate one per failed index.
-    let failed = |e: std::io::Error, at: &Path| {
-        let _ = std::fs::remove_file(&tmp);
-        std::io::Error::new(e.kind(), format!("{at:?}: {e}"))
+    let failed = |e: io::Error, at: &Path| {
+        let _ = fs::remove_file(&tmp);
+        io::Error::new(e.kind(), format!("{at:?}: {e}"))
     };
 
-    let mut file = std::fs::File::create(&tmp).map_err(|e| failed(e, &tmp))?;
+    let mut file = fs::File::create(&tmp).map_err(|e| failed(e, &tmp))?;
     file.write_all(&data).map_err(|e| failed(e, &tmp))?;
     file.sync_all().map_err(|e| failed(e, &tmp))?;
     drop(file);
 
-    std::fs::rename(&tmp, path).map_err(|e| failed(e, path))
+    fs::rename(&tmp, path).map_err(|e| failed(e, path))
 }
 
 /// Flush a directory so that files created or renamed inside it survive a crash:
 /// flushing a file's own contents leaves its directory entry unflushed.
 #[cfg(unix)]
-fn sync_dir(dir: &Path) -> Result<(), std::io::Error> {
-    std::fs::File::open(dir)
+fn sync_dir(dir: &Path) -> Result<(), io::Error> {
+    fs::File::open(dir)
         .and_then(|f| f.sync_all())
-        .map_err(|e| std::io::Error::new(e.kind(), format!("{dir:?}: {e}")))
+        .map_err(|e| io::Error::new(e.kind(), format!("{dir:?}: {e}")))
 }
 
 /// Windows has no directory handle to fsync, so a rename there is best-effort:
 /// NTFS metadata ordering without an explicit flush is not a stated guarantee.
 /// spurctld is built and tested on unix only.
 #[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> Result<(), std::io::Error> {
+fn sync_dir(_dir: &Path) -> Result<(), io::Error> {
     Ok(())
 }
 
@@ -1581,7 +1582,7 @@ mod tests {
             raft_dir.join("log").join("00000000000000000008.json.tmp"),
         ];
         for path in stale {
-            std::fs::write(&path, "{\"log_id\":{\"lead").unwrap();
+            fs::write(&path, "{\"log_id\":{\"lead").unwrap();
         }
 
         let store2 = SpurStore::new(dir.path(), noop_applier()).unwrap();
