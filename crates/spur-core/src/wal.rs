@@ -947,6 +947,17 @@ mod suspend_wal_tests {
     use super::*;
 
     #[test]
+    fn preempt_cancel_op_round_trips() {
+        let op = WalOperation::JobPreemptCancel { job_id: 7 };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobPreemptCancel { job_id } => assert_eq!(job_id, 7),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn preempt_requeue_op_round_trips() {
         let begin_time = chrono::Utc::now();
         let op = WalOperation::JobPreemptRequeue {

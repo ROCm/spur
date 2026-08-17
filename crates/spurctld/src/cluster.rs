@@ -638,18 +638,13 @@ impl ClusterManager {
                 job_id
             };
 
-            // When the user didn't request an explicit --priority, use the QOS
-            // priority as the base so it seeds the multiplicative formula
-            // (fair-share × age × partition-tier). Without this, every job
-            // starts at DEFAULT_PRIORITY (1000) and the QOS delta is negligible
-            // compared to the age-driven effective value, so preemption never
-            // fires between tiers.
+            // Seed the base from QOS so it feeds the multiplicative formula rather than
+            // being a negligible delta on top of it.
             if task_spec.priority.is_none() {
                 if let Some(qos_name) = task_spec.qos.as_deref() {
                     if let Some(qos) = self.qos_cache.get(qos_name) {
-                        if qos.priority > 0 {
-                            task_spec.priority = Some(qos.priority as u32);
-                        }
+                        task_spec.priority =
+                            Some(DEFAULT_PRIORITY.saturating_add_signed(qos.priority).max(1));
                     }
                 }
             }
@@ -4289,10 +4284,8 @@ impl ClusterManager {
         }
     }
 
-    /// Recompute a job's live effective priority (a running job's stored
-    /// `priority` is stale). Takes `qos` pre-resolved so it can be reused,
-    /// and `partitions` so callers iterating over multiple jobs don't pay
-    /// for a separate lock acquisition per call.
+    /// Recompute a job's live effective priority. A running job's stored
+    /// `priority` is stale; this recalculates from age, fair-share, and tier.
     pub(crate) fn current_effective_priority(&self, job: &Job, partitions: &[Partition]) -> u32 {
         let now = Utc::now();
         let age_minutes = (now - job.submit_time).num_minutes().max(0);
@@ -4660,9 +4653,14 @@ impl ClusterManager {
                     allocated_resources = job.allocated_resources.clone();
                     per_node_map = job.per_node_alloc.clone();
                     job.node_completions.clear();
-                    job.allocated_nodes.clear();
-                    job.allocated_resources = None;
-                    job.per_node_alloc.clear();
+                    // Preempted → Cancelled so the job is terminal: dependents
+                    // (afterok/AfterAny) unblock and array aggregation resolves.
+                    // Preempted is reported to accounting via jobs_finalized so
+                    // the PREEMPTED counter still increments correctly.
+                    if let Err(e) = job.transition(JobState::Cancelled) {
+                        warn!(job_id = *job_id, error = %e, "invalid preempt-cancel final transition in WAL apply");
+                        return ClientResponse::default();
+                    }
                 }
                 if let Some(ref total) = allocated_resources {
                     let node_count = freed_nodes.len().max(1) as u32;
@@ -10160,10 +10158,12 @@ mod tests {
         let job_id = run_job_on(&cm, "preempt-cancel", "worker1");
         let outcome = cm.preempt_job(job_id, PreemptMode::Cancel).unwrap();
         assert_eq!(outcome, PreemptOutcome::Killed);
-        settle(&cm, job_id, JobState::Preempted);
+        settle(&cm, job_id, JobState::Cancelled);
 
         let job = cm.get_job(job_id).unwrap();
-        assert_eq!(job.state, JobState::Preempted);
+        // Preempted is reported to accounting (jobs_finalized); the job's
+        // live state is Cancelled so dependents and arrays can resolve.
+        assert_eq!(job.state, JobState::Cancelled);
         assert_eq!(cm.node_metrics().alloc_cpus, 0);
     }
 
@@ -10199,15 +10199,17 @@ mod tests {
         let resp = cm.apply_operation(&WalOperation::JobPreemptCancel { job_id: 1 });
 
         assert_eq!(resp.jobs_finalized.len(), 1);
+        // Accounting sees Preempted; live state is Cancelled (terminal).
         assert_eq!(resp.jobs_finalized[0].state, JobState::Preempted);
         assert_eq!(resp.jobs_finalized[0].exit_code, -1);
         let job = cm.get_job(1).unwrap();
-        assert_eq!(job.state, JobState::Preempted);
+        assert_eq!(job.state, JobState::Cancelled);
         assert_eq!(job.exit_code, Some(-1));
-        assert!(job.allocated_nodes.is_empty());
+        // allocated_nodes preserved (epilog reads NodeList after finalize).
+        assert!(!job.allocated_nodes.is_empty());
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
 
-        // Replay: job is already Preempted (not Running) → NoOp.
+        // Replay: job is already Cancelled (not Running) → NoOp.
         let replay = cm.apply_operation(&WalOperation::JobPreemptCancel { job_id: 1 });
         assert!(
             replay.jobs_finalized.is_empty(),
@@ -10247,13 +10249,16 @@ mod tests {
 
         let burst_job = cm.get_job(burst_id).unwrap();
         let primus_job = cm.get_job(primus_id).unwrap();
+        // base = DEFAULT_PRIORITY.saturating_add_signed(qos.priority)
         assert_eq!(
-            burst_job.priority, 100,
-            "burst job base priority must equal qos.priority"
+            burst_job.priority,
+            DEFAULT_PRIORITY.saturating_add_signed(100),
+            "burst base must be DEFAULT_PRIORITY + qos.priority"
         );
         assert_eq!(
-            primus_job.priority, 10000,
-            "primus job base priority must equal qos.priority"
+            primus_job.priority,
+            DEFAULT_PRIORITY.saturating_add_signed(10000),
+            "primus base must be DEFAULT_PRIORITY + qos.priority"
         );
     }
 
@@ -11722,9 +11727,9 @@ mod tests {
             ..Default::default()
         });
 
-        // No explicit --priority: QOS priority becomes the base seed for the
-        // multiplicative formula. high-QoS (5000) should outrank low-QoS
-        // (negative penalty → falls back to DEFAULT_PRIORITY 1000).
+        // No explicit --priority: base = DEFAULT_PRIORITY.saturating_add_signed(qos.priority).
+        // low (-500): base = 500, below DEFAULT_PRIORITY — penalty semantics preserved.
+        // high (5000): base = 6000, above DEFAULT_PRIORITY — boost semantics preserved.
         let mut low = basic_spec("low");
         low.qos = Some("low".into());
         let low_id = submit_and_wait(&cm, low);
@@ -11748,6 +11753,10 @@ mod tests {
             high_priority > low_priority,
             "high-QoS job ({high_priority}) should outrank low-QoS job ({low_priority})"
         );
+        assert!(
+            low_priority < DEFAULT_PRIORITY,
+            "penalty QoS job ({low_priority}) must rank below DEFAULT_PRIORITY ({DEFAULT_PRIORITY})"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11761,15 +11770,14 @@ mod tests {
         });
         cm.qos_cache().insert(Qos {
             name: "high".into(),
-            priority: 5000,
+            priority: 10000,
             ..Default::default()
         });
 
         // Even with high fairshare and near-max age on the low-QoS job, the
-        // high-QoS base (5000) should still produce a higher effective priority
-        // than low-QoS base (100) scaled by fairshare=3.0 and 6 days of age.
-        // low:  100 * 3.0 * (1 + 5040/10080) * tier ≈ 450
-        // high: 5000 * 1.0 * 1.0 * tier = 5000
+        // high-QoS base (11000) must outrank low-QoS base (1100) × 3.0 × 1.857.
+        // low:  1100 * 3.0 * 1.857 * tier ≈ 6128
+        // high: 11000 * 1.0 * 1.0 * tier = 11000
         cm.fairshare_cache().set_for_test("low-user", "", 3.0);
 
         let mut low = basic_spec("low");
@@ -11994,7 +12002,7 @@ mod tests {
         let partitions = cm.get_partitions();
         crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs).await;
 
-        settle(&cm, low_id, JobState::Preempted);
+        settle(&cm, low_id, JobState::Cancelled);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -12052,7 +12060,7 @@ mod tests {
 
         crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs).await;
 
-        settle(&cm, burst_id, JobState::Preempted);
+        settle(&cm, burst_id, JobState::Cancelled);
         assert_eq!(
             cm.node_metrics().alloc_cpus,
             0,

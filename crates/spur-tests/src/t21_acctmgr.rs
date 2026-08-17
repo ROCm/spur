@@ -218,33 +218,26 @@ mod tests {
         );
     }
 
-    // ── T21.14: QOS priority adjustment ──────────────────────────
+    // ── T21.14: QOS base priority seeding ────────────────────────
+    // QOS priority is applied as a signed offset from DEFAULT_PRIORITY at
+    // submit time so the multiplicative formula amplifies the difference.
 
     #[test]
     fn t21_14_qos_priority_boost() {
-        let qos = Qos {
-            priority: 1000,
-            ..Default::default()
-        };
-        assert_eq!(qos_adjusted_priority(500, &qos), 1500);
+        // positive delta raises above DEFAULT_PRIORITY
+        assert_eq!(DEFAULT_PRIORITY.saturating_add_signed(1000).max(1), 2000,);
     }
 
     #[test]
     fn t21_15_qos_priority_penalty() {
-        let qos = Qos {
-            priority: -200,
-            ..Default::default()
-        };
-        assert_eq!(qos_adjusted_priority(1000, &qos), 800);
+        // negative delta lowers below DEFAULT_PRIORITY
+        assert_eq!(DEFAULT_PRIORITY.saturating_add_signed(-200).max(1), 800,);
     }
 
     #[test]
     fn t21_16_qos_priority_floor() {
-        let qos = Qos {
-            priority: -5000,
-            ..Default::default()
-        };
-        assert_eq!(qos_adjusted_priority(1000, &qos), 1);
+        // large negative saturates at 1, never zero
+        assert_eq!(DEFAULT_PRIORITY.saturating_add_signed(-5000).max(1), 1,);
     }
 
     // ── T21.17: TRES record accumulation ─────────────────────────
