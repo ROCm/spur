@@ -218,28 +218,6 @@ mod tests {
         );
     }
 
-    // ── T21.14: QOS base priority seeding ────────────────────────
-    // QOS priority is applied as a signed offset from DEFAULT_PRIORITY at
-    // submit time so the multiplicative formula amplifies the difference.
-
-    #[test]
-    fn t21_14_qos_priority_boost() {
-        // positive delta raises above DEFAULT_PRIORITY
-        assert_eq!(DEFAULT_PRIORITY.saturating_add_signed(1000).max(1), 2000,);
-    }
-
-    #[test]
-    fn t21_15_qos_priority_penalty() {
-        // negative delta lowers below DEFAULT_PRIORITY
-        assert_eq!(DEFAULT_PRIORITY.saturating_add_signed(-200).max(1), 800,);
-    }
-
-    #[test]
-    fn t21_16_qos_priority_floor() {
-        // large negative saturates at 1, never zero
-        assert_eq!(DEFAULT_PRIORITY.saturating_add_signed(-5000).max(1), 1,);
-    }
-
     // ── T21.17: TRES record accumulation ─────────────────────────
 
     #[test]

@@ -4653,10 +4653,8 @@ impl ClusterManager {
                     allocated_resources = job.allocated_resources.clone();
                     per_node_map = job.per_node_alloc.clone();
                     job.node_completions.clear();
-                    // Preempted → Cancelled so the job is terminal: dependents
-                    // (afterok/AfterAny) unblock and array aggregation resolves.
-                    // Preempted is reported to accounting via jobs_finalized so
-                    // the PREEMPTED counter still increments correctly.
+                    // Cancelled is terminal (dependents/arrays unblock); Preempted
+                    // is reported to accounting via jobs_finalized.
                     if let Err(e) = job.transition(JobState::Cancelled) {
                         warn!(job_id = *job_id, error = %e, "invalid preempt-cancel final transition in WAL apply");
                         return ClientResponse::default();
@@ -12121,6 +12119,45 @@ mod tests {
             burst_job.state,
             JobState::Running,
             "burst job must keep running when both jobs have identical explicit --priority"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_cancel_unblocks_afterok_and_afterany_dependents() {
+        // A cancel-preempted job lands in Cancelled (terminal), so afterok
+        // and afterany dependents must stop waiting and resolve their outcome.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let parent_id = run_job_on(&cm, "parent", "worker1");
+        cm.preempt_job(parent_id, PreemptMode::Cancel).unwrap();
+        settle(&cm, parent_id, JobState::Cancelled);
+
+        // afterok: parent exited non-zero (preempted) → unsatisfiable; watcher cancels it.
+        let mut afterok_child = basic_spec("afterok-child");
+        afterok_child.dependency = vec![format!("afterok:{parent_id}")];
+        let afterok_id = submit_and_wait(&cm, afterok_child);
+
+        // afterany: fires regardless of exit status → satisfied once parent is terminal.
+        let mut afterany_child = basic_spec("afterany-child");
+        afterany_child.dependency = vec![format!("afterany:{parent_id}")];
+        let afterany_id = submit_and_wait(&cm, afterany_child);
+
+        cm.cancel_unsatisfiable_dependency_jobs();
+
+        // afterok cancelled: parent's non-zero exit makes it permanently unsatisfiable.
+        assert_eq!(
+            cm.get_job(afterok_id).unwrap().state,
+            JobState::Cancelled,
+            "afterok dependent must be cancelled after parent was preempted"
+        );
+
+        // afterany unblocked: parent is terminal, dependency is satisfied.
+        // pending_jobs() returns only schedulable (non-blocked) jobs.
+        assert!(
+            cm.pending_jobs().iter().any(|j| j.job_id == afterany_id),
+            "afterany dependent must be schedulable once parent is terminal"
         );
     }
 

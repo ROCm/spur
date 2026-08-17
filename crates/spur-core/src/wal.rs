@@ -127,9 +127,11 @@ pub enum WalOperation {
         job_id: JobId,
         begin_time: chrono::DateTime<chrono::Utc>,
     },
-    /// Preempt a running job with cancel (job ends in PREEMPTED, not requeued).
-    /// Single atomic entry so a leadership change cannot strand the job running
-    /// with its allocations held.
+    /// Preempt a running job with cancel. The job transitions Running →
+    /// Preempted → Cancelled: Preempted is reported to accounting so the
+    /// PREEMPTED counter increments; Cancelled is the terminal live state so
+    /// dependents and arrays resolve. Single atomic entry so a leadership
+    /// change cannot strand the job running with its allocations held.
     JobPreemptCancel {
         job_id: JobId,
     },

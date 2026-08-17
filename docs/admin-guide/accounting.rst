@@ -368,8 +368,9 @@ QOS keys
    * - ``preemptmode``
      - ``off``
      - Preemption behavior when this QOS's jobs are the victim:
-       ``cancel`` (job ends in ``PREEMPTED``), ``requeue`` (returned to
-       pending), ``suspend``, or ``off`` (not preemptable).
+       ``cancel`` (job's terminal state is ``CANCELLED``; ``PREEMPTED`` is
+       recorded in accounting), ``requeue`` (returned to pending),
+       ``suspend``, or ``off`` (not preemptable).
        A job from a higher-``priority`` QOS can preempt a running job from a
        lower-``priority`` QOS when its effective priority exceeds twice the
        victim's.
