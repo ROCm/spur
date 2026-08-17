@@ -22,8 +22,9 @@ use spur_net::address::AddressPool;
 use spur_net::mesh::{MeshMembership, MeshNode};
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::{
-    ClusterNodeStatus, CreateK0sJoinTokenRequest, GetClusterComponentStatusRequest,
-    GetKubeconfigRequest, StartClusterComponentRequest, StopClusterComponentRequest,
+    ClusterNodeStatus, CreateK0sJoinTokenRequest, DeleteK8sNodeRequest, DrainK8sNodeRequest,
+    GetClusterComponentStatusRequest, GetKubeconfigRequest, StartClusterComponentRequest,
+    StopClusterComponentRequest,
 };
 
 use crate::cluster::ClusterManager;
@@ -151,11 +152,12 @@ pub(crate) async fn reconcile_phase(
                 warn!(error = %e, "k0s provisioning assignment failed; will retry next tick");
                 return true;
             }
-            let errors = converge_provisioning(cluster, net, join_tokens).await;
+            let (errors, active_cp) = converge_provisioning(cluster, net, join_tokens).await;
             // converge may have flipped us to Ready this tick; only degrade a still-provisioning
-            // cluster that has blown its deadline.
+            // cluster that has blown its deadline. Reuse converge's control-plane liveness (no second
+            // per-node status sweep).
             if timed_out && cluster.k0s_state().phase == K0sPhase::Provisioning {
-                degrade_stuck_cluster(cluster, net, join_tokens).await;
+                degrade_stuck_cluster(cluster, net, join_tokens, &active_cp).await;
             }
             errors > 0
         }
@@ -673,15 +675,17 @@ fn controller_k0s_config(net: &ClusterNetworking, node: &spur_core::node::Node) 
     )
 }
 
-/// Start any assigned component that is not yet active; when all are active, mark the cluster Ready.
+/// One convergence pass: start any assigned component not yet active and, once the control-plane
+/// quorum is up, mark the cluster Ready (partial-Ready — workers keep converging in the background).
 /// `join_tokens` caches each worker's minted join token across ticks so we mint once per join.
-/// Returns the number of errors encountered this iteration (currently join-token mint failures),
-/// so the reconcile loop can surface them via `spur_k8s_reconcile_errors_total`.
+/// Returns the error count for this pass (currently join-token mint failures, surfaced via
+/// `spur_k8s_reconcile_errors_total`) plus the set of control-plane nodes observed `active` this
+/// pass, so the caller can decide the degrade/Ready edge without a second per-node status sweep.
 async fn converge_provisioning(
     cluster: &ClusterManager,
     net: &ClusterNetworking,
     join_tokens: &mut HashMap<String, String>,
-) -> u64 {
+) -> (u64, HashSet<String>) {
     let mut errors = 0u64;
     let assigned: Vec<_> = cluster
         .get_nodes()
@@ -690,11 +694,13 @@ async fn converge_provisioning(
         .collect();
     if assigned.is_empty() {
         join_tokens.clear();
-        return errors;
+        return (errors, HashSet::new());
     }
     let bootstrap = cluster.k0s_state().bootstrap();
-    let mut all_active = true;
     let mut bootstrap_active = false;
+    // Active control-plane nodes this tick: Ready is gated on their quorum (partial-Ready), not on
+    // every worker being up.
+    let mut active_cp: HashSet<String> = HashSet::new();
     // Bootstrap control-plane first: it seeds etcd (tokenless) and its k0s API must answer before any
     // secondary control-plane or worker can mint a join token. A Single node is always the bootstrap.
     for node in &assigned {
@@ -708,19 +714,22 @@ async fn converge_provisioning(
         }
         if fetch_component_state(cluster, &node.name).await.as_deref() == Some("active") {
             bootstrap_active = true;
+            active_cp.insert(node.name.clone());
             clear_node_error(cluster, node);
             continue;
         }
-        all_active = false;
         // Mesh-native cluster: generate the k0s config (api on the mesh IP + Calico bird) when
         // cni=calico; None keeps the default kube-router. The bootstrap seeds etcd — no join token.
         let k0s_config = controller_k0s_config(net, node);
         spawn_start_component(cluster, &node.name, role, None, k0s_config, None);
     }
-    // Don't touch secondary CPs / workers until the bootstrap's etcd is seeded and its API answers:
-    // a controller token minted before then would race the quorum. Retry on the next tick.
+    // Don't mint join tokens for secondary CPs / workers until the bootstrap's etcd is seeded and its
+    // API answers: a controller token minted before then would race the quorum. But if a quorum of
+    // control planes is already active (e.g. the bootstrap died after secondaries joined), the cluster
+    // is still usable — flip it Ready before returning rather than pinning it in Provisioning forever.
     if !bootstrap_active {
-        return errors;
+        maybe_mark_ready(cluster, &active_cp);
+        return (errors, active_cp);
     }
     // Secondary CPs join the etcd quorum with a `controller` token, then workers with a `worker`
     // token; both mint from a healthy CP agent, and a minting error just retries next tick.
@@ -732,10 +741,12 @@ async fn converge_provisioning(
         }
         if fetch_component_state(cluster, &node.name).await.as_deref() == Some("active") {
             join_tokens.remove(&node.name); // joined — drop the cached token
+            if role == K0sRole::Controller {
+                active_cp.insert(node.name.clone());
+            }
             clear_node_error(cluster, node);
             continue;
         }
-        all_active = false;
         let token_role = if role == K0sRole::Controller {
             "controller"
         } else {
@@ -771,15 +782,68 @@ async fn converge_provisioning(
         };
         spawn_start_component(cluster, &node.name, role, Some(token), k0s_config, node_ip);
     }
-    // Only transition on the edge — this reconcile also runs every tick while already Ready (to
-    // heal re-added nodes), so an unconditional set would churn a WAL write + log line each tick.
-    if all_active && cluster.k0s_state().phase != K0sPhase::Ready {
+    maybe_mark_ready(cluster, &active_cp);
+    (errors, active_cp)
+}
+
+/// Flip the cluster to `Ready` on the edge when the control-plane quorum is active (partial-Ready).
+/// A cluster whose control plane is up is usable; stragglers keep converging on later ticks (the
+/// reconcile loop also runs while Ready). Only transitions on the edge, so an already-Ready cluster
+/// does not churn a WAL write + log line each tick. Shared by both the bootstrap-down early return
+/// and the end of `converge_provisioning` so the quorum decision lives in one place.
+fn maybe_mark_ready(cluster: &ClusterManager, active_cp: &HashSet<String>) {
+    let cp_set = cluster.k0s_state().controllers();
+    if control_plane_quorum_met(&cp_set, active_cp) && cluster.k0s_state().phase != K0sPhase::Ready
+    {
         match cluster.set_k0s_phase(K0sPhase::Ready, None, Vec::new(), Vec::new(), false) {
-            Ok(()) => info!("k0s cluster converged: all components active -> Ready"),
+            Ok(()) => info!(
+                control_planes_active = active_cp.len(),
+                "k0s control-plane quorum reached -> Ready (workers converge in background)"
+            ),
             Err(e) => warn!(error = %e, "failed to mark k0s cluster Ready"),
         }
     }
-    errors
+}
+
+/// Whether a quorum of the control-plane set has its k0s unit `active`: at least `quorum(cp_set.len())`
+/// of the control-plane nodes are in `active`. This is measured from systemd unit liveness (a proxy
+/// for etcd quorum, not a direct etcd health check) and is what makes the cluster usable, so the
+/// reconcile loop gates `Ready` on it (partial-Ready: workers converge in background). An empty
+/// control-plane set is never a quorum.
+fn control_plane_quorum_met(cp_set: &[String], active: &HashSet<String>) -> bool {
+    let need = spur_core::k0s::quorum(cp_set.len());
+    if need == 0 {
+        return false;
+    }
+    let have = cp_set.iter().filter(|n| active.contains(*n)).count();
+    have >= need
+}
+
+/// Union `add` into the current member set, sorted + deduped. Used to grow a scoped cluster's
+/// `member_nodes` online (`spur k8s add-nodes`). Adding an already-present node is a no-op. Callers
+/// must not use this to "add" to a whole-inventory cluster (empty `member_nodes` = all nodes) — that
+/// would narrow the scope; the RPC handler guards that case.
+pub(crate) fn merge_member_nodes(current: &[String], add: &[String]) -> Vec<String> {
+    let mut set: HashSet<String> = current.iter().cloned().collect();
+    set.extend(add.iter().cloned());
+    let mut out: Vec<String> = set.into_iter().collect();
+    out.sort();
+    out
+}
+
+/// Remove `drop` from the current member set, keeping it sorted. Used to shrink a scoped cluster's
+/// `member_nodes` online (`spur k8s remove-nodes`). Removing an absent node is a no-op. Note: this
+/// can return an empty vec — the caller must not let a scoped cluster shrink to empty, since empty
+/// `member_nodes` means "whole inventory" (the RPC handler guards that).
+pub(crate) fn subtract_member_nodes(current: &[String], drop: &[String]) -> Vec<String> {
+    let drop: HashSet<&String> = drop.iter().collect();
+    let mut out: Vec<String> = current
+        .iter()
+        .filter(|n| !drop.contains(n))
+        .cloned()
+        .collect();
+    out.sort();
+    out
 }
 
 /// Drop a node's stale degrade reason once it is healthy again, so status reports honestly on retry.
@@ -793,14 +857,35 @@ fn clear_node_error(cluster: &ClusterManager, node: &spur_core::node::Node) {
     }
 }
 
-/// Provisioning blew its deadline: record why each non-active node blocked convergence, stop its
-/// half-started unit (non-reset, keeping the role so `spur k8s up` can retry), then mark `degraded`.
+/// Provisioning blew its deadline. Decide by control-plane quorum (partial-Ready), reusing the
+/// `active_cp` liveness `converge_provisioning` already gathered this tick (no second status sweep):
+/// if a quorum of control planes is active the cluster is usable, so flip it `Ready` right here (the
+/// converge early-return path may not have) and let the stragglers keep converging. Only when the
+/// quorum is unmet is the cluster truly stuck — record each non-active node's reason, stop its
+/// half-started unit (non-reset, keeping the role so `spur k8s up` can retry), and mark `Degraded`.
 async fn degrade_stuck_cluster(
     cluster: &ClusterManager,
     net: &ClusterNetworking,
     join_tokens: &mut HashMap<String, String>,
+    active_cp: &HashSet<String>,
 ) {
     let timeout_secs = net.provisioning_timeout.as_secs();
+
+    // Partial-Ready: a control-plane quorum means the cluster is usable. Flip Ready (idempotent on
+    // the edge) instead of degrading, and leave the stragglers converging.
+    let cp_set = cluster.k0s_state().controllers();
+    if control_plane_quorum_met(&cp_set, active_cp) {
+        maybe_mark_ready(cluster, active_cp);
+        warn!(
+            timeout_secs,
+            "k0s provisioning past deadline but control-plane quorum holds; \
+             staying up, stragglers keep converging (see `spur k8s status` for per-node reasons)"
+        );
+        return;
+    }
+
+    // Control-plane quorum is unmet: the cluster genuinely cannot come up. Record why each non-active
+    // node blocked convergence, stop its half-started unit (keep the role for a retry), and degrade.
     for node in cluster.get_nodes() {
         if node.k0s_role.is_none() {
             continue;
@@ -821,9 +906,142 @@ async fn degrade_stuck_cluster(
     match cluster.set_k0s_phase(K0sPhase::Degraded, None, Vec::new(), Vec::new(), false) {
         Ok(()) => warn!(
             timeout_secs,
-            "k0s provisioning timed out -> Degraded; see `spur k8s status` for per-node reasons"
+            "k0s provisioning timed out with no control-plane quorum -> Degraded; \
+             see `spur k8s status` for per-node reasons"
         ),
         Err(e) => warn!(error = %e, "failed to mark k0s cluster Degraded"),
+    }
+}
+
+/// Upper bound on a k8s drain RPC: the caller's per-node drain timeout plus slack for the eviction
+/// round-trip, so a black-holed control-plane agent can't pin the removal handler indefinitely.
+const DRAIN_RPC_SLACK: Duration = Duration::from_secs(30);
+
+/// Cordon + drain a worker's pods via a control-plane agent (which holds the admin kubeconfig). The
+/// agent reports a blocked/timed-out drain in-band (`drained=false`); we return that as an error so
+/// the caller can decide (retry, or proceed under `--force`). `force` is passed through to the agent
+/// (kubectl `--force --disable-eviction`). The whole RPC is bounded (drain timeout + slack) so a
+/// hung agent can't stall the serial removal loop.
+pub(crate) async fn drain_via_control_plane(
+    cluster: &ClusterManager,
+    node: &str,
+    timeout_secs: u32,
+    force: bool,
+) -> anyhow::Result<()> {
+    let mut client = connect_control_plane(cluster).await?;
+    let agent_default = 120u32;
+    let bound = Duration::from_secs(u64::from(if timeout_secs == 0 {
+        agent_default
+    } else {
+        timeout_secs
+    })) + DRAIN_RPC_SLACK;
+    let resp = tokio::time::timeout(
+        bound,
+        client.drain_k8s_node(DrainK8sNodeRequest {
+            node: node.to_string(),
+            timeout_secs,
+            force,
+        }),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("drain_k8s_node RPC for {node} timed out"))?
+    .map_err(|e| anyhow::anyhow!("drain_k8s_node RPC failed: {e}"))?
+    .into_inner();
+    if !resp.drained {
+        anyhow::bail!("drain of {node} did not complete: {}", resp.message);
+    }
+    Ok(())
+}
+
+/// Delete a drained+stopped worker's k8s Node object via a control-plane agent. Runs AFTER the
+/// component is stopped so the kubelet can't re-register a fresh (uncordoned) node in the gap.
+async fn delete_node_via_control_plane(cluster: &ClusterManager, node: &str) -> anyhow::Result<()> {
+    let mut client = connect_control_plane(cluster).await?;
+    let resp = tokio::time::timeout(
+        AGENT_TIMEOUT,
+        client.delete_k8s_node(DeleteK8sNodeRequest {
+            node: node.to_string(),
+        }),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("delete_k8s_node RPC for {node} timed out"))?
+    .map_err(|e| anyhow::anyhow!("delete_k8s_node RPC failed: {e}"))?
+    .into_inner();
+    if !resp.deleted {
+        anyhow::bail!("delete of node {node} did not complete: {}", resp.message);
+    }
+    Ok(())
+}
+
+/// Await a StopClusterComponent on a single node (ordered, unlike the fire-and-forget
+/// `spawn_stop_component`). Used by online remove, where declassify must not race the stop. The dial
+/// and RPC are bounded so a black-holed agent can't hang the removal handler. Returns an error if
+/// the RPC fails or the agent reports the stop/reset did not complete.
+async fn stop_component_now(
+    cluster: &ClusterManager,
+    node: &str,
+    reset: bool,
+) -> anyhow::Result<()> {
+    let endpoint = agent_endpoint(cluster, node)
+        .ok_or_else(|| anyhow::anyhow!("{node} has no agent address"))?;
+    let fut = async {
+        let mut client = SlurmAgentClient::connect(endpoint)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to agent {node} failed: {e}"))?;
+        client
+            .stop_cluster_component(StopClusterComponentRequest { reset })
+            .await
+            .map_err(|e| anyhow::anyhow!("stop_cluster_component {node} failed: {e}"))
+    };
+    let r = tokio::time::timeout(AGENT_TIMEOUT, fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("stop_cluster_component {node} timed out"))??
+        .into_inner();
+    if !r.stopped {
+        anyhow::bail!("stop/reset of {node} did not complete: {}", r.message);
+    }
+    Ok(())
+}
+
+/// Gracefully remove a worker: drain, then stop+reset, then delete the Node object, then declassify.
+/// The ordering matters — see the step comments — and the caller must drop it from `member_nodes`
+/// first (re-adding on failure) so the reconcile loop never re-enrolls a mid-removal node.
+pub(crate) async fn remove_worker(
+    cluster: &ClusterManager,
+    node: &str,
+    drain_timeout_secs: u32,
+    force: bool,
+) -> anyhow::Result<()> {
+    if let Err(e) = drain_via_control_plane(cluster, node, drain_timeout_secs, force).await {
+        if !force {
+            record_remove_error(cluster, node, &format!("drain failed: {e}"));
+            return Err(e);
+        }
+        warn!(node = %node, error = %e, "drain did not complete; proceeding under --force");
+    }
+    // Stop+reset before deleting the Node object: a delete while the kubelet still runs lets it
+    // re-register an uncordoned node.
+    if let Err(e) = stop_component_now(cluster, node, true).await {
+        record_remove_error(cluster, node, &format!("stop/reset failed: {e}"));
+        return Err(e);
+    }
+    if let Err(e) = delete_node_via_control_plane(cluster, node).await {
+        record_remove_error(cluster, node, &format!("node delete failed: {e}"));
+        return Err(e);
+    }
+    cluster.clear_node_k0s(node).map_err(|e| {
+        record_remove_error(cluster, node, &format!("declassify failed: {e}"));
+        anyhow::anyhow!("clear k0s role for {node}: {e}")
+    })?;
+    info!(node = %node, "worker removed from k0s cluster (drained + reset + deleted + declassified)");
+    Ok(())
+}
+
+/// Record why a worker removal did not finish, so `spur k8s status` shows the reason instead of the
+/// node silently sitting in a half-removed state. Best-effort — a failed write is only logged.
+fn record_remove_error(cluster: &ClusterManager, node: &str, reason: &str) {
+    if let Err(e) = cluster.set_node_k0s_error(node, Some(reason.to_string())) {
+        warn!(node = %node, error = %e, "failed to record k0s remove error");
     }
 }
 
@@ -988,6 +1206,91 @@ pub async fn live_node_statuses(cluster: &ClusterManager) -> Vec<ClusterNodeStat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn active_set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn cp_quorum_met_for_single_cp() {
+        let cp = vec!["cp-1".to_string()];
+        assert!(control_plane_quorum_met(&cp, &active_set(&["cp-1"])));
+        assert!(!control_plane_quorum_met(&cp, &active_set(&[])));
+    }
+
+    #[test]
+    fn cp_quorum_met_needs_majority_of_three() {
+        let cp = vec!["cp-1".to_string(), "cp-2".to_string(), "cp-3".to_string()];
+        // 2 of 3 is quorum; 1 of 3 is not.
+        assert!(control_plane_quorum_met(
+            &cp,
+            &active_set(&["cp-1", "cp-2"])
+        ));
+        assert!(!control_plane_quorum_met(&cp, &active_set(&["cp-1"])));
+        // A down worker does not affect the count; extra actives outside the CP set are ignored.
+        assert!(control_plane_quorum_met(
+            &cp,
+            &active_set(&["cp-1", "cp-3", "worker-9"])
+        ));
+    }
+
+    #[test]
+    fn cp_quorum_met_needs_majority_of_five() {
+        let cp: Vec<String> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(control_plane_quorum_met(&cp, &active_set(&["a", "b", "c"])));
+        assert!(!control_plane_quorum_met(&cp, &active_set(&["a", "b"])));
+    }
+
+    #[test]
+    fn cp_quorum_not_met_for_empty_cp_set() {
+        assert!(!control_plane_quorum_met(&[], &active_set(&[])));
+    }
+
+    #[test]
+    fn merge_member_nodes_unions_and_sorts() {
+        let cur = names(&["b", "a"]);
+        let add = names(&["c", "a"]); // "a" already present
+        assert_eq!(merge_member_nodes(&cur, &add), names(&["a", "b", "c"]));
+    }
+
+    #[test]
+    fn merge_member_nodes_all_present_is_unchanged() {
+        let cur = names(&["a", "b"]);
+        assert_eq!(merge_member_nodes(&cur, &names(&["a"])), names(&["a", "b"]));
+    }
+
+    #[test]
+    fn subtract_member_nodes_removes_and_keeps_sorted() {
+        let cur = names(&["a", "b", "c"]);
+        assert_eq!(
+            subtract_member_nodes(&cur, &names(&["b"])),
+            names(&["a", "c"])
+        );
+    }
+
+    #[test]
+    fn subtract_member_nodes_absent_is_unchanged() {
+        let cur = names(&["a", "c"]);
+        assert_eq!(
+            subtract_member_nodes(&cur, &names(&["x"])),
+            names(&["a", "c"])
+        );
+    }
+
+    #[test]
+    fn subtract_member_nodes_can_empty_the_set() {
+        // Pure-function contract: subtraction can return empty. Preventing a scoped cluster from
+        // actually shrinking to empty (which would flip it to whole-inventory) is the handler's job —
+        // see `cluster_remove_nodes_rejects_emptying_the_member_set` in server.rs.
+        let cur = names(&["a"]);
+        assert_eq!(
+            subtract_member_nodes(&cur, &names(&["a"])),
+            Vec::<String>::new()
+        );
+    }
 
     #[test]
     fn provisioning_clock_arms_then_trips_at_deadline() {

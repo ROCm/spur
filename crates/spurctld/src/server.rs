@@ -2572,6 +2572,224 @@ impl SlurmController for ControllerService {
         }))
     }
 
+    async fn cluster_add_nodes(
+        &self,
+        request: Request<ClusterAddNodesRequest>,
+    ) -> Result<Response<ClusterAddNodesResponse>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            match self.leader_proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.cluster_add_nodes(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward cluster_add_nodes to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+        let req = request.into_inner();
+        if !is_k0s_admin(self.cluster.association_cache(), &req.caller) {
+            return Err(Status::permission_denied(
+                "k0s cluster add-nodes requires cluster admin",
+            ));
+        }
+
+        let state = self.cluster.k0s_state();
+        // Online add only makes sense on a running cluster.
+        if !matches!(
+            state.phase,
+            spur_core::k0s::K0sPhase::Ready | spur_core::k0s::K0sPhase::Provisioning
+        ) {
+            return Err(Status::failed_precondition(
+                "cluster is not up; use `spur k8s up` to start it",
+            ));
+        }
+        // A whole-inventory cluster (empty member_nodes) already enrolls every registered node, so a
+        // node added later is picked up automatically — narrowing to an explicit set here would drop
+        // the others. Direct the operator to the mechanism that already works.
+        if state.member_nodes.is_empty() {
+            return Err(Status::failed_precondition(
+                "cluster enrolls all nodes; a newly-registered node joins automatically \
+                 (no add-nodes needed on a whole-inventory cluster)",
+            ));
+        }
+
+        // Resolve the requested nodes with the same union semantics as `spur k8s up` scope flags.
+        let all_nodes = self.cluster.get_nodes();
+        let requested = crate::cluster_k8s::resolve_member_nodes(
+            &all_nodes,
+            &req.nodes,
+            &req.partition,
+            &req.selector,
+        )
+        .map_err(Status::invalid_argument)?;
+        if requested.is_empty() {
+            return Err(Status::invalid_argument(
+                "no nodes selected; pass --nodes, --partition, or --selector",
+            ));
+        }
+        // Adding a control-plane node would change the etcd quorum topology — out of scope here.
+        let controller_set = state.controllers();
+        let controllers: std::collections::HashSet<&String> = controller_set.iter().collect();
+        for n in &requested {
+            if controllers.contains(n) {
+                return Err(Status::invalid_argument(format!(
+                    "node {n} is a control plane; online control-plane changes are not supported \
+                     (tear down with `spur k8s down --reset` to re-elect)"
+                )));
+            }
+        }
+
+        self.cluster
+            .add_k0s_member_nodes(requested.clone())
+            .map_err(|e| Status::internal(format!("add k0s member nodes: {e}")))?;
+        Ok(Response::new(ClusterAddNodesResponse {
+            accepted: true,
+            message: format!("added {} node(s) to the cluster", requested.len()),
+            nodes: crate::cluster_k8s::node_statuses(&self.cluster),
+        }))
+    }
+
+    async fn cluster_remove_nodes(
+        &self,
+        request: Request<ClusterRemoveNodesRequest>,
+    ) -> Result<Response<ClusterRemoveNodesResponse>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            match self.leader_proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.cluster_remove_nodes(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward cluster_remove_nodes to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+        let req = request.into_inner();
+        if !is_k0s_admin(self.cluster.association_cache(), &req.caller) {
+            return Err(Status::permission_denied(
+                "k0s cluster remove-nodes requires cluster admin",
+            ));
+        }
+
+        let state = self.cluster.k0s_state();
+        if !matches!(
+            state.phase,
+            spur_core::k0s::K0sPhase::Ready | spur_core::k0s::K0sPhase::Provisioning
+        ) {
+            return Err(Status::failed_precondition(
+                "cluster is not up; nothing to remove",
+            ));
+        }
+        // A whole-inventory cluster (empty member_nodes) enrolls every registered node, so a removed
+        // node would just be re-enrolled by the next reconcile. Removal only makes sense for a scoped
+        // cluster, where the node can actually leave the member set.
+        if state.member_nodes.is_empty() {
+            return Err(Status::failed_precondition(
+                "cluster enrolls all nodes; remove-nodes needs a scoped cluster \
+                 (use `spur node remove` to decommission a host from SPUR entirely)",
+            ));
+        }
+
+        // Expand the hostlist; every name must be a registered node.
+        let requested = spur_core::hostlist::expand(&req.nodes)
+            .map_err(|e| Status::invalid_argument(format!("invalid --nodes hostlist: {e}")))?;
+        if requested.is_empty() {
+            return Err(Status::invalid_argument("no nodes selected; pass --nodes"));
+        }
+        // Guard against emptying the member set: an empty member_nodes means "whole inventory", so
+        // removing every member would flip the scope and re-enroll the very nodes just removed.
+        // Checked before the per-node loop so it fires ahead of the control-plane reject.
+        let requested_set: std::collections::HashSet<&String> = requested.iter().collect();
+        if state.member_nodes.iter().all(|m| requested_set.contains(m)) {
+            return Err(Status::failed_precondition(
+                "removing these nodes would empty the cluster; tear it down with \
+                 `spur k8s down` instead of removing every member",
+            ));
+        }
+        let registered: std::collections::HashSet<String> = self
+            .cluster
+            .get_nodes()
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        let controller_set = state.controllers();
+        let controllers: std::collections::HashSet<&String> = controller_set.iter().collect();
+        let force = req.force.unwrap_or(false);
+        for n in &requested {
+            if !registered.contains(n) {
+                return Err(Status::invalid_argument(format!(
+                    "node {n} is not a registered node"
+                )));
+            }
+            // Only nodes actually enrolled in this (scoped) cluster can be removed — otherwise an
+            // out-of-scope registered node could be drained + `k0s reset` destructively for nothing.
+            if !state.is_member(n) {
+                return Err(Status::invalid_argument(format!(
+                    "node {n} is not a member of this cluster"
+                )));
+            }
+            // A control-plane node can't be removed here — that changes etcd quorum (out of scope).
+            if controllers.contains(n) {
+                return Err(Status::invalid_argument(format!(
+                    "node {n} is a control plane; online control-plane changes are not supported \
+                     (tear down with `spur k8s down --reset` to change the control plane)"
+                )));
+            }
+            // Refuse a busy node unless forced (Slurm `scontrol delete` semantics).
+            if !force && self.cluster.node_has_running_jobs(n) {
+                return Err(Status::failed_precondition(format!(
+                    "node {n} has running jobs; drain them or pass --force to skip this check"
+                )));
+            }
+        }
+
+        // Drive removal per node. Drop each node from the member set BEFORE draining it, re-adding it
+        // only if removal fails: while a node is a member with no role, `provision_assignments` would
+        // re-enroll and restart the very component being torn down (RECONCILE_INTERVAL 30s vs a 120s
+        // drain makes that the norm, not a race — and a leader flip after the loop would strand it).
+        let timeout = req.drain_timeout_secs.unwrap_or(0);
+        let mut removed: Vec<String> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+        for n in &requested {
+            if let Err(e) = self.cluster.remove_k0s_member_nodes(vec![n.clone()]) {
+                failures.push(format!("{n}: could not update membership: {e}"));
+                continue;
+            }
+            match crate::cluster_k8s::remove_worker(&self.cluster, n, timeout, force).await {
+                Ok(()) => removed.push(n.clone()),
+                Err(e) => {
+                    // Removal failed — put it back in scope so the reconcile loop keeps managing it
+                    // rather than leaving a stranded, unmanaged node.
+                    if let Err(re) = self.cluster.add_k0s_member_nodes(vec![n.clone()]) {
+                        warn!(node = %n, error = %re, "failed to restore member after remove error");
+                    }
+                    failures.push(format!("{n}: {e}"));
+                }
+            }
+        }
+
+        let message = if failures.is_empty() {
+            format!("removed {} node(s) from the cluster", removed.len())
+        } else {
+            format!(
+                "removed {} node(s); {} failed: {}",
+                removed.len(),
+                failures.len(),
+                failures.join("; ")
+            )
+        };
+        Ok(Response::new(ClusterRemoveNodesResponse {
+            accepted: failures.is_empty(),
+            message,
+            nodes: crate::cluster_k8s::live_node_statuses(&self.cluster).await,
+        }))
+    }
+
     async fn cluster_down(
         &self,
         request: Request<ClusterDownRequest>,
@@ -4810,6 +5028,190 @@ mod tests {
                 "10.42.0.0/24",
             )
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_add_nodes_unions_into_scoped_member_set() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        // Scoped to {node-a, node-b}; node-c is registered but out of scope.
+        scoped_assigned_cluster(&svc).await;
+        let resp = svc
+            .cluster_add_nodes(Request::new(ClusterAddNodesRequest {
+                nodes: "node-c".into(),
+                caller: "root".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect("add-nodes accepted")
+            .into_inner();
+        assert!(resp.accepted);
+        assert_eq!(
+            svc.cluster.k0s_state().member_nodes,
+            vec!["node-a", "node-b", "node-c"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_add_nodes_rejected_on_whole_inventory_cluster() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        for (i, n) in ["node-a", "node-b"].iter().enumerate() {
+            register_plain_node(&svc, n, 6818 + i as u16).await;
+        }
+        // Whole-inventory up (empty member_nodes) — new nodes auto-enroll, so add-nodes is rejected.
+        svc.cluster
+            .set_k0s_phase(
+                spur_core::k0s::K0sPhase::Ready,
+                Some("node-a".into()),
+                vec!["node-a".into()],
+                Vec::new(),
+                false,
+            )
+            .unwrap();
+        let err = svc
+            .cluster_add_nodes(Request::new(ClusterAddNodesRequest {
+                nodes: "node-b".into(),
+                caller: "root".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("add-nodes on a whole-inventory cluster must be rejected");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_add_nodes_rejects_control_plane_node() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        scoped_assigned_cluster(&svc).await; // control plane = node-a
+        let err = svc
+            .cluster_add_nodes(Request::new(ClusterAddNodesRequest {
+                nodes: "node-a".into(),
+                caller: "root".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("adding a control-plane node must be rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_remove_nodes_rejects_control_plane_node() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        scoped_assigned_cluster(&svc).await; // control plane = node-a
+        let err = svc
+            .cluster_remove_nodes(Request::new(ClusterRemoveNodesRequest {
+                nodes: "node-a".into(),
+                caller: "root".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("removing a control-plane node must be rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_remove_nodes_rejects_unregistered_node() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        scoped_assigned_cluster(&svc).await;
+        let err = svc
+            .cluster_remove_nodes(Request::new(ClusterRemoveNodesRequest {
+                nodes: "ghost".into(),
+                caller: "root".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("removing an unregistered node must be rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_remove_nodes_rejected_when_down() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        for (i, n) in ["node-a", "node-b"].iter().enumerate() {
+            register_plain_node(&svc, n, 6818 + i as u16).await;
+        }
+        // Cluster never brought up (phase Down) — nothing to remove.
+        let err = svc
+            .cluster_remove_nodes(Request::new(ClusterRemoveNodesRequest {
+                nodes: "node-b".into(),
+                caller: "root".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("remove on a down cluster must be rejected");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_remove_nodes_denied_for_non_admin_caller() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        scoped_assigned_cluster(&svc).await;
+        let err = svc
+            .cluster_remove_nodes(Request::new(ClusterRemoveNodesRequest {
+                nodes: "node-b".into(),
+                caller: "mallory".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("non-admin must not remove nodes");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_remove_nodes_rejected_on_whole_inventory_cluster() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        for (i, n) in ["node-a", "node-b"].iter().enumerate() {
+            register_plain_node(&svc, n, 6818 + i as u16).await;
+        }
+        // Whole-inventory up (empty member_nodes) — a removed node would just re-enroll, so reject.
+        svc.cluster
+            .set_k0s_phase(
+                spur_core::k0s::K0sPhase::Ready,
+                Some("node-a".into()),
+                vec!["node-a".into()],
+                Vec::new(),
+                false,
+            )
+            .unwrap();
+        let err = svc
+            .cluster_remove_nodes(Request::new(ClusterRemoveNodesRequest {
+                nodes: "node-b".into(),
+                caller: "root".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("remove on a whole-inventory cluster must be rejected");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_remove_nodes_rejects_emptying_the_member_set() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        // Scoped to exactly {node-a (CP), node-b}; removing node-b alone is fine, but requesting the
+        // whole member set must be refused rather than flip the cluster to whole-inventory.
+        scoped_assigned_cluster(&svc).await;
+        let err = svc
+            .cluster_remove_nodes(Request::new(ClusterRemoveNodesRequest {
+                nodes: "node-a,node-b".into(),
+                caller: "root".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("removing every member must be rejected");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message().contains("would empty the cluster"),
+            "unexpected error: {}",
+            err.message()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

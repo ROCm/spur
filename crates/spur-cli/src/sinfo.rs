@@ -537,6 +537,8 @@ mod tests {
         cluster_down(pb::ClusterDownRequest) -> pb::ClusterDownResponse;
         cluster_status(pb::ClusterStatusRequest) -> pb::ClusterStatusResponse;
         cluster_kubeconfig(pb::ClusterKubeconfigRequest) -> pb::ClusterKubeconfigResponse;
+        cluster_add_nodes(pb::ClusterAddNodesRequest) -> pb::ClusterAddNodesResponse;
+        cluster_remove_nodes(pb::ClusterRemoveNodesRequest) -> pb::ClusterRemoveNodesResponse;
     }
 
     #[tokio::test]

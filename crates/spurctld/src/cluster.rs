@@ -2569,6 +2569,23 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Grow a scoped k0s cluster's member set online: union `nodes` into `member_nodes` (idempotent).
+    /// The reconcile loop enrolls the newly-in-scope nodes on its next tick. Caller must ensure the
+    /// cluster is scoped (non-empty `member_nodes`) — adding to a whole-inventory cluster would
+    /// narrow it (see the `cluster_add_nodes` handler guard).
+    pub fn add_k0s_member_nodes(&self, nodes: Vec<String>) -> anyhow::Result<()> {
+        self.propose(WalOperation::K0sMemberNodesAdd { nodes })?;
+        Ok(())
+    }
+
+    /// Shrink a scoped k0s cluster's member set online: subtract `nodes` from `member_nodes`
+    /// (idempotent). Caller must ensure the cluster stays scoped (non-empty `member_nodes`) — an
+    /// empty set means whole-inventory (see the `cluster_remove_nodes` handler guard).
+    pub fn remove_k0s_member_nodes(&self, nodes: Vec<String>) -> anyhow::Result<()> {
+        self.propose(WalOperation::K0sMemberNodesRemove { nodes })?;
+        Ok(())
+    }
+
     /// snapshot of the current cluster-wide k0s state.
     pub fn k0s_state(&self) -> spur_core::k0s::K0sClusterState {
         self.k0s.read().clone()
@@ -2727,6 +2744,19 @@ impl ClusterManager {
         Ok((target_state, running_count))
     }
 
+    /// Whether `name` has any job holding an allocation (Running/Completing/Suspended). Shared by
+    /// `remove_node` (inventory) and `cluster_remove_nodes` (k0s membership) so both refuse to yank a
+    /// busy node without `--force` using the same rule.
+    pub fn node_has_running_jobs(&self, name: &str) -> bool {
+        let jobs = self.jobs.read();
+        jobs.values().any(|j| {
+            matches!(
+                j.state,
+                JobState::Running | JobState::Completing | JobState::Suspended
+            ) && j.allocated_nodes.iter().any(|n| n == name)
+        })
+    }
+
     /// Remove a node from the cluster. If `force`, evict running jobs first.
     /// Returns finalized jobs from eviction so callers can send cancel RPCs.
     pub fn remove_node(
@@ -2741,20 +2771,11 @@ impl ClusterManager {
                 anyhow::bail!("node '{}' not found", name);
             }
         }
-        if !force {
-            let jobs = self.jobs.read();
-            let has_running = jobs.values().any(|j| {
-                matches!(
-                    j.state,
-                    JobState::Running | JobState::Completing | JobState::Suspended
-                ) && j.allocated_nodes.iter().any(|n| n == name)
-            });
-            if has_running {
-                anyhow::bail!(
-                    "node '{}' has running jobs; use --force to evict them",
-                    name
-                );
-            }
+        if !force && self.node_has_running_jobs(name) {
+            anyhow::bail!(
+                "node '{}' has running jobs; use --force to evict them",
+                name
+            );
         }
 
         let resp = self.propose(WalOperation::NodeRemove {
@@ -5407,6 +5428,15 @@ impl ClusterManager {
                 if let Some(node) = nodes.get_mut(name) {
                     node.k0s_last_error = error.clone();
                 }
+            }
+            WalOperation::K0sMemberNodesAdd { nodes: add } => {
+                let mut k0s = self.k0s.write();
+                k0s.member_nodes = crate::cluster_k8s::merge_member_nodes(&k0s.member_nodes, add);
+            }
+            WalOperation::K0sMemberNodesRemove { nodes: drop } => {
+                let mut k0s = self.k0s.write();
+                k0s.member_nodes =
+                    crate::cluster_k8s::subtract_member_nodes(&k0s.member_nodes, drop);
             }
             WalOperation::K0sSetPhase {
                 phase,
@@ -14729,6 +14759,34 @@ mod tests {
             cm.get_node("node-c").and_then(|n| n.k0s_role).is_none(),
             "out-of-scope node must stay un-roled and schedulable"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn k0s_member_nodes_add_and_remove_apply() {
+        use spur_core::k0s::K0sPhase;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.set_k0s_phase(
+            K0sPhase::Ready,
+            Some("cp".into()),
+            vec!["cp".into()],
+            vec!["cp".into(), "w1".into()],
+            false,
+        )
+        .unwrap();
+        wait_for("scope recorded", || cm.k0s_state().member_nodes.len() == 2);
+
+        // Add unions in (sorted, deduped).
+        cm.add_k0s_member_nodes(vec!["w2".into(), "w1".into()])
+            .unwrap();
+        wait_for("w2 added", || cm.k0s_state().member_nodes.len() == 3);
+        assert_eq!(cm.k0s_state().member_nodes, vec!["cp", "w1", "w2"]);
+
+        // Remove subtracts (idempotent — removing an absent node is a no-op).
+        cm.remove_k0s_member_nodes(vec!["w1".into(), "ghost".into()])
+            .unwrap();
+        wait_for("w1 removed", || cm.k0s_state().member_nodes.len() == 2);
+        assert_eq!(cm.k0s_state().member_nodes, vec!["cp", "w2"]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

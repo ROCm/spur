@@ -751,6 +751,24 @@ impl SlurmAgent for VirtualAgent {
         ))
     }
 
+    async fn drain_k8s_node(
+        &self,
+        _request: Request<DrainK8sNodeRequest>,
+    ) -> Result<Response<DrainK8sNodeResponse>, Status> {
+        Err(Status::unimplemented(
+            "cluster components not supported for K8s agent",
+        ))
+    }
+
+    async fn delete_k8s_node(
+        &self,
+        _request: Request<DeleteK8sNodeRequest>,
+    ) -> Result<Response<DeleteK8sNodeResponse>, Status> {
+        Err(Status::unimplemented(
+            "cluster components not supported for K8s agent",
+        ))
+    }
+
     async fn get_kubeconfig(
         &self,
         _request: Request<GetKubeconfigRequest>,

@@ -218,6 +218,33 @@ pub fn validate_control_plane_replicas(replicas: u32) -> Result<(), String> {
     ))
 }
 
+/// The majority of `n` (`n/2 + 1`) — the number of control planes whose k0s unit must be active for
+/// the reconcile loop to gate `Ready` (a proxy for etcd quorum, not a direct etcd health check).
+/// `quorum(0)` is 0 (no control plane assigned yet — never a satisfiable quorum).
+pub fn quorum(n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    n / 2 + 1
+}
+
+#[cfg(test)]
+mod quorum_tests {
+    use super::quorum;
+
+    #[test]
+    fn quorum_is_majority_for_valid_cp_counts() {
+        assert_eq!(quorum(1), 1);
+        assert_eq!(quorum(3), 2);
+        assert_eq!(quorum(5), 3);
+    }
+
+    #[test]
+    fn quorum_of_zero_is_zero() {
+        assert_eq!(quorum(0), 0);
+    }
+}
+
 /// Which k0s role a node's spurd-owned systemd unit runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -286,6 +286,18 @@ pub enum WalOperation {
         name: String,
         error: Option<String>,
     },
+    /// Grow a scoped k0s cluster's member set online (`spur k8s add-nodes`). Applied as a union into
+    /// `K0sClusterState.member_nodes`, so replaying it is idempotent. Never emitted for a
+    /// whole-inventory cluster (empty `member_nodes`), where every node is already a member.
+    K0sMemberNodesAdd {
+        nodes: Vec<String>,
+    },
+    /// Shrink a scoped k0s cluster's member set online (`spur k8s remove-nodes`). Applied as a
+    /// set-subtraction from `K0sClusterState.member_nodes`, so replaying it is idempotent. Never
+    /// emitted for a whole-inventory cluster (empty `member_nodes`).
+    K0sMemberNodesRemove {
+        nodes: Vec<String>,
+    },
 }
 
 impl WalOperation {
@@ -850,6 +862,30 @@ mod deregistration_wal_tests {
                 assert_eq!(control_plane_nodes, vec!["head-node", "cp-2", "cp-3"]);
                 assert_eq!(member_nodes, vec!["head-node", "cp-2", "cp-3", "w-4"]);
                 assert!(!reset_requested);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let op = WalOperation::K0sMemberNodesAdd {
+            nodes: vec!["gpu-09".into(), "gpu-10".into()],
+        };
+        let back: WalOperation =
+            serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
+        match back {
+            WalOperation::K0sMemberNodesAdd { nodes } => {
+                assert_eq!(nodes, vec!["gpu-09", "gpu-10"]);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let op = WalOperation::K0sMemberNodesRemove {
+            nodes: vec!["gpu-09".into()],
+        };
+        let back: WalOperation =
+            serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
+        match back {
+            WalOperation::K0sMemberNodesRemove { nodes } => {
+                assert_eq!(nodes, vec!["gpu-09"]);
             }
             _ => panic!("wrong variant"),
         }
