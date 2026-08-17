@@ -344,16 +344,19 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), std::io
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     let tmp = path.with_extension("json.tmp");
-    let mut file = std::fs::File::create(&tmp)
-        .map_err(|e| std::io::Error::new(e.kind(), format!("{tmp:?}: {e}")))?;
-    file.write_all(&data)
-        .map_err(|e| std::io::Error::new(e.kind(), format!("{tmp:?}: {e}")))?;
-    file.sync_all()
-        .map_err(|e| std::io::Error::new(e.kind(), format!("{tmp:?}: {e}")))?;
+    // A failed attempt must not leave its temp file behind: a sustained
+    // disk-full condition would otherwise accumulate one per failed index.
+    let failed = |e: std::io::Error, at: &Path| {
+        let _ = std::fs::remove_file(&tmp);
+        std::io::Error::new(e.kind(), format!("{at:?}: {e}"))
+    };
+
+    let mut file = std::fs::File::create(&tmp).map_err(|e| failed(e, &tmp))?;
+    file.write_all(&data).map_err(|e| failed(e, &tmp))?;
+    file.sync_all().map_err(|e| failed(e, &tmp))?;
     drop(file);
 
-    std::fs::rename(&tmp, path)
-        .map_err(|e| std::io::Error::new(e.kind(), format!("{path:?}: {e}")))
+    std::fs::rename(&tmp, path).map_err(|e| failed(e, path))
 }
 
 /// Flush a directory so that files created or renamed inside it survive a crash:
