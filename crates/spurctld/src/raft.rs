@@ -365,8 +365,9 @@ fn sync_dir(dir: &Path) -> Result<(), std::io::Error> {
         .map_err(|e| std::io::Error::new(e.kind(), format!("{dir:?}: {e}")))
 }
 
-/// Windows cannot fsync a directory handle; `MoveFileEx` is ordered enough there
-/// once the file's own contents have been flushed.
+/// Windows has no directory handle to fsync, so a rename there is best-effort:
+/// NTFS metadata ordering without an explicit flush is not a stated guarantee.
+/// spurctld is built and tested on unix only.
 #[cfg(not(unix))]
 fn sync_dir(_dir: &Path) -> Result<(), std::io::Error> {
     Ok(())
