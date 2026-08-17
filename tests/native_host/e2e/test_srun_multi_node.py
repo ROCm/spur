@@ -8,6 +8,9 @@ import shlex
 import time
 
 from cluster import job_state, parse_job_id, wait_job, wait_job_state
+import pytest
+
+pytestmark = pytest.mark.suite_fabric
 
 
 class TestStandaloneSrun:

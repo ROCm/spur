@@ -6,6 +6,9 @@
 import time
 
 from cluster import parse_job_id, job_state, wait_job
+import pytest
+
+pytestmark = pytest.mark.suite_runtime
 
 
 class TestClusterHealth:

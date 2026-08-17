@@ -112,6 +112,10 @@ pub struct SlurmConfig {
     #[serde(default)]
     pub rlimits: RlimitsConfig,
 
+    /// cgroup enforcement policy for job processes.
+    #[serde(default)]
+    pub cgroup: CgroupConfig,
+
     /// MPI plugin settings for `--mpi=pmix` job steps.
     #[serde(default)]
     pub mpi: MpiConfig,
@@ -1178,6 +1182,81 @@ impl MpiConfig {
             return std::path::PathBuf::from(&self.pmix_plugin);
         }
         std::path::Path::new(&self.plugin_dir).join("spur_mpi_pmix.so")
+    }
+}
+
+/// cgroup constraints applied to a job's processes (Slurm's `cgroup.conf`).
+///
+/// The limits themselves come from the allocation; this section only sets how
+/// they are enforced.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CgroupConfig {
+    /// Cap a job's swap alongside its memory (Slurm's `ConstrainSwapSpace`).
+    ///
+    /// Off by default, as in Slurm: while off, `memory.max` bounds resident
+    /// memory only and a job that outgrows `--mem` swaps instead of being killed.
+    #[serde(default)]
+    pub constrain_swap_space: bool,
+
+    /// Swap a job may use, as a percentage of its memory allocation (Slurm's
+    /// `AllowedSwapSpace`). Only consulted when `constrain_swap_space` is set.
+    #[serde(default)]
+    pub allowed_swap_space: u32,
+}
+
+/// Swap budget for a job's cgroup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapLimit {
+    /// Leave `memory.swap.max` alone; the job may swap without bound.
+    Unconstrained,
+    /// Cap swap at this percentage of the job's memory allocation.
+    Percent(u32),
+}
+
+impl SwapLimit {
+    /// Swap budget in bytes for a job capped at `memory_bytes`, or `None` when
+    /// swap is unconstrained.
+    pub fn bytes_for(&self, memory_bytes: u64) -> Option<u64> {
+        match self {
+            Self::Unconstrained => None,
+            Self::Percent(percent) => Some(memory_bytes.saturating_mul(u64::from(*percent)) / 100),
+        }
+    }
+}
+
+impl CgroupConfig {
+    pub fn swap_limit(&self) -> Result<SwapLimit, ConfigError> {
+        if !self.constrain_swap_space {
+            return Ok(SwapLimit::Unconstrained);
+        }
+        if self.allowed_swap_space > 100 {
+            return Err(ConfigError::InvalidValue {
+                field: "cgroup.allowed_swap_space".into(),
+                value: format!(
+                    "{} (expected a percentage of the memory allocation, 0 to 100)",
+                    self.allowed_swap_space
+                ),
+            });
+        }
+        Ok(SwapLimit::Percent(self.allowed_swap_space))
+    }
+}
+
+/// Resolved limits an agent applies to every job it launches, as opposed to
+/// the per-job sizes that come from the allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobLimits {
+    /// Applied before exec, while still privileged.
+    pub memlock: MemlockLimit,
+    pub swap: SwapLimit,
+}
+
+impl Default for JobLimits {
+    fn default() -> Self {
+        Self {
+            memlock: MemlockLimit::Unlimited,
+            swap: SwapLimit::Unconstrained,
+        }
     }
 }
 
@@ -2596,6 +2675,76 @@ cluster_name = "test"
         assert_eq!(
             config.rlimits.memlock_limit().unwrap(),
             MemlockLimit::Unlimited
+        );
+    }
+
+    #[test]
+    fn cgroup_swap_is_unconstrained_by_default() {
+        let cfg = CgroupConfig::default();
+        assert_eq!(cfg.swap_limit().unwrap(), SwapLimit::Unconstrained);
+        assert_eq!(SwapLimit::Unconstrained.bytes_for(64 * 1024 * 1024), None);
+    }
+
+    #[test]
+    fn cgroup_constrained_swap_defaults_to_denying_swap() {
+        let cfg = CgroupConfig {
+            constrain_swap_space: true,
+            allowed_swap_space: 0,
+        };
+        let limit = cfg.swap_limit().unwrap();
+        assert_eq!(limit, SwapLimit::Percent(0));
+        assert_eq!(limit.bytes_for(64 * 1024 * 1024), Some(0));
+    }
+
+    #[test]
+    fn cgroup_allowed_swap_is_a_percentage_of_the_allocation() {
+        let cfg = CgroupConfig {
+            constrain_swap_space: true,
+            allowed_swap_space: 50,
+        };
+        assert_eq!(
+            cfg.swap_limit().unwrap().bytes_for(64 * 1024 * 1024),
+            Some(32 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn cgroup_allowed_swap_percentage_above_100_errors() {
+        let cfg = CgroupConfig {
+            constrain_swap_space: true,
+            allowed_swap_space: 101,
+        };
+        assert!(cfg.swap_limit().is_err());
+    }
+
+    #[test]
+    fn cgroup_allowed_swap_is_ignored_while_unconstrained() {
+        let cfg = CgroupConfig {
+            constrain_swap_space: false,
+            allowed_swap_space: 999,
+        };
+        assert_eq!(cfg.swap_limit().unwrap(), SwapLimit::Unconstrained);
+    }
+
+    #[test]
+    fn cgroup_from_toml_explicit() {
+        let toml = r#"
+cluster_name = "test"
+
+[cgroup]
+constrain_swap_space = true
+allowed_swap_space = 25
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.cgroup.swap_limit().unwrap(), SwapLimit::Percent(25));
+    }
+
+    #[test]
+    fn cgroup_from_toml_default() {
+        let config = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert_eq!(
+            config.cgroup.swap_limit().unwrap(),
+            SwapLimit::Unconstrained
         );
     }
 

@@ -16,6 +16,9 @@ timeouts below allow for the 10s watchdog tick plus the 30s grace period.
 """
 
 from cluster import parse_job_id, wait_job
+import pytest
+
+pytestmark = pytest.mark.suite_scheduling
 
 TIME_LIMIT = "00:00:20"
 # Deadline + watchdog tick + grace period + SIGKILL reap, with slack.

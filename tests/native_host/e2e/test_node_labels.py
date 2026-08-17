@@ -4,6 +4,9 @@
 """E2E tests for node labels and partition selector routing."""
 
 import time
+import pytest
+
+pytestmark = pytest.mark.suite_policy
 
 
 def _wait_node_in_partition(cluster, node_name, partition, present=True, timeout=10):

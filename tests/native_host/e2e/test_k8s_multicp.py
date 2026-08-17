@@ -5,6 +5,8 @@
 
 import pytest
 
+pytestmark = pytest.mark.suite_ha
+
 
 @pytest.mark.k0s
 class TestK8sMultiControlPlane:

@@ -12,6 +12,9 @@ dispatch. Each test cancels its job in a finally block.
 import time
 
 from cluster import parse_job_id, job_state
+import pytest
+
+pytestmark = pytest.mark.suite_policy
 
 
 def _wait_state(cluster, job_id, want, timeout=30):

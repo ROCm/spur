@@ -68,14 +68,33 @@ jobs:
       matrix:
         include:
           - cluster_type: native-host
-            STATUS_CONTEXT: "E2E / native-host"
+            suite: scheduling
+            STATUS_CONTEXT: "E2E / native-host / scheduling"
+          - cluster_type: native-host
+            suite: policy
+            STATUS_CONTEXT: "E2E / native-host / policy"
+          - cluster_type: native-host
+            suite: api
+            STATUS_CONTEXT: "E2E / native-host / api"
+          - cluster_type: native-host
+            suite: runtime
+            STATUS_CONTEXT: "E2E / native-host / runtime"
+          - cluster_type: native-host
+            suite: fabric
+            STATUS_CONTEXT: "E2E / native-host / fabric"
+          - cluster_type: native-host
+            suite: ha
+            STATUS_CONTEXT: "E2E / native-host / ha"
           - cluster_type: k8s
             STATUS_CONTEXT: "E2E / k8s"
     env:
       STATUS_CONTEXT: ${{ matrix.STATUS_CONTEXT }}
       # LogLevel=ERROR silences the known-hosts warning from UserKnownHostsFile=/dev/null.
       SSH_OPTS: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
-      RUN_DIR: /tmp/spur-e2e-${{ github.run_id }}
+      # Scoped per matrix entry so the six native-host suite jobs never collide
+      # on run dir, VM prefix, or artifact name. k8s falls back to its type.
+      RUN_SLUG: ${{ matrix.suite || matrix.cluster_type }}
+      RUN_DIR: /tmp/spur-e2e-${{ github.run_id }}-${{ matrix.suite || matrix.cluster_type }}
     steps:
       - name: Set pending status
         uses: actions/github-script@v9
@@ -140,7 +159,7 @@ jobs:
           CLUSTER_ENV=$(mktemp /tmp/cluster-env-XXXXXX.sh)
           echo "cluster_env=$CLUSTER_ENV" >> "$GITHUB_OUTPUT"
           /opt/spur-ci/bin/cluster-up.sh \
-            --prefix "${SPUR_CI_VM_PREFIX}-${{ github.run_id }}" \
+            --prefix "${SPUR_CI_VM_PREFIX}-${{ github.run_id }}-${{ env.RUN_SLUG }}" \
             --count 4 \
             --image "${{ steps.image.outputs.path }}" \
             --gpus-per-vm 1 \
@@ -233,28 +252,20 @@ jobs:
           export SPUR_TEST_GPU_VENV=/opt/spur-ci/gpu-venv
           chmod +x ${{ env.RUN_DIR }}/release-binaries/*
           source /opt/spur-ci/test-venv/bin/activate
-          pytest ${{ env.RUN_DIR }}/e2e-assets/tests/native_host/e2e/ -v --junitxml=${{ env.RUN_DIR }}/results.xml
+          pytest ${{ env.RUN_DIR }}/e2e-assets/tests/native_host/e2e/ -m "suite_${{ matrix.suite }}" -v --junitxml=${{ env.RUN_DIR }}/results.xml
           REMOTE
 
-      - name: Apply RBAC and verify cluster state (k8s)
+      - name: Verify cluster state (k8s)
         if: matrix.cluster_type == 'k8s'
         run: |
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
-          NS="spur-ci-${{ github.run_id }}"
 
+          # Per-namespace RBAC is applied by the suite driver; here we only
+          # confirm the nodes came up labeled before launching the suites.
           ssh $SSH_OPTS -i "$KEY" ci@"$DRIVER_IP" bash -s <<REMOTE
           set -euo pipefail
           export KUBECONFIG=/home/ci/.kube/config
-
-          # Create test namespace
-          kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
-
-          # Apply RBAC with namespace patched
-          sed "s/namespace: spur/namespace: $NS/g" \
-            ${{ env.RUN_DIR }}/e2e-assets/tests/k8s/e2e/manifests/rbac.yaml | kubectl apply -f -
-
-          # Verify nodes are labeled
           echo "=== Labeled nodes ==="
           kubectl get nodes -l spur.amd.com/managed=true -o wide
           REMOTE
@@ -264,15 +275,14 @@ jobs:
         run: |
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
-          NS="spur-ci-${{ github.run_id }}"
 
           ssh $SSH_OPTS -i "$KEY" ci@"$DRIVER_IP" bash -s <<REMOTE
           set -euo pipefail
           export KUBECONFIG=/home/ci/.kube/config
           export SPUR_CI_IMAGE=docker.io/library/spur:ci
-          export SPUR_TEST_NS="$NS"
           source /opt/spur-ci/test-venv/bin/activate
-          pytest ${{ env.RUN_DIR }}/e2e-assets/tests/k8s/e2e/ -v --junitxml=${{ env.RUN_DIR }}/results.xml
+          bash ${{ env.RUN_DIR }}/e2e-assets/tests/k8s/e2e/run_suites.sh \
+            ${{ env.RUN_DIR }}/e2e-assets/tests/k8s/e2e "${{ github.run_id }}" "${{ env.RUN_DIR }}"
           REMOTE
 
       - name: Dump cluster diagnostics (k8s)
@@ -306,14 +316,15 @@ jobs:
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
           mkdir -p "${{ env.RUN_DIR }}/e2e-results"
+          # native-host writes results.xml; the k8s driver writes results-<suite>.xml.
           scp $SSH_OPTS -i "$KEY" \
-            ci@"$DRIVER_IP":"${{ env.RUN_DIR }}/results.xml" "${{ env.RUN_DIR }}/e2e-results/" 2>/dev/null || true
+            ci@"$DRIVER_IP":"${{ env.RUN_DIR }}/results*.xml" "${{ env.RUN_DIR }}/e2e-results/" 2>/dev/null || true
 
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: e2e-results-${{ matrix.cluster_type }}
+          name: e2e-results-${{ matrix.cluster_type }}-${{ matrix.suite || 'all' }}
           path: ${{ env.RUN_DIR }}/e2e-results/
           retention-days: 3
           if-no-files-found: ignore
@@ -322,7 +333,7 @@ jobs:
         if: always()
         run: |
           /opt/spur-ci/bin/cluster-down.sh \
-            --prefix "${SPUR_CI_VM_PREFIX}-${{ github.run_id }}" \
+            --prefix "${SPUR_CI_VM_PREFIX}-${{ github.run_id }}-${{ env.RUN_SLUG }}" \
             --count 4
 
       - name: Cleanup ephemeral keys

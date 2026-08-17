@@ -7,8 +7,8 @@ Pytest configuration and fixtures for Spur native-host E2E tests.
 See docs/developer/building.rst for full environment variable reference.
 """
 
+import contextlib
 import os
-import time
 from pathlib import Path
 
 import pytest
@@ -27,6 +27,35 @@ def pytest_configure(config):
         "markers",
         "k0s: native spur-managed k0s cluster tests (rootful spurd + systemd + etcd; slow)",
     )
+
+
+_SUITE_MARKERS = (
+    "suite_scheduling", "suite_policy", "suite_api",
+    "suite_runtime", "suite_fabric", "suite_ha",
+)
+_E2E_DIR = Path(__file__).parent
+
+
+def pytest_collection_modifyitems(config, items):
+    """Fail if any native-host e2e test lacks exactly one suite_* marker.
+
+    Markers select CI suites; a file with none would never run in any suite,
+    and one with two would run twice. Enforced at collection so the mistake
+    surfaces in the fast fixture job, not an hour into E2E.
+    """
+    bad = []
+    for item in items:
+        path = getattr(item, "path", None)
+        if path is None or (path != _E2E_DIR and _E2E_DIR not in path.parents):
+            continue
+        suites = [m.name for m in item.iter_markers() if m.name in _SUITE_MARKERS]
+        if len(suites) != 1:
+            bad.append(f"{item.nodeid}: {sorted(suites) or 'none'}")
+    if bad:
+        raise pytest.UsageError(
+            "each native-host e2e test needs exactly one suite_* marker:\n  "
+            + "\n  ".join(bad)
+        )
 
 
 def _get_nodes_config() -> list[str]:
@@ -349,6 +378,104 @@ def mpi_multi_node_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     c.mpi_preflight(2)
     yield c
     c.teardown()
+
+
+@pytest.fixture
+def metrics_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
+    """
+    Per-test fixture with the metrics server reachable off-loopback.
+
+    ``[metrics] bind`` defaults to ``loopback``; ``all`` lets a test scrape
+    from any node. ``high_cardinality`` is left off so the 404 gating on
+    /metrics/jobs-users-accts stays observable.
+    """
+    overrides = deep_merge(
+        dict(cluster_config_overrides or {}),
+        {"metrics": {"bind": "all"}},
+    )
+    spur_cluster = _deploy_cluster(ssh_nodes, remote_bin_dir, config_overrides=overrides)
+    spur_cluster.curl_preflight()
+    yield spur_cluster
+    spur_cluster.teardown()
+
+
+@pytest.fixture
+def hostname_raft_cluster(ssh_nodes, remote_bin_dir):
+    """
+    Raft cluster whose peers are listed by hostname, so each controller
+    derives its node_id from its position in that list.
+
+    Separate from raft_cluster, which uses IP peers and an explicit node_id:
+    that works anywhere, while this needs every node to resolve every peer.
+    """
+    if len(ssh_nodes) < 3:
+        pytest.skip(
+            f"Raft HA tests require at least 3 nodes for a quorum "
+            f"(got {len(ssh_nodes)})"
+        )
+
+    c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
+    c.enable_raft(3, peer_style="hostname")
+    try:
+        c.provision()
+        c.curl_preflight()
+        c.peer_resolution_preflight()
+        c.start()
+    except Exception:
+        c.teardown()
+        raise
+    yield c
+    c.teardown()
+
+
+@pytest.fixture(scope="module")
+def raft_cluster(ssh_nodes, remote_bin_dir):
+    """
+    Module-scoped fixture running spurctld on three nodes as Raft peers.
+
+    Clients address the full endpoint list, so CLI calls survive a leader
+    change. Skips unless three nodes are available for a quorum.
+
+    Scoped to the module rather than the test: a three-controller cluster is
+    the most expensive fixture in the suite, and every test here restores the
+    controller it killed, so one cluster serves the whole module. Tests that
+    leave a controller down must do so inside a ``finally``.
+    """
+    if len(ssh_nodes) < 3:
+        pytest.skip(
+            f"Raft HA tests require at least 3 nodes for a quorum "
+            f"(got {len(ssh_nodes)})"
+        )
+
+    c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
+    c.enable_raft(3)
+    try:
+        c.provision()
+        c.curl_preflight()
+        c.start()
+    except Exception as exc:
+        # The cluster is about to be torn down, so capture why the election
+        # failed while the controllers are still reachable.
+        diagnostics = ""
+        with contextlib.suppress(Exception):
+            diagnostics = c.raft_diagnostics()
+        c.teardown()
+        raise RuntimeError(f"raft_cluster failed to start: {exc}\n{diagnostics}") from exc
+    yield c
+    c.teardown()
+
+
+@pytest.fixture
+def spank_cluster(ssh_nodes, remote_bin_dir):
+    """
+    Per-test fixture for SPANK plugin tests.
+
+    Provisioned but not started: the test compiles its plugin, calls
+    ``write_plugstack``, then ``start()`` so spurd picks up SPUR_PLUGSTACK.
+    """
+    spur_cluster = _provision_cluster(ssh_nodes, remote_bin_dir)
+    yield spur_cluster
+    spur_cluster.teardown()
 
 
 @pytest.fixture

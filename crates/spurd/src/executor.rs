@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -14,7 +15,7 @@ use nix::unistd::Pid;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
-use spur_core::config::MemlockLimit;
+use spur_core::config::{MemlockLimit, SwapLimit};
 use spur_core::job::JobId;
 use spur_spank::{SpankContext, SpankHandle, SpankHost};
 
@@ -161,6 +162,8 @@ pub struct JobLaunchConfig {
     pub host_device_plan: Option<spur_devices::inject::HostInjectionPlan>,
     /// RLIMIT_MEMLOCK to apply before exec (while still privileged).
     pub memlock: MemlockLimit,
+    /// Swap budget for the job's cgroup.
+    pub swap_limit: SwapLimit,
     /// I/O mode for the job.
     pub io_mode: LaunchIo,
     /// Direct multi-rank PMIx launch via a wrapper script (batch `--mpi=pmix`).
@@ -502,7 +505,7 @@ async fn spawn_job_process(
     info!(job_id, work_dir, "launching job");
 
     // Set up cgroup for isolation
-    let cgroup_path = setup_cgroup(job_id, cpus, memory_mb, cpu_ids)?;
+    let cgroup_path = setup_cgroup(job_id, cpus, memory_mb, cpu_ids, cfg.swap_limit)?;
 
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
     // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
@@ -518,15 +521,11 @@ async fn spawn_job_process(
     };
     let work_dir = effective_work_dir.as_str();
 
-    // Wrap script with burst buffer stage-in/stage-out if configured
-    let script = if let Ok(bb) = std::env::var("SPUR_BURST_BUFFER") {
-        if !bb.is_empty() {
-            wrap_with_burst_buffer(script, &bb)
-        } else {
-            script.to_string()
-        }
-    } else {
-        script.to_string()
+    // The directive is per job, so it comes from the job's environment. Reading
+    // the daemon's own env instead would only ever see a cluster-wide value.
+    let script = match environment.get("SPUR_BURST_BUFFER") {
+        Some(bb) if !bb.is_empty() => wrap_with_burst_buffer(script, bb),
+        _ => script.to_string(),
     };
     let script = script.as_str();
 
@@ -756,6 +755,22 @@ async fn spawn_job_process(
         });
     }
 
+    // Join the cgroup pre-exec, not from the parent after spawn: the rootful path
+    // runs under `unshare --fork`, whose forked workload only inherits the cgroup
+    // if we join before exec. A parent-side move races that fork and can leave the
+    // job unconstrained. Must precede the privilege drop -- only root writes here.
+    let cgroup_procs = cgroup_path
+        .as_ref()
+        .and_then(|p| CString::new(p.join("cgroup.procs").as_os_str().as_bytes()).ok());
+    if let Some(procs) = cgroup_procs {
+        unsafe {
+            cmd.pre_exec(move || {
+                join_cgroup_self(&procs);
+                Ok(())
+            });
+        }
+    }
+
     // Issue #99, #107: Run job as the submitting user (not root).
     // Must set supplementary groups (video, render) so the process can
     // access GPU device nodes.
@@ -849,12 +864,8 @@ async fn spawn_job_process(
     // Drop the slave fd immediately so the master gets EOF when the child exits.
     let pty_master = job_io.into_master();
 
-    // Move process into cgroup
-    if let Some(ref cgroup) = cgroup_path {
-        if let Some(pid) = child.id() {
-            move_to_cgroup(cgroup, pid);
-        }
-    }
+    // Cgroup placement already happened pre-exec (join_cgroup_self); a move here
+    // would race the wrapper's fork.
 
     debug!(
         job_id,
@@ -877,6 +888,7 @@ fn setup_cgroup(
     cpus: u32,
     memory_mb: u64,
     cpu_ids: &[u32],
+    swap_limit: SwapLimit,
 ) -> anyhow::Result<Option<PathBuf>> {
     let cgroup_root = PathBuf::from(CGROUP_ROOT);
     let cgroup_path = cgroup_root.join(format!("job_{}", job_id));
@@ -923,6 +935,16 @@ fn setup_cgroup(
         if let Err(e) = std::fs::write(cgroup_path.join("memory.max"), memory_bytes.to_string()) {
             warn!(job_id, error = %e, "failed to set memory.max");
         }
+        // memory.max bounds resident memory only: with swap available the
+        // kernel pages the overflow out instead of OOM-killing. Opt-in, since
+        // capping swap starts killing jobs that used to survive.
+        if let Some(swap_bytes) = swap_limit.bytes_for(memory_bytes) {
+            if let Err(e) =
+                std::fs::write(cgroup_path.join("memory.swap.max"), swap_bytes.to_string())
+            {
+                warn!(job_id, error = %e, "failed to set memory.swap.max");
+            }
+        }
     }
 
     // OOM isolation: kill entire cgroup on OOM, not a random process
@@ -961,18 +983,33 @@ fn setup_cgroup(
     Ok(Some(cgroup_path))
 }
 
-/// Move a process into a cgroup. Returns true if successful.
-fn move_to_cgroup(cgroup_path: &Path, pid: u32) -> bool {
-    let procs_file = cgroup_path.join("cgroup.procs");
-    if let Err(e) = std::fs::write(&procs_file, pid.to_string()) {
-        warn!(
-            pid,
-            error = %e,
-            "failed to move process to cgroup — job runs without isolation"
-        );
-        false
-    } else {
-        true
+/// Move the calling process into a cgroup by writing its own pid to
+/// `cgroup.procs`. Runs in the post-fork child before exec, so it must be
+/// async-signal-safe: no heap allocation, only raw syscalls. Best-effort —
+/// on failure the job stays in the parent cgroup rather than aborting launch.
+fn join_cgroup_self(procs_path: &std::ffi::CStr) {
+    let pid = unsafe { libc::getpid() };
+
+    let mut buf = [0u8; 24];
+    let mut i = buf.len();
+    let mut n = pid.max(0) as u64;
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    let digits = &buf[i..];
+
+    unsafe {
+        let fd = libc::open(procs_path.as_ptr(), libc::O_WRONLY);
+        if fd < 0 {
+            return;
+        }
+        libc::write(fd, digits.as_ptr() as *const libc::c_void, digits.len());
+        libc::close(fd);
     }
 }
 
@@ -1411,7 +1448,13 @@ async fn launch_container_job(
     job_io: JobIo,
 ) -> anyhow::Result<(RunningJob, Option<OwnedFd>)> {
     let job_id = cfg.job_id;
-    let cgroup_path = setup_cgroup(job_id, cfg.cpus, cfg.memory_mb, &cfg.cpu_ids)?;
+    let cgroup_path = setup_cgroup(
+        job_id,
+        cfg.cpus,
+        cfg.memory_mb,
+        &cfg.cpu_ids,
+        cfg.swap_limit,
+    )?;
 
     // Sync pipe: child writes status, parent reads.
     // Convert OwnedFd to raw fds for manual lifecycle management across fork.
@@ -2163,6 +2206,7 @@ mod tests {
             nodelist: String::new(),
             host_device_plan: None,
             memlock: MemlockLimit::Unlimited,
+            swap_limit: SwapLimit::Unconstrained,
             io_mode: LaunchIo::File,
             pmix_multi_task: false,
         }
@@ -2496,5 +2540,30 @@ mod tests {
             libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
             "wire() should have returned an error for bad fd"
         );
+    }
+
+    #[test]
+    fn join_cgroup_self_writes_own_pid() {
+        // cgroup.procs is a plain "write my decimal pid" interface, so a regular
+        // file exercises the hand-rolled formatting and write without a cgroup.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cgroup.procs");
+        // The real cgroup.procs is kernel-created; join_cgroup_self opens it
+        // without O_CREAT, so the stand-in must exist first.
+        std::fs::write(&path, "").unwrap();
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+
+        join_cgroup_self(&c_path);
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, std::process::id().to_string());
+    }
+
+    #[test]
+    fn join_cgroup_self_is_silent_when_the_path_is_missing() {
+        // Best-effort: a non-existent cgroup.procs must not panic, so a failed
+        // placement degrades to an unconstrained job instead of aborting launch.
+        let c_path = CString::new("/nonexistent/spur-test/cgroup.procs").unwrap();
+        join_cgroup_self(&c_path);
     }
 }

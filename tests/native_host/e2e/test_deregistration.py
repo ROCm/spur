@@ -14,6 +14,8 @@ import pytest
 
 from cluster import parse_job_id, job_state, SpurCluster
 
+pytestmark = pytest.mark.suite_runtime
+
 
 def _wait_job_terminal(cluster, job_id, timeout=120):
     """Wait for a job to reach any terminal state including NODE_FAIL."""

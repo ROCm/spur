@@ -17,6 +17,8 @@ import pytest
 
 from cluster import SpurCluster, job_state, parse_job_id, wait_job
 
+pytestmark = pytest.mark.suite_fabric
+
 _FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 

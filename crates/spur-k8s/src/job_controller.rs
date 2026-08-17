@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::pin::pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use backon::{ExponentialBuilder, Retryable};
@@ -26,6 +26,7 @@ use spur_proto::proto::{
 };
 
 const FINALIZER: &str = "spur.amd.com/cleanup";
+const INITIAL_BACKOFF_SECS: u64 = 1;
 const MAX_BACKOFF_SECS: u64 = 60;
 const LABEL_PATCH_BUDGET: Duration = Duration::from_secs(3);
 
@@ -53,6 +54,50 @@ pub struct JobControllerCtx {
     pub ctrl_client: Mutex<SlurmControllerClient<Channel>>,
     /// Track multi-pod completion: job_id → (expected_count, completed_count, any_failed)
     pub(crate) pod_tracker: Mutex<HashMap<u32, PodTracker>>,
+    /// Consecutive reconcile failures per SpurJob, driving the retry delay.
+    /// Std mutex because `error_policy` is synchronous.
+    pub(crate) failures: StdMutex<HashMap<String, u32>>,
+}
+
+fn object_key(job: &SpurJob) -> String {
+    format!(
+        "{}/{}",
+        job.metadata.namespace.as_deref().unwrap_or_default(),
+        job.metadata.name.as_deref().unwrap_or_default()
+    )
+}
+
+type FailureCounts = StdMutex<HashMap<String, u32>>;
+
+/// Delay before the *attempt*-th retry: doubling from `INITIAL_BACKOFF_SECS`, capped.
+fn backoff_delay(attempt: u32) -> Duration {
+    // Cap the shift before the multiply so the doubling cannot overflow.
+    let shift = attempt.saturating_sub(1).min(u32::BITS - 1);
+    let secs = INITIAL_BACKOFF_SECS
+        .saturating_mul(1u64.checked_shl(shift).unwrap_or(u64::MAX))
+        .min(MAX_BACKOFF_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Counts another consecutive failure for *key* and returns how long to wait.
+fn record_failure(failures: &FailureCounts, key: &str) -> Duration {
+    let mut counts = failures.lock().unwrap_or_else(|e| e.into_inner());
+    let attempt = counts.entry(key.to_string()).or_insert(0);
+    *attempt = attempt.saturating_add(1);
+    backoff_delay(*attempt)
+}
+
+impl JobControllerCtx {
+    fn next_backoff(&self, key: &str) -> Duration {
+        record_failure(&self.failures, key)
+    }
+
+    fn clear_backoff(&self, key: &str) {
+        self.failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
 }
 
 pub(crate) struct PodTracker {
@@ -75,8 +120,9 @@ async fn reconcile(
         .clone()
         .ok_or_else(|| ReconcileError::Other("SpurJob has no namespace".into()))?;
     let api: Api<SpurJob> = Api::namespaced(ctx.client.clone(), &ns);
+    let key = object_key(&job);
 
-    finalizer(&api, FINALIZER, job, |event| {
+    let result = finalizer(&api, FINALIZER, job, |event| {
         let api = api.clone();
         let ctx = ctx.clone();
         async move {
@@ -87,7 +133,14 @@ async fn reconcile(
         }
     })
     .await
-    .map_err(map_finalizer_err)
+    .map_err(map_finalizer_err);
+
+    // A clean pass ends the retry sequence; cleanup also lands here, so the
+    // entry is dropped when the SpurJob goes away.
+    if result.is_ok() {
+        ctx.clear_backoff(&key);
+    }
+    result
 }
 
 fn map_finalizer_err(e: finalizer::Error<ReconcileError>) -> ReconcileError {
@@ -108,22 +161,40 @@ fn should_submit(status: &SpurJobStatus) -> bool {
     status.spur_job_id.is_none()
 }
 
+/// Whether a failed submit is worth another attempt. Only "no controller
+/// answered" codes qualify; anything else faults the spec itself and would be
+/// rejected identically forever. Matches the agent's controller-RPC rule.
+fn submit_is_retryable(status: &tonic::Status) -> bool {
+    use tonic::Code;
+    matches!(
+        status.code(),
+        Code::Unavailable | Code::Internal | Code::DeadlineExceeded | Code::Unknown
+    )
+}
+
+enum SubmitOutcome {
+    Submitted,
+    /// A prior reconcile already submitted this SpurJob.
+    AlreadySubmitted,
+    /// The controller refused the spec; the SpurJob is now Failed.
+    Rejected,
+}
+
 /// Submit to spurctld, apply job-id label, and patch CRD status.
 /// Re-reads from the API server first to guard against stale informer cache.
-/// Returns `Ok(None)` if a prior reconcile already submitted.
 async fn submit_to_controller(
     api: &Api<SpurJob>,
     ctx: &JobControllerCtx,
     name: &str,
     ns: &str,
     job: &SpurJob,
-) -> Result<Option<u32>, ReconcileError> {
+) -> Result<SubmitOutcome, ReconcileError> {
     // Fresh read from API server — informer cache may be stale after finalizer patch
     let fresh = api.get(name).await.map_err(ReconcileError::Kube)?;
     let fresh_status = fresh.status.clone().unwrap_or_default();
     if !should_submit(&fresh_status) {
         debug!(spurjob = %name, "already submitted by prior reconcile");
-        return Ok(None);
+        return Ok(SubmitOutcome::AlreadySubmitted);
     }
 
     let user = job
@@ -145,9 +216,19 @@ async fn submit_to_controller(
         .await
     {
         Ok(resp) => resp.into_inner().job_id,
-        Err(e) => {
+        Err(e) if submit_is_retryable(&e) => {
             error!(spurjob = %name, error = %e, "failed to submit SpurJob");
             return Err(ReconcileError::Grpc(e));
+        }
+        Err(e) => {
+            error!(spurjob = %name, error = %e, "SpurJob rejected by the controller");
+            let new_status = SpurJobStatus {
+                state: "Failed".into(),
+                message: Some(format!("rejected by spurctld: {}", e.message())),
+                ..fresh_status.clone()
+            };
+            patch_status(api, name, &new_status).await;
+            return Ok(SubmitOutcome::Rejected);
         }
     };
     drop(ctrl);
@@ -166,7 +247,7 @@ async fn submit_to_controller(
     };
     patch_status(api, name, &new_status).await;
 
-    Ok(Some(job_id))
+    Ok(SubmitOutcome::Submitted)
 }
 
 /// State-machine dispatcher: submit if no job_id, otherwise poll spurctld.
@@ -190,8 +271,9 @@ async fn handle_job(
     // Phase 1: Submit (no spur_job_id yet)
     if should_submit(&status) {
         return match submit_to_controller(api, ctx, &name, &ns, &job).await? {
-            Some(_job_id) => Ok(Action::requeue(Duration::from_secs(5))),
-            None => Ok(Action::requeue(Duration::from_secs(2))),
+            SubmitOutcome::Submitted => Ok(Action::requeue(Duration::from_secs(5))),
+            SubmitOutcome::AlreadySubmitted => Ok(Action::requeue(Duration::from_secs(2))),
+            SubmitOutcome::Rejected => Ok(Action::await_change()),
         };
     }
 
@@ -280,10 +362,15 @@ async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action
     Ok(Action::await_change())
 }
 
-fn error_policy(_job: Arc<SpurJob>, error: &ReconcileError, _ctx: Arc<JobControllerCtx>) -> Action {
-    error!(error = %error, "SpurJob reconciler error");
-    // Exponential backoff capped at MAX_BACKOFF_SECS
-    Action::requeue(Duration::from_secs(MAX_BACKOFF_SECS))
+fn error_policy(job: Arc<SpurJob>, error: &ReconcileError, ctx: Arc<JobControllerCtx>) -> Action {
+    let delay = ctx.next_backoff(&object_key(&job));
+    error!(
+        spurjob = %object_key(&job),
+        error = %error,
+        retry_in_secs = delay.as_secs(),
+        "SpurJob reconciler error"
+    );
+    Action::requeue(delay)
 }
 
 /// Start the SpurJob controller and Pod watcher.
@@ -306,6 +393,7 @@ pub async fn run(
         client: client.clone(),
         ctrl_client: Mutex::new(ctrl_client),
         pod_tracker: Mutex::new(HashMap::new()),
+        failures: StdMutex::new(HashMap::new()),
     });
 
     let spurjobs: Api<SpurJob> = Api::all(client.clone());
@@ -860,6 +948,37 @@ mod tests {
         assert_eq!(proto_job_state_to_string(99), "Unknown");
     }
 
+    // --- retry backoff ---
+
+    #[test]
+    fn test_backoff_doubles_from_one_second_and_caps() {
+        let seconds: Vec<u64> = (1..=10).map(|n| backoff_delay(n).as_secs()).collect();
+        assert_eq!(seconds, vec![1, 2, 4, 8, 16, 32, 60, 60, 60, 60]);
+        assert_eq!(backoff_delay(u32::MAX).as_secs(), MAX_BACKOFF_SECS);
+    }
+
+    #[test]
+    fn test_record_failure_counts_per_object() {
+        let failures = FailureCounts::default();
+        assert_eq!(record_failure(&failures, "ns/a").as_secs(), 1);
+        assert_eq!(record_failure(&failures, "ns/a").as_secs(), 2);
+        // A different SpurJob starts its own sequence.
+        assert_eq!(record_failure(&failures, "ns/b").as_secs(), 1);
+        assert_eq!(record_failure(&failures, "ns/a").as_secs(), 4);
+    }
+
+    #[test]
+    fn test_cleared_object_restarts_backoff() {
+        let failures = FailureCounts::default();
+        record_failure(&failures, "ns/a");
+        record_failure(&failures, "ns/a");
+        failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove("ns/a");
+        assert_eq!(record_failure(&failures, "ns/a").as_secs(), 1);
+    }
+
     // --- is_terminal ---
 
     #[test]
@@ -888,6 +1007,33 @@ mod tests {
         assert!(!is_terminal("Suspended"));
         assert!(!is_terminal("Unknown"));
         assert!(!is_terminal(""));
+    }
+
+    // --- submit_is_retryable ---
+
+    #[test]
+    fn a_spec_rejection_is_not_retried() {
+        // What spurctld returns for an unknown partition or a denied account.
+        assert!(!submit_is_retryable(&tonic::Status::invalid_argument(
+            "partition 'gpu' not found"
+        )));
+        assert!(!submit_is_retryable(&tonic::Status::permission_denied(
+            "account denied"
+        )));
+    }
+
+    #[test]
+    fn a_controller_that_did_not_answer_is_retried() {
+        // "not the Raft leader" and a failed Raft propose are both transient.
+        assert!(submit_is_retryable(&tonic::Status::unavailable(
+            "not the Raft leader"
+        )));
+        assert!(submit_is_retryable(&tonic::Status::internal(
+            "raft propose failed"
+        )));
+        assert!(submit_is_retryable(&tonic::Status::deadline_exceeded(
+            "timed out"
+        )));
     }
 
     // --- resolve_reporting_node ---

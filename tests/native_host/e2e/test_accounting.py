@@ -11,6 +11,9 @@ import re
 import time
 
 from cluster import deep_merge, parse_job_id, wait_job, wait_job_state, wait_sacct_row
+import pytest
+
+pytestmark = pytest.mark.suite_runtime
 
 
 class TestSacctExitReporting:

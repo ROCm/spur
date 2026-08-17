@@ -22,6 +22,8 @@ import pytest
 
 from cluster import parse_job_id, wait_job, wait_job_state
 
+pytestmark = pytest.mark.suite_policy
+
 
 class TestQosPriorityPreemption:
     """A low-QOS running job must be preempted by a high-QOS pending job

@@ -10,6 +10,9 @@ The multi_node_cluster fixture validates this and skips if insufficient.
 import time
 
 from cluster import parse_job_id, job_state, wait_job
+import pytest
+
+pytestmark = pytest.mark.suite_fabric
 
 
 def _wait_node_state(cluster, node_name, target_states, timeout=60):

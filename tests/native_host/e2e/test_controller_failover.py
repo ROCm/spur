@@ -9,10 +9,13 @@ run against the standard single-controller cluster; the dead endpoint is a
 closed port on the same host, so no extra topology is needed.
 
 Full multi-controller Raft failover (kill the connected controller, survivor
-takes over) is covered separately once the harness grows Raft support.
+takes over) lives in test_controller_raft.py.
 """
 
 from cluster import parse_job_id, wait_job
+import pytest
+
+pytestmark = pytest.mark.suite_ha
 
 # Port with nothing listening — connections are refused immediately.
 DEAD_PORT = 1

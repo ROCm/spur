@@ -10,6 +10,9 @@ environment variable propagation, failure semantics, and execution ordering.
 import time
 
 from cluster import parse_job_id, wait_job, job_state
+import pytest
+
+pytestmark = pytest.mark.suite_runtime
 
 
 LOGGING_PROLOG = """\
