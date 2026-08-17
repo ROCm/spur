@@ -164,7 +164,11 @@ mod tests {
                 Request::get("/api/v1/ping").body(Body::empty()).unwrap(),
             )
             .await;
-            assert_eq!(s, StatusCode::OK, "{mode:?}: /ping must not require a token");
+            assert_eq!(
+                s,
+                StatusCode::OK,
+                "{mode:?}: /ping must not require a token"
+            );
         }
     }
 
