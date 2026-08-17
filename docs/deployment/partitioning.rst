@@ -85,8 +85,7 @@ features and weight; see :doc:`native-host`), keyed by ``names`` (hostlist) or
 Applying Config Changes
 -----------------------
 
-After editing ``spur.conf``, apply the changes to a running controller without
-a restart:
+After editing ``spur.conf``, apply the changes to the running controller:
 
 .. code-block:: bash
 
@@ -95,34 +94,12 @@ a restart:
 ``reconfigure`` re-reads ``spur.conf`` and makes the file authoritative:
 runtime-only changes not reflected in the file are overwritten.
 
-**Applied live** (no restart): ``[[partitions]]`` (created, updated, or deleted
-to match the file), ``[[nodes]]`` features and weight, ``licenses``,
-``burst_buffer``, controller-side ``[hooks]`` (``prolog_slurmctld``,
-``epilog_slurmctld``), ``[notifications]``, ``[federation]``,
-``[power]`` suspend/resume commands, ``[admission]`` mode, and the
-``[scheduler]`` tunables ``complete_wait_secs`` and ``resv_overrun_minutes``.
-Node-side hooks (the per-node prolog/epilog run by ``spurd``), the device
-registry, and memlock are read by the node agent at its own startup;
-``reconfigure`` does not reach compute nodes, so those need a ``spurd`` restart.
-
-**Restart-only**: settings baked in when the daemon starts — listen addresses
-and ports (``[controller]``, ``[metrics]``, ``[rest_api]``), the accounting
-database (``[accounting]``), Raft identity and peers, ``first_job_id``,
-``auth.jwt_key`` (swapping the node-token signing key live would immediately
-invalidate every outstanding node token), and the scheduler loop cadence
-(``interval_secs``, ``max_jobs_per_cycle``, topology). ``reconfigure`` reads
-these but does not apply them; a full controller restart is required. This
-mirrors Slurm, where a documented subset of parameters (ports,
-``StateSaveLocation``, ``AuthType``, plugin set) also require a daemon restart.
-
-**Leader-only, in an HA cluster.** ``reconfigure`` is handled by the Raft
-leader and swaps only the leader's in-memory config; no Raft log entry carries
-the new config, so follower controllers keep the config they loaded at startup
-until they restart (in Kubernetes they re-read the same ConfigMap on restart).
-Partition changes still replicate through the partition write-ahead log, but
-followers recompute node membership from their own (pre-reconfigure) node
-config. Do not rely on reconfigured non-partition state surviving an immediate
-failover; roll the controllers to converge them.
+Partition changes apply immediately, and they are the only part of the file that
+also replicates to follower controllers. Many other sections apply live too, but
+some are read once at daemon startup and some are consumed by ``spurd`` on each
+compute node — see :ref:`the configuration reference <reload-scope>` for the
+per-field breakdown, the leader-only caveat, and the behaviour when a partition
+being removed still has active jobs (drain it first).
 
 Verifying Membership
 --------------------

@@ -50,6 +50,7 @@ Raft
 RDMA
 README
 reconfigure
+reloadable
 requeue
 requeued
 requeues
@@ -132,6 +133,7 @@ env
 ExitCode
 failover
 filesystem
+forgeable
 forks
 gapped
 GiB
