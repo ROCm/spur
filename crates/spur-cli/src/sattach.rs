@@ -46,7 +46,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .and_then(|s| s.parse().ok())
         .context("sattach: invalid job ID format (expected JOB_ID or JOB_ID.STEP_ID)")?;
 
-    let channel = spur_client::connect_channel(&args.controller)
+    let channel = crate::authclient::connect(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);

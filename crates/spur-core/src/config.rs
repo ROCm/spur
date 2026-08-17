@@ -565,14 +565,43 @@ impl Default for SchedulerConfig {
     }
 }
 
+/// How strictly the control plane authenticates its callers.
+///
+/// Exists so a running cluster can adopt authentication without an outage: bring the control plane
+/// up in `permissive`, roll credentials out to clients (the logs name every caller still
+/// unauthenticated), then flip to `required`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    /// Do not authenticate at all; trust the identity asserted by the client.
+    Disabled,
+    /// Verify a credential when one is presented, and reject it if invalid; fall back to the
+    /// client-asserted identity when none is presented, logging the caller. The default, because
+    /// flipping an existing cluster straight to `required` locks out every client at once.
+    #[default]
+    Permissive,
+    /// Require a valid credential on every request.
+    Required,
+}
+
+impl AuthMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthMode::Disabled => "disabled",
+            AuthMode::Permissive => "permissive",
+            AuthMode::Required => "required",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
-    /// Auth plugin: "jwt", "munge", "none".
-    ///
-    /// NOTE: this selector is not yet enforced — spurctld does not authenticate the calling user on
-    /// any RPC, and the identity used for authorization is a client-supplied field. Treat the
-    /// control-plane ports as an administrative boundary until that lands.
+    /// Auth plugin: "jwt" (implemented) or "none". "munge" is recognised but not implemented and is
+    /// rejected at startup rather than silently ignored.
     pub plugin: String,
+    /// How strictly callers are authenticated. See [`AuthMode`].
+    #[serde(default)]
+    pub mode: AuthMode,
     /// JWT secret key (file path or inline). Currently used only to sign/verify NODE admission
     /// tokens, not user identity.
     pub jwt_key: Option<String>,
@@ -590,6 +619,7 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             plugin: "jwt".into(),
+            mode: AuthMode::default(),
             jwt_key: None,
             allow_root_jobs: false,
         }
@@ -1310,6 +1340,33 @@ impl SlurmConfig {
                 ),
             });
         }
+        // `plugin` used to be parsed and never read, so an operator could set "munge" (or a typo)
+        // and get no authentication with no warning — worse than the field not existing. Reject
+        // anything unimplemented instead of silently ignoring it.
+        match self.auth.plugin.as_str() {
+            "jwt" | "none" => {}
+            "munge" => {
+                return Err(ConfigError::InvalidValue {
+                    field: "auth.plugin".into(),
+                    value: "munge (not implemented; use \"jwt\", or \"none\" to disable)".into(),
+                })
+            }
+            other => {
+                return Err(ConfigError::InvalidValue {
+                    field: "auth.plugin".into(),
+                    value: format!("{other} (expected \"jwt\" or \"none\")"),
+                })
+            }
+        }
+        // "none" and a mode that promises enforcement are contradictory; fail rather than pick one.
+        if self.auth.plugin == "none" && self.auth.mode == AuthMode::Required {
+            return Err(ConfigError::InvalidValue {
+                field: "auth.mode".into(),
+                value: "required with auth.plugin = \"none\" (no credential can be verified)"
+                    .into(),
+            });
+        }
+
         if self.cluster.enabled {
             if self.cluster.distro != "k0s" {
                 return Err(ConfigError::InvalidValue {

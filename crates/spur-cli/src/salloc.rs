@@ -121,7 +121,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let job_spec = build_salloc_job_spec(&args, nodelist)?;
     let user = job_spec.user.clone();
 
-    let channel = spur_client::connect_channel(&controller)
+    let channel = crate::authclient::connect(&controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);

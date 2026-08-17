@@ -66,7 +66,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .and_then(parse_time_arg)
         .map(datetime_to_proto);
 
-    let channel = spur_client::connect_channel(&args.controller)
+    let channel = crate::authclient::connect(&args.controller)
         .await
         .context("failed to connect to controller")?;
     let mut client = spur_proto::accounting_client(channel);
@@ -103,7 +103,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     }
 }
 
-type AcctClient = SlurmAccountingClient<tonic::transport::Channel>;
+type AcctClient = SlurmAccountingClient<crate::authclient::AuthChannel>;
 
 async fn report_account_utilization_by_user(
     client: &mut AcctClient,

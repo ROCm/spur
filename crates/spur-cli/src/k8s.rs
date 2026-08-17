@@ -184,7 +184,7 @@ async fn cmd_up(
     selector: Vec<(String, String)>,
 ) -> Result<()> {
     let selector = selector_map(selector)?;
-    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
+    let mut client = SlurmControllerClient::new(crate::authclient::connect(controller).await?);
     let resp = client
         .cluster_up(ClusterUpRequest {
             control_plane_node,
@@ -209,7 +209,7 @@ async fn cmd_up(
 }
 
 async fn cmd_down(controller: &str, reset: bool) -> Result<()> {
-    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
+    let mut client = SlurmControllerClient::new(crate::authclient::connect(controller).await?);
     let resp = client
         .cluster_down(ClusterDownRequest {
             reset,
@@ -226,7 +226,7 @@ async fn cmd_down(controller: &str, reset: bool) -> Result<()> {
 }
 
 async fn cmd_status(controller: &str) -> Result<()> {
-    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
+    let mut client = SlurmControllerClient::new(crate::authclient::connect(controller).await?);
     let resp = client
         .cluster_status(ClusterStatusRequest {})
         .await?
@@ -260,7 +260,7 @@ async fn cmd_status(controller: &str) -> Result<()> {
 }
 
 async fn cmd_kubeconfig(controller: &str, user: Option<String>, admin: bool) -> Result<()> {
-    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
+    let mut client = SlurmControllerClient::new(crate::authclient::connect(controller).await?);
     let resp = client
         .cluster_kubeconfig(ClusterKubeconfigRequest {
             user: user.unwrap_or_default(),
