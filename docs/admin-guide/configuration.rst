@@ -63,14 +63,6 @@ manager are all off unless explicitly configured.
    features = ["mi300x", "rocm6"]
    weight = 1
 
-   [network]
-   wg_enabled = false
-   agent_port = 6818
-
-   [logging]
-   level = "info"
-   format = "text"
-
 The full annotated example — including label selectors, account restrictions, and
 the k0s cluster manager — lives at ``examples/spur.conf`` in the repository.
 

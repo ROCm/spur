@@ -3464,7 +3464,8 @@ impl ClusterManager {
 
     /// Re-read spur.conf and apply it to the running controller. Leader-only, and
     /// the swap is in-memory here — no WAL entry carries it, so followers keep
-    /// their startup config. Per-field scope: docs/admin-guide/configuration.rst.
+    /// their startup config. Per-field scope: docs/admin-guide/configuration.rst,
+    /// "Applying configuration changes" section.
     pub fn reconfigure(&self) -> Result<(), anyhow::Error> {
         let Some(ref path) = self.config_path else {
             anyhow::bail!("reconfigure requires a config file path, but none is configured");
@@ -3572,7 +3573,7 @@ impl ClusterManager {
             self.reconcile_partitions(&mut nodes);
         }
 
-        info!("reconfigure: applied spur.conf on this leader (followers converge on restart); restart-only sections (listen ports, accounting DB, raft peers, jwt_key, scheduler cadence) unchanged until controller restart");
+        info!("reconfigure: applied spur.conf on the leader (followers converge on restart; see docs/admin-guide/configuration.rst, \"Applying configuration changes\", for per-field reload scope)");
         Ok(())
     }
 
