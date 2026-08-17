@@ -282,6 +282,9 @@ impl SpurStore {
     /// Flush the log directory so that entry files created or removed since the
     /// last call survive a crash. Called once per append/truncate/purge rather
     /// than once per entry file.
+    // The error type is openraft's, and every caller is a `RaftStorage` method
+    // that must return it anyway; boxing it here would only unbox at the call.
+    #[allow(clippy::result_large_err)]
     fn sync_log_dir(&self) -> Result<(), StorageError<NodeId>> {
         sync_dir(&self.log_dir()).map_err(|e| {
             StorageError::from_io_error(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
