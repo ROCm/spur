@@ -6982,7 +6982,7 @@ mod tests {
                 allow_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
-            preempt_exempt_time: None,
+                preempt_exempt_time: None,
             }],
             nodes: Vec::new(),
             network: Default::default(),
@@ -12722,7 +12722,8 @@ mod tests {
         let high_job = cm.get_job(high_id).unwrap();
         let partitions = cm.get_partitions();
 
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job], &cm.config().scheduler).await;
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job], &cm.config().scheduler)
+            .await;
         assert_eq!(cm.get_job(low_id).unwrap().state, JobState::Running);
     }
 
@@ -12756,7 +12757,8 @@ mod tests {
         let high_job = cm.get_job(high_id).unwrap();
         let partitions = cm.get_partitions();
 
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job], &cm.config().scheduler).await;
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job], &cm.config().scheduler)
+            .await;
         assert_eq!(cm.get_job(low_id).unwrap().state, JobState::Running);
     }
 
@@ -12797,7 +12799,8 @@ mod tests {
         let pending = cm.pending_jobs();
         let pending_refs: Vec<&Job> = pending.iter().collect();
         let partitions = cm.get_partitions();
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler).await;
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler)
+            .await;
 
         settle(&cm, low_id, JobState::Cancelled);
     }
@@ -12855,7 +12858,8 @@ mod tests {
              for preemption to fire"
         );
 
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler).await;
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler)
+            .await;
 
         settle(&cm, burst_id, JobState::Cancelled);
         assert_eq!(
@@ -12910,7 +12914,8 @@ mod tests {
         let pending = cm.pending_jobs();
         let pending_refs: Vec<&Job> = pending.iter().collect();
         let partitions = cm.get_partitions();
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler).await;
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler)
+            .await;
 
         // burst job must still be running — equal explicit priorities, no preemption.
         let burst_job = cm.get_job(burst_id).unwrap();
@@ -12942,7 +12947,7 @@ mod tests {
         cm.qos_cache().insert(Qos {
             name: "high".into(),
             priority: 10000,
-            preempt: vec![],   // empty = not allowed to preempt anything
+            preempt: vec![], // empty = not allowed to preempt anything
             ..Default::default()
         });
 
@@ -12966,7 +12971,8 @@ mod tests {
         let pending = cm.pending_jobs();
         let pending_refs: Vec<&Job> = pending.iter().collect();
         let partitions = cm.get_partitions();
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler).await;
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler)
+            .await;
 
         // low job must still be running — "high" QOS is not allowed to preempt "low"
         assert_eq!(
@@ -13019,7 +13025,8 @@ mod tests {
         let pending = cm.pending_jobs();
         let pending_refs: Vec<&Job> = pending.iter().collect();
         let partitions = cm.get_partitions();
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler).await;
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler)
+            .await;
 
         settle(&cm, low_id, JobState::Cancelled);
     }
@@ -13051,7 +13058,10 @@ mod tests {
 
         // Confirm the job has a start_time (required for exempt check to fire).
         let low_job = cm.get_job(low_id).unwrap();
-        assert!(low_job.start_time.is_some(), "running job must have a start_time");
+        assert!(
+            low_job.start_time.is_some(),
+            "running job must have a start_time"
+        );
 
         let mut high = basic_spec("high");
         high.priority = Some(10_000);
@@ -13060,7 +13070,8 @@ mod tests {
         let pending = cm.pending_jobs();
         let pending_refs: Vec<&Job> = pending.iter().collect();
         let partitions = cm.get_partitions();
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler).await;
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler)
+            .await;
 
         // low job must still be running — it was started moments ago and is within the exempt window
         assert_eq!(
@@ -13144,7 +13155,8 @@ mod tests {
         let high_job = cm.get_job(high_id).unwrap();
         let partitions = cm.get_partitions();
 
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job], &cm.config().scheduler).await;
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job], &cm.config().scheduler)
+            .await;
 
         // Suspended, not Cancelled: proves the QoS override reached the real
         // preemption action, not just the pure job_preempt_mode() decision.
@@ -18936,7 +18948,7 @@ mod tests {
                 allow_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
-            preempt_exempt_time: None,
+                preempt_exempt_time: None,
             },
             spur_core::config::PartitionConfig {
                 name: "train".into(),
@@ -18955,7 +18967,7 @@ mod tests {
                 allow_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
-            preempt_exempt_time: None,
+                preempt_exempt_time: None,
             },
         ];
         let cm = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
