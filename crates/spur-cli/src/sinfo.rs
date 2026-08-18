@@ -45,8 +45,7 @@ pub struct SinfoArgs {
     #[arg(short = 'h', long)]
     pub noheader: bool,
 
-    /// Report values without unit conversion. Accepted for Slurm compatibility:
-    /// Spur already emits unconverted values, so there is nothing to suppress.
+    /// Accepted for Slurm compatibility; has no effect
     #[arg(long)]
     pub noconvert: bool,
 
@@ -352,7 +351,7 @@ mod tests {
     use super::*;
     use spur_proto::proto as pb;
     use spur_proto::proto::slurm_controller_server::SlurmController;
-    use spur_proto::proto::NodeState;
+    use spur_proto::proto::{NodeState, ResourceSet};
     use std::sync::{Arc, Mutex};
     use tonic::{Request, Response, Status};
 
@@ -402,16 +401,37 @@ mod tests {
     }
 
     #[test]
-    fn noconvert_changes_nothing_else() {
-        // Spur never humanizes units, so the flag has nothing to suppress. If unit
-        // conversion is ever added, this is what should force the flag to be honoured.
-        let plain = parse_sinfo_args(&["sinfo", "-N", "-h", "-o", "%n %m"]);
-        let flagged = parse_sinfo_args(&["sinfo", "-N", "-h", "-o", "%n %m", "--noconvert"]);
-        assert_eq!(plain.format, flagged.format);
-        assert_eq!(plain.noheader, flagged.noheader);
-        assert_eq!(plain.node_oriented, flagged.node_oriented);
-        assert!(!plain.noconvert);
-        assert!(flagged.noconvert);
+    fn memory_columns_render_as_raw_megabytes_with_and_without_noconvert() {
+        // The flag is inert only because these cells are already raw MB. Driving the
+        // real render path pins that: humanizing memory_mb or free_memory_mb later
+        // turns this red, which a parse-only test would not.
+        let mut node = make_node("gpu001", NodeState::NodeIdle, "gpu");
+        node.total_resources = Some(ResourceSet {
+            memory_mb: 2_321_924,
+            ..Default::default()
+        });
+        node.free_memory_mb = 11_077;
+        let partitions = vec![make_partition("gpu", true)];
+
+        for argv in [
+            ["sinfo", "-N", "-h", "-o", "%m %e"].as_slice(),
+            ["sinfo", "-N", "-h", "-o", "%m %e", "--noconvert"].as_slice(),
+        ] {
+            let args = parse_sinfo_args(argv);
+            let fields = format_engine::parse_format(
+                args.format.as_deref().expect("-o sets format"),
+                &format_engine::sinfo_header,
+            );
+
+            let lines = render_sinfo_output(
+                &fields,
+                &partitions,
+                std::slice::from_ref(&node),
+                args.node_oriented,
+            );
+
+            assert_eq!(lines, ["2321924 11077"], "argv: {argv:?}");
+        }
     }
 
     #[test]
