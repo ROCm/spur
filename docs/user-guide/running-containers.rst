@@ -83,6 +83,35 @@ An interactive shell in a container with your home directory mounted:
 
    srun --container-image ubuntu:22.04 --container-mount-home bash
 
+Environment Inside the Container
+--------------------------------
+
+A container job starts from the image's own environment — the ``config.Env`` that
+``docker run`` would apply — and layers the job's environment on top of it. Spur
+records the image config at ``spur image import`` time, so images imported by an
+older Spur have nothing recorded and keep starting from the job environment
+alone; re-import them to pick up their environment.
+
+Later entries win:
+
+1. the image's ``config.Env``
+2. the job environment (``--export``, which defaults to ``ALL``)
+3. ``--container-env KEY=VAL``
+4. admin ``environ.d`` files and hook variables
+
+``PATH`` and ``LD_LIBRARY_PATH`` are the exception: instead of being replaced,
+the image's entries and the job's are joined, image first, so that the programs
+and libraries shipped in the image stay reachable while additions from the
+submitting host still apply. An explicit ``--container-env PATH=...`` replaces
+the result outright.
+
+This is what lets an image's own tooling run without spelling out its paths:
+
+.. code-block:: bash
+
+   # torchrun lives on the image's PATH (/opt/venv/bin), not the host's
+   sbatch --container-image registry.example.com/pytorch:latest train.sh
+
 Exec Into a Running Container Job
 ---------------------------------
 
