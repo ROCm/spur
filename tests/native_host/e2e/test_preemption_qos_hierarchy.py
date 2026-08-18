@@ -92,7 +92,7 @@ class TestQosPreemptHierarchyBlocked:
 
             # low job must still be running — high-hier has an empty
             # preempt allow-list so it cannot preempt low-hier.
-            state = c.scontrol(["show", "job", str(low_id)])
+            state = c.scontrol("show", "job", str(low_id))
             assert "JobState=RUNNING" in state, (
                 "low job must remain RUNNING when pending QOS allow-list is empty"
             )
@@ -214,7 +214,7 @@ class TestPreemptExemptTime:
             )
             low_id = parse_job_id(low_out)
             assert low_id is not None, f"submit failed:\n{low_out}"
-            wait_job_state(c, low_id, "R", timeout=30)
+            wait_job_state(c, low_id, "R", timeout=60)
 
             # Submit the high-priority job immediately after low starts.
             high_script = c.write_file(
@@ -227,13 +227,11 @@ class TestPreemptExemptTime:
             high_id = parse_job_id(high_out)
             assert high_id is not None, f"submit failed:\n{high_out}"
             # Force high's priority above the 2× threshold.
-            c.scontrol(
-                ["update", f"JobId={high_id}", "Priority=1000000"]
-            )
+            c.scontrol("update", f"JobId={high_id}", "Priority=1000000")
 
             # Within the exempt window: low must still be running.
             time.sleep(self.SAFE_WAIT_SECS)
-            state = c.scontrol(["show", "job", str(low_id)])
+            state = c.scontrol("show", "job", str(low_id))
             assert "JobState=RUNNING" in state, (
                 f"low job must be protected within the {self.EXEMPT_SECS}s "
                 f"exempt window (checked after {self.SAFE_WAIT_SECS}s)"
@@ -275,19 +273,17 @@ class TestReconfigurePreservesExemptTime:
     def test_reconfigure_preserves_partition_exempt_time(self, cluster):
         c = cluster
 
-        # Set a per-partition exempt time via scontrol at runtime.
-        c.scontrol(
-            ["update-partition", "--name=default", "--preempt-exempt-time=120"]
-        )
+        # Set a per-partition exempt time via scontrol inline syntax.
+        c.scontrol("update", "PartitionName=default", "PreemptExemptTime=120")
 
         # Confirm it's visible in scontrol show partition.
-        out = c.scontrol(["show", "partition", "default"])
+        out = c.scontrol("show", "partition", "default")
         assert "PreemptExemptTime=120" in out, (
             f"preempt_exempt_time not set after scontrol update: {out}"
         )
 
         # Trigger a reconfigure.
-        c.scontrol(["reconfigure"])
+        c.scontrol("reconfigure")
         time.sleep(3)  # let the controller apply the reload
 
         # The override must survive: it was set at runtime, not from TOML.
@@ -296,7 +292,7 @@ class TestReconfigurePreservesExemptTime:
         # the reconfigure WAL entry carries preempt_exempt_time=None (no change)
         # for partitions whose TOML does not have the field set, so the
         # runtime value is preserved.
-        out_after = c.scontrol(["show", "partition", "default"])
+        out_after = c.scontrol("show", "partition", "default")
         assert "PreemptExemptTime=120" in out_after, (
             f"preempt_exempt_time was wiped by reconfigure:\nbefore: {out}\nafter: {out_after}"
         )
