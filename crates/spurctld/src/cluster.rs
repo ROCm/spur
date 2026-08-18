@@ -9,7 +9,7 @@ use std::sync::{Arc, OnceLock};
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use tokio::sync::Notify;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use spur_core::account_limits::{check_account_limits, AccountCheckResult};
 use spur_core::accounting::{Qos, TresRecord, TresType};
@@ -45,30 +45,23 @@ use crate::sched_stats::SchedStatsCollector;
 /// so operator runbooks and log greps written against Slurm keep working.
 pub const LAUNCH_FAILURE_HELD_DESC: &str = "launch failed requeued held";
 
-/// How far `Node.alloc_resources` disagreed with the job records that own it,
-/// measured when a rebuild examined it.
-///
-/// The two directions are not symmetric and are counted separately.
-/// *Undercharged* means the index holds less than the job records prove is in
-/// use; that over-places work and is corrected. *Overcharged* means it holds
-/// more; that is only reported, because the controller cannot tell a leaked
-/// charge apart from one whose release has not arrived yet, and releasing a
-/// charge on a guess is the failure this whole effort exists to prevent.
+/// How far `Node.alloc_resources` disagreed with the job records that own it.
+/// Undercharges are corrected; overcharges are only counted, since a leak and a
+/// release still in flight are indistinguishable here.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct AllocDrift {
     pub nodes_checked: usize,
+    /// Active job/node pairs whose record carries no slice at all. Nothing is
+    /// charged for them and the diff cannot see it, so they are counted directly.
+    pub unaccounted_slices: usize,
     pub nodes_undercharged: usize,
     pub nodes_overcharged: usize,
     pub cpus_undercharged: u64,
     pub cpus_overcharged: u64,
+    pub memory_undercharged_mb: u64,
+    pub memory_overcharged_mb: u64,
     pub devices_undercharged: u64,
     pub devices_overcharged: u64,
-}
-
-impl AllocDrift {
-    pub fn is_clean(&self) -> bool {
-        self.nodes_undercharged == 0 && self.nodes_overcharged == 0
-    }
 }
 
 /// Total device units held, summed across every gres kind.
@@ -4491,28 +4484,14 @@ impl ClusterManager {
         }
     }
 
-    /// Rebuild every node's allocation total from the job records that own it.
-    ///
-    /// Safe to call at any time — it is a no-op on an index that already agrees.
-    /// Callers are the points where this process's view is newly assembled, not
-    /// the steady state, which the incremental apply path keeps correct.
+    /// Lock-taking wrapper over [`Self::rebuild_node_alloc_from_jobs`], for callers
+    /// that hold neither guard. A no-op on an index that already agrees.
     pub(crate) fn rebuild_node_alloc(&self, trigger: RebuildTrigger) -> AllocDrift {
         let drift = {
             let jobs = self.jobs.read();
             let mut nodes = self.nodes.write();
-            Self::rebuild_node_alloc_from_jobs(&jobs, &mut nodes)
+            Self::rebuild_node_alloc_from_jobs(&jobs, &mut nodes, trigger)
         };
-        if !drift.is_clean() {
-            warn!(
-                trigger = trigger.as_str(),
-                nodes_checked = drift.nodes_checked,
-                nodes_undercharged = drift.nodes_undercharged,
-                nodes_overcharged = drift.nodes_overcharged,
-                cpus_undercharged = drift.cpus_undercharged,
-                cpus_overcharged = drift.cpus_overcharged,
-                "reconciled node allocations against job records"
-            );
-        }
         self.record_alloc_drift(trigger, drift);
         drift
     }
@@ -4645,26 +4624,24 @@ impl ClusterManager {
                 continue;
             };
             let Some(slice) = per_node_alloc.get(name) else {
-                // Releasing a guess is worse than releasing nothing: an even
-                // split of the job total carries no devices, so subtracting it
-                // silently strands every GPU the node held. Leave the charge for
-                // rebuild_node_alloc_from_jobs to correct against the job records.
-                warn!(job_id, node = %name, "per_node_alloc missing at deallocation, leaving charge in place");
+                // An even split of the job total carries no devices, so releasing
+                // a guessed slice would strand every GPU the node held. The charge
+                // is left behind deliberately and surfaces as an overcharge.
+                warn!(job_id, node = %name, "per_node_alloc missing at deallocation, leaving charge in place for an operator");
                 continue;
             };
-            Self::release_node_slice(node, &slice.clone());
+            Self::release_node_slice(node, slice);
         }
     }
 
-    /// Node totals implied by the job records that own them.
-    ///
-    /// `Job.per_node_alloc` is the authority; `Node.alloc_resources` is an index
-    /// the WAL apply path maintains incrementally, so the two are only trustworthy
-    /// together. A node is charged a job's slice while the job is active and that
-    /// node has not yet reported its own completion — exactly the window between
-    /// `JobStart` and either `JobNodeComplete` for that node or the job finalizing.
-    fn derive_node_alloc(jobs: &HashMap<JobId, Job>) -> HashMap<String, ResourceAllocations> {
+    /// Node totals implied by the job records that own them: a node is charged a
+    /// job's slice while `job.state.is_active()` and that node is in
+    /// `allocated_nodes` but not yet in `node_completions`.
+    fn derive_node_alloc(
+        jobs: &HashMap<JobId, Job>,
+    ) -> (HashMap<String, ResourceAllocations>, usize) {
         let mut derived: HashMap<String, ResourceAllocations> = HashMap::new();
+        let mut unaccounted = 0;
         for job in jobs.values() {
             if !job.state.is_active() {
                 continue;
@@ -4674,51 +4651,58 @@ impl ClusterManager {
                     continue;
                 }
                 let Some(slice) = job.per_node_alloc.get(name) else {
+                    // The record names the node but carries no slice, so nothing
+                    // can be charged and the shortfall is invisible to the diff.
+                    unaccounted += 1;
                     continue;
                 };
                 derived.entry(name.clone()).or_default().add(slice);
             }
         }
-        derived
+        (derived, unaccounted)
     }
 
-    /// Reconcile every node's `alloc_resources` against the job records that own
-    /// it. Runs where a process's view of the cluster is newly assembled: snapshot
-    /// restore and leadership gain.
+    /// Reconcile every node's `alloc_resources` against the job records that own it.
     ///
-    /// **Widens only.** A node short of what its job records prove is in use is
-    /// topped up, because that shortfall is what lets the scheduler place work on
-    /// resources somebody already holds. A node holding *more* than the records
-    /// account for is reported and left alone: the controller cannot distinguish a
-    /// leaked charge from one whose release is still in flight — a job can sit
-    /// terminal for as long as it takes its agent's completion report to arrive —
-    /// and releasing on that guess would hand out resources a live process is
-    /// still using.
-    ///
-    /// Only nodes that actually disagree are touched, so a correct index costs
-    /// nothing and cannot have its state churned as a side effect.
+    /// **Widens only.** A shortfall is topped up, because that is what lets the
+    /// scheduler place work on resources somebody already holds. An excess is only
+    /// counted: a leaked charge and a release still in flight look identical here,
+    /// and releasing on that guess is the failure this exists to prevent.
     fn rebuild_node_alloc_from_jobs(
         jobs: &HashMap<JobId, Job>,
         nodes: &mut HashMap<String, Node>,
+        trigger: RebuildTrigger,
     ) -> AllocDrift {
-        let derived = Self::derive_node_alloc(jobs);
+        let (derived, unaccounted_slices) = Self::derive_node_alloc(jobs);
+        let empty = ResourceAllocations::default();
         let mut drift = AllocDrift {
             nodes_checked: nodes.len(),
+            unaccounted_slices,
             ..Default::default()
         };
+        if unaccounted_slices > 0 {
+            error!(
+                trigger = trigger.as_str(),
+                unaccounted_slices,
+                "active jobs name a node with no per-node allocation recorded; those nodes are running work nothing is charged for"
+            );
+        }
 
         for (name, node) in nodes.iter_mut() {
-            let want = derived.get(name).cloned().unwrap_or_default();
-            let missing = shortfall(&node.alloc_resources, &want);
-            let excess = shortfall(&want, &node.alloc_resources);
+            let want = derived.get(name).unwrap_or(&empty);
+            let missing = shortfall(&node.alloc_resources, want);
+            let excess = shortfall(want, &node.alloc_resources);
 
             if !excess.is_empty() {
                 drift.nodes_overcharged += 1;
                 drift.cpus_overcharged += u64::from(excess.cpus);
+                drift.memory_overcharged_mb += excess.memory_mb;
                 drift.devices_overcharged += device_total(&excess);
                 warn!(
+                    trigger = trigger.as_str(),
                     node = %name,
                     excess_cpus = excess.cpus,
+                    excess_memory_mb = excess.memory_mb,
                     excess_devices = device_total(&excess),
                     "node is charged more than its job records account for; leaving it charged pending proof of release"
                 );
@@ -4729,22 +4713,21 @@ impl ClusterManager {
             }
             drift.nodes_undercharged += 1;
             drift.cpus_undercharged += u64::from(missing.cpus);
+            drift.memory_undercharged_mb += missing.memory_mb;
             drift.devices_undercharged += device_total(&missing);
             warn!(
+                trigger = trigger.as_str(),
                 node = %name,
                 missing_cpus = missing.cpus,
+                missing_memory_mb = missing.memory_mb,
                 missing_devices = device_total(&missing),
                 "node is charged less than its job records prove is in use; topping it up"
             );
 
+            // Only ever grows the charge, so a node cannot become idle here and
+            // the Draining -> Drain retirement the release path does has no place.
             node.alloc_resources.add(&missing);
             node.update_state_from_alloc();
-            if node.state == NodeState::Draining
-                && node.alloc_resources.cpus == 0
-                && !node.alloc_resources.has_devices()
-            {
-                node.state = NodeState::Drain;
-            }
         }
 
         drift
@@ -5212,15 +5195,30 @@ impl ClusterManager {
                 srun_step_dispatch,
                 run_attempt,
             } => {
-                if let Some(job) = jobs.get_mut(job_id) {
-                    job.start_time = Some(timestamp);
-                    job.allocated_nodes = node_names.clone();
-                    job.allocated_resources = Some(resources.clone());
-                    job.per_node_alloc = per_node_alloc.clone();
-                    job.set_pending_reason(PendingReason::None);
-                    job.srun_step_dispatch = *srun_step_dispatch;
-                    job.run_attempt = *run_attempt;
-                    job.launch_failure_detail = None;
+                // Dispatch proposes the Pending -> Running transition first and this
+                // charge second. If that transition was rejected (a cancel landing
+                // between the two proposals), charging here would bind resources to
+                // a job no release path will ever revisit.
+                match jobs.get_mut(job_id) {
+                    Some(job) if job.state.is_active() => {
+                        job.start_time = Some(timestamp);
+                        job.allocated_nodes = node_names.clone();
+                        job.allocated_resources = Some(resources.clone());
+                        job.per_node_alloc = per_node_alloc.clone();
+                        job.set_pending_reason(PendingReason::None);
+                        job.srun_step_dispatch = *srun_step_dispatch;
+                        job.run_attempt = *run_attempt;
+                        job.launch_failure_detail = None;
+                    }
+                    Some(job) => {
+                        warn!(
+                            job_id = *job_id,
+                            state = ?job.state,
+                            "ignoring allocation for a job that is no longer active"
+                        );
+                        return ClientResponse::default();
+                    }
+                    None => return ClientResponse::default(),
                 }
                 for name in node_names {
                     if let Some(node) = nodes.get_mut(name) {
@@ -6099,7 +6097,7 @@ impl StateMachineApply for ClusterManager {
         // The snapshot carries the accumulator as the writing leader last saw it,
         // so any drift it had accumulated ships with it. Rebuild from the job
         // records, which are the authority for who holds what.
-        let drift = Self::rebuild_node_alloc_from_jobs(&jobs, &mut nodes);
+        let drift = Self::rebuild_node_alloc_from_jobs(&jobs, &mut nodes, RebuildTrigger::Restore);
         self.record_alloc_drift(RebuildTrigger::Restore, drift);
 
         *self.reservations.write() = snap.reservations;
@@ -8076,6 +8074,11 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("j")),
         });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
 
         let resources = scalar_alloc(4, 8000);
         cm.apply_operation(&WalOperation::JobStart {
@@ -20665,6 +20668,16 @@ mod tests {
     /// Deterministic PRNG so a failing sequence is reproducible from its seed
     /// alone. Test-local on purpose: no dependency, and no dependence on the
     /// runner's environment.
+    /// Operations the generator got to actually apply, so a refactor that turns
+    /// every step into a silent no-op cannot leave the suite green.
+    #[derive(Debug, Default, Clone, Copy)]
+    struct OpCounts {
+        dispatched: usize,
+        node_completed: usize,
+        completed: usize,
+        released: usize,
+    }
+
     struct Rng(u64);
 
     impl Rng {
@@ -20729,16 +20742,13 @@ mod tests {
         });
     }
 
-    /// Every node holds at least what the job records prove is in use.
-    ///
-    /// Being *short* is the failure that matters: it lets the scheduler place
-    /// work on resources somebody already holds, which is the production loop
-    /// this reconciliation exists to close. Holding extra is a separate concern
-    /// (a release that has not arrived, or a leak) and is asserted separately.
+    /// Every node holds at least what the job records prove is in use — being
+    /// short is what lets the scheduler place work on resources already held.
+    #[allow(dead_code)]
     fn assert_never_undercharged(cm: &ClusterManager, context: &str) {
         let jobs = cm.jobs.read();
         let nodes = cm.nodes.read();
-        let derived = ClusterManager::derive_node_alloc(&jobs);
+        let (derived, _) = ClusterManager::derive_node_alloc(&jobs);
         for (name, want) in &derived {
             let Some(node) = nodes.get(name) else {
                 continue;
@@ -20758,7 +20768,7 @@ mod tests {
     fn assert_matches_job_records(cm: &ClusterManager, context: &str) {
         let jobs = cm.jobs.read();
         let nodes = cm.nodes.read();
-        let derived = ClusterManager::derive_node_alloc(&jobs);
+        let (derived, _) = ClusterManager::derive_node_alloc(&jobs);
         for (name, node) in nodes.iter() {
             let want = derived.get(name).cloned().unwrap_or_default();
             assert_eq!(
@@ -20775,15 +20785,9 @@ mod tests {
         });
     }
 
-    /// Drive a randomized but well-formed sequence of real WAL operations
-    /// through the state machine and check the index against the job records
-    /// after every single step.
-    ///
-    /// This is a differential test, not a simulation: every mutation goes
-    /// through `apply_operation`, the same path the Raft log takes in
-    /// production, so a drift bug at any of the four mutation sites shows up
-    /// here as a failing step with the seed needed to replay it.
-    async fn run_differential_sequence(seed: u64, steps: usize) {
+    /// Differential, not simulated: every mutation goes through `apply_operation`,
+    /// the same path the Raft log takes, and the index is checked after each step.
+    async fn run_differential_sequence(seed: u64, steps: usize) -> OpCounts {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
@@ -20794,6 +20798,7 @@ mod tests {
 
         let mut rng = Rng(seed);
         let mut next_job_id: JobId = 1;
+        let mut fired = OpCounts::default();
 
         for step in 0..steps {
             let context = format!("seed {seed}, step {step}");
@@ -20843,6 +20848,7 @@ mod tests {
                         srun_step_dispatch: false,
                         run_attempt: 1,
                     });
+                    fired.dispatched += 1;
                 }
                 // One node of a job reports its own completion.
                 5..=6 => {
@@ -20856,59 +20862,67 @@ mod tests {
                         continue;
                     }
                     let idx = rng.below(job.allocated_nodes.len() as u64) as usize;
+                    let node_name = job.allocated_nodes[idx].clone();
+                    let reported_before = cm
+                        .get_job(job_id)
+                        .is_some_and(|j| j.node_completions.contains_key(&node_name));
                     cm.apply_operation(&WalOperation::JobNodeComplete {
                         job_id,
-                        node_name: job.allocated_nodes[idx].clone(),
+                        node_name: node_name.clone(),
                         exit_code: 0,
                         signal: 0,
                     });
+                    let reported_after = cm
+                        .get_job(job_id)
+                        .is_some_and(|j| j.node_completions.contains_key(&node_name));
+                    if !reported_before && reported_after {
+                        fired.node_completed += 1;
+                    }
                 }
                 // Whole-job completion.
                 7 => {
                     let Some(job_id) = pick(&mut rng, &job_ids) else {
                         continue;
                     };
+                    let before = cm.get_job(job_id).map(|j| j.state);
                     cm.apply_operation(&WalOperation::JobComplete {
                         job_id,
                         exit_code: 0,
                         state: JobState::Completed,
                     });
+                    if cm.get_job(job_id).map(|j| j.state) != before {
+                        fired.completed += 1;
+                    }
                 }
                 // Eviction / preemption / requeue: the paths that free a whole
                 // job's spread at once, and historically the ones that could
                 // subtract a node's slice a second time.
-                8 => match rng.below(4) {
-                    0 => {
-                        if let Some(job_id) = pick(&mut rng, &job_ids) {
-                            cm.apply_operation(&WalOperation::JobEvict {
-                                job_id,
-                                detail: None,
-                            });
-                        }
+                8 => {
+                    let Some(job_id) = pick(&mut rng, &job_ids) else {
+                        continue;
+                    };
+                    let op = match rng.below(4) {
+                        0 => WalOperation::JobEvict {
+                            job_id,
+                            detail: None,
+                        },
+                        1 => WalOperation::JobPreemptCancel { job_id },
+                        2 => WalOperation::JobPreemptRequeue {
+                            job_id,
+                            begin_time: Utc::now(),
+                        },
+                        _ => WalOperation::JobUserRequeue {
+                            job_id,
+                            hold: false,
+                            begin_time: None,
+                        },
+                    };
+                    let before = cm.get_job(job_id).map(|j| j.state);
+                    cm.apply_operation(&op);
+                    if cm.get_job(job_id).map(|j| j.state) != before {
+                        fired.released += 1;
                     }
-                    1 => {
-                        if let Some(job_id) = pick(&mut rng, &job_ids) {
-                            cm.apply_operation(&WalOperation::JobPreemptCancel { job_id });
-                        }
-                    }
-                    2 => {
-                        if let Some(job_id) = pick(&mut rng, &job_ids) {
-                            cm.apply_operation(&WalOperation::JobPreemptRequeue {
-                                job_id,
-                                begin_time: Utc::now(),
-                            });
-                        }
-                    }
-                    _ => {
-                        if let Some(job_id) = pick(&mut rng, &job_ids) {
-                            cm.apply_operation(&WalOperation::JobUserRequeue {
-                                job_id,
-                                hold: false,
-                                begin_time: None,
-                            });
-                        }
-                    }
-                },
+                }
                 // Suspend / resume hold the allocation throughout.
                 _ => {
                     let Some(job_id) = pick(&mut rng, &job_ids) else {
@@ -20929,15 +20943,171 @@ mod tests {
                 }
             }
 
-            assert_never_undercharged(&cm, &context);
+            assert_matches_job_records(&cm, &context);
         }
+
+        fired
+    }
+
+    #[test]
+    fn shortfall_is_empty_when_the_holding_covers_the_want() {
+        let have = gpu_alloc(8, 16000, &[0, 1]);
+        let want = gpu_alloc(4, 8000, &[0]);
+        assert!(shortfall(&have, &want).is_empty());
+        assert!(shortfall(&have, &have).is_empty());
+    }
+
+    #[test]
+    fn shortfall_reports_a_memory_only_gap() {
+        let have = gpu_alloc(4, 1000, &[0]);
+        let want = gpu_alloc(4, 8000, &[0]);
+        let missing = shortfall(&have, &want);
+        assert!(
+            !missing.is_empty(),
+            "a memory-only gap is still a shortfall"
+        );
+        assert_eq!(missing.cpus, 0);
+        assert_eq!(missing.memory_mb, 7000);
+        assert!(!missing.has_devices());
+    }
+
+    #[test]
+    fn shortfall_counts_a_device_the_holding_does_not_have_at_all() {
+        let have = gpu_alloc(4, 8000, &[0]);
+        let want = gpu_alloc(4, 8000, &[1]);
+        let missing = shortfall(&have, &want);
+        assert_eq!(missing.device_ids("gpu"), vec![1]);
+        // Device ids do not offset each other: holding 0 while 1 is wanted is
+        // simultaneously an excess of 0 and a shortfall of 1.
+        assert_eq!(shortfall(&want, &have).device_ids("gpu"), vec![0]);
+    }
+
+    #[test]
+    fn shortfall_ignores_a_gres_kind_only_the_holding_has() {
+        let mut have = gpu_alloc(4, 8000, &[0]);
+        have.devices
+            .insert("nic".into(), vec![AllocatedDevice::injectable(3)]);
+        let want = gpu_alloc(4, 8000, &[0]);
+        assert!(shortfall(&have, &want).is_empty());
+        assert_eq!(
+            shortfall(&want, &have).device_ids("nic"),
+            vec![3],
+            "the extra gres kind is an excess in the other direction"
+        );
+    }
+
+    #[test]
+    fn shortfall_reports_a_partial_count_gap_on_a_countable_device() {
+        let mut have = ResourceAllocations::default();
+        have.devices.insert(
+            "bandwidth".into(),
+            vec![AllocatedDevice {
+                device_id: 0,
+                count: 2,
+            }],
+        );
+        let mut want = ResourceAllocations::default();
+        want.devices.insert(
+            "bandwidth".into(),
+            vec![AllocatedDevice {
+                device_id: 0,
+                count: 5,
+            }],
+        );
+        assert_eq!(device_total(&shortfall(&have, &want)), 3);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn incremental_allocation_never_falls_short_of_the_job_records() {
+    async fn a_charge_is_refused_for_a_job_that_is_no_longer_active() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_gpu_node(&cm, "n1", 16, 4);
+
+        // Dispatch proposes the Running transition first; if a cancel lands in
+        // between, the charge must not bind resources to a dead job.
+        submit_pending_job(&cm, 1);
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Cancelled,
+        });
+
+        let slice = gpu_alloc(4, 8000, &[0, 1]);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: slice.clone(),
+            per_node_alloc: per_node_for(&["n1"], slice),
+            srun_step_dispatch: false,
+            run_attempt: 1,
+        });
+
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(
+            node.alloc_resources,
+            ResourceAllocations::default(),
+            "a cancelled job must not be charged: no release path would ever revisit it"
+        );
+        assert!(cm.get_job(1).unwrap().allocated_nodes.is_empty());
+        assert_matches_job_records(&cm, "after a charge for an inactive job");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_active_job_naming_a_node_with_no_slice_is_counted_as_unaccounted() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_gpu_node(&cm, "n1", 16, 4);
+
+        submit_pending_job(&cm, 1);
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: gpu_alloc(8, 16000, &[0, 1]),
+            per_node_alloc: HashMap::new(),
+            srun_step_dispatch: false,
+            run_attempt: 1,
+        });
+
+        let drift = cm.rebuild_node_alloc(RebuildTrigger::LeadershipGain);
+        assert_eq!(
+            drift.unaccounted_slices, 1,
+            "nothing is charged and the diff cannot see it, so it must be counted directly"
+        );
+        assert_eq!(
+            drift.nodes_undercharged, 0,
+            "no node disagrees; the gap is that nothing was charged at all"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn incremental_allocation_matches_the_job_records_at_every_step() {
+        let mut total = OpCounts::default();
         for seed in [1, 2, 3, 5, 8, 13, 21, 34] {
-            run_differential_sequence(seed, 120).await;
+            let fired = run_differential_sequence(seed, 120).await;
+            total.dispatched += fired.dispatched;
+            total.node_completed += fired.node_completed;
+            total.completed += fired.completed;
+            total.released += fired.released;
         }
+
+        assert!(total.dispatched >= 50, "too few dispatches: {total:?}");
+        assert!(
+            total.node_completed >= 20,
+            "too few per-node completions: {total:?}"
+        );
+        assert!(
+            total.completed >= 5,
+            "too few whole-job completions: {total:?}"
+        );
+        assert!(
+            total.released >= 20,
+            "too few evict/preempt/requeue releases: {total:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -21178,7 +21348,9 @@ mod tests {
 
         let drift = cm.rebuild_node_alloc(RebuildTrigger::LeadershipGain);
 
-        assert!(drift.is_clean());
+        assert_eq!(drift.nodes_undercharged, 0);
+        assert_eq!(drift.nodes_overcharged, 0);
+        assert_eq!(drift.unaccounted_slices, 0);
         let after = cm.get_node("n1").unwrap();
         assert_eq!(after.alloc_resources, before.alloc_resources);
         assert_eq!(after.state, before.state, "node state must not be churned");

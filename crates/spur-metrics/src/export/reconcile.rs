@@ -25,13 +25,12 @@ struct CauseLabel {
 
 type CounterFamily<L> = Family<L, Counter<u64, AtomicU64>>;
 
-fn bump(family: &CounterFamily<TriggerLabel>, trigger: &str, value: u64) {
+fn bump(family: &CounterFamily<TriggerLabel>, label: &TriggerLabel, value: u64) {
+    // get_or_create even at zero: a clean rebuild must still publish the series,
+    // or absent()-style alerts fire on a healthy cluster.
+    let counter = family.get_or_create(label);
     if value > 0 {
-        family
-            .get_or_create(&TriggerLabel {
-                trigger: trigger.to_string(),
-            })
-            .inc_by(value);
+        counter.inc_by(value);
     }
 }
 
@@ -44,21 +43,30 @@ pub fn register_reconcile(registry: &mut Registry, snap: &ReconcileStatsSnapshot
     let cpus_over = CounterFamily::<TriggerLabel>::default();
     let devices_under = CounterFamily::<TriggerLabel>::default();
     let devices_over = CounterFamily::<TriggerLabel>::default();
+    let memory_under = CounterFamily::<TriggerLabel>::default();
+    let memory_over = CounterFamily::<TriggerLabel>::default();
     let last_under = Family::<TriggerLabel, Gauge<u64, AtomicU64>>::default();
+    let unaccounted = Family::<TriggerLabel, Gauge<u64, AtomicU64>>::default();
+    let checked = Family::<TriggerLabel, Gauge<u64, AtomicU64>>::default();
 
     for r in &snap.rebuilds {
-        bump(&rebuilds, &r.trigger, r.rebuilds);
-        bump(&under_nodes, &r.trigger, r.nodes_undercharged);
-        bump(&over_nodes, &r.trigger, r.nodes_overcharged);
-        bump(&cpus_under, &r.trigger, r.cpus_undercharged);
-        bump(&cpus_over, &r.trigger, r.cpus_overcharged);
-        bump(&devices_under, &r.trigger, r.devices_undercharged);
-        bump(&devices_over, &r.trigger, r.devices_overcharged);
+        let label = TriggerLabel {
+            trigger: r.trigger.clone(),
+        };
+        bump(&rebuilds, &label, r.rebuilds);
+        bump(&under_nodes, &label, r.nodes_undercharged);
+        bump(&over_nodes, &label, r.nodes_overcharged);
+        bump(&cpus_under, &label, r.cpus_undercharged);
+        bump(&cpus_over, &label, r.cpus_overcharged);
+        bump(&memory_under, &label, r.memory_undercharged_mb);
+        bump(&memory_over, &label, r.memory_overcharged_mb);
+        bump(&devices_under, &label, r.devices_undercharged);
+        bump(&devices_over, &label, r.devices_overcharged);
         last_under
-            .get_or_create(&TriggerLabel {
-                trigger: r.trigger.clone(),
-            })
+            .get_or_create(&label)
             .set(r.last_nodes_undercharged);
+        unaccounted.get_or_create(&label).set(r.unaccounted_slices);
+        checked.get_or_create(&label).set(r.nodes_checked);
     }
 
     let reclaims = CounterFamily::<CauseLabel>::default();
@@ -113,6 +121,26 @@ pub fn register_reconcile(registry: &mut Registry, snap: &ReconcileStatsSnapshot
         devices_over,
     );
     registry.register(
+        "spur_reconcile_undercharged_memory_mb",
+        "Memory (MB) the node index was short of its job records, by trigger",
+        memory_under,
+    );
+    registry.register(
+        "spur_reconcile_overcharged_memory_mb",
+        "Memory (MB) the node index held beyond its job records, by trigger",
+        memory_over,
+    );
+    registry.register(
+        "spur_reconcile_unaccounted_slices",
+        "Active job/node pairs whose record carries no allocation, so nothing is charged for them",
+        unaccounted,
+    );
+    registry.register(
+        "spur_reconcile_nodes_checked",
+        "Nodes examined on the most recent pass, by trigger",
+        checked,
+    );
+    registry.register(
         "spur_reconcile_agent_job_reclaims",
         "Jobs reclaimed from an agent heartbeat, by cause",
         reclaims,
@@ -151,8 +179,12 @@ mod tests {
                 last_nodes_undercharged: 2,
                 cpus_undercharged: 8,
                 cpus_overcharged: 0,
+                memory_undercharged_mb: 2048,
+                memory_overcharged_mb: 0,
                 devices_undercharged: 4,
                 devices_overcharged: 1,
+                unaccounted_slices: 3,
+                nodes_checked: 12,
             }],
             reclaims: vec![ReclaimCauseSnapshot {
                 cause: "terminal".into(),
@@ -172,6 +204,11 @@ mod tests {
         assert!(body.contains("spur_reconcile_last_undercharged_nodes{trigger=\"restore\"} 2"));
         assert!(body.contains("spur_reconcile_undercharged_cpus_total{trigger=\"restore\"} 8"));
         assert!(body.contains("spur_reconcile_undercharged_devices_total{trigger=\"restore\"} 4"));
+        assert!(
+            body.contains("spur_reconcile_undercharged_memory_mb_total{trigger=\"restore\"} 2048")
+        );
+        assert!(body.contains("spur_reconcile_unaccounted_slices{trigger=\"restore\"} 3"));
+        assert!(body.contains("spur_reconcile_nodes_checked{trigger=\"restore\"} 12"));
         assert!(body.ends_with("# EOF\n"));
     }
 
@@ -181,6 +218,23 @@ mod tests {
         assert!(body.contains("spur_reconcile_agent_job_reclaims_total{cause=\"terminal\"} 7"));
         assert!(body.contains("spur_reconcile_heartbeats_total 100"));
         assert!(body.contains("spur_reconcile_empty_heartbeats_total 40"));
+    }
+
+    #[test]
+    fn a_clean_rebuild_still_publishes_its_series_at_zero() {
+        let snap = ReconcileStatsSnapshot {
+            rebuilds: vec![RebuildSnapshot {
+                trigger: "leadership_gain".into(),
+                rebuilds: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let body = encode_reconcile_metrics(&snap);
+        assert!(
+            body.contains("spur_reconcile_undercharged_nodes_total{trigger=\"leadership_gain\"} 0"),
+            "a zero series must still be published or absent() alerts fire on a healthy cluster"
+        );
     }
 
     #[test]

@@ -238,18 +238,16 @@ impl ControllerService {
         if stale.is_empty() {
             return;
         }
-        for (_, cause) in &stale {
-            self.cluster.record_reclaim(*cause);
-        }
         let cluster = self.cluster.clone();
         let node = node.to_string();
         tokio::spawn(async move {
-            for (job_id, _) in stale {
+            for (job_id, cause) in stale {
                 // Re-check: a requeue since the snapshot above would otherwise
                 // send an unguarded cancel into the job's new run.
                 if reclaim_cause(&cluster, &node, job_id).is_none() {
                     continue;
                 }
+                cluster.record_reclaim(cause);
                 warn!(
                     job_id,
                     node = %node,
@@ -4676,16 +4674,16 @@ mod tests {
         };
         let mut per_node = std::collections::HashMap::new();
         per_node.insert("n2".to_string(), res.clone());
+        apply(&WalOperation::job_state_change(
+            40,
+            JobState::Pending,
+            JobState::Running,
+        ));
         apply(&WalOperation::job_start(
             40,
             vec!["n2".into()],
             res,
             per_node,
-        ));
-        apply(&WalOperation::job_state_change(
-            40,
-            JobState::Pending,
-            JobState::Running,
         ));
 
         let reported = vec![RunningJobStatus {

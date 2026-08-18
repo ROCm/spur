@@ -164,6 +164,11 @@ async fn main() -> anyhow::Result<()> {
         (config.controller.peers.clone(), id)
     };
 
+    // Wired before Raft starts: starting it installs any persisted snapshot, and
+    // that restore is the drift measurement most worth having.
+    let reconcile_stats = Arc::new(ReconcileStatsCollector::new());
+    cluster.set_reconcile_stats(reconcile_stats.clone());
+
     let handle = raft::start_raft_with_recovery_mode(
         node_id,
         &peers,
@@ -187,9 +192,6 @@ async fn main() -> anyhow::Result<()> {
 
     let sched_stats = Arc::new(SchedStatsCollector::new(config.scheduler.plugin.clone()));
     cluster.set_sched_stats(sched_stats.clone());
-
-    let reconcile_stats = Arc::new(ReconcileStatsCollector::new());
-    cluster.set_reconcile_stats(reconcile_stats.clone());
 
     // Accounting stays best-effort so a database outage does not stop scheduling.
     let accounting_service = if config.accounting.database_url.is_empty() {

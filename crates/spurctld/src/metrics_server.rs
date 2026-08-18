@@ -428,8 +428,13 @@ mod tests {
         });
         let resp = metrics_rpc(State(state.clone())).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let resp = metrics_scheduler(State(state)).await;
+        let resp = metrics_scheduler(State(state.clone())).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Reconcile counters record what the local process saw, including drift
+        // installed with a snapshot, so a follower must still serve them.
+        let resp = metrics_reconcile(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

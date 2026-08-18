@@ -1,12 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! In-memory accumulator for allocation-reconciliation statistics.
-//!
-//! Observe-only. Nothing here feeds a scheduling or eviction decision; it exists
-//! so drift between what the controller charges a node and what that node's job
-//! records say is a number an operator can watch, rather than something only
-//! visible once a job fails to place.
+//! Observe-only accumulator for allocation-reconciliation statistics. Nothing
+//! here feeds a scheduling or eviction decision.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -64,8 +60,12 @@ struct RebuildAccum {
     last_nodes_undercharged: u64,
     cpus_undercharged: u64,
     cpus_overcharged: u64,
+    memory_undercharged_mb: u64,
+    memory_overcharged_mb: u64,
     devices_undercharged: u64,
     devices_overcharged: u64,
+    unaccounted_slices: u64,
+    nodes_checked: u64,
 }
 
 impl RebuildAccum {
@@ -152,8 +152,12 @@ impl ReconcileStatsCollector {
             last_nodes_undercharged: a.last_nodes_undercharged,
             cpus_undercharged: a.cpus_undercharged,
             cpus_overcharged: a.cpus_overcharged,
+            memory_undercharged_mb: a.memory_undercharged_mb,
+            memory_overcharged_mb: a.memory_overcharged_mb,
             devices_undercharged: a.devices_undercharged,
             devices_overcharged: a.devices_overcharged,
+            unaccounted_slices: a.unaccounted_slices,
+            nodes_checked: a.nodes_checked,
         })
         .collect();
 
@@ -194,8 +198,7 @@ mod tests {
             nodes_overcharged: over,
             cpus_undercharged: cpus_under,
             cpus_overcharged: cpus_over,
-            devices_undercharged: 0,
-            devices_overcharged: 0,
+            ..Default::default()
         }
     }
 

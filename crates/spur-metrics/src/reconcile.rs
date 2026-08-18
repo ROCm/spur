@@ -15,8 +15,15 @@ pub struct RebuildSnapshot {
     pub last_nodes_undercharged: u64,
     pub cpus_undercharged: u64,
     pub cpus_overcharged: u64,
+    pub memory_undercharged_mb: u64,
+    pub memory_overcharged_mb: u64,
     pub devices_undercharged: u64,
     pub devices_overcharged: u64,
+    /// Active job/node pairs whose record carries no allocation at all, so
+    /// nothing is charged and the diff cannot see the shortfall.
+    pub unaccounted_slices: u64,
+    /// Nodes examined on the most recent pass, as a denominator for the rest.
+    pub nodes_checked: u64,
 }
 
 /// One reclaim cause's fire count.
