@@ -609,6 +609,9 @@ mod tests {
     fn stray_bracket_before_comma_now_splits() {
         assert_eq!(expand("x],y").unwrap(), vec!["x]", "y"]);
         assert_eq!(expand("node01],node02").unwrap(), vec!["node01]", "node02"]);
+        assert_eq!(expand("],y").unwrap(), vec!["]", "y"]);
+        assert_eq!(expand("x,]y").unwrap(), vec!["x", "]y"]);
+        assert_eq!(expand("x]],y").unwrap(), vec!["x]]", "y"]);
     }
 
     #[test]
