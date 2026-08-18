@@ -191,6 +191,71 @@ pub fn verify_token(token: &str, secret: &[u8]) -> Result<Identity, AuthError> {
     })
 }
 
+/// What to do with one request's `Authorization` header.
+///
+/// Shared by both daemons so the controller and the agent cannot drift apart on a security
+/// decision: they wrap this in their own Tower layer, but the ruling itself lives here.
+#[derive(Debug)]
+pub enum BearerOutcome {
+    /// Verified; carry this identity to the handler.
+    Authenticated(Box<Identity>),
+    /// No credential presented, and the mode tolerates that.
+    Anonymous,
+    /// Refuse the request with this message.
+    Reject(String),
+}
+
+/// Rule the `Authorization` header against the configured mode.
+///
+/// Deliberate properties:
+/// * an INVALID credential is rejected in every mode that verifies — `permissive` tolerates the
+///   *absence* of a credential, never a bad one, or forging would beat sending none;
+/// * a malformed header is rejected rather than silently downgraded to anonymous;
+/// * `disabled` ignores even a valid token, so it cannot be quietly stricter than it claims.
+pub fn authenticate_bearer(
+    mode: crate::config::AuthMode,
+    jwt_key: &[u8],
+    header: Option<&str>,
+    missing_credential_hint: &str,
+) -> BearerOutcome {
+    use crate::config::AuthMode;
+
+    let token = match header {
+        Some(h) => match h
+            .strip_prefix("Bearer ")
+            .or_else(|| h.strip_prefix("bearer "))
+        {
+            Some(t) if !t.trim().is_empty() => t.trim(),
+            _ => {
+                return BearerOutcome::Reject(
+                    "malformed authorization header: expected 'Bearer <token>'".into(),
+                )
+            }
+        },
+        None => {
+            return match mode {
+                AuthMode::Required => BearerOutcome::Reject(format!(
+                    "authentication required: {missing_credential_hint}"
+                )),
+                _ => BearerOutcome::Anonymous,
+            }
+        }
+    };
+
+    if mode == AuthMode::Disabled {
+        return BearerOutcome::Anonymous;
+    }
+    if jwt_key.is_empty() {
+        return BearerOutcome::Reject(
+            "a token was presented but no auth.jwt_key is configured".into(),
+        );
+    }
+    match verify_token(token, jwt_key) {
+        Ok(identity) => BearerOutcome::Authenticated(Box::new(identity)),
+        Err(e) => BearerOutcome::Reject(format!("invalid credential: {e}")),
+    }
+}
+
 /// "none" auth — always returns an identity based on UNIX user.
 pub fn auth_none() -> Identity {
     Identity {
@@ -302,5 +367,121 @@ mod tests {
         };
         assert!(user.require_admin().is_err());
         assert!(Identity::admin().require_admin().is_ok());
+    }
+
+    // --- authenticate_bearer ---
+    //
+    // The function is the shared ruling used by both the controller and the agent. Testing it
+    // directly (not just through the middleware wrappers) ensures the contract holds at the source
+    // so neither daemon can silently diverge.
+
+    fn bearer(key: &[u8]) -> String {
+        format!(
+            "Bearer {}",
+            generate_token("alice", 1000, false, key, 3600).unwrap()
+        )
+    }
+
+    #[test]
+    fn required_rejects_missing_credential() {
+        assert!(matches!(
+            authenticate_bearer(crate::config::AuthMode::Required, TEST_SECRET, None, "hint"),
+            BearerOutcome::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn permissive_allows_missing_credential() {
+        assert!(matches!(
+            authenticate_bearer(
+                crate::config::AuthMode::Permissive,
+                TEST_SECRET,
+                None,
+                "hint"
+            ),
+            BearerOutcome::Anonymous
+        ));
+    }
+
+    #[test]
+    fn disabled_allows_missing_credential() {
+        assert!(matches!(
+            authenticate_bearer(crate::config::AuthMode::Disabled, TEST_SECRET, None, "hint"),
+            BearerOutcome::Anonymous
+        ));
+    }
+
+    #[test]
+    fn valid_token_is_authenticated_in_required_mode() {
+        let h = bearer(TEST_SECRET);
+        match authenticate_bearer(
+            crate::config::AuthMode::Required,
+            TEST_SECRET,
+            Some(&h),
+            "hint",
+        ) {
+            BearerOutcome::Authenticated(id) => {
+                assert_eq!(id.user, "alice");
+                assert_eq!(id.uid, 1000);
+            }
+            other => panic!("expected Authenticated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forged_token_rejected_in_permissive_mode() {
+        // permissive tolerates absence of a credential, never a bad one.
+        let forged = bearer(b"attacker-key");
+        assert!(matches!(
+            authenticate_bearer(
+                crate::config::AuthMode::Permissive,
+                TEST_SECRET,
+                Some(&forged),
+                "hint"
+            ),
+            BearerOutcome::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn malformed_header_always_rejected() {
+        for bad in &["token-without-bearer-prefix", "Bearer ", "bearer", ""] {
+            assert!(
+                matches!(
+                    authenticate_bearer(
+                        crate::config::AuthMode::Permissive,
+                        TEST_SECRET,
+                        Some(bad),
+                        "hint"
+                    ),
+                    BearerOutcome::Reject(_)
+                ),
+                "header {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_ignores_a_valid_token() {
+        // disabled must not silently verify — that would make `disabled` secretly stricter.
+        let h = bearer(TEST_SECRET);
+        assert!(matches!(
+            authenticate_bearer(
+                crate::config::AuthMode::Disabled,
+                TEST_SECRET,
+                Some(&h),
+                "hint"
+            ),
+            BearerOutcome::Anonymous
+        ));
+    }
+
+    #[test]
+    fn token_presented_but_no_key_configured_is_rejected() {
+        let h = bearer(TEST_SECRET);
+        assert!(matches!(
+            authenticate_bearer(crate::config::AuthMode::Required, b"", Some(&h), "hint"),
+            BearerOutcome::Reject(_)
+        ));
     }
 }

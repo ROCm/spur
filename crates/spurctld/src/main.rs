@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod accounting;
+mod agent_client;
 mod association_cache;
 mod auth_middleware;
 mod cluster;
@@ -358,6 +359,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Start gRPC server
     let addr: std::net::SocketAddr = listen_addr.parse()?;
+    // The controller presents this key as its credential to agents (spurd authenticates callers).
+    crate::agent_client::set_signing_key(config.auth.jwt_key.clone().unwrap_or_default());
+
     // State the authentication posture explicitly at startup: it determines whether the listening
     // port is the trust boundary or merely the transport.
     match config.auth.mode {

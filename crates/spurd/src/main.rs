@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod agent_server;
+mod auth_middleware;
 mod cluster;
 pub mod container;
 mod executor;
@@ -358,7 +359,38 @@ async fn main() -> anyhow::Result<()> {
     let addr = args.listen.parse()?;
     info!(%addr, "agent gRPC server listening");
 
+    // Authenticate callers of the agent surface: without this, reaching this port is enough to ask
+    // the node to run work, which steps around the controller's authentication entirely.
+    let auth_mode = config.as_ref().map(|c| c.auth.mode).unwrap_or_default();
+    let jwt_key = config
+        .as_ref()
+        .and_then(|c| c.auth.jwt_key.clone())
+        .unwrap_or_default();
+    match auth_mode {
+        spur_core::config::AuthMode::Required if jwt_key.is_empty() => {
+            anyhow::bail!(
+                "[auth] mode = \"required\" but no jwt_key is configured on this node: the agent \
+                 could never verify a credential and would refuse every launch"
+            )
+        }
+        spur_core::config::AuthMode::Required => {
+            info!("agent requires a cluster credential on every RPC")
+        }
+        spur_core::config::AuthMode::Permissive => warn!(
+            "agent accepts uncredentialed RPCs (auth.mode = permissive): any peer that can reach \
+             this port can ask this node to run work. Set mode = \"required\" once controllers are \
+             upgraded."
+        ),
+        spur_core::config::AuthMode::Disabled => warn!(
+            "agent does NOT authenticate callers (auth.mode = disabled): treat this port as an \
+             administrative boundary."
+        ),
+    }
+
     let server_future = tonic::transport::Server::builder()
+        .layer(crate::auth_middleware::AgentAuthLayer::new(
+            auth_mode, &jwt_key,
+        ))
         .add_service(spur_proto::agent_server(agent_service))
         .serve(addr);
 
