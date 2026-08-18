@@ -575,12 +575,7 @@ pub(crate) async fn try_preempt(
     // `pending`'s fully adjusted one; recompute a comparable value.
     let running_priority: std::collections::HashMap<spur_core::job::JobId, u32> = running
         .iter()
-        .map(|j| {
-            (
-                j.job_id,
-                cluster.current_effective_priority_with_qos(j, &running_qos[&j.job_id], partitions),
-            )
-        })
+        .map(|j| (j.job_id, cluster.current_effective_priority(j, partitions)))
         .collect();
     running.sort_by_key(|j| running_priority[&j.job_id]);
 

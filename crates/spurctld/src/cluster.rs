@@ -21,7 +21,7 @@ use spur_core::job::{
 };
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
-use spur_core::qos::{check_qos_limits, qos_adjusted_priority, QosCheckResult};
+use spur_core::qos::{check_qos_limits, QosCheckResult};
 use spur_core::reservation::{self, normalize_node_list, running_jobs_overlap_start, Reservation};
 use spur_core::resource::{ResourceAllocations, ResourceSet};
 use spur_core::step::{JobStep, StepState, STEP_BATCH, STEP_RESERVED_MIN};
@@ -631,12 +631,24 @@ impl ClusterManager {
         let specs =
             expand_job_specs(spec, job_id).map_err(|e| SubmitError::invalid(e.to_string()))?;
 
-        for task_spec in specs {
+        for mut task_spec in specs {
             let task_id = if task_spec.array_job_id.is_some() {
                 self.next_job_id.fetch_add(1, Ordering::SeqCst)
             } else {
                 job_id
             };
+
+            // Seed the base from QOS so it feeds the multiplicative formula rather than
+            // being a negligible delta on top of it.
+            if task_spec.priority.is_none() {
+                if let Some(qos_name) = task_spec.qos.as_deref() {
+                    if let Some(qos) = self.qos_cache.get(qos_name) {
+                        task_spec.priority =
+                            Some(DEFAULT_PRIORITY.saturating_add_signed(qos.priority).max(1));
+                    }
+                }
+            }
+
             self.propose(WalOperation::JobSubmit {
                 job_id: task_id,
                 spec: Box::new(task_spec),
@@ -1521,7 +1533,8 @@ impl ClusterManager {
                 Ok(PreemptOutcome::Suspended)
             }
             PreemptMode::Cancel => {
-                self.complete_job(job_id, -1, JobState::Cancelled)?;
+                let resp = self.propose(WalOperation::JobPreemptCancel { job_id })?;
+                self.run_all_finalized_side_effects(&resp);
                 info!(job_id, "job preempted (cancel)");
                 Ok(PreemptOutcome::Killed)
             }
@@ -2904,13 +2917,8 @@ impl ClusterManager {
             let fair_share = self
                 .fairshare_cache
                 .get(&job.spec.user, job.spec.account.as_deref().unwrap_or(""));
-            job.priority = compute_effective_priority(
-                job.priority,
-                fair_share,
-                age_minutes,
-                partition_tier,
-                &qos_by_job[&job.job_id],
-            );
+            job.priority =
+                compute_effective_priority(job.priority, fair_share, age_minutes, partition_tier);
         }
         drop(partitions);
 
@@ -4248,16 +4256,9 @@ impl ClusterManager {
         }
     }
 
-    /// Recompute a job's live effective priority (a running job's stored
-    /// `priority` is stale). Takes `qos` pre-resolved so it can be reused,
-    /// and `partitions` so callers iterating over multiple jobs don't pay
-    /// for a separate lock acquisition per call.
-    pub(crate) fn current_effective_priority_with_qos(
-        &self,
-        job: &Job,
-        qos: &Qos,
-        partitions: &[Partition],
-    ) -> u32 {
+    /// Recompute a job's live effective priority. A running job's stored
+    /// `priority` is stale; this recalculates from age, fair-share, and tier.
+    pub(crate) fn current_effective_priority(&self, job: &Job, partitions: &[Partition]) -> u32 {
         let now = Utc::now();
         let age_minutes = (now - job.submit_time).num_minutes().max(0);
         let partition_tier =
@@ -4265,7 +4266,7 @@ impl ClusterManager {
         let fair_share = self
             .fairshare_cache
             .get(&job.spec.user, job.spec.account.as_deref().unwrap_or(""));
-        compute_effective_priority(job.priority, fair_share, age_minutes, partition_tier, qos)
+        compute_effective_priority(job.priority, fair_share, age_minutes, partition_tier)
     }
 
     /// Persist a mutation via Raft consensus. The apply callback
@@ -4589,6 +4590,76 @@ impl ClusterManager {
                 drop(nodes);
                 // Complete steps and fire accounting for the terminated run as
                 // PREEMPTED, even though the job itself is now Pending-with-hold.
+                self.complete_job_steps(job_id, -1, timestamp);
+                self.next_job_id.store(next_id, Ordering::Relaxed);
+                return ClientResponse {
+                    jobs_finalized: vec![JobFinalized {
+                        job_id: *job_id,
+                        state: JobState::Preempted,
+                        exit_code: -1,
+                    }],
+                    ..Default::default()
+                };
+            }
+            WalOperation::JobPreemptCancel { job_id } => {
+                let freed_nodes;
+                let allocated_resources;
+                let per_node_map;
+                {
+                    let Some(job) = jobs.get_mut(job_id) else {
+                        return ClientResponse::default();
+                    };
+                    if job.state != JobState::Running {
+                        return ClientResponse::default();
+                    }
+                    if let Err(e) = job.transition(JobState::Preempted) {
+                        warn!(job_id = *job_id, error = %e, "invalid preempt-cancel transition in WAL apply");
+                        return ClientResponse::default();
+                    }
+                    job.exit_code = Some(-1);
+                    job.end_time = Some(timestamp);
+                    if let Some(since) = job.suspended_at.take() {
+                        job.suspended_secs += (timestamp - since).num_seconds().max(0);
+                    }
+                    freed_nodes = job.allocated_nodes.clone();
+                    allocated_resources = job.allocated_resources.clone();
+                    per_node_map = job.per_node_alloc.clone();
+                    job.node_completions.clear();
+                    // Cancelled is terminal (dependents/arrays unblock); Preempted
+                    // is reported to accounting via jobs_finalized.
+                    if let Err(e) = job.transition(JobState::Cancelled) {
+                        warn!(job_id = *job_id, error = %e, "invalid preempt-cancel final transition in WAL apply");
+                        return ClientResponse::default();
+                    }
+                }
+                if let Some(ref total) = allocated_resources {
+                    let node_count = freed_nodes.len().max(1) as u32;
+                    for name in &freed_nodes {
+                        if let Some(node) = nodes.get_mut(name) {
+                            let slice = per_node_map.get(name).cloned().unwrap_or_else(|| {
+                                warn!(
+                                    job_id = *job_id,
+                                    node = %name,
+                                    "per_node_alloc missing at preempt-cancel deallocation, using scalar fallback"
+                                );
+                                ResourceAllocations::with_scalar(
+                                    total.cpus / node_count,
+                                    total.memory_mb / node_count as u64,
+                                )
+                            });
+                            node.alloc_resources.subtract(&slice);
+                            node.update_state_from_alloc();
+                            if node.state == NodeState::Draining
+                                && node.alloc_resources.cpus == 0
+                                && !node.alloc_resources.has_devices()
+                            {
+                                node.state = NodeState::Drain;
+                            }
+                        }
+                    }
+                }
+                drop(jobs);
+                drop(nodes);
                 self.complete_job_steps(job_id, -1, timestamp);
                 self.next_job_id.store(next_id, Ordering::Relaxed);
                 return ClientResponse {
@@ -5764,22 +5835,15 @@ fn reservation_block(
     }
 }
 
-/// QoS is added on top of the fairshare/age/tier product rather than fed
-/// into it, so it's a constant offset instead of an amplified/diluted one.
+/// QOS priority is baked into the job's base priority at submit time, so it
+/// seeds the multiplicative formula directly rather than being a flat delta.
 fn compute_effective_priority(
     base_priority: u32,
     fair_share: f64,
     age_minutes: i64,
     partition_tier: u32,
-    qos: &Qos,
 ) -> u32 {
-    let raw = spur_sched::priority::effective_priority(
-        base_priority,
-        fair_share,
-        age_minutes,
-        partition_tier,
-    );
-    qos_adjusted_priority(raw, qos)
+    spur_sched::priority::effective_priority(base_priority, fair_share, age_minutes, partition_tier)
 }
 
 /// Reason a job is ineligible because currently-available licenses cannot satisfy
@@ -10067,8 +10131,129 @@ mod tests {
         settle(&cm, job_id, JobState::Cancelled);
 
         let job = cm.get_job(job_id).unwrap();
+        // Preempted is reported to accounting (jobs_finalized); the job's
+        // live state is Cancelled so dependents and arrays can resolve.
         assert_eq!(job.state, JobState::Cancelled);
         assert_eq!(cm.node_metrics().alloc_cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_preempt_cancel_is_atomic_and_replay_deterministic() {
+        // JobPreemptCancel transitions Running → Preempted, frees nodes, and
+        // fires jobs_finalized in one WAL entry. Replay on a non-running job
+        // is a NoOp: no double-free, no re-finalize.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("preempt-cancel-replay")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let alloc = scalar_alloc(2, 4000);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["worker1".into()],
+            resources: alloc.clone(),
+            per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+        });
+        assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
+
+        let resp = cm.apply_operation(&WalOperation::JobPreemptCancel { job_id: 1 });
+
+        assert_eq!(resp.jobs_finalized.len(), 1);
+        // Accounting sees Preempted; live state is Cancelled (terminal).
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Preempted);
+        assert_eq!(resp.jobs_finalized[0].exit_code, -1);
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(job.exit_code, Some(-1));
+        // allocated_nodes preserved (epilog reads NodeList after finalize).
+        assert!(!job.allocated_nodes.is_empty());
+        assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
+
+        // Replay: job is already Cancelled (not Running) → NoOp.
+        let replay = cm.apply_operation(&WalOperation::JobPreemptCancel { job_id: 1 });
+        assert!(
+            replay.jobs_finalized.is_empty(),
+            "replayed preempt-cancel must not re-finalize"
+        );
+        assert_eq!(
+            cm.get_node("worker1").unwrap().alloc_resources.cpus,
+            0,
+            "replayed preempt-cancel must not double-free"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_uses_qos_priority_as_base_when_user_omits_priority() {
+        // When --priority is not set, the job's stored priority should equal
+        // the QOS priority so it seeds the multiplicative formula correctly.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache().insert(Qos {
+            name: "burst".into(),
+            priority: 100,
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "primus".into(),
+            priority: 10000,
+            ..Default::default()
+        });
+
+        let mut burst = basic_spec("burst");
+        burst.qos = Some("burst".into());
+        let burst_id = submit_and_wait(&cm, burst);
+
+        let mut primus = basic_spec("primus");
+        primus.qos = Some("primus".into());
+        let primus_id = submit_and_wait(&cm, primus);
+
+        let burst_job = cm.get_job(burst_id).unwrap();
+        let primus_job = cm.get_job(primus_id).unwrap();
+        // base = DEFAULT_PRIORITY.saturating_add_signed(qos.priority)
+        assert_eq!(
+            burst_job.priority,
+            DEFAULT_PRIORITY.saturating_add_signed(100),
+            "burst base must be DEFAULT_PRIORITY + qos.priority"
+        );
+        assert_eq!(
+            primus_job.priority,
+            DEFAULT_PRIORITY.saturating_add_signed(10000),
+            "primus base must be DEFAULT_PRIORITY + qos.priority"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_explicit_priority_overrides_qos_priority() {
+        // An explicit --priority flag must win over the QOS priority so users
+        // can still pin a job's priority independent of its QOS tier.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 9999,
+            ..Default::default()
+        });
+
+        let mut spec = basic_spec("explicit-prio");
+        spec.priority = Some(42);
+        spec.qos = Some("high".into());
+        let job_id = submit_and_wait(&cm, spec);
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(
+            job.priority, 42,
+            "explicit --priority must not be overridden by qos.priority"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11512,13 +11697,14 @@ mod tests {
             ..Default::default()
         });
 
+        // No explicit --priority: base = DEFAULT_PRIORITY.saturating_add_signed(qos.priority).
+        // low (-500): base = 500, below DEFAULT_PRIORITY — penalty semantics preserved.
+        // high (5000): base = 6000, above DEFAULT_PRIORITY — boost semantics preserved.
         let mut low = basic_spec("low");
-        low.priority = Some(1000);
         low.qos = Some("low".into());
         let low_id = submit_and_wait(&cm, low);
 
         let mut high = basic_spec("high");
-        high.priority = Some(1000);
         high.qos = Some("high".into());
         let high_id = submit_and_wait(&cm, high);
 
@@ -11535,8 +11721,11 @@ mod tests {
             .priority;
         assert!(
             high_priority > low_priority,
-            "high-QoS job ({high_priority}) should outrank low-QoS job ({low_priority}) \
-             despite identical base priority"
+            "high-QoS job ({high_priority}) should outrank low-QoS job ({low_priority})"
+        );
+        assert!(
+            low_priority < DEFAULT_PRIORITY,
+            "penalty QoS job ({low_priority}) must rank below DEFAULT_PRIORITY ({DEFAULT_PRIORITY})"
         );
     }
 
@@ -11551,17 +11740,18 @@ mod tests {
         });
         cm.qos_cache().insert(Qos {
             name: "high".into(),
-            priority: 5000,
+            priority: 10000,
             ..Default::default()
         });
 
-        // Non-neutral fairshare/age on the low-QoS job would previously let
-        // that unrelated boost amplify its QoS delta and outrank the high-QoS job.
+        // Even with high fairshare and near-max age on the low-QoS job, the
+        // high-QoS base (11000) must outrank low-QoS base (1100) × 3.0 × 1.857.
+        // low:  1100 * 3.0 * 1.857 * tier ≈ 6128
+        // high: 11000 * 1.0 * 1.0 * tier = 11000
         cm.fairshare_cache().set_for_test("low-user", "", 3.0);
 
         let mut low = basic_spec("low");
         low.user = "low-user".into();
-        low.priority = Some(1000);
         low.qos = Some("low".into());
         let low_id = submit_and_wait(&cm, low);
         {
@@ -11570,7 +11760,6 @@ mod tests {
         }
 
         let mut high = basic_spec("high");
-        high.priority = Some(1000);
         high.qos = Some("high".into());
         let high_id = submit_and_wait(&cm, high);
 
@@ -11588,7 +11777,7 @@ mod tests {
         assert!(
             high_priority > low_priority,
             "high-QoS job ({high_priority}) should still outrank low-QoS job ({low_priority}) \
-             once fairshare/age no longer amplify the QoS delta"
+             even with high fairshare and near-max age on the low-QoS job"
         );
     }
 
@@ -11621,8 +11810,7 @@ mod tests {
             },
         );
 
-        let priority =
-            cm.current_effective_priority_with_qos(&job, &Qos::default(), &cm.get_partitions());
+        let priority = cm.current_effective_priority(&job, &cm.get_partitions());
         assert_eq!(
             priority, 9000,
             "multi-partition job should use the highest matched priority_tier (9), \
@@ -11759,7 +11947,9 @@ mod tests {
             ..Default::default()
         });
 
-        // Same base priority on both jobs; only the QoS adjustment differentiates them.
+        // low job has no QOS (base=DEFAULT_PRIORITY=1000); high job's QOS
+        // priority (5000) becomes its base, making it >2x the low job's
+        // effective priority and crossing the preemption threshold.
         let mut low = basic_spec("low");
         low.priority = Some(1000);
         let low_id = submit_and_wait(&cm, low);
@@ -11774,17 +11964,173 @@ mod tests {
         settle(&cm, low_id, JobState::Running);
 
         let mut high = basic_spec("high");
-        high.priority = Some(1000);
         high.qos = Some("high".into());
         submit_and_wait(&cm, high);
 
-        // pending_jobs() applies the QoS adjustment, unlike a synthetic Job.
         let pending = cm.pending_jobs();
         let pending_refs: Vec<&Job> = pending.iter().collect();
         let partitions = cm.get_partitions();
         crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs).await;
 
         settle(&cm, low_id, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn high_qos_job_preempts_low_qos_job_end_to_end() {
+        // Full end-to-end: burst job runs, primus job arrives pending.
+        // Neither sets --priority; both get their base from QOS.
+        // burst (100) must be evicted to make room for primus (10000).
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].preempt_mode = "cancel".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.qos_cache().insert(Qos {
+            name: "burst".into(),
+            priority: 100,
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "primus".into(),
+            priority: 10000,
+            ..Default::default()
+        });
+
+        let mut burst = basic_spec("burst");
+        burst.qos = Some("burst".into());
+        let burst_id = submit_and_wait(&cm, burst);
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            burst_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, burst_id, JobState::Running);
+
+        let mut primus = basic_spec("primus");
+        primus.qos = Some("primus".into());
+        submit_and_wait(&cm, primus);
+
+        // Confirm that primus effective > 2x burst effective (preemption threshold).
+        let pending = cm.pending_jobs();
+        let pending_refs: Vec<&Job> = pending.iter().collect();
+        let partitions = cm.get_partitions();
+
+        let burst_job = cm.get_job(burst_id).unwrap();
+        let burst_effective = cm.current_effective_priority(&burst_job, &partitions);
+        let primus_effective = pending_refs[0].priority;
+        assert!(
+            primus_effective >= burst_effective * 2,
+            "primus effective ({primus_effective}) must be ≥2x burst ({burst_effective}) \
+             for preemption to fire"
+        );
+
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs).await;
+
+        settle(&cm, burst_id, JobState::Cancelled);
+        assert_eq!(
+            cm.node_metrics().alloc_cpus,
+            0,
+            "burst job's allocation must be freed after preemption"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_priority_disables_qos_based_preemption() {
+        // When --priority is set explicitly on both jobs, QOS priority is not
+        // applied as the base seed. Both jobs land at the same effective
+        // priority and preemption does not fire — this is intentional: explicit
+        // --priority opts the job out of QOS-based scheduling.
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].preempt_mode = "cancel".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.qos_cache().insert(Qos {
+            name: "burst".into(),
+            priority: 100,
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "primus".into(),
+            priority: 10000,
+            ..Default::default()
+        });
+
+        let mut burst = basic_spec("burst");
+        burst.priority = Some(1000);
+        burst.qos = Some("burst".into());
+        let burst_id = submit_and_wait(&cm, burst);
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            burst_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, burst_id, JobState::Running);
+
+        let mut primus = basic_spec("primus");
+        primus.priority = Some(1000);
+        primus.qos = Some("primus".into());
+        submit_and_wait(&cm, primus);
+
+        let pending = cm.pending_jobs();
+        let pending_refs: Vec<&Job> = pending.iter().collect();
+        let partitions = cm.get_partitions();
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs).await;
+
+        // burst job must still be running — equal explicit priorities, no preemption.
+        let burst_job = cm.get_job(burst_id).unwrap();
+        assert_eq!(
+            burst_job.state,
+            JobState::Running,
+            "burst job must keep running when both jobs have identical explicit --priority"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_cancel_unblocks_afterok_and_afterany_dependents() {
+        // A cancel-preempted job lands in Cancelled (terminal), so afterok
+        // and afterany dependents must stop waiting and resolve their outcome.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let parent_id = run_job_on(&cm, "parent", "worker1");
+        cm.preempt_job(parent_id, PreemptMode::Cancel).unwrap();
+        settle(&cm, parent_id, JobState::Cancelled);
+
+        // afterok: parent exited non-zero (preempted) → unsatisfiable; watcher cancels it.
+        let mut afterok_child = basic_spec("afterok-child");
+        afterok_child.dependency = vec![format!("afterok:{parent_id}")];
+        let afterok_id = submit_and_wait(&cm, afterok_child);
+
+        // afterany: fires regardless of exit status → satisfied once parent is terminal.
+        let mut afterany_child = basic_spec("afterany-child");
+        afterany_child.dependency = vec![format!("afterany:{parent_id}")];
+        let afterany_id = submit_and_wait(&cm, afterany_child);
+
+        cm.cancel_unsatisfiable_dependency_jobs();
+
+        // afterok cancelled: parent's non-zero exit makes it permanently unsatisfiable.
+        assert_eq!(
+            cm.get_job(afterok_id).unwrap().state,
+            JobState::Cancelled,
+            "afterok dependent must be cancelled after parent was preempted"
+        );
+
+        // afterany unblocked: parent is terminal, dependency is satisfied.
+        // pending_jobs() returns only schedulable (non-blocked) jobs.
+        assert!(
+            cm.pending_jobs().iter().any(|j| j.job_id == afterany_id),
+            "afterany dependent must be schedulable once parent is terminal"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

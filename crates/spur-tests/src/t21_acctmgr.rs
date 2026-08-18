@@ -218,35 +218,6 @@ mod tests {
         );
     }
 
-    // ── T21.14: QOS priority adjustment ──────────────────────────
-
-    #[test]
-    fn t21_14_qos_priority_boost() {
-        let qos = Qos {
-            priority: 1000,
-            ..Default::default()
-        };
-        assert_eq!(qos_adjusted_priority(500, &qos), 1500);
-    }
-
-    #[test]
-    fn t21_15_qos_priority_penalty() {
-        let qos = Qos {
-            priority: -200,
-            ..Default::default()
-        };
-        assert_eq!(qos_adjusted_priority(1000, &qos), 800);
-    }
-
-    #[test]
-    fn t21_16_qos_priority_floor() {
-        let qos = Qos {
-            priority: -5000,
-            ..Default::default()
-        };
-        assert_eq!(qos_adjusted_priority(1000, &qos), 1);
-    }
-
     // ── T21.17: TRES record accumulation ─────────────────────────
 
     #[test]
