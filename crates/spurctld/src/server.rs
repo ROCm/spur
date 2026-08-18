@@ -1990,6 +1990,7 @@ impl SlurmController for ControllerService {
             allow_qos: req.allow_qos,
             priority_tier: req.priority_tier,
             preempt_mode,
+            preempt_exempt_time: req.preempt_exempt_time,
             ..Default::default()
         };
 
@@ -2098,7 +2099,11 @@ impl SlurmController for ControllerService {
                 allow_qos,
                 req.priority_tier,
                 preempt_mode,
-                req.preempt_exempt_time.map(|v| if v == 0 { None } else { Some(v) }),
+                if req.clear_preempt_exempt_time {
+                    Some(None)
+                } else {
+                    req.preempt_exempt_time.map(Some)
+                },
             )
             .map_err(partition_rpc_status)?;
 

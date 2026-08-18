@@ -535,6 +535,9 @@ fn job_preempt_mode(
 }
 
 /// Effective preempt-exempt seconds for a running job: QOS > partition > global.
+/// When the job spans multiple partitions, the maximum partition override wins
+/// (most protective), consistent with how `job_preempt_mode` uses the most
+/// aggressive mode across partitions.
 fn effective_exempt_secs(
     job: &spur_core::job::Job,
     partitions: &[spur_core::partition::Partition],
@@ -546,7 +549,8 @@ fn effective_exempt_secs(
     }
     spur_core::partition::matched_partitions(job.spec.partition.as_deref(), partitions)
         .into_iter()
-        .find_map(|p| p.preempt_exempt_time)
+        .filter_map(|p| p.preempt_exempt_time)
+        .max()
         .unwrap_or(sched.preempt_exempt_time)
 }
 
@@ -642,12 +646,15 @@ pub(crate) async fn try_preempt(
             }
 
             // Exempt time: skip candidates that haven't been running long enough.
+            // A missing start_time is treated as immediately preemptable — we
+            // can't know when it started, so we don't grant extra protection.
             let exempt_secs = effective_exempt_secs(candidate, partitions, candidate_qos, sched);
             if exempt_secs > 0 {
-                let started_at = candidate.start_time.unwrap_or(now);
-                let running_for = (now - started_at).num_seconds().max(0) as u32;
-                if running_for < exempt_secs {
-                    continue;
+                if let Some(started_at) = candidate.start_time {
+                    let running_for = (now - started_at).num_seconds().max(0) as u32;
+                    if running_for < exempt_secs {
+                        continue;
+                    }
                 }
             }
 
@@ -3108,6 +3115,7 @@ mod tests {
                     deny_qos: Vec::new(),
                     priority_tier: 1,
                     preempt_mode: String::new(),
+                    preempt_exempt_time: None,
                 }],
                 nodes: Vec::new(),
                 network: Default::default(),

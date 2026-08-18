@@ -715,6 +715,11 @@ pub struct PartitionConfig {
     pub priority_tier: u32,
     #[serde(default)]
     pub preempt_mode: String,
+    /// Minimum seconds a job must have been running before it is eligible for
+    /// preemption from this partition. Overrides the cluster-wide default.
+    /// `None` defers to `scheduler.preempt_exempt_time`.
+    #[serde(default)]
+    pub preempt_exempt_time: Option<u32>,
 }
 
 fn default_partition_state() -> String {
@@ -1597,6 +1602,7 @@ impl SlurmConfig {
                     "suspend" => PreemptMode::Suspend,
                     _ => PreemptMode::Off,
                 },
+                preempt_exempt_time: pc.preempt_exempt_time,
                 ..Default::default()
             })
             .collect()

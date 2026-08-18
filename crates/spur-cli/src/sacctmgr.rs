@@ -118,6 +118,7 @@ const QOS_KEYS: &[&str] = &[
     "preemptmode",
     "preempt",
     "preemptexempttime",
+    "clearpreemptexempttime",
     "usagefactor",
     "maxjobsperuser",
     "maxjobspu",
@@ -488,6 +489,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     preempt_exempt_time: p
                         .get("preemptexempttime")
                         .and_then(|v| v.parse::<u32>().ok()),
+                    clear_preempt_exempt_time: false,
                 })
                 .await
                 .context("CreateQos RPC failed")?;
@@ -654,6 +656,7 @@ fn build_modify_qos_request(
         preempt_exempt_time: p
             .get("preemptexempttime")
             .and_then(|v| v.parse::<u32>().ok()),
+        clear_preempt_exempt_time: p.contains_key("clearpreemptexempttime"),
     })
 }
 

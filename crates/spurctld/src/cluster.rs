@@ -6982,6 +6982,7 @@ mod tests {
                 allow_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
+            preempt_exempt_time: None,
             }],
             nodes: Vec::new(),
             network: Default::default(),
@@ -7587,6 +7588,7 @@ mod tests {
             allow_qos: Vec::new(),
             priority_tier: 1,
             preempt_mode: String::new(),
+            preempt_exempt_time: None,
         });
         config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"partition":"small"}'"#));
         let cm = test_cluster_with_config(&dir, config).await;
@@ -7764,6 +7766,7 @@ mod tests {
             allow_qos: Vec::new(),
             priority_tier: 1,
             preempt_mode: String::new(),
+            preempt_exempt_time: None,
         });
         config.hooks.job_submit_lua = Some(write_lua_script(
             &dir,
@@ -12915,6 +12918,155 @@ mod tests {
             burst_job.state,
             JobState::Running,
             "burst job must keep running when both jobs have identical explicit --priority"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_preempt_hierarchy_blocks_preemption_when_not_in_allow_list() {
+        // With preempt_type = qos_priority, a pending job may only preempt a
+        // running job when the pending job's QOS lists the running QOS in its
+        // `preempt` allow-list. Here "high" does NOT list "low", so even though
+        // "high" has a priority gap > 2x, preemption must be blocked.
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].preempt_mode = "cancel".into();
+        config.scheduler.preempt_type = spur_core::partition::PreemptType::QosPriority;
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.qos_cache().insert(Qos {
+            name: "low".into(),
+            priority: 100,
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 10000,
+            preempt: vec![],   // empty = not allowed to preempt anything
+            ..Default::default()
+        });
+
+        let mut low = basic_spec("low");
+        low.qos = Some("low".into());
+        let low_id = submit_and_wait(&cm, low);
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            low_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, low_id, JobState::Running);
+
+        let mut high = basic_spec("high");
+        high.qos = Some("high".into());
+        submit_and_wait(&cm, high);
+
+        let pending = cm.pending_jobs();
+        let pending_refs: Vec<&Job> = pending.iter().collect();
+        let partitions = cm.get_partitions();
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler).await;
+
+        // low job must still be running — "high" QOS is not allowed to preempt "low"
+        assert_eq!(
+            cm.get_job(low_id).unwrap().state,
+            JobState::Running,
+            "preemption must be blocked when pending QOS allow-list does not include running QOS"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_preempt_hierarchy_allows_preemption_when_in_allow_list() {
+        // With preempt_type = qos_priority and "high" explicitly listing "low"
+        // in its preempt allow-list, the preemption must fire.
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].preempt_mode = "cancel".into();
+        config.scheduler.preempt_type = spur_core::partition::PreemptType::QosPriority;
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.qos_cache().insert(Qos {
+            name: "low".into(),
+            priority: 100,
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 10000,
+            preempt: vec!["low".into()],
+            ..Default::default()
+        });
+
+        let mut low = basic_spec("low");
+        low.qos = Some("low".into());
+        let low_id = submit_and_wait(&cm, low);
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            low_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, low_id, JobState::Running);
+
+        let mut high = basic_spec("high");
+        high.qos = Some("high".into());
+        submit_and_wait(&cm, high);
+
+        let pending = cm.pending_jobs();
+        let pending_refs: Vec<&Job> = pending.iter().collect();
+        let partitions = cm.get_partitions();
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler).await;
+
+        settle(&cm, low_id, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_exempt_time_protects_recently_started_job() {
+        // A job that started less than preempt_exempt_time seconds ago must not
+        // be preempted even when the priority gap is large enough.
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].preempt_mode = "cancel".into();
+        // Set a very large exempt window so a job started "just now" is always protected.
+        config.scheduler.preempt_exempt_time = 3600;
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        let mut low = basic_spec("low");
+        low.priority = Some(100);
+        let low_id = submit_and_wait(&cm, low);
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            low_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, low_id, JobState::Running);
+
+        // Confirm the job has a start_time (required for exempt check to fire).
+        let low_job = cm.get_job(low_id).unwrap();
+        assert!(low_job.start_time.is_some(), "running job must have a start_time");
+
+        let mut high = basic_spec("high");
+        high.priority = Some(10_000);
+        submit_and_wait(&cm, high);
+
+        let pending = cm.pending_jobs();
+        let pending_refs: Vec<&Job> = pending.iter().collect();
+        let partitions = cm.get_partitions();
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler).await;
+
+        // low job must still be running — it was started moments ago and is within the exempt window
+        assert_eq!(
+            cm.get_job(low_id).unwrap().state,
+            JobState::Running,
+            "job started within preempt_exempt_time window must not be preempted"
         );
     }
 
@@ -18791,6 +18943,7 @@ mod tests {
                 allow_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
+            preempt_exempt_time: None,
             },
             spur_core::config::PartitionConfig {
                 name: "train".into(),
@@ -18809,6 +18962,7 @@ mod tests {
                 allow_qos: Vec::new(),
                 priority_tier: 1,
                 preempt_mode: String::new(),
+            preempt_exempt_time: None,
             },
         ];
         let cm = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
@@ -18868,6 +19022,7 @@ mod tests {
             allow_qos: Vec::new(),
             priority_tier: 1,
             preempt_mode: String::new(),
+            preempt_exempt_time: None,
         }];
         let cm = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
         let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
