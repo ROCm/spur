@@ -162,6 +162,10 @@ pub(crate) async fn reconcile_phase(
             errors > 0
         }
         K0sPhase::Down => {
+            // Drop cached join tokens: they were minted against this incarnation's CA, which a
+            // rebuild regenerates. Keeping them would hand a worker a stale-CA token on the next
+            // `up` (roles are re-assigned before converge runs, so its empty-set clear never fires).
+            join_tokens.clear();
             stop_all_components(cluster, state.reset_requested).await;
             false
         }

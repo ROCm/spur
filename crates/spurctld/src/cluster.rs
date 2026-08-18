@@ -15633,12 +15633,19 @@ mod tests {
             provisioning_timeout: std::time::Duration::from_secs(600),
         };
         let mut tokens = std::collections::HashMap::new();
+        // A token cached from the torn-down incarnation must not survive the Down tick: reusing it
+        // on the next `up` would hand a worker a stale-CA token, failing its join.
+        tokens.insert("worker-1".to_string(), "stale-ca-token".to_string());
 
         let down = spur_core::k0s::K0sClusterState {
             phase: K0sPhase::Down,
             ..Default::default()
         };
         assert!(!crate::cluster_k8s::reconcile_phase(&cm, &net, &down, &mut tokens, false).await);
+        assert!(
+            tokens.is_empty(),
+            "Down reconcile must clear cached join tokens so a rebuild mints fresh ones"
+        );
 
         let degraded = spur_core::k0s::K0sClusterState {
             phase: K0sPhase::Degraded,

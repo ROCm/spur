@@ -211,9 +211,12 @@ Tear down
    spur k8s down            # stop + disable the k0s unit on every node
    spur k8s down --reset    # also `k0s reset` (destructive: wipes cluster state)
 
-``--reset`` removes ``/var/lib/k0s`` on every node but leaves the WireGuard mesh
-(``spur0``) intact. To switch the CNI, tear down with ``--reset`` and bring the
-cluster back up with the new ``cni`` setting.
+``--reset`` removes ``/var/lib/k0s`` on every node, along with the spurd-owned
+systemd unit and cached join token, but leaves the WireGuard mesh (``spur0``)
+intact. Purging the join token matters: a token minted against the torn-down
+cluster's CA would fail the next join with a ``kubernetes-ca`` verification
+error. To switch the CNI, tear down with ``--reset`` and bring the cluster back
+up with the new ``cni`` setting.
 
 For Users
 ---------
