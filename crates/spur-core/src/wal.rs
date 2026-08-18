@@ -135,6 +135,19 @@ pub enum WalOperation {
     JobPreemptCancel {
         job_id: JobId,
     },
+    /// Admin requeue (`scontrol requeue` / `requeuehold`): return a job to
+    /// Pending with the same spec in one atomic step. A running/suspended job is
+    /// finalized once (steps, allocations, accounting-end as REQUEUED) before
+    /// re-pending; an already-terminal job re-pends with no re-finalization.
+    /// `hold` parks it held; `begin_time` defers eligibility (leader-computed).
+    /// NoOp on replay once Pending.
+    JobUserRequeue {
+        job_id: JobId,
+        #[serde(default)]
+        hold: bool,
+        #[serde(default)]
+        begin_time: Option<chrono::DateTime<chrono::Utc>>,
+    },
     JobSuspend {
         job_id: JobId,
         /// Controller-stamped instant of suspension (for replay-deterministic accounting).
@@ -1011,6 +1024,52 @@ mod suspend_wal_tests {
             } => {
                 assert_eq!(job_id, 42);
                 assert_eq!(b, begin_time);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn user_requeue_op_round_trips() {
+        let begin = chrono::Utc::now();
+        for (hold, begin_time) in [(false, Some(begin)), (true, None), (false, None)] {
+            let op = WalOperation::JobUserRequeue {
+                job_id: 42,
+                hold,
+                begin_time,
+            };
+            let json = serde_json::to_string(&op).unwrap();
+            let back: WalOperation = serde_json::from_str(&json).unwrap();
+            match back {
+                WalOperation::JobUserRequeue {
+                    job_id,
+                    hold: got_hold,
+                    begin_time: got_begin,
+                } => {
+                    assert_eq!(job_id, 42);
+                    assert_eq!(got_hold, hold);
+                    assert_eq!(got_begin, begin_time);
+                }
+                _ => panic!("wrong variant"),
+            }
+        }
+    }
+
+    /// The optional fields default when absent, so a minimal/older-encoded
+    /// entry still replays.
+    #[test]
+    fn user_requeue_op_defaults_missing_fields() {
+        let json = r#"{"JobUserRequeue":{"job_id":7}}"#;
+        let back: WalOperation = serde_json::from_str(json).unwrap();
+        match back {
+            WalOperation::JobUserRequeue {
+                job_id,
+                hold,
+                begin_time,
+            } => {
+                assert_eq!(job_id, 7);
+                assert!(!hold);
+                assert_eq!(begin_time, None);
             }
             _ => panic!("wrong variant"),
         }

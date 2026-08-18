@@ -914,6 +914,46 @@ impl SlurmController for ControllerService {
         Ok(Response::new(()))
     }
 
+    async fn requeue_job(
+        &self,
+        request: Request<RequeueJobRequest>,
+    ) -> Result<Response<RequeueJobResponse>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut fwd = Request::new(request.into_inner());
+                    *fwd.metadata_mut() = Self::forwarded_metadata();
+                    return client.requeue_job(fwd).await;
+                }
+                Err(e) => {
+                    warn!("failed to forward requeue_job to leader: {e}");
+                    return Err(status);
+                }
+            }
+        }
+
+        let req = request.into_inner();
+        let outcome = self
+            .cluster
+            .requeue_job_by_user(req.job_id, &req.user, req.hold)
+            .map_err(cluster_err_to_precondition_status)?;
+
+        // Kill the old processes for jobs that were Running/Suspended; the
+        // requeue already freed their allocations and re-pended them.
+        for job in outcome.killed {
+            let cluster = self.cluster.clone();
+            tokio::spawn(async move {
+                crate::scheduler_loop::send_cancel_to_agents(&cluster, &job, 0).await;
+            });
+        }
+
+        Ok(Response::new(RequeueJobResponse {
+            requeued: outcome.requeued,
+            skipped: outcome.skipped,
+        }))
+    }
+
     async fn get_nodes(
         &self,
         request: Request<GetNodesRequest>,
@@ -4524,6 +4564,112 @@ mod tests {
             control_plane_replicas: 1,
             jwt_key: String::new(),
         }
+    }
+
+    // Exercises the requeue RPC boundary: gRPC status mapping (auth vs. state
+    // precondition) and the requeued-count response the CLI relies on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeue_job_rpc_reports_count_and_maps_errors() {
+        use spur_core::resource::{ResourceAllocations, ResourceSet};
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .register_node(
+                "n1".into(),
+                "n1".into(),
+                ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                std::collections::HashMap::new(),
+            )
+            .unwrap();
+        for _ in 0..200 {
+            if svc.cluster.get_node("n1").is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let spec = spur_core::job::JobSpec {
+            name: "rq".into(),
+            user: "alice".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // Unknown job -> FailedPrecondition (non-auth cluster error).
+        let err = svc
+            .requeue_job(Request::new(RequeueJobRequest {
+                job_id: 999_999,
+                user: "alice".into(),
+                hold: false,
+            }))
+            .await
+            .expect_err("unknown job must error");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+
+        // Wrong user -> PermissionDenied (auth precedes the state checks).
+        let err = svc
+            .requeue_job(Request::new(RequeueJobRequest {
+                job_id,
+                user: "mallory".into(),
+                hold: false,
+            }))
+            .await
+            .expect_err("non-owner must be denied");
+        assert_eq!(err.code(), Code::PermissionDenied);
+
+        // Drive to terminal, then a valid owner requeue succeeds and reports the count.
+        let res = ResourceAllocations::with_scalar(1, 1000);
+        let per_node: std::collections::HashMap<_, _> =
+            [("n1".to_string(), res.clone())].into_iter().collect();
+        svc.cluster
+            .start_job(job_id, vec!["n1".into()], res, per_node)
+            .unwrap();
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).map(|j| j.state) == Some(JobState::Running) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        svc.cluster
+            .complete_job(job_id, 0, JobState::Completed)
+            .unwrap();
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).map(|j| j.state) == Some(JobState::Completed) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let resp = svc
+            .requeue_job(Request::new(RequeueJobRequest {
+                job_id,
+                user: "alice".into(),
+                hold: false,
+            }))
+            .await
+            .expect("owner requeue must succeed")
+            .into_inner();
+        assert_eq!(resp.requeued, 1);
+        assert!(resp.skipped.is_empty());
     }
 
     // A step must NOT be created when the target node is allocated but unregistered: address
