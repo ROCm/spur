@@ -124,7 +124,7 @@ impl SlurmAccounting for AccountingService {
         let (memory_mb, cpus) = req
             .resources
             .as_ref()
-            .map(|r| (r.memory_mb as i64, r.cpus as i32))
+            .map(|r| (r.memory_mb, r.cpus))
             .unwrap_or((0, 1));
 
         let mut conn = pool
@@ -133,18 +133,21 @@ impl SlurmAccounting for AccountingService {
             .map_err(|e| Status::internal(e.to_string()))?;
         db::record_job_start(
             &mut conn,
-            req.job_id as i32,
-            &req.name,
-            &req.user,
-            &req.account,
-            &req.partition,
-            1, // num_nodes — simplified
-            cpus,
-            1,
-            memory_mb,
-            submit_time,
-            start_time,
-            &req.reservation,
+            &db::JobStartRecord {
+                job_id: req.job_id,
+                name: req.name,
+                user: req.user,
+                account: req.account,
+                partition: req.partition,
+                qos: req.qos,
+                num_nodes: 1, // simplified
+                num_tasks: cpus,
+                cpus_per_task: 1,
+                memory_mb,
+                submit_time,
+                start_time,
+                reservation: Some(req.reservation),
+            },
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;

@@ -1182,6 +1182,7 @@ message RecordJobStartRequest {
   string reservation = 7;
   string name = 8;
   google.protobuf.Timestamp submit_time = 9;
+  string qos = 10;
 }
 
 message RecordJobEndRequest {

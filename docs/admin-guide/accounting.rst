@@ -543,6 +543,14 @@ unreachable, matching the rest of the accounting path: a database outage does no
 stop scheduling. Where a budget must hold, keep the accounting database
 available.
 
+.. note::
+
+   Consumption is attributed per QOS from the QOS recorded on each job, which
+   earlier releases did not store. Jobs that ran before the upgrade therefore
+   count for nothing and cannot be backfilled, so a budget set immediately after
+   upgrading starts from zero and fills over the following
+   ``grp_wall_window_days``.
+
 QOS preemption hierarchy
 ~~~~~~~~~~~~~~~~~~~~~~~~
 

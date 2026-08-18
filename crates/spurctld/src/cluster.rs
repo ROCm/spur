@@ -1568,6 +1568,7 @@ impl ClusterManager {
                 user: spec_for_notify.user.clone(),
                 account: spec_for_notify.account.clone().unwrap_or_default(),
                 partition: spec_for_notify.partition.clone().unwrap_or_default(),
+                qos: spec_for_notify.qos.clone().unwrap_or_default(),
                 num_nodes: spec_for_notify.num_nodes,
                 num_tasks: spec_for_notify.num_tasks,
                 cpus_per_task: spec_for_notify.cpus_per_task,
