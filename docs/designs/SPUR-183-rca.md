@@ -110,67 +110,70 @@ the controller cache, so the cache is where the fix must live.
 
 ## Proposed Fix
 
-Two complementary changes. **[1] is required to close the bug; [2] is the
-requested UX/behavior change and is safe hygiene but not sufficient alone.**
+Two complementary changes, both required. Hardware testing (see below) showed
+that **[1] alone does not close the bug**: on a real teardown the operative stale
+state is the node-side `/etc/k0s/token` file, and it only survives when spurd's
+`k0s reset` cannot complete — at which point the controller sees the node's unit
+`active` (k0s crash-looping on the stale token) and never re-pushes a fresh one.
 
-### [1] Clear the controller token cache on teardown (the actual fix)
+### [1] Clear the controller token cache on teardown
 
 Clear `join_tokens` in the `K0sPhase::Down` arm so the cache lifetime is bound to
-the cluster incarnation, not the process lifetime. This mirrors the existing
-`assigned.is_empty()` clear and guarantees the next `up` mints fresh tokens
-against the new CA.
+the cluster incarnation, not the process lifetime. Mirrors the existing
+`assigned.is_empty()` clear. Necessary defense-in-depth so the controller never
+re-pushes a token minted against the old CA.
 
-### [2] Make `spur k8s down` always purge node state (requested behavior)
+### [2] Purge the node join token even when `k0s reset` fails (the operative fix)
 
-Drop the `--reset`-gated distinction so `down` unconditionally performs the
-destructive teardown (`k0s reset` + `purge_unit` on every node), matching the
-"leave no state behind" behavior of PR #655's remove path. This removes the
-soft-stop semantics of a bare `down` (see Risk).
+In spurd's teardown (`ClusterSupervisor::stop` and `K0sAgent::stop_untracked`),
+`k0s reset` was awaited with `?`, so a failing reset (broken/half-installed k0s
+binary, or a node whose k0s was swapped out) short-circuited **before**
+`purge_unit()` ran. The spurd-owned unit (`Restart=always`) then restarted k0s
+with the **stale token file**, which was minted against the torn-down CA →
+`crypto/rsa: verification error ... kubernetes-ca` on the next join. Purge the
+unit + token file **unconditionally**, then surface the reset failure afterward.
 
 ### Changes Required
 
 | File | Change | Reason |
 |------|--------|--------|
-| `crates/spurctld/src/cluster_k8s.rs` (`reconcile_phase`, `Down` arm ~L164) | Clear `join_tokens` on the `Down` phase | **[1]** Bind token-cache lifetime to the cluster incarnation; stop reusing a token minted against the old CA |
-| `crates/spurctld/src/server.rs` (`cluster_down` ~L2925) | Force `reset=true` (or drop the field from the decision) so teardown is always destructive | **[2]** Always purge node-side k0s state/files |
-| `crates/spur-cli/src/k8s.rs` (`Down { reset }` ~L84, `cmd_down` ~L304) | Remove/deprecate the `--reset` flag; always request a full teardown | **[2]** No explicit `--reset` required |
-| `docs/` (k8s teardown page) | Document that `down` is now always destructive; note `--reset` removal/deprecation | User-facing behavior + CLI change (AGENTS.md docs rule) |
+| `crates/spurctld/src/cluster_k8s.rs` (`reconcile_phase`, `Down` arm) | Clear `join_tokens` on the `Down` phase | **[1]** Bind token-cache lifetime to the cluster incarnation |
+| `crates/spurd/src/cluster.rs` (`ClusterSupervisor::stop`) | Run `purge_unit()` even when `k0s reset` fails; surface the error after | **[2]** Never leave a stale-CA token/unit behind |
+| `crates/spurd/src/cluster.rs` (`K0sAgent::stop_untracked`) | Same unconditional purge for the untracked (post-restart) teardown path | **[2]** Same guarantee when spurd has no tracked supervisor |
 
 ### Risk Assessment
 
-**Medium.**
-- **[1]** is low-risk and surgical: clearing an in-memory cache on teardown. The
-  only tokens dropped are for a cluster being torn down; a node still mid-join
-  would simply be re-minted a fresh (valid) token on the next tick.
-- **[2]** is the higher-risk half: it changes user-facing CLI semantics and makes
-  a bare `down` unconditionally destructive (`k0s reset` wipes `/var/lib/k0s`).
-  This removes the ability to stop-and-restart a cluster without a full rebuild.
-  Removing the `--reset` flag is a **breaking CLI change** (Slurm-compat surface
-  per AGENTS.md) — prefer deprecating the flag (accept-and-ignore) over removing
-  it, to avoid breaking existing scripts. Confirm the intent to always-destroy.
+**Low.** Both changes only reorder existing teardown steps so the purge is not
+skipped on a failed reset, and add a defensive in-memory cache clear. No proto,
+config, or user-facing CLI change. `down --reset` semantics are unchanged; the
+purge simply becomes robust to a failing `k0s reset`.
 
 ### Dependencies
 
-None. `ClusterDownRequest.reset` stays on the proto for wire compat even if the
-CLI stops exposing it (do **not** renumber/remove the proto field).
+None.
 
 ## Test Plan
 
-- **Unit (fix [1], the regression guard):** drive `reconcile_phase` through a
-  `Provisioning → Ready → Down → Provisioning` sequence on a `ClusterManager`
-  test fixture (pattern already in `cluster.rs` tests, e.g.
-  `reconcile_phase_reports_no_error_for_down_and_degraded` at `cluster.rs:14835`
-  and the reconcile wiring tests around `cluster.rs:14705-14807`). Seed a token
-  into `join_tokens`, run the `Down` tick, assert the cache is empty afterward so
-  the rebuild cannot reuse it. This exercises the real `converge`/`reconcile`
-  code, not a simulation.
-- **Unit (behavior [2]):** `cluster_down` sets `reset_requested=true`
-  unconditionally (extend the `server.rs` `cluster_down` tests); CLI `cmd_down`
-  always sends a full-teardown request (extend `parses_down_reset_and_status` at
-  `k8s.rs:475`).
-- **Regression guard:** assert a bare `down` (no flag) still drains roles and, on
-  the following `up`, workers are handed a **freshly minted** token (cache miss),
-  not a cached one.
-- **Manual E2E:** single long-lived `spurctld`; `up` → `down` → `up`; confirm the
-  worker joins and appears in `kubectl get nodes` with no `kubernetes-ca`
-  verification error, without restarting the controller.
+- **Unit (fix [1]):** `reconcile_phase_reports_no_error_for_down_and_degraded`
+  (`spurctld/src/cluster.rs`) extended to seed a token into `join_tokens` and
+  assert the `Down` tick clears it. Exercises the real reconcile code. — DONE, passes.
+- **Unit (fix [2]):** `stop_reset_purges_token_even_when_k0s_reset_fails`
+  (`spurd/src/cluster.rs`): `ClusterSupervisor::stop(reset=true)` with a
+  non-existent k0s binary must (a) return `Err` (reset surfaced) and (b) still
+  remove the token + unit files. `#[ignore]`d because `stop()` probes `systemctl`
+  (env-dependent, matching the file's `derisk_*` convention); run explicitly with
+  `--ignored`. — DONE, passes.
+- **Hardware E2E (done, 2026-08-18, testbed master 10.11.98.229 + galena
+  10.11.194.197):**
+  - *Baseline reproduced on pre-fix build `f9c31da9`:* with galena's k0s made
+    non-executable (so `k0s reset` fails on teardown), after `down --reset` + `up`
+    on the same controller, galena's journal showed continuous
+    `crypto/rsa: verification error ... kubernetes-ca` and `kubectl get nodes`
+    reported "No resources found" while `spur k8s status` showed the unit active —
+    exactly the reported symptom. Confirmed the master CA regenerates across the
+    cycle (`29368e8e…` → `4160457669…`).
+  - *Fixed build `c6ec2134`:* same scenario — the patched spurd purged the stale
+    `/etc/k0s/token` on teardown **despite the failed `k0s reset`** (verified
+    token file gone), and on the next `up` galena rejoined with a fresh token: no
+    `kubernetes-ca` errors, reaching `kubectl get nodes` → `Ready`, controller
+    never restarted.

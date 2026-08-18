@@ -317,11 +317,14 @@ impl ClusterSupervisor {
         }
         self.disable_unit().await;
         if reset {
-            self.k0s_reset().await?;
-            // `k0s reset` only wipes /var/lib/k0s data — it leaves the spurd-owned unit (Restart=always)
-            // and the join token, which would restart + rejoin the node. Purge both so a reset is a
-            // real teardown (essential for a single-node remove; harmless for a whole-cluster down).
+            // `k0s reset` wipes /var/lib/k0s; purge_unit removes the spurd-owned unit (Restart=always)
+            // + join token, which would otherwise restart and rejoin the node. Purge UNCONDITIONALLY,
+            // even if `k0s reset` fails (e.g. a broken/half-installed k0s binary): a surviving token is
+            // minted against the torn-down CA and makes the node fail its next join with a
+            // kubernetes-ca verification error. Surface the reset failure only after purging.
+            let reset_result = self.k0s_reset().await;
             self.purge_unit().await;
+            reset_result?;
         }
         Ok(())
     }
@@ -818,16 +821,16 @@ impl K0sAgent {
             self.probe_supervisor(role).disable_unit().await;
         }
         if reset {
-            self.probe_supervisor(ClusterRole::Controller)
-                .k0s_reset()
-                .await?;
-            // Purge both spurd-owned units so a lingering unit (Restart=always) can't restart the
-            // component after the reset. The probe supervisor carries no token path, so also remove
-            // the token file directly.
+            // Purge UNCONDITIONALLY, even if `k0s reset` fails (broken/half-installed k0s binary):
+            // a surviving token was minted against the torn-down CA and makes the node fail its next
+            // join with a kubernetes-ca verification error. Surface the reset failure only after
+            // purging. The probe supervisor carries no token path, so also remove the token directly.
+            let reset_result = self.probe_supervisor(ClusterRole::Controller).k0s_reset().await;
             for role in [ClusterRole::Controller, ClusterRole::Worker] {
                 self.probe_supervisor(role).purge_unit().await;
             }
             let _ = tokio::fs::remove_file(self.config_dir.join("token")).await;
+            reset_result?;
         }
         Ok(())
     }
@@ -1297,6 +1300,50 @@ mod tests {
         assert!(
             sup.unit_status_is(&["is-active"], "active").await,
             "active again after re-write"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires systemctl on PATH; run explicitly on a Linux host"]
+    async fn stop_reset_purges_token_even_when_k0s_reset_fails() {
+        // Regression: `down --reset` must purge the spurd-owned unit + join token even if `k0s reset`
+        // fails (e.g. a broken/half-installed k0s binary). A surviving token was minted against the
+        // torn-down CA, so the node fails its next join with a kubernetes-ca verification error. The
+        // reset failure must still be surfaced (Err), but only AFTER the purge.
+        // Gated: `stop()` probes `systemctl --version`, so this needs systemd on PATH.
+        let dir = tempfile::TempDir::new().unwrap();
+        let unit_dir = dir.path().join("systemd");
+        tokio::fs::create_dir_all(&unit_dir).await.unwrap();
+        let token = dir.path().join("token");
+        tokio::fs::write(&token, b"stale-ca-token").await.unwrap();
+
+        let sup = ClusterSupervisor {
+            cfg: ClusterConfig {
+                role: ClusterRole::Worker,
+                // Non-existent binary: `k0s reset` fails deterministically without touching the host.
+                k0s_binary: dir.path().join("no-such-k0s"),
+                k0s_config: None,
+                join_token_file: Some(token.clone()),
+                node_ip: None,
+            },
+            unit_dir: unit_dir.clone(),
+        };
+        let unit_path = unit_dir.join(sup.unit_file_name());
+        tokio::fs::write(&unit_path, b"[Unit]\n").await.unwrap();
+
+        let result = sup.stop(true).await;
+
+        assert!(
+            result.is_err(),
+            "a failed `k0s reset` must be surfaced, not swallowed"
+        );
+        assert!(
+            !token.exists(),
+            "the join token must be purged even when `k0s reset` fails"
+        );
+        assert!(
+            !unit_path.exists(),
+            "the spurd-owned unit must be purged even when `k0s reset` fails"
         );
     }
 
