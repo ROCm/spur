@@ -116,6 +116,8 @@ const QOS_KEYS: &[&str] = &[
     "description",
     "priority",
     "preemptmode",
+    "preempt",
+    "preemptexempttime",
     "usagefactor",
     "maxjobsperuser",
     "maxjobspu",
@@ -469,6 +471,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     description: Some(desc),
                     priority: Some(priority),
                     preempt_mode: Some(preempt.clone()),
+                    preempt: p.get("preempt").cloned(),
                     usage_factor: Some(usage_factor),
                     max_jobs_per_user: Some(max_jobs),
                     max_wall_minutes: Some(max_wall),
@@ -482,6 +485,9 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     max_tres_per_user: Some(p.get("maxtresperuser").cloned().unwrap_or_default()),
                     grp_tres: Some(p.get("grptres").cloned().unwrap_or_default()),
                     grp_wall_minutes: Some(grp_wall),
+                    preempt_exempt_time: p
+                        .get("preemptexempttime")
+                        .and_then(|v| v.parse::<u32>().ok()),
                 })
                 .await
                 .context("CreateQos RPC failed")?;
@@ -622,6 +628,7 @@ fn build_modify_qos_request(
             .map(|v| parse_i32("priority", v))
             .transpose()?,
         preempt_mode: p.get("preemptmode").cloned(),
+        preempt: p.get("preempt").cloned(),
         usage_factor: p
             .get("usagefactor")
             .map(|v| parse_f64("usagefactor", v))
@@ -644,6 +651,9 @@ fn build_modify_qos_request(
             .get("grpwall")
             .map(|v| parse_wall_limit("grpwall", v))
             .transpose()?,
+        preempt_exempt_time: p
+            .get("preemptexempttime")
+            .and_then(|v| v.parse::<u32>().ok()),
     })
 }
 
@@ -949,7 +959,9 @@ fn qos_header(spec: char) -> &'static str {
         'N' => "Name",
         'D' => "Descr",
         'p' => "Priority",
-        'P' => "Preempt",
+        'P' => "PreemptMode",
+        'Q' => "Preempt",
+        'E' => "PreemptExemptTime",
         'U' => "UsageFactor",
         'G' => "GrpTRES",
         'T' => "MaxTRES",
@@ -967,7 +979,9 @@ fn qos_field_spec(name: &str) -> Option<char> {
         "name" => Some('N'),
         "description" | "descr" => Some('D'),
         "priority" | "prio" => Some('p'),
-        "preempt" | "preemptmode" => Some('P'),
+        "preemptmode" => Some('P'),
+        "preempt" => Some('Q'),
+        "preemptexempttime" => Some('E'),
         "usagefactor" => Some('U'),
         "grptres" => Some('G'),
         "maxtres" | "maxtrespj" | "maxtresperjob" => Some('T'),
@@ -986,6 +1000,8 @@ fn resolve_qos_field(q: &QosInfo, spec: char) -> String {
         'D' => q.description.clone(),
         'p' => q.priority.to_string(),
         'P' => q.preempt_mode.clone(),
+        'Q' => q.preempt.clone(),
+        'E' => blank_if_zero(q.preempt_exempt_time),
         'U' => format!("{}", q.usage_factor),
         'G' => q.grp_tres.clone(),
         'T' => q.max_tres_per_job.clone(),

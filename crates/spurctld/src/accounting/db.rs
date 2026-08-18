@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS qos (
     description     TEXT NOT NULL DEFAULT '',
     priority        INTEGER NOT NULL DEFAULT 0,
     preempt_mode    TEXT NOT NULL DEFAULT 'off',
+    preempt         TEXT NOT NULL DEFAULT '',
     usage_factor    REAL NOT NULL DEFAULT 1.0,
     max_jobs_per_user INTEGER,
     max_submit_per_user INTEGER,
@@ -99,6 +100,7 @@ CREATE TABLE IF NOT EXISTS qos (
     grp_tres        TEXT,
     max_wall_min    INTEGER,
     grp_wall_min    INTEGER,
+    preempt_exempt_time INTEGER,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -144,6 +146,8 @@ ALTER TABLE associations ADD COLUMN IF NOT EXISTS default_qos TEXT;
 ALTER TABLE associations ADD COLUMN IF NOT EXISTS allowed_qos TEXT;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS grp_wall_min INTEGER;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS grp_tres TEXT;
+ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt TEXT NOT NULL DEFAULT '';
+ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt_exempt_time INTEGER;
 
 -- users.default_account is the single source of truth for a user's default
 -- account (the scheduler reads it via the association cache). associations
@@ -975,6 +979,8 @@ pub struct QosUpdate<'a> {
     pub description: Option<&'a str>,
     pub priority: Option<i32>,
     pub preempt_mode: Option<&'a str>,
+    /// Comma-separated QOS names; `Some("")` clears the list.
+    pub preempt: Option<&'a str>,
     pub usage_factor: Option<f64>,
     pub max_jobs_per_user: Option<Option<i32>>,
     pub max_wall_min: Option<Option<i32>>,
@@ -983,6 +989,7 @@ pub struct QosUpdate<'a> {
     pub max_tres_per_user: Option<Option<&'a str>>,
     pub grp_tres: Option<Option<&'a str>>,
     pub grp_wall_min: Option<Option<i32>>,
+    pub preempt_exempt_time: Option<Option<i32>>,
 }
 
 /// Create or update a QOS, writing only the fields set in `u`. `modify` sends
@@ -1023,6 +1030,12 @@ pub async fn upsert_qos<'a>(pool: &PgPool, name: &'a str, u: QosUpdate<'a>) -> a
     }
     if let Some(v) = u.grp_wall_min {
         updates.push(("grp_wall_min", SqlVal::NullInt(v)));
+    }
+    if let Some(v) = u.preempt {
+        updates.push(("preempt", SqlVal::Text(v)));
+    }
+    if let Some(v) = u.preempt_exempt_time {
+        updates.push(("preempt_exempt_time", SqlVal::NullInt(v)));
     }
     upsert_row(pool, UpsertTable::Qos, &keys, &updates).await
 }
@@ -1069,7 +1082,7 @@ pub async fn missing_qos(pool: &PgPool, names: &[&str]) -> anyhow::Result<Vec<St
 /// List all QOS.
 pub async fn list_qos(pool: &PgPool) -> anyhow::Result<Vec<QosRecord>> {
     let rows = sqlx::query(
-        "SELECT name, description, priority, preempt_mode, usage_factor, max_jobs_per_user, max_wall_min, max_tres_per_job, max_submit_per_user, max_tres_per_user, grp_tres, grp_wall_min FROM qos ORDER BY name"
+        "SELECT name, description, priority, preempt_mode, preempt, usage_factor, max_jobs_per_user, max_wall_min, max_tres_per_job, max_submit_per_user, max_tres_per_user, grp_tres, grp_wall_min, preempt_exempt_time FROM qos ORDER BY name"
     ).fetch_all(pool).await?;
 
     Ok(rows
@@ -1079,6 +1092,7 @@ pub async fn list_qos(pool: &PgPool) -> anyhow::Result<Vec<QosRecord>> {
             description: r.get("description"),
             priority: r.get("priority"),
             preempt_mode: r.get("preempt_mode"),
+            preempt: r.get::<Option<String>, _>("preempt").unwrap_or_default(),
             // Column is REAL (f32) in the schema; widen to the struct's f64.
             usage_factor: r.get::<f32, _>("usage_factor") as f64,
             max_jobs_per_user: r.get("max_jobs_per_user"),
@@ -1088,6 +1102,7 @@ pub async fn list_qos(pool: &PgPool) -> anyhow::Result<Vec<QosRecord>> {
             max_tres_per_user: r.get("max_tres_per_user"),
             grp_tres: r.get("grp_tres"),
             grp_wall_min: r.get("grp_wall_min"),
+            preempt_exempt_time: r.get("preempt_exempt_time"),
         })
         .collect())
 }
@@ -1098,6 +1113,8 @@ pub struct QosRecord {
     pub description: String,
     pub priority: i32,
     pub preempt_mode: String,
+    /// Comma-separated QOS names this QOS may preempt; empty string = none.
+    pub preempt: String,
     pub usage_factor: f64,
     pub max_jobs_per_user: Option<i32>,
     pub max_wall_min: Option<i32>,
@@ -1106,6 +1123,7 @@ pub struct QosRecord {
     pub max_tres_per_user: Option<String>,
     pub grp_tres: Option<String>,
     pub grp_wall_min: Option<i32>,
+    pub preempt_exempt_time: Option<i32>,
 }
 
 #[cfg(test)]
@@ -1400,6 +1418,7 @@ mod job_history_tests {
                 description: Some("d"),
                 priority: Some(5),
                 preempt_mode: Some("cluster"),
+                preempt: None,
                 usage_factor: Some(1.5),
                 max_jobs_per_user: Some(Some(3)),
                 max_wall_min: Some(Some(60)),
@@ -1408,6 +1427,7 @@ mod job_history_tests {
                 max_tres_per_user: Some(Some("cpu=16")),
                 grp_tres: Some(Some("cpu=64")),
                 grp_wall_min: Some(Some(120)),
+                preempt_exempt_time: None,
             },
         )
         .await?;

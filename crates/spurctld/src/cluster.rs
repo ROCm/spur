@@ -3558,6 +3558,7 @@ impl ClusterManager {
         allow_qos: Option<Vec<String>>,
         priority_tier: Option<u32>,
         preempt_mode: Option<String>,
+        preempt_exempt_time: Option<Option<u32>>,
     ) -> Result<(), PartitionError> {
         if !self.partitions.read().iter().any(|p| p.name == name) {
             return Err(PartitionError::not_found(format!(
@@ -3614,6 +3615,7 @@ impl ClusterManager {
             priority_tier,
             preempt_mode,
             is_default,
+            preempt_exempt_time,
         })
         .map_err(|e| PartitionError::raft(e.to_string()))?;
         Ok(())
@@ -3735,6 +3737,7 @@ impl ClusterManager {
                 priority_tier: Some(part.priority_tier),
                 preempt_mode: Some(preempt_str.to_string()),
                 is_default: Some(part.is_default),
+                preempt_exempt_time: Some(part.preempt_exempt_time),
             })
             .map_err(|e| anyhow::anyhow!("reconfigure: update {}: {e}", part.name))?;
         }
@@ -5533,6 +5536,7 @@ impl ClusterManager {
                 priority_tier,
                 preempt_mode,
                 is_default,
+                preempt_exempt_time,
             } => {
                 {
                     let mut partitions = self.partitions.write();
@@ -5592,6 +5596,9 @@ impl ClusterManager {
                         }
                         if let Some(def) = is_default {
                             part.is_default = *def;
+                        }
+                        if let Some(et) = preempt_exempt_time {
+                            part.preempt_exempt_time = *et;
                         }
                         info!(name, "partition updated");
                     } else {
@@ -12712,7 +12719,7 @@ mod tests {
         let high_job = cm.get_job(high_id).unwrap();
         let partitions = cm.get_partitions();
 
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job]).await;
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job], &cm.config().scheduler).await;
         assert_eq!(cm.get_job(low_id).unwrap().state, JobState::Running);
     }
 
@@ -12746,7 +12753,7 @@ mod tests {
         let high_job = cm.get_job(high_id).unwrap();
         let partitions = cm.get_partitions();
 
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job]).await;
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job], &cm.config().scheduler).await;
         assert_eq!(cm.get_job(low_id).unwrap().state, JobState::Running);
     }
 
@@ -12787,7 +12794,7 @@ mod tests {
         let pending = cm.pending_jobs();
         let pending_refs: Vec<&Job> = pending.iter().collect();
         let partitions = cm.get_partitions();
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs).await;
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler).await;
 
         settle(&cm, low_id, JobState::Cancelled);
     }
@@ -12845,7 +12852,7 @@ mod tests {
              for preemption to fire"
         );
 
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs).await;
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler).await;
 
         settle(&cm, burst_id, JobState::Cancelled);
         assert_eq!(
@@ -12900,7 +12907,7 @@ mod tests {
         let pending = cm.pending_jobs();
         let pending_refs: Vec<&Job> = pending.iter().collect();
         let partitions = cm.get_partitions();
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs).await;
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler).await;
 
         // burst job must still be running — equal explicit priorities, no preemption.
         let burst_job = cm.get_job(burst_id).unwrap();
@@ -12985,7 +12992,7 @@ mod tests {
         let high_job = cm.get_job(high_id).unwrap();
         let partitions = cm.get_partitions();
 
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job]).await;
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job], &cm.config().scheduler).await;
 
         // Suspended, not Cancelled: proves the QoS override reached the real
         // preemption action, not just the pure job_preempt_mode() decision.
@@ -19923,6 +19930,7 @@ mod tests {
             priority_tier: None,
             preempt_mode: None,
             is_default: None,
+            preempt_exempt_time: None,
         });
 
         let gpu = cm
@@ -20045,6 +20053,7 @@ mod tests {
             priority_tier: None,
             preempt_mode: None,
             is_default: None,
+            preempt_exempt_time: None,
         });
 
         assert_eq!(
@@ -20089,6 +20098,7 @@ mod tests {
             priority_tier: None,
             preempt_mode: None,
             is_default: Some(true),
+            preempt_exempt_time: None,
         });
 
         let parts = cm.get_partitions();

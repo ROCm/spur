@@ -147,6 +147,12 @@ pub struct Qos {
     /// Usage factor — multiplier for fair-share usage accounting.
     /// 0.0 = don't charge, 1.0 = normal, 2.0 = double charge.
     pub usage_factor: f64,
+    /// QOS names that jobs in this QOS are allowed to preempt. Only enforced
+    /// when `scheduler.preempt_type = qos_priority`. Empty means this QOS may
+    /// not preempt any other QOS under that mode. Mirrors Slurm's `Preempt=`
+    /// field on a QOS.
+    #[serde(default)]
+    pub preempt: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -181,6 +187,12 @@ pub struct QosLimits {
     pub grp_tres: Option<TresRecord>,
     pub max_wall_minutes: Option<u32>,
     pub grp_wall_minutes: Option<u32>,
+    /// Per-QOS override for the minimum seconds a job must have been running
+    /// before it is eligible for preemption. Overrides the partition value,
+    /// which in turn overrides the cluster-wide `preempt_exempt_time`. `None`
+    /// defers to the next level.
+    #[serde(default)]
+    pub preempt_exempt_time: Option<u32>,
 }
 
 impl Default for Account {
@@ -205,6 +217,7 @@ impl Default for Qos {
             preempt_mode: QosPreemptMode::Off,
             limits: QosLimits::default(),
             usage_factor: 1.0,
+            preempt: Vec::new(),
         }
     }
 }

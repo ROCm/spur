@@ -2098,6 +2098,7 @@ impl SlurmController for ControllerService {
                 allow_qos,
                 req.priority_tier,
                 preempt_mode,
+                req.preempt_exempt_time.map(|v| if v == 0 { None } else { Some(v) }),
             )
             .map_err(partition_rpc_status)?;
 
@@ -3742,6 +3743,7 @@ fn partition_to_proto(part: &spur_core::partition::Partition) -> PartitionInfo {
         deny_qos: part.deny_qos.join(","),
         preempt_mode: format!("{:?}", part.preempt_mode),
         priority_tier: part.priority_tier,
+        preempt_exempt_time: part.preempt_exempt_time.unwrap_or(0),
     }
 }
 

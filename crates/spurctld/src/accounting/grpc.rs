@@ -548,6 +548,7 @@ impl SlurmAccounting for AccountingService {
             description: req.description.as_deref(),
             priority: req.priority,
             preempt_mode: req.preempt_mode.as_deref(),
+            preempt: req.preempt.as_deref(),
             usage_factor: req.usage_factor,
             max_jobs_per_user: nullable_limit(req.max_jobs_per_user, "max_jobs_per_user")?,
             max_wall_min: nullable_limit(req.max_wall_minutes, "max_wall_minutes")?,
@@ -559,6 +560,9 @@ impl SlurmAccounting for AccountingService {
             max_tres_per_user: nullable_str(&req.max_tres_per_user),
             grp_tres: nullable_str(&req.grp_tres),
             grp_wall_min: nullable_limit(req.grp_wall_minutes, "grp_wall_minutes")?,
+            preempt_exempt_time: req
+                .preempt_exempt_time
+                .map(|v| if v == 0 { None } else { Some(v as i32) }),
         };
         db::upsert_qos(pool, &req.name, update)
             .await
@@ -591,6 +595,7 @@ impl SlurmAccounting for AccountingService {
                 description: r.description,
                 priority: r.priority,
                 preempt_mode: r.preempt_mode,
+                preempt: r.preempt,
                 usage_factor: r.usage_factor,
                 max_jobs_per_user: r.max_jobs_per_user.unwrap_or(0) as u32,
                 max_wall_minutes: r.max_wall_min.unwrap_or(0) as u32,
@@ -599,6 +604,7 @@ impl SlurmAccounting for AccountingService {
                 max_tres_per_user: r.max_tres_per_user.unwrap_or_default(),
                 grp_tres: r.grp_tres.unwrap_or_default(),
                 grp_wall_minutes: r.grp_wall_min.unwrap_or(0) as u32,
+                preempt_exempt_time: r.preempt_exempt_time.unwrap_or(0) as u32,
             })
             .collect();
 
