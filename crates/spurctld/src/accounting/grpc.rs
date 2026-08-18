@@ -560,9 +560,11 @@ impl SlurmAccounting for AccountingService {
             max_tres_per_user: nullable_str(&req.max_tres_per_user),
             grp_tres: nullable_str(&req.grp_tres),
             grp_wall_min: nullable_limit(req.grp_wall_minutes, "grp_wall_minutes")?,
-            preempt_exempt_time: req
-                .preempt_exempt_time
-                .map(|v| if v == 0 { None } else { Some(v as i32) }),
+            preempt_exempt_time: if req.clear_preempt_exempt_time {
+                Some(None)
+            } else {
+                req.preempt_exempt_time.map(|v| Some(v as i32))
+            },
         };
         db::upsert_qos(pool, &req.name, update)
             .await
