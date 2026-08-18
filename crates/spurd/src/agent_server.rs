@@ -2457,6 +2457,46 @@ impl SlurmAgent for AgentService {
         }
     }
 
+    async fn drain_k8s_node(
+        &self,
+        request: Request<DrainK8sNodeRequest>,
+    ) -> Result<Response<DrainK8sNodeResponse>, Status> {
+        let req = request.into_inner();
+        match self
+            .k0s
+            .drain_node(&req.node, req.timeout_secs, req.force)
+            .await
+        {
+            Ok(()) => Ok(Response::new(DrainK8sNodeResponse {
+                drained: true,
+                message: String::new(),
+            })),
+            // In-band failure (drain blocked/timed out): the controller decides whether to proceed
+            // (with --force) or leave the node cordoned, so report it as a normal response.
+            Err(e) => Ok(Response::new(DrainK8sNodeResponse {
+                drained: false,
+                message: e.to_string(),
+            })),
+        }
+    }
+
+    async fn delete_k8s_node(
+        &self,
+        request: Request<DeleteK8sNodeRequest>,
+    ) -> Result<Response<DeleteK8sNodeResponse>, Status> {
+        let req = request.into_inner();
+        match self.k0s.delete_node(&req.node).await {
+            Ok(()) => Ok(Response::new(DeleteK8sNodeResponse {
+                deleted: true,
+                message: String::new(),
+            })),
+            Err(e) => Ok(Response::new(DeleteK8sNodeResponse {
+                deleted: false,
+                message: e.to_string(),
+            })),
+        }
+    }
+
     async fn get_kubeconfig(
         &self,
         request: Request<GetKubeconfigRequest>,

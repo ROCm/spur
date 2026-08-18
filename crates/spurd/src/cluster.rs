@@ -309,7 +309,8 @@ impl ClusterSupervisor {
         parse_execstart(exec)
     }
 
-    /// Stop + disable the unit; optionally `k0s reset` (destructive). Idempotent.
+    /// Stop + disable the unit; optionally `k0s reset` (destructive) followed by purging the
+    /// spurd-owned unit file + join token so nothing restarts the component. Idempotent.
     async fn stop(&self, reset: bool) -> anyhow::Result<()> {
         if !self.systemd_available().await {
             anyhow::bail!("systemctl unavailable");
@@ -317,6 +318,10 @@ impl ClusterSupervisor {
         self.disable_unit().await;
         if reset {
             self.k0s_reset().await?;
+            // `k0s reset` only wipes /var/lib/k0s data — it leaves the spurd-owned unit (Restart=always)
+            // and the join token, which would restart + rejoin the node. Purge both so a reset is a
+            // real teardown (essential for a single-node remove; harmless for a whole-cluster down).
+            self.purge_unit().await;
         }
         Ok(())
     }
@@ -326,6 +331,18 @@ impl ClusterSupervisor {
     async fn disable_unit(&self) {
         let unit = self.unit_file_name();
         let _ = self.systemctl(&["disable", "--now", &unit]).await;
+    }
+
+    /// Delete the spurd-owned unit file + join token and reload systemd, so nothing (Restart=always,
+    /// or a reconcile that re-adopts a lingering unit) can bring the component back. Best-effort: an
+    /// already-absent file is fine. Call only when tearing a node down for good (reset path).
+    async fn purge_unit(&self) {
+        let path = self.unit_path();
+        let _ = tokio::fs::remove_file(&path).await;
+        if let Some(tok) = &self.cfg.join_token_file {
+            let _ = tokio::fs::remove_file(tok).await;
+        }
+        let _ = self.systemctl(&["daemon-reload"]).await;
     }
 
     /// `k0s reset` (destructive host-wide cleanup). Returns an error if the reset fails so the
@@ -804,6 +821,13 @@ impl K0sAgent {
             self.probe_supervisor(ClusterRole::Controller)
                 .k0s_reset()
                 .await?;
+            // Purge both spurd-owned units so a lingering unit (Restart=always) can't restart the
+            // component after the reset. The probe supervisor carries no token path, so also remove
+            // the token file directly.
+            for role in [ClusterRole::Controller, ClusterRole::Worker] {
+                self.probe_supervisor(role).purge_unit().await;
+            }
+            let _ = tokio::fs::remove_file(self.config_dir.join("token")).await;
         }
         Ok(())
     }
@@ -929,6 +953,77 @@ impl K0sAgent {
         ))
     }
 
+    /// Cordon then drain a k8s node via `k0s kubectl` (run on a control-plane node). Cordon marks it
+    /// unschedulable; drain evicts pods PDB-aware, skipping DaemonSets and deleting emptyDir data.
+    /// `force` adds `--force --disable-eviction` (bypass PDBs — data-loss risk) for a stuck drain.
+    /// Returns Ok(()) only when cordon + drain succeed. Deleting the Node object is a separate step
+    /// (`delete_node`) the controller runs AFTER stopping the component, so the kubelet can't
+    /// re-register an uncordoned node in the gap.
+    pub async fn drain_node(
+        &self,
+        node: &str,
+        timeout_secs: u32,
+        force: bool,
+    ) -> anyhow::Result<()> {
+        if node.is_empty() {
+            anyhow::bail!("drain_node requires a non-empty node name");
+        }
+        let cordon = Command::new(&self.k0s_binary)
+            .args(["kubectl", "cordon", node])
+            .output()
+            .await?;
+        if !cordon.status.success() {
+            anyhow::bail!(
+                "k0s kubectl cordon {node} failed: {}",
+                String::from_utf8_lossy(&cordon.stderr).trim()
+            );
+        }
+        let timeout = if timeout_secs == 0 { 120 } else { timeout_secs };
+        let mut args: Vec<String> = vec![
+            "kubectl".into(),
+            "drain".into(),
+            node.to_string(),
+            "--ignore-daemonsets".into(),
+            "--delete-emptydir-data".into(),
+            format!("--timeout={timeout}s"),
+        ];
+        if force {
+            args.push("--force".into());
+            args.push("--disable-eviction".into());
+        }
+        let drain = Command::new(&self.k0s_binary).args(&args).output().await?;
+        if !drain.status.success() {
+            anyhow::bail!(
+                "k0s kubectl drain {node} failed: {}",
+                String::from_utf8_lossy(&drain.stderr).trim()
+            );
+        }
+        info!(node, force, "k8s node cordoned + drained");
+        Ok(())
+    }
+
+    /// Delete a k8s Node object via `k0s kubectl delete node --ignore-not-found` (control-plane node).
+    /// The controller calls this only AFTER the node's component is stopped, so the kubelet is gone
+    /// and cannot re-register a fresh (uncordoned) Node. Tolerant of an absent node so a re-run is
+    /// idempotent.
+    pub async fn delete_node(&self, node: &str) -> anyhow::Result<()> {
+        if node.is_empty() {
+            anyhow::bail!("delete_node requires a non-empty node name");
+        }
+        let del = Command::new(&self.k0s_binary)
+            .args(["kubectl", "delete", "node", node, "--ignore-not-found"])
+            .output()
+            .await?;
+        if !del.status.success() {
+            anyhow::bail!(
+                "k0s kubectl delete node {node} failed: {}",
+                String::from_utf8_lossy(&del.stderr).trim()
+            );
+        }
+        info!(node, "k8s node object deleted");
+        Ok(())
+    }
+
     /// (role, active_state, enabled) for the node's component. When there is no tracked component,
     /// it probes the actual spurd-owned units so a restarted spurd (before/without adoption) still
     /// reports the truth instead of a false `inactive`.
@@ -1007,6 +1102,40 @@ mod tests {
         assert!(!active);
         assert_eq!(restarts, 0);
         assert_eq!(install, 0.0);
+    }
+
+    #[tokio::test]
+    async fn purge_unit_removes_unit_file_and_token() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let unit_dir = dir.path().join("systemd");
+        tokio::fs::create_dir_all(&unit_dir).await.unwrap();
+        let token = dir.path().join("token");
+        tokio::fs::write(&token, b"secret").await.unwrap();
+
+        let sup = ClusterSupervisor {
+            cfg: ClusterConfig {
+                role: ClusterRole::Worker,
+                k0s_binary: PathBuf::from("/usr/local/bin/k0s"),
+                k0s_config: None,
+                join_token_file: Some(token.clone()),
+                node_ip: None,
+            },
+            unit_dir: unit_dir.clone(),
+        };
+        // Simulate the installed unit file.
+        let unit_path = unit_dir.join(sup.unit_file_name());
+        tokio::fs::write(&unit_path, b"[Unit]\n").await.unwrap();
+
+        sup.purge_unit().await;
+
+        assert!(
+            !unit_path.exists(),
+            "purge_unit must remove the spurd-owned unit file"
+        );
+        assert!(
+            !token.exists(),
+            "purge_unit must remove the join token so the node can't rejoin"
+        );
     }
 
     #[test]

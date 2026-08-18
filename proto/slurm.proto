@@ -383,6 +383,10 @@ service SlurmController {
   rpc ClusterDown(ClusterDownRequest) returns (ClusterDownResponse);
   rpc ClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
   rpc ClusterKubeconfig(ClusterKubeconfigRequest) returns (ClusterKubeconfigResponse);
+  // Grow a running cluster's worker set online (scoped clusters only; no down/reset needed).
+  rpc ClusterAddNodes(ClusterAddNodesRequest) returns (ClusterAddNodesResponse);
+  // Gracefully remove workers from a running cluster (cordon+drain, then k0s reset the node).
+  rpc ClusterRemoveNodes(ClusterRemoveNodesRequest) returns (ClusterRemoveNodesResponse);
 }
 
 // -- Agent service (slurmd) --
@@ -419,6 +423,11 @@ service SlurmAgent {
   //    the admin kubeconfig or a scoped per-user token. Erroring on a
   //    non-control-plane node is expected. --
   rpc CreateK0sJoinToken(CreateK0sJoinTokenRequest) returns (CreateK0sJoinTokenResponse);
+  // Cordon + drain a k8s node by name (shells `k0s kubectl`). Control-plane-only.
+  rpc DrainK8sNode(DrainK8sNodeRequest) returns (DrainK8sNodeResponse);
+  // Delete a (drained, stopped) k8s Node object by name (shells `k0s kubectl delete node`).
+  // Control-plane-only. Called after the component is stopped so the kubelet can't re-register.
+  rpc DeleteK8sNode(DeleteK8sNodeRequest) returns (DeleteK8sNodeResponse);
   rpc GetKubeconfig(GetKubeconfigRequest) returns (GetKubeconfigResponse);
 
   // Apply the full-mesh WireGuard membership on this node: the controller pushes the
@@ -906,6 +915,40 @@ message ClusterNodeStatus {
   string reason = 5;           // why this node blocked convergence when degraded; empty otherwise
 }
 
+message ClusterAddNodesRequest {
+  // Nodes to add to a scoped cluster's worker set: UNION of a hostlist (e.g. "gpu[09-12]"), a
+  // partition's members, and a label selector (all key=val match). Same resolution as ClusterUp's
+  // scope fields. At least one selector must be non-empty.
+  string nodes = 1;
+  string partition = 2;
+  map<string, string> selector = 3;
+  string caller = 4;   // For authorization (cluster admin required).
+}
+message ClusterAddNodesResponse {
+  bool accepted = 1;
+  string message = 2;
+  // Current per-node status. A just-added node only appears once the reconcile loop has assigned it
+  // a role (it has none at accept time), so it may be absent from the immediate response.
+  repeated ClusterNodeStatus nodes = 3;
+}
+
+message ClusterRemoveNodesRequest {
+  // Worker nodes to remove (hostlist, e.g. "gpu[09-12]").
+  string nodes = 1;
+  string caller = 2;   // For authorization (cluster admin required).
+  // Max seconds to wait for the k8s drain per node. 0/absent = server default.
+  optional uint32 drain_timeout_secs = 3;
+  // Proceed even if a node has running SPUR jobs (they are left running — this only skips the
+  // busy-node check, it does not evict them) or its drain does not complete (bypasses
+  // PodDisruptionBudgets via kubectl --force --disable-eviction). Destructive.
+  optional bool force = 4;
+}
+message ClusterRemoveNodesResponse {
+  bool accepted = 1;
+  string message = 2;
+  repeated ClusterNodeStatus nodes = 3;  // resulting per-node status after the removal
+}
+
 message ClusterKubeconfigRequest {
   // Target user for the scoped kubeconfig. Empty -> the caller's own namespace. A non-empty value
   // other than the caller requires cluster admin.
@@ -960,6 +1003,24 @@ message CreateK0sJoinTokenRequest {
 message CreateK0sJoinTokenResponse {
   // k0s join token (bearer secret — never log).
   string join_token = 1;
+}
+
+message DrainK8sNodeRequest {
+  string node = 1;                  // k8s node name to cordon + drain
+  uint32 timeout_secs = 2;          // drain timeout; 0 = agent default
+  bool force = 3;                   // when set, pass kubectl drain --force --disable-eviction (bypass PDBs)
+}
+message DrainK8sNodeResponse {
+  bool drained = 1;                 // true if cordon+drain completed
+  string message = 2;               // detail when not drained (e.g. PDB blocked, timeout)
+}
+
+message DeleteK8sNodeRequest {
+  string node = 1;                  // k8s node name to delete (after its component is stopped)
+}
+message DeleteK8sNodeResponse {
+  bool deleted = 1;                 // true if the Node object was deleted (or already absent)
+  string message = 2;               // detail on failure
 }
 
 message GetKubeconfigRequest {

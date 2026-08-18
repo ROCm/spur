@@ -2794,6 +2794,22 @@ mod tests {
                 Err(tonic::Status::unimplemented("not used in tests"))
             }
 
+            async fn drain_k8s_node(
+                &self,
+                _request: tonic::Request<spur_proto::proto::DrainK8sNodeRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::DrainK8sNodeResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+
+            async fn delete_k8s_node(
+                &self,
+                _request: tonic::Request<spur_proto::proto::DeleteK8sNodeRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::DeleteK8sNodeResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+
             async fn get_kubeconfig(
                 &self,
                 _request: tonic::Request<spur_proto::proto::GetKubeconfigRequest>,
