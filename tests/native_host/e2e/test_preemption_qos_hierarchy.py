@@ -29,6 +29,10 @@ import pytest
 
 from cluster import parse_job_id, wait_job, wait_job_state
 
+# Merged into every cluster_config_overrides fixture so that jobs submitted
+# by the root user (the typical CI / developer case) are not rejected by spurd.
+_AUTH_ALLOW_ROOT = {"auth": {"plugin": "none", "allow_root_jobs": True}}
+
 
 class TestQosPreemptHierarchyBlocked:
     """With preempt_type=qos_priority, a high-priority job whose QOS has an
@@ -52,6 +56,7 @@ class TestQosPreemptHierarchyBlocked:
             "scheduler": {
                 "preempt_type": "qos_priority",
             },
+            **_AUTH_ALLOW_ROOT,
         }
 
     def test_preemption_blocked_when_qos_not_in_allow_list(self, accounting_cluster):
@@ -123,6 +128,7 @@ class TestQosPreemptHierarchyAllowed:
             "scheduler": {
                 "preempt_type": "qos_priority",
             },
+            **_AUTH_ALLOW_ROOT,
         }
 
     def test_preemption_fires_when_qos_in_allow_list(self, accounting_cluster):
@@ -197,6 +203,7 @@ class TestPreemptExemptTime:
             "scheduler": {
                 "preempt_exempt_time": self.EXEMPT_SECS,
             },
+            **_AUTH_ALLOW_ROOT,
         }
 
     def test_exempt_window_protects_then_expires(self, cluster):
@@ -268,6 +275,7 @@ class TestReconfigurePreservesExemptTime:
                     # No preempt_exempt_time in TOML — starts at None (inherit global=0).
                 }
             ],
+            **_AUTH_ALLOW_ROOT,
         }
 
     def test_reconfigure_preserves_partition_exempt_time(self, cluster):
